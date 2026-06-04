@@ -1,0 +1,45 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [
+        "npm --prefix functions run lint"
+      ]
+    }
+  ],
+  "storage": {
+    "rules": [
+      {
+        "match": {
+          "service": "storage.googleapis.com",
+          "name": "projects/_/buckets/tai-invoice-automation.appspot.com",
+          "resource": {
+            "name": "emailAttachments/**",
+            "type": "storage#object"
+          }
+        },
+        "lifecycle": {
+          "rule": [
+            {
+              "action": {
+                "type": "Delete"
+              },
+              "condition": {
+                "age": 7
+              }
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
