@@ -747,6 +747,7 @@ exports.continueWorkflow = onRequest(async (req, res) => {
     });
 
     const response = await fetch(
+        process.env.PROCESS_TAI_WORKFLOW_URL ||
         "https://us-central1-tai-invoice-automation.cloudfunctions.net/processTaiWorkflow",
         {
           method: "POST",
@@ -2316,7 +2317,7 @@ async function processGmailMessage(
 
       await logWorkflowStep({
         gmailMessageId: messageId,
-        stepName: "openai_classification_completed",
+        stepName: "claude_classification_completed",
         stepStatus: "success",
         output: {
           loadNumber: aiResult.loadNumber,
@@ -2333,7 +2334,7 @@ async function processGmailMessage(
 
       await logWorkflowStep({
         gmailMessageId: messageId,
-        stepName: "openai_classification_completed",
+        stepName: "claude_classification_completed",
         stepStatus: "failed",
         error: aiError.message,
       });
@@ -2794,6 +2795,7 @@ async function processGmailMessage(
 
       try {
         const workflowUrl =
+          process.env.PROCESS_TAI_WORKFLOW_URL ||
           "https://us-central1-tai-invoice-automation.cloudfunctions.net/processTaiWorkflow";
         const workflowRes = await fetch(
             workflowUrl,
@@ -2992,6 +2994,7 @@ exports.checkGmailInbox = onRequest(
           "-label:CHARGES_NO_PROOF",
           "-label:NOT_FOUND",
           "-label:NO_LOAD_NUMBER",
+          "-label:NO_INVOICE_PDF",
           "-label:ERROR",
         ].join(" ");
 
@@ -3430,6 +3433,8 @@ exports.processTaiWorkflow = onRequest(
           await invoiceDoc.ref.update({
             decisionStage: "unrecognized_charges",
             decisionReason: "Unrecognized charges detected",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -3461,6 +3466,8 @@ exports.processTaiWorkflow = onRequest(
           await invoiceDoc.ref.update({
             decisionStage: "charges_no_proof",
             decisionReason: "Extra charges present with no proof",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -3942,10 +3949,7 @@ exports.processTaiWorkflow = onRequest(
           input: {loadNumber: invoice.loadNumber, proNumber: workingProNumber},
         });
 
-        const customerRateResult = await getCustomerRate(
-            invoice.loadNumber,
-            workingProNumber,
-        );
+        const customerRateResult = customerForCheckResult;
 
         if (!customerRateResult.ok) {
           await logWorkflowStep({
@@ -4174,7 +4178,7 @@ exports.processTaiWorkflow = onRequest(
               invoiceId: invoiceId,
               customerName: customerName,
               profit: profit,
-              customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+              customerInvoiceId: finalCustomerInvoiceId,
             },
         );
 
