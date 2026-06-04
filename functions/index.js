@@ -3343,6 +3343,8 @@ exports.processTaiWorkflow = onRequest(
           });
         }
 
+        
+
         const {invoiceId, resumeFrom} = req.body || {};
 
         if (!invoiceId) {
