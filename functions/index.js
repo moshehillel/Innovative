@@ -2812,7 +2812,7 @@ async function processGmailMessage(
 
       await writeLog("error", "gmail", "Load number missing/invalid", {
         event: "Load number validation failed",
-        messageId: message.id,
+        messageId: messageId,
         details: {
           loadNumberRaw: aiResult.loadNumber || null,
           loadNumberNormalized: normalizedLoadNumber || null,
@@ -3481,11 +3481,6 @@ exports.checkGmailInbox = onRequest(
     {timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
       try {
-        await logWorkflowStep({
-          stepName: "gmail_email_found",
-          stepStatus: "started",
-        });
-
         await writeLog("info", "gmail", "Starting Gmail inbox check");
 
         const inboxFlowId = crypto.randomUUID ?
@@ -3754,16 +3749,19 @@ exports.processGmailQueue = onRequest(
  */
 async function validateAmountWithPrimus(loadNumber, amount) {
   try {
-    const response = await fetch(process.env.PRIMUS_VALIDATE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        loadNumber: loadNumber,
-        amount: amount,
-      }),
-    });
+    const response = await fetch(
+        `${process.env.PRIMUS_BASE_URL}/validateAmount`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            loadNumber: loadNumber,
+            amount: amount,
+          }),
+        },
+    );
 
     return await response.json();
   } catch (error) {
@@ -4079,9 +4077,6 @@ exports.processPrimusWorkflow = onRequest(
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        const extractedPodOnlyFile =
-      await maybeExtractPodOnlyPdf(invoiceId, invoice);
-
         await logWorkflowStep({
           invoiceId,
           stepName: "pod_extraction_started",
@@ -4089,13 +4084,16 @@ exports.processPrimusWorkflow = onRequest(
           input: {podSource: (invoice.pod && invoice.pod.source) || null},
         });
 
+        const extractedPodOnlyFile =
+      await maybeExtractPodOnlyPdf(invoiceId, invoice);
+
         await logWorkflowStep({
           invoiceId,
           stepName: "pod_extraction_completed",
-          stepStatus: extractedPodOnlyFile ? "success" : "failed",
+          stepStatus: extractedPodOnlyFile ? "success" : "skipped",
           output: extractedPodOnlyFile ?
         {storagePath: extractedPodOnlyFile.storagePath} : null,
-          error: extractedPodOnlyFile ? null : "POD extraction returned null",
+          error: null,
         });
 
         if (extractedPodOnlyFile) {
@@ -4309,7 +4307,7 @@ exports.processPrimusWorkflow = onRequest(
             await writeLog("info", "workflow", "Marking shipment delivered", {
               invoiceId,
               loadNumber: invoice.loadNumber,
-              proNumber: invoice.proNumber,
+              proNumber: workingProNumber,
             });
 
             const deliveredRes = await markShipmentDelivered(
