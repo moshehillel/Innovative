@@ -1,4 +1,4 @@
-const {onRequest} = require("firebase-functions/v2/https");
+﻿const {onRequest} = require("firebase-functions/v2/https");
 
 const admin = require("firebase-admin");
 const {google} = require("googleapis");
@@ -70,7 +70,7 @@ async function downloadStorageFileBase64(storagePath) {
 }
 
 /**
- * Checks if a TAI API response indicates the operation already completed.
+ * Checks if a Primus API response indicates the operation already completed.
  * Treats "already delivered/approved/exists" as success.
  * @param {object} result API response object.
  * @return {boolean} True if already done.
@@ -102,15 +102,15 @@ function isAlreadyDoneResult(result) {
 }
 
 /**
- * Marks a shipment as delivered in the TAI system.
+ * Marks a shipment as delivered in the Primus system.
  * @param {string} loadNumber - The load number.
  * @param {string} proNumber - The PRO number.
- * @return {Promise<object>} Response from TAI API.
+ * @return {Promise<object>} Response from Primus API.
  */
 async function markShipmentDelivered(loadNumber, proNumber) {
   try {
     const response = await fetch(
-        `${process.env.TAI_BASE_URL}/markShipmentDelivered`,
+        `${process.env.PRIMUS_BASE_URL}/markShipmentDelivered`,
         {
           method: "POST",
           headers: {
@@ -125,7 +125,7 @@ async function markShipmentDelivered(loadNumber, proNumber) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to mark shipment delivered", {
+    await writeLog("error", "primus", "Failed to mark shipment delivered", {
       loadNumber,
       proNumber,
       error: error.message,
@@ -135,15 +135,15 @@ async function markShipmentDelivered(loadNumber, proNumber) {
 }
 
 /**
- * Adds a charge to a customer invoice in the TAI system.
+ * Adds a charge to a customer invoice in the Primus system.
  * @param {string} customerInvoiceId - The customer invoice ID.
  * @param {object} charge - The charge object.
- * @return {Promise<object>} Response from TAI API.
+ * @return {Promise<object>} Response from Primus API.
  */
 async function addChargeToCustomerInvoice(customerInvoiceId, charge) {
   try {
     const response = await fetch(
-        `${process.env.TAI_BASE_URL}/addChargeToCustomerInvoice`,
+        `${process.env.PRIMUS_BASE_URL}/addChargeToCustomerInvoice`,
         {
           method: "POST",
           headers: {
@@ -158,7 +158,7 @@ async function addChargeToCustomerInvoice(customerInvoiceId, charge) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to add charge to customer invoice", {
+    await writeLog("error", "primus", "Failed to add charge to customer invoice", {
       customerInvoiceId,
       charge,
       error: error.message,
@@ -374,7 +374,7 @@ async function summarizeSingleFlow(flowId, logs) {
       "attachments found (count and filenames if available), " +
       "what data was " +
       "extracted (load/pro/invoice amount), " +
-      "what TAI checks were attempted " +
+      "what Primus checks were attempted " +
       "and the outcome, what decision was made " +
       "(approved / needs review / " +
       "error), and why. " +
@@ -747,8 +747,8 @@ exports.continueWorkflow = onRequest(async (req, res) => {
     });
 
     const response = await fetch(
-        process.env.PROCESS_TAI_WORKFLOW_URL ||
-        "https://us-central1-tai-invoice-automation.cloudfunctions.net/processTaiWorkflow",
+        process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+        "https://us-central1-tai-invoice-automation.cloudfunctions.net/processPrimusWorkflow",
         {
           method: "POST",
           headers: {
@@ -873,7 +873,7 @@ exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
 /**
  * Writes detailed log to Firestore for debugging and monitoring.
  * @param {string} level Log level (info, warn, error).
- * @param {string} category Log category (gmail, tai, ai, storage, general).
+ * @param {string} category Log category (gmail, primus, ai, storage, general).
  * @param {string} message Log message.
  * @param {object} details Additional details object.
  * @param {string} messageId Gmail message ID if applicable.
@@ -1001,7 +1001,7 @@ exports.processInvoice = onRequest(async (req, res) => {
       });
     }
 
-    const decisionStage = "pending_tai_check";
+    const decisionStage = "pending_primus_check";
 
     const docRef = await db.collection("invoices").add({
       carrierName: carrierName,
@@ -1015,10 +1015,10 @@ exports.processInvoice = onRequest(async (req, res) => {
       matchStatus: "not_checked",
       reviewStatus: "not_needed",
       decisionStage: decisionStage,
-      taiLoadId: null,
-      taiAmount: null,
+      primusLoadId: null,
+      primusAmount: null,
       amountDifference: null,
-      decisionReason: "Waiting for TAI lookup.",
+      decisionReason: "Waiting for Primus lookup.",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       deleteAt: getDeleteAt(7),
@@ -1041,7 +1041,7 @@ exports.processInvoice = onRequest(async (req, res) => {
   }
 });
 
-exports.checkInvoiceAgainstTai = onRequest(async (req, res) => {
+exports.checkInvoiceAgainstPrimus = onRequest(async (req, res) => {
   try {
     if (req.method !== "POST") {
       return res.status(405).json({
@@ -1073,12 +1073,12 @@ exports.checkInvoiceAgainstTai = onRequest(async (req, res) => {
     const invoice = invoiceSnap.data();
     const invoiceAmount = Number(invoice.invoiceAmount);
 
-    const fakeTaiAmount = invoiceAmount;
-    const amountDifference = Math.abs(invoiceAmount - fakeTaiAmount);
+    const fakePrimusAmount = invoiceAmount;
+    const amountDifference = Math.abs(invoiceAmount - fakePrimusAmount);
 
     let decisionStage = "ready_to_approve";
     let reviewStatus = "not_needed";
-    let decisionReason = "Invoice matches TAI amount.";
+    let decisionReason = "Invoice matches Primus amount.";
 
     if (amountDifference > 5) {
       decisionStage = "needs_charge_review";
@@ -1086,12 +1086,12 @@ exports.checkInvoiceAgainstTai = onRequest(async (req, res) => {
       decisionReason = "Difference is more than $5.";
     }
 
-    const taiLoadId = invoice.loadNumber || null;
+    const primusLoadId = invoice.loadNumber || null;
 
     await invoiceRef.update({
       matchStatus: "matched",
-      taiLoadId: taiLoadId,
-      taiAmount: fakeTaiAmount,
+      primusLoadId: primusLoadId,
+      primusAmount: fakePrimusAmount,
       amountDifference: amountDifference,
       decisionStage: decisionStage,
       reviewStatus: reviewStatus,
@@ -1102,14 +1102,14 @@ exports.checkInvoiceAgainstTai = onRequest(async (req, res) => {
     return res.json({
       ok: true,
       invoiceId: invoiceId,
-      taiAmount: fakeTaiAmount,
+      primusAmount: fakePrimusAmount,
       amountDifference: amountDifference,
       decisionStage: decisionStage,
       reviewStatus: reviewStatus,
       decisionReason: decisionReason,
     });
   } catch (error) {
-    console.error("checkInvoiceAgainstTai error:", error);
+    console.error("checkInvoiceAgainstPrimus error:", error);
 
     return res.status(500).json({
       ok: false,
@@ -1201,7 +1201,13 @@ async function parseWithDocumentAiWithLogging(
  * @return {boolean}
  */
 function shouldProcessAttachment(attachment, fileBuffer) {
-  if (attachment.mimeType !== "application/pdf") return false;
+  const isPdf = attachment.mimeType === "application/pdf" ||
+    // Some email clients send PDFs as octet-stream; detect by magic bytes %PDF
+    (attachment.mimeType === "application/octet-stream" &&
+      fileBuffer.length >= 4 &&
+      fileBuffer[0] === 0x25 && fileBuffer[1] === 0x50 &&
+      fileBuffer[2] === 0x44 && fileBuffer[3] === 0x46);
+  if (!isPdf) return false;
   if (fileBuffer.length < 10000) return false;
   return true;
 }
@@ -1249,7 +1255,10 @@ async function preCheckDocumentType(pdfBuffer) {
     }],
   });
 
-  const word = response.content[0].text.trim().toUpperCase().split(/\s+/)[0];
+  if (!response.content || response.content.length === 0) return "OTHER";
+  const block = response.content[0];
+  if (!block || block.type !== "text" || !block.text) return "OTHER";
+  const word = block.text.trim().toUpperCase().split(/\s+/)[0];
   return ["INVOICE", "STATEMENT", "INSURANCE"].includes(word) ? word : "OTHER";
 }
 
@@ -1263,63 +1272,251 @@ async function preCheckDocumentType(pdfBuffer) {
  * @param {string} notes - Detailed notes for the reviewer.
  * @return {Promise<void>}
  */
-async function forwardToHumanReview(gmail, messageId, subject, from, reason, notes) {
-  const reviewEmail = process.env.HUMAN_REVIEW_EMAIL;
-  if (!reviewEmail) {
-    await writeLog("warn", "gmail", "HUMAN_REVIEW_EMAIL not set, skipping forward", {messageId});
+
+/**
+ * Escapes a string for safe insertion into HTML.
+ * @param {*} str - Value to escape.
+ * @return {string} HTML-safe string.
+ */
+function escapeHtml(str) {
+  return String(str == null ? "" : str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+}
+
+/**
+ * Encodes a buffer as base64 with RFC 2045 line wrapping.
+ * @param {Buffer} buf - Raw bytes to encode.
+ * @return {string} Base64 string with CRLF every 76 characters.
+ */
+function encodeMimeBase64(buf) {
+  const b64 = buf.toString("base64");
+  return b64.replace(/.{1,76}/g, "$&\r\n").trim();
+}
+
+/**
+ * Builds a multipart review email: HTML summary + original message attachment.
+ * @param {object} params - MIME build parameters.
+ * @param {string} params.to - Recipient address.
+ * @param {string} params.subject - Email subject.
+ * @param {string} params.html - HTML body for the AI summary.
+ * @param {Buffer} params.originalRawBuffer - Full original RFC822 message.
+ * @param {string} params.originalFilename - Attachment filename.
+ * @return {Buffer} Complete MIME message ready for Gmail send.
+ */
+function buildReviewForwardMime({
+  to,
+  subject,
+  html,
+  originalRawBuffer,
+  originalFilename,
+}) {
+  const boundary = `review_${crypto.randomBytes(16).toString("hex")}`;
+  const safeFilename = String(originalFilename || "original.eml")
+      .replace(/[\r\n"]/g, "_");
+
+  const lines = [
+    `To: ${to}\r\n`,
+    `Subject: ${subject}\r\n`,
+    `MIME-Version: 1.0\r\n`,
+    `Content-Type: multipart/mixed; boundary="${boundary}"\r\n`,
+    `\r\n`,
+    `--${boundary}\r\n`,
+    `Content-Type: text/html; charset="UTF-8"\r\n`,
+    `Content-Transfer-Encoding: 7bit\r\n`,
+    `\r\n`,
+    `${html}\r\n`,
+    `--${boundary}\r\n`,
+    `Content-Type: message/rfc822\r\n`,
+    `Content-Disposition: attachment; filename="${safeFilename}"\r\n`,
+    `Content-Transfer-Encoding: base64\r\n`,
+    `\r\n`,
+    `${encodeMimeBase64(originalRawBuffer)}\r\n`,
+    `--${boundary}--`,
+  ];
+  return Buffer.from(lines.join(""));
+}
+
+async function forwardToHumanReview(
+    gmail, messageId, subject, from, reason, notes, options = {}) {
+  const {
+    department = "general",
+    extractedData = null,
+    emailBody = null,
+  } = options;
+
+  const departmentEmail =
+    (department === "billing" && process.env.REVIEW_EMAIL_BILLING) ||
+    (department === "operations" && process.env.REVIEW_EMAIL_OPERATIONS) ||
+    process.env.HUMAN_REVIEW_EMAIL;
+
+  if (!departmentEmail) {
+    const missingVar = department === "billing" ? "REVIEW_EMAIL_BILLING" :
+      department === "operations" ? "REVIEW_EMAIL_OPERATIONS" :
+      "HUMAN_REVIEW_EMAIL";
+    console.error(
+        `[forwardToHumanReview] ${missingVar} env var not set — ` +
+        `forward dropped for message ${messageId} (reason: ${reason})`,
+    );
+    await writeLog("error", "gmail",
+        `Review forward dropped — ${missingVar} is not configured`,
+        {messageId, department, reason});
+    try {
+      await db.collection("emailErrors").add({
+        gmailMessageId: messageId,
+        error: `${missingVar} not configured — forward dropped`,
+        reason,
+        department,
+        status: "config_error",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        deleteAt: getDeleteAt(30),
+      });
+    } catch (_) {}
     return;
   }
 
-  const forwardSubject = `[REVIEW NEEDED] ${reason} | ${subject}`;
-  const body = [
-    "AUTOMATED REVIEW REQUEST",
-    "========================",
-    `Reason: ${reason}`,
-    `Notes: ${notes}`,
-    `Original From: ${from}`,
-    `Original Subject: ${subject}`,
-    `Gmail Message ID: ${messageId}`,
-    "",
-    "Please review and handle manually.",
-  ].join("\n");
+  let dataRows = "";
+  if (extractedData) {
+    dataRows = Object.entries(extractedData)
+        .filter(([, v]) => v !== null && v !== undefined && v !== "")
+        .map(([k, v]) =>
+          `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;` +
+          `white-space:nowrap;font-weight:600;">${escapeHtml(k)}</td>` +
+          `<td style="padding:4px 0;">${escapeHtml(v)}</td></tr>`,
+        ).join("");
+  }
 
-  const raw = Buffer.from(
-      `To: ${reviewEmail}\r\nSubject: ${forwardSubject}\r\n` +
-      `Content-Type: text/plain; charset="UTF-8"\r\n\r\n${body}`,
-  ).toString("base64url");
+  const dataSection = dataRows ?
+    `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Invoice Details</h3>` +
+    `<table style="border-collapse:collapse;font-size:13px;">` +
+    `${dataRows}</table>` : "";
+
+  let originalRawBuffer = null;
+  try {
+    const origMsg = await gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+      format: "raw",
+    });
+    const rawB64url = origMsg.data.raw;
+    if (rawB64url) {
+      originalRawBuffer = Buffer.from(
+          rawB64url.replace(/-/g, "+").replace(/_/g, "/"),
+          "base64",
+      );
+    }
+  } catch (attachErr) {
+    await writeLog("warn", "gmail",
+        "Could not fetch original message for review attachment",
+        {messageId, error: attachErr.message});
+  }
+
+  const attachmentNotice = originalRawBuffer ?
+    `<p style="margin:16px 0 0;padding:12px;background:#f0fdf4;` +
+    `border:1px solid #bbf7d0;border-radius:6px;font-size:13px;color:#166534;">` +
+    `The complete original email, including all attachments, is attached ` +
+    `as <strong>original.eml</strong>. Open it in your mail client to view ` +
+    `everything.</p>` : "";
+
+  const emailBodySection = !originalRawBuffer && emailBody ?
+    `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Original Message</h3>` +
+    `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;` +
+    `padding:14px;font-size:13px;line-height:1.6;white-space:pre-wrap;` +
+    `color:#374151;">` +
+    `${escapeHtml(String(emailBody).slice(0, 2000))}` +
+    `</div>` : "";
+
+  const html =
+    `<div style="font-family:Arial,sans-serif;max-width:620px;` +
+    `color:#111827;font-size:14px;">` +
+    `<div style="background:#dc2626;color:#fff;padding:14px 18px;` +
+    `border-radius:6px 6px 0 0;font-size:15px;font-weight:700;">` +
+    `&#9888; Action Required — ${escapeHtml(reason)}</div>` +
+    `<div style="border:1px solid #e5e7eb;border-top:none;padding:18px;` +
+    `border-radius:0 0 6px 6px;">` +
+    `<p style="margin:0 0 16px;color:#374151;line-height:1.6;` +
+    `white-space:pre-wrap;">${escapeHtml(notes)}</p>` +
+    `${dataSection}` +
+    `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Original Email</h3>` +
+    `<table style="border-collapse:collapse;font-size:13px;">` +
+    `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+    `From</td><td>${escapeHtml(from)}</td></tr>` +
+    `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+    `Subject</td><td>${escapeHtml(subject)}</td></tr>` +
+    `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+    `Message&nbsp;ID</td>` +
+    `<td style="font-family:monospace;font-size:11px;">${escapeHtml(messageId)}</td>` +
+    `</tr></table>` +
+    `${attachmentNotice}` +
+    `${emailBodySection}` +
+    `</div></div>`;
+
+  const safeReason = String(reason || "").replace(/[\r\n]/g, " ");
+  const safeSubject = String(subject || "").replace(/[\r\n]/g, " ");
+  const forwardSubject = `[ACTION REQUIRED] ${safeReason} — ${safeSubject}`;
+
+  let mimeBuffer;
+  if (originalRawBuffer) {
+    mimeBuffer = buildReviewForwardMime({
+      to: departmentEmail,
+      subject: forwardSubject,
+      html,
+      originalRawBuffer,
+      originalFilename: "original.eml",
+    });
+  } else {
+    mimeBuffer = Buffer.from(
+        `To: ${departmentEmail}\r\n` +
+        `Subject: ${forwardSubject}\r\n` +
+        `Content-Type: text/html; charset="UTF-8"\r\n\r\n${html}`,
+    );
+  }
+
+  const raw = mimeBuffer.toString("base64url");
 
   await gmail.users.messages.send({userId: "me", requestBody: {raw}});
-  await writeLog("info", "gmail", "Forwarded to human review", {messageId, reason, reviewEmail});
+  await writeLog("info", "gmail", "Forwarded to human review", {
+    messageId,
+    reason,
+    reviewEmail: departmentEmail,
+    department,
+    originalAttached: Boolean(originalRawBuffer),
+  });
 }
 
 /**
  * Validates invoice amount by subtracting lumper charges before comparing to rate.
  * @param {object} aiResult - AI classification result.
- * @param {number} taiRate - Rate from TAI/Primus.
+ * @param {number} primusRate - Rate from Primus.
  * @return {{valid: boolean, baseAmount: number, totalLumper: number, difference: number}}
  */
-function validateLumperAmount(aiResult, taiRate) {
+function validateLumperAmount(aiResult, primusRate) {
   const lumperCharges = (aiResult.recognizedCharges || [])
       .filter((c) => c && c.type === "lumper");
   const totalLumper = lumperCharges.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
   const baseAmount = Number(aiResult.invoiceAmount || 0) - totalLumper;
-  const difference = Math.abs(baseAmount - Number(taiRate || 0));
+  const difference = Math.abs(baseAmount - Number(primusRate || 0));
   return {valid: difference <= 5, baseAmount, totalLumper, difference};
 }
 
 /**
  * Checks profit and margin thresholds against business rules.
  * profit < $10 = no rate scenario; margin < 10% = broker commission adjustment needed.
- * @param {number} taiRate - Customer rate from TAI/Primus.
+ * @param {number} primusRate - Customer rate from Primus.
  * @param {number} invoiceAmount - Carrier invoice amount.
  * @return {{noRate: boolean, profit: number, margin: number, lowProfit: boolean, lowMargin: boolean}}
  */
-function checkProfitMargin(taiRate, invoiceAmount) {
-  if (!taiRate || Number(taiRate) <= 0) {
+function checkProfitMargin(primusRate, invoiceAmount) {
+  if (!primusRate || Number(primusRate) <= 0) {
     return {noRate: true, profit: 0, margin: 0, lowProfit: true, lowMargin: true};
   }
-  const profit = Number(taiRate) - Number(invoiceAmount || 0);
-  const margin = (profit / Number(taiRate)) * 100;
+  const profit = Number(primusRate) - Number(invoiceAmount || 0);
+  const margin = (profit / Number(primusRate)) * 100;
   return {
     noRate: false,
     profit,
@@ -1381,7 +1578,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
       lastKnownLoadNumber: Number.isFinite(Number(lastKnownLoadNumber)) ?
         Number(lastKnownLoadNumber) : null,
       allowedStatuses: [
-        "ready_for_tai_validation",
+        "ready_for_primus_validation",
         "unmatched_amount",
         "unrecognized_charges",
         "charges_no_proof",
@@ -1431,7 +1628,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "bottom portion of an invoice page.",
       ],
       requiredJsonShape: {
-        status: "ready_for_tai_validation",
+        status: "ready_for_primus_validation",
         invoiceNumber: "",
         loadNumber: "",
         proNumber: "",
@@ -1470,11 +1667,16 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
     messages: [{role: "user", content: contentBlocks}],
   });
 
+  if (!response.content || response.content.length === 0) {
+    throw new Error("Claude returned an empty response for invoice classification");
+  }
+  const rawText = response.content[0].text;
+  const jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
   try {
-    return JSON.parse(response.content[0].text);
+    return JSON.parse(jsonText);
   } catch (e) {
     throw new Error(
-        `Claude returned non-JSON response: ${response.content[0].text.slice(0, 200)}`,
+        `Claude returned non-JSON response: ${rawText.slice(0, 200)}`,
     );
   }
 }
@@ -1970,15 +2172,25 @@ async function hasEmailBeenProcessed(messageId) {
       .where("gmailMessageId", "==", messageId)
       .limit(1)
       .get();
-  if (intakeSnap.size > 0) {
-    return true;
-  }
+  if (intakeSnap.size > 0) return true;
 
   const invoiceSnap = await db.collection("invoices")
       .where("gmailMessageId", "==", messageId)
       .limit(1)
       .get();
-  return invoiceSnap.size > 0;
+  if (invoiceSnap.size > 0) return true;
+
+  // Also check the queue — covers NO_INVOICE_PDF and other early-exit paths
+  // that never create an emailIntake record but did reserve a queue slot.
+  const queueSnap = await db.collection("gmailQueue").doc(messageId).get();
+  if (queueSnap.exists) {
+    const queueStatus = (queueSnap.data() || {}).status;
+    if (queueStatus && queueStatus !== "queued" && queueStatus !== "failed") {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -2117,6 +2329,99 @@ async function reserveGmailQueueItemForProcessing(
 }
 
 /**
+ * Extracts plain-text body from a Gmail message payload.
+ * @param {object} payload Gmail message payload.
+ * @return {string} Plain text body.
+ */
+function extractEmailBody(payload) {
+  if (!payload) return "";
+
+  if (payload.body && payload.body.data) {
+    const mimeType = payload.mimeType || "";
+    if (mimeType === "text/plain") {
+      return Buffer.from(
+          payload.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+          "base64",
+      ).toString("utf-8");
+    }
+    if (mimeType === "text/html") {
+      const html = Buffer.from(
+          payload.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+          "base64",
+      ).toString("utf-8");
+      return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+    // multipart/* and unknown types: body.data is typically empty, fall through
+  }
+
+  if (payload.parts && Array.isArray(payload.parts)) {
+    for (const part of payload.parts) {
+      if (part.mimeType === "text/plain" && part.body && part.body.data) {
+        return Buffer.from(
+            part.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+            "base64",
+        ).toString("utf-8");
+      }
+    }
+    for (const part of payload.parts) {
+      if (part.mimeType === "text/html" && part.body && part.body.data) {
+        const html = Buffer.from(
+            part.body.data.replace(/-/g, "+").replace(/_/g, "/"),
+            "base64",
+        ).toString("utf-8");
+        return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+      }
+    }
+    for (const part of payload.parts) {
+      const nested = extractEmailBody(part);
+      if (nested) return nested;
+    }
+  }
+
+  return "";
+}
+
+/**
+ * Uses Claude Haiku to produce a one-line summary of an incoming email.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @param {string} body Email plain-text body.
+ * @return {Promise<{summary: string}>}
+ */
+async function analyzeEmailForForwarding(subject, from, body) {
+  const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
+
+  const res = await client.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 200,
+    system:
+      "You are an assistant for a freight brokerage handling incoming emails. " +
+      "Analyze the email and return ONLY valid JSON with one key: " +
+      "\"summary\" (one or two sentences describing what the sender wants or " +
+      "what this email appears to be about).",
+    messages: [{
+      role: "user",
+      content: JSON.stringify({
+        subject,
+        from,
+        body: String(body || "").slice(0, 3000),
+      }),
+    }],
+  });
+
+  if (!res.content || res.content.length === 0) {
+    return {summary: "Could not analyze email."};
+  }
+  const rawText = res.content[0].text || "";
+  const jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  try {
+    return JSON.parse(jsonText);
+  } catch (e) {
+    return {summary: rawText || "Could not analyze email."};
+  }
+}
+
+/**
  * Processes a Gmail message and ingests it into the invoice workflow.
  * @param {object} gmail - Gmail client instance.
  * @param {object} message - Message metadata.
@@ -2136,7 +2441,6 @@ async function processGmailMessage(
   let subject = String(options.subject || "");
   let from = String(options.from || "");
 
-  let queueStatusUpdated = false;
   try {
     const fullMessage = await gmail.users.messages.get({
       userId: "me",
@@ -2154,6 +2458,36 @@ async function processGmailMessage(
     if (!from) {
       from = fromHeader ? fromHeader.value : "";
     }
+
+    const emailBody = extractEmailBody(payload);
+
+    // Used when the system doesn't know how to handle an email.
+    // Asks Claude what the email is about, then forwards it to the reviewer
+    // written as a first-person note from the AI — no suggested reply.
+    const forwardWithAnalysis = async (reason, fwdOpts = {}) => {
+      let summary = "";
+      try {
+        const analysis = await analyzeEmailForForwarding(subject, from, emailBody);
+        summary = analysis.summary || "";
+      } catch (e) {
+        await writeLog("warn", "gmail", "Email analysis failed before forward", {
+          messageId, error: e.message,
+        });
+      }
+
+      const aiNote =
+        `Hi,\n\n` +
+        `I am your AI helper. I just received the following email and I am ` +
+        `not sure how to handle it.\n\n` +
+        (summary ? `Here is what I think this email is about: ${summary}\n\n` : "") +
+        `I do not have a rule for this type of email yet. ` +
+        `Please take care of it.\n\nThank you,\nAI Helper`;
+
+      return forwardToHumanReview(
+          gmail, messageId, subject, from, reason, aiNote,
+          {...fwdOpts, emailBody},
+      );
+    };
 
     await writeLog("info", "gmail", `Message details retrieved`, {
       messageId: messageId,
@@ -2174,7 +2508,7 @@ async function processGmailMessage(
 
     const attachments = extractAttachmentsRecursive(payload.parts || []);
 
-    if (attachments.length > 0 && !options.fromQueue) {
+    if (!options.fromQueue) {
       const reserved = await reserveGmailQueueItemForProcessing(
           messageId,
           subject,
@@ -2193,16 +2527,23 @@ async function processGmailMessage(
     }
 
     if (attachments.length === 0) {
-      await writeLog(
-          "warn",
-          "gmail",
-          `No attachments found, skipping message`,
-          {
-            messageId: messageId,
-            subject: subject,
-          },
+      await writeLog("warn", "gmail", "No attachments found, forwarding for review", {
+        messageId, subject,
+      });
+      await forwardWithAnalysis(
+          "Email received with no attachments",
+          {department: "general"},
       );
-      await updateGmailQueueStatus(messageId, "failed", "No attachments found");
+      await applyGmailOutcome(gmail, messageId, "NO_INVOICE_PDF", false);
+      await updateGmailQueueStatus(messageId, "completed");
+      await db.collection("emailIntake").doc(messageId).set({
+        gmailMessageId: messageId,
+        subject, from,
+        finalStatus: "no_attachment",
+        finalLabel: "NO_INVOICE_PDF",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        deleteAt: getDeleteAt(30),
+      }, {merge: true});
       return;
     }
 
@@ -2211,7 +2552,6 @@ async function processGmailMessage(
         skipAttemptIncrement: true,
       });
     }
-    queueStatusUpdated = true;
 
     await writeLog(
         "info",
@@ -2231,6 +2571,7 @@ async function processGmailMessage(
     // storedAttachments: saved to Firestore (no buffer)
     const pdfAttachments = [];
     const storedAttachments = [];
+    const skippedDocTypes = [];
 
     await logWorkflowStep({
       stepName: "attachments_saved_to_storage",
@@ -2265,6 +2606,19 @@ async function processGmailMessage(
           mimeType: attachment.mimeType,
           fileSize: fileBuffer.length,
         });
+        const isPdfMime = attachment.mimeType === "application/pdf" ||
+          (attachment.mimeType === "application/octet-stream" &&
+            fileBuffer.length >= 4 &&
+            fileBuffer[0] === 0x25 && fileBuffer[1] === 0x50 &&
+            fileBuffer[2] === 0x44 && fileBuffer[3] === 0x46);
+        if (isPdfMime && fileBuffer.length < 10000) {
+          // Small PDF — likely a real document but too short to be an invoice
+          skippedDocTypes.push("small PDF");
+        } else if (!isPdfMime && fileBuffer.length >= 10000) {
+          // Substantive non-PDF (Excel, Word, image, etc.)
+          const ext = String(attachment.filename || "").split(".").pop().toUpperCase();
+          skippedDocTypes.push(ext || attachment.mimeType || "non-PDF file");
+        }
         continue;
       }
 
@@ -2282,11 +2636,7 @@ async function processGmailMessage(
         await writeLog("info", "gmail", `Attachment is ${docType}, skipping`, {
           messageId, filename: attachment.filename, docType,
         });
-        await forwardToHumanReview(
-            gmail, messageId, subject, from,
-            `Non-invoice attachment: ${docType}`,
-            `Attachment "${attachment.filename}" was classified as ${docType}, not an invoice.`,
-        );
+        skippedDocTypes.push(docType);
         continue;
       }
 
@@ -2318,13 +2668,23 @@ async function processGmailMessage(
     // If no processable PDFs found, forward entire email for human review
     if (pdfAttachments.length === 0) {
       await writeLog("warn", "gmail", "No processable PDF invoices found", {messageId, subject});
-      await forwardToHumanReview(
-          gmail, messageId, subject, from,
-          "No invoice PDF found",
-          `Email had ${attachments.length} attachment(s) but none were valid invoice PDFs.`,
-      );
+      let noInvoiceReason = "Could not find a freight invoice in this email";
+      if (skippedDocTypes.length > 0) {
+        const typeList = [...new Set(skippedDocTypes)].join(", ");
+        noInvoiceReason = `Email contained ${typeList} attachment(s) but no invoice`;
+      }
+      await forwardWithAnalysis(noInvoiceReason, {department: "general"});
       await applyGmailOutcome(gmail, messageId, "NO_INVOICE_PDF", false);
       await updateGmailQueueStatus(messageId, "completed");
+      await db.collection("emailIntake").doc(messageId).set({
+        gmailMessageId: messageId,
+        subject, from,
+        finalStatus: "no_invoice_pdf",
+        finalLabel: "NO_INVOICE_PDF",
+        skippedAttachmentTypes: skippedDocTypes,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        deleteAt: getDeleteAt(30),
+      }, {merge: true});
       return;
     }
 
@@ -2401,8 +2761,8 @@ async function processGmailMessage(
           filename: a.filename,
           mimeType: a.mimeType,
         })),
-        decision: aiResult.status === "ready_for_tai_validation" ?
-          "proceed_to_tai" : aiResult.status,
+        decision: aiResult.status === "ready_for_primus_validation" ?
+          "proceed_to_primus" : aiResult.status,
         reason: aiResult.reason,
       },
     });
@@ -2410,7 +2770,7 @@ async function processGmailMessage(
     let finalLabel = "ERROR";
     let finalStatus = "error";
     let markRead = false;
-    let taiResult = null;
+    let primusResult = null;
 
     const normalizedLoadNumber =
       normalizeLoadNumber(aiResult.loadNumber);
@@ -2432,11 +2792,22 @@ async function processGmailMessage(
 
       await forwardToHumanReview(
           gmail, messageId, subject, from,
-          "Load number missing or invalid",
-          `Could not find a valid 9-digit load number. ` +
-          `Raw value: "${aiResult.loadNumber || "none"}". ` +
-          `PRO number found: "${aiResult.proNumber || "none"}". ` +
-          `Carrier: ${aiResult.carrierName || "unknown"}.`,
+          "Could not find a valid load number on this invoice",
+          `I processed the invoice from ` +
+          `${aiResult.carrierName || "this carrier"} but could not find a valid ` +
+          `9-digit load number. Without a load number I cannot match this invoice ` +
+          `to a shipment in Primus. Please verify the load number with the carrier ` +
+          `and reprocess, or handle this invoice manually.`,
+          {
+            department: "operations",
+            extractedData: {
+              "Carrier": aiResult.carrierName || "—",
+              "Invoice Amount": aiResult.invoiceAmount ?
+                `$${aiResult.invoiceAmount}` : "—",
+              "PRO Number Found": aiResult.proNumber || "none",
+              "Raw Load # Found": aiResult.loadNumber || "none",
+            },
+          },
       );
 
       await writeLog("error", "gmail", "Load number missing/invalid", {
@@ -2469,17 +2840,31 @@ async function processGmailMessage(
       normalizedChargeData.chargesNeedProof.length > 0;
 
     if (loadGateFailed) {
-      // Stop execution: do not attempt TAI lookup or workflow.
+      // Stop execution: do not attempt Primus lookup or workflow.
     } else if (aiResult.status === "unrecognized_charges" ||
     hasUnrecognizedCharges) {
       finalLabel = "UNRECOGNIZED_CHARGES";
       finalStatus = "unrecognized_charges";
       await forwardToHumanReview(
           gmail, messageId, subject, from,
-          "Unrecognized charges on invoice",
-          `Load ${aiResult.loadNumber} from ${aiResult.carrierName}: ` +
-          `unrecognized charges: ${JSON.stringify(normalizedChargeData.unrecognizedCharges)}. ` +
-          `Invoice total: $${aiResult.invoiceAmount}.`,
+          "Invoice has charges I am not authorized to approve",
+          `I received an invoice from ${aiResult.carrierName || "this carrier"} ` +
+          `for load ${aiResult.loadNumber}. The invoice total is ` +
+          `$${aiResult.invoiceAmount}, however it contains charges I do not ` +
+          `recognize and cannot approve automatically: ` +
+          normalizedChargeData.unrecognizedCharges
+              .map((c) => `${c.label || c.type} ($${c.amount})`).join(", ") +
+          `. Please review these charges and decide whether to approve or reject them.`,
+          {
+            department: "billing",
+            extractedData: {
+              "Carrier": aiResult.carrierName || "—",
+              "Load Number": aiResult.loadNumber || "—",
+              "Invoice Total": `$${aiResult.invoiceAmount}`,
+              "Unrecognized Charges": normalizedChargeData.unrecognizedCharges
+                  .map((c) => `${c.label || c.type}: $${c.amount}`).join(", "),
+            },
+          },
       );
       await writeLog("warn", "ai", "Unrecognized charges detected", {
         event: "AI decision - needs review",
@@ -2501,10 +2886,24 @@ async function processGmailMessage(
       finalStatus = "charges_no_proof";
       await forwardToHumanReview(
           gmail, messageId, subject, from,
-          "Charges need proof (lumper/detention receipt missing)",
-          `Load ${aiResult.loadNumber} from ${aiResult.carrierName}: ` +
-          `charges requiring proof: ${JSON.stringify(normalizedChargeData.chargesNeedProof)}. ` +
-          `Invoice total: $${aiResult.invoiceAmount}.`,
+          "Invoice has extra charges but supporting receipts are missing",
+          `I received an invoice from ${aiResult.carrierName || "this carrier"} ` +
+          `for load ${aiResult.loadNumber}. The invoice amount is ` +
+          `$${aiResult.invoiceAmount}. The invoice includes ` +
+          normalizedChargeData.chargesNeedProof.map((c) => c.type).join(" and ") +
+          ` charges but no supporting receipt or proof document was attached. ` +
+          `Please request the missing proof from the carrier before approving ` +
+          `this invoice.`,
+          {
+            department: "billing",
+            extractedData: {
+              "Carrier": aiResult.carrierName || "—",
+              "Load Number": aiResult.loadNumber || "—",
+              "Invoice Total": `$${aiResult.invoiceAmount}`,
+              "Charges Missing Proof": normalizedChargeData.chargesNeedProof
+                  .map((c) => `${c.type}: $${c.amount}`).join(", "),
+            },
+          },
       );
       await writeLog("warn", "ai", "Charges need proof documentation", {
         event: "AI decision - needs review",
@@ -2520,37 +2919,86 @@ async function processGmailMessage(
           reviewRequired: true,
         },
       });
-    } else if (aiResult.status === "ready_for_tai_validation") {
+    } else if (aiResult.status === "ready_for_primus_validation") {
       // ── Primus shipment lookup (stub) ──────────────────────────────────
       const primusData = await getPrimusShipment(
           aiResult.loadNumber, aiResult.proNumber,
       );
 
       // ── Lumper validation: subtract lumper from invoice before comparing ──
+      let primusValidationAmount = aiResult.invoiceAmount;
       if (normalizedChargeData.recognizedCharges &&
           normalizedChargeData.recognizedCharges.length > 0) {
         const lumperValidation = validateLumperAmount(
             aiResult, primusData.rate,
         );
+        if (lumperValidation.totalLumper > 0) {
+          primusValidationAmount = lumperValidation.baseAmount;
+        }
         await writeLog("info", "ai", "Lumper validation result", {
           messageId,
           baseAmount: lumperValidation.baseAmount,
           totalLumper: lumperValidation.totalLumper,
+          primusValidationAmount,
           difference: lumperValidation.difference,
           valid: lumperValidation.valid,
         });
-      }
 
-      // ── Profit / margin check ──────────────────────────────────────────
-      if (primusData.rate) {
-        const profitCheck = checkProfitMargin(primusData.rate, aiResult.invoiceAmount);
-        if (profitCheck.noRate || profitCheck.lowProfit) {
+        // If lumpers are present but the base amount still doesn't match the
+        // Primus rate, flag for billing — better message than a generic mismatch.
+        if (primusData.rate && lumperValidation.totalLumper > 0 &&
+            !lumperValidation.valid) {
           await forwardToHumanReview(
               gmail, messageId, subject, from,
-              "No rate / low profit",
-              `Load ${aiResult.loadNumber}: profit $${profitCheck.profit.toFixed(2)} ` +
-              `is below $10 threshold. Rate: $${primusData.rate}, ` +
-              `Invoice: $${aiResult.invoiceAmount}.`,
+              "Lumper charges do not reconcile with the shipment rate",
+              `The carrier invoice includes $${lumperValidation.totalLumper.toFixed(2)} ` +
+              `in lumper charges. After removing them the base freight charge is ` +
+              `$${lumperValidation.baseAmount.toFixed(2)}, but the Primus rate on ` +
+              `file is $${primusData.rate}. ` +
+              `Please verify the lumper receipts and correct the amounts.`,
+              {
+                department: "billing",
+                extractedData: {
+                  "Carrier": aiResult.carrierName || "—",
+                  "Load Number": aiResult.loadNumber || "—",
+                  "Invoice Total": `$${aiResult.invoiceAmount}`,
+                  "Lumper Charges": `$${lumperValidation.totalLumper.toFixed(2)}`,
+                  "Base Freight": `$${lumperValidation.baseAmount.toFixed(2)}`,
+                  "Primus Rate": `$${primusData.rate}`,
+                  "Discrepancy": `$${lumperValidation.difference.toFixed(2)}`,
+                },
+                emailBody,
+              },
+          );
+          finalLabel = "UNMATCHED_AMOUNT";
+          finalStatus = "unmatched_amount";
+        }
+      }
+
+      // ── Profit / margin check (use lumper-adjusted amount) ───────────────
+      if (primusData.rate) {
+        const profitCheck = checkProfitMargin(primusData.rate, primusValidationAmount);
+        if (profitCheck.noRate || profitCheck.lowProfit) {
+          const hasLumpers = primusValidationAmount !== aiResult.invoiceAmount;
+          await forwardToHumanReview(
+              gmail, messageId, subject, from,
+              "Invoice profit is below the minimum threshold",
+              `I processed the invoice from ` +
+              `${aiResult.carrierName || "this carrier"} for load ` +
+              `${aiResult.loadNumber}. The calculated profit is ` +
+              `$${profitCheck.profit.toFixed(2)}, which is below the $10 minimum. ` +
+              `Please review the customer rate or authorize an exception.`,
+              {
+                department: "billing",
+                extractedData: {
+                  "Carrier": aiResult.carrierName || "—",
+                  "Load Number": aiResult.loadNumber || "—",
+                  "Invoice Amount": `$${aiResult.invoiceAmount}`,
+                  ...(hasLumpers ? {"Lumper-Adjusted Amount": `$${primusValidationAmount}`} : {}),
+                  "Customer Rate": `$${primusData.rate}`,
+                  "Profit": `$${profitCheck.profit.toFixed(2)}`,
+                },
+              },
           );
           finalLabel = "NO_RATE";
           finalStatus = "no_rate";
@@ -2564,77 +3012,130 @@ async function processGmailMessage(
         }
       }
 
-      await writeLog("info", "tai", `Starting TAI validation`, {
-        messageId: messageId,
-        proNumber: aiResult.proNumber,
-        loadNumber: aiResult.loadNumber,
-        invoiceAmount: aiResult.invoiceAmount,
-      });
-
-      taiResult = await validateAmountWithTai(
-          aiResult.loadNumber,
-          aiResult.invoiceAmount,
-      );
-
-      await writeLog("info", "tai", "TAI validation completed", {
-        event: "TAI validation completed",
-        messageId: messageId,
-        details: {
-          submittedAmount: aiResult.invoiceAmount,
-          savedAmount: taiResult.amount,
-          difference: taiResult.amount ?
-            Math.abs(aiResult.invoiceAmount - taiResult.amount) :
-            null,
-          result: taiResult.validAmount ? "MATCH" : "MISMATCH",
-          ok: taiResult.ok,
-          validAmount: taiResult.validAmount,
-          reason: taiResult.reason,
-        },
-      });
-
-      if (taiResult.ok === true && taiResult.validAmount === true) {
-        finalLabel = "PROCESSING";
-        finalStatus = "processing";
-        markRead = false;
-        await writeLog("info", "gmail", `Invoice queued for workflow`, {
+      // Only run Primus validation if earlier checks didn't already reject this invoice
+      if (finalLabel !== "NO_RATE" && finalLabel !== "UNMATCHED_AMOUNT") {
+        await writeLog("info", "primus", `Starting Primus validation`, {
           messageId: messageId,
-          taiAmount: taiResult.amount,
+          proNumber: aiResult.proNumber,
+          loadNumber: aiResult.loadNumber,
+          invoiceAmount: aiResult.invoiceAmount,
         });
-      } else if (taiResult.ok === false &&
-             taiResult.reason &&
-             taiResult.reason.toLowerCase().includes("not found")) {
-        finalLabel = "NOT_FOUND";
-        finalStatus = "not_found";
-        await writeLog("warn", "tai", "Shipment not found in TAI", {
-          event: "TAI validation failed",
+
+        primusResult = await validateAmountWithPrimus(
+            aiResult.loadNumber,
+            primusValidationAmount,
+        );
+
+        await writeLog("info", "primus", "Primus validation completed", {
+          event: "Primus validation completed",
           messageId: messageId,
           details: {
-            submittedAmount: aiResult.invoiceAmount,
-            loadNumber: aiResult.loadNumber,
-            proNumber: aiResult.proNumber,
-            result: "NOT_FOUND",
-            reason: taiResult.reason,
-            decision: "NOT_FOUND",
-          },
-        });
-      } else {
-        finalLabel = "UNMATCHED_AMOUNT";
-        finalStatus = "unmatched_amount";
-        await writeLog("warn", "tai", "TAI validation failed", {
-          event: "TAI validation failed",
-          messageId: messageId,
-          details: {
-            submittedAmount: aiResult.invoiceAmount,
-            savedAmount: taiResult.amount,
-            difference: taiResult.amount ?
-              Math.abs(aiResult.invoiceAmount - taiResult.amount) :
+            submittedAmount: primusValidationAmount,
+            savedAmount: primusResult.amount,
+            difference: primusResult.amount ?
+              Math.abs(aiResult.invoiceAmount - primusResult.amount) :
               null,
-            result: "MISMATCH",
-            reason: taiResult.reason || "Amount does not match TAI",
-            decision: "UNMATCHED_AMOUNT",
+            result: primusResult.validAmount ? "MATCH" : "MISMATCH",
+            ok: primusResult.ok,
+            validAmount: primusResult.validAmount,
+            reason: primusResult.reason,
           },
         });
+
+        if (primusResult.ok === true && primusResult.validAmount === true) {
+          finalLabel = "PROCESSING";
+          finalStatus = "processing";
+          markRead = false;
+          await writeLog("info", "gmail", `Invoice queued for workflow`, {
+            messageId: messageId,
+            primusAmount: primusResult.amount,
+          });
+        } else if (primusResult.ok === false &&
+               primusResult.reason &&
+               primusResult.reason.toLowerCase().includes("not found")) {
+          finalLabel = "NOT_FOUND";
+          finalStatus = "not_found";
+          await writeLog("warn", "primus", "Shipment not found in Primus", {
+            event: "Primus validation failed",
+            messageId: messageId,
+            details: {
+              submittedAmount: aiResult.invoiceAmount,
+              loadNumber: aiResult.loadNumber,
+              proNumber: aiResult.proNumber,
+              result: "NOT_FOUND",
+              reason: primusResult.reason,
+              decision: "NOT_FOUND",
+            },
+          });
+          await forwardToHumanReview(
+              gmail, messageId, subject, from,
+              "Shipment not found — cannot validate invoice",
+              `I looked up load ${aiResult.loadNumber} but could not find ` +
+              `a matching shipment. The invoice cannot be processed until the ` +
+              `load number is confirmed or corrected.`,
+              {
+                department: "operations",
+                extractedData: {
+                  "Carrier": aiResult.carrierName || "—",
+                  "Load Number": aiResult.loadNumber || "—",
+                  "PRO Number": aiResult.proNumber || "—",
+                  "Invoice Amount": `$${aiResult.invoiceAmount}`,
+                },
+                emailBody,
+              },
+          );
+        } else {
+          finalLabel = "UNMATCHED_AMOUNT";
+          finalStatus = "unmatched_amount";
+          await writeLog("warn", "primus", "Primus validation failed", {
+            event: "Primus validation failed",
+            messageId: messageId,
+            details: {
+              submittedAmount: aiResult.invoiceAmount,
+              savedAmount: primusResult.amount,
+              difference: primusResult.amount ?
+                Math.abs(aiResult.invoiceAmount - primusResult.amount) :
+                null,
+              result: "MISMATCH",
+              reason: primusResult.reason || "Amount does not match Primus",
+              decision: "UNMATCHED_AMOUNT",
+            },
+          });
+          await forwardToHumanReview(
+              gmail, messageId, subject, from,
+              "Invoice amount does not match the shipment rate",
+              `The carrier invoiced $${aiResult.invoiceAmount} but the amount ` +
+              `on file does not match. ` +
+              (primusResult.amount ? `Expected: $${primusResult.amount}. ` : "") +
+              `Please verify the correct amount and update the shipment.`,
+              {
+                department: "billing",
+                extractedData: {
+                  "Carrier": aiResult.carrierName || "—",
+                  "Load Number": aiResult.loadNumber || "—",
+                  "Invoice Amount": `$${aiResult.invoiceAmount}`,
+                  "Expected Amount": primusResult.amount ? `$${primusResult.amount}` : "—",
+                  "Difference": primusResult.amount ?
+                    `$${Math.abs(aiResult.invoiceAmount - primusResult.amount).toFixed(2)}` : "—",
+                },
+                emailBody,
+              },
+          );
+        }
       }
+    } else {
+      // Claude returned a status we don't have a rule for (e.g. "error",
+      // "unmatched_amount" returned directly). Forward with AI note so a
+      // human can handle it, and label ERROR.
+      finalLabel = "ERROR";
+      finalStatus = "error";
+      await writeLog("warn", "ai", "Unexpected AI classification status", {
+        messageId, status: aiResult.status,
+      });
+      await forwardWithAnalysis(
+          `AI returned an unexpected invoice status: ${aiResult.status}`,
+          {department: "general", emailBody},
+      );
     }
 
     await writeLog("info", "gmail", `Applying Gmail label`, {
@@ -2669,7 +3170,7 @@ async function processGmailMessage(
       }
 
       tx.set(emailIntakeRef, {
-        taiResult: taiResult,
+        primusResult: primusResult,
         finalLabel: finalLabel,
         finalStatus: finalStatus,
         markRead: markRead,
@@ -2715,33 +3216,33 @@ async function processGmailMessage(
         mimeType: att.mimeType,
       }));
 
-      let decisionStage = "pending_tai_check";
+      let decisionStage = "pending_primus_check";
       let matchStatus = "not_checked";
       let reviewStatus = "not_needed";
-      let decisionReason = "Waiting for TAI lookup.";
-      let taiAmount = null;
+      let decisionReason = "Waiting for Primus lookup.";
+      let primusAmount = null;
       let amountDifference = null;
 
-      if (taiResult && taiResult.ok && taiResult.validAmount) {
-        taiAmount = Number(taiResult.amount || 0);
-        amountDifference = Math.abs(aiResult.invoiceAmount - taiAmount);
+      if (primusResult && primusResult.ok && primusResult.validAmount) {
+        primusAmount = Number(primusResult.amount || 0);
+        amountDifference = Math.abs(aiResult.invoiceAmount - primusAmount);
 
         if (amountDifference <= 5) {
           decisionStage = "ready_to_approve";
           matchStatus = "matched";
-          decisionReason = "Invoice matches TAI amount.";
+          decisionReason = "Invoice matches Primus amount.";
         } else {
           decisionStage = "needs_charge_review";
           reviewStatus = "needed";
           decisionReason = "Difference is more than $5.";
         }
-      } else if (taiResult && taiResult.ok === false &&
-             taiResult.reason &&
-             taiResult.reason.toLowerCase().includes("not found")) {
+      } else if (primusResult && primusResult.ok === false &&
+             primusResult.reason &&
+             primusResult.reason.toLowerCase().includes("not found")) {
         decisionStage = "shipment_not_found";
         matchStatus = "not_found";
         reviewStatus = "needed";
-        decisionReason = "Shipment not found in TAI system.";
+        decisionReason = "Shipment not found in Primus system.";
       }
 
       const flowId = messageId;
@@ -2772,8 +3273,8 @@ async function processGmailMessage(
         matchStatus: matchStatus,
         reviewStatus: reviewStatus,
         decisionStage: decisionStage,
-        taiLoadId: aiResult.loadNumber || null,
-        taiAmount: taiAmount,
+        primusLoadId: aiResult.loadNumber || null,
+        primusAmount: primusAmount,
         amountDifference: amountDifference,
         decisionReason: decisionReason,
         gmailMessageId: messageId,
@@ -2786,7 +3287,7 @@ async function processGmailMessage(
         lastHeartbeatAt: null,
         currentStep: null,
         finalWorkflowStatus: "created",
-        taiSteps: {
+        primusSteps: {
           amountValidated: false,
           proAdded: false,
           shipmentDelivered: false,
@@ -2825,7 +3326,7 @@ async function processGmailMessage(
       await writeLog(
           "info",
           "workflow",
-          `Starting TAI workflow for new invoice`,
+          `Starting Primus workflow for new invoice`,
           {
             messageId: messageId,
             invoiceId: invoiceDoc.id,
@@ -2834,8 +3335,8 @@ async function processGmailMessage(
 
       try {
         const workflowUrl =
-          process.env.PROCESS_TAI_WORKFLOW_URL ||
-          "https://us-central1-tai-invoice-automation.cloudfunctions.net/processTaiWorkflow";
+          process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+          "https://us-central1-tai-invoice-automation.cloudfunctions.net/processPrimusWorkflow";
         const workflowRes = await fetch(
             workflowUrl,
             {
@@ -2852,7 +3353,7 @@ async function processGmailMessage(
           await writeLog(
               "error",
               "workflow",
-              "Failed to start TAI workflow",
+              "Failed to start Primus workflow",
               {
                 messageId: messageId,
                 invoiceId: invoiceDoc.id,
@@ -2865,7 +3366,7 @@ async function processGmailMessage(
         await writeLog(
             "error",
             "workflow",
-            "Failed to start TAI workflow",
+            "Failed to start Primus workflow",
             {
               messageId: messageId,
               invoiceId: invoiceDoc.id,
@@ -2896,9 +3397,7 @@ async function processGmailMessage(
 
     await updateGmailQueueStatus(messageId, "completed");
   } catch (error) {
-    if (queueStatusUpdated || options.fromQueue) {
-      await updateGmailQueueStatus(messageId, "failed", error.message);
-    }
+    await updateGmailQueueStatus(messageId, "failed", error.message);
     throw error;
   }
 }
@@ -3025,7 +3524,6 @@ exports.checkGmailInbox = onRequest(
         const gmailQuery = [
           "in:inbox",
           "is:unread",
-          "has:attachment",
           "-label:PROCESSING",
           "-label:APPROVED",
           "-label:UNMATCHED_AMOUNT",
@@ -3034,6 +3532,7 @@ exports.checkGmailInbox = onRequest(
           "-label:NOT_FOUND",
           "-label:NO_LOAD_NUMBER",
           "-label:NO_INVOICE_PDF",
+          "-label:NO_RATE",
           "-label:ERROR",
         ].join(" ");
 
@@ -3104,8 +3603,38 @@ exports.checkGmailInbox = onRequest(
 
             console.error(`Error processing message ${message.id}:`, error);
 
-            // Apply ERROR label and keep email unread
             await applyGmailOutcomeByStoredTokens(message.id, "ERROR", false);
+
+            try {
+              let errSubject = "(unknown subject)";
+              let errFrom = "(unknown sender)";
+              let errBody = null;
+              try {
+                const fullErrMsg = await gmail.users.messages.get({
+                  userId: "me",
+                  id: message.id,
+                  format: "full",
+                });
+                const hdrs = fullErrMsg.data.payload?.headers || [];
+                errSubject = hdrs.find((h) => h.name === "Subject")?.value || errSubject;
+                errFrom = hdrs.find((h) => h.name === "From")?.value || errFrom;
+                errBody = extractEmailBody(fullErrMsg.data.payload) || null;
+              } catch (_) {}
+              await forwardToHumanReview(
+                  gmail,
+                  message.id,
+                  errSubject,
+                  errFrom,
+                  "An unexpected error occurred processing this email",
+                  `I attempted to process this email but encountered an unexpected ` +
+                  `error and was unable to complete the workflow. ` +
+                  `Error: ${error.message}. ` +
+                  `Please review this email and handle it manually.`,
+                  {department: "general", emailBody: errBody},
+              );
+            } catch (fwdErr) {
+              console.error("Failed to forward error email:", fwdErr.message);
+            }
 
             await db.collection("emailErrors").add({
               gmailMessageId: message.id,
@@ -3218,14 +3747,14 @@ exports.processGmailQueue = onRequest(
 );
 
 /**
- * Calls mock TAI validateAmount endpoint.
+ * Calls mock Primus validateAmount endpoint.
  * @param {string} loadNumber Load number.
  * @param {number} amount Invoice amount.
  * @return {Promise<object>} Validation result.
  */
-async function validateAmountWithTai(loadNumber, amount) {
+async function validateAmountWithPrimus(loadNumber, amount) {
   try {
-    const response = await fetch(process.env.TAI_VALIDATE_URL, {
+    const response = await fetch(process.env.PRIMUS_VALIDATE_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -3238,7 +3767,7 @@ async function validateAmountWithTai(loadNumber, amount) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to validate amount with TAI", {
+    await writeLog("error", "primus", "Failed to validate amount with Primus", {
       loadNumber: loadNumber,
       amount: amount,
       error: error.message,
@@ -3248,7 +3777,7 @@ async function validateAmountWithTai(loadNumber, amount) {
 }
 
 /**
- * Calls mock TAI addProNumberToLoad endpoint.
+ * Calls mock Primus addProNumberToLoad endpoint.
  * @param {string} loadNumber Load number.
  * @param {string} proNumber PRO number.
  * @return {Promise<object>} Add PRO result.
@@ -3256,7 +3785,7 @@ async function validateAmountWithTai(loadNumber, amount) {
 async function addProNumberToLoad(loadNumber, proNumber) {
   try {
     const response = await fetch(
-        `${process.env.TAI_BASE_URL}/addProNumberToLoad`,
+        `${process.env.PRIMUS_BASE_URL}/addProNumberToLoad`,
         {
           method: "POST",
           headers: {
@@ -3271,7 +3800,7 @@ async function addProNumberToLoad(loadNumber, proNumber) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to add PRO number to load", {
+    await writeLog("error", "primus", "Failed to add PRO number to load", {
       loadNumber: loadNumber,
       proNumber: proNumber,
       error: error.message,
@@ -3281,7 +3810,7 @@ async function addProNumberToLoad(loadNumber, proNumber) {
 }
 
 /**
- * Calls mock TAI getCustomerRate endpoint.
+ * Calls mock Primus getCustomerRate endpoint.
  * @param {string} loadNumber Load number.
  * @param {string} proNumber PRO number.
  * @return {Promise<object>} Customer rate result.
@@ -3289,7 +3818,7 @@ async function addProNumberToLoad(loadNumber, proNumber) {
 async function getCustomerRate(loadNumber, proNumber) {
   try {
     const response = await fetch(
-        `${process.env.TAI_BASE_URL}/getCustomerRate`,
+        `${process.env.PRIMUS_BASE_URL}/getCustomerRate`,
         {
           method: "POST",
           headers: {
@@ -3304,7 +3833,7 @@ async function getCustomerRate(loadNumber, proNumber) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to get customer rate", {
+    await writeLog("error", "primus", "Failed to get customer rate", {
       loadNumber: loadNumber,
       proNumber: proNumber,
       error: error.message,
@@ -3314,14 +3843,14 @@ async function getCustomerRate(loadNumber, proNumber) {
 }
 
 /**
- * Calls mock TAI approveCarrierBill endpoint.
+ * Calls mock Primus approveCarrierBill endpoint.
  * @param {object} billData Bill approval data.
  * @return {Promise<object>} Approval result.
  */
 async function approveCarrierBill(billData) {
   try {
     const response = await fetch(
-        `${process.env.TAI_BASE_URL}/approveCarrierBill`,
+        `${process.env.PRIMUS_BASE_URL}/approveCarrierBill`,
         {
           method: "POST",
           headers: {
@@ -3333,7 +3862,7 @@ async function approveCarrierBill(billData) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to approve carrier bill", {
+    await writeLog("error", "primus", "Failed to approve carrier bill", {
       billData: billData,
       error: error.message,
     });
@@ -3342,14 +3871,14 @@ async function approveCarrierBill(billData) {
 }
 
 /**
- * Calls mock TAI generateCustomerInvoice endpoint.
+ * Calls mock Primus generateCustomerInvoice endpoint.
  * @param {object} invoiceData Customer invoice data.
  * @return {Promise<object>} Invoice generation result.
  */
 async function generateCustomerInvoice(invoiceData) {
   try {
     const response = await fetch(
-        `${process.env.TAI_BASE_URL}/generateCustomerInvoice`,
+        `${process.env.PRIMUS_BASE_URL}/generateCustomerInvoice`,
         {
           method: "POST",
           headers: {
@@ -3361,7 +3890,7 @@ async function generateCustomerInvoice(invoiceData) {
 
     return await response.json();
   } catch (error) {
-    await writeLog("error", "tai", "Failed to generate customer invoice", {
+    await writeLog("error", "primus", "Failed to generate customer invoice", {
       invoiceData: invoiceData,
       error: error.message,
     });
@@ -3370,11 +3899,11 @@ async function generateCustomerInvoice(invoiceData) {
 }
 
 /**
- * Processes invoice through complete TAI workflow.
+ * Processes invoice through complete Primus workflow.
  * @param {string} invoiceId Invoice document ID.
  * @return {Promise<object>} Workflow result.
  */
-exports.processTaiWorkflow = onRequest(
+exports.processPrimusWorkflow = onRequest(
     {timeoutSeconds: 300, memory: "512MiB"},
     async (req, res) => {
       try {
@@ -3396,7 +3925,7 @@ exports.processTaiWorkflow = onRequest(
           });
         }
 
-        await writeLog("info", "workflow", "Starting TAI workflow", {
+        await writeLog("info", "workflow", "Starting Primus workflow", {
           invoiceId: invoiceId,
         });
 
@@ -3444,8 +3973,8 @@ exports.processTaiWorkflow = onRequest(
         // but we do not block resume based on age.
 
         let workingProNumber = invoice.proNumber;
-        // Load taiSteps from invoice document to track completed steps
-        const taiSteps = invoice.taiSteps || {
+        // Load primusSteps from invoice document to track completed steps
+        const primusSteps = invoice.primusSteps || {
           amountValidated: false,
           proAdded: false,
           shipmentDelivered: false,
@@ -3601,7 +4130,7 @@ exports.processTaiWorkflow = onRequest(
 
         const baseAmount = Number(invoice.invoiceAmount) - approvedChargesTotal;
 
-        const amountValidation = await validateAmountWithTai(
+        const amountValidation = await validateAmountWithPrimus(
             invoice.loadNumber,
             baseAmount,
         );
@@ -3615,10 +4144,10 @@ exports.processTaiWorkflow = onRequest(
         });
 
         if (!amountValidation.ok || !amountValidation.validAmount) {
-          const taiAmountFromValidation = amountValidation.amount || null;
+          const primusAmountFromValidation = amountValidation.amount || null;
           const submitted = amountValidation.submittedAmount ||
           invoice.invoiceAmount;
-          const saved = amountValidation.savedAmount || taiAmountFromValidation;
+          const saved = amountValidation.savedAmount || primusAmountFromValidation;
           const diff = amountValidation.difference ||
           (saved ? Math.abs(submitted - saved) : null);
 
@@ -3630,10 +4159,10 @@ exports.processTaiWorkflow = onRequest(
               savedAmount: saved,
               difference: diff,
               reason: amountValidation.reason ||
-                "Amount does not match TAI record",
+                "Amount does not match Primus record",
               decision: "UNMATCHED_AMOUNT",
               invoiceAmount: invoice.invoiceAmount,
-              taiAmount: taiAmountFromValidation,
+              primusAmount: primusAmountFromValidation,
               baseAmount: baseAmount,
             },
           });
@@ -3660,25 +4189,25 @@ exports.processTaiWorkflow = onRequest(
           });
         }
 
-        taiSteps.amountValidated = true;
+        primusSteps.amountValidated = true;
         await invoiceDoc.ref.update({
-          taiSteps: taiSteps,
+          primusSteps: primusSteps,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
         await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validated");
 
-        // PRO Number Handling - use TAI response proNumber
-        const taiProNumber = amountValidation.proNumber || "";
+        // PRO Number Handling - use Primus response proNumber
+        const primusProNumber = amountValidation.proNumber || "";
         if (invoice.proNumber &&
-            invoice.proNumber.trim() !== "" && !taiProNumber) {
+            invoice.proNumber.trim() !== "" && !primusProNumber) {
           await logWorkflowStep({
             invoiceId,
             stepName: "pro_check_started",
             stepStatus: "started",
             input: {
               invoicePro: invoice.proNumber,
-              taiPro: taiProNumber,
+              taiPro: primusProNumber,
             },
           });
 
@@ -3702,19 +4231,19 @@ exports.processTaiWorkflow = onRequest(
           });
 
           if (proResult.ok) {
-            taiSteps.proAdded = true;
+            primusSteps.proAdded = true;
             workingProNumber = invoice.proNumber;
             await invoiceDoc.ref.update({
               proNumber: workingProNumber,
-              taiSteps: taiSteps,
+              primusSteps: primusSteps,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
 
             await setWorkflowHeartbeat(invoiceDoc.ref, "pro_added");
           }
         } else {
-          // Use TAI proNumber if available, otherwise use workingProNumber
-          workingProNumber = taiProNumber || workingProNumber;
+          // Use Primus proNumber if available, otherwise use workingProNumber
+          workingProNumber = primusProNumber || workingProNumber;
         }
 
         // Ensure approval only runs if shipment has valid PRO
@@ -3758,8 +4287,8 @@ exports.processTaiWorkflow = onRequest(
         currentStep === "approve_bill" ||
         currentStep === "get_rate" ||
         currentStep === "generate_invoice") {
-          // Skip if already marked delivered (from taiSteps or TAI duplicate)
-          if (taiSteps.shipmentDelivered) {
+          // Skip if already marked delivered (from primusSteps or Primus duplicate)
+          if (primusSteps.shipmentDelivered) {
             await logWorkflowStep({
               invoiceId,
               stepName: "shipment_mark_delivered_started",
@@ -3812,9 +4341,9 @@ exports.processTaiWorkflow = onRequest(
               });
             }
           }
-          taiSteps.shipmentDelivered = true;
+          primusSteps.shipmentDelivered = true;
           await invoiceDoc.ref.update({
-            taiSteps: taiSteps,
+            primusSteps: primusSteps,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -3973,9 +4502,9 @@ exports.processTaiWorkflow = onRequest(
           });
         }
 
-        taiSteps.billApproved = true;
+        primusSteps.billApproved = true;
         await invoiceDoc.ref.update({
-          taiSteps: taiSteps,
+          primusSteps: primusSteps,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
@@ -4028,14 +4557,14 @@ exports.processTaiWorkflow = onRequest(
         const profit = Number(customerRate || 0) -
       (Number(invoice.invoiceAmount || 0) - approvedChargesTotal);
 
-        taiSteps.customerRateChecked = true;
+        primusSteps.customerRateChecked = true;
 
         await invoiceDoc.ref.update({
           customerName: customerName,
           customerRate: customerRate,
           profit: profit,
-          taiSteps: {
-            ...taiSteps,
+          primusSteps: {
+            ...primusSteps,
             customerRateChecked: true,
           },
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -4123,9 +4652,9 @@ exports.processTaiWorkflow = onRequest(
             output: {customerInvoiceId: invoice.customerInvoiceId},
           });
 
-          taiSteps.customerInvoiceGenerated = true;
+          primusSteps.customerInvoiceGenerated = true;
           await invoiceDoc.ref.update({
-            taiSteps: taiSteps,
+            primusSteps: primusSteps,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -4162,9 +4691,9 @@ exports.processTaiWorkflow = onRequest(
             });
           }
 
-          taiSteps.customerInvoiceGenerated = true;
+          primusSteps.customerInvoiceGenerated = true;
           await invoiceDoc.ref.update({
-            taiSteps: taiSteps,
+            primusSteps: primusSteps,
             customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
@@ -4199,11 +4728,11 @@ exports.processTaiWorkflow = onRequest(
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
           decisionStage: "completed",
-          decisionReason: "TAI workflow completed successfully",
+          decisionReason: "Primus workflow completed successfully",
           customerName: customerName,
           customerRate: customerRate,
           profit: profit,
-          taiSteps: taiSteps,
+          primusSteps: primusSteps,
           finalWorkflowStatus: "completed",
           customerInvoiceId: finalCustomerInvoiceId,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -4212,7 +4741,7 @@ exports.processTaiWorkflow = onRequest(
         await writeLog(
             "info",
             "workflow",
-            "TAI workflow completed",
+            "Primus workflow completed",
             {
               invoiceId: invoiceId,
               customerName: customerName,
@@ -4323,7 +4852,7 @@ exports.processTaiWorkflow = onRequest(
             details: {
               finalStatus: "APPROVED",
               invoiceAmount: invoice.invoiceAmount,
-              taiAmount: invoice.taiAmount,
+              primusAmount: invoice.primusAmount,
               carrierName: invoice.carrierName,
               loadNumber: invoice.loadNumber,
               proNumber: invoice.proNumber,
@@ -4351,7 +4880,7 @@ exports.processTaiWorkflow = onRequest(
 
         return res.json({
           ok: true,
-          message: "TAI workflow completed successfully",
+          message: "Primus workflow completed successfully",
           customerName: customerName,
           customerRate: customerRate,
           profit: profit,
@@ -4369,12 +4898,12 @@ exports.processTaiWorkflow = onRequest(
           error: error.message,
         });
 
-        await writeLog("error", "workflow", "TAI workflow failed", {
+        await writeLog("error", "workflow", "Primus workflow failed", {
           invoiceId,
           error: error.message,
           stack: error.stack,
         });
-        console.error("processTaiWorkflow error:", error);
+        console.error("processPrimusWorkflow error:", error);
 
         // Apply ERROR label and keep email unread + release processing lock
         if (invoiceId) {
