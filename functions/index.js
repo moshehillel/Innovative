@@ -747,6 +747,7 @@ exports.continueWorkflow = onRequest(async (req, res) => {
     });
 
     const response = await fetch(
+        process.env.PROCESS_TAI_WORKFLOW_URL ||
         "https://us-central1-tai-invoice-automation.cloudfunctions.net/processTaiWorkflow",
         {
           method: "POST",
@@ -1417,9 +1418,17 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Any other added charge is unrecognized_charges.",
         "If attachment is not a freight invoice, status is error.",
         "Detect Proof of Delivery (POD) documents.",
-        "POD may be a separate attachment or on the last page of the invoice.",
+        "POD may be a separate attachment, on the last page of the invoice, " +
+        "or in the bottom section of the same page as the invoice.",
         "Look for signed Bill of Lading, delivery receipt, or POD confirmation.",
         "POD should have signatures, delivery dates, or Received stamps.",
+        "If POD content (signature, stamp, Received mark, or delivery confirmation) " +
+        "appears in the bottom section of an invoice page rather than on its own page, " +
+        "set pod.source to 'same_page_as_invoice', pod.attachmentFilename to that file, " +
+        "pod.page to the 1-based page number, and pod.cropFromBottom to the estimated " +
+        "fraction of the page height from the bottom that contains the POD content " +
+        "(e.g. 0.35 means the bottom 35%). Only use when the POD is clearly in the " +
+        "bottom portion of an invoice page.",
       ],
       requiredJsonShape: {
         status: "ready_for_tai_validation",
@@ -1442,6 +1451,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
           source: "",
           attachmentFilename: "",
           page: "",
+          cropFromBottom: 0,
           reason: "",
         },
         reason: "",
@@ -1664,6 +1674,36 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
         storagePath,
         source: "attachment",
       };
+    }
+
+    if (invoice.pod.source === "same_page_as_invoice") {
+      const cropFromBottom = Math.min(
+          Math.max(Number(invoice.pod.cropFromBottom || 0.5), 0.1),
+          0.9,
+      );
+      const pageNum = Number(invoice.pod.page) || 1;
+
+      const [fileBuffer] = await bucket.file(podAtt.storagePath).download();
+      const doc = await PDFDocument.load(fileBuffer);
+      const pageCount = doc.getPageCount();
+
+      const pageIndex = Math.max(0, Math.min(pageNum - 1, pageCount - 1));
+
+      const newDoc = await PDFDocument.create();
+      const [copiedPage] = await newDoc.copyPages(doc, [pageIndex]);
+      newDoc.addPage(copiedPage);
+
+      const {width, height} = copiedPage.getSize();
+      copiedPage.setCropBox(0, 0, width, height * cropFromBottom);
+
+      const pdfBytes = await newDoc.save();
+      const storagePath = `podOnly/${invoiceId}/pod.pdf`;
+
+      await bucket.file(storagePath).save(Buffer.from(pdfBytes), {
+        metadata: {contentType: "application/pdf"},
+      });
+
+      return {storagePath, source: "same_page_as_invoice"};
     }
 
     if (invoice.pod.source !== "last_page_of_invoice") {
@@ -2316,7 +2356,7 @@ async function processGmailMessage(
 
       await logWorkflowStep({
         gmailMessageId: messageId,
-        stepName: "openai_classification_completed",
+        stepName: "claude_classification_completed",
         stepStatus: "success",
         output: {
           loadNumber: aiResult.loadNumber,
@@ -2333,7 +2373,7 @@ async function processGmailMessage(
 
       await logWorkflowStep({
         gmailMessageId: messageId,
-        stepName: "openai_classification_completed",
+        stepName: "claude_classification_completed",
         stepStatus: "failed",
         error: aiError.message,
       });
@@ -2794,6 +2834,7 @@ async function processGmailMessage(
 
       try {
         const workflowUrl =
+          process.env.PROCESS_TAI_WORKFLOW_URL ||
           "https://us-central1-tai-invoice-automation.cloudfunctions.net/processTaiWorkflow";
         const workflowRes = await fetch(
             workflowUrl,
@@ -2992,6 +3033,7 @@ exports.checkGmailInbox = onRequest(
           "-label:CHARGES_NO_PROOF",
           "-label:NOT_FOUND",
           "-label:NO_LOAD_NUMBER",
+          "-label:NO_INVOICE_PDF",
           "-label:ERROR",
         ].join(" ");
 
@@ -3343,6 +3385,8 @@ exports.processTaiWorkflow = onRequest(
           });
         }
 
+        
+
         const {invoiceId, resumeFrom} = req.body || {};
 
         if (!invoiceId) {
@@ -3428,6 +3472,8 @@ exports.processTaiWorkflow = onRequest(
           await invoiceDoc.ref.update({
             decisionStage: "unrecognized_charges",
             decisionReason: "Unrecognized charges detected",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -3459,6 +3505,8 @@ exports.processTaiWorkflow = onRequest(
           await invoiceDoc.ref.update({
             decisionStage: "charges_no_proof",
             decisionReason: "Extra charges present with no proof",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -3940,10 +3988,7 @@ exports.processTaiWorkflow = onRequest(
           input: {loadNumber: invoice.loadNumber, proNumber: workingProNumber},
         });
 
-        const customerRateResult = await getCustomerRate(
-            invoice.loadNumber,
-            workingProNumber,
-        );
+        const customerRateResult = customerForCheckResult;
 
         if (!customerRateResult.ok) {
           await logWorkflowStep({
@@ -4172,7 +4217,7 @@ exports.processTaiWorkflow = onRequest(
               invoiceId: invoiceId,
               customerName: customerName,
               profit: profit,
-              customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+              customerInvoiceId: finalCustomerInvoiceId,
             },
         );
 
