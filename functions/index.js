@@ -1745,6 +1745,13 @@ async function saveOutboundEmail(email) {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     deleteAt: getDeleteAt(7),
   });
+
+  await writeLog("info", "email", "Outbound email sent", {
+    type: email.type,
+    invoiceId: email.invoiceId,
+    to: email.to || process.env.WORKFLOW_EMAIL_TO,
+    sent: Boolean(sendResult && sendResult.ok),
+  });
 }
 
 /**
@@ -3474,6 +3481,125 @@ exports.gmailOAuthCallback = onRequest(async (req, res) => {
   } catch (error) {
     console.error("gmailOAuthCallback error:", error);
     return res.status(500).send(error.message);
+  }
+});
+
+/**
+ * Applies CORS headers so the static dashboard can call these endpoints
+ * directly from the browser. Set the DASHBOARD_ORIGIN env var to the
+ * dashboard's URL (e.g. https://your-site.netlify.app) to restrict access;
+ * it falls back to "*" so the dashboard works before that's configured.
+ * @param {object} req Express request.
+ * @param {object} res Express response.
+ * @return {boolean} True if this was an OPTIONS preflight that was already
+ *   responded to, meaning the caller should stop handling the request.
+ */
+function applyDashboardCors(req, res) {
+  res.set("Access-Control-Allow-Origin", process.env.DASHBOARD_ORIGIN || "*");
+  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return true;
+  }
+  return false;
+}
+
+// Supported dashboard time ranges, mapped to how far back to look and the
+// granularity to bucket results into. Kept as a whitelist so the range
+// query param can never reach the SQL string directly.
+const DASHBOARD_RANGES = {
+  week: {days: 7, truncUnit: "DAY"},
+  month: {days: 30, truncUnit: "DAY"},
+  year: {days: 365, truncUnit: "MONTH"},
+};
+
+exports.getGmailStatus = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) {
+    return;
+  }
+
+  try {
+    const gmailDoc = await db.collection("settings").doc("gmail").get();
+    if (!gmailDoc.exists) {
+      return res.json({ok: true, connected: false});
+    }
+
+    const data = gmailDoc.data();
+    return res.json({
+      ok: true,
+      connected: true,
+      connectedAt: data.connectedAt ? data.connectedAt.toDate() : null,
+    });
+  } catch (error) {
+    console.error("getGmailStatus error:", error);
+    return res.status(500).json({ok: false, error: error.message});
+  }
+});
+
+exports.getDashboardStats = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) {
+    return;
+  }
+
+  try {
+    const range = String(req.query.range || "week").toLowerCase();
+    const rangeConfig = DASHBOARD_RANGES[range];
+    if (!rangeConfig) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid range. Use week, month, or year.",
+      });
+    }
+
+    const query = `
+      SELECT
+        TIMESTAMP_TRUNC(timestamp, ${rangeConfig.truncUnit}) AS period,
+        COUNTIF(
+          category = "gmail" AND message = "Email processing completed"
+        ) AS invoicesProcessed,
+        COUNTIF(
+          category = "email" AND message = "Outbound email sent"
+        ) AS emailsReplied,
+        COUNTIF(
+          category = "gmail" AND (
+            message = "Forwarded to human review" OR
+            message = "No attachments found, forwarding for review"
+          )
+        ) AS emailsForwarded
+      FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
+      WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
+      GROUP BY period
+      ORDER BY period ASC
+    `;
+
+    const [rows] = await bigquery.query({
+      query,
+      params: {days: rangeConfig.days},
+    });
+
+    const series = rows.map((row) => ({
+      period: row.period && row.period.value ?
+        row.period.value : row.period,
+      invoicesProcessed: Number(row.invoicesProcessed || 0),
+      emailsReplied: Number(row.emailsReplied || 0),
+      emailsForwarded: Number(row.emailsForwarded || 0),
+    }));
+
+    const totals = series.reduce((acc, row) => ({
+      invoicesProcessed: acc.invoicesProcessed + row.invoicesProcessed,
+      emailsReplied: acc.emailsReplied + row.emailsReplied,
+      emailsForwarded: acc.emailsForwarded + row.emailsForwarded,
+    }), {invoicesProcessed: 0, emailsReplied: 0, emailsForwarded: 0});
+
+    return res.json({ok: true, range, totals, series});
+  } catch (error) {
+    console.error("getDashboardStats error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to load dashboard stats.",
+      details: error.message,
+    });
   }
 });
 
