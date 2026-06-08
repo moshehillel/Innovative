@@ -118,20 +118,15 @@ async function markShipmentDelivered(loadNumber, proNumber) {
       return {ok: true, alreadyDelivered: true};
     }
     if (!tracking.dispatchDate || tracking.dispatchDate === "") {
-      const dispData = await primusRequest(
-          "POST", `/dispatch/${booking.BOLId}`, {
-            makeEDI: false,
-            forceDispatch: true,
-          });
-      const dispResult = dispData && dispData.data && dispData.data.results;
-      if (!dispResult || !dispResult.success) {
-        return {
-          ok: false,
-          error: "Dispatch failed: " + JSON.stringify(dispResult),
-        };
-      }
+      // primusRequest throws on non-2xx; response is {offerEDI, reason} on ok
+      await primusRequest("POST", `/dispatch/${booking.BOLId}`, {
+        makeEDI: false,
+        forceDispatch: true,
+      });
     }
-    return {ok: true};
+    // Actual deliveryDateActual is set via carrier EDI or Primus portal;
+    // no API endpoint exists to set it directly.
+    return {ok: true, dispatched: true};
   } catch (error) {
     await writeLog("error", "primus", "Failed to mark shipment delivered", {
       loadNumber,
