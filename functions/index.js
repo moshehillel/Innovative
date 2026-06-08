@@ -2,8 +2,6 @@
 
 const admin = require("firebase-admin");
 const {google} = require("googleapis");
-const {DocumentProcessorServiceClient} =
-  require("@google-cloud/documentai").v1;
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
 const {PDFDocument, StandardFonts} = require("pdf-lib");
@@ -128,39 +126,6 @@ async function markShipmentDelivered(loadNumber, proNumber) {
     await writeLog("error", "primus", "Failed to mark shipment delivered", {
       loadNumber,
       proNumber,
-      error: error.message,
-    });
-    return {ok: false, error: error.message};
-  }
-}
-
-/**
- * Adds a charge to a customer invoice in the Primus system.
- * @param {string} customerInvoiceId - The customer invoice ID.
- * @param {object} charge - The charge object.
- * @return {Promise<object>} Response from Primus API.
- */
-async function addChargeToCustomerInvoice(customerInvoiceId, charge) {
-  try {
-    const response = await fetch(
-        `${process.env.PRIMUS_BASE_URL}/addChargeToCustomerInvoice`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            customerInvoiceId,
-            ...charge,
-          }),
-        },
-    );
-
-    return await response.json();
-  } catch (error) {
-    await writeLog("error", "primus", "Failed to add charge to customer invoice", {
-      customerInvoiceId,
-      charge,
       error: error.message,
     });
     return {ok: false, error: error.message};
@@ -1132,69 +1097,6 @@ function getGmailOAuthClient() {
 }
 
 /**
- * Parses a document attachment with Google Document AI.
- * @param {Buffer} fileBuffer File buffer.
- * @param {string} mimeType File MIME type.
- * @return {Promise<string>} Extracted document text.
- */
-async function parseWithDocumentAi(fileBuffer, mimeType) {
-  const client = new DocumentProcessorServiceClient();
-
-  const name = client.processorPath(
-      process.env.DOCUMENT_AI_PROJECT_ID,
-      process.env.DOCUMENT_AI_LOCATION,
-      process.env.DOCUMENT_AI_PROCESSOR_ID,
-  );
-
-  const [result] = await client.processDocument({
-    name: name,
-    rawDocument: {
-      content: fileBuffer.toString("base64"),
-      mimeType: mimeType,
-    },
-  });
-
-  return result.document.text || "";
-}
-
-/**
- * Parses a PDF file using Document AI with logging.
- * @param {string|null} invoiceId - The invoice ID.
- * @param {string|null} gmailMessageId - The Gmail message ID.
- * @param {Buffer} fileBuffer - The file buffer.
- * @param {string} mimeType - The MIME type.
- * @param {string} filename - The filename.
- * @return {Promise<string>} Extracted text.
- */
-async function parseWithDocumentAiWithLogging(
-    invoiceId,
-    gmailMessageId,
-    fileBuffer,
-    mimeType,
-    filename,
-) {
-  await logWorkflowStep({
-    invoiceId,
-    gmailMessageId,
-    stepName: "document_ai_ocr_started",
-    stepStatus: "started",
-    input: {filename, mimeType},
-  });
-
-  const text = await parseWithDocumentAi(fileBuffer, mimeType);
-
-  await logWorkflowStep({
-    invoiceId,
-    gmailMessageId,
-    stepName: "document_ai_ocr_completed",
-    stepStatus: "success",
-    output: {textLength: text.length},
-  });
-
-  return text;
-}
-
-/**
  * Returns true if an attachment should be processed (PDF, not too small).
  * @param {object} attachment - Attachment metadata.
  * @param {Buffer} fileBuffer - File bytes.
@@ -1339,6 +1241,20 @@ function buildReviewForwardMime({
   return Buffer.from(lines.join(""));
 }
 
+/**
+ * Forwards an email to the appropriate human-review inbox.
+ * @param {object} gmail - Authenticated Gmail API client.
+ * @param {string} messageId - The Gmail message ID being forwarded.
+ * @param {string} subject - The original email subject.
+ * @param {string} from - The original sender address.
+ * @param {string} reason - Short reason shown to the reviewer.
+ * @param {string} notes - Detailed notes for the reviewer.
+ * @param {object} options - Optional extras.
+ * @param {string} options.department - Routes to a department inbox.
+ * @param {object} options.extractedData - Extracted invoice data to render.
+ * @param {string} options.emailBody - Original email body to include.
+ * @return {Promise<void>}
+ */
 async function forwardToHumanReview(
     gmail, messageId, subject, from, reason, notes, options = {}) {
   const {
@@ -1373,7 +1289,12 @@ async function forwardToHumanReview(
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         deleteAt: getDeleteAt(30),
       });
-    } catch (_) {}
+    } catch (logErr) {
+      console.error(
+          `[forwardToHumanReview] Failed to record emailErrors entry ` +
+          `for message ${messageId}:`, logErr,
+      );
+    }
     return;
   }
 
@@ -1416,7 +1337,8 @@ async function forwardToHumanReview(
 
   const attachmentNotice = originalRawBuffer ?
     `<p style="margin:16px 0 0;padding:12px;background:#f0fdf4;` +
-    `border:1px solid #bbf7d0;border-radius:6px;font-size:13px;color:#166534;">` +
+    `border:1px solid #bbf7d0;border-radius:6px;font-size:13px;` +
+    `color:#166534;">` +
     `The complete original email, including all attachments, is attached ` +
     `as <strong>original.eml</strong>. Open it in your mail client to view ` +
     `everything.</p>` : "";
@@ -1424,7 +1346,8 @@ async function forwardToHumanReview(
   const emailBodySection = !originalRawBuffer && emailBody ?
     `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
     `letter-spacing:.05em;color:#374151;">Original Message</h3>` +
-    `<div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;` +
+    `<div style="background:#f9fafb;border:1px solid #e5e7eb;` +
+    `border-radius:6px;` +
     `padding:14px;font-size:13px;line-height:1.6;white-space:pre-wrap;` +
     `color:#374151;">` +
     `${escapeHtml(String(emailBody).slice(0, 2000))}` +
@@ -1450,7 +1373,8 @@ async function forwardToHumanReview(
     `Subject</td><td>${escapeHtml(subject)}</td></tr>` +
     `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
     `Message&nbsp;ID</td>` +
-    `<td style="font-family:monospace;font-size:11px;">${escapeHtml(messageId)}</td>` +
+    `<td style="font-family:monospace;font-size:11px;">` +
+    `${escapeHtml(messageId)}</td>` +
     `</tr></table>` +
     `${attachmentNotice}` +
     `${emailBodySection}` +
@@ -1490,15 +1414,18 @@ async function forwardToHumanReview(
 }
 
 /**
- * Validates invoice amount by subtracting lumper charges before comparing to rate.
+ * Validates invoice amount by subtracting lumper charges before
+ * comparing to rate.
  * @param {object} aiResult - AI classification result.
  * @param {number} primusRate - Rate from Primus.
- * @return {{valid: boolean, baseAmount: number, totalLumper: number, difference: number}}
+ * @return {object} Validation result (valid, baseAmount, totalLumper,
+ *   difference).
  */
 function validateLumperAmount(aiResult, primusRate) {
   const lumperCharges = (aiResult.recognizedCharges || [])
       .filter((c) => c && c.type === "lumper");
-  const totalLumper = lumperCharges.reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+  const totalLumper = lumperCharges.reduce(
+      (sum, c) => sum + (Number(c.amount) || 0), 0);
   const baseAmount = Number(aiResult.invoiceAmount || 0) - totalLumper;
   const difference = Math.abs(baseAmount - Number(primusRate || 0));
   return {valid: difference <= 5, baseAmount, totalLumper, difference};
@@ -1506,14 +1433,22 @@ function validateLumperAmount(aiResult, primusRate) {
 
 /**
  * Checks profit and margin thresholds against business rules.
- * profit < $10 = no rate scenario; margin < 10% = broker commission adjustment needed.
+ * profit < $10 = no rate scenario; margin < 10% = broker commission
+ * adjustment needed.
  * @param {number} primusRate - Customer rate from Primus.
  * @param {number} invoiceAmount - Carrier invoice amount.
- * @return {{noRate: boolean, profit: number, margin: number, lowProfit: boolean, lowMargin: boolean}}
+ * @return {object} Margin check result (noRate, profit, margin,
+ *   lowProfit, lowMargin).
  */
 function checkProfitMargin(primusRate, invoiceAmount) {
   if (!primusRate || Number(primusRate) <= 0) {
-    return {noRate: true, profit: 0, margin: 0, lowProfit: true, lowMargin: true};
+    return {
+      noRate: true,
+      profit: 0,
+      margin: 0,
+      lowProfit: true,
+      lowMargin: true,
+    };
   }
   const profit = Number(primusRate) - Number(invoiceAmount || 0);
   const margin = (profit / Number(primusRate)) * 100;
@@ -1530,11 +1465,13 @@ function checkProfitMargin(primusRate, invoiceAmount) {
  * Retrieves shipment data from Primus by load/PRO number.
  * @param {string} loadNumber - Load number.
  * @param {string} proNumber - PRO number.
- * @return {Promise<{found: boolean, rate: number|null, customerEmail: string|null}>}
+ * @return {Promise<object>} Shipment lookup result (found, rate,
+ *   customerEmail).
  */
 async function getPrimusShipment(loadNumber, proNumber) {
   // TODO: Implement Primus API integration once documentation is shared
-  await writeLog("info", "primus", "TODO: getPrimusShipment stub called", {loadNumber, proNumber});
+  await writeLog("info", "primus",
+      "TODO: getPrimusShipment stub called", {loadNumber, proNumber});
   return {found: false, rate: null, customerEmail: null};
 }
 
@@ -1546,7 +1483,8 @@ async function getPrimusShipment(loadNumber, proNumber) {
  */
 async function adjustBrokerCommission(loadNumber, margin) {
   // TODO: Implement Primus broker commission adjustment
-  await writeLog("info", "primus", "TODO: adjustBrokerCommission stub called", {loadNumber, margin});
+  await writeLog("info", "primus",
+      "TODO: adjustBrokerCommission stub called", {loadNumber, margin});
 }
 
 /**
@@ -1574,7 +1512,8 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   contentBlocks.push({
     type: "text",
     text: JSON.stringify({
-      task: "Extract invoice data and classify from the attached PDF document(s).",
+      task: "Extract invoice data and classify from the attached PDF " +
+          "document(s).",
       lastKnownLoadNumber: Number.isFinite(Number(lastKnownLoadNumber)) ?
         Number(lastKnownLoadNumber) : null,
       allowedStatuses: [
@@ -1594,7 +1533,8 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "9-digit number (ignoring spaces and dashes).",
         "If lastKnownLoadNumber is provided, prefer a 9-digit candidate " +
         "where abs(candidate - lastKnownLoadNumber) <= 100000.",
-        "If no valid 9-digit candidate is found, return loadNumber as empty string.",
+        "If no valid 9-digit candidate is found, return loadNumber as " +
+        "empty string.",
         "PRO number may appear as PRO #, Carrier PRO, " +
         "Beyond PRO, Advance PRO, or freight bill number.",
         "Keep load number and PRO number separate.",
@@ -1607,7 +1547,8 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Only classify lumper if clearly shown on the invoice.",
         "Populate recognizedCharges with recognized extra charges only.",
         "Populate unrecognizedCharges with any extra charge not recognized.",
-        "Populate chargesNeedProof with recognized charges that need proof but it is missing.",
+        "Populate chargesNeedProof with recognized charges that need " +
+        "proof but it is missing.",
         "Populate chargeProofRefs with {type, amount, attachmentFilename} " +
         "for each recognized charge that has proof.",
         "If no extra charges exist, charges must be an empty array.",
@@ -1617,15 +1558,18 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Detect Proof of Delivery (POD) documents.",
         "POD may be a separate attachment, on the last page of the invoice, " +
         "or in the bottom section of the same page as the invoice.",
-        "Look for signed Bill of Lading, delivery receipt, or POD confirmation.",
+        "Look for signed Bill of Lading, delivery receipt, or POD " +
+        "confirmation.",
         "POD should have signatures, delivery dates, or Received stamps.",
-        "If POD content (signature, stamp, Received mark, or delivery confirmation) " +
-        "appears in the bottom section of an invoice page rather than on its own page, " +
-        "set pod.source to 'same_page_as_invoice', pod.attachmentFilename to that file, " +
-        "pod.page to the 1-based page number, and pod.cropFromBottom to the estimated " +
-        "fraction of the page height from the bottom that contains the POD content " +
-        "(e.g. 0.35 means the bottom 35%). Only use when the POD is clearly in the " +
-        "bottom portion of an invoice page.",
+        "If POD content (signature, stamp, Received mark, or delivery " +
+        "confirmation) appears in the bottom section of an invoice page " +
+        "rather than on its own page, set pod.source to " +
+        "'same_page_as_invoice', pod.attachmentFilename to that file, " +
+        "pod.page to the 1-based page number, and pod.cropFromBottom to " +
+        "the estimated fraction of the page height from the bottom that " +
+        "contains the POD content (e.g. 0.35 means the bottom 35%). " +
+        "Only use when the POD is clearly in the bottom portion of an " +
+        "invoice page.",
       ],
       requiredJsonShape: {
         status: "ready_for_primus_validation",
@@ -1668,10 +1612,14 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   });
 
   if (!response.content || response.content.length === 0) {
-    throw new Error("Claude returned an empty response for invoice classification");
+    throw new Error(
+        "Claude returned an empty response for invoice classification");
   }
   const rawText = response.content[0].text;
-  const jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const jsonText = rawText
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
   try {
     return JSON.parse(jsonText);
   } catch (e) {
@@ -2402,7 +2350,8 @@ async function analyzeEmailForForwarding(subject, from, body) {
     model: "claude-haiku-4-5",
     max_tokens: 200,
     system:
-      "You are an assistant for a freight brokerage handling incoming emails. " +
+      "You are an assistant for a freight brokerage handling incoming " +
+      "emails. " +
       "Analyze the email and return ONLY valid JSON with one key: " +
       "\"summary\" (one or two sentences describing what the sender wants or " +
       "what this email appears to be about).",
@@ -2420,7 +2369,10 @@ async function analyzeEmailForForwarding(subject, from, body) {
     return {summary: "Could not analyze email."};
   }
   const rawText = res.content[0].text || "";
-  const jsonText = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  const jsonText = rawText
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
   try {
     return JSON.parse(jsonText);
   } catch (e) {
@@ -2474,19 +2426,22 @@ async function processGmailMessage(
     const forwardWithAnalysis = async (reason, fwdOpts = {}) => {
       let summary = "";
       try {
-        const analysis = await analyzeEmailForForwarding(subject, from, emailBody);
+        const analysis =
+            await analyzeEmailForForwarding(subject, from, emailBody);
         summary = analysis.summary || "";
       } catch (e) {
-        await writeLog("warn", "gmail", "Email analysis failed before forward", {
-          messageId, error: e.message,
-        });
+        await writeLog("warn", "gmail",
+            "Email analysis failed before forward", {
+              messageId, error: e.message,
+            });
       }
 
       const aiNote =
         `Hi,\n\n` +
         `I am your AI helper. I just received the following email and I am ` +
         `not sure how to handle it.\n\n` +
-        (summary ? `Here is what I think this email is about: ${summary}\n\n` : "") +
+        (summary ?
+          `Here is what I think this email is about: ${summary}\n\n` : "") +
         `I do not have a rule for this type of email yet. ` +
         `Please take care of it.\n\nThank you,\nAI Helper`;
 
@@ -2534,9 +2489,10 @@ async function processGmailMessage(
     }
 
     if (attachments.length === 0) {
-      await writeLog("warn", "gmail", "No attachments found, forwarding for review", {
-        messageId, subject,
-      });
+      await writeLog("warn", "gmail",
+          "No attachments found, forwarding for review", {
+            messageId, subject,
+          });
       await forwardWithAnalysis(
           "Email received with no attachments",
           {department: "general"},
@@ -2587,11 +2543,12 @@ async function processGmailMessage(
     });
 
     for (const attachment of attachments) {
-      await writeLog("info", "storage", `Processing attachment ${attachment.filename}`, {
-        messageId,
-        filename: attachment.filename,
-        mimeType: attachment.mimeType,
-      });
+      await writeLog("info", "storage",
+          `Processing attachment ${attachment.filename}`, {
+            messageId,
+            filename: attachment.filename,
+            mimeType: attachment.mimeType,
+          });
 
       const attachmentResponse = await gmail.users.messages.attachments.get({
         userId: "me",
@@ -2623,7 +2580,8 @@ async function processGmailMessage(
           skippedDocTypes.push("small PDF");
         } else if (!isPdfMime && fileBuffer.length >= 10000) {
           // Substantive non-PDF (Excel, Word, image, etc.)
-          const ext = String(attachment.filename || "").split(".").pop().toUpperCase();
+          const ext = String(attachment.filename || "")
+              .split(".").pop().toUpperCase();
           skippedDocTypes.push(ext || attachment.mimeType || "non-PDF file");
         }
         continue;
@@ -2647,15 +2605,20 @@ async function processGmailMessage(
         continue;
       }
 
-      const safeFilename = attachment.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
-      const storagePath = `emailAttachments/${messageId}/${Date.now()}-${safeFilename}`;
+      const safeFilename =
+          attachment.filename.replace(/[^a-zA-Z0-9._-]/g, "_");
+      const storagePath =
+          `emailAttachments/${messageId}/${Date.now()}-${safeFilename}`;
 
       await bucket.file(storagePath).save(fileBuffer, {
         metadata: {contentType: "application/pdf"},
       });
 
       await writeLog("info", "storage", `Saved PDF to storage`, {
-        messageId, filename: attachment.filename, storagePath, fileSize: fileBuffer.length,
+        messageId,
+        filename: attachment.filename,
+        storagePath,
+        fileSize: fileBuffer.length,
       });
 
       pdfAttachments.push({
@@ -2674,11 +2637,14 @@ async function processGmailMessage(
 
     // If no processable PDFs found, forward entire email for human review
     if (pdfAttachments.length === 0) {
-      await writeLog("warn", "gmail", "No processable PDF invoices found", {messageId, subject});
-      let noInvoiceReason = "Could not find a freight invoice in this email";
+      await writeLog("warn", "gmail", "No processable PDF invoices found",
+          {messageId, subject});
+      let noInvoiceReason =
+          "Could not find a freight invoice in this email";
       if (skippedDocTypes.length > 0) {
         const typeList = [...new Set(skippedDocTypes)].join(", ");
-        noInvoiceReason = `Email contained ${typeList} attachment(s) but no invoice`;
+        noInvoiceReason =
+            `Email contained ${typeList} attachment(s) but no invoice`;
       }
       await forwardWithAnalysis(noInvoiceReason, {department: "general"});
       await applyGmailOutcome(gmail, messageId, "NO_INVOICE_PDF", false);
@@ -2801,10 +2767,11 @@ async function processGmailMessage(
           gmail, messageId, subject, from,
           "Could not find a valid load number on this invoice",
           `I processed the invoice from ` +
-          `${aiResult.carrierName || "this carrier"} but could not find a valid ` +
-          `9-digit load number. Without a load number I cannot match this invoice ` +
-          `to a shipment in Primus. Please verify the load number with the carrier ` +
-          `and reprocess, or handle this invoice manually.`,
+          `${aiResult.carrierName || "this carrier"} but could not find ` +
+          `a valid 9-digit load number. Without a load number I cannot ` +
+          `match this invoice to a shipment in Primus. Please verify the ` +
+          `load number with the carrier and reprocess, or handle this ` +
+          `invoice manually.`,
           {
             department: "operations",
             extractedData: {
@@ -2855,13 +2822,15 @@ async function processGmailMessage(
       await forwardToHumanReview(
           gmail, messageId, subject, from,
           "Invoice has charges I am not authorized to approve",
-          `I received an invoice from ${aiResult.carrierName || "this carrier"} ` +
-          `for load ${aiResult.loadNumber}. The invoice total is ` +
-          `$${aiResult.invoiceAmount}, however it contains charges I do not ` +
-          `recognize and cannot approve automatically: ` +
+          `I received an invoice from ` +
+          `${aiResult.carrierName || "this carrier"} for load ` +
+          `${aiResult.loadNumber}. The invoice total is ` +
+          `$${aiResult.invoiceAmount}, however it contains charges I do ` +
+          `not recognize and cannot approve automatically: ` +
           normalizedChargeData.unrecognizedCharges
               .map((c) => `${c.label || c.type} ($${c.amount})`).join(", ") +
-          `. Please review these charges and decide whether to approve or reject them.`,
+          `. Please review these charges and decide whether to approve ` +
+          `or reject them.`,
           {
             department: "billing",
             extractedData: {
@@ -2894,13 +2863,15 @@ async function processGmailMessage(
       await forwardToHumanReview(
           gmail, messageId, subject, from,
           "Invoice has extra charges but supporting receipts are missing",
-          `I received an invoice from ${aiResult.carrierName || "this carrier"} ` +
-          `for load ${aiResult.loadNumber}. The invoice amount is ` +
+          `I received an invoice from ` +
+          `${aiResult.carrierName || "this carrier"} for load ` +
+          `${aiResult.loadNumber}. The invoice amount is ` +
           `$${aiResult.invoiceAmount}. The invoice includes ` +
-          normalizedChargeData.chargesNeedProof.map((c) => c.type).join(" and ") +
-          ` charges but no supporting receipt or proof document was attached. ` +
-          `Please request the missing proof from the carrier before approving ` +
-          `this invoice.`,
+          normalizedChargeData.chargesNeedProof
+              .map((c) => c.type).join(" and ") +
+          ` charges but no supporting receipt or proof document was ` +
+          `attached. Please request the missing proof from the carrier ` +
+          `before approving this invoice.`,
           {
             department: "billing",
             extractedData: {
@@ -2951,17 +2922,19 @@ async function processGmailMessage(
           valid: lumperValidation.valid,
         });
 
-        // If lumpers are present but the base amount still doesn't match the
-        // Primus rate, flag for billing — better message than a generic mismatch.
+        // If lumpers are present but the base amount still doesn't match
+        // the Primus rate, flag for billing — better than a generic
+        // mismatch message.
         if (primusData.rate && lumperValidation.totalLumper > 0 &&
             !lumperValidation.valid) {
           await forwardToHumanReview(
               gmail, messageId, subject, from,
               "Lumper charges do not reconcile with the shipment rate",
-              `The carrier invoice includes $${lumperValidation.totalLumper.toFixed(2)} ` +
-              `in lumper charges. After removing them the base freight charge is ` +
-              `$${lumperValidation.baseAmount.toFixed(2)}, but the Primus rate on ` +
-              `file is $${primusData.rate}. ` +
+              `The carrier invoice includes ` +
+              `$${lumperValidation.totalLumper.toFixed(2)} in lumper ` +
+              `charges. After removing them the base freight charge is ` +
+              `$${lumperValidation.baseAmount.toFixed(2)}, but the Primus ` +
+              `rate on file is $${primusData.rate}. ` +
               `Please verify the lumper receipts and correct the amounts.`,
               {
                 department: "billing",
@@ -2969,8 +2942,10 @@ async function processGmailMessage(
                   "Carrier": aiResult.carrierName || "—",
                   "Load Number": aiResult.loadNumber || "—",
                   "Invoice Total": `$${aiResult.invoiceAmount}`,
-                  "Lumper Charges": `$${lumperValidation.totalLumper.toFixed(2)}`,
-                  "Base Freight": `$${lumperValidation.baseAmount.toFixed(2)}`,
+                  "Lumper Charges":
+                      `$${lumperValidation.totalLumper.toFixed(2)}`,
+                  "Base Freight":
+                      `$${lumperValidation.baseAmount.toFixed(2)}`,
                   "Primus Rate": `$${primusData.rate}`,
                   "Discrepancy": `$${lumperValidation.difference.toFixed(2)}`,
                 },
@@ -2984,7 +2959,8 @@ async function processGmailMessage(
 
       // ── Profit / margin check (use lumper-adjusted amount) ───────────────
       if (primusData.rate) {
-        const profitCheck = checkProfitMargin(primusData.rate, primusValidationAmount);
+        const profitCheck = checkProfitMargin(
+            primusData.rate, primusValidationAmount);
         if (profitCheck.noRate || profitCheck.lowProfit) {
           const hasLumpers = primusValidationAmount !== aiResult.invoiceAmount;
           await forwardToHumanReview(
@@ -2993,7 +2969,8 @@ async function processGmailMessage(
               `I processed the invoice from ` +
               `${aiResult.carrierName || "this carrier"} for load ` +
               `${aiResult.loadNumber}. The calculated profit is ` +
-              `$${profitCheck.profit.toFixed(2)}, which is below the $10 minimum. ` +
+              `$${profitCheck.profit.toFixed(2)}, which is below the $10 ` +
+              `minimum. ` +
               `Please review the customer rate or authorize an exception.`,
               {
                 department: "billing",
@@ -3001,7 +2978,9 @@ async function processGmailMessage(
                   "Carrier": aiResult.carrierName || "—",
                   "Load Number": aiResult.loadNumber || "—",
                   "Invoice Amount": `$${aiResult.invoiceAmount}`,
-                  ...(hasLumpers ? {"Lumper-Adjusted Amount": `$${primusValidationAmount}`} : {}),
+                  ...(hasLumpers ? {
+                    "Lumper-Adjusted Amount": `$${primusValidationAmount}`,
+                  } : {}),
                   "Customer Rate": `$${primusData.rate}`,
                   "Profit": `$${profitCheck.profit.toFixed(2)}`,
                 },
@@ -3011,15 +2990,18 @@ async function processGmailMessage(
           finalStatus = "no_rate";
         } else if (profitCheck.lowMargin) {
           // Margin < 10%: flag for broker commission adjustment
-          await adjustBrokerCommission(aiResult.loadNumber, profitCheck.margin);
-          await writeLog("info", "primus", "Low margin flagged for broker commission", {
-            messageId, loadNumber: aiResult.loadNumber,
-            margin: profitCheck.margin, profit: profitCheck.profit,
-          });
+          await adjustBrokerCommission(
+              aiResult.loadNumber, profitCheck.margin);
+          await writeLog("info", "primus",
+              "Low margin flagged for broker commission", {
+                messageId, loadNumber: aiResult.loadNumber,
+                margin: profitCheck.margin, profit: profitCheck.profit,
+              });
         }
       }
 
-      // Only run Primus validation if earlier checks didn't already reject this invoice
+      // Only run Primus validation if earlier checks didn't already
+      // reject this invoice
       if (finalLabel !== "NO_RATE" && finalLabel !== "UNMATCHED_AMOUNT") {
         await writeLog("info", "primus", `Starting Primus validation`, {
           messageId: messageId,
@@ -3077,9 +3059,9 @@ async function processGmailMessage(
           await forwardToHumanReview(
               gmail, messageId, subject, from,
               "Shipment not found — cannot validate invoice",
-              `I looked up load ${aiResult.loadNumber} but could not find ` +
-              `a matching shipment. The invoice cannot be processed until the ` +
-              `load number is confirmed or corrected.`,
+              `I looked up load ${aiResult.loadNumber} but could not ` +
+              `find a matching shipment. The invoice cannot be processed ` +
+              `until the load number is confirmed or corrected.`,
               {
                 department: "operations",
                 extractedData: {
@@ -3111,9 +3093,10 @@ async function processGmailMessage(
           await forwardToHumanReview(
               gmail, messageId, subject, from,
               "Invoice amount does not match the shipment rate",
-              `The carrier invoiced $${aiResult.invoiceAmount} but the amount ` +
-              `on file does not match. ` +
-              (primusResult.amount ? `Expected: $${primusResult.amount}. ` : "") +
+              `The carrier invoiced $${aiResult.invoiceAmount} but the ` +
+              `amount on file does not match. ` +
+              (primusResult.amount ?
+                `Expected: $${primusResult.amount}. ` : "") +
               `Please verify the correct amount and update the shipment.`,
               {
                 department: "billing",
@@ -3121,9 +3104,11 @@ async function processGmailMessage(
                   "Carrier": aiResult.carrierName || "—",
                   "Load Number": aiResult.loadNumber || "—",
                   "Invoice Amount": `$${aiResult.invoiceAmount}`,
-                  "Expected Amount": primusResult.amount ? `$${primusResult.amount}` : "—",
+                  "Expected Amount": primusResult.amount ?
+                    `$${primusResult.amount}` : "—",
                   "Difference": primusResult.amount ?
-                    `$${Math.abs(aiResult.invoiceAmount - primusResult.amount).toFixed(2)}` : "—",
+                    `$${Math.abs(aiResult.invoiceAmount -
+                      primusResult.amount).toFixed(2)}` : "—",
                 },
                 emailBody,
               },
@@ -3742,18 +3727,25 @@ exports.checkGmailInbox = onRequest(
                   format: "full",
                 });
                 const hdrs = fullErrMsg.data.payload?.headers || [];
-                errSubject = hdrs.find((h) => h.name === "Subject")?.value || errSubject;
+                errSubject = hdrs.find((h) => h.name === "Subject")
+                    ?.value || errSubject;
                 errFrom = hdrs.find((h) => h.name === "From")?.value || errFrom;
                 errBody = extractEmailBody(fullErrMsg.data.payload) || null;
-              } catch (_) {}
+              } catch (fetchErr) {
+                console.error(
+                    `[processInbox] Could not fetch details for message ` +
+                    `${message.id} while building error-review forward:`,
+                    fetchErr,
+                );
+              }
               await forwardToHumanReview(
                   gmail,
                   message.id,
                   errSubject,
                   errFrom,
                   "An unexpected error occurred processing this email",
-                  `I attempted to process this email but encountered an unexpected ` +
-                  `error and was unable to complete the workflow. ` +
+                  `I attempted to process this email but encountered an ` +
+                  `unexpected error and was unable to complete the workflow. ` +
                   `Error: ${error.message}. ` +
                   `Please review this email and handle it manually.`,
                   {department: "general", emailBody: errBody},
@@ -4040,7 +4032,6 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
-        
 
         const {invoiceId, resumeFrom} = req.body || {};
 
@@ -4273,7 +4264,8 @@ exports.processPrimusWorkflow = onRequest(
           const primusAmountFromValidation = amountValidation.amount || null;
           const submitted = amountValidation.submittedAmount ||
           invoice.invoiceAmount;
-          const saved = amountValidation.savedAmount || primusAmountFromValidation;
+          const saved = amountValidation.savedAmount ||
+            primusAmountFromValidation;
           const diff = amountValidation.difference ||
           (saved ? Math.abs(submitted - saved) : null);
 
@@ -4322,6 +4314,79 @@ exports.processPrimusWorkflow = onRequest(
         });
 
         await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validated");
+
+        // Extra charges (e.g. lumper) are never auto-added to the customer
+        // invoice, even when their proof checks out — a human must decide
+        // whether to invoice them or dispute them with the carrier.
+        if (approvedChargeProofFiles.length > 0) {
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "extra_charges_held_for_review",
+            stepStatus: "failed",
+            reason: "Extra charges require human approval before invoicing",
+            input: {approvedChargeProofFiles, approvedChargesTotal},
+            error: "EXTRA_CHARGES_PENDING_REVIEW",
+          });
+
+          await invoiceDoc.ref.update({
+            decisionStage: "extra_charges_pending_review",
+            decisionReason:
+                "Extra charges verified but held for human approval",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          if (invoice.gmailMessageId) {
+            const gmailDoc =
+              await db.collection("settings").doc("gmail").get();
+            if (gmailDoc.exists) {
+              const gmailSettings = gmailDoc.data();
+              const tokens = gmailSettings.tokens || gmailSettings;
+              const oauth2Client = getGmailOAuthClient();
+              oauth2Client.setCredentials(tokens);
+              const gmail =
+                google.gmail({version: "v1", auth: oauth2Client});
+
+              await forwardToHumanReview(
+                  gmail,
+                  invoice.gmailMessageId,
+                  invoice.gmailSubject,
+                  invoice.gmailFrom,
+                  "Extra charges verified — approval needed before " +
+                  "invoicing",
+                  `The amount and proof both check out, but the extra ` +
+                  `charges on this invoice are being held for manual ` +
+                  `review before adding them to the customer's invoice. ` +
+                  `Please confirm whether to invoice them or dispute ` +
+                  `them with the carrier.`,
+                  {
+                    department: "billing",
+                    extractedData: {
+                      "Carrier": invoice.carrierName || "—",
+                      "Load Number": invoice.loadNumber || "—",
+                      "Extra Charges": approvedChargeProofFiles
+                          .map((c) => `${c.type}: $${c.amount.toFixed(2)}`)
+                          .join(", "),
+                      "Total Extra Charges":
+                          `$${approvedChargesTotal.toFixed(2)}`,
+                    },
+                  },
+              );
+            }
+
+            await applyGmailOutcomeByStoredTokens(
+                invoice.gmailMessageId,
+                "EXTRA_CHARGES_REVIEW",
+                false,
+            );
+          }
+
+          return res.json({
+            ok: false,
+            error: "EXTRA_CHARGES_PENDING_REVIEW",
+          });
+        }
 
         // PRO Number Handling - use Primus response proNumber
         const primusProNumber = amountValidation.proNumber || "";
@@ -4413,7 +4478,8 @@ exports.processPrimusWorkflow = onRequest(
         currentStep === "approve_bill" ||
         currentStep === "get_rate" ||
         currentStep === "generate_invoice") {
-          // Skip if already marked delivered (from primusSteps or Primus duplicate)
+          // Skip if already marked delivered (from primusSteps or
+          // Primus duplicate)
           if (primusSteps.shipmentDelivered) {
             await logWorkflowStep({
               invoiceId,
@@ -4832,24 +4898,10 @@ exports.processPrimusWorkflow = onRequest(
       (invoiceGenerationResult && invoiceGenerationResult.customerInvoiceId) ||
       invoice.customerInvoiceId || null;
 
-        if (approvedChargeProofFiles.length > 0) {
-          for (const charge of approvedChargeProofFiles) {
-            await logWorkflowStep({
-              invoiceId,
-              stepName: "extra_charge_added_to_customer_invoice",
-              stepStatus: "success",
-              input: {type: charge.type, amount: charge.amount},
-            });
-
-            await addChargeToCustomerInvoice(
-                finalCustomerInvoiceId,
-                {
-                  type: charge.type,
-                  amount: charge.amount,
-                  storagePath: charge.storagePath,
-                });
-          }
-        }
+        // Note: extra charges (lumper, etc.) are never auto-added here —
+        // they're held for human review earlier in the workflow (see
+        // "extra_charges_pending_review"), so finalCustomerInvoiceId only
+        // ever reflects the base freight amount.
 
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
@@ -4907,22 +4959,6 @@ exports.processPrimusWorkflow = onRequest(
               contentBase64: podBase64,
             });
           }
-        }
-
-        for (const proof of approvedChargeProofFiles) {
-          if (!proof.storagePath) {
-            continue;
-          }
-          const proofBase64 =
-            await downloadStorageFileBase64(proof.storagePath);
-          if (!proofBase64) {
-            continue;
-          }
-          attachmentsToSend.push({
-            filename: `${String(proof.type || "charge")}-${invoiceId}.pdf`,
-            contentType: "application/pdf",
-            contentBase64: proofBase64,
-          });
         }
 
         await logWorkflowStep({
