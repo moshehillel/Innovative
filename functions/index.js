@@ -4092,10 +4092,14 @@ exports.processGmailQueue = onRequest(
     },
 );
 
-// Primus API — shared auth token cache (lives for the Cloud Run instance lifetime)
+// Primus API — auth token cache (shared within this Cloud Run instance)
 let primusTokenCache = null;
 let primusTokenExpiry = 0;
 
+/**
+ * Returns a valid Primus Bearer token, logging in if needed.
+ * @return {Promise<string>} Bearer token.
+ */
 async function getPrimusToken() {
   const now = Date.now();
   if (primusTokenCache && now < primusTokenExpiry) return primusTokenCache;
@@ -4123,6 +4127,13 @@ async function getPrimusToken() {
   return token;
 }
 
+/**
+ * Makes an authenticated request to the Primus API.
+ * @param {string} method HTTP method.
+ * @param {string} path API path (appended to PRIMUS_BASE_URL).
+ * @param {object} [body] Optional request body.
+ * @return {Promise<object|null>} Parsed response or null on 404.
+ */
 async function primusRequest(method, path, body) {
   const token = await getPrimusToken();
   const opts = {
@@ -4143,6 +4154,11 @@ async function primusRequest(method, path, body) {
   return resp.json();
 }
 
+/**
+ * Fetches a Primus booking by BOL/load number.
+ * @param {string} loadNumber BOL or load number.
+ * @return {Promise<object|null>} Booking object or null.
+ */
 async function fetchPrimusBooking(loadNumber) {
   const data = await primusRequest(
       "GET", `/book/bolnumber/${encodeURIComponent(loadNumber)}`);
@@ -4151,6 +4167,11 @@ async function fetchPrimusBooking(loadNumber) {
   return Array.isArray(results) ? (results[0] || null) : (results || null);
 }
 
+/**
+ * Parses a Primus amount string like "* 500.25" to a number.
+ * @param {string|number|null} raw Raw value from Primus.
+ * @return {number|null} Parsed amount or null.
+ */
 function parsePrimusAmount(raw) {
   if (raw == null) return null;
   // Primus returns amounts like "* 500.25" — strip non-numeric prefix
@@ -4198,7 +4219,8 @@ async function validateAmountWithPrimus(loadNumber, amount) {
       proNumber,
       reason: valid ?
         "Amount matches" :
-        `Submitted $${amount} vs Primus $${primusAmount} (diff $${diff.toFixed(2)})`,
+        `Submitted $${amount} vs Primus $${primusAmount}` +
+          ` (diff $${diff.toFixed(2)})`,
     };
   } catch (error) {
     await writeLog("error", "primus", "Failed to validate amount with Primus", {
@@ -4283,13 +4305,16 @@ async function getCustomerRate(loadNumber, proNumber) {
  * @return {Promise<object>} Approval result.
  */
 async function approveCarrierBill(billData) {
-  await writeLog("info", "primus", "approveCarrierBill: logged for audit trail", {
-    loadNumber: billData.loadNumber,
-    proNumber: billData.proNumber,
-    carrierName: billData.carrierName,
-    invoiceAmount: billData.invoiceAmount,
-    invoiceNumber: billData.invoiceNumber,
-  });
+  await writeLog(
+      "info", "primus",
+      "approveCarrierBill: logged for audit trail",
+      {
+        loadNumber: billData.loadNumber,
+        proNumber: billData.proNumber,
+        carrierName: billData.carrierName,
+        invoiceAmount: billData.invoiceAmount,
+        invoiceNumber: billData.invoiceNumber,
+      });
   return {ok: true, billId: null, skipped: true};
 }
 
@@ -4323,7 +4348,8 @@ async function generateCustomerInvoice(invoiceData) {
         rate: customerRate,
       }],
     };
-    const result = await primusRequest("POST", `/invoice/${booking.BOLId}`, body);
+    const result = await primusRequest(
+        "POST", `/invoice/${booking.BOLId}`, body);
     const invoiceResult = result &&
         result.data &&
         result.data.results &&
