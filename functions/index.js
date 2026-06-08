@@ -4242,7 +4242,16 @@ async function addProNumberToLoad(loadNumber, proNumber) {
     if (!booking || !booking.BOLId) {
       return {ok: false, error: "Load not found in Primus"};
     }
-    await primusRequest("PUT", `/book/${booking.BOLId}`, {PRONmbr: proNumber});
+    try {
+      await primusRequest(
+          "PUT", `/book/${booking.BOLId}`, {PRONmbr: proNumber});
+    } catch (putErr) {
+      // 409 means booking is locked/dispatched — PRO already set, treat as ok
+      if (putErr.message && putErr.message.includes("409")) {
+        return {ok: true, skipped: true, reason: "Booking locked (409)"};
+      }
+      throw putErr;
+    }
     return {ok: true};
   } catch (error) {
     await writeLog("error", "primus", "Failed to add PRO number to load", {
@@ -4337,15 +4346,17 @@ async function generateCustomerInvoice(invoiceData) {
     const acct = booking.accountingInformation || {};
     const customerRate = parsePrimusAmount(acct.customerQuoteAmount) ||
         Number(invoiceData.customerRate || 0);
-    const body = {
-      customerId,
-      invoiceBreakdown: [{
+    // When a customerQuoteId exists Primus uses the stored quote automatically;
+    // sending a breakdown would be rejected for "Collect" shipments.
+    const body = {customerId};
+    if (!acct.customerQuoteId) {
+      body.invoiceBreakdown = [{
         code: "FREIGHT",
         description: "Freight Charges",
         qty: 1,
         rate: customerRate,
-      }],
-    };
+      }];
+    }
     const result = await primusRequest(
         "POST", `/invoice/${booking.BOLId}`, body);
     const invoiceResult = result &&
