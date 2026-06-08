@@ -4226,20 +4226,37 @@ async function validateAmountWithPrimus(loadNumber, amount) {
 }
 
 /**
- * Updates the PRO number on a Primus booking.
+ * Updates the PRO number on a Primus booking, and optionally writes carrier
+ * invoice metadata (invoice number, due date) to shipmentReference fields.
  * @param {string} loadNumber Load/BOL number.
  * @param {string} proNumber PRO number to set.
+ * @param {object} [invoiceData] Optional carrier invoice metadata.
+ * @param {string} [invoiceData.invoiceNumber] Carrier invoice number.
+ * @param {string} [invoiceData.dueDate] Invoice due date (YYYY-MM-DD).
+ * @param {string} [invoiceData.carrierName] Carrier name for notes.
  * @return {Promise<object>} Update result.
  */
-async function addProNumberToLoad(loadNumber, proNumber) {
+async function addProNumberToLoad(loadNumber, proNumber, invoiceData = {}) {
   try {
     const booking = await fetchPrimusBooking(loadNumber);
     if (!booking || !booking.BOLId) {
       return {ok: false, error: "Load not found in Primus"};
     }
+    const putBody = {PRONmbr: proNumber};
+    if (invoiceData.invoiceNumber || invoiceData.dueDate) {
+      const dueDate = invoiceData.dueDate ||
+          (() => {
+            const d = new Date();
+            d.setDate(d.getDate() + 30);
+            return d.toISOString().slice(0, 10);
+          })();
+      putBody.additionalInformation = {
+        shipmentReference1: String(invoiceData.invoiceNumber || ""),
+        shipmentReference2: dueDate,
+      };
+    }
     try {
-      await primusRequest(
-          "PUT", `/book/${booking.BOLId}`, {PRONmbr: proNumber});
+      await primusRequest("PUT", `/book/${booking.BOLId}`, putBody);
     } catch (putErr) {
       // 409 means booking is locked/dispatched — PRO already set, treat as ok
       if (putErr.message && putErr.message.includes("409")) {
@@ -4421,6 +4438,14 @@ exports.processPrimusWorkflow = onRequest(
         }
 
         const invoice = invoiceDoc.data();
+
+        if (invoice.finalWorkflowStatus === "completed") {
+          return res.status(409).json({
+            ok: false,
+            error: "ALREADY_COMPLETED",
+            customerInvoiceId: invoice.customerInvoiceId || null,
+          });
+        }
 
         const flowId = invoice.flowId || invoice.gmailMessageId || invoiceId;
 
@@ -4775,6 +4800,11 @@ exports.processPrimusWorkflow = onRequest(
           const proResult = await addProNumberToLoad(
               invoice.loadNumber,
               invoice.proNumber,
+              {
+                invoiceNumber: invoice.invoiceNumber,
+                dueDate: invoice.dueDate,
+                carrierName: invoice.carrierName,
+              },
           );
 
           await logWorkflowStep({
