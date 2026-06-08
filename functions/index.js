@@ -4103,9 +4103,7 @@ let primusTokenExpiry = 0;
 async function getPrimusToken() {
   const now = Date.now();
   if (primusTokenCache && now < primusTokenExpiry) return primusTokenCache;
-  const base = (process.env.PRIMUS_BASE_URL || "")
-      .replace(/\/api\/v\d+\/?$/, "");
-  const resp = await fetch(`${base}/login`, {
+  const resp = await fetch(`${process.env.PRIMUS_BASE_URL}/login`, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
@@ -4118,9 +4116,9 @@ async function getPrimusToken() {
     throw new Error(`Primus login failed ${resp.status}: ${txt}`);
   }
   const data = await resp.json();
-  const token = data.token ||
+  const token = (data.data && data.data.accessToken) ||
       (data.data && data.data.token) ||
-      data.access_token || data.accessToken;
+      data.accessToken || data.token || data.access_token;
   if (!token) throw new Error("Primus login: no token in response");
   primusTokenCache = token;
   primusTokenExpiry = now + 23 * 60 * 60 * 1000;
