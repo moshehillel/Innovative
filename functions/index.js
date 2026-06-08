@@ -100,28 +100,38 @@ function isAlreadyDoneResult(result) {
 }
 
 /**
- * Marks a shipment as delivered in the Primus system.
- * @param {string} loadNumber - The load number.
+ * Marks a shipment as delivered. Checks the booking's tracking status and
+ * dispatches if not already dispatched. Actual delivery status is set by
+ * carrier EDI or manual update in Primus — the API has no direct endpoint.
+ * @param {string} loadNumber - The load/BOL number.
  * @param {string} proNumber - The PRO number.
  * @return {Promise<object>} Response from Primus API.
  */
 async function markShipmentDelivered(loadNumber, proNumber) {
   try {
-    const response = await fetch(
-        `${process.env.PRIMUS_BASE_URL}/markShipmentDelivered`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            loadNumber: loadNumber,
-            proNumber: proNumber,
-          }),
-        },
-    );
-
-    return await response.json();
+    const booking = await fetchPrimusBooking(loadNumber);
+    if (!booking || !booking.BOLId) {
+      return {ok: false, error: "Load not found in Primus"};
+    }
+    const tracking = booking.trackingInformation || {};
+    if (tracking.deliveryDateActual && tracking.deliveryDateActual !== "") {
+      return {ok: true, alreadyDelivered: true};
+    }
+    if (!tracking.dispatchDate || tracking.dispatchDate === "") {
+      const dispData = await primusRequest(
+          "POST", `/dispatch/${booking.BOLId}`, {
+            makeEDI: false,
+            forceDispatch: true,
+          });
+      const dispResult = dispData && dispData.data && dispData.data.results;
+      if (!dispResult || !dispResult.success) {
+        return {
+          ok: false,
+          error: "Dispatch failed: " + JSON.stringify(dispResult),
+        };
+      }
+    }
+    return {ok: true};
   } catch (error) {
     await writeLog("error", "primus", "Failed to mark shipment delivered", {
       loadNumber,
@@ -1462,17 +1472,38 @@ function checkProfitMargin(primusRate, invoiceAmount) {
 }
 
 /**
- * Retrieves shipment data from Primus by load/PRO number.
- * @param {string} loadNumber - Load number.
- * @param {string} proNumber - PRO number.
- * @return {Promise<object>} Shipment lookup result (found, rate,
- *   customerEmail).
+ * Retrieves shipment data from Primus by load/BOL or PRO number.
+ * @param {string} loadNumber - Load/BOL number.
+ * @param {string} proNumber - PRO number (fallback search key).
+ * @return {Promise<object>} Shipment lookup result.
  */
 async function getPrimusShipment(loadNumber, proNumber) {
-  // TODO: Implement Primus API integration once documentation is shared
-  await writeLog("info", "primus",
-      "TODO: getPrimusShipment stub called", {loadNumber, proNumber});
-  return {found: false, rate: null, customerEmail: null};
+  try {
+    let booking = await fetchPrimusBooking(loadNumber);
+    if (!booking && proNumber) {
+      const searchData = await primusRequest(
+          "GET", `/book?vendorPro=${encodeURIComponent(proNumber)}&limit=1`);
+      const results = searchData && searchData.data && searchData.data.results;
+      booking = Array.isArray(results) ? (results[0] || null) : null;
+    }
+    if (!booking) return {found: false, rate: null, customerEmail: null};
+    const acct = booking.accountingInformation || {};
+    const rate = parsePrimusAmount(acct.customerQuoteAmount);
+    let customerEmail = null;
+    if (booking.thirdParty && booking.thirdParty.email) {
+      customerEmail = booking.thirdParty.email;
+    } else if (booking.shipper && booking.shipper.email) {
+      customerEmail = booking.shipper.email;
+    }
+    return {found: true, rate, customerEmail, BOLId: booking.BOLId};
+  } catch (error) {
+    await writeLog("error", "primus", "getPrimusShipment failed", {
+      loadNumber,
+      proNumber,
+      error: error.message,
+    });
+    return {found: false, rate: null, customerEmail: null};
+  }
 }
 
 /**
@@ -3481,7 +3512,7 @@ exports.gmailOAuthCallback = onRequest(async (req, res) => {
  */
 function applyDashboardCors(req, res) {
   res.set("Access-Control-Allow-Origin", process.env.DASHBOARD_ORIGIN || "*");
-  res.set("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") {
     res.status(204).send("");
@@ -3584,6 +3615,203 @@ exports.getDashboardStats = onRequest(async (req, res) => {
       ok: false,
       error: "Failed to load dashboard stats.",
       details: error.message,
+    });
+  }
+});
+
+/**
+ * Emails a captured support-chat issue summary to the support inbox.
+ * @param {object} data Issue data.
+ * @param {string} data.clientName Display name of the client whose
+ *   dashboard the chat ran on.
+ * @param {string} data.summary AI-written report of the customer's issue.
+ * @param {Array<{role: string, content: string}>} data.transcript Full
+ *   chat transcript to include for context.
+ * @return {Promise<void>}
+ */
+async function sendSupportIssueEmail({clientName, summary, transcript}) {
+  const to = process.env.SUPPORT_ISSUE_EMAIL || "mshglck@gmail.com";
+
+  const transcriptHtml = transcript.map((turn) =>
+    `<p style="margin:0 0 8px;line-height:1.5;">` +
+    `<strong>${turn.role === "user" ? "Customer" : "Assistant"}:</strong> ` +
+    `${escapeHtml(turn.content)}</p>`,
+  ).join("");
+
+  const html =
+    `<div style="font-family:Arial,sans-serif;max-width:620px;` +
+    `color:#111827;font-size:14px;">` +
+    `<div style="background:#4f46e5;color:#fff;padding:14px 18px;` +
+    `border-radius:6px 6px 0 0;font-size:15px;font-weight:700;">` +
+    `Support chat — ${escapeHtml(clientName)}</div>` +
+    `<div style="border:1px solid #e5e7eb;border-top:none;padding:18px;` +
+    `border-radius:0 0 6px 6px;">` +
+    `<h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Issue Summary</h3>` +
+    `<p style="margin:0 0 16px;color:#374151;line-height:1.6;` +
+    `white-space:pre-wrap;">${escapeHtml(summary)}</p>` +
+    `<h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Conversation</h3>` +
+    `${transcriptHtml}` +
+    `</div></div>`;
+
+  const safeClientName = String(clientName || "").replace(/[\r\n]/g, " ");
+  const subject = `[Support Chat] ${safeClientName} — issue reported`;
+
+  const gmailDoc = await db.collection("settings").doc("gmail").get();
+  if (!gmailDoc.exists) {
+    console.error(
+        "[sendSupportIssueEmail] Gmail not connected — issue report " +
+        `dropped for ${safeClientName}`,
+    );
+    return;
+  }
+
+  const gmailSettings = gmailDoc.data();
+  const tokens = gmailSettings.tokens || gmailSettings;
+
+  const oauth2Client = getGmailOAuthClient();
+  oauth2Client.setCredentials(tokens);
+
+  const gmail = google.gmail({version: "v1", auth: oauth2Client});
+
+  const mimeBuffer = Buffer.from(
+      `To: ${to}\r\n` +
+      `Subject: ${subject}\r\n` +
+      `Content-Type: text/html; charset="UTF-8"\r\n\r\n${html}`,
+  );
+
+  await gmail.users.messages.send({
+    userId: "me",
+    requestBody: {raw: mimeBuffer.toString("base64url")},
+  });
+}
+
+// Support-chat conversations are capped to keep prompt size and per-request
+// cost predictable — long enough for a real back-and-forth, short enough
+// that a confused user can't run up an unbounded bill.
+const SUPPORT_CHAT_MAX_TURNS = 24;
+const SUPPORT_CHAT_MAX_MESSAGE_LENGTH = 4000;
+
+exports.dashboardSupportChat = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) {
+    return;
+  }
+
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST."});
+  }
+
+  try {
+    const body = req.body || {};
+    const clientName = String(body.clientName || "Client").slice(0, 120);
+    const incoming = Array.isArray(body.messages) ? body.messages : null;
+
+    if (!incoming || incoming.length === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: "Request must include a non-empty messages array.",
+      });
+    }
+
+    const history = incoming
+        .slice(-SUPPORT_CHAT_MAX_TURNS)
+        .map((turn) => ({
+          role: turn && turn.role === "assistant" ? "assistant" : "user",
+          content: String((turn && turn.content) || "")
+              .slice(0, SUPPORT_CHAT_MAX_MESSAGE_LENGTH),
+        }))
+        .filter((turn) => turn.content.trim().length > 0);
+
+    if (history.length === 0) {
+      return res.status(400).json({ok: false, error: "Empty message."});
+    }
+
+    const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
+
+    const systemPrompt =
+      `You are the support assistant on ${clientName}'s invoice-` +
+      "automation dashboard. Customers come to you when something looks " +
+      "wrong — e.g. an invoice they expected to see is missing, the " +
+      "stats or chart look off, a reply or forward never went out, or " +
+      "Gmail shows as disconnected. " +
+      "Have a natural, brief conversation: ask short, focused follow-up " +
+      "questions — one or two at a time, in plain language — until you " +
+      "understand what the customer expected, what actually happened, " +
+      "roughly when, and any identifying details (load number, invoice " +
+      "number, carrier name, email subject, date/time, the time-range " +
+      "tab they were viewing). Don't interrogate — once you have enough " +
+      "to write a useful report for an engineer, stop and wrap up. " +
+      "Reply with ONLY valid JSON (no markdown fences) in this exact " +
+      "shape: {\"reply\": string, \"status\": \"asking\" | \"ready\", " +
+      "\"summary\": string}. " +
+      "\"reply\" is what you say to the customer next — for \"ready\" " +
+      "turns, a short, friendly note that you've passed this along. " +
+      "\"status\" is \"ready\" only once you can write a complete " +
+      "report; otherwise \"asking\". " +
+      "\"summary\" stays empty while \"status\" is \"asking\", and — " +
+      "only on the turn you switch to \"ready\" — becomes a clear, " +
+      "complete written report of the issue for an internal engineer " +
+      "(what's wrong, what was expected, key identifying details, and " +
+      "any relevant context from the conversation).";
+
+    const aiRes = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 800,
+      system: systemPrompt,
+      messages: history,
+    });
+
+    const block = aiRes.content && aiRes.content.find(
+        (c) => c.type === "text",
+    );
+    const rawText = block && block.text ? block.text.trim() : "";
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (parseErr) {
+      console.error(
+          "[dashboardSupportChat] Could not parse AI response as JSON:",
+          parseErr, rawText,
+      );
+      parsed = {
+        reply: "Sorry, I had trouble processing that — could you try " +
+          "rephrasing?",
+        status: "asking",
+        summary: "",
+      };
+    }
+
+    const reply = String(parsed.reply || "").trim() ||
+      "Could you tell me a bit more about what you're seeing?";
+    const isReady = parsed.status === "ready" &&
+      String(parsed.summary || "").trim().length > 0;
+
+    if (isReady) {
+      try {
+        await sendSupportIssueEmail({
+          clientName,
+          summary: String(parsed.summary).trim(),
+          transcript: history.concat(
+              [{role: "assistant", content: reply}],
+          ),
+        });
+      } catch (emailErr) {
+        console.error(
+            "[dashboardSupportChat] Failed to email issue summary:",
+            emailErr,
+        );
+      }
+    }
+
+    return res.json({ok: true, reply, done: isReady});
+  } catch (error) {
+    console.error("dashboardSupportChat error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "The support chat is temporarily unavailable. Please try " +
+        "again shortly.",
     });
   }
 });
@@ -3864,30 +4092,118 @@ exports.processGmailQueue = onRequest(
     },
 );
 
+// Primus API — shared auth token cache (lives for the Cloud Run instance lifetime)
+let primusTokenCache = null;
+let primusTokenExpiry = 0;
+
+async function getPrimusToken() {
+  const now = Date.now();
+  if (primusTokenCache && now < primusTokenExpiry) return primusTokenCache;
+  const base = (process.env.PRIMUS_BASE_URL || "")
+      .replace(/\/api\/v\d+\/?$/, "");
+  const resp = await fetch(`${base}/login`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      username: process.env.PRIMUS_USERNAME,
+      password: process.env.PRIMUS_PASSWORD,
+    }),
+  });
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`Primus login failed ${resp.status}: ${txt}`);
+  }
+  const data = await resp.json();
+  const token = data.token ||
+      (data.data && data.data.token) ||
+      data.access_token || data.accessToken;
+  if (!token) throw new Error("Primus login: no token in response");
+  primusTokenCache = token;
+  primusTokenExpiry = now + 23 * 60 * 60 * 1000;
+  return token;
+}
+
+async function primusRequest(method, path, body) {
+  const token = await getPrimusToken();
+  const opts = {
+    method,
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  const resp = await fetch(`${process.env.PRIMUS_BASE_URL}${path}`, opts);
+  if (resp.status === 204) return {ok: true};
+  if (resp.status === 404) return null;
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    throw new Error(`Primus ${method} ${path} → ${resp.status}: ${txt}`);
+  }
+  return resp.json();
+}
+
+async function fetchPrimusBooking(loadNumber) {
+  const data = await primusRequest(
+      "GET", `/book/bolnumber/${encodeURIComponent(loadNumber)}`);
+  if (!data) return null;
+  const results = data.data && data.data.results;
+  return Array.isArray(results) ? (results[0] || null) : (results || null);
+}
+
+function parsePrimusAmount(raw) {
+  if (raw == null) return null;
+  // Primus returns amounts like "* 500.25" — strip non-numeric prefix
+  const n = Number(String(raw).replace(/[^0-9.]/g, ""));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
 /**
- * Calls mock Primus validateAmount endpoint.
- * @param {string} loadNumber Load number.
- * @param {number} amount Invoice amount.
+ * Validates carrier invoice amount against Primus booking's recorded cost.
+ * @param {string} loadNumber Load/BOL number.
+ * @param {number} amount Invoice amount to validate.
  * @return {Promise<object>} Validation result.
  */
 async function validateAmountWithPrimus(loadNumber, amount) {
   try {
-    const response = await fetch(process.env.PRIMUS_VALIDATE_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        loadNumber: loadNumber,
-        amount: amount,
-      }),
-    });
-
-    return await response.json();
+    const booking = await fetchPrimusBooking(loadNumber);
+    if (!booking) {
+      return {
+        ok: false,
+        validAmount: false,
+        error: "Load not found in Primus",
+      };
+    }
+    const primusAmount = Number(
+        (booking.vendor && booking.vendor.cost) || 0,
+    );
+    const proNumber = (booking.vendor && booking.vendor.PRO) || "";
+    if (!primusAmount) {
+      return {
+        ok: false,
+        validAmount: false,
+        error: "No carrier cost on Primus record",
+      };
+    }
+    const diff = Math.abs(Number(amount) - primusAmount);
+    const tolerance = Math.max(0.50, primusAmount * 0.02);
+    const valid = diff <= tolerance;
+    return {
+      ok: true,
+      validAmount: valid,
+      amount: primusAmount,
+      submittedAmount: Number(amount),
+      savedAmount: primusAmount,
+      difference: diff,
+      proNumber,
+      reason: valid ?
+        "Amount matches" :
+        `Submitted $${amount} vs Primus $${primusAmount} (diff $${diff.toFixed(2)})`,
+    };
   } catch (error) {
     await writeLog("error", "primus", "Failed to validate amount with Primus", {
-      loadNumber: loadNumber,
-      amount: amount,
+      loadNumber,
+      amount,
       error: error.message,
     });
     return {ok: false, error: error.message};
@@ -3895,32 +4211,23 @@ async function validateAmountWithPrimus(loadNumber, amount) {
 }
 
 /**
- * Calls mock Primus addProNumberToLoad endpoint.
- * @param {string} loadNumber Load number.
- * @param {string} proNumber PRO number.
- * @return {Promise<object>} Add PRO result.
+ * Updates the PRO number on a Primus booking.
+ * @param {string} loadNumber Load/BOL number.
+ * @param {string} proNumber PRO number to set.
+ * @return {Promise<object>} Update result.
  */
 async function addProNumberToLoad(loadNumber, proNumber) {
   try {
-    const response = await fetch(
-        `${process.env.PRIMUS_BASE_URL}/addProNumberToLoad`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            loadNumber: loadNumber,
-            proNumber: proNumber,
-          }),
-        },
-    );
-
-    return await response.json();
+    const booking = await fetchPrimusBooking(loadNumber);
+    if (!booking || !booking.BOLId) {
+      return {ok: false, error: "Load not found in Primus"};
+    }
+    await primusRequest("PUT", `/book/${booking.BOLId}`, {PRONmbr: proNumber});
+    return {ok: true};
   } catch (error) {
     await writeLog("error", "primus", "Failed to add PRO number to load", {
-      loadNumber: loadNumber,
-      proNumber: proNumber,
+      loadNumber,
+      proNumber,
       error: error.message,
     });
     return {ok: false, error: error.message};
@@ -3928,32 +4235,40 @@ async function addProNumberToLoad(loadNumber, proNumber) {
 }
 
 /**
- * Calls mock Primus getCustomerRate endpoint.
- * @param {string} loadNumber Load number.
- * @param {string} proNumber PRO number.
+ * Retrieves customer name and rate from a Primus booking.
+ * @param {string} loadNumber Load/BOL number.
+ * @param {string} proNumber PRO number (used as fallback search key).
  * @return {Promise<object>} Customer rate result.
  */
 async function getCustomerRate(loadNumber, proNumber) {
   try {
-    const response = await fetch(
-        `${process.env.PRIMUS_BASE_URL}/getCustomerRate`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            loadNumber: loadNumber,
-            proNumber: proNumber,
-          }),
-        },
-    );
-
-    return await response.json();
+    let booking = await fetchPrimusBooking(loadNumber);
+    if (!booking && proNumber) {
+      const searchData = await primusRequest(
+          "GET", `/book?vendorPro=${encodeURIComponent(proNumber)}&limit=1`);
+      const results = searchData && searchData.data && searchData.data.results;
+      booking = Array.isArray(results) ? (results[0] || null) : null;
+    }
+    if (!booking) {
+      return {ok: false, error: "Load not found in Primus"};
+    }
+    const acct = booking.accountingInformation || {};
+    const customerRate = parsePrimusAmount(acct.customerQuoteAmount);
+    const billTo = booking.billTo || "";
+    let customerName = null;
+    if (billTo === "thirdparty" && booking.thirdParty) {
+      customerName = booking.thirdParty.name || null;
+    } else if (booking.shipper) {
+      customerName = booking.shipper.name || null;
+    }
+    if (!customerRate) {
+      return {ok: false, customerName, error: "No customer rate in Primus"};
+    }
+    return {ok: true, customerName, customerRate};
   } catch (error) {
     await writeLog("error", "primus", "Failed to get customer rate", {
-      loadNumber: loadNumber,
-      proNumber: proNumber,
+      loadNumber,
+      proNumber,
       error: error.message,
     });
     return {ok: false, error: error.message};
@@ -3961,55 +4276,74 @@ async function getCustomerRate(loadNumber, proNumber) {
 }
 
 /**
- * Calls mock Primus approveCarrierBill endpoint.
+ * Logs carrier bill approval intent; Primus payables are created automatically
+ * when the booking is dispatched. No dedicated Payables API endpoint is
+ * available in the current API version.
  * @param {object} billData Bill approval data.
  * @return {Promise<object>} Approval result.
  */
 async function approveCarrierBill(billData) {
-  try {
-    const response = await fetch(
-        `${process.env.PRIMUS_BASE_URL}/approveCarrierBill`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(billData),
-        },
-    );
-
-    return await response.json();
-  } catch (error) {
-    await writeLog("error", "primus", "Failed to approve carrier bill", {
-      billData: billData,
-      error: error.message,
-    });
-    return {ok: false, error: error.message};
-  }
+  await writeLog("info", "primus", "approveCarrierBill: logged for audit trail", {
+    loadNumber: billData.loadNumber,
+    proNumber: billData.proNumber,
+    carrierName: billData.carrierName,
+    invoiceAmount: billData.invoiceAmount,
+    invoiceNumber: billData.invoiceNumber,
+  });
+  return {ok: true, billId: null, skipped: true};
 }
 
 /**
- * Calls mock Primus generateCustomerInvoice endpoint.
+ * Creates a customer invoice in Primus via POST /api/v1/invoice/{BOLId}.
  * @param {object} invoiceData Customer invoice data.
  * @return {Promise<object>} Invoice generation result.
  */
 async function generateCustomerInvoice(invoiceData) {
   try {
-    const response = await fetch(
-        `${process.env.PRIMUS_BASE_URL}/generateCustomerInvoice`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(invoiceData),
-        },
-    );
-
-    return await response.json();
+    const booking = await fetchPrimusBooking(invoiceData.loadNumber);
+    if (!booking || !booking.BOLId) {
+      return {ok: false, error: "Load not found in Primus"};
+    }
+    const billTo = booking.billTo || "";
+    let customerId = null;
+    if (billTo === "thirdparty" && booking.thirdParty) {
+      customerId = booking.thirdParty.id || null;
+    } else if (booking.shipper) {
+      customerId = booking.shipper.id || null;
+    }
+    const acct = booking.accountingInformation || {};
+    const customerRate = parsePrimusAmount(acct.customerQuoteAmount) ||
+        Number(invoiceData.customerRate || 0);
+    const body = {
+      customerId,
+      invoiceBreakdown: [{
+        code: "FREIGHT",
+        description: "Freight Charges",
+        qty: 1,
+        rate: customerRate,
+      }],
+    };
+    const result = await primusRequest("POST", `/invoice/${booking.BOLId}`, body);
+    const invoiceResult = result &&
+        result.data &&
+        result.data.results &&
+        (Array.isArray(result.data.results) ?
+          result.data.results[0] : result.data.results);
+    if (!invoiceResult || !invoiceResult.invoiceId) {
+      return {
+        ok: false,
+        error: "Invoice creation returned no ID",
+        raw: result,
+      };
+    }
+    return {
+      ok: true,
+      customerInvoiceId: invoiceResult.invoiceId,
+      invoiceNumber: invoiceResult.invoiceNumber,
+    };
   } catch (error) {
     await writeLog("error", "primus", "Failed to generate customer invoice", {
-      invoiceData: invoiceData,
+      invoiceData,
       error: error.message,
     });
     return {ok: false, error: error.message};
