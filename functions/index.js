@@ -3412,6 +3412,55 @@ exports.getGmailStatus = onRequest(async (req, res) => {
   }
 });
 
+exports.gmailDisconnect = onRequest(
+    {invoker: "public"},
+    async (req, res) => {
+      if (applyDashboardCors(req, res)) return;
+      if (req.method !== "POST") {
+        return res.status(405).json({ok: false, error: "Method not allowed."});
+      }
+      try {
+        await db.collection("settings").doc("gmail").delete();
+        return res.json({ok: true});
+      } catch (error) {
+        console.error("gmailDisconnect error:", error);
+        return res.status(500).json({ok: false, error: error.message});
+      }
+    },
+);
+
+exports.getRecentLogs = onRequest(
+    {invoker: "public"},
+    async (req, res) => {
+      if (applyDashboardCors(req, res)) return;
+      try {
+        const limit = Math.min(Number(req.query.limit || 40), 100);
+        const [rows] = await bigquery.query({
+          query: `
+            SELECT timestamp, level, category, message
+            FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
+            ORDER BY timestamp DESC
+            LIMIT @limit
+          `,
+          params: {limit},
+        });
+        const logs = rows.map((row) => ({
+          timestamp: row.timestamp && row.timestamp.value ?
+            row.timestamp.value : String(row.timestamp),
+          level: row.level,
+          category: row.category,
+          message: row.message,
+        }));
+        return res.json({ok: true, logs});
+      } catch (error) {
+        console.error("getRecentLogs error:", error);
+        return res.status(500).json({
+          ok: false, error: "Failed to load logs.", details: error.message,
+        });
+      }
+    },
+);
+
 exports.getDashboardStats = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) {
     return;
