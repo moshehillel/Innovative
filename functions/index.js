@@ -39,7 +39,15 @@ const BQ_SUMMARIES_SCHEMA = [
 ];
 
 const db = admin.firestore();
-const bucket = admin.storage().bucket();
+let _bucket = null;
+/**
+ * Returns the default Storage bucket, lazily initialized.
+ * @return {object} Firebase Storage bucket.
+ */
+function getBucket() {
+  if (!_bucket) _bucket = admin.storage().bucket();
+  return _bucket;
+}
 
 /**
  * Gets timestamp for deletion after specified days.
@@ -63,7 +71,7 @@ async function downloadStorageFileBase64(storagePath) {
     return null;
   }
 
-  const [buf] = await bucket.file(storagePath).download();
+  const [buf] = await getBucket().file(storagePath).download();
   return Buffer.from(buf).toString("base64");
 }
 
@@ -1831,7 +1839,8 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
 
     if (invoice.pod.source === "attachment") {
       // POD is embedded in invoice PDF at specific page
-      const [fileBuffer] = await bucket.file(podAtt.storagePath).download();
+      const [fileBuffer] = await getBucket()
+          .file(podAtt.storagePath).download();
       const doc = await PDFDocument.load(fileBuffer);
       const pageCount = doc.getPageCount();
 
@@ -1847,7 +1856,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       const pdfBytes = await newDoc.save();
       const storagePath = `podOnly/${invoiceId}/pod.pdf`;
 
-      await bucket.file(storagePath).save(Buffer.from(pdfBytes), {
+      await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
         metadata: {
           contentType: "application/pdf",
         },
@@ -1866,7 +1875,8 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       );
       const pageNum = Number(invoice.pod.page) || 1;
 
-      const [fileBuffer] = await bucket.file(podAtt.storagePath).download();
+      const [fileBuffer] = await getBucket()
+          .file(podAtt.storagePath).download();
       const doc = await PDFDocument.load(fileBuffer);
       const pageCount = doc.getPageCount();
 
@@ -1882,7 +1892,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       const pdfBytes = await newDoc.save();
       const storagePath = `podOnly/${invoiceId}/pod.pdf`;
 
-      await bucket.file(storagePath).save(Buffer.from(pdfBytes), {
+      await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
         metadata: {contentType: "application/pdf"},
       });
 
@@ -1893,7 +1903,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       return null;
     }
 
-    const [fileBuffer] = await bucket.file(podAtt.storagePath).download();
+    const [fileBuffer] = await getBucket().file(podAtt.storagePath).download();
     const doc = await PDFDocument.load(fileBuffer);
     const pageCount = doc.getPageCount();
 
@@ -1908,7 +1918,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
     const pdfBytes = await newDoc.save();
     const storagePath = `podOnly/${invoiceId}/pod.pdf`;
 
-    await bucket.file(storagePath).save(Buffer.from(pdfBytes), {
+    await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
       metadata: {
         contentType: "application/pdf",
       },
@@ -2636,7 +2646,7 @@ async function processGmailMessage(
       const storagePath =
           `emailAttachments/${messageId}/${Date.now()}-${safeFilename}`;
 
-      await bucket.file(storagePath).save(fileBuffer, {
+      await getBucket().file(storagePath).save(fileBuffer, {
         metadata: {contentType: "application/pdf"},
       });
 
