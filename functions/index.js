@@ -278,17 +278,17 @@ function normalizeLoadNumber(loadNumber) {
 }
 
 /**
- * Validates a load number is exactly 9 digits.
+ * Validates a load number is 5–9 digits.
  * @param {string|null|undefined} loadNumber Raw load number.
  * @return {boolean} True if valid.
  */
 function isValidLoadNumber(loadNumber) {
   const normalized = normalizeLoadNumber(loadNumber);
-  return /^\d{9}$/.test(normalized);
+  return /^\d{5,9}$/.test(normalized);
 }
 
 /**
- * Returns the most recently created valid 9-digit load number from invoices.
+ * Returns the most recently created valid load number from invoices.
  * @return {Promise<number|null>} Last known load number, or null.
  */
 async function getLastKnownLoadNumber() {
@@ -302,7 +302,7 @@ async function getLastKnownLoadNumber() {
     for (const doc of snap.docs) {
       const inv = doc.data();
       const normalized = normalizeLoadNumber(inv.loadNumber);
-      if (/^\d{9}$/.test(normalized)) {
+      if (/^\d{5,9}$/.test(normalized)) {
         const n = Number(normalized);
         if (Number.isFinite(n)) {
           return n;
@@ -326,7 +326,7 @@ async function getLastKnownLoadNumber() {
 async function summarizeSingleFlow(flowId, logs) {
   const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
 
-  const lastLog = logs[logs.length - 1];
+  const lastLog = logs.length > 0 ? logs[logs.length - 1] : {};
   const messageId = lastLog.messageId || null;
   const invoiceId = lastLog.invoiceId || null;
 
@@ -571,6 +571,11 @@ exports.checkStuckFlows = onRequest(async (req, res) => {
       }
 
       const flowId = inv.flowId || inv.gmailMessageId || doc.id;
+      const carrier = inv.carrierName || "Unknown carrier";
+      const loadNum = inv.loadNumber || "—";
+      const amount = inv.invoiceAmount ? `$${inv.invoiceAmount}` : "—";
+      const lastStep = inv.currentStep || inv.decisionStage || "unknown step";
+      const stuckMins = Math.round(ageMs / 60000);
 
       await doc.ref.update({
         processingLock: false,
@@ -578,14 +583,6 @@ exports.checkStuckFlows = onRequest(async (req, res) => {
         decisionStage: "stuck",
         decisionReason: "No heartbeat for 20+ minutes while locked",
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      await saveOutboundEmail({
-        type: "stuck_flow",
-        invoiceId: doc.id,
-        subject: `Workflow stuck: ${doc.id}`,
-        html: `<p>Workflow stuck for invoice ${doc.id} ` +
-          `(flowId: ${flowId}).</p>`,
       });
 
       const [logRows] = await bigquery.query({
@@ -597,11 +594,46 @@ exports.checkStuckFlows = onRequest(async (req, res) => {
         params: {flowId: String(flowId)},
       });
 
-      const summary = await summarizeSingleFlow(flowId, logRows);
+      const summary = logRows.length > 0 ?
+        await summarizeSingleFlow(flowId, logRows) : null;
+      const aiSum = summary && summary.summary;
+      const summaryText = aiSum && aiSum.aiSummary ?
+        `<p><strong>Summary:</strong> ` +
+        `${escapeHtml(aiSum.aiSummary)}</p>` : "";
+      const fixText = aiSum && aiSum.recommendedFix ?
+        `<p><strong>Recommended fix:</strong> ` +
+        `${escapeHtml(aiSum.recommendedFix)}</p>` : "";
+
+      await saveOutboundEmail({
+        type: "stuck_flow",
+        invoiceId: doc.id,
+        subject: `Workflow stuck — Load ${loadNum} (${carrier})`,
+        html:
+          `<h2>Workflow Stuck</h2>` +
+          `<table style="border-collapse:collapse;font-size:14px">` +
+          `<tr><td style="padding:4px 12px 4px 0">` +
+          `<strong>Carrier</strong></td>` +
+          `<td>${escapeHtml(carrier)}</td></tr>` +
+          `<tr><td style="padding:4px 12px 4px 0">` +
+          `<strong>Load #</strong></td>` +
+          `<td>${escapeHtml(loadNum)}</td></tr>` +
+          `<tr><td style="padding:4px 12px 4px 0">` +
+          `<strong>Invoice Amount</strong></td>` +
+          `<td>${escapeHtml(amount)}</td></tr>` +
+          `<tr><td style="padding:4px 12px 4px 0">` +
+          `<strong>Stuck at</strong></td>` +
+          `<td>${escapeHtml(lastStep)} (${stuckMins} min ago)</td></tr>` +
+          `</table>` +
+          summaryText + fixText +
+          `<p style="color:#6b7280;font-size:12px">` +
+          `Invoice ID: ${doc.id}</p>`,
+      });
+
       results.push({
         invoiceId: doc.id,
         flowId,
-        summaryStatus: summary.summary.finalStatus || "unknown",
+        summaryStatus: summary && summary.summary ?
+          summary.summary.finalStatus || "unknown" : "no_logs",
       });
     }
 
@@ -1607,10 +1639,10 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Load number may also appear as SHIPPER B/L NUMBER, " +
         "Invoice Number, B/L, Broker Ref, BOL Number.",
         "If you cannot find loadNumber using labeled fields, scan for any " +
-        "9-digit number (ignoring spaces and dashes).",
-        "If lastKnownLoadNumber is provided, prefer a 9-digit candidate " +
+        "5–9 digit number (ignoring spaces and dashes).",
+        "If lastKnownLoadNumber is provided, prefer a 5–9 digit candidate " +
         "where abs(candidate - lastKnownLoadNumber) <= 100000.",
-        "If no valid 9-digit candidate is found, return loadNumber as " +
+        "If no valid 5–9 digit candidate is found, return loadNumber as " +
         "empty string.",
         "PRO number may appear as PRO #, Carrier PRO, " +
         "Beyond PRO, Advance PRO, or freight bill number.",
@@ -2674,9 +2706,11 @@ async function processGmailMessage(
       normalizedLoadNumber !== normalizedProNumber);
     const loadNumberInt = Number(normalizedLoadNumber);
 
+    const sameDigitLength = lastKnownLoadNumber === null ? true :
+      String(loadNumberInt).length === String(lastKnownLoadNumber).length;
     const withinRange = lastKnownLoadNumber === null ? true :
-      (Number.isFinite(loadNumberInt) &&
-      Math.abs(loadNumberInt - lastKnownLoadNumber) <= 100000);
+      (!sameDigitLength || (Number.isFinite(loadNumberInt) &&
+      Math.abs(loadNumberInt - lastKnownLoadNumber) <= 100000));
 
     const loadGateFailed = !isLoadNumberValid || !withinRange;
     if (loadGateFailed) {
@@ -2687,7 +2721,7 @@ async function processGmailMessage(
           "Could not find a valid load number on this invoice",
           `I processed the invoice from ` +
           `${aiResult.carrierName || "this carrier"} but could not find ` +
-          `a valid 9-digit load number. Without a load number I cannot ` +
+          `a valid load number. Without a load number I cannot ` +
           `match this invoice to a shipment in Primus. Please verify the ` +
           `load number with the carrier and reprocess, or handle this ` +
           `invoice manually.`,
@@ -3429,6 +3463,178 @@ exports.gmailDisconnect = onRequest(
     },
 );
 
+exports.setCustomerRate = onRequest(async (req, res) => {
+  const invoiceId = req.query.invoiceId || (req.body && req.body.invoiceId);
+  if (!invoiceId) {
+    return res.status(400).send("Missing invoiceId.");
+  }
+
+  const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+  const snap = await invoiceRef.get();
+  if (!snap.exists) {
+    return res.status(404).send("Invoice not found.");
+  }
+  const inv = snap.data();
+
+  // ── GET — show form ──────────────────────────────────────────────────────
+  if (req.method === "GET") {
+    const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Set Customer Rate — Load ${escapeHtml(inv.loadNumber || "")}</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      background:#f5f6fa;margin:0;padding:2rem;color:#1f2430}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;
+      padding:2rem;max-width:480px;margin:0 auto}
+    h2{margin:0 0 1.25rem;font-size:1.15rem}
+    .field{margin-bottom:1rem}
+    label{display:block;font-size:.85rem;font-weight:600;
+      color:#6b7280;margin-bottom:.35rem}
+    .readonly{padding:.5rem .75rem;background:#f5f6fa;border:1px solid #e5e7eb;
+      border-radius:8px;font-size:.95rem}
+    input[type=number],input[type=text]{width:100%;padding:.5rem .75rem;
+      border:1px solid #d1d5db;border-radius:8px;font-size:.95rem;
+      box-sizing:border-box}
+    input:focus{outline:none;border-color:#4f46e5}
+    .btn{width:100%;padding:.65rem;background:#4f46e5;color:#fff;
+      border:none;border-radius:8px;font-size:1rem;font-weight:600;
+      cursor:pointer;margin-top:.5rem}
+    .btn:hover{opacity:.9}
+    .note{font-size:.8rem;color:#6b7280;margin-top:1rem}
+  </style>
+</head>
+<body>
+<div class="card">
+  <h2>Set Customer Rate — Load ${escapeHtml(inv.loadNumber || "—")}</h2>
+  <form method="POST">
+    <input type="hidden" name="invoiceId" value="${escapeHtml(invoiceId)}"/>
+    <div class="field">
+      <label>Carrier</label>
+      <div class="readonly">${escapeHtml(inv.carrierName || "—")}</div>
+    </div>
+    <div class="field">
+      <label>Carrier Invoice Amount</label>
+      <div class="readonly">$${escapeHtml(String(
+      inv.invoiceAmount || "—"))}</div>
+    </div>
+    <div class="field">
+      <label>Customer Name</label>
+      <input type="text" name="customerName"
+        value="${escapeHtml(inv.customerName || "")}"
+        placeholder="e.g. S3 Holdings LLC" required/>
+    </div>
+    <div class="field">
+      <label>Customer Rate ($)</label>
+      <input type="number" name="customerRate" min="1" step="0.01"
+        placeholder="e.g. 2100" required/>
+    </div>
+    <button type="submit" class="btn">Save &amp; Continue Workflow</button>
+  </form>
+  <p class="note">This will save the rate and automatically resume
+    the invoice workflow.</p>
+</div>
+</body></html>`;
+    return res.send(html);
+  }
+
+  // ── POST — save rate and resume ──────────────────────────────────────────
+  if (req.method !== "POST") {
+    return res.status(405).send("Method not allowed.");
+  }
+
+  const customerRate = Number(req.body.customerRate);
+  const customerName = String(req.body.customerName || "").trim();
+
+  if (!customerRate || customerRate <= 0) {
+    return res.status(400).send("Invalid customer rate.");
+  }
+
+  const primusSteps = inv.primusSteps || {};
+
+  // Push rate to Primus booking before resuming workflow.
+  let primusUpdateOk = false;
+  try {
+    const booking = await fetchPrimusBooking(inv.loadNumber);
+    if (booking && booking.BOLId) {
+      const putBody = {
+        accountingInformation: {customerQuoteAmount: customerRate},
+      };
+      await primusRequest("PUT", `/book/${booking.BOLId}`, putBody);
+      primusUpdateOk = true;
+      await writeLog("info", "primus",
+          "Customer rate updated in Primus booking", {
+            invoiceId,
+            loadNumber: inv.loadNumber,
+            customerRate,
+            BOLId: booking.BOLId,
+          });
+    }
+  } catch (primusErr) {
+    await writeLog("warn", "primus",
+        "Could not update customer rate in Primus booking", {
+          invoiceId,
+          loadNumber: inv.loadNumber,
+          error: primusErr.message,
+        });
+  }
+
+  await invoiceRef.update({
+    customerRate,
+    customerName: customerName || inv.customerName || null,
+    primusRateUpdated: primusUpdateOk,
+    primusSteps: {...primusSteps, customerRateChecked: true},
+    workflowPausedAtStep: null,
+    workflowPausedAt: null,
+    finalWorkflowStatus: "running",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  await writeLog("info", "workflow", "Customer rate set manually", {
+    invoiceId,
+    loadNumber: inv.loadNumber,
+    customerRate,
+    customerName,
+    primusUpdateOk,
+  });
+
+  const workflowUrl =
+    process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+    "https://us-central1-tai-invoice-automation.cloudfunctions.net" +
+    "/processPrimusWorkflow";
+
+  fetch(workflowUrl, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({invoiceId, resumeFrom: "generate_invoice"}),
+  }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
+
+  return res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Rate saved</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      background:#f5f6fa;margin:0;padding:2rem;color:#1f2430}
+    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;
+      padding:2rem;max-width:480px;margin:0 auto;text-align:center}
+    h2{color:#16a34a}
+  </style>
+</head>
+<body>
+<div class="card">
+  <h2>✓ Rate saved</h2>
+  <p>Customer rate of <strong>$${customerRate}</strong> saved for
+    Load ${escapeHtml(inv.loadNumber || invoiceId)}.</p>
+  <p>The workflow is resuming — you will receive the customer invoice
+    shortly.</p>
+</div>
+</body></html>`);
+});
+
 exports.getRecentLogs = onRequest(
     {invoker: "public"},
     async (req, res) => {
@@ -3771,6 +3977,7 @@ exports.checkGmailInbox = onRequest(
         const qAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
         const gmailQuery = [
           "in:inbox",
+          "is:unread",
           `after:${qAfter.getFullYear()}/${
             qAfter.getMonth() + 1}/${qAfter.getDate()}`,
         ].join(" ");
@@ -3818,6 +4025,15 @@ exports.checkGmailInbox = onRequest(
 
         for (const message of messages) {
           try {
+            // Skip if already processed (deduplication guard).
+            const alreadyProcessed = await db.collection("emailIntake")
+                .where("gmailMessageId", "==", message.id).limit(1).get();
+            if (!alreadyProcessed.empty) {
+              await writeLog("info", "gmail",
+                  `Skipping already-processed message ${message.id}`);
+              continue;
+            }
+
             await writeLog(
                 "info",
                 "gmail",
@@ -3833,6 +4049,13 @@ exports.checkGmailInbox = onRequest(
                 inboxFlowId,
                 lastKnownLoadNumber,
             );
+
+            // Mark as read so it won't appear in future unread queries.
+            await gmail.users.messages.modify({
+              userId: "me",
+              id: message.id,
+              requestBody: {removeLabelIds: ["UNREAD"]},
+            });
           } catch (error) {
             await writeLog("error", "gmail", `Error processing message`, {
               messageId: message.id,
@@ -3887,6 +4110,19 @@ exports.checkGmailInbox = onRequest(
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               deleteAt: getDeleteAt(30),
             });
+
+            try {
+              await gmail.users.messages.modify({
+                userId: "me",
+                id: message.id,
+                requestBody: {removeLabelIds: ["UNREAD"]},
+              });
+            } catch (markErr) {
+              console.error(
+                  `Failed to mark message ${message.id} as read:`,
+                  markErr.message,
+              );
+            }
           }
         }
 
@@ -4706,33 +4942,7 @@ exports.processPrimusWorkflow = onRequest(
           workingProNumber = primusProNumber || workingProNumber;
         }
 
-        // Ensure approval only runs if shipment has valid PRO
-        if (!workingProNumber || workingProNumber.trim() === "") {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "pro_check_started",
-            stepStatus: "failed",
-            reason: "No valid PRO number available for approval",
-            error: "MISSING_PRO",
-          });
-
-          await writeLog("error", "workflow", "Cannot approve without PRO", {
-            invoiceId: invoiceId,
-            loadNumber: invoice.loadNumber,
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "missing_pro",
-            decisionReason: "No valid PRO number available for approval",
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "MISSING_PRO",
-          });
-        }
+        // PRO is optional for FTL; workflow proceeds on load number alone.
 
         if (!currentStep || currentStep === "mark_delivered" ||
         currentStep === "check_customer" ||
@@ -4981,14 +5191,34 @@ exports.processPrimusWorkflow = onRequest(
           );
 
           const baseUrl = `https://${req.get("host")}`;
-          const htmlContent =
-        `<p>Invoice ${invoiceId} has no customer rate.</p>` +
-        `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
           await saveOutboundEmail({
             type: "rate_missing",
             invoiceId,
-            subject: "Customer rate needs attention",
-            html: htmlContent,
+            subject: `Action needed — No customer rate` +
+              ` for Load ${invoice.loadNumber}`,
+            html:
+              `<h2>Customer Rate Missing</h2>` +
+              `<p>No customer rate was found for this load. ` +
+              `Click the button below to enter the rate and ` +
+              `resume the workflow automatically.</p>` +
+              `<table style="border-collapse:collapse;` +
+              `font-size:14px;margin:12px 0">` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Carrier</strong></td>` +
+              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Load #</strong></td>` +
+              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Carrier Invoice</strong></td>` +
+              `<td>$${invoice.invoiceAmount || "—"}</td></tr>` +
+              `</table>` +
+              `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
+              `${encodeURIComponent(invoiceId)}" ` +
+              `style="display:inline-block;padding:.6rem 1.25rem;` +
+              `background:#4f46e5;color:#fff;border-radius:8px;` +
+              `font-weight:600;text-decoration:none;margin-top:.5rem">` +
+              `Set Customer Rate</a>`,
           });
 
           return res.json({
@@ -5037,16 +5267,50 @@ exports.processPrimusWorkflow = onRequest(
           );
 
           const baseUrl = `https://${req.get("host")}`;
-          const rateStatus = !customerRate || Number(customerRate) <= 0 ?
-        "no customer rate" : "low margin";
-          const htmlContent =
-        `<p>Invoice ${invoiceId} has ${rateStatus}.</p>` +
-        `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
+          const isLowMargin = customerRate > 0;
+          const marginPct = customerRate > 0 ?
+            Math.round((profit / customerRate) * 100) : 0;
           await saveOutboundEmail({
             type: "rate_missing",
             invoiceId,
-            subject: "Customer rate needs attention",
-            html: htmlContent,
+            subject: `Action needed — ` +
+              `${isLowMargin ? "Low margin" : "No customer rate"}` +
+              ` for Load ${invoice.loadNumber}`,
+            html:
+              `<h2>${isLowMargin ?
+                "Low Margin Warning" : "Customer Rate Missing"}</h2>` +
+              `<p>${isLowMargin ?
+                "Margin is below the $15 minimum." :
+                "No customer rate found in Primus."} ` +
+              `Set the customer quote in Primus then click ` +
+              `<strong>Continue Workflow</strong>.</p>` +
+              `<table style="border-collapse:collapse;` +
+              `font-size:14px;margin:12px 0">` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Carrier</strong></td>` +
+              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Load #</strong></td>` +
+              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Carrier Invoice</strong></td>` +
+              `<td>$${invoice.invoiceAmount || "—"}</td></tr>` +
+              `<tr><td style="padding:4px 12px 4px 0">` +
+              `<strong>Customer Rate</strong></td>` +
+              `<td>${customerRate > 0 ?
+                `$${customerRate}` : "Not set"}</td></tr>` +
+              (isLowMargin ?
+                `<tr><td style="padding:4px 12px 4px 0">` +
+                `<strong>Profit</strong></td>` +
+                `<td>$${profit} (${marginPct}%)</td></tr>` : "") +
+              `</table>` +
+              `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
+              `${encodeURIComponent(invoiceId)}" ` +
+              `style="display:inline-block;padding:.6rem 1.25rem;` +
+              `background:#4f46e5;color:#fff;border-radius:8px;` +
+              `font-weight:600;text-decoration:none;margin-top:.5rem">` +
+              `${isLowMargin ? "Update Customer Rate" : "Set Customer Rate"}` +
+              `</a>`,
           });
 
           return res.json({
