@@ -580,14 +580,6 @@ exports.checkStuckFlows = onRequest(async (req, res) => {
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      if (inv.gmailMessageId) {
-        await applyGmailOutcomeByStoredTokens(
-            inv.gmailMessageId,
-            "ERROR",
-            false,
-        );
-      }
-
       await saveOutboundEmail({
         type: "stuck_flow",
         invoiceId: doc.id,
@@ -1427,6 +1419,57 @@ async function forwardToHumanReview(
 }
 
 /**
+ * Sends an email via the connected Gmail account using stored OAuth tokens.
+ * @param {string} to Recipient email address.
+ * @param {string} subject Email subject.
+ * @param {string} html HTML body.
+ * @param {Array<object>} attachments PDF attachments array.
+ * @return {Promise<void>}
+ */
+async function sendViaGmail(to, subject, html, attachments = []) {
+  const gmailDoc = await db.collection("settings").doc("gmail").get();
+  if (!gmailDoc.exists) throw new Error("Gmail not connected");
+  const tokens = gmailDoc.data().tokens || gmailDoc.data();
+  const oauth2Client = getGmailOAuthClient();
+  oauth2Client.setCredentials(tokens);
+  const gmail = google.gmail({version: "v1", auth: oauth2Client});
+
+  const boundary = `msg_${crypto.randomBytes(16).toString("hex")}`;
+  const safeTo = String(to || "").replace(/[\r\n]/g, "");
+  const safeSubject = String(subject || "").replace(/[\r\n]/g, " ");
+
+  const lines = [
+    `To: ${safeTo}\r\n`,
+    `Subject: ${safeSubject}\r\n`,
+    `MIME-Version: 1.0\r\n`,
+    `Content-Type: multipart/mixed; boundary="${boundary}"\r\n`,
+    `\r\n`,
+    `--${boundary}\r\n`,
+    `Content-Type: text/html; charset="UTF-8"\r\n`,
+    `Content-Transfer-Encoding: 7bit\r\n`,
+    `\r\n`,
+    `${html}\r\n`,
+  ];
+
+  for (const att of attachments) {
+    const wrapped = att.contentBase64
+        .replace(/.{1,76}/g, "$&\r\n").trim();
+    lines.push(
+        `--${boundary}\r\n`,
+        `Content-Type: ${att.contentType}; name="${att.filename}"\r\n`,
+        `Content-Disposition: attachment; filename="${att.filename}"\r\n`,
+        `Content-Transfer-Encoding: base64\r\n`,
+        `\r\n`,
+        `${wrapped}\r\n`,
+    );
+  }
+  lines.push(`--${boundary}--`);
+
+  const raw = Buffer.from(lines.join("")).toString("base64url");
+  await gmail.users.messages.send({userId: "me", requestBody: {raw}});
+}
+
+/**
  * Validates invoice amount by subtracting lumper charges before
  * comparing to rate.
  * @param {object} aiResult - AI classification result.
@@ -1670,55 +1713,26 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
  */
 async function saveOutboundEmail(email) {
   let sendResult = null;
-  const sendUrl = process.env.WORKFLOW_EMAIL_URL;
+  const to = process.env.ALERT_EMAIL || email.to || "";
 
-  // Log email sending attempt
-  console.log("saveOutboundEmail called:", {
-    type: email.type,
-    invoiceId: email.invoiceId,
-    to: email.to || process.env.WORKFLOW_EMAIL_TO,
-    sendUrl: sendUrl || "NOT SET",
-    hasAttachments: Array.isArray(email.attachments) ?
-      email.attachments.length : 0,
-  });
-
-  if (sendUrl) {
+  if (to) {
     try {
-      const response = await fetch(sendUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          to: email.to || process.env.WORKFLOW_EMAIL_TO || "",
-          subject: email.subject || "",
-          html: email.html || "",
-          text: email.text || "",
-          attachments: Array.isArray(email.attachments) ?
-            email.attachments : [],
-        }),
-      });
-
-      if (response.ok) {
-        const responseData = await response.json();
-        sendResult = {ok: true, ...responseData};
-        console.log("saveOutboundEmail send successful:", responseData);
-      } else {
-        const text = await response.text();
-        sendResult = {ok: false, status: response.status, response: text};
-        console.error("saveOutboundEmail send failed:", {
-          status: response.status,
-          response: text,
-        });
-      }
-    } catch (error) {
-      sendResult = {ok: false, error: error.message};
-      console.error("saveOutboundEmail send error:", error.message);
+      await sendViaGmail(
+          to,
+          email.subject || "",
+          email.html || "",
+          Array.isArray(email.attachments) ? email.attachments : [],
+      );
+      sendResult = {ok: true};
+    } catch (sendErr) {
+      sendResult = {ok: false, error: sendErr.message};
+      console.error("saveOutboundEmail send error:", sendErr.message);
     }
   } else {
-    console.warn(
-        "saveOutboundEmail: WORKFLOW_EMAIL_URL not set, email not sent",
-    );
+    console.warn("saveOutboundEmail: no recipient, email not sent", {
+      type: email.type,
+      invoiceId: email.invoiceId,
+    });
   }
 
   await db.collection("outboundEmails").add({
@@ -2024,128 +2038,6 @@ function normalizeAiChargeArrays(aiResult) {
     chargesNeedProof,
     chargeProofRefs,
   };
-}
-/**
- * Gets or creates a Gmail label.
- * @param {object} gmail Gmail client.
- * @param {string} labelName Label name.
- * @return {Promise<string>} Gmail label id.
- */
-async function getOrCreateGmailLabel(gmail, labelName) {
-  const labelList = await gmail.users.labels.list({
-    userId: "me",
-  });
-
-  const existing = (labelList.data.labels || []).find((label) => {
-    return label.name === labelName;
-  });
-
-  if (existing) {
-    return existing.id;
-  }
-
-  const created = await gmail.users.labels.create({
-    userId: "me",
-    requestBody: {
-      name: labelName,
-      labelListVisibility: "labelShow",
-      messageListVisibility: "show",
-    },
-  });
-
-  return created.data.id;
-}
-
-/**
- * Applies Gmail label and read/unread status.
- * @param {object} gmail Gmail client.
- * @param {string} messageId Gmail message id.
- * @param {string} labelName Label name.
- * @param {boolean} markRead Whether to mark read.
- * @return {Promise<void>}
- */
-async function applyGmailOutcome(gmail, messageId, labelName, markRead) {
-  const labelId = await getOrCreateGmailLabel(gmail, labelName);
-
-  const removeLabelIds = [];
-  if (markRead) {
-    removeLabelIds.push("UNREAD");
-  }
-
-  if (labelName !== "PROCESSING") {
-    try {
-      const processingLabelId = await getOrCreateGmailLabel(
-          gmail,
-          "PROCESSING",
-      );
-      if (processingLabelId) {
-        removeLabelIds.push(processingLabelId);
-      }
-    } catch (e) {
-      const warnMessage =
-          `Unable to resolve PROCESSING label id for message ${messageId}: ` +
-          `${e.message}`;
-      console.warn(warnMessage);
-    }
-  }
-
-  await gmail.users.messages.modify({
-    userId: "me",
-    id: messageId,
-    requestBody: {
-      addLabelIds: [labelId],
-      removeLabelIds: removeLabelIds,
-    },
-  });
-}
-
-/**
- * Applies Gmail label and read/unread status using stored tokens.
- * @param {string} messageId - The Gmail message ID.
- * @param {string} labelName - The label name.
- * @param {boolean} markRead - Whether to mark read.
- * @return {Promise<void>}
- */
-async function applyGmailOutcomeByStoredTokens(messageId, labelName, markRead) {
-  const gmailDoc = await db.collection("settings").doc("gmail").get();
-
-  if (!gmailDoc.exists) {
-    return;
-  }
-
-  const gmailSettings = gmailDoc.data();
-  const tokens = gmailSettings.tokens || gmailSettings;
-
-  const oauth2Client = getGmailOAuthClient();
-  oauth2Client.setCredentials(tokens);
-
-  const gmail = google.gmail({
-    version: "v1",
-    auth: oauth2Client,
-  });
-
-  await applyGmailOutcome(gmail, messageId, labelName, markRead);
-}
-
-/**
- * Creates or updates a Gmail queue document for a claimed message.
- * @param {string} messageId - The Gmail message ID.
- * @param {string} subject - The email subject.
- * @param {string} from - The email sender.
- * @param {string} inboxFlowId - The inbox check flow ID.
- * @return {Promise<void>}
- */
-/**
- * Claims a Gmail message for processing by applying the PROCESSING label.
- * @param {object} gmail - Gmail client.
- * @param {string} messageId - The Gmail message ID.
- * @return {Promise<void>}
- */
-async function claimGmailMessage(gmail, messageId) {
-  await writeLog("info", "gmail", "Claiming message for processing", {
-    messageId,
-  });
-  await applyGmailOutcome(gmail, messageId, "PROCESSING", false);
 }
 
 /**
@@ -2521,7 +2413,6 @@ async function processGmailMessage(
         });
         return;
       }
-      await claimGmailMessage(gmail, messageId);
     }
 
     if (attachments.length === 0) {
@@ -2533,13 +2424,11 @@ async function processGmailMessage(
           "Email received with no attachments",
           {department: "general"},
       );
-      await applyGmailOutcome(gmail, messageId, "NO_INVOICE_PDF", false);
       await updateGmailQueueStatus(messageId, "completed");
       await db.collection("emailIntake").doc(messageId).set({
         gmailMessageId: messageId,
         subject, from,
         finalStatus: "no_attachment",
-        finalLabel: "NO_INVOICE_PDF",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         deleteAt: getDeleteAt(30),
       }, {merge: true});
@@ -2683,13 +2572,11 @@ async function processGmailMessage(
             `Email contained ${typeList} attachment(s) but no invoice`;
       }
       await forwardWithAnalysis(noInvoiceReason, {department: "general"});
-      await applyGmailOutcome(gmail, messageId, "NO_INVOICE_PDF", false);
       await updateGmailQueueStatus(messageId, "completed");
       await db.collection("emailIntake").doc(messageId).set({
         gmailMessageId: messageId,
         subject, from,
         finalStatus: "no_invoice_pdf",
-        finalLabel: "NO_INVOICE_PDF",
         skippedAttachmentTypes: skippedDocTypes,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         deleteAt: getDeleteAt(30),
@@ -2776,9 +2663,7 @@ async function processGmailMessage(
       },
     });
 
-    let finalLabel = "ERROR";
     let finalStatus = "error";
-    let markRead = false;
     let primusResult = null;
 
     const normalizedLoadNumber =
@@ -2795,9 +2680,7 @@ async function processGmailMessage(
 
     const loadGateFailed = !isLoadNumberValid || !withinRange;
     if (loadGateFailed) {
-      finalLabel = "NO_LOAD_NUMBER";
       finalStatus = "no_load_number";
-      markRead = false;
 
       await forwardToHumanReview(
           gmail, messageId, subject, from,
@@ -2853,7 +2736,6 @@ async function processGmailMessage(
       // Stop execution: do not attempt Primus lookup or workflow.
     } else if (aiResult.status === "unrecognized_charges" ||
     hasUnrecognizedCharges) {
-      finalLabel = "UNRECOGNIZED_CHARGES";
       finalStatus = "unrecognized_charges";
       await forwardToHumanReview(
           gmail, messageId, subject, from,
@@ -2894,7 +2776,6 @@ async function processGmailMessage(
       });
     } else if (aiResult.status === "charges_no_proof" ||
     hasChargesNeedProof) {
-      finalLabel = "CHARGES_NO_PROOF";
       finalStatus = "charges_no_proof";
       await forwardToHumanReview(
           gmail, messageId, subject, from,
@@ -2988,7 +2869,6 @@ async function processGmailMessage(
                 emailBody,
               },
           );
-          finalLabel = "UNMATCHED_AMOUNT";
           finalStatus = "unmatched_amount";
         }
       }
@@ -3022,7 +2902,6 @@ async function processGmailMessage(
                 },
               },
           );
-          finalLabel = "NO_RATE";
           finalStatus = "no_rate";
         } else if (profitCheck.lowMargin) {
           // Margin < 10%: flag for broker commission adjustment
@@ -3038,7 +2917,7 @@ async function processGmailMessage(
 
       // Only run Primus validation if earlier checks didn't already
       // reject this invoice
-      if (finalLabel !== "NO_RATE" && finalLabel !== "UNMATCHED_AMOUNT") {
+      if (finalStatus !== "no_rate" && finalStatus !== "unmatched_amount") {
         await writeLog("info", "primus", `Starting Primus validation`, {
           messageId: messageId,
           proNumber: aiResult.proNumber,
@@ -3068,9 +2947,7 @@ async function processGmailMessage(
         });
 
         if (primusResult.ok === true && primusResult.validAmount === true) {
-          finalLabel = "PROCESSING";
           finalStatus = "processing";
-          markRead = false;
           await writeLog("info", "gmail", `Invoice queued for workflow`, {
             messageId: messageId,
             primusAmount: primusResult.amount,
@@ -3078,7 +2955,6 @@ async function processGmailMessage(
         } else if (primusResult.ok === false &&
                primusResult.reason &&
                primusResult.reason.toLowerCase().includes("not found")) {
-          finalLabel = "NOT_FOUND";
           finalStatus = "not_found";
           await writeLog("warn", "primus", "Shipment not found in Primus", {
             event: "Primus validation failed",
@@ -3110,7 +2986,6 @@ async function processGmailMessage(
               },
           );
         } else {
-          finalLabel = "UNMATCHED_AMOUNT";
           finalStatus = "unmatched_amount";
           await writeLog("warn", "primus", "Primus validation failed", {
             event: "Primus validation failed",
@@ -3155,7 +3030,6 @@ async function processGmailMessage(
       // Claude returned a status we don't have a rule for (e.g. "error",
       // "unmatched_amount" returned directly). Forward with AI note so a
       // human can handle it, and label ERROR.
-      finalLabel = "ERROR";
       finalStatus = "error";
       await writeLog("warn", "ai", "Unexpected AI classification status", {
         messageId, status: aiResult.status,
@@ -3166,28 +3040,11 @@ async function processGmailMessage(
       );
     }
 
-    await writeLog("info", "gmail", `Applying Gmail label`, {
-      messageId: messageId,
-      label: finalLabel,
-      markRead: markRead,
-    });
-
-    await applyGmailOutcome(
-        gmail,
-        messageId,
-        finalLabel,
-        markRead,
-    );
-
     await writeLog(
         "info",
         "gmail",
         `Saving to emailIntake collection`,
-        {
-          messageId: messageId,
-          finalStatus: finalStatus,
-          finalLabel: finalLabel,
-        },
+        {messageId: messageId, finalStatus: finalStatus},
     );
 
     const emailIntakeRef = db.collection("emailIntake").doc(messageId);
@@ -3199,9 +3056,7 @@ async function processGmailMessage(
 
       tx.set(emailIntakeRef, {
         primusResult: primusResult,
-        finalLabel: finalLabel,
         finalStatus: finalStatus,
-        markRead: markRead,
         gmailMessageId: messageId,
         from: from,
         subject: subject,
@@ -3419,7 +3274,6 @@ async function processGmailMessage(
 
     await writeLog("info", "gmail", `Email processing completed`, {
       messageId: messageId,
-      finalLabel: finalLabel,
       finalStatus: finalStatus,
     });
 
@@ -3865,19 +3719,11 @@ exports.checkGmailInbox = onRequest(
             {flowId: inboxFlowId, currentStep: "gmail_inbox_check"},
         );
 
+        const qAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
         const gmailQuery = [
           "in:inbox",
-          "is:unread",
-          "-label:PROCESSING",
-          "-label:APPROVED",
-          "-label:UNMATCHED_AMOUNT",
-          "-label:UNRECOGNIZED_CHARGES",
-          "-label:CHARGES_NO_PROOF",
-          "-label:NOT_FOUND",
-          "-label:NO_LOAD_NUMBER",
-          "-label:NO_INVOICE_PDF",
-          "-label:NO_RATE",
-          "-label:ERROR",
+          `after:${qAfter.getFullYear()}/${
+            qAfter.getMonth() + 1}/${qAfter.getDate()}`,
         ].join(" ");
 
         const messages = [];
@@ -3946,8 +3792,6 @@ exports.checkGmailInbox = onRequest(
             });
 
             console.error(`Error processing message ${message.id}:`, error);
-
-            await applyGmailOutcomeByStoredTokens(message.id, "ERROR", false);
 
             try {
               let errSubject = "(unknown subject)";
@@ -4397,6 +4241,8 @@ async function generateCustomerInvoice(invoiceData) {
       ok: true,
       customerInvoiceId: invoiceResult.invoiceId,
       invoiceNumber: invoiceResult.invoiceNumber,
+      invoicePdfUrl: (invoiceResult.shipment &&
+          invoiceResult.shipment.url) || null,
     };
   } catch (error) {
     await writeLog("error", "primus", "Failed to generate customer invoice", {
@@ -4522,14 +4368,6 @@ exports.processPrimusWorkflow = onRequest(
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          if (invoice.gmailMessageId) {
-            await applyGmailOutcomeByStoredTokens(
-                invoice.gmailMessageId,
-                "UNRECOGNIZED_CHARGES",
-                false,
-            );
-          }
-
           return res.json({
             ok: false,
             error: "UNRECOGNIZED_CHARGES",
@@ -4554,14 +4392,6 @@ exports.processPrimusWorkflow = onRequest(
             finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-
-          if (invoice.gmailMessageId) {
-            await applyGmailOutcomeByStoredTokens(
-                invoice.gmailMessageId,
-                "CHARGES_NO_PROOF",
-                false,
-            );
-          }
 
           return res.json({
             ok: false,
@@ -4691,14 +4521,6 @@ exports.processPrimusWorkflow = onRequest(
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          if (invoice.gmailMessageId) {
-            await applyGmailOutcomeByStoredTokens(
-                invoice.gmailMessageId,
-                "UNMATCHED_AMOUNT",
-                false,
-            );
-          }
-
           return res.json({
             ok: false,
             error: "UNMATCHED_AMOUNT",
@@ -4773,12 +4595,6 @@ exports.processPrimusWorkflow = onRequest(
                   },
               );
             }
-
-            await applyGmailOutcomeByStoredTokens(
-                invoice.gmailMessageId,
-                "EXTRA_CHARGES_REVIEW",
-                false,
-            );
           }
 
           return res.json({
@@ -4862,14 +4678,6 @@ exports.processPrimusWorkflow = onRequest(
             finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-
-          if (invoice.gmailMessageId) {
-            await applyGmailOutcomeByStoredTokens(
-                invoice.gmailMessageId,
-                "ERROR",
-                false,
-            );
-          }
 
           return res.json({
             ok: false,
@@ -5074,14 +4882,6 @@ exports.processPrimusWorkflow = onRequest(
             finalWorkflowStatus: "failed",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
-
-          if (invoice.gmailMessageId) {
-            await applyGmailOutcomeByStoredTokens(
-                invoice.gmailMessageId,
-                "ERROR",
-                false,
-            );
-          }
 
           return res.json({
             ok: false,
@@ -5339,14 +5139,37 @@ exports.processPrimusWorkflow = onRequest(
 
         const attachmentsToSend = [];
 
-        const customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
-          invoiceId,
-          loadNumber: invoice.loadNumber,
-          proNumber: workingProNumber,
-          customerName,
-          customerRate,
-          carrierInvoiceAmount: invoice.invoiceAmount,
-        });
+        // Try to use the Primus-generated invoice PDF first; fall back to
+        // locally generated PDF if the URL is unavailable or download fails.
+        const primusInvoiceUrl =
+            (invoiceGenerationResult &&
+            invoiceGenerationResult.invoicePdfUrl) || null;
+        let customerInvoicePdfBase64 = null;
+        if (primusInvoiceUrl) {
+          try {
+            const token = await getPrimusToken();
+            const pdfResp = await fetch(primusInvoiceUrl, {
+              headers: {Authorization: `Bearer ${token}`},
+            });
+            if (pdfResp.ok) {
+              const buf = await pdfResp.arrayBuffer();
+              customerInvoicePdfBase64 =
+                  Buffer.from(buf).toString("base64");
+            }
+          } catch (_) {
+            // fall through to local build
+          }
+        }
+        if (!customerInvoicePdfBase64) {
+          customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            proNumber: workingProNumber,
+            customerName,
+            customerRate,
+            carrierInvoiceAmount: invoice.invoiceAmount,
+          });
+        }
 
         attachmentsToSend.push({
           filename: `customer-invoice-${invoiceId}.pdf`,
@@ -5374,11 +5197,46 @@ exports.processPrimusWorkflow = onRequest(
 
         await setWorkflowHeartbeat(invoiceDoc.ref, "final_email_sending");
 
+        // Resolve customer email from Primus booking (billTo party).
+        let customerEmail = null;
+        try {
+          const bkData = await fetchPrimusBooking(invoice.loadNumber);
+          if (bkData) {
+            const billTo = bkData.billTo || "";
+            if (billTo === "thirdparty" && bkData.thirdParty) {
+              customerEmail = bkData.thirdParty.email || null;
+            }
+            if (!customerEmail && bkData.shipper) {
+              customerEmail = bkData.shipper.email || null;
+            }
+            if (!customerEmail && bkData.consignee) {
+              customerEmail = bkData.consignee.email || null;
+            }
+          }
+        } catch (_) {
+          // Non-fatal — email will go to ALERT_EMAIL fallback
+        }
+
+        const invoiceEmailSubject =
+            `Invoice — Load ${invoice.loadNumber}` +
+            (workingProNumber ? ` / PRO ${workingProNumber}` : "");
+        const invoiceEmailHtml =
+            `<p>Dear ${escapeHtml(customerName)},</p>` +
+            `<p>Please find attached your invoice for load ` +
+            `<strong>${escapeHtml(invoice.loadNumber)}</strong>` +
+            (workingProNumber ?
+              ` (PRO: ${escapeHtml(workingProNumber)})` : "") +
+            `.</p>` +
+            `<p>Amount: <strong>$${Number(customerRate).toFixed(2)
+            }</strong></p>` +
+            `<p>Thank you for your business.</p>`;
+
         await saveOutboundEmail({
           type: "generated_bill",
           invoiceId,
-          subject: "Generated bill ready",
-          html: `<p>Generated bill for invoice ${invoiceId}.</p>`,
+          to: customerEmail,
+          subject: invoiceEmailSubject,
+          html: invoiceEmailHtml,
           attachments: attachmentsToSend,
         });
 
@@ -5396,20 +5254,6 @@ exports.processPrimusWorkflow = onRequest(
           attachmentsSent: attachmentsToSend.length,
         });
 
-        if (invoice.gmailMessageId) {
-          await applyGmailOutcomeByStoredTokens(
-              invoice.gmailMessageId,
-              "APPROVED",
-              true,
-          );
-
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "gmail_label_updated",
-            stepStatus: "success",
-            output: {label: "APPROVED"},
-          });
-        }
 
         if (invoice.gmailMessageId) {
           await writeLog("info", "workflow", "Invoice approved and completed", {
@@ -5484,14 +5328,6 @@ exports.processPrimusWorkflow = onRequest(
               currentStep: inv.currentStep || "failed",
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
-
-            if (inv.gmailMessageId) {
-              await applyGmailOutcomeByStoredTokens(
-                  inv.gmailMessageId,
-                  "ERROR",
-                  false,
-              );
-            }
           }
         }
 
