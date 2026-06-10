@@ -678,7 +678,7 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
       (invoiceAmount - approvedChargesTotal);
 
     const missingRate = !customerRate || Number(customerRate) <= 0;
-    const lowMargin = !missingRate && profit < 15;
+    const lowMargin = !missingRate && profit < 10;
 
     if (!missingRate && !lowMargin) {
       return res.json({
@@ -1566,7 +1566,8 @@ async function getPrimusShipment(loadNumber, proNumber) {
     }
     if (!booking) return {found: false, rate: null, customerEmail: null};
     const acct = booking.accountingInformation || {};
-    const rate = parsePrimusAmount(acct.customerQuoteAmount);
+    const rate = parsePrimusAmount(acct.customerQuoteAmount) ||
+        parsePrimusAmount(acct.invoiceAmount);
     let customerEmail = null;
     if (booking.thirdParty && booking.thirdParty.email) {
       customerEmail = booking.thirdParty.email;
@@ -5247,7 +5248,7 @@ exports.processPrimusWorkflow = onRequest(
 
         await setWorkflowHeartbeat(invoiceDoc.ref, "customer_rate_checked");
 
-        if (!customerRate || Number(customerRate) <= 0 || profit < 15) {
+        if (!customerRate || Number(customerRate) <= 0 || profit < 10) {
           const pauseReason = !customerRate || Number(customerRate) <= 0 ?
         "Missing customer rate" : "Customer rate too low";
           await logWorkflowStep({
@@ -5280,7 +5281,7 @@ exports.processPrimusWorkflow = onRequest(
               `<h2>${isLowMargin ?
                 "Low Margin Warning" : "Customer Rate Missing"}</h2>` +
               `<p>${isLowMargin ?
-                "Margin is below the $15 minimum." :
+                "Margin is below the $10 minimum." :
                 "No customer rate found in Primus."} ` +
               `Set the customer quote in Primus then click ` +
               `<strong>Continue Workflow</strong>.</p>` +
