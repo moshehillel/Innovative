@@ -4,7 +4,7 @@ const admin = require("firebase-admin");
 const {google} = require("googleapis");
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
-const {PDFDocument, StandardFonts} = require("pdf-lib");
+const {PDFDocument, StandardFonts, rgb} = require("pdf-lib");
 const crypto = require("crypto");
 
 admin.initializeApp();
@@ -1791,25 +1791,153 @@ async function saveOutboundEmail(email) {
 async function buildCustomerInvoicePdfBase64(data) {
   const doc = await PDFDocument.create();
   const page = doc.addPage([612, 792]);
-  const {height} = page.getSize();
+  const W = 612;
+  const H = 792;
+  const MARGIN = 50;
 
-  const font = await doc.embedFont(StandardFonts.Helvetica);
-  const drawText = (text, x, y, size = 12) => {
-    page.drawText(String(text), {x, y, size, font});
+  const fontReg = await doc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+  const txt = (text, x, y, size, bold = false, color = null) => {
+    const opts = {x, y, size, font: bold ? fontBold : fontReg};
+    if (color) opts.color = color;
+    page.drawText(String(text ?? ""), opts);
   };
 
-  drawText("Customer Invoice", 50, height - 60, 18);
-  drawText(`Invoice ID: ${data.invoiceId}`, 50, height - 90, 12);
-  drawText(`Load: ${data.loadNumber || ""}`, 50, height - 110, 12);
-  drawText(`PRO: ${data.proNumber || ""}`, 50, height - 130, 12);
-  drawText(`Customer: ${data.customerName || ""}`, 50, height - 150, 12);
-  const customerRateText =
-    `Customer Rate: $${Number(data.customerRate || 0).toFixed(2)}`;
-  drawText(customerRateText, 50, height - 170, 12);
-  const carrierAmountText =
-    `Carrier Invoice Amount: $` +
-    `${Number(data.carrierInvoiceAmount || 0).toFixed(2)}`;
-  drawText(carrierAmountText, 50, height - 190, 12);
+  const BLUE = rgb(0.09, 0.28, 0.65);
+  const GRAY = rgb(0.45, 0.45, 0.45);
+  const BLACK = rgb(0, 0, 0);
+  const WHITE = rgb(1, 1, 1);
+  const LIGHT = rgb(0.95, 0.97, 1.0);
+
+  // Header bar
+  page.drawRectangle({x: 0, y: H - 80, width: W, height: 80, color: BLUE});
+  txt("INNOVATIVE CARRIERS", MARGIN, H - 38, 20, true, WHITE);
+  txt("FREIGHT INVOICE", W - 180, H - 38, 14, false, WHITE);
+
+  // Invoice meta block (right side)
+  const today = new Date();
+  const fmt = (d) => d.toLocaleDateString("en-US",
+      {month: "short", day: "numeric", year: "numeric"});
+  const dueDate = new Date(today);
+  dueDate.setDate(dueDate.getDate() + 30);
+
+  const invoiceNum = data.invoiceNumber ||
+      data.loadNumber || data.invoiceId || "";
+
+  // Light info box
+  page.drawRectangle(
+      {x: W - 210, y: H - 175, width: 160, height: 85, color: LIGHT});
+  txt("Invoice #:", W - 200, H - 105, 9, false, GRAY);
+  txt(String(invoiceNum), W - 200, H - 118, 11, true, BLACK);
+  txt("Date:", W - 200, H - 135, 9, false, GRAY);
+  txt(fmt(today), W - 200, H - 148, 10, false, BLACK);
+  txt("Due:", W - 200, H - 165, 9, false, GRAY);
+  txt(fmt(dueDate), W - 200, H - 178, 10, false, BLACK);
+
+  // Bill To
+  txt("BILL TO:", MARGIN, H - 110, 9, false, GRAY);
+  txt(data.customerName || "", MARGIN, H - 125, 12, true, BLACK);
+
+  // Divider
+  page.drawLine({
+    start: {x: MARGIN, y: H - 195},
+    end: {x: W - MARGIN, y: H - 195},
+    thickness: 1,
+    color: BLUE,
+  });
+
+  // Shipment details section
+  txt("SHIPMENT DETAILS", MARGIN, H - 220, 10, true, BLUE);
+
+  const col1 = MARGIN;
+  const col2 = 220;
+  const col3 = 390;
+
+  const detail = (label, value, x, y) => {
+    txt(label, x, y, 8, false, GRAY);
+    txt(value || "—", x, y - 13, 10, false, BLACK);
+  };
+
+  detail("Load / BOL #", String(data.loadNumber || ""), col1, H - 238);
+  detail("PRO #", String(data.proNumber || ""), col2, H - 238);
+  detail("Shipper", String(data.shipperName || ""), col3, H - 238);
+  detail("Consignee", String(data.consigneeName || ""), col1, H - 275);
+  detail("Origin", String(data.originCity || ""), col2, H - 275);
+  detail("Destination", String(data.destinationCity || ""), col3, H - 275);
+
+  // Divider
+  page.drawLine({
+    start: {x: MARGIN, y: H - 305},
+    end: {x: W - MARGIN, y: H - 305},
+    thickness: 0.5,
+    color: GRAY,
+  });
+
+  // Charges table header
+  page.drawRectangle(
+      {x: MARGIN, y: H - 335, width: W - MARGIN * 2, height: 22, color: BLUE},
+  );
+  txt("DESCRIPTION", MARGIN + 8, H - 328, 9, true, WHITE);
+  txt("QTY", W - 190, H - 328, 9, true, WHITE);
+  txt("RATE", W - 140, H - 328, 9, true, WHITE);
+  txt("AMOUNT", W - 80, H - 328, 9, true, WHITE);
+
+  // Charge row
+  const amt = Number(data.customerRate || 0);
+  page.drawRectangle(
+      {x: MARGIN, y: H - 360, width: W - MARGIN * 2, height: 22, color: LIGHT},
+  );
+  txt("Freight Charges", MARGIN + 8, H - 353, 10, false, BLACK);
+  txt("1", W - 186, H - 353, 10, false, BLACK);
+  txt(`$${amt.toFixed(2)}`, W - 145, H - 353, 10, false, BLACK);
+  txt(`$${amt.toFixed(2)}`, W - 85, H - 353, 10, true, BLACK);
+
+  // Total box
+  page.drawRectangle(
+      {x: W - 210, y: H - 405, width: 160, height: 36, color: BLUE});
+  txt("TOTAL DUE:", W - 200, H - 385, 10, false, WHITE);
+  txt(`$${amt.toFixed(2)}`, W - 200, H - 400, 14, true, WHITE);
+
+  // Divider
+  page.drawLine({
+    start: {x: MARGIN, y: H - 420},
+    end: {x: W - MARGIN, y: H - 420},
+    thickness: 1,
+    color: BLUE,
+  });
+
+  // Payment instructions
+  txt("PAYMENT INSTRUCTIONS", MARGIN, H - 440, 10, true, BLUE);
+
+  const payLines = [
+    ["ACH / Wire Transfer", true],
+    ["Bank: Customers Bank", false],
+    ["99 Bridge St, Phoenixville, PA 19460", false],
+    ["Account: 4255247", false],
+    ["Routing (ACH & Domestic Wire): 031302971", false],
+    ["", false],
+    ["Quickpay / Zelle", true],
+    ["accounting@innovativecarriers.com", false],
+    ["", false],
+    ["Check (email image)", true],
+    ["Abe@innovativecarriers.com", false],
+    ["", false],
+    ["Credit Card (3% fee)", true],
+    ["https://secure.cardknox.com/innovativecarriers", false],
+  ];
+
+  let py = H - 458;
+  for (const [line, bold] of payLines) {
+    if (line) txt(line, MARGIN, py, 9, bold, bold ? BLACK : GRAY);
+    py -= 13;
+  }
+
+  // Footer
+  page.drawRectangle({x: 0, y: 0, width: W, height: 28, color: BLUE});
+  txt("$50.00 maximum liability per shipment  |  " +
+      "Innovative Carriers  |  accounting@innovativecarriers.com",
+  MARGIN, 9, 8, false, WHITE);
 
   const pdfBytes = await doc.save();
   return Buffer.from(pdfBytes).toString("base64");
@@ -1864,6 +1992,14 @@ async function pauseWorkflow(
 async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
   try {
     if (!invoice || !invoice.pod || invoice.pod.found !== true) {
+      await writeLog("info", "workflow",
+          "POD not detected in this invoice — no extraction attempted", {
+            invoiceId,
+            loadNumber: invoice && invoice.loadNumber,
+            podFound: invoice && invoice.pod && invoice.pod.found,
+            podSource: invoice && invoice.pod && invoice.pod.source,
+            podReason: invoice && invoice.pod && invoice.pod.reason,
+          });
       return null;
     }
 
@@ -1874,6 +2010,13 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
     );
 
     if (!podAtt || !podAtt.storagePath) {
+      await writeLog("warn", "workflow",
+          "POD was detected by AI but attachment file not found in storage", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            expectedFilename: invoice.pod.attachmentFilename,
+            availableFilenames: attachments.map((a) => a && a.filename),
+          });
       return null;
     }
 
@@ -4507,16 +4650,23 @@ async function generateCustomerInvoice(invoiceData) {
     }
 
     if (existing.length > 0) {
+      // Prefer a generated (issued) invoice over drafts. Primus auto-creates a
+      // draft and we may also create a draft via API — if staff manually issues
+      // one in the Primus UI, that issued invoice is the authoritative one.
+      const issuedInv = existing.find((e) => e.status && e.status.generated);
+      const inv = issuedInv || existing[0];
       if (existing.length > 1) {
-        await writeLog("warn", "primus",
-            "Multiple customer invoice drafts found — using first; " +
-            "duplicates need manual cleanup in ShipPrimus", {
+        await writeLog(issuedInv ? "info" : "warn", "primus",
+            issuedInv ?
+              "Multiple invoices found — using the issued one" :
+              "Multiple invoice drafts found — using first; " +
+              "duplicates need manual cleanup in ShipPrimus", {
               loadNumber: invoiceData.loadNumber,
               BOLId,
-              invoiceIds: existing.map((e) => e.invoiceId),
+              selectedInvoiceId: inv.invoiceId,
+              allInvoiceIds: existing.map((e) => e.invoiceId),
             });
       }
-      const inv = existing[0];
       const total = Number(inv.total || 0);
       // AMOUNT SANITY CHECK — compare the draft total against the agreed
       // sell rate. Human-entered rate wins; fall back to whichever Primus
@@ -5665,14 +5815,35 @@ exports.processPrimusWorkflow = onRequest(
         // "extra_charges_pending_review"), so finalCustomerInvoiceId only
         // ever reflects the base freight amount.
 
-        // Determine PDF source before logging/completing — only attempt
-        // Primus download when the invoice is in "generated" state.
+        // Determine PDF source. Query the Primus document endpoint to get the
+        // real issued invoice URL — only present when the invoice has been
+        // issued/generated. This is more reliable than invoiceGenerationResult
+        // .invoicePdfUrl (which uses a hash that only works in the browser).
         const primusGenerated =
             invoiceGenerationResult && invoiceGenerationResult.generated;
-        const primusInvoiceUrl =
-            (primusGenerated &&
-            invoiceGenerationResult.invoicePdfUrl) || null;
+        let primusInvoiceUrl = null;
         let customerInvoicePdfBase64 = null;
+        try {
+          const docToken = await getPrimusToken();
+          const docResp = await fetch(
+              `${process.env.PRIMUS_BASE_URL}/document/bolnumber/` +
+              `${invoice.loadNumber}`,
+              {headers: {Authorization: `Bearer ${docToken}`}},
+          );
+          const docData = await docResp.json();
+          const allDocs = (docData.data && docData.data.results) || [];
+          const invDoc = allDocs.find((d) => d.type === "INV");
+          if (invDoc && invDoc.url) {
+            primusInvoiceUrl = invDoc.url;
+          }
+        } catch (docErr) {
+          await writeLog("warn", "primus",
+              "Could not fetch Primus document list; will use local PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                error: docErr.message,
+              });
+        }
 
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
@@ -5700,7 +5871,7 @@ exports.processPrimusWorkflow = onRequest(
           marginPct: marginPctCalc,
           customerInvoiceId: finalCustomerInvoiceId,
           primusSteps,
-          pdfSource: primusGenerated ? "primus" : "local",
+          pdfSource: primusInvoiceUrl ? "primus" : "local",
         });
 
         const podStoragePath =
@@ -5709,44 +5880,48 @@ exports.processPrimusWorkflow = onRequest(
       null;
 
         const attachmentsToSend = [];
-        if (!primusGenerated && invoiceGenerationResult) {
-          await writeLog("info", "primus",
-              "Primus invoice is still a draft (not yet generated); " +
-              "using locally-built invoice PDF", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                customerInvoiceId:
-                    invoiceGenerationResult.customerInvoiceId || null,
-                reused: invoiceGenerationResult.reused || false,
-              });
-        }
         if (primusInvoiceUrl) {
           try {
-            const token = await getPrimusToken();
-            const pdfResp = await fetch(primusInvoiceUrl, {
-              headers: {Authorization: `Bearer ${token}`},
-            });
+            // The document URL returned by /document/bolnumber/{n}?type=INV
+            // is self-authenticating (no auth header required).
+            const pdfResp = await fetch(primusInvoiceUrl);
             if (pdfResp.ok) {
               const buf = Buffer.from(await pdfResp.arrayBuffer());
-              // VALIDATE it's a real PDF. A 404 "Invoice not found" page is
-              // served as HTML with HTTP 200, which previously got attached as
-              // a corrupt .pdf. Only accept content starting with the %PDF-
-              // magic bytes; otherwise fall back to the locally-built PDF.
+              // Only accept real PDFs (%PDF- magic bytes). The server can
+              // return HTTP 200 HTML for draft/not-found invoices.
               if (buf.slice(0, 5).toString("latin1") === "%PDF-") {
                 customerInvoicePdfBase64 = buf.toString("base64");
               } else {
                 await writeLog("warn", "primus",
-                    "Primus invoice URL did not return a PDF; " +
-                    "using locally-built invoice instead", {
+                    "Primus document URL did not return a valid PDF; " +
+                    "falling back to locally-built invoice", {
                       invoiceId,
                       loadNumber: invoice.loadNumber,
                       primusInvoiceUrl,
+                      preview: buf.slice(0, 100).toString("latin1"),
                     });
               }
             }
-          } catch (_) {
-            // fall through to local build
+          } catch (pdfErr) {
+            await writeLog("warn", "primus",
+                "Error downloading Primus invoice PDF; " +
+                "falling back to locally-built invoice", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  error: pdfErr.message,
+                });
           }
+        } else if (!primusGenerated) {
+          await writeLog("info", "primus",
+              "Primus invoice not yet issued (draft); " +
+              "no INV document found via document API", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId:
+                    invoiceGenerationResult ?
+                    (invoiceGenerationResult.customerInvoiceId || null) :
+                    (invoice.customerInvoiceId || null),
+              });
         }
         if (!customerInvoicePdfBase64) {
           customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
@@ -5761,9 +5936,9 @@ exports.processPrimusWorkflow = onRequest(
               "Using locally-built customer invoice PDF", {
                 invoiceId,
                 loadNumber: invoice.loadNumber,
-                reason: primusGenerated ?
-                  "Primus URL download failed" :
-                  "Primus invoice not yet generated (draft)",
+                reason: primusInvoiceUrl ?
+                  "Primus document URL did not return valid PDF" :
+                  "No issued invoice document found in Primus",
               });
         } else {
           await writeLog("info", "workflow",
@@ -5788,7 +5963,23 @@ exports.processPrimusWorkflow = onRequest(
               contentType: "application/pdf",
               contentBase64: podBase64,
             });
+          } else {
+            await writeLog("warn", "workflow",
+                "POD file stored but could not be downloaded for email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  podStoragePath,
+                });
           }
+        } else {
+          await writeLog("warn", "workflow",
+              "No POD attached to customer invoice email — " +
+              "POD was not found or not extracted", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                podFound: invoice.pod && invoice.pod.found,
+                podSource: invoice.pod && invoice.pod.source,
+              });
         }
 
         await logWorkflowStep({
@@ -5942,4 +6133,5 @@ exports.processPrimusWorkflow = onRequest(
       }
     },
 );
+
 
