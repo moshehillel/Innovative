@@ -1566,8 +1566,7 @@ async function getPrimusShipment(loadNumber, proNumber) {
     }
     if (!booking) return {found: false, rate: null, customerEmail: null};
     const acct = booking.accountingInformation || {};
-    const rate = parsePrimusAmount(acct.customerQuoteAmount) ||
-        parsePrimusAmount(acct.invoiceAmount);
+    const {rate} = readCustomerRateFromAcct(acct);
     let customerEmail = null;
     if (booking.thirdParty && booking.thirdParty.email) {
       customerEmail = booking.thirdParty.email;
@@ -1778,7 +1777,8 @@ async function saveOutboundEmail(email) {
   await writeLog("info", "email", "Outbound email sent", {
     type: email.type,
     invoiceId: email.invoiceId,
-    to: email.to || process.env.WORKFLOW_EMAIL_TO,
+    to: to,
+    intendedTo: email.to || null,
     sent: Boolean(sendResult && sendResult.ok),
   });
 }
@@ -3555,37 +3555,14 @@ exports.setCustomerRate = onRequest(async (req, res) => {
 
   const primusSteps = inv.primusSteps || {};
 
-  // Push rate to Primus booking before resuming workflow.
-  let primusUpdateOk = false;
-  try {
-    const booking = await fetchPrimusBooking(inv.loadNumber);
-    if (booking && booking.BOLId) {
-      const putBody = {
-        accountingInformation: {customerQuoteAmount: customerRate},
-      };
-      await primusRequest("PUT", `/book/${booking.BOLId}`, putBody);
-      primusUpdateOk = true;
-      await writeLog("info", "primus",
-          "Customer rate updated in Primus booking", {
-            invoiceId,
-            loadNumber: inv.loadNumber,
-            customerRate,
-            BOLId: booking.BOLId,
-          });
-    }
-  } catch (primusErr) {
-    await writeLog("warn", "primus",
-        "Could not update customer rate in Primus booking", {
-          invoiceId,
-          loadNumber: inv.loadNumber,
-          error: primusErr.message,
-        });
-  }
+  // The Primus PUT /book/{BOLId} schema does not expose accountingInformation
+  // as a writable field, so there is no API way to store the rate on the
+  // booking record. The rate reaches the invoice via invoiceBreakdown when
+  // generateCustomerInvoice runs later in the workflow.
 
   await invoiceRef.update({
     customerRate,
     customerName: customerName || inv.customerName || null,
-    primusRateUpdated: primusUpdateOk,
     primusSteps: {...primusSteps, customerRateChecked: true},
     workflowPausedAtStep: null,
     workflowPausedAt: null,
@@ -3598,7 +3575,6 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     loadNumber: inv.loadNumber,
     customerRate,
     customerName,
-    primusUpdateOk,
   });
 
   const workflowUrl =
@@ -4416,6 +4392,26 @@ async function addProNumberToLoad(loadNumber, proNumber, invoiceData = {}) {
 }
 
 /**
+ * Reads the customer sell rate from a booking's accountingInformation.
+ *
+ * Two mutually-exclusive patterns in live data:
+ *   1. Quoted loads   — customerQuoteId set → rate in customerQuoteAmount.
+ *   2. Manual loads   — customerQuoteId null → rate in invoiceAmount.
+ *
+ * @param {object} acct accountingInformation from a Primus booking.
+ * @return {object} Object with rate (number|null) and source (string).
+ */
+function readCustomerRateFromAcct(acct) {
+  if (!acct) return {rate: null, source: "none"};
+  if (acct.customerQuoteId) {
+    const rate = parsePrimusAmount(acct.customerQuoteAmount);
+    return {rate, source: rate ? "customerQuoteAmount" : "none"};
+  }
+  const rate = parsePrimusAmount(acct.invoiceAmount);
+  return {rate, source: rate ? "invoiceAmount" : "none"};
+}
+
+/**
  * Retrieves customer name and rate from a Primus booking.
  * @param {string} loadNumber Load/BOL number.
  * @param {string} proNumber PRO number (used as fallback search key).
@@ -4434,7 +4430,8 @@ async function getCustomerRate(loadNumber, proNumber) {
       return {ok: false, error: "Load not found in Primus"};
     }
     const acct = booking.accountingInformation || {};
-    const customerRate = parsePrimusAmount(acct.customerQuoteAmount);
+    const {rate: customerRate, source: rateSource} =
+        readCustomerRateFromAcct(acct);
     const billTo = booking.billTo || "";
     let customerName = null;
     if (billTo === "thirdparty" && booking.thirdParty) {
@@ -4445,7 +4442,7 @@ async function getCustomerRate(loadNumber, proNumber) {
     if (!customerRate) {
       return {ok: false, customerName, error: "No customer rate in Primus"};
     }
-    return {ok: true, customerName, customerRate};
+    return {ok: true, customerName, customerRate, rateSource};
   } catch (error) {
     await writeLog("error", "primus", "Failed to get customer rate", {
       loadNumber,
@@ -4488,6 +4485,78 @@ async function generateCustomerInvoice(invoiceData) {
     if (!booking || !booking.BOLId) {
       return {ok: false, error: "Load not found in Primus"};
     }
+    const BOLId = booking.BOLId;
+    const expectedRate = Number(invoiceData.customerRate || 0);
+
+    // IDEMPOTENCY GUARD — the #1 safety check.
+    // Primus auto-creates a draft customer invoice (already populated with the
+    // freight charge and customer) when a load is booked. POSTing again creates
+    // a SECOND draft and adds another freight line, doubling
+    // accountingInformation.invoiceAmount. So we always look for an existing
+    // invoice first and reuse it — we only ever POST when none exists.
+    let existing = [];
+    try {
+      const existingData = await primusRequest(
+          "GET",
+          `/invoice/bolnumber/${encodeURIComponent(invoiceData.loadNumber)}`);
+      const list = existingData && existingData.data &&
+          existingData.data.results;
+      if (Array.isArray(list)) existing = list;
+    } catch (_) {
+      // 404 / no invoice yet — fall through to create one.
+    }
+
+    if (existing.length > 0) {
+      if (existing.length > 1) {
+        await writeLog("warn", "primus",
+            "Multiple customer invoice drafts found — using first; " +
+            "duplicates need manual cleanup in ShipPrimus", {
+              loadNumber: invoiceData.loadNumber,
+              BOLId,
+              invoiceIds: existing.map((e) => e.invoiceId),
+            });
+      }
+      const inv = existing[0];
+      const total = Number(inv.total || 0);
+      // AMOUNT SANITY CHECK — compare the draft total against the agreed
+      // sell rate. Human-entered rate wins; fall back to whichever Primus
+      // field is correct for this booking type (see readCustomerRateFromAcct).
+      const {rate: primusRateForCheck} =
+          readCustomerRateFromAcct(booking.accountingInformation || {});
+      const rateForCheck = expectedRate || primusRateForCheck || 0;
+      if (rateForCheck > 0 && Math.abs(total - rateForCheck) > 0.5) {
+        const mismatchMsg =
+            `Invoice total ($${total}) does not match expected ` +
+            `customer rate ($${rateForCheck}). Refusing to proceed.`;
+        await writeLog("error", "primus", mismatchMsg, {
+          loadNumber: invoiceData.loadNumber,
+          invoiceId: inv.invoiceId,
+          invoiceTotal: total,
+          expectedRate: rateForCheck,
+          difference: Math.abs(total - rateForCheck),
+          hint: "Check for duplicate invoice drafts in ShipPrimus",
+        });
+        return {
+          ok: false,
+          error: mismatchMsg,
+          customerInvoiceId: inv.invoiceId,
+          invoiceTotal: total,
+          expectedRate: rateForCheck,
+          difference: Math.abs(total - rateForCheck),
+        };
+      }
+      return {
+        ok: true,
+        reused: true,
+        customerInvoiceId: inv.invoiceId,
+        invoiceNumber: inv.invoiceNumber || null,
+        generated: !!(inv.status && inv.status.generated),
+        invoiceTotal: total,
+        invoicePdfUrl: (inv.shipment && inv.shipment.url) || null,
+      };
+    }
+
+    // No invoice exists yet — create the draft.
     const billTo = booking.billTo || "";
     let customerId = null;
     if (billTo === "thirdparty" && booking.thirdParty) {
@@ -4496,8 +4565,11 @@ async function generateCustomerInvoice(invoiceData) {
       customerId = booking.shipper.id || null;
     }
     const acct = booking.accountingInformation || {};
-    const customerRate = parsePrimusAmount(acct.customerQuoteAmount) ||
-        Number(invoiceData.customerRate || 0);
+    const {rate: primusRate} = readCustomerRateFromAcct(acct);
+    // Human-entered rate wins; fall back to Primus field appropriate for
+    // this booking type (customerQuoteAmount for quoted loads, invoiceAmount
+    // for manually-rated loads — see readCustomerRateFromAcct).
+    const customerRate = expectedRate || primusRate;
     // When a customerQuoteId exists Primus uses the stored quote automatically;
     // sending a breakdown would be rejected for "Collect" shipments.
     const body = {customerId};
@@ -4509,24 +4581,22 @@ async function generateCustomerInvoice(invoiceData) {
         rate: customerRate,
       }];
     }
-    const result = await primusRequest(
-        "POST", `/invoice/${booking.BOLId}`, body);
+    const result = await primusRequest("POST", `/invoice/${BOLId}`, body);
     const invoiceResult = result &&
         result.data &&
         result.data.results &&
         (Array.isArray(result.data.results) ?
           result.data.results[0] : result.data.results);
     if (!invoiceResult || !invoiceResult.invoiceId) {
-      return {
-        ok: false,
-        error: "Invoice creation returned no ID",
-        raw: result,
-      };
+      return {ok: false, error: "Invoice creation returned no ID", raw: result};
     }
     return {
       ok: true,
+      reused: false,
       customerInvoiceId: invoiceResult.invoiceId,
       invoiceNumber: invoiceResult.invoiceNumber,
+      generated: !!(invoiceResult.status && invoiceResult.status.generated),
+      invoiceTotal: Number(invoiceResult.total || 0),
       invoicePdfUrl: (invoiceResult.shipment &&
           invoiceResult.shipment.url) || null,
     };
@@ -4565,10 +4635,6 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
-        await writeLog("info", "workflow", "Starting Primus workflow", {
-          invoiceId: invoiceId,
-        });
-
         // Get invoice document
         const invoiceDoc = await db.collection("invoices").doc(invoiceId).get();
 
@@ -4582,6 +4648,12 @@ exports.processPrimusWorkflow = onRequest(
         const invoice = invoiceDoc.data();
 
         if (invoice.finalWorkflowStatus === "completed") {
+          await writeLog("info", "workflow",
+              "Workflow skipped — already completed", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId: invoice.customerInvoiceId || null,
+              });
           return res.status(409).json({
             ok: false,
             error: "ALREADY_COMPLETED",
@@ -4610,12 +4682,29 @@ exports.processPrimusWorkflow = onRequest(
         });
 
         if (!lockAcquired) {
-          await writeLog(
-              "warn", "workflow", "Invoice already being processed", {
+          await writeLog("warn", "workflow",
+              "Workflow skipped — another instance is already running", {
                 invoiceId,
+                loadNumber: invoice.loadNumber,
               });
           return res.status(409).json({ok: false, error: "ALREADY_PROCESSING"});
         }
+
+        await writeLog("info", "workflow",
+            resumeFrom ?
+              `Resuming Primus workflow from step: ${resumeFrom}` :
+              "Starting Primus workflow", {
+              invoiceId,
+              flowId,
+              resumeFrom: resumeFrom || null,
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName || null,
+              invoiceAmount: invoice.invoiceAmount || null,
+              proNumber: invoice.proNumber || null,
+              primusStepsCompleted: Object.entries(
+                  invoice.primusSteps || {},
+              ).filter(([, v]) => v).map(([k]) => k),
+            });
 
         // Note: workflowPausedAt is tracked,
         // but we do not block resume based on age.
@@ -4750,17 +4839,18 @@ exports.processPrimusWorkflow = onRequest(
           },
         });
 
-        await writeLog("info", "workflow", "Validating invoice amount", {
-          invoiceId: invoiceId,
-          flowId: flowId,
-          currentStep: "amount_validation",
-          loadNumber: invoice.loadNumber,
-          invoiceAmount: invoice.invoiceAmount,
-        });
-
         await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validation");
 
         const baseAmount = Number(invoice.invoiceAmount) - approvedChargesTotal;
+
+        await writeLog("info", "workflow", "Validating invoice amount", {
+          invoiceId,
+          flowId,
+          loadNumber: invoice.loadNumber,
+          invoiceAmount: invoice.invoiceAmount,
+          approvedChargesTotal,
+          baseAmountToValidate: baseAmount,
+        });
 
         const amountValidation = await validateAmountWithPrimus(
             invoice.loadNumber,
@@ -4770,10 +4860,28 @@ exports.processPrimusWorkflow = onRequest(
         await logWorkflowStep({
           invoiceId,
           stepName: "amount_validation_completed",
-          stepStatus: amountValidation.ok ? "success" : "failed",
-          output: {validAmount: amountValidation.validAmount},
-          error: amountValidation.ok ? null : "Amount validation failed",
+          stepStatus: amountValidation.ok && amountValidation.validAmount ?
+            "success" : "failed",
+          output: {
+            validAmount: amountValidation.validAmount,
+            submittedAmount: amountValidation.submittedAmount,
+            primusAmount: amountValidation.savedAmount,
+            difference: amountValidation.difference,
+          },
+          error: (amountValidation.ok && amountValidation.validAmount) ?
+            null : (amountValidation.reason || "Amount validation failed"),
         });
+
+        if (amountValidation.ok && amountValidation.validAmount) {
+          await writeLog("info", "workflow", "Amount validation passed", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            submittedAmount: amountValidation.submittedAmount,
+            primusAmount: amountValidation.savedAmount,
+            difference: amountValidation.difference,
+            proNumber: amountValidation.proNumber || null,
+          });
+        }
 
         if (!amountValidation.ok || !amountValidation.validAmount) {
           const primusAmountFromValidation = amountValidation.amount || null;
@@ -4903,12 +5011,6 @@ exports.processPrimusWorkflow = onRequest(
             },
           });
 
-          await writeLog("info", "workflow", "Adding PRO number to load", {
-            invoiceId: invoiceId,
-            loadNumber: invoice.loadNumber,
-            invoicePro: invoice.proNumber,
-          });
-
           const proResult = await addProNumberToLoad(
               invoice.loadNumber,
               invoice.proNumber,
@@ -4922,10 +5024,33 @@ exports.processPrimusWorkflow = onRequest(
           await logWorkflowStep({
             invoiceId,
             stepName: "pro_added",
-            stepStatus: proResult.ok ? "success" : "failed",
-            output: proResult.ok ? {newPro: invoice.proNumber} : null,
+            stepStatus: proResult.ok ? "success" :
+              (proResult.skipped ? "skipped" : "failed"),
+            output: proResult.ok ? {
+              newPro: invoice.proNumber,
+              skipped: proResult.skipped || false,
+              reason: proResult.reason || null,
+            } : null,
             error: proResult.ok ? null : "Failed to add PRO to load",
           });
+          if (proResult.ok) {
+            await writeLog("info", "workflow",
+                proResult.skipped ?
+                  `PRO number step skipped — ${proResult.reason}` :
+                  "PRO number written to Primus booking", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumber: invoice.proNumber,
+                });
+          } else {
+            await writeLog("warn", "workflow",
+                "Failed to write PRO number to Primus — workflow continues", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumber: invoice.proNumber,
+                  error: proResult.error,
+                });
+          }
 
           if (proResult.ok) {
             primusSteps.proAdded = true;
@@ -4970,12 +5095,6 @@ exports.processPrimusWorkflow = onRequest(
               },
             });
 
-            await writeLog("info", "workflow", "Marking shipment delivered", {
-              invoiceId,
-              loadNumber: invoice.loadNumber,
-              proNumber: invoice.proNumber,
-            });
-
             const deliveredRes = await markShipmentDelivered(
                 invoice.loadNumber,
                 workingProNumber,
@@ -4997,13 +5116,15 @@ exports.processPrimusWorkflow = onRequest(
               });
             }
 
-            if (alreadyDelivered) {
-              await writeLog("info", "workflow", "Shipment already delivered", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                details: deliveredRes,
-              });
-            }
+            await writeLog("info", "workflow",
+                alreadyDelivered ?
+                  "Shipment already marked delivered in Primus — skipped" :
+                  "Shipment marked delivered in Primus", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumber: workingProNumber || null,
+                  alreadyDelivered,
+                });
           }
           primusSteps.shipmentDelivered = true;
           await invoiceDoc.ref.update({
@@ -5028,12 +5149,6 @@ exports.processPrimusWorkflow = onRequest(
           input: {loadNumber: invoice.loadNumber, proNumber: workingProNumber},
         });
 
-        await writeLog("info", "workflow", "Checking customer", {
-          invoiceId: invoiceId,
-          loadNumber: invoice.loadNumber,
-          proNumber: invoice.proNumber,
-        });
-
         let customerNameForCheck = invoice.customerName;
         const customerForCheckResult = await getCustomerRate(
             invoice.loadNumber,
@@ -5046,6 +5161,21 @@ exports.processPrimusWorkflow = onRequest(
             customerName: customerNameForCheck,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
+          await writeLog("info", "workflow",
+              "Customer rate fetched from Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerName: customerForCheckResult.customerName,
+                customerRate: customerForCheckResult.customerRate,
+                rateSource: customerForCheckResult.rateSource,
+              });
+        } else {
+          await writeLog("warn", "workflow",
+              "Could not fetch customer rate from Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                error: customerForCheckResult && customerForCheckResult.error,
+              });
         }
 
         if (
@@ -5085,12 +5215,6 @@ exports.processPrimusWorkflow = onRequest(
             workflowStatus: "test_customer_review",
           });
         }
-
-        await writeLog("info", "workflow", "Approving carrier bill", {
-          invoiceId: invoiceId,
-          carrierName: invoice.carrierName,
-          invoiceAmount: invoice.invoiceAmount,
-        });
 
         await logWorkflowStep({
           invoiceId,
@@ -5150,13 +5274,16 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
-        if (alreadyApproved) {
-          await writeLog("info", "workflow", "Carrier bill already approved", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            details: approvalResult,
-          });
-        }
+        await writeLog("info", "workflow",
+            alreadyApproved ?
+              "Carrier bill already approved — skipped" :
+              "Carrier bill approved", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName,
+              invoiceAmount: invoice.invoiceAmount,
+              alreadyApproved,
+            });
 
         primusSteps.billApproved = true;
         await invoiceDoc.ref.update({
@@ -5229,9 +5356,27 @@ exports.processPrimusWorkflow = onRequest(
         }
 
         const customerName = customerRateResult.customerName;
-        const customerRate = Number(customerRateResult.customerRate || 0);
+        // A rate manually entered via setCustomerRate takes priority over
+        // whatever Primus currently reports (which can be stale/doubled).
+        const manualRate = Number(invoice.customerRate || 0);
+        const primusRate = Number(customerRateResult.customerRate || 0);
+        const customerRate = manualRate || primusRate;
         const profit = Number(customerRate || 0) -
       (Number(invoice.invoiceAmount || 0) - approvedChargesTotal);
+        const marginPctCalc = customerRate > 0 ?
+          Math.round((profit / customerRate) * 100) : 0;
+
+        await writeLog("info", "workflow", "Customer rate and profit check", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          customerName,
+          customerRate,
+          carrierInvoiceAmount: invoice.invoiceAmount,
+          approvedChargesTotal,
+          profit,
+          marginPct: marginPctCalc,
+          willPause: !customerRate || Number(customerRate) <= 0 || profit < 10,
+        });
 
         primusSteps.customerRateChecked = true;
 
@@ -5269,8 +5414,9 @@ exports.processPrimusWorkflow = onRequest(
 
           const baseUrl = `https://${req.get("host")}`;
           const isLowMargin = customerRate > 0;
-          const marginPct = customerRate > 0 ?
-            Math.round((profit / customerRate) * 100) : 0;
+          const marginPct = marginPctCalc;
+          const carrierCost = Number(invoice.invoiceAmount || 0) -
+            approvedChargesTotal;
           await saveOutboundEmail({
             type: "rate_missing",
             invoiceId,
@@ -5279,38 +5425,58 @@ exports.processPrimusWorkflow = onRequest(
               ` for Load ${invoice.loadNumber}`,
             html:
               `<h2>${isLowMargin ?
-                "Low Margin Warning" : "Customer Rate Missing"}</h2>` +
-              `<p>${isLowMargin ?
-                "Margin is below the $10 minimum." :
-                "No customer rate found in Primus."} ` +
-              `Set the customer quote in Primus then click ` +
-              `<strong>Continue Workflow</strong>.</p>` +
-              `<table style="border-collapse:collapse;` +
-              `font-size:14px;margin:12px 0">` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Carrier</strong></td>` +
-              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Load #</strong></td>` +
-              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Carrier Invoice</strong></td>` +
-              `<td>$${invoice.invoiceAmount || "—"}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Customer Rate</strong></td>` +
-              `<td>${customerRate > 0 ?
-                `$${customerRate}` : "Not set"}</td></tr>` +
+                "Low Margin Warning" :
+                "Customer Rate Missing"} — Load ` +
+              `${escapeHtml(invoice.loadNumber || "")}</h2>` +
               (isLowMargin ?
-                `<tr><td style="padding:4px 12px 4px 0">` +
+                `<p>Margin is too low to proceed. Here is the breakdown:</p>` +
+                `<table style="border-collapse:collapse;` +
+                `font-size:15px;margin:12px 0">` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Carrier cost</strong></td>` +
+                `<td style="font-weight:700">` +
+                `$${Number(carrierCost).toFixed(2)}</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Customer rate</strong></td>` +
+                `<td style="font-weight:700">` +
+                `$${Number(customerRate).toFixed(2)}</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
                 `<strong>Profit</strong></td>` +
-                `<td>$${profit} (${marginPct}%)</td></tr>` : "") +
+                `<td style="color:${profit < 0 ?
+                  "#dc2626" : "#d97706"};font-weight:700">` +
+                `$${Number(profit).toFixed(2)} (${marginPct}%)</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Minimum required profit</strong></td>` +
+                `<td>$10.00</td></tr>` +
+                `</table>` :
+                `<p>No customer rate was found for this load in Primus. ` +
+                `Enter the correct rate below to resume.</p>` +
+                `<table style="border-collapse:collapse;` +
+                `font-size:15px;margin:12px 0">` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Carrier cost</strong></td>` +
+                `<td style="font-weight:700">` +
+                `$${Number(carrierCost).toFixed(2)}</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Customer rate</strong></td>` +
+                `<td style="color:#dc2626;font-weight:700">Not set</td></tr>` +
+                `</table>`) +
+              `<table style="border-collapse:collapse;` +
+              `font-size:13px;margin:8px 0;color:#555">` +
+              `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
+              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+              `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
+              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+              `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
+              `<td>${escapeHtml(customerName || "—")}</td></tr>` +
               `</table>` +
               `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
               `${encodeURIComponent(invoiceId)}" ` +
               `style="display:inline-block;padding:.6rem 1.25rem;` +
               `background:#4f46e5;color:#fff;border-radius:8px;` +
               `font-weight:600;text-decoration:none;margin-top:.5rem">` +
-              `${isLowMargin ? "Update Customer Rate" : "Set Customer Rate"}` +
+              `${isLowMargin ?
+                "Update Customer Rate" : "Set Customer Rate"}` +
               `</a>`,
           });
 
@@ -5394,6 +5560,70 @@ exports.processPrimusWorkflow = onRequest(
                 },
             );
 
+            await invoiceDoc.ref.update({
+              processingLock: false,
+              finalWorkflowStatus: "needs_invoice_review",
+              decisionStage: "invoice_generation_failed",
+              decisionReason: invoiceGenerationResult.error ||
+                "Customer invoice generation failed",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            const baseUrl = `https://${req.get("host")}`;
+            const primusTotal = invoiceGenerationResult.invoiceTotal || 0;
+            const expectedRateVal =
+              invoiceGenerationResult.expectedRate || customerRate;
+            const diffVal = invoiceGenerationResult.difference ||
+              Math.abs(primusTotal - expectedRateVal);
+            const isMismatch = primusTotal > 0 && expectedRateVal > 0;
+            await saveOutboundEmail({
+              type: "invoice_generation_failed",
+              invoiceId,
+              subject: `Action needed — Rate mismatch on Load` +
+                ` ${invoice.loadNumber}`,
+              html:
+                `<h2>Invoice Amount Mismatch — Load ` +
+                `${escapeHtml(invoice.loadNumber || "")}</h2>` +
+                (isMismatch ?
+                  `<p>The invoice in ShipPrimus does not match the ` +
+                  `expected customer rate:</p>` +
+                  `<table style="border-collapse:collapse;` +
+                  `font-size:15px;margin:12px 0">` +
+                  `<tr><td style="padding:6px 16px 6px 0">` +
+                  `<strong>Rate on the bill (Primus)</strong></td>` +
+                  `<td style="color:#dc2626;font-weight:700">` +
+                  `$${Number(primusTotal).toFixed(2)}</td></tr>` +
+                  `<tr><td style="padding:6px 16px 6px 0">` +
+                  `<strong>Expected customer rate</strong></td>` +
+                  `<td style="color:#16a34a;font-weight:700">` +
+                  `$${Number(expectedRateVal).toFixed(2)}</td></tr>` +
+                  `<tr><td style="padding:6px 16px 6px 0">` +
+                  `<strong>Difference</strong></td>` +
+                  `<td style="color:#dc2626;font-weight:700">` +
+                  `$${Number(diffVal).toFixed(2)}</td></tr>` +
+                  `</table>` :
+                  `<p>${escapeHtml(invoiceGenerationResult.error || "")}</p>`
+                ) +
+                `<table style="border-collapse:collapse;` +
+                `font-size:13px;margin:12px 0;color:#555">` +
+                `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
+                `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+                `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
+                `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+                `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
+                `<td>${escapeHtml(customerName || "—")}</td></tr>` +
+                `</table>` +
+                `<p>Fix the invoice amount in ShipPrimus to ` +
+                `<strong>$${Number(expectedRateVal).toFixed(2)}</strong>` +
+                `, then click Resume.</p>` +
+                `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
+                `${encodeURIComponent(invoiceId)}" ` +
+                `style="display:inline-block;padding:.6rem 1.25rem;` +
+                `background:#4f46e5;color:#fff;border-radius:8px;` +
+                `font-weight:600;text-decoration:none;margin-top:.5rem">` +
+                `Resume Workflow</a>`,
+            });
+
             return res.json({
               ok: false,
               error: "Customer invoice generation failed",
@@ -5408,6 +5638,20 @@ exports.processPrimusWorkflow = onRequest(
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
+          await writeLog("info", "workflow",
+              invoiceGenerationResult.reused ?
+                "Customer invoice already existed in Primus — reused" :
+                "Customer invoice created in Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+                invoiceNumber: invoiceGenerationResult.invoiceNumber || null,
+                invoiceTotal: invoiceGenerationResult.invoiceTotal,
+                generated: invoiceGenerationResult.generated,
+                reused: invoiceGenerationResult.reused || false,
+                pdfUrlAvailable: !!invoiceGenerationResult.invoicePdfUrl,
+              });
+
           await setWorkflowHeartbeat(
               invoiceDoc.ref, "customer_invoice_generated");
         }
@@ -5421,6 +5665,15 @@ exports.processPrimusWorkflow = onRequest(
         // "extra_charges_pending_review"), so finalCustomerInvoiceId only
         // ever reflects the base freight amount.
 
+        // Determine PDF source before logging/completing — only attempt
+        // Primus download when the invoice is in "generated" state.
+        const primusGenerated =
+            invoiceGenerationResult && invoiceGenerationResult.generated;
+        const primusInvoiceUrl =
+            (primusGenerated &&
+            invoiceGenerationResult.invoicePdfUrl) || null;
+        let customerInvoicePdfBase64 = null;
+
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
           decisionStage: "completed",
@@ -5431,20 +5684,24 @@ exports.processPrimusWorkflow = onRequest(
           primusSteps: primusSteps,
           finalWorkflowStatus: "completed",
           customerInvoiceId: finalCustomerInvoiceId,
+          processingLock: false,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        await writeLog(
-            "info",
-            "workflow",
-            "Primus workflow completed",
-            {
-              invoiceId: invoiceId,
-              customerName: customerName,
-              profit: profit,
-              customerInvoiceId: finalCustomerInvoiceId,
-            },
-        );
+        await writeLog("info", "workflow", "Primus workflow completed", {
+          invoiceId,
+          flowId,
+          loadNumber: invoice.loadNumber,
+          carrierName: invoice.carrierName,
+          carrierInvoiceAmount: invoice.invoiceAmount,
+          customerName,
+          customerRate,
+          profit,
+          marginPct: marginPctCalc,
+          customerInvoiceId: finalCustomerInvoiceId,
+          primusSteps,
+          pdfSource: primusGenerated ? "primus" : "local",
+        });
 
         const podStoragePath =
       (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
@@ -5452,13 +5709,17 @@ exports.processPrimusWorkflow = onRequest(
       null;
 
         const attachmentsToSend = [];
-
-        // Try to use the Primus-generated invoice PDF first; fall back to
-        // locally generated PDF if the URL is unavailable or download fails.
-        const primusInvoiceUrl =
-            (invoiceGenerationResult &&
-            invoiceGenerationResult.invoicePdfUrl) || null;
-        let customerInvoicePdfBase64 = null;
+        if (!primusGenerated && invoiceGenerationResult) {
+          await writeLog("info", "primus",
+              "Primus invoice is still a draft (not yet generated); " +
+              "using locally-built invoice PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId:
+                    invoiceGenerationResult.customerInvoiceId || null,
+                reused: invoiceGenerationResult.reused || false,
+              });
+        }
         if (primusInvoiceUrl) {
           try {
             const token = await getPrimusToken();
@@ -5466,9 +5727,22 @@ exports.processPrimusWorkflow = onRequest(
               headers: {Authorization: `Bearer ${token}`},
             });
             if (pdfResp.ok) {
-              const buf = await pdfResp.arrayBuffer();
-              customerInvoicePdfBase64 =
-                  Buffer.from(buf).toString("base64");
+              const buf = Buffer.from(await pdfResp.arrayBuffer());
+              // VALIDATE it's a real PDF. A 404 "Invoice not found" page is
+              // served as HTML with HTTP 200, which previously got attached as
+              // a corrupt .pdf. Only accept content starting with the %PDF-
+              // magic bytes; otherwise fall back to the locally-built PDF.
+              if (buf.slice(0, 5).toString("latin1") === "%PDF-") {
+                customerInvoicePdfBase64 = buf.toString("base64");
+              } else {
+                await writeLog("warn", "primus",
+                    "Primus invoice URL did not return a PDF; " +
+                    "using locally-built invoice instead", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      primusInvoiceUrl,
+                    });
+              }
             }
           } catch (_) {
             // fall through to local build
@@ -5483,6 +5757,21 @@ exports.processPrimusWorkflow = onRequest(
             customerRate,
             carrierInvoiceAmount: invoice.invoiceAmount,
           });
+          await writeLog("info", "workflow",
+              "Using locally-built customer invoice PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                reason: primusGenerated ?
+                  "Primus URL download failed" :
+                  "Primus invoice not yet generated (draft)",
+              });
+        } else {
+          await writeLog("info", "workflow",
+              "Using Primus-generated customer invoice PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                primusInvoiceUrl,
+              });
         }
 
         attachmentsToSend.push({
@@ -5653,3 +5942,4 @@ exports.processPrimusWorkflow = onRequest(
       }
     },
 );
+
