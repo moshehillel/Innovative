@@ -5511,8 +5511,13 @@ exports.processPrimusWorkflow = onRequest(
         const manualRate = Number(invoice.customerRate || 0);
         const primusRate = Number(customerRateResult.customerRate || 0);
         const customerRate = manualRate || primusRate;
+        // Carrier cost: use booking.vendor.cost (the load rate) — this is the
+        // source of truth. invoice.invoiceAmount can be doubled/stale.
+        const bookingCarrierCost = Number(
+            amountValidation.savedAmount || invoice.invoiceAmount || 0,
+        );
         const profit = Number(customerRate || 0) -
-      (Number(invoice.invoiceAmount || 0) - approvedChargesTotal);
+          (bookingCarrierCost - approvedChargesTotal);
         const marginPctCalc = customerRate > 0 ?
           Math.round((profit / customerRate) * 100) : 0;
 
@@ -5565,8 +5570,7 @@ exports.processPrimusWorkflow = onRequest(
           const baseUrl = `https://${req.get("host")}`;
           const isLowMargin = customerRate > 0;
           const marginPct = marginPctCalc;
-          const carrierCost = Number(invoice.invoiceAmount || 0) -
-            approvedChargesTotal;
+          const carrierCost = bookingCarrierCost - approvedChargesTotal;
           await saveOutboundEmail({
             type: "rate_missing",
             invoiceId,
@@ -6071,6 +6075,67 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
+        // Push carrier bill to QuickBooks once the invoice is confirmed.
+        // The payable already exists in Primus (created when the invoice was
+        // issued). We call /quickbooks/billing to sync it to QB. If the
+        // dueDate is missing, we calculate Net 30 from the carrier invoice
+        // date and store it for reference.
+        if (finalCustomerInvoiceId) {
+          try {
+            const qbResult = await primusRequest(
+                "POST", "/quickbooks/billing",
+                {invoiceId: finalCustomerInvoiceId},
+            );
+            const qbBills = qbResult && qbResult.data &&
+                qbResult.data.results && qbResult.data.results.bills;
+            const uploaded = qbBills && qbBills.uploadedBills &&
+                qbBills.uploadedBills.length || 0;
+            const failed = qbBills && qbBills.failedBills &&
+                qbBills.failedBills.length || 0;
+            if (uploaded > 0) {
+              await writeLog("info", "workflow",
+                  "Carrier bill pushed to QuickBooks", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    uploadedBills: uploaded,
+                  });
+            } else {
+              await writeLog("warn", "workflow",
+                  "QB billing call returned no uploaded bills " +
+                  "(QB may not be connected or bill not ready)", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    failedBills: failed,
+                    raw: JSON.stringify(qbResult).slice(0, 300),
+                  });
+            }
+
+            // Calculate and store Net 30 due date for reference
+            const invDateRaw = invoice.dueDate ? null :
+                (invoice.invoiceDate || invoice.receivedAt || null);
+            if (!invoice.dueDate && invDateRaw) {
+              const invDate = new Date(invDateRaw);
+              if (!isNaN(invDate.getTime())) {
+                invDate.setDate(invDate.getDate() + 30);
+                const net30 = invDate.toISOString().split("T")[0];
+                await invoiceDoc.ref.update({
+                  carrierBillDueDate: net30,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              }
+            }
+          } catch (qbErr) {
+            await writeLog("warn", "workflow",
+                "QB billing sync failed — bill still in Primus", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  error: qbErr.message,
+                });
+          }
+        }
+
         await logWorkflowStep({
           invoiceId,
           stepName: "workflow_completed",
@@ -6134,4 +6199,34 @@ exports.processPrimusWorkflow = onRequest(
     },
 );
 
+// ── TAI TMS integration ────────────────────────────────────────────────────
+// Firebase only deploys exports found in the main entry file, so we re-export
+// the TAI webhook receiver, resolver, and workflow defined in ./tai.js.
+//
+// The TAI workflow reuses the TMS-agnostic helpers below (pause/email/logging
+// /POD extraction/PDF building) so its behavior stays identical to the Primus
+// workflow — only the TMS API calls differ. We inject them rather than
+// duplicating them. These are passed by reference and remain closures over
+// this module's scope (db, getBucket, sendViaGmail, etc.).
+const tai = require("./tai");
+
+tai.init({
+  db,
+  writeLog,
+  logWorkflowStep,
+  setWorkflowHeartbeat,
+  pauseWorkflow,
+  saveOutboundEmail,
+  buildContinueButtonHtml,
+  escapeHtml,
+  maybeExtractPodOnlyPdf,
+  isAlreadyDoneResult,
+  downloadStorageFileBase64,
+  buildCustomerInvoicePdfBase64,
+  FieldValue: admin.firestore.FieldValue,
+});
+
+exports.taiWebhook = tai.taiWebhook;
+exports.taiResolveShipment = tai.taiResolveShipment;
+exports.processTaiWorkflow = tai.processTaiWorkflow;
 
