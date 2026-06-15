@@ -214,6 +214,33 @@ function workflowUrlForTms(tms) {
     `${base}/processPrimusWorkflow`;
 }
 
+// Per-company workflow endpoints. Each company file owns its own workflow
+// function, so routing is keyed by tenantId first (a company can have a
+// dedicated endpoint), then falls back to the generic per-TMS workflow. Add a
+// row here when onboarding a company with its own file.
+const TENANT_WORKFLOW_FUNCTIONS = Object.freeze({
+  coast_to_coast: "processCtcTaiWorkflow",
+});
+
+/**
+ * Resolves the workflow kickoff URL for a specific tenant. Prefers a dedicated
+ * per-company endpoint (TENANT_WORKFLOW_FUNCTIONS) and otherwise falls back to
+ * the generic per-TMS workflow URL.
+ * @param {object} tenant Tenant config.
+ * @return {string} Absolute workflow endpoint URL.
+ */
+function workflowUrlForTenant(tenant) {
+  const base =
+    "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+  const fn = tenant && TENANT_WORKFLOW_FUNCTIONS[tenant.tenantId];
+  if (fn) {
+    const envOverride = process.env[
+        `PROCESS_${tenant.tenantId.toUpperCase()}_WORKFLOW_URL`];
+    return envOverride || `${base}/${fn}`;
+  }
+  return workflowUrlForTms(tenant && tenant.tms);
+}
+
 // Tenant context for logging. Routing a tenant through every one of the dozens
 // of writeLog/logWorkflowStep calls in the ingestion + workflow paths would be
 // error-prone, so we stash the active tenant in async-local storage for the
@@ -227,6 +254,20 @@ const tenantContext = new AsyncLocalStorage();
  */
 function currentTenant() {
   return tenantContext.getStore() || null;
+}
+
+/**
+ * Binds `tenant` as the ambient logging context for the remainder of the
+ * current async execution, without a callback wrapper. Per-company workflow
+ * handlers call this once after resolving their tenant so every downstream
+ * writeLog/logWorkflowStep routes to that tenant's BigQuery dataset and
+ * Firestore collections — never another company's. Each HTTP invocation runs
+ * in its own async context, so this never leaks across requests.
+ * @param {object} tenant Tenant config.
+ * @return {void}
+ */
+function enterTenantContext(tenant) {
+  tenantContext.enterWith(tenant || DEFAULT_TENANT);
 }
 
 /**
@@ -3637,7 +3678,7 @@ async function processGmailMessage(
       );
 
       try {
-        const workflowUrl = workflowUrlForTms(tenant.tms);
+        const workflowUrl = workflowUrlForTenant(tenant);
         const workflowRes = await fetch(
             workflowUrl,
             {
@@ -6614,10 +6655,14 @@ exports.processPrimusWorkflow = onRequest(
 // workflow — only the TMS API calls differ. We inject them rather than
 // duplicating them. These are passed by reference and remain closures over
 // this module's scope (db, getBucket, sendViaGmail, etc.).
-const tai = require("./tai");
-
-tai.init({
+// Shared, company-agnostic helper bundle injected into every per-company TMS
+// module. index.js is the base: it owns intake + these helpers; each company
+// file owns its own workflow and is fed the same bundle.
+const sharedTmsBundle = {
   db,
+  tcol,
+  getTenant,
+  enterTenantContext,
   writeLog,
   logWorkflowStep,
   setWorkflowHeartbeat,
@@ -6630,9 +6675,18 @@ tai.init({
   downloadStorageFileBase64,
   buildCustomerInvoicePdfBase64,
   FieldValue: admin.firestore.FieldValue,
-});
+};
 
+const tai = require("./tai");
+tai.init(sharedTmsBundle);
 exports.taiWebhook = tai.taiWebhook;
 exports.taiResolveShipment = tai.taiResolveShipment;
 exports.processTaiWorkflow = tai.processTaiWorkflow;
+
+// Coast to Coast Carriers — dedicated, self-contained TAI workflow file.
+const ctcTai = require("./ctc-tai");
+ctcTai.init(sharedTmsBundle);
+exports.ctcTaiWebhook = ctcTai.ctcTaiWebhook;
+exports.ctcTaiResolveShipment = ctcTai.ctcTaiResolveShipment;
+exports.processCtcTaiWorkflow = ctcTai.processCtcTaiWorkflow;
 
