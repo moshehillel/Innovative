@@ -2,7 +2,7 @@
  * Coast to Coast Carriers — dedicated TAI TMS integration.
  *
  * A COMPLETE, self-contained copy of the TAI workflow bound to the
- * `coast_to_coast` tenant. Per the per-company file model, each company owns
+ * `ctc` tenant. Per the per-company file model, each company owns
  * its own file so its TAI credentials, webhook secret, endpoints, and workflow
  * stay fully isolated from every other client. Shared, company-agnostic
  * helpers (logging, email, PDF, POD, storage) still come from index.js via
@@ -10,8 +10,7 @@
  *
  * Exports (re-exported from index.js): ctcTaiWebhook, ctcTaiResolveShipment,
  * processCtcTaiWorkflow. Credentials (env, falling back to the shared TAI_*
- * vars): TAI_BASE_URL_COAST_TO_COAST, TAI_API_KEY_COAST_TO_COAST,
- * TAI_WEBHOOK_SECRET_COAST_TO_COAST.
+ * vars): TAI_BASE_URL_CTC, TAI_API_KEY_CTC, TAI_WEBHOOK_SECRET_CTC.
  *
  * ── Original module notes ───────────────────────────────────────────────────
  * TAI TMS integration — webhook receiver and shipment index.
@@ -47,7 +46,7 @@ const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 
 /** The tenant this file is dedicated to. */
-const CTC_TENANT_ID = "coast_to_coast";
+const CTC_TENANT_ID = "ctc";
 
 /**
  * Returns the Firestore client. Lazily resolved so this module can be
@@ -62,7 +61,7 @@ function db() {
  * Returns a tenant-scoped collection reference. Routes through the shared
  * `tcol` helper (injected from index.js) so the TAI workflow reads and writes
  * EXACTLY the same prefixed collections the intake pipeline used for that
- * tenant — e.g. `coast_to_coast_invoices`. With no tenant (or the default
+ * tenant — e.g. `ctc_invoices`. With no tenant (or the default
  * tenant, whose prefix is ""), this is the unprefixed collection, preserving
  * legacy behavior. Using one shared prefixing helper (rather than a private
  * copy) is itself a safety property: intake, workflow, and dashboard can never
@@ -293,7 +292,7 @@ async function indexShipment(shipment, eventType, tenant = null) {
  * @return {boolean} True if the request is authorized.
  */
 function isAuthorized(req) {
-  const expected = process.env.TAI_WEBHOOK_SECRET_COAST_TO_COAST ||
+  const expected = process.env.TAI_WEBHOOK_SECRET_CTC ||
     process.env.TAI_WEBHOOK_SECRET;
   if (!expected) {
     console.warn(
@@ -543,10 +542,10 @@ function s() {
  * @return {Promise<object|Array|string|null>} Parsed response, or null on 404.
  */
 async function taiRequest(method, path, body) {
-  const base = process.env.TAI_BASE_URL_COAST_TO_COAST ||
+  const base = process.env.TAI_BASE_URL_CTC ||
     process.env.TAI_BASE_URL || "https://www.taibeta.net";
   const headers = {
-    "x-api-key": process.env.TAI_API_KEY_COAST_TO_COAST ||
+    "x-api-key": process.env.TAI_API_KEY_CTC ||
       process.env.TAI_API_KEY || "",
     "Content-Type": "application/json",
     "accept": "application/json",

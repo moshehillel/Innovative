@@ -44,7 +44,7 @@ function db() {
  * Returns a tenant-scoped collection reference. Routes through the shared
  * `tcol` helper (injected from index.js) so the TAI workflow reads and writes
  * EXACTLY the same prefixed collections the intake pipeline used for that
- * tenant — e.g. `coast_to_coast_invoices`. With no tenant (or the default
+ * tenant — e.g. `ctc_invoices`. With no tenant (or the default
  * tenant, whose prefix is ""), this is the unprefixed collection, preserving
  * legacy behavior. Using one shared prefixing helper (rather than a private
  * copy) is itself a safety property: intake, workflow, and dashboard can never

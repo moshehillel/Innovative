@@ -224,7 +224,7 @@ function workflowUrlForTms(tms) {
 // dedicated endpoint), then falls back to the generic per-TMS workflow. Add a
 // row here when onboarding a company with its own file.
 const TENANT_WORKFLOW_FUNCTIONS = Object.freeze({
-  coast_to_coast: "processCtcTaiWorkflow",
+  ctc: "processCtcTaiWorkflow",
 });
 
 /**
