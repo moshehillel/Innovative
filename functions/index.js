@@ -6,6 +6,7 @@ const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
 const {PDFDocument, StandardFonts, rgb} = require("pdf-lib");
 const crypto = require("crypto");
+const {AsyncLocalStorage} = require("async_hooks");
 
 admin.initializeApp();
 
@@ -59,6 +60,183 @@ function getDeleteAt(days) {
   return admin.firestore.Timestamp.fromDate(
       new Date(now.getTime() + days * 24 * 60 * 60 * 1000),
   );
+}
+
+// ── Multi-tenant support ─────────────────────────────────────────────────────
+// Each client (e.g. the Primus client, the TAI client) is a "tenant". A tenant
+// decides which TMS workflow runs for its invoices, which Firestore collections
+// and BigQuery dataset its data lives in, and which Gmail account its invoices
+// arrive on. There is one shared deployment; tenants are namespaced by a
+// collection prefix rather than by separate Firebase projects.
+//
+// DEFAULT_TENANT reproduces the ORIGINAL single-tenant Primus behavior exactly:
+// empty collection prefix (so collection names are unchanged), the original
+// BigQuery dataset, and the legacy `settings/gmail` token doc. This guarantees
+// that existing data and the live Primus pipeline keep working with zero config
+// — only newly-added tenants get namespaced collections/datasets/inboxes.
+const DEFAULT_TENANT = Object.freeze({
+  tenantId: "default",
+  name: "Default (Primus)",
+  tms: "primus",
+  collectionPrefix: "",
+  bqDataset: BQ_DATASET,
+  gmailDocId: "gmail",
+  alertEmail: process.env.ALERT_EMAIL || null,
+  active: true,
+});
+
+/**
+ * Normalizes a raw `tenants/{id}` Firestore document into a tenant config.
+ * @param {string} tenantId Tenant identifier (the Firestore doc id).
+ * @param {object} data Raw document data.
+ * @return {object} Normalized tenant config.
+ */
+function normalizeTenant(tenantId, data) {
+  const d = data || {};
+  return {
+    tenantId: String(tenantId),
+    name: d.name || String(tenantId),
+    tms: String(d.tms || "primus").toLowerCase(),
+    collectionPrefix: String(d.collectionPrefix || "").trim(),
+    bqDataset: d.bqDataset || BQ_DATASET,
+    gmailDocId: d.gmailDocId || `gmail_${tenantId}`,
+    alertEmail: d.alertEmail || process.env.ALERT_EMAIL || null,
+    active: d.active !== false,
+  };
+}
+
+/**
+ * Resolves a tenant by id, falling back to the default (Primus) tenant when the
+ * id is missing/"default" or no matching tenant doc exists.
+ * @param {string|null} tenantId Tenant identifier.
+ * @return {Promise<object>} Tenant config.
+ */
+async function getTenant(tenantId) {
+  if (!tenantId || tenantId === "default") {
+    return {...DEFAULT_TENANT};
+  }
+  try {
+    const snap = await db.collection("tenants").doc(String(tenantId)).get();
+    if (!snap.exists) {
+      return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+    }
+    return normalizeTenant(tenantId, snap.data());
+  } catch (error) {
+    console.error(`getTenant(${tenantId}) failed:`, error.message);
+    return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+  }
+}
+
+/**
+ * Lists every tenant whose Gmail inbox should be polled. Always includes the
+ * default tenant (legacy `settings/gmail`) so the original Primus inbox keeps
+ * being processed, then appends every active doc in the `tenants` collection.
+ * @return {Promise<Array<object>>} Active tenant configs.
+ */
+async function getActiveTenants() {
+  const tenants = [{...DEFAULT_TENANT}];
+  try {
+    const snap = await db.collection("tenants")
+        .where("active", "==", true).get();
+    for (const doc of snap.docs) {
+      if (doc.id === "default") continue;
+      tenants.push(normalizeTenant(doc.id, doc.data()));
+    }
+  } catch (error) {
+    console.error("getActiveTenants failed:", error.message);
+  }
+  return tenants;
+}
+
+/**
+ * Returns a Firestore collection reference namespaced to a tenant. The default
+ * tenant uses an empty prefix, so its collection names are unchanged.
+ * @param {object} tenant Tenant config.
+ * @param {string} name Base collection name (e.g. "invoices").
+ * @return {FirebaseFirestore.CollectionReference} Namespaced collection ref.
+ */
+function tcol(tenant, name) {
+  const prefix = tenant && tenant.collectionPrefix;
+  return db.collection(prefix ? `${prefix}_${name}` : name);
+}
+
+/**
+ * Returns the `settings/{docId}` document id that stores a tenant's Gmail OAuth
+ * tokens. Defaults to the legacy "gmail" doc for the default tenant.
+ * @param {object} tenant Tenant config.
+ * @return {string} Settings doc id.
+ */
+function tenantGmailDocId(tenant) {
+  return (tenant && tenant.gmailDocId) || "gmail";
+}
+
+/**
+ * Loads a tenant's stored Gmail OAuth tokens, or null if not connected.
+ * @param {object} tenant Tenant config.
+ * @return {Promise<object|null>} OAuth tokens or null.
+ */
+async function getTenantGmailTokens(tenant) {
+  const snap = await db.collection("settings")
+      .doc(tenantGmailDocId(tenant)).get();
+  if (!snap.exists) return null;
+  const data = snap.data() || {};
+  return data.tokens || data;
+}
+
+/**
+ * Builds an authenticated Gmail API client for a tenant, or null if the
+ * tenant's inbox is not connected.
+ * @param {object} tenant Tenant config.
+ * @return {Promise<object|null>} Gmail client or null.
+ */
+async function getTenantGmailClient(tenant) {
+  const tokens = await getTenantGmailTokens(tenant);
+  if (!tokens) return null;
+  const oauth2Client = getGmailOAuthClient();
+  oauth2Client.setCredentials(tokens);
+  return google.gmail({version: "v1", auth: oauth2Client});
+}
+
+/**
+ * Resolves the workflow kickoff URL for a TMS. Falls back to the deployed
+ * Cloud Functions URL when the matching env var is not set.
+ * @param {string} tms TMS key ("tai" or "primus").
+ * @return {string} Absolute workflow endpoint URL.
+ */
+function workflowUrlForTms(tms) {
+  const base =
+    "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+  if (String(tms).toLowerCase() === "tai") {
+    return process.env.PROCESS_TAI_WORKFLOW_URL ||
+      `${base}/processTaiWorkflow`;
+  }
+  return process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+    `${base}/processPrimusWorkflow`;
+}
+
+// Tenant context for logging. Routing a tenant through every one of the dozens
+// of writeLog/logWorkflowStep calls in the ingestion + workflow paths would be
+// error-prone, so we stash the active tenant in async-local storage for the
+// duration of a request/message and let the loggers read it. An explicit
+// `tenant` argument always wins over the ambient context.
+const tenantContext = new AsyncLocalStorage();
+
+/**
+ * Returns the tenant bound to the current async context, or null.
+ * @return {object|null} Active tenant config.
+ */
+function currentTenant() {
+  return tenantContext.getStore() || null;
+}
+
+/**
+ * Runs `fn` with `tenant` bound as the ambient logging context.
+ * @param {object} tenant Tenant config.
+ * @param {Function} fn Async function to run.
+ * @return {*} Result of fn.
+ */
+function runWithTenant(tenant, fn) {
+  return tenantContext.run(tenant || DEFAULT_TENANT, fn);
 }
 
 /**
@@ -289,12 +467,12 @@ function isValidLoadNumber(loadNumber) {
 
 /**
  * Returns the most recently created valid load number from invoices.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<number|null>} Last known load number, or null.
  */
-async function getLastKnownLoadNumber() {
+async function getLastKnownLoadNumber(tenant = DEFAULT_TENANT) {
   try {
-    const snap = await db
-        .collection("invoices")
+    const snap = await tcol(tenant, "invoices")
         .orderBy("createdAt", "desc")
         .limit(50)
         .get();
@@ -418,10 +596,22 @@ async function summarizeSingleFlow(flowId, logs) {
 
 exports.setupBigQuery = onRequest(async (req, res) => {
   try {
-    const dataset = bigquery.dataset(BQ_DATASET);
+    // Provision the default dataset, or a specific tenant's dataset when a
+    // ?tenantId= (or ?dataset=) query param is supplied. Run this once per
+    // tenant so its logs land in its own dataset.
+    let datasetName = BQ_DATASET;
+    const tenantId = req.query.tenantId || (req.body && req.body.tenantId);
+    if (tenantId) {
+      const tenant = await getTenant(String(tenantId));
+      datasetName = tenant.bqDataset;
+    } else if (req.query.dataset) {
+      datasetName = String(req.query.dataset);
+    }
+
+    const dataset = bigquery.dataset(datasetName);
     const [datasetExists] = await dataset.exists();
     if (!datasetExists) {
-      await bigquery.createDataset(BQ_DATASET, {location: "US"});
+      await bigquery.createDataset(datasetName, {location: "US"});
     }
 
     const [logsExists] = await dataset.table(BQ_LOGS_TABLE).exists();
@@ -439,7 +629,7 @@ exports.setupBigQuery = onRequest(async (req, res) => {
     return res.json({
       ok: true,
       message: "BigQuery dataset and tables are ready.",
-      dataset: BQ_DATASET,
+      dataset: datasetName,
       tables: [BQ_LOGS_TABLE, BQ_SUMMARIES_TABLE],
     });
   } catch (error) {
@@ -879,6 +1069,7 @@ exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
  * @param {string} message Log message.
  * @param {object} details Additional details object.
  * @param {string} messageId Gmail message ID if applicable.
+ * @param {object} [tenant] Tenant config for namespaced logs.
  * @return {Promise<void>}
  */
 async function writeLog(
@@ -887,6 +1078,7 @@ async function writeLog(
     message,
     details = {},
     messageId = null,
+    tenant = null,
 ) {
   try {
     const cleanDetails = JSON.parse(JSON.stringify(details, (key, value) => {
@@ -905,8 +1097,18 @@ async function writeLog(
       (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
     const resolvedCurrentStep = cleanDetails.currentStep || null;
 
+    // Dataset resolution order: explicit tenant arg → ambient tenant context
+    // (set per message/request) → dataset carried in details → default. This
+    // keeps single-tenant behavior unchanged while routing tenant logs to
+    // their own dataset.
+    const ambient = currentTenant();
+    const dataset = (tenant && tenant.bqDataset) ||
+      (ambient && ambient.bqDataset) ||
+      (cleanDetails && cleanDetails.bqDataset) ||
+      BQ_DATASET;
+
     bigquery
-        .dataset(BQ_DATASET)
+        .dataset(dataset)
         .table(BQ_LOGS_TABLE)
         .insert([{
           timestamp: new Date().toISOString(),
@@ -1456,10 +1658,14 @@ async function forwardToHumanReview(
  * @param {string} subject Email subject.
  * @param {string} html HTML body.
  * @param {Array<object>} attachments PDF attachments array.
+ * @param {object} [tenant] Tenant config for Gmail doc lookup.
  * @return {Promise<void>}
  */
-async function sendViaGmail(to, subject, html, attachments = []) {
-  const gmailDoc = await db.collection("settings").doc("gmail").get();
+async function sendViaGmail(
+    to, subject, html, attachments = [], tenant = null,
+) {
+  const docId = tenantGmailDocId(tenant || DEFAULT_TENANT);
+  const gmailDoc = await db.collection("settings").doc(docId).get();
   if (!gmailDoc.exists) throw new Error("Gmail not connected");
   const tokens = gmailDoc.data().tokens || gmailDoc.data();
   const oauth2Client = getGmailOAuthClient();
@@ -1744,8 +1950,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
  * @return {Promise<object>} Result of the operation.
  */
 async function saveOutboundEmail(email) {
+  const tenant = (email && email.tenant) || DEFAULT_TENANT;
   let sendResult = null;
-  const to = process.env.ALERT_EMAIL || email.to || "";
+  const to = tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "";
 
   if (to) {
     try {
@@ -1754,6 +1961,7 @@ async function saveOutboundEmail(email) {
           email.subject || "",
           email.html || "",
           Array.isArray(email.attachments) ? email.attachments : [],
+          tenant,
       );
       sendResult = {ok: true};
     } catch (sendErr) {
@@ -1767,8 +1975,11 @@ async function saveOutboundEmail(email) {
     });
   }
 
-  await db.collection("outboundEmails").add({
-    ...email,
+  // The tenant object is internal routing metadata; don't persist it.
+  const emailToStore = {...email};
+  delete emailToStore.tenant;
+  await tcol(tenant, "outboundEmails").add({
+    ...emailToStore,
     sendResult: sendResult,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     deleteAt: getDeleteAt(7),
@@ -1780,7 +1991,7 @@ async function saveOutboundEmail(email) {
     to: to,
     intendedTo: email.to || null,
     sent: Boolean(sendResult && sendResult.ok),
-  });
+  }, null, tenant);
 }
 
 /**
@@ -2177,9 +2388,10 @@ async function logWorkflowStep(data) {
     input,
     output,
     error,
+    tenant,
   } = data || {};
 
-  await db.collection("workflowLogs").add({
+  await tcol(tenant || currentTenant() || DEFAULT_TENANT, "workflowLogs").add({
     invoiceId: invoiceId || null,
     gmailMessageId: gmailMessageId || null,
     stepName: stepName || "unknown",
@@ -2217,23 +2429,19 @@ function normalizeAiChargeArrays(aiResult) {
 }
 
 /**
- * Checks whether a Gmail message has already been processed.
- * @param {string} messageId - The Gmail message ID.
- * @return {Promise<boolean>} True if already processed.
- */
-/**
  * Checks whether a Gmail message has already been ingested.
  * @param {string} messageId - Gmail message ID.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<boolean>} True if the message was previously processed.
  */
-async function hasEmailBeenProcessed(messageId) {
-  const intakeSnap = await db.collection("emailIntake")
+async function hasEmailBeenProcessed(messageId, tenant = DEFAULT_TENANT) {
+  const intakeSnap = await tcol(tenant, "emailIntake")
       .where("gmailMessageId", "==", messageId)
       .limit(1)
       .get();
   if (intakeSnap.size > 0) return true;
 
-  const invoiceSnap = await db.collection("invoices")
+  const invoiceSnap = await tcol(tenant, "invoices")
       .where("gmailMessageId", "==", messageId)
       .limit(1)
       .get();
@@ -2241,7 +2449,7 @@ async function hasEmailBeenProcessed(messageId) {
 
   // Also check the queue — covers NO_INVOICE_PDF and other early-exit paths
   // that never create an emailIntake record but did reserve a queue slot.
-  const queueSnap = await db.collection("gmailQueue").doc(messageId).get();
+  const queueSnap = await tcol(tenant, "gmailQueue").doc(messageId).get();
   if (queueSnap.exists) {
     const queueStatus = (queueSnap.data() || {}).status;
     if (queueStatus && queueStatus !== "queued" && queueStatus !== "failed") {
@@ -2267,7 +2475,8 @@ async function updateGmailQueueStatus(
     options = {},
 ) {
   try {
-    const queueRef = db.collection("gmailQueue").doc(messageId);
+    const tenant = options.tenant || DEFAULT_TENANT;
+    const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
     const updateData = {
       status: status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2299,10 +2508,11 @@ async function updateGmailQueueStatus(
 /**
  * Claims a Gmail queue item using a Firestore transaction.
  * @param {string} messageId - Gmail message ID.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<boolean>} True when the queue item was claimed.
  */
-async function claimGmailQueueItem(messageId) {
-  const queueRef = db.collection("gmailQueue").doc(messageId);
+async function claimGmailQueueItem(messageId, tenant = DEFAULT_TENANT) {
+  const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
 
   try {
     const claimed = await db.runTransaction(async (tx) => {
@@ -2341,6 +2551,7 @@ async function claimGmailQueueItem(messageId) {
  * @param {string} subject - Email subject.
  * @param {string} from - Email sender.
  * @param {string} inboxFlowId - Inbox flow identifier.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<boolean>} True when the queue item was reserved.
  */
 async function reserveGmailQueueItemForProcessing(
@@ -2348,8 +2559,9 @@ async function reserveGmailQueueItemForProcessing(
     subject,
     from,
     inboxFlowId,
+    tenant = DEFAULT_TENANT,
 ) {
-  const queueRef = db.collection("gmailQueue").doc(messageId);
+  const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
   const now = admin.firestore.FieldValue.serverTimestamp();
 
   try {
@@ -2363,6 +2575,7 @@ async function reserveGmailQueueItemForProcessing(
 
       tx.set(queueRef, {
         gmailMessageId: messageId,
+        tenantId: tenant.tenantId,
         subject: String(subject || "").slice(0, 500),
         from: String(from || "").slice(0, 500),
         status: "processing",
@@ -2503,6 +2716,8 @@ async function processGmailMessage(
   const messageId = String(message.id || message.gmailMessageId || "");
   let subject = String(options.subject || "");
   let from = String(options.from || "");
+  const tenant = options.tenant || currentTenant() || DEFAULT_TENANT;
+  const isTai = tenant.tms === "tai";
 
   try {
     const fullMessage = await gmail.users.messages.get({
@@ -2561,14 +2776,14 @@ async function processGmailMessage(
       from: from,
     });
 
-    const alreadyProcessed = await hasEmailBeenProcessed(messageId);
+    const alreadyProcessed = await hasEmailBeenProcessed(messageId, tenant);
     if (alreadyProcessed) {
       await writeLog("warn", "gmail", "Message already processed, skipping", {
         messageId: messageId,
         subject: subject,
         from: from,
       });
-      await updateGmailQueueStatus(messageId, "completed");
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
       return;
     }
 
@@ -2580,6 +2795,7 @@ async function processGmailMessage(
           subject,
           from,
           inboxFlowId,
+          tenant,
       );
       if (!reserved) {
         await writeLog("warn", "gmail", "Skipped duplicate inbox processing", {
@@ -2600,9 +2816,10 @@ async function processGmailMessage(
           "Email received with no attachments",
           {department: "general"},
       );
-      await updateGmailQueueStatus(messageId, "completed");
-      await db.collection("emailIntake").doc(messageId).set({
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+      await tcol(tenant, "emailIntake").doc(messageId).set({
         gmailMessageId: messageId,
+        tenantId: tenant.tenantId,
         subject, from,
         finalStatus: "no_attachment",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2614,6 +2831,7 @@ async function processGmailMessage(
     if (!options.fromQueue) {
       await updateGmailQueueStatus(messageId, "processing", null, {
         skipAttemptIncrement: true,
+        tenant,
       });
     }
 
@@ -2748,9 +2966,10 @@ async function processGmailMessage(
             `Email contained ${typeList} attachment(s) but no invoice`;
       }
       await forwardWithAnalysis(noInvoiceReason, {department: "general"});
-      await updateGmailQueueStatus(messageId, "completed");
-      await db.collection("emailIntake").doc(messageId).set({
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+      await tcol(tenant, "emailIntake").doc(messageId).set({
         gmailMessageId: messageId,
+        tenantId: tenant.tenantId,
         subject, from,
         finalStatus: "no_invoice_pdf",
         skippedAttachmentTypes: skippedDocTypes,
@@ -2992,6 +3211,20 @@ async function processGmailMessage(
           reviewRequired: true,
         },
       });
+    } else if (aiResult.status === "ready_for_primus_validation" && isTai) {
+      // ── TAI tenant ───────────────────────────────────────────────────────
+      // All shipment/amount validation for TAI happens inside
+      // processTaiWorkflow (it resolves the shipmentId from the webhook index,
+      // validates the amount, adds the PRO, etc.). We skip the Primus-specific
+      // pre-checks here and simply mark the invoice ready so it is created and
+      // routed to the TAI workflow below.
+      finalStatus = "processing";
+      await writeLog("info", "tai",
+          "TAI tenant — deferring validation to TAI workflow", {
+            messageId,
+            loadNumber: aiResult.loadNumber,
+            proNumber: aiResult.proNumber,
+          });
     } else if (aiResult.status === "ready_for_primus_validation") {
       // ── Primus shipment lookup (stub) ──────────────────────────────────
       const primusData = await getPrimusShipment(
@@ -3225,7 +3458,7 @@ async function processGmailMessage(
         {messageId: messageId, finalStatus: finalStatus},
     );
 
-    const emailIntakeRef = db.collection("emailIntake").doc(messageId);
+    const emailIntakeRef = tcol(tenant, "emailIntake").doc(messageId);
     const intakeCreated = await db.runTransaction(async (tx) => {
       const intakeSnap = await tx.get(emailIntakeRef);
       if (intakeSnap.exists) {
@@ -3234,6 +3467,7 @@ async function processGmailMessage(
 
       tx.set(emailIntakeRef, {
         primusResult: primusResult,
+        tenantId: tenant.tenantId,
         finalStatus: finalStatus,
         gmailMessageId: messageId,
         from: from,
@@ -3255,7 +3489,7 @@ async function processGmailMessage(
       await writeLog("warn", "gmail", duplicateIntakeMessage, {
         messageId,
       });
-      await updateGmailQueueStatus(messageId, "completed");
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
       return;
     }
 
@@ -3277,10 +3511,12 @@ async function processGmailMessage(
         mimeType: att.mimeType,
       }));
 
-      let decisionStage = "pending_primus_check";
+      let decisionStage = isTai ?
+        "pending_tai_check" : "pending_primus_check";
       let matchStatus = "not_checked";
       let reviewStatus = "not_needed";
-      let decisionReason = "Waiting for Primus lookup.";
+      let decisionReason = isTai ?
+        "Waiting for TAI lookup." : "Waiting for Primus lookup.";
       let primusAmount = null;
       let amountDifference = null;
 
@@ -3307,7 +3543,9 @@ async function processGmailMessage(
       }
 
       const flowId = messageId;
-      const invoiceDoc = await db.collection("invoices").add({
+      const invoiceDoc = await tcol(tenant, "invoices").add({
+        tenantId: tenant.tenantId,
+        tms: tenant.tms,
         carrierName: aiResult.carrierName || null,
         invoiceNumber: aiResult.invoiceNumber || null,
         proNumber: aiResult.proNumber || null,
@@ -3368,6 +3606,7 @@ async function processGmailMessage(
         stepStatus: "success",
         input: {messageId: messageId, subject: subject},
         output: {invoiceId: invoiceDoc.id},
+        tenant,
       });
 
       await logWorkflowStep({
@@ -3375,6 +3614,7 @@ async function processGmailMessage(
         stepName: "invoice_created",
         stepStatus: "success",
         output: {invoiceId: invoiceDoc.id},
+        tenant,
       });
 
       await writeLog("info", "gmail", `Invoice document created`, {
@@ -3387,17 +3627,17 @@ async function processGmailMessage(
       await writeLog(
           "info",
           "workflow",
-          `Starting Primus workflow for new invoice`,
+          `Starting ${tenant.tms} workflow for new invoice`,
           {
             messageId: messageId,
             invoiceId: invoiceDoc.id,
+            tms: tenant.tms,
+            tenantId: tenant.tenantId,
           },
       );
 
       try {
-        const workflowUrl =
-          process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-          "https://us-central1-tai-invoice-automation.cloudfunctions.net/processPrimusWorkflow";
+        const workflowUrl = workflowUrlForTms(tenant.tms);
         const workflowRes = await fetch(
             workflowUrl,
             {
@@ -3405,7 +3645,10 @@ async function processGmailMessage(
               headers: {
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({invoiceId: invoiceDoc.id}),
+              body: JSON.stringify({
+                invoiceId: invoiceDoc.id,
+                tenantId: tenant.tenantId,
+              }),
             },
         );
 
@@ -3414,7 +3657,7 @@ async function processGmailMessage(
           await writeLog(
               "error",
               "workflow",
-              "Failed to start Primus workflow",
+              `Failed to start ${tenant.tms} workflow`,
               {
                 messageId: messageId,
                 invoiceId: invoiceDoc.id,
@@ -3427,7 +3670,7 @@ async function processGmailMessage(
         await writeLog(
             "error",
             "workflow",
-            "Failed to start Primus workflow",
+            `Failed to start ${tenant.tms} workflow`,
             {
               messageId: messageId,
               invoiceId: invoiceDoc.id,
@@ -3455,9 +3698,9 @@ async function processGmailMessage(
       finalStatus: finalStatus,
     });
 
-    await updateGmailQueueStatus(messageId, "completed");
+    await updateGmailQueueStatus(messageId, "completed", null, {tenant});
   } catch (error) {
-    await updateGmailQueueStatus(messageId, "failed", error.message);
+    await updateGmailQueueStatus(messageId, "failed", error.message, {tenant});
     throw error;
   }
 }
@@ -3495,7 +3738,11 @@ function extractAttachmentsRecursive(parts) {
 }
 exports.gmailConnect = onRequest(async (req, res) => {
   try {
+    const tenant = await resolveDashboardTenant(req);
     const oauth2Client = getGmailOAuthClient();
+    const state = Buffer.from(JSON.stringify({
+      tenantId: tenant.tenantId,
+    })).toString("base64url");
 
     const url = oauth2Client.generateAuthUrl({
       access_type: "offline",
@@ -3504,6 +3751,7 @@ exports.gmailConnect = onRequest(async (req, res) => {
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.send",
       ],
+      state,
     });
 
     return res.redirect(url);
@@ -3521,16 +3769,33 @@ exports.gmailOAuthCallback = onRequest(async (req, res) => {
       return res.status(400).send("Missing code from Google.");
     }
 
+    let tenantId = "default";
+    if (req.query.state) {
+      try {
+        const parsed = JSON.parse(
+            Buffer.from(String(req.query.state), "base64url").toString("utf8"));
+        if (parsed && parsed.tenantId) {
+          tenantId = String(parsed.tenantId);
+        }
+      } catch (_) {
+        // Legacy connect without state — fall back to default tenant.
+      }
+    }
+    const tenant = await getTenant(tenantId);
+
     const oauth2Client = getGmailOAuthClient();
 
     const {tokens} = await oauth2Client.getToken(code);
 
-    await db.collection("settings").doc("gmail").set({
+    await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
       tokens: tokens,
+      tenantId: tenant.tenantId,
       connectedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    return res.send("Gmail connected successfully. You can close this page.");
+    return res.send(
+        `Gmail connected successfully for ${tenant.name || tenant.tenantId}. ` +
+        "You can close this page.");
   } catch (error) {
     console.error("gmailOAuthCallback error:", error);
     return res.status(500).send(error.message);
@@ -3558,6 +3823,18 @@ function applyDashboardCors(req, res) {
   return false;
 }
 
+/**
+ * Resolves the tenant for a dashboard API call from ?tenantId= or POST body.
+ * Defaults to the legacy Primus tenant when omitted.
+ * @param {object} req Express request.
+ * @return {Promise<object>} Tenant config.
+ */
+async function resolveDashboardTenant(req) {
+  const tenantId = (req.query && req.query.tenantId) ||
+    (req.body && req.body.tenantId) || "default";
+  return getTenant(String(tenantId));
+}
+
 // Supported dashboard time ranges, mapped to how far back to look and the
 // granularity to bucket results into. Kept as a whitelist so the range
 // query param can never reach the SQL string directly.
@@ -3573,15 +3850,25 @@ exports.getGmailStatus = onRequest(async (req, res) => {
   }
 
   try {
-    const gmailDoc = await db.collection("settings").doc("gmail").get();
+    const tenant = await resolveDashboardTenant(req);
+    const gmailDoc = await db.collection("settings")
+        .doc(tenantGmailDocId(tenant)).get();
     if (!gmailDoc.exists) {
-      return res.json({ok: true, connected: false});
+      return res.json({
+        ok: true,
+        connected: false,
+        tenantId: tenant.tenantId,
+        tms: tenant.tms,
+      });
     }
 
     const data = gmailDoc.data();
     return res.json({
       ok: true,
       connected: true,
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
+      tenantName: tenant.name,
       connectedAt: data.connectedAt ? data.connectedAt.toDate() : null,
     });
   } catch (error) {
@@ -3598,8 +3885,9 @@ exports.gmailDisconnect = onRequest(
         return res.status(405).json({ok: false, error: "Method not allowed."});
       }
       try {
-        await db.collection("settings").doc("gmail").delete();
-        return res.json({ok: true});
+        const tenant = await resolveDashboardTenant(req);
+        await db.collection("settings").doc(tenantGmailDocId(tenant)).delete();
+        return res.json({ok: true, tenantId: tenant.tenantId});
       } catch (error) {
         console.error("gmailDisconnect error:", error);
         return res.status(500).json({ok: false, error: error.message});
@@ -3760,11 +4048,13 @@ exports.getRecentLogs = onRequest(
     async (req, res) => {
       if (applyDashboardCors(req, res)) return;
       try {
+        const tenant = await resolveDashboardTenant(req);
         const limit = Math.min(Number(req.query.limit || 40), 100);
+        const dataset = tenant.bqDataset || BQ_DATASET;
         const [rows] = await bigquery.query({
           query: `
             SELECT timestamp, level, category, message
-            FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
+            FROM \`${dataset}.${BQ_LOGS_TABLE}\`
             ORDER BY timestamp DESC
             LIMIT @limit
           `,
@@ -3777,11 +4067,61 @@ exports.getRecentLogs = onRequest(
           category: row.category,
           message: row.message,
         }));
-        return res.json({ok: true, logs});
+        return res.json({ok: true, tenantId: tenant.tenantId, logs});
       } catch (error) {
         console.error("getRecentLogs error:", error);
         return res.status(500).json({
           ok: false, error: "Failed to load logs.", details: error.message,
+        });
+      }
+    },
+);
+
+exports.getRecentInvoices = onRequest(
+    {invoker: "public"},
+    async (req, res) => {
+      if (applyDashboardCors(req, res)) return;
+      try {
+        const tenant = await resolveDashboardTenant(req);
+        const limit = Math.min(Number(req.query.limit || 20), 50);
+        const snap = await tcol(tenant, "invoices")
+            .orderBy("createdAt", "desc")
+            .limit(limit)
+            .get();
+        const invoices = snap.docs.map((doc) => {
+          const data = doc.data() || {};
+          const createdAt = data.createdAt && data.createdAt.toDate ?
+            data.createdAt.toDate().toISOString() : null;
+          return {
+            id: doc.id,
+            loadNumber: data.loadNumber || null,
+            proNumber: data.proNumber || null,
+            carrierName: data.carrierName || null,
+            customerName: data.customerName || null,
+            invoiceAmount: data.invoiceAmount || null,
+            customerRate: data.customerRate || null,
+            profit: data.profit || null,
+            tms: data.tms || tenant.tms,
+            taiShipmentId: data.taiShipmentId || null,
+            finalWorkflowStatus: data.finalWorkflowStatus || null,
+            decisionStage: data.decisionStage || null,
+            decisionReason: data.decisionReason || null,
+            currentStep: data.currentStep || null,
+            createdAt,
+          };
+        });
+        return res.json({
+          ok: true,
+          tenantId: tenant.tenantId,
+          tms: tenant.tms,
+          invoices,
+        });
+      } catch (error) {
+        console.error("getRecentInvoices error:", error);
+        return res.status(500).json({
+          ok: false,
+          error: "Failed to load invoices.",
+          details: error.message,
         });
       }
     },
@@ -3793,6 +4133,8 @@ exports.getDashboardStats = onRequest(async (req, res) => {
   }
 
   try {
+    const tenant = await resolveDashboardTenant(req);
+    const dataset = tenant.bqDataset || BQ_DATASET;
     const range = String(req.query.range || "week").toLowerCase();
     const rangeConfig = DASHBOARD_RANGES[range];
     if (!rangeConfig) {
@@ -3817,7 +4159,7 @@ exports.getDashboardStats = onRequest(async (req, res) => {
             message = "No attachments found, forwarding for review"
           )
         ) AS emailsForwarded
-      FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
+      FROM \`${dataset}.${BQ_LOGS_TABLE}\`
       WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
       GROUP BY period
       ORDER BY period ASC
@@ -3842,7 +4184,14 @@ exports.getDashboardStats = onRequest(async (req, res) => {
       emailsForwarded: acc.emailsForwarded + row.emailsForwarded,
     }), {invoicesProcessed: 0, emailsReplied: 0, emailsForwarded: 0});
 
-    return res.json({ok: true, range, totals, series});
+    return res.json({
+      ok: true,
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
+      range,
+      totals,
+      series,
+    });
   } catch (error) {
     console.error("getDashboardStats error:", error);
     return res.status(500).json({
@@ -4050,6 +4399,198 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
   }
 });
 
+/**
+ * Polls a single tenant's Gmail inbox and processes new invoice emails. The
+ * tenant determines which Gmail account is read, which collections data is
+ * written to, and which TMS workflow runs. All logging is bound to the tenant
+ * via async-local context.
+ * @param {object} tenant Tenant config.
+ * @param {string} inboxFlowId Flow id for this inbox-check run.
+ * @return {Promise<object>} {connected, processed}.
+ */
+async function checkGmailInboxForTenant(tenant, inboxFlowId) {
+  return runWithTenant(tenant, async () => {
+    const gmail = await getTenantGmailClient(tenant);
+    if (!gmail) {
+      await writeLog("warn", "gmail",
+          `Gmail is not connected for tenant ${tenant.tenantId}`);
+      return {connected: false, processed: 0};
+    }
+
+    await writeLog(
+        "info",
+        "gmail",
+        "Fetching messages from Gmail",
+        {
+          flowId: inboxFlowId,
+          currentStep: "gmail_inbox_check",
+          tenantId: tenant.tenantId,
+        },
+    );
+
+    const qAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const gmailQuery = [
+      "in:inbox",
+      "is:unread",
+      `after:${qAfter.getFullYear()}/${
+        qAfter.getMonth() + 1}/${qAfter.getDate()}`,
+    ].join(" ");
+
+    const messages = [];
+    let pageToken = null;
+
+    const lastKnownLoadNumber = await getLastKnownLoadNumber(tenant);
+
+    // Safety cap to avoid hitting function timeouts if inbox is flooded.
+    const maxMessagesPerRun = 10;
+
+    do {
+      const listResponse = await gmail.users.messages.list({
+        userId: "me",
+        q: gmailQuery,
+        maxResults: 50,
+        includeSpamTrash: false,
+        pageToken: pageToken || undefined,
+      });
+
+      const batch = listResponse.data.messages || [];
+      messages.push(...batch);
+      pageToken = listResponse.data.nextPageToken || null;
+
+      if (messages.length >= maxMessagesPerRun) {
+        messages.splice(maxMessagesPerRun);
+        pageToken = null;
+      }
+    } while (pageToken);
+
+    await writeLog(
+        "info",
+        "gmail",
+        `Found ${messages.length} new invoice email(s)`,
+        {
+          flowId: inboxFlowId,
+          currentStep: "gmail_inbox_check",
+          messageCount: messages.length,
+          tenantId: tenant.tenantId,
+        },
+    );
+
+    console.log(
+        `[${tenant.tenantId}] Found ${messages.length} new invoice email(s).`);
+
+    for (const message of messages) {
+      try {
+        // Skip if already processed (deduplication guard).
+        const alreadyProcessed = await tcol(tenant, "emailIntake")
+            .where("gmailMessageId", "==", message.id).limit(1).get();
+        if (!alreadyProcessed.empty) {
+          await writeLog("info", "gmail",
+              `Skipping already-processed message ${message.id}`);
+          continue;
+        }
+
+        await writeLog(
+            "info",
+            "gmail",
+            `Processing message ${message.id}`,
+            {
+              messageId: message.id,
+            },
+        );
+
+        await processGmailMessage(
+            gmail,
+            message,
+            inboxFlowId,
+            lastKnownLoadNumber,
+            {tenant},
+        );
+
+        // Mark as read so it won't appear in future unread queries.
+        await gmail.users.messages.modify({
+          userId: "me",
+          id: message.id,
+          requestBody: {removeLabelIds: ["UNREAD"]},
+        });
+      } catch (error) {
+        await writeLog("error", "gmail", `Error processing message`, {
+          messageId: message.id,
+          error: error.message,
+          stack: error.stack,
+        });
+
+        console.error(`Error processing message ${message.id}:`, error);
+
+        try {
+          let errSubject = "(unknown subject)";
+          let errFrom = "(unknown sender)";
+          let errBody = null;
+          try {
+            const fullErrMsg = await gmail.users.messages.get({
+              userId: "me",
+              id: message.id,
+              format: "full",
+            });
+            const hdrs = fullErrMsg.data.payload?.headers || [];
+            errSubject = hdrs.find((h) => h.name === "Subject")
+                ?.value || errSubject;
+            errFrom = hdrs.find((h) => h.name === "From")?.value || errFrom;
+            errBody = extractEmailBody(fullErrMsg.data.payload) || null;
+          } catch (fetchErr) {
+            console.error(
+                `[processInbox] Could not fetch details for message ` +
+                `${message.id} while building error-review forward:`,
+                fetchErr,
+            );
+          }
+          await forwardToHumanReview(
+              gmail,
+              message.id,
+              errSubject,
+              errFrom,
+              "An unexpected error occurred processing this email",
+              `I attempted to process this email but encountered an ` +
+              `unexpected error and was unable to complete the workflow. ` +
+              `Error: ${error.message}. ` +
+              `Please review this email and handle it manually.`,
+              {department: "general", emailBody: errBody},
+          );
+        } catch (fwdErr) {
+          console.error("Failed to forward error email:", fwdErr.message);
+        }
+
+        await tcol(tenant, "emailErrors").add({
+          gmailMessageId: message.id,
+          tenantId: tenant.tenantId,
+          error: error.message,
+          status: "error",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          deleteAt: getDeleteAt(30),
+        });
+
+        try {
+          await gmail.users.messages.modify({
+            userId: "me",
+            id: message.id,
+            requestBody: {removeLabelIds: ["UNREAD"]},
+          });
+        } catch (markErr) {
+          console.error(
+              `Failed to mark message ${message.id} as read:`,
+              markErr.message,
+          );
+        }
+      }
+    }
+
+    await writeLog("info", "gmail", "Gmail inbox check completed", {
+      processedMessages: messages.length,
+      tenantId: tenant.tenantId,
+    });
+    return {connected: true, processed: messages.length};
+  });
+}
+
 exports.checkGmailInbox = onRequest(
     {timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
@@ -4065,191 +4606,33 @@ exports.checkGmailInbox = onRequest(
           crypto.randomUUID() :
           `inbox-${Date.now()}`;
 
-        const gmailDoc = await db.collection("settings").doc("gmail").get();
-
-        if (!gmailDoc.exists) {
-          await writeLog("warn", "gmail", "Gmail is not connected");
-          console.log("Gmail is not connected.");
-          return res.status(400).json({
-            ok: false,
-            error: "Gmail is not connected.",
-          });
+        // Process every active tenant's inbox. A specific tenant can be polled
+        // in isolation with ?tenantId=. Tenants are processed sequentially so a
+        // flooded inbox can't starve the others within a single invocation.
+        let tenants;
+        if (req.query.tenantId) {
+          tenants = [await getTenant(String(req.query.tenantId))];
+        } else {
+          tenants = await getActiveTenants();
         }
 
-        const gmailSettings = gmailDoc.data();
-        const tokens = gmailSettings.tokens || gmailSettings;
-
-        const oauth2Client = getGmailOAuthClient();
-        oauth2Client.setCredentials(tokens);
-
-        const gmail = google.gmail({
-          version: "v1",
-          auth: oauth2Client,
-        });
-
-        await writeLog(
-            "info",
-            "gmail",
-            "Fetching messages from Gmail",
-            {flowId: inboxFlowId, currentStep: "gmail_inbox_check"},
-        );
-
-        const qAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-        const gmailQuery = [
-          "in:inbox",
-          "is:unread",
-          `after:${qAfter.getFullYear()}/${
-            qAfter.getMonth() + 1}/${qAfter.getDate()}`,
-        ].join(" ");
-
-        const messages = [];
-        let pageToken = null;
-
-        // Cache last known load number for the run.
-        const lastKnownLoadNumber = await getLastKnownLoadNumber();
-
-        // Safety cap to avoid hitting function timeouts if inbox is flooded.
-        const maxMessagesPerRun = 10;
-
-        do {
-          const listResponse = await gmail.users.messages.list({
-            userId: "me",
-            q: gmailQuery,
-            maxResults: 50,
-            includeSpamTrash: false,
-            pageToken: pageToken || undefined,
-          });
-
-          const batch = listResponse.data.messages || [];
-          messages.push(...batch);
-          pageToken = listResponse.data.nextPageToken || null;
-
-          if (messages.length >= maxMessagesPerRun) {
-            messages.splice(maxMessagesPerRun);
-            pageToken = null;
-          }
-        } while (pageToken);
-
-        await writeLog(
-            "info",
-            "gmail",
-            `Found ${messages.length} new invoice email(s)`,
-            {
-              flowId: inboxFlowId,
-              currentStep: "gmail_inbox_check",
-              messageCount: messages.length,
-            },
-        );
-
-        console.log(`Found ${messages.length} new invoice email(s).`);
-
-        for (const message of messages) {
+        const results = [];
+        for (const tenant of tenants) {
           try {
-            // Skip if already processed (deduplication guard).
-            const alreadyProcessed = await db.collection("emailIntake")
-                .where("gmailMessageId", "==", message.id).limit(1).get();
-            if (!alreadyProcessed.empty) {
-              await writeLog("info", "gmail",
-                  `Skipping already-processed message ${message.id}`);
-              continue;
-            }
-
-            await writeLog(
-                "info",
-                "gmail",
-                `Processing message ${message.id}`,
-                {
-                  messageId: message.id,
-                },
-            );
-
-            await processGmailMessage(
-                gmail,
-                message,
-                inboxFlowId,
-                lastKnownLoadNumber,
-            );
-
-            // Mark as read so it won't appear in future unread queries.
-            await gmail.users.messages.modify({
-              userId: "me",
-              id: message.id,
-              requestBody: {removeLabelIds: ["UNREAD"]},
+            const r = await checkGmailInboxForTenant(tenant, inboxFlowId);
+            results.push({tenantId: tenant.tenantId, ...r});
+          } catch (tenantErr) {
+            console.error(
+                `checkGmailInbox tenant ${tenant.tenantId} failed:`,
+                tenantErr);
+            results.push({
+              tenantId: tenant.tenantId,
+              error: tenantErr.message,
             });
-          } catch (error) {
-            await writeLog("error", "gmail", `Error processing message`, {
-              messageId: message.id,
-              error: error.message,
-              stack: error.stack,
-            });
-
-            console.error(`Error processing message ${message.id}:`, error);
-
-            try {
-              let errSubject = "(unknown subject)";
-              let errFrom = "(unknown sender)";
-              let errBody = null;
-              try {
-                const fullErrMsg = await gmail.users.messages.get({
-                  userId: "me",
-                  id: message.id,
-                  format: "full",
-                });
-                const hdrs = fullErrMsg.data.payload?.headers || [];
-                errSubject = hdrs.find((h) => h.name === "Subject")
-                    ?.value || errSubject;
-                errFrom = hdrs.find((h) => h.name === "From")?.value || errFrom;
-                errBody = extractEmailBody(fullErrMsg.data.payload) || null;
-              } catch (fetchErr) {
-                console.error(
-                    `[processInbox] Could not fetch details for message ` +
-                    `${message.id} while building error-review forward:`,
-                    fetchErr,
-                );
-              }
-              await forwardToHumanReview(
-                  gmail,
-                  message.id,
-                  errSubject,
-                  errFrom,
-                  "An unexpected error occurred processing this email",
-                  `I attempted to process this email but encountered an ` +
-                  `unexpected error and was unable to complete the workflow. ` +
-                  `Error: ${error.message}. ` +
-                  `Please review this email and handle it manually.`,
-                  {department: "general", emailBody: errBody},
-              );
-            } catch (fwdErr) {
-              console.error("Failed to forward error email:", fwdErr.message);
-            }
-
-            await db.collection("emailErrors").add({
-              gmailMessageId: message.id,
-              error: error.message,
-              status: "error",
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              deleteAt: getDeleteAt(30),
-            });
-
-            try {
-              await gmail.users.messages.modify({
-                userId: "me",
-                id: message.id,
-                requestBody: {removeLabelIds: ["UNREAD"]},
-              });
-            } catch (markErr) {
-              console.error(
-                  `Failed to mark message ${message.id} as read:`,
-                  markErr.message,
-              );
-            }
           }
         }
 
-        await writeLog("info", "gmail", "Gmail inbox check completed", {
-          processedMessages: messages.length,
-        });
-        return res.json({ok: true, processedMessages: messages.length});
+        return res.json({ok: true, tenants: results});
       } catch (error) {
         console.error("checkGmailInbox error:", error);
         return res.status(500).json({
@@ -4261,6 +4644,69 @@ exports.checkGmailInbox = onRequest(
     },
 );
 
+/**
+ * Drains a single tenant's Gmail processing queue.
+ * @param {object} tenant Tenant config.
+ * @param {string} inboxFlowId Flow id for this queue run.
+ * @return {Promise<object>} {connected, processed}.
+ */
+async function processGmailQueueForTenant(tenant, inboxFlowId) {
+  return runWithTenant(tenant, async () => {
+    const gmail = await getTenantGmailClient(tenant);
+    if (!gmail) {
+      await writeLog("warn", "gmail",
+          `Gmail is not connected for tenant ${tenant.tenantId}`);
+      return {connected: false, processed: 0};
+    }
+
+    const queueSnap = await tcol(tenant, "gmailQueue")
+        .where("status", "==", "queued")
+        .orderBy("claimedAt")
+        .limit(10)
+        .get();
+
+    const lastKnownLoadNumber = await getLastKnownLoadNumber(tenant);
+
+    await writeLog("info", "gmail", "Fetched queued Gmail messages", {
+      queueCount: queueSnap.size,
+      tenantId: tenant.tenantId,
+    });
+
+    let processed = 0;
+    for (const doc of queueSnap.docs) {
+      const queueItem = doc.data() || {};
+      try {
+        const claimed = await claimGmailQueueItem(doc.id, tenant);
+        if (!claimed) {
+          const skippedClaimedMessage =
+              "Skipped queue item already claimed or no longer queued";
+          await writeLog("warn", "gmail", skippedClaimedMessage, {
+            messageId: doc.id,
+          });
+          continue;
+        }
+
+        await processGmailMessage(
+            gmail,
+            {id: doc.id, subject: queueItem.subject, from: queueItem.from},
+            inboxFlowId,
+            lastKnownLoadNumber,
+            {fromQueue: true, queueDocRef: doc.ref, tenant},
+        );
+        processed += 1;
+      } catch (error) {
+        await writeLog("error", "gmail", "Queued message failed", {
+          messageId: doc.id,
+          error: error.message,
+          stack: error.stack,
+        });
+      }
+    }
+
+    return {connected: true, processed};
+  });
+}
+
 exports.processGmailQueue = onRequest(
     {timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
@@ -4271,70 +4717,30 @@ exports.processGmailQueue = onRequest(
           crypto.randomUUID() :
           `queue-${Date.now()}`;
 
-        const gmailDoc = await db.collection("settings").doc("gmail").get();
-        if (!gmailDoc.exists) {
-          await writeLog("warn", "gmail", "Gmail is not connected");
-          return res.status(400).json({
-            ok: false,
-            error: "Gmail is not connected.",
-          });
+        let tenants;
+        if (req.query.tenantId) {
+          tenants = [await getTenant(String(req.query.tenantId))];
+        } else {
+          tenants = await getActiveTenants();
         }
 
-        const gmailSettings = gmailDoc.data();
-        const tokens = gmailSettings.tokens || gmailSettings;
-
-        const oauth2Client = getGmailOAuthClient();
-        oauth2Client.setCredentials(tokens);
-
-        const gmail = google.gmail({
-          version: "v1",
-          auth: oauth2Client,
-        });
-
-        const queueSnap = await db.collection("gmailQueue")
-            .where("status", "==", "queued")
-            .orderBy("claimedAt")
-            .limit(10)
-            .get();
-
-        const lastKnownLoadNumber = await getLastKnownLoadNumber();
-
-        await writeLog("info", "gmail", "Fetched queued Gmail messages", {
-          queueCount: queueSnap.size,
-        });
-
-        let processed = 0;
-        for (const doc of queueSnap.docs) {
-          const queueItem = doc.data() || {};
+        const results = [];
+        for (const tenant of tenants) {
           try {
-            const claimed = await claimGmailQueueItem(doc.id);
-            if (!claimed) {
-              const skippedClaimedMessage =
-                  "Skipped queue item already claimed or no longer queued";
-              await writeLog("warn", "gmail", skippedClaimedMessage, {
-                messageId: doc.id,
-              });
-              continue;
-            }
-
-            await processGmailMessage(
-                gmail,
-                {id: doc.id, subject: queueItem.subject, from: queueItem.from},
-                inboxFlowId,
-                lastKnownLoadNumber,
-                {fromQueue: true, queueDocRef: doc.ref},
-            );
-            processed += 1;
-          } catch (error) {
-            await writeLog("error", "gmail", "Queued message failed", {
-              messageId: doc.id,
-              error: error.message,
-              stack: error.stack,
+            const r = await processGmailQueueForTenant(tenant, inboxFlowId);
+            results.push({tenantId: tenant.tenantId, ...r});
+          } catch (tenantErr) {
+            console.error(
+                `processGmailQueue tenant ${tenant.tenantId} failed:`,
+                tenantErr);
+            results.push({
+              tenantId: tenant.tenantId,
+              error: tenantErr.message,
             });
           }
         }
 
-        return res.json({ok: true, processedQueue: processed});
+        return res.json({ok: true, tenants: results});
       } catch (error) {
         console.error("processGmailQueue error:", error);
         return res.status(500).json({
