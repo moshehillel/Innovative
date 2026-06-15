@@ -1,0 +1,748 @@
+Accounting
+Invoices
+
+Approve Invoice
+post
+Set Invoice to Variance
+post
+Update Invoice Sync Status
+put
+By Invoice Id
+get
+By Shipment Id
+get
+By Sync Status
+get
+Invoice Payments
+
+Create an Invoice Payment
+post
+Update an Invoice Payment Sync Status
+put
+By Invoice Payment Id
+get
+By Shipment Id
+get
+By Sync Status
+get
+Bills
+
+Approve Bill
+post
+Update Bill to Variance
+post
+Update Bill Sync Status
+put
+By Bill Id
+get
+By Shipment Id
+get
+By Sync Status
+get
+Bill Payments
+
+Create Bill Payment
+post
+Create Advanced Payment
+post
+By Bill Id
+get
+By Shipment Id
+get
+By Sync Status
+get
+Update Bill Payment Sync Status
+put
+Commissions
+
+Approve Commission
+post
+Update Commission to Variance
+post
+Update Commission Bill Sync Status
+put
+By Bill Id
+get
+By Shipment Id
+get
+By Sync Status
+get
+General Ledger
+
+Get GL Accounts
+get
+Carriers
+Details
+
+Create Carrier
+post
+Update Carrier
+put
+By LSP Carrier Id
+get
+By DOT Number
+get
+By Carrier Master Id
+get
+Create Carrier Activity Log
+post
+Attachments
+
+Create Carrier Attachment
+post
+By Carrier Attachment Id
+get
+By LSP Carrier Id
+get
+Delete Carrier Attachment
+del
+Contacts
+
+Create Carrier Contact
+post
+Update Carrier Contact
+put
+Delete Carrier Contact
+del
+Insurance
+
+Create Carrier Insurance
+post
+Update Carrier Insurance
+put
+Delete Carrier Insurance
+del
+Attachments
+
+Create Attachment
+post
+By Carrier Insurance Attatachment Id
+get
+By Carrier Insurance Id
+get
+Delete Attachment
+del
+Trailer Types
+
+Update Trailer Types
+put
+By LSP Carrier Id
+get
+Organizations
+Broker
+
+Create Organization
+post
+Update Broker
+put
+Change Parent
+put
+Create Activity
+post
+Get Shipment Reference Number Type
+get
+Staff
+
+Create Broker Staff
+post
+Get Broker Staff
+get
+Address Book
+
+Create Address
+post
+Alerts
+
+Get Shipment Alert Type
+get
+Create Shipment Alert Type
+post
+Customers
+
+Create Customer
+post
+Update Customer
+put
+Update Accounting Profile
+put
+Change Parent
+put
+Create Activity
+post
+By Organization Id
+get
+By Reference Number
+get
+Get Shipment Reference Number Types
+get
+Get Accounting Profile
+get
+Get Shipment Alert Types
+get
+Address Book
+
+Create Addresses
+put
+Get Addresses
+get
+Product Catalog
+
+Get Products
+get
+Staff
+
+Create Customer Staff
+post
+Update Customer Staff
+put
+SalesRep
+
+Create Commissions
+post
+Update Commissions
+put
+Delete Commissions
+del
+Get Commissions
+get
+Shipments
+Shipping
+
+Update Stop Dates and POD
+put
+Create Carrier Rep
+post
+Update Tracking
+put
+Create Shipment Changes
+post
+Get Shipment
+get
+Create Shipment
+post
+Activity Log
+
+Create Shipment Activity
+post
+Get Shipment Activities
+get
+Alerts
+
+Create Shipment Alert
+post
+Update Shipment Alert
+post
+Assignments
+
+Create Staff Assignment
+post
+Update Staff Assignment
+post
+Get Staff Assignments
+get
+Attachments
+
+Create Shipment Document
+post
+Commissions
+
+Delete Shipment Commissions
+del
+Update Shipment Commissions
+put
+Create Shipment Commissions
+post
+Get Shipment Commissions
+get
+Commodities
+
+Update Stop to Commodity Association
+put
+Create Reference Numbers
+
+post
+Get Commodity Reference Numbers
+get
+Delete Commodity Reference Numbers
+del
+Locations
+
+Get Shipment Locations
+get
+Create Shipment Location
+post
+Loadboard
+
+Update Loadboard Posting
+put
+Pricing
+
+Get Insurance Commodities
+get
+Get Pricing Details
+get
+Update Shipment Buy Rate
+put
+Update Shipment Sell Rate
+put
+Reference Numbers
+
+Create Reference Numbers
+put
+Update Shipment Reference Numbers
+put
+Update Shipment Reference Numbers
+put
+Delete Shipment Reference Numbers
+del
+Get Shipment Reference Numbers
+get
+Spot Quotes
+
+Update Spot Quote
+put
+Create Spot Quote
+post
+Get Truckload Quotes
+get
+Stops
+
+Upsert Shipment Stop Reference Numbers
+put
+Delete Shipment Stop Reference Numbers
+del
+Get Shipment Stop Reference Numbers by StopId
+get
+Legacy End Points (v1)
+Test API Key
+
+Validate Customer API Key
+get
+Shipping
+
+Book Shipment
+put
+Rating
+
+Documents
+
+Shipment Status
+
+Zip Code Look Up
+get
+Get Accessorials
+get
+Webhooks
+Example Payloads
+
+ShipmentCreateUrl Example
+get
+ShipmentDetailUpdateUrl Example
+get
+BillCreateUrl Example
+get
+InvoiceCreateUrl Example
+get
+InvoiceCreateWithShipmentUrl Example
+get
+CustomerCreateUrl Example
+get
+CustomerUpdateUrl Example
+get
+LSPCarrierCreateUrl Example
+get
+LSPCarrierUpdateUrl Example
+get
+Deprecated
+Depracted End Points
+
+Upsert Shipment Stop Reference Numbers
+
+post
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Deprecated
+put
+Deprecated
+put
+Deprecated
+put
+Deprecated
+put
+Deprecated
+get
+Deprecated
+put
+Deprecated
+get
+Deprecated
+put
+Deprecated
+get
+Deprecated
+put
+Deprecated
+post
+Deprecated
+get
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Deprecated
+post
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Beta
+Accounting Bill Payments
+
+By Sync Status
+get
+Create Bill Payment
+post
+Create Advanced Payment
+post
+By Bill Id
+get
+By Shipment Id
+get
+Update Bill Payment Sync Status
+put
+Accounting Bills
+
+Approve Bill
+post
+Update Bill to Variance
+post
+Update Bill Sync Status
+put
+By Bill Id
+get
+By Shipment Id
+get
+By Sync Status
+get
+Accounting Commissions
+
+By Sync Status
+get
+Approve Commission
+post
+Update Commission Bill Sync Status
+put
+Update Commission to Variance
+post
+By Bill Id
+get
+By Shipment Id
+get
+Accounting General Ledger
+
+Get GL Accounts
+get
+Accounting Invoice Payments
+
+By Sync Status
+get
+Create an Invoice Payment
+post
+Update an Invoice Payment Sync Status
+put
+By Invoice Payment Id
+get
+By Shipment Id
+get
+Accounting Invoices
+
+By Sync Status
+get
+Approve Invoice
+post
+Set Invoice to Variance
+post
+Update Invoice Sync Status
+put
+By Invoice Id
+get
+By Shipment Id
+get
+Deprecated
+
+Deprecated
+put
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Deprecated
+put
+Deprecated
+put
+Deprecated
+put
+Deprecated
+put
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Deprecated
+get
+Deprecated
+put
+Deprecated
+post
+Deprecated
+get
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Deprecated
+post
+Deprecated
+get
+Deprecated
+get
+Deprecated
+put
+Loadboard
+
+Update Loadboard Posting
+put
+LSP Carriers
+
+By LSP Carrier Id
+get
+Update Trailer Types
+put
+Update Carrier
+put
+Create Carrier
+post
+By LSP Carrier Id
+get
+By Carrier Master Id
+get
+By DOT Number
+get
+Update Carrier Contact
+put
+Create Carrier Contact
+post
+Delete Carrier Contact
+del
+Update Carrier Insurance
+put
+Create Carrier Insurance
+post
+Delete Carrier Insurance
+del
+Create Carrier Attachment
+post
+By LSP Carrier Id
+get
+Delete Carrier Attachment
+del
+By Carrier Attachment Id
+get
+Create Attachment
+post
+By Carrier Insurance Id
+get
+Delete Attachment
+del
+By Carrier Insurance Attatachment Id
+get
+Create Carrier Activity Log
+post
+Organizations
+
+Create Address
+post
+Update Broker
+put
+Create Organization
+post
+Change Parent
+put
+Get Shipment Alert Type
+get
+Create Shipment Alert Type
+post
+Get Shipment Reference Number Type
+get
+Create Activity
+post
+Get Addresses
+get
+Create Addresses
+put
+By Organization Id
+get
+Update Customer
+put
+Create Customer
+post
+By Reference Number
+get
+Get Accounting Profile
+get
+Update Accounting Profile
+put
+Change Parent
+put
+Get Shipment Alert Types
+get
+Get Shipment Reference Number Types
+get
+Get Products
+get
+Create Activity
+post
+SalesRep
+
+Get Commissions
+get
+Update Commissions
+put
+Create Commissions
+post
+Delete Commissions
+del
+Shipment Commissions
+
+Get Shipment Commissions
+get
+Create Shipment Commissions
+post
+Update Shipment Commissions
+put
+Delete Shipment Commissions
+del
+Shipment Locations
+
+Create Shipment Location
+post
+Get Shipment Locations
+get
+Shipment Stops
+
+Get Shipment Stop Reference Numbers by StopId
+get
+Upsert Shipment Stop Reference Numbers
+put
+Upsert Shipment Stop Reference Numbers
+
+post
+Delete Shipment Stop Reference Numbers
+del
+Shipping
+
+Create Shipment
+post
+Get Shipment
+get
+Create Spot Quote
+post
+Update Spot Quote
+put
+Get Truckload Quotes
+get
+Create Shipment Activity
+post
+Get Shipment Activities
+get
+Get Shipment Reference Numbers
+get
+Update Shipment Reference Numbers
+put
+Delete Shipment Reference Numbers
+del
+Update Shipment Sell Rate
+put
+Update Shipment Buy Rate
+put
+Get Pricing Details
+get
+Get Commodity Reference Numbers
+get
+Create Reference Numbers
+put
+Create Reference Numbers
+
+post
+Delete Commodity Reference Numbers
+del
+Create Shipment Alert
+post
+Update Shipment Alert
+post
+Update Tracking
+put
+Update Shipment Reference Numbers
+put
+Create Carrier Rep
+post
+Create Shipment Changes
+post
+Create Shipment Document
+post
+Update Stop to Commodity Association
+put
+Get Insurance Commodities
+get
+Get Staff Assignments
+get
+Create Staff Assignment
+post
+Update Staff Assignment
+post
+Update Stop Dates and POD
+put
+Staff
+
+Update Customer Staff
+put
+Create Customer Staff
+post
+Create Broker Staff
+post
+Get Broker Staff
+get
+WebHooks
+
+Example ShipmentCreateUrl
+get
+Example ShipmentDetailUpdateUrl
+get
+Example InvoiceCreateUrl
+get
+Example InvoiceCreateWithShipmentUrl
+get
+Example CustomerCreateUrl
+get
+Example CustomerUpdateUrl
+get
+Example LSPCarrierCreateUrl
+get
+Example LSPCarrierUpdateUrl
+get
+Example BillCreateUrl
+get

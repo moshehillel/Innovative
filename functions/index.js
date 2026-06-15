@@ -4,8 +4,9 @@ const admin = require("firebase-admin");
 const {google} = require("googleapis");
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
-const {PDFDocument, StandardFonts} = require("pdf-lib");
+const {PDFDocument, StandardFonts, rgb} = require("pdf-lib");
 const crypto = require("crypto");
+const {AsyncLocalStorage} = require("async_hooks");
 
 admin.initializeApp();
 
@@ -59,6 +60,183 @@ function getDeleteAt(days) {
   return admin.firestore.Timestamp.fromDate(
       new Date(now.getTime() + days * 24 * 60 * 60 * 1000),
   );
+}
+
+// ── Multi-tenant support ─────────────────────────────────────────────────────
+// Each client (e.g. the Primus client, the TAI client) is a "tenant". A tenant
+// decides which TMS workflow runs for its invoices, which Firestore collections
+// and BigQuery dataset its data lives in, and which Gmail account its invoices
+// arrive on. There is one shared deployment; tenants are namespaced by a
+// collection prefix rather than by separate Firebase projects.
+//
+// DEFAULT_TENANT reproduces the ORIGINAL single-tenant Primus behavior exactly:
+// empty collection prefix (so collection names are unchanged), the original
+// BigQuery dataset, and the legacy `settings/gmail` token doc. This guarantees
+// that existing data and the live Primus pipeline keep working with zero config
+// — only newly-added tenants get namespaced collections/datasets/inboxes.
+const DEFAULT_TENANT = Object.freeze({
+  tenantId: "default",
+  name: "Default (Primus)",
+  tms: "primus",
+  collectionPrefix: "",
+  bqDataset: BQ_DATASET,
+  gmailDocId: "gmail",
+  alertEmail: process.env.ALERT_EMAIL || null,
+  active: true,
+});
+
+/**
+ * Normalizes a raw `tenants/{id}` Firestore document into a tenant config.
+ * @param {string} tenantId Tenant identifier (the Firestore doc id).
+ * @param {object} data Raw document data.
+ * @return {object} Normalized tenant config.
+ */
+function normalizeTenant(tenantId, data) {
+  const d = data || {};
+  return {
+    tenantId: String(tenantId),
+    name: d.name || String(tenantId),
+    tms: String(d.tms || "primus").toLowerCase(),
+    collectionPrefix: String(d.collectionPrefix || "").trim(),
+    bqDataset: d.bqDataset || BQ_DATASET,
+    gmailDocId: d.gmailDocId || `gmail_${tenantId}`,
+    alertEmail: d.alertEmail || process.env.ALERT_EMAIL || null,
+    active: d.active !== false,
+  };
+}
+
+/**
+ * Resolves a tenant by id, falling back to the default (Primus) tenant when the
+ * id is missing/"default" or no matching tenant doc exists.
+ * @param {string|null} tenantId Tenant identifier.
+ * @return {Promise<object>} Tenant config.
+ */
+async function getTenant(tenantId) {
+  if (!tenantId || tenantId === "default") {
+    return {...DEFAULT_TENANT};
+  }
+  try {
+    const snap = await db.collection("tenants").doc(String(tenantId)).get();
+    if (!snap.exists) {
+      return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+    }
+    return normalizeTenant(tenantId, snap.data());
+  } catch (error) {
+    console.error(`getTenant(${tenantId}) failed:`, error.message);
+    return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+  }
+}
+
+/**
+ * Lists every tenant whose Gmail inbox should be polled. Always includes the
+ * default tenant (legacy `settings/gmail`) so the original Primus inbox keeps
+ * being processed, then appends every active doc in the `tenants` collection.
+ * @return {Promise<Array<object>>} Active tenant configs.
+ */
+async function getActiveTenants() {
+  const tenants = [{...DEFAULT_TENANT}];
+  try {
+    const snap = await db.collection("tenants")
+        .where("active", "==", true).get();
+    for (const doc of snap.docs) {
+      if (doc.id === "default") continue;
+      tenants.push(normalizeTenant(doc.id, doc.data()));
+    }
+  } catch (error) {
+    console.error("getActiveTenants failed:", error.message);
+  }
+  return tenants;
+}
+
+/**
+ * Returns a Firestore collection reference namespaced to a tenant. The default
+ * tenant uses an empty prefix, so its collection names are unchanged.
+ * @param {object} tenant Tenant config.
+ * @param {string} name Base collection name (e.g. "invoices").
+ * @return {FirebaseFirestore.CollectionReference} Namespaced collection ref.
+ */
+function tcol(tenant, name) {
+  const prefix = tenant && tenant.collectionPrefix;
+  return db.collection(prefix ? `${prefix}_${name}` : name);
+}
+
+/**
+ * Returns the `settings/{docId}` document id that stores a tenant's Gmail OAuth
+ * tokens. Defaults to the legacy "gmail" doc for the default tenant.
+ * @param {object} tenant Tenant config.
+ * @return {string} Settings doc id.
+ */
+function tenantGmailDocId(tenant) {
+  return (tenant && tenant.gmailDocId) || "gmail";
+}
+
+/**
+ * Loads a tenant's stored Gmail OAuth tokens, or null if not connected.
+ * @param {object} tenant Tenant config.
+ * @return {Promise<object|null>} OAuth tokens or null.
+ */
+async function getTenantGmailTokens(tenant) {
+  const snap = await db.collection("settings")
+      .doc(tenantGmailDocId(tenant)).get();
+  if (!snap.exists) return null;
+  const data = snap.data() || {};
+  return data.tokens || data;
+}
+
+/**
+ * Builds an authenticated Gmail API client for a tenant, or null if the
+ * tenant's inbox is not connected.
+ * @param {object} tenant Tenant config.
+ * @return {Promise<object|null>} Gmail client or null.
+ */
+async function getTenantGmailClient(tenant) {
+  const tokens = await getTenantGmailTokens(tenant);
+  if (!tokens) return null;
+  const oauth2Client = getGmailOAuthClient();
+  oauth2Client.setCredentials(tokens);
+  return google.gmail({version: "v1", auth: oauth2Client});
+}
+
+/**
+ * Resolves the workflow kickoff URL for a TMS. Falls back to the deployed
+ * Cloud Functions URL when the matching env var is not set.
+ * @param {string} tms TMS key ("tai" or "primus").
+ * @return {string} Absolute workflow endpoint URL.
+ */
+function workflowUrlForTms(tms) {
+  const base =
+    "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+  if (String(tms).toLowerCase() === "tai") {
+    return process.env.PROCESS_TAI_WORKFLOW_URL ||
+      `${base}/processTaiWorkflow`;
+  }
+  return process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+    `${base}/processPrimusWorkflow`;
+}
+
+// Tenant context for logging. Routing a tenant through every one of the dozens
+// of writeLog/logWorkflowStep calls in the ingestion + workflow paths would be
+// error-prone, so we stash the active tenant in async-local storage for the
+// duration of a request/message and let the loggers read it. An explicit
+// `tenant` argument always wins over the ambient context.
+const tenantContext = new AsyncLocalStorage();
+
+/**
+ * Returns the tenant bound to the current async context, or null.
+ * @return {object|null} Active tenant config.
+ */
+function currentTenant() {
+  return tenantContext.getStore() || null;
+}
+
+/**
+ * Runs `fn` with `tenant` bound as the ambient logging context.
+ * @param {object} tenant Tenant config.
+ * @param {Function} fn Async function to run.
+ * @return {*} Result of fn.
+ */
+function runWithTenant(tenant, fn) {
+  return tenantContext.run(tenant || DEFAULT_TENANT, fn);
 }
 
 /**
@@ -289,12 +467,12 @@ function isValidLoadNumber(loadNumber) {
 
 /**
  * Returns the most recently created valid load number from invoices.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<number|null>} Last known load number, or null.
  */
-async function getLastKnownLoadNumber() {
+async function getLastKnownLoadNumber(tenant = DEFAULT_TENANT) {
   try {
-    const snap = await db
-        .collection("invoices")
+    const snap = await tcol(tenant, "invoices")
         .orderBy("createdAt", "desc")
         .limit(50)
         .get();
@@ -418,10 +596,22 @@ async function summarizeSingleFlow(flowId, logs) {
 
 exports.setupBigQuery = onRequest(async (req, res) => {
   try {
-    const dataset = bigquery.dataset(BQ_DATASET);
+    // Provision the default dataset, or a specific tenant's dataset when a
+    // ?tenantId= (or ?dataset=) query param is supplied. Run this once per
+    // tenant so its logs land in its own dataset.
+    let datasetName = BQ_DATASET;
+    const tenantId = req.query.tenantId || (req.body && req.body.tenantId);
+    if (tenantId) {
+      const tenant = await getTenant(String(tenantId));
+      datasetName = tenant.bqDataset;
+    } else if (req.query.dataset) {
+      datasetName = String(req.query.dataset);
+    }
+
+    const dataset = bigquery.dataset(datasetName);
     const [datasetExists] = await dataset.exists();
     if (!datasetExists) {
-      await bigquery.createDataset(BQ_DATASET, {location: "US"});
+      await bigquery.createDataset(datasetName, {location: "US"});
     }
 
     const [logsExists] = await dataset.table(BQ_LOGS_TABLE).exists();
@@ -439,7 +629,7 @@ exports.setupBigQuery = onRequest(async (req, res) => {
     return res.json({
       ok: true,
       message: "BigQuery dataset and tables are ready.",
-      dataset: BQ_DATASET,
+      dataset: datasetName,
       tables: [BQ_LOGS_TABLE, BQ_SUMMARIES_TABLE],
     });
   } catch (error) {
@@ -879,6 +1069,7 @@ exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
  * @param {string} message Log message.
  * @param {object} details Additional details object.
  * @param {string} messageId Gmail message ID if applicable.
+ * @param {object} [tenant] Tenant config for namespaced logs.
  * @return {Promise<void>}
  */
 async function writeLog(
@@ -887,6 +1078,7 @@ async function writeLog(
     message,
     details = {},
     messageId = null,
+    tenant = null,
 ) {
   try {
     const cleanDetails = JSON.parse(JSON.stringify(details, (key, value) => {
@@ -905,8 +1097,18 @@ async function writeLog(
       (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()));
     const resolvedCurrentStep = cleanDetails.currentStep || null;
 
+    // Dataset resolution order: explicit tenant arg → ambient tenant context
+    // (set per message/request) → dataset carried in details → default. This
+    // keeps single-tenant behavior unchanged while routing tenant logs to
+    // their own dataset.
+    const ambient = currentTenant();
+    const dataset = (tenant && tenant.bqDataset) ||
+      (ambient && ambient.bqDataset) ||
+      (cleanDetails && cleanDetails.bqDataset) ||
+      BQ_DATASET;
+
     bigquery
-        .dataset(BQ_DATASET)
+        .dataset(dataset)
         .table(BQ_LOGS_TABLE)
         .insert([{
           timestamp: new Date().toISOString(),
@@ -1456,10 +1658,14 @@ async function forwardToHumanReview(
  * @param {string} subject Email subject.
  * @param {string} html HTML body.
  * @param {Array<object>} attachments PDF attachments array.
+ * @param {object} [tenant] Tenant config for Gmail doc lookup.
  * @return {Promise<void>}
  */
-async function sendViaGmail(to, subject, html, attachments = []) {
-  const gmailDoc = await db.collection("settings").doc("gmail").get();
+async function sendViaGmail(
+    to, subject, html, attachments = [], tenant = null,
+) {
+  const docId = tenantGmailDocId(tenant || DEFAULT_TENANT);
+  const gmailDoc = await db.collection("settings").doc(docId).get();
   if (!gmailDoc.exists) throw new Error("Gmail not connected");
   const tokens = gmailDoc.data().tokens || gmailDoc.data();
   const oauth2Client = getGmailOAuthClient();
@@ -1566,8 +1772,7 @@ async function getPrimusShipment(loadNumber, proNumber) {
     }
     if (!booking) return {found: false, rate: null, customerEmail: null};
     const acct = booking.accountingInformation || {};
-    const rate = parsePrimusAmount(acct.customerQuoteAmount) ||
-        parsePrimusAmount(acct.invoiceAmount);
+    const {rate} = readCustomerRateFromAcct(acct);
     let customerEmail = null;
     if (booking.thirdParty && booking.thirdParty.email) {
       customerEmail = booking.thirdParty.email;
@@ -1745,8 +1950,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
  * @return {Promise<object>} Result of the operation.
  */
 async function saveOutboundEmail(email) {
+  const tenant = (email && email.tenant) || DEFAULT_TENANT;
   let sendResult = null;
-  const to = process.env.ALERT_EMAIL || email.to || "";
+  const to = tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "";
 
   if (to) {
     try {
@@ -1755,6 +1961,7 @@ async function saveOutboundEmail(email) {
           email.subject || "",
           email.html || "",
           Array.isArray(email.attachments) ? email.attachments : [],
+          tenant,
       );
       sendResult = {ok: true};
     } catch (sendErr) {
@@ -1768,8 +1975,11 @@ async function saveOutboundEmail(email) {
     });
   }
 
-  await db.collection("outboundEmails").add({
-    ...email,
+  // The tenant object is internal routing metadata; don't persist it.
+  const emailToStore = {...email};
+  delete emailToStore.tenant;
+  await tcol(tenant, "outboundEmails").add({
+    ...emailToStore,
     sendResult: sendResult,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     deleteAt: getDeleteAt(7),
@@ -1778,9 +1988,10 @@ async function saveOutboundEmail(email) {
   await writeLog("info", "email", "Outbound email sent", {
     type: email.type,
     invoiceId: email.invoiceId,
-    to: email.to || process.env.WORKFLOW_EMAIL_TO,
+    to: to,
+    intendedTo: email.to || null,
     sent: Boolean(sendResult && sendResult.ok),
-  });
+  }, null, tenant);
 }
 
 /**
@@ -1791,25 +2002,153 @@ async function saveOutboundEmail(email) {
 async function buildCustomerInvoicePdfBase64(data) {
   const doc = await PDFDocument.create();
   const page = doc.addPage([612, 792]);
-  const {height} = page.getSize();
+  const W = 612;
+  const H = 792;
+  const MARGIN = 50;
 
-  const font = await doc.embedFont(StandardFonts.Helvetica);
-  const drawText = (text, x, y, size = 12) => {
-    page.drawText(String(text), {x, y, size, font});
+  const fontReg = await doc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
+
+  const txt = (text, x, y, size, bold = false, color = null) => {
+    const opts = {x, y, size, font: bold ? fontBold : fontReg};
+    if (color) opts.color = color;
+    page.drawText(String(text ?? ""), opts);
   };
 
-  drawText("Customer Invoice", 50, height - 60, 18);
-  drawText(`Invoice ID: ${data.invoiceId}`, 50, height - 90, 12);
-  drawText(`Load: ${data.loadNumber || ""}`, 50, height - 110, 12);
-  drawText(`PRO: ${data.proNumber || ""}`, 50, height - 130, 12);
-  drawText(`Customer: ${data.customerName || ""}`, 50, height - 150, 12);
-  const customerRateText =
-    `Customer Rate: $${Number(data.customerRate || 0).toFixed(2)}`;
-  drawText(customerRateText, 50, height - 170, 12);
-  const carrierAmountText =
-    `Carrier Invoice Amount: $` +
-    `${Number(data.carrierInvoiceAmount || 0).toFixed(2)}`;
-  drawText(carrierAmountText, 50, height - 190, 12);
+  const BLUE = rgb(0.09, 0.28, 0.65);
+  const GRAY = rgb(0.45, 0.45, 0.45);
+  const BLACK = rgb(0, 0, 0);
+  const WHITE = rgb(1, 1, 1);
+  const LIGHT = rgb(0.95, 0.97, 1.0);
+
+  // Header bar
+  page.drawRectangle({x: 0, y: H - 80, width: W, height: 80, color: BLUE});
+  txt("INNOVATIVE CARRIERS", MARGIN, H - 38, 20, true, WHITE);
+  txt("FREIGHT INVOICE", W - 180, H - 38, 14, false, WHITE);
+
+  // Invoice meta block (right side)
+  const today = new Date();
+  const fmt = (d) => d.toLocaleDateString("en-US",
+      {month: "short", day: "numeric", year: "numeric"});
+  const dueDate = new Date(today);
+  dueDate.setDate(dueDate.getDate() + 30);
+
+  const invoiceNum = data.invoiceNumber ||
+      data.loadNumber || data.invoiceId || "";
+
+  // Light info box
+  page.drawRectangle(
+      {x: W - 210, y: H - 175, width: 160, height: 85, color: LIGHT});
+  txt("Invoice #:", W - 200, H - 105, 9, false, GRAY);
+  txt(String(invoiceNum), W - 200, H - 118, 11, true, BLACK);
+  txt("Date:", W - 200, H - 135, 9, false, GRAY);
+  txt(fmt(today), W - 200, H - 148, 10, false, BLACK);
+  txt("Due:", W - 200, H - 165, 9, false, GRAY);
+  txt(fmt(dueDate), W - 200, H - 178, 10, false, BLACK);
+
+  // Bill To
+  txt("BILL TO:", MARGIN, H - 110, 9, false, GRAY);
+  txt(data.customerName || "", MARGIN, H - 125, 12, true, BLACK);
+
+  // Divider
+  page.drawLine({
+    start: {x: MARGIN, y: H - 195},
+    end: {x: W - MARGIN, y: H - 195},
+    thickness: 1,
+    color: BLUE,
+  });
+
+  // Shipment details section
+  txt("SHIPMENT DETAILS", MARGIN, H - 220, 10, true, BLUE);
+
+  const col1 = MARGIN;
+  const col2 = 220;
+  const col3 = 390;
+
+  const detail = (label, value, x, y) => {
+    txt(label, x, y, 8, false, GRAY);
+    txt(value || "—", x, y - 13, 10, false, BLACK);
+  };
+
+  detail("Load / BOL #", String(data.loadNumber || ""), col1, H - 238);
+  detail("PRO #", String(data.proNumber || ""), col2, H - 238);
+  detail("Shipper", String(data.shipperName || ""), col3, H - 238);
+  detail("Consignee", String(data.consigneeName || ""), col1, H - 275);
+  detail("Origin", String(data.originCity || ""), col2, H - 275);
+  detail("Destination", String(data.destinationCity || ""), col3, H - 275);
+
+  // Divider
+  page.drawLine({
+    start: {x: MARGIN, y: H - 305},
+    end: {x: W - MARGIN, y: H - 305},
+    thickness: 0.5,
+    color: GRAY,
+  });
+
+  // Charges table header
+  page.drawRectangle(
+      {x: MARGIN, y: H - 335, width: W - MARGIN * 2, height: 22, color: BLUE},
+  );
+  txt("DESCRIPTION", MARGIN + 8, H - 328, 9, true, WHITE);
+  txt("QTY", W - 190, H - 328, 9, true, WHITE);
+  txt("RATE", W - 140, H - 328, 9, true, WHITE);
+  txt("AMOUNT", W - 80, H - 328, 9, true, WHITE);
+
+  // Charge row
+  const amt = Number(data.customerRate || 0);
+  page.drawRectangle(
+      {x: MARGIN, y: H - 360, width: W - MARGIN * 2, height: 22, color: LIGHT},
+  );
+  txt("Freight Charges", MARGIN + 8, H - 353, 10, false, BLACK);
+  txt("1", W - 186, H - 353, 10, false, BLACK);
+  txt(`$${amt.toFixed(2)}`, W - 145, H - 353, 10, false, BLACK);
+  txt(`$${amt.toFixed(2)}`, W - 85, H - 353, 10, true, BLACK);
+
+  // Total box
+  page.drawRectangle(
+      {x: W - 210, y: H - 405, width: 160, height: 36, color: BLUE});
+  txt("TOTAL DUE:", W - 200, H - 385, 10, false, WHITE);
+  txt(`$${amt.toFixed(2)}`, W - 200, H - 400, 14, true, WHITE);
+
+  // Divider
+  page.drawLine({
+    start: {x: MARGIN, y: H - 420},
+    end: {x: W - MARGIN, y: H - 420},
+    thickness: 1,
+    color: BLUE,
+  });
+
+  // Payment instructions
+  txt("PAYMENT INSTRUCTIONS", MARGIN, H - 440, 10, true, BLUE);
+
+  const payLines = [
+    ["ACH / Wire Transfer", true],
+    ["Bank: Customers Bank", false],
+    ["99 Bridge St, Phoenixville, PA 19460", false],
+    ["Account: 4255247", false],
+    ["Routing (ACH & Domestic Wire): 031302971", false],
+    ["", false],
+    ["Quickpay / Zelle", true],
+    ["accounting@innovativecarriers.com", false],
+    ["", false],
+    ["Check (email image)", true],
+    ["Abe@innovativecarriers.com", false],
+    ["", false],
+    ["Credit Card (3% fee)", true],
+    ["https://secure.cardknox.com/innovativecarriers", false],
+  ];
+
+  let py = H - 458;
+  for (const [line, bold] of payLines) {
+    if (line) txt(line, MARGIN, py, 9, bold, bold ? BLACK : GRAY);
+    py -= 13;
+  }
+
+  // Footer
+  page.drawRectangle({x: 0, y: 0, width: W, height: 28, color: BLUE});
+  txt("$50.00 maximum liability per shipment  |  " +
+      "Innovative Carriers  |  accounting@innovativecarriers.com",
+  MARGIN, 9, 8, false, WHITE);
 
   const pdfBytes = await doc.save();
   return Buffer.from(pdfBytes).toString("base64");
@@ -1864,6 +2203,14 @@ async function pauseWorkflow(
 async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
   try {
     if (!invoice || !invoice.pod || invoice.pod.found !== true) {
+      await writeLog("info", "workflow",
+          "POD not detected in this invoice — no extraction attempted", {
+            invoiceId,
+            loadNumber: invoice && invoice.loadNumber,
+            podFound: invoice && invoice.pod && invoice.pod.found,
+            podSource: invoice && invoice.pod && invoice.pod.source,
+            podReason: invoice && invoice.pod && invoice.pod.reason,
+          });
       return null;
     }
 
@@ -1874,6 +2221,13 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
     );
 
     if (!podAtt || !podAtt.storagePath) {
+      await writeLog("warn", "workflow",
+          "POD was detected by AI but attachment file not found in storage", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            expectedFilename: invoice.pod.attachmentFilename,
+            availableFilenames: attachments.map((a) => a && a.filename),
+          });
       return null;
     }
 
@@ -2034,9 +2388,10 @@ async function logWorkflowStep(data) {
     input,
     output,
     error,
+    tenant,
   } = data || {};
 
-  await db.collection("workflowLogs").add({
+  await tcol(tenant || currentTenant() || DEFAULT_TENANT, "workflowLogs").add({
     invoiceId: invoiceId || null,
     gmailMessageId: gmailMessageId || null,
     stepName: stepName || "unknown",
@@ -2074,23 +2429,19 @@ function normalizeAiChargeArrays(aiResult) {
 }
 
 /**
- * Checks whether a Gmail message has already been processed.
- * @param {string} messageId - The Gmail message ID.
- * @return {Promise<boolean>} True if already processed.
- */
-/**
  * Checks whether a Gmail message has already been ingested.
  * @param {string} messageId - Gmail message ID.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<boolean>} True if the message was previously processed.
  */
-async function hasEmailBeenProcessed(messageId) {
-  const intakeSnap = await db.collection("emailIntake")
+async function hasEmailBeenProcessed(messageId, tenant = DEFAULT_TENANT) {
+  const intakeSnap = await tcol(tenant, "emailIntake")
       .where("gmailMessageId", "==", messageId)
       .limit(1)
       .get();
   if (intakeSnap.size > 0) return true;
 
-  const invoiceSnap = await db.collection("invoices")
+  const invoiceSnap = await tcol(tenant, "invoices")
       .where("gmailMessageId", "==", messageId)
       .limit(1)
       .get();
@@ -2098,7 +2449,7 @@ async function hasEmailBeenProcessed(messageId) {
 
   // Also check the queue — covers NO_INVOICE_PDF and other early-exit paths
   // that never create an emailIntake record but did reserve a queue slot.
-  const queueSnap = await db.collection("gmailQueue").doc(messageId).get();
+  const queueSnap = await tcol(tenant, "gmailQueue").doc(messageId).get();
   if (queueSnap.exists) {
     const queueStatus = (queueSnap.data() || {}).status;
     if (queueStatus && queueStatus !== "queued" && queueStatus !== "failed") {
@@ -2124,7 +2475,8 @@ async function updateGmailQueueStatus(
     options = {},
 ) {
   try {
-    const queueRef = db.collection("gmailQueue").doc(messageId);
+    const tenant = options.tenant || DEFAULT_TENANT;
+    const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
     const updateData = {
       status: status,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2156,10 +2508,11 @@ async function updateGmailQueueStatus(
 /**
  * Claims a Gmail queue item using a Firestore transaction.
  * @param {string} messageId - Gmail message ID.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<boolean>} True when the queue item was claimed.
  */
-async function claimGmailQueueItem(messageId) {
-  const queueRef = db.collection("gmailQueue").doc(messageId);
+async function claimGmailQueueItem(messageId, tenant = DEFAULT_TENANT) {
+  const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
 
   try {
     const claimed = await db.runTransaction(async (tx) => {
@@ -2198,6 +2551,7 @@ async function claimGmailQueueItem(messageId) {
  * @param {string} subject - Email subject.
  * @param {string} from - Email sender.
  * @param {string} inboxFlowId - Inbox flow identifier.
+ * @param {object} [tenant] Tenant config (defaults to DEFAULT_TENANT).
  * @return {Promise<boolean>} True when the queue item was reserved.
  */
 async function reserveGmailQueueItemForProcessing(
@@ -2205,8 +2559,9 @@ async function reserveGmailQueueItemForProcessing(
     subject,
     from,
     inboxFlowId,
+    tenant = DEFAULT_TENANT,
 ) {
-  const queueRef = db.collection("gmailQueue").doc(messageId);
+  const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
   const now = admin.firestore.FieldValue.serverTimestamp();
 
   try {
@@ -2220,6 +2575,7 @@ async function reserveGmailQueueItemForProcessing(
 
       tx.set(queueRef, {
         gmailMessageId: messageId,
+        tenantId: tenant.tenantId,
         subject: String(subject || "").slice(0, 500),
         from: String(from || "").slice(0, 500),
         status: "processing",
@@ -2360,6 +2716,8 @@ async function processGmailMessage(
   const messageId = String(message.id || message.gmailMessageId || "");
   let subject = String(options.subject || "");
   let from = String(options.from || "");
+  const tenant = options.tenant || currentTenant() || DEFAULT_TENANT;
+  const isTai = tenant.tms === "tai";
 
   try {
     const fullMessage = await gmail.users.messages.get({
@@ -2418,14 +2776,14 @@ async function processGmailMessage(
       from: from,
     });
 
-    const alreadyProcessed = await hasEmailBeenProcessed(messageId);
+    const alreadyProcessed = await hasEmailBeenProcessed(messageId, tenant);
     if (alreadyProcessed) {
       await writeLog("warn", "gmail", "Message already processed, skipping", {
         messageId: messageId,
         subject: subject,
         from: from,
       });
-      await updateGmailQueueStatus(messageId, "completed");
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
       return;
     }
 
@@ -2437,6 +2795,7 @@ async function processGmailMessage(
           subject,
           from,
           inboxFlowId,
+          tenant,
       );
       if (!reserved) {
         await writeLog("warn", "gmail", "Skipped duplicate inbox processing", {
@@ -2457,9 +2816,10 @@ async function processGmailMessage(
           "Email received with no attachments",
           {department: "general"},
       );
-      await updateGmailQueueStatus(messageId, "completed");
-      await db.collection("emailIntake").doc(messageId).set({
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+      await tcol(tenant, "emailIntake").doc(messageId).set({
         gmailMessageId: messageId,
+        tenantId: tenant.tenantId,
         subject, from,
         finalStatus: "no_attachment",
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2471,6 +2831,7 @@ async function processGmailMessage(
     if (!options.fromQueue) {
       await updateGmailQueueStatus(messageId, "processing", null, {
         skipAttemptIncrement: true,
+        tenant,
       });
     }
 
@@ -2605,9 +2966,10 @@ async function processGmailMessage(
             `Email contained ${typeList} attachment(s) but no invoice`;
       }
       await forwardWithAnalysis(noInvoiceReason, {department: "general"});
-      await updateGmailQueueStatus(messageId, "completed");
-      await db.collection("emailIntake").doc(messageId).set({
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+      await tcol(tenant, "emailIntake").doc(messageId).set({
         gmailMessageId: messageId,
+        tenantId: tenant.tenantId,
         subject, from,
         finalStatus: "no_invoice_pdf",
         skippedAttachmentTypes: skippedDocTypes,
@@ -2849,6 +3211,20 @@ async function processGmailMessage(
           reviewRequired: true,
         },
       });
+    } else if (aiResult.status === "ready_for_primus_validation" && isTai) {
+      // ── TAI tenant ───────────────────────────────────────────────────────
+      // All shipment/amount validation for TAI happens inside
+      // processTaiWorkflow (it resolves the shipmentId from the webhook index,
+      // validates the amount, adds the PRO, etc.). We skip the Primus-specific
+      // pre-checks here and simply mark the invoice ready so it is created and
+      // routed to the TAI workflow below.
+      finalStatus = "processing";
+      await writeLog("info", "tai",
+          "TAI tenant — deferring validation to TAI workflow", {
+            messageId,
+            loadNumber: aiResult.loadNumber,
+            proNumber: aiResult.proNumber,
+          });
     } else if (aiResult.status === "ready_for_primus_validation") {
       // ── Primus shipment lookup (stub) ──────────────────────────────────
       const primusData = await getPrimusShipment(
@@ -3082,7 +3458,7 @@ async function processGmailMessage(
         {messageId: messageId, finalStatus: finalStatus},
     );
 
-    const emailIntakeRef = db.collection("emailIntake").doc(messageId);
+    const emailIntakeRef = tcol(tenant, "emailIntake").doc(messageId);
     const intakeCreated = await db.runTransaction(async (tx) => {
       const intakeSnap = await tx.get(emailIntakeRef);
       if (intakeSnap.exists) {
@@ -3091,6 +3467,7 @@ async function processGmailMessage(
 
       tx.set(emailIntakeRef, {
         primusResult: primusResult,
+        tenantId: tenant.tenantId,
         finalStatus: finalStatus,
         gmailMessageId: messageId,
         from: from,
@@ -3112,7 +3489,7 @@ async function processGmailMessage(
       await writeLog("warn", "gmail", duplicateIntakeMessage, {
         messageId,
       });
-      await updateGmailQueueStatus(messageId, "completed");
+      await updateGmailQueueStatus(messageId, "completed", null, {tenant});
       return;
     }
 
@@ -3134,10 +3511,12 @@ async function processGmailMessage(
         mimeType: att.mimeType,
       }));
 
-      let decisionStage = "pending_primus_check";
+      let decisionStage = isTai ?
+        "pending_tai_check" : "pending_primus_check";
       let matchStatus = "not_checked";
       let reviewStatus = "not_needed";
-      let decisionReason = "Waiting for Primus lookup.";
+      let decisionReason = isTai ?
+        "Waiting for TAI lookup." : "Waiting for Primus lookup.";
       let primusAmount = null;
       let amountDifference = null;
 
@@ -3164,7 +3543,9 @@ async function processGmailMessage(
       }
 
       const flowId = messageId;
-      const invoiceDoc = await db.collection("invoices").add({
+      const invoiceDoc = await tcol(tenant, "invoices").add({
+        tenantId: tenant.tenantId,
+        tms: tenant.tms,
         carrierName: aiResult.carrierName || null,
         invoiceNumber: aiResult.invoiceNumber || null,
         proNumber: aiResult.proNumber || null,
@@ -3225,6 +3606,7 @@ async function processGmailMessage(
         stepStatus: "success",
         input: {messageId: messageId, subject: subject},
         output: {invoiceId: invoiceDoc.id},
+        tenant,
       });
 
       await logWorkflowStep({
@@ -3232,6 +3614,7 @@ async function processGmailMessage(
         stepName: "invoice_created",
         stepStatus: "success",
         output: {invoiceId: invoiceDoc.id},
+        tenant,
       });
 
       await writeLog("info", "gmail", `Invoice document created`, {
@@ -3244,17 +3627,17 @@ async function processGmailMessage(
       await writeLog(
           "info",
           "workflow",
-          `Starting Primus workflow for new invoice`,
+          `Starting ${tenant.tms} workflow for new invoice`,
           {
             messageId: messageId,
             invoiceId: invoiceDoc.id,
+            tms: tenant.tms,
+            tenantId: tenant.tenantId,
           },
       );
 
       try {
-        const workflowUrl =
-          process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-          "https://us-central1-tai-invoice-automation.cloudfunctions.net/processPrimusWorkflow";
+        const workflowUrl = workflowUrlForTms(tenant.tms);
         const workflowRes = await fetch(
             workflowUrl,
             {
@@ -3262,7 +3645,10 @@ async function processGmailMessage(
               headers: {
                 "Content-Type": "application/json",
               },
-              body: JSON.stringify({invoiceId: invoiceDoc.id}),
+              body: JSON.stringify({
+                invoiceId: invoiceDoc.id,
+                tenantId: tenant.tenantId,
+              }),
             },
         );
 
@@ -3271,7 +3657,7 @@ async function processGmailMessage(
           await writeLog(
               "error",
               "workflow",
-              "Failed to start Primus workflow",
+              `Failed to start ${tenant.tms} workflow`,
               {
                 messageId: messageId,
                 invoiceId: invoiceDoc.id,
@@ -3284,7 +3670,7 @@ async function processGmailMessage(
         await writeLog(
             "error",
             "workflow",
-            "Failed to start Primus workflow",
+            `Failed to start ${tenant.tms} workflow`,
             {
               messageId: messageId,
               invoiceId: invoiceDoc.id,
@@ -3312,9 +3698,9 @@ async function processGmailMessage(
       finalStatus: finalStatus,
     });
 
-    await updateGmailQueueStatus(messageId, "completed");
+    await updateGmailQueueStatus(messageId, "completed", null, {tenant});
   } catch (error) {
-    await updateGmailQueueStatus(messageId, "failed", error.message);
+    await updateGmailQueueStatus(messageId, "failed", error.message, {tenant});
     throw error;
   }
 }
@@ -3352,7 +3738,11 @@ function extractAttachmentsRecursive(parts) {
 }
 exports.gmailConnect = onRequest(async (req, res) => {
   try {
+    const tenant = await resolveDashboardTenant(req);
     const oauth2Client = getGmailOAuthClient();
+    const state = Buffer.from(JSON.stringify({
+      tenantId: tenant.tenantId,
+    })).toString("base64url");
 
     const url = oauth2Client.generateAuthUrl({
       access_type: "offline",
@@ -3361,6 +3751,7 @@ exports.gmailConnect = onRequest(async (req, res) => {
         "https://www.googleapis.com/auth/gmail.modify",
         "https://www.googleapis.com/auth/gmail.send",
       ],
+      state,
     });
 
     return res.redirect(url);
@@ -3378,16 +3769,33 @@ exports.gmailOAuthCallback = onRequest(async (req, res) => {
       return res.status(400).send("Missing code from Google.");
     }
 
+    let tenantId = "default";
+    if (req.query.state) {
+      try {
+        const parsed = JSON.parse(
+            Buffer.from(String(req.query.state), "base64url").toString("utf8"));
+        if (parsed && parsed.tenantId) {
+          tenantId = String(parsed.tenantId);
+        }
+      } catch (_) {
+        // Legacy connect without state — fall back to default tenant.
+      }
+    }
+    const tenant = await getTenant(tenantId);
+
     const oauth2Client = getGmailOAuthClient();
 
     const {tokens} = await oauth2Client.getToken(code);
 
-    await db.collection("settings").doc("gmail").set({
+    await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
       tokens: tokens,
+      tenantId: tenant.tenantId,
       connectedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    return res.send("Gmail connected successfully. You can close this page.");
+    return res.send(
+        `Gmail connected successfully for ${tenant.name || tenant.tenantId}. ` +
+        "You can close this page.");
   } catch (error) {
     console.error("gmailOAuthCallback error:", error);
     return res.status(500).send(error.message);
@@ -3415,6 +3823,18 @@ function applyDashboardCors(req, res) {
   return false;
 }
 
+/**
+ * Resolves the tenant for a dashboard API call from ?tenantId= or POST body.
+ * Defaults to the legacy Primus tenant when omitted.
+ * @param {object} req Express request.
+ * @return {Promise<object>} Tenant config.
+ */
+async function resolveDashboardTenant(req) {
+  const tenantId = (req.query && req.query.tenantId) ||
+    (req.body && req.body.tenantId) || "default";
+  return getTenant(String(tenantId));
+}
+
 // Supported dashboard time ranges, mapped to how far back to look and the
 // granularity to bucket results into. Kept as a whitelist so the range
 // query param can never reach the SQL string directly.
@@ -3430,15 +3850,25 @@ exports.getGmailStatus = onRequest(async (req, res) => {
   }
 
   try {
-    const gmailDoc = await db.collection("settings").doc("gmail").get();
+    const tenant = await resolveDashboardTenant(req);
+    const gmailDoc = await db.collection("settings")
+        .doc(tenantGmailDocId(tenant)).get();
     if (!gmailDoc.exists) {
-      return res.json({ok: true, connected: false});
+      return res.json({
+        ok: true,
+        connected: false,
+        tenantId: tenant.tenantId,
+        tms: tenant.tms,
+      });
     }
 
     const data = gmailDoc.data();
     return res.json({
       ok: true,
       connected: true,
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
+      tenantName: tenant.name,
       connectedAt: data.connectedAt ? data.connectedAt.toDate() : null,
     });
   } catch (error) {
@@ -3455,8 +3885,9 @@ exports.gmailDisconnect = onRequest(
         return res.status(405).json({ok: false, error: "Method not allowed."});
       }
       try {
-        await db.collection("settings").doc("gmail").delete();
-        return res.json({ok: true});
+        const tenant = await resolveDashboardTenant(req);
+        await db.collection("settings").doc(tenantGmailDocId(tenant)).delete();
+        return res.json({ok: true, tenantId: tenant.tenantId});
       } catch (error) {
         console.error("gmailDisconnect error:", error);
         return res.status(500).json({ok: false, error: error.message});
@@ -3555,37 +3986,14 @@ exports.setCustomerRate = onRequest(async (req, res) => {
 
   const primusSteps = inv.primusSteps || {};
 
-  // Push rate to Primus booking before resuming workflow.
-  let primusUpdateOk = false;
-  try {
-    const booking = await fetchPrimusBooking(inv.loadNumber);
-    if (booking && booking.BOLId) {
-      const putBody = {
-        accountingInformation: {customerQuoteAmount: customerRate},
-      };
-      await primusRequest("PUT", `/book/${booking.BOLId}`, putBody);
-      primusUpdateOk = true;
-      await writeLog("info", "primus",
-          "Customer rate updated in Primus booking", {
-            invoiceId,
-            loadNumber: inv.loadNumber,
-            customerRate,
-            BOLId: booking.BOLId,
-          });
-    }
-  } catch (primusErr) {
-    await writeLog("warn", "primus",
-        "Could not update customer rate in Primus booking", {
-          invoiceId,
-          loadNumber: inv.loadNumber,
-          error: primusErr.message,
-        });
-  }
+  // The Primus PUT /book/{BOLId} schema does not expose accountingInformation
+  // as a writable field, so there is no API way to store the rate on the
+  // booking record. The rate reaches the invoice via invoiceBreakdown when
+  // generateCustomerInvoice runs later in the workflow.
 
   await invoiceRef.update({
     customerRate,
     customerName: customerName || inv.customerName || null,
-    primusRateUpdated: primusUpdateOk,
     primusSteps: {...primusSteps, customerRateChecked: true},
     workflowPausedAtStep: null,
     workflowPausedAt: null,
@@ -3598,7 +4006,6 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     loadNumber: inv.loadNumber,
     customerRate,
     customerName,
-    primusUpdateOk,
   });
 
   const workflowUrl =
@@ -3641,11 +4048,13 @@ exports.getRecentLogs = onRequest(
     async (req, res) => {
       if (applyDashboardCors(req, res)) return;
       try {
+        const tenant = await resolveDashboardTenant(req);
         const limit = Math.min(Number(req.query.limit || 40), 100);
+        const dataset = tenant.bqDataset || BQ_DATASET;
         const [rows] = await bigquery.query({
           query: `
             SELECT timestamp, level, category, message
-            FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
+            FROM \`${dataset}.${BQ_LOGS_TABLE}\`
             ORDER BY timestamp DESC
             LIMIT @limit
           `,
@@ -3658,11 +4067,61 @@ exports.getRecentLogs = onRequest(
           category: row.category,
           message: row.message,
         }));
-        return res.json({ok: true, logs});
+        return res.json({ok: true, tenantId: tenant.tenantId, logs});
       } catch (error) {
         console.error("getRecentLogs error:", error);
         return res.status(500).json({
           ok: false, error: "Failed to load logs.", details: error.message,
+        });
+      }
+    },
+);
+
+exports.getRecentInvoices = onRequest(
+    {invoker: "public"},
+    async (req, res) => {
+      if (applyDashboardCors(req, res)) return;
+      try {
+        const tenant = await resolveDashboardTenant(req);
+        const limit = Math.min(Number(req.query.limit || 20), 50);
+        const snap = await tcol(tenant, "invoices")
+            .orderBy("createdAt", "desc")
+            .limit(limit)
+            .get();
+        const invoices = snap.docs.map((doc) => {
+          const data = doc.data() || {};
+          const createdAt = data.createdAt && data.createdAt.toDate ?
+            data.createdAt.toDate().toISOString() : null;
+          return {
+            id: doc.id,
+            loadNumber: data.loadNumber || null,
+            proNumber: data.proNumber || null,
+            carrierName: data.carrierName || null,
+            customerName: data.customerName || null,
+            invoiceAmount: data.invoiceAmount || null,
+            customerRate: data.customerRate || null,
+            profit: data.profit || null,
+            tms: data.tms || tenant.tms,
+            taiShipmentId: data.taiShipmentId || null,
+            finalWorkflowStatus: data.finalWorkflowStatus || null,
+            decisionStage: data.decisionStage || null,
+            decisionReason: data.decisionReason || null,
+            currentStep: data.currentStep || null,
+            createdAt,
+          };
+        });
+        return res.json({
+          ok: true,
+          tenantId: tenant.tenantId,
+          tms: tenant.tms,
+          invoices,
+        });
+      } catch (error) {
+        console.error("getRecentInvoices error:", error);
+        return res.status(500).json({
+          ok: false,
+          error: "Failed to load invoices.",
+          details: error.message,
         });
       }
     },
@@ -3674,6 +4133,8 @@ exports.getDashboardStats = onRequest(async (req, res) => {
   }
 
   try {
+    const tenant = await resolveDashboardTenant(req);
+    const dataset = tenant.bqDataset || BQ_DATASET;
     const range = String(req.query.range || "week").toLowerCase();
     const rangeConfig = DASHBOARD_RANGES[range];
     if (!rangeConfig) {
@@ -3698,7 +4159,7 @@ exports.getDashboardStats = onRequest(async (req, res) => {
             message = "No attachments found, forwarding for review"
           )
         ) AS emailsForwarded
-      FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
+      FROM \`${dataset}.${BQ_LOGS_TABLE}\`
       WHERE timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @days DAY)
       GROUP BY period
       ORDER BY period ASC
@@ -3723,7 +4184,14 @@ exports.getDashboardStats = onRequest(async (req, res) => {
       emailsForwarded: acc.emailsForwarded + row.emailsForwarded,
     }), {invoicesProcessed: 0, emailsReplied: 0, emailsForwarded: 0});
 
-    return res.json({ok: true, range, totals, series});
+    return res.json({
+      ok: true,
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
+      range,
+      totals,
+      series,
+    });
   } catch (error) {
     console.error("getDashboardStats error:", error);
     return res.status(500).json({
@@ -3931,6 +4399,198 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
   }
 });
 
+/**
+ * Polls a single tenant's Gmail inbox and processes new invoice emails. The
+ * tenant determines which Gmail account is read, which collections data is
+ * written to, and which TMS workflow runs. All logging is bound to the tenant
+ * via async-local context.
+ * @param {object} tenant Tenant config.
+ * @param {string} inboxFlowId Flow id for this inbox-check run.
+ * @return {Promise<object>} {connected, processed}.
+ */
+async function checkGmailInboxForTenant(tenant, inboxFlowId) {
+  return runWithTenant(tenant, async () => {
+    const gmail = await getTenantGmailClient(tenant);
+    if (!gmail) {
+      await writeLog("warn", "gmail",
+          `Gmail is not connected for tenant ${tenant.tenantId}`);
+      return {connected: false, processed: 0};
+    }
+
+    await writeLog(
+        "info",
+        "gmail",
+        "Fetching messages from Gmail",
+        {
+          flowId: inboxFlowId,
+          currentStep: "gmail_inbox_check",
+          tenantId: tenant.tenantId,
+        },
+    );
+
+    const qAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const gmailQuery = [
+      "in:inbox",
+      "is:unread",
+      `after:${qAfter.getFullYear()}/${
+        qAfter.getMonth() + 1}/${qAfter.getDate()}`,
+    ].join(" ");
+
+    const messages = [];
+    let pageToken = null;
+
+    const lastKnownLoadNumber = await getLastKnownLoadNumber(tenant);
+
+    // Safety cap to avoid hitting function timeouts if inbox is flooded.
+    const maxMessagesPerRun = 10;
+
+    do {
+      const listResponse = await gmail.users.messages.list({
+        userId: "me",
+        q: gmailQuery,
+        maxResults: 50,
+        includeSpamTrash: false,
+        pageToken: pageToken || undefined,
+      });
+
+      const batch = listResponse.data.messages || [];
+      messages.push(...batch);
+      pageToken = listResponse.data.nextPageToken || null;
+
+      if (messages.length >= maxMessagesPerRun) {
+        messages.splice(maxMessagesPerRun);
+        pageToken = null;
+      }
+    } while (pageToken);
+
+    await writeLog(
+        "info",
+        "gmail",
+        `Found ${messages.length} new invoice email(s)`,
+        {
+          flowId: inboxFlowId,
+          currentStep: "gmail_inbox_check",
+          messageCount: messages.length,
+          tenantId: tenant.tenantId,
+        },
+    );
+
+    console.log(
+        `[${tenant.tenantId}] Found ${messages.length} new invoice email(s).`);
+
+    for (const message of messages) {
+      try {
+        // Skip if already processed (deduplication guard).
+        const alreadyProcessed = await tcol(tenant, "emailIntake")
+            .where("gmailMessageId", "==", message.id).limit(1).get();
+        if (!alreadyProcessed.empty) {
+          await writeLog("info", "gmail",
+              `Skipping already-processed message ${message.id}`);
+          continue;
+        }
+
+        await writeLog(
+            "info",
+            "gmail",
+            `Processing message ${message.id}`,
+            {
+              messageId: message.id,
+            },
+        );
+
+        await processGmailMessage(
+            gmail,
+            message,
+            inboxFlowId,
+            lastKnownLoadNumber,
+            {tenant},
+        );
+
+        // Mark as read so it won't appear in future unread queries.
+        await gmail.users.messages.modify({
+          userId: "me",
+          id: message.id,
+          requestBody: {removeLabelIds: ["UNREAD"]},
+        });
+      } catch (error) {
+        await writeLog("error", "gmail", `Error processing message`, {
+          messageId: message.id,
+          error: error.message,
+          stack: error.stack,
+        });
+
+        console.error(`Error processing message ${message.id}:`, error);
+
+        try {
+          let errSubject = "(unknown subject)";
+          let errFrom = "(unknown sender)";
+          let errBody = null;
+          try {
+            const fullErrMsg = await gmail.users.messages.get({
+              userId: "me",
+              id: message.id,
+              format: "full",
+            });
+            const hdrs = fullErrMsg.data.payload?.headers || [];
+            errSubject = hdrs.find((h) => h.name === "Subject")
+                ?.value || errSubject;
+            errFrom = hdrs.find((h) => h.name === "From")?.value || errFrom;
+            errBody = extractEmailBody(fullErrMsg.data.payload) || null;
+          } catch (fetchErr) {
+            console.error(
+                `[processInbox] Could not fetch details for message ` +
+                `${message.id} while building error-review forward:`,
+                fetchErr,
+            );
+          }
+          await forwardToHumanReview(
+              gmail,
+              message.id,
+              errSubject,
+              errFrom,
+              "An unexpected error occurred processing this email",
+              `I attempted to process this email but encountered an ` +
+              `unexpected error and was unable to complete the workflow. ` +
+              `Error: ${error.message}. ` +
+              `Please review this email and handle it manually.`,
+              {department: "general", emailBody: errBody},
+          );
+        } catch (fwdErr) {
+          console.error("Failed to forward error email:", fwdErr.message);
+        }
+
+        await tcol(tenant, "emailErrors").add({
+          gmailMessageId: message.id,
+          tenantId: tenant.tenantId,
+          error: error.message,
+          status: "error",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          deleteAt: getDeleteAt(30),
+        });
+
+        try {
+          await gmail.users.messages.modify({
+            userId: "me",
+            id: message.id,
+            requestBody: {removeLabelIds: ["UNREAD"]},
+          });
+        } catch (markErr) {
+          console.error(
+              `Failed to mark message ${message.id} as read:`,
+              markErr.message,
+          );
+        }
+      }
+    }
+
+    await writeLog("info", "gmail", "Gmail inbox check completed", {
+      processedMessages: messages.length,
+      tenantId: tenant.tenantId,
+    });
+    return {connected: true, processed: messages.length};
+  });
+}
+
 exports.checkGmailInbox = onRequest(
     {timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
@@ -3946,191 +4606,33 @@ exports.checkGmailInbox = onRequest(
           crypto.randomUUID() :
           `inbox-${Date.now()}`;
 
-        const gmailDoc = await db.collection("settings").doc("gmail").get();
-
-        if (!gmailDoc.exists) {
-          await writeLog("warn", "gmail", "Gmail is not connected");
-          console.log("Gmail is not connected.");
-          return res.status(400).json({
-            ok: false,
-            error: "Gmail is not connected.",
-          });
+        // Process every active tenant's inbox. A specific tenant can be polled
+        // in isolation with ?tenantId=. Tenants are processed sequentially so a
+        // flooded inbox can't starve the others within a single invocation.
+        let tenants;
+        if (req.query.tenantId) {
+          tenants = [await getTenant(String(req.query.tenantId))];
+        } else {
+          tenants = await getActiveTenants();
         }
 
-        const gmailSettings = gmailDoc.data();
-        const tokens = gmailSettings.tokens || gmailSettings;
-
-        const oauth2Client = getGmailOAuthClient();
-        oauth2Client.setCredentials(tokens);
-
-        const gmail = google.gmail({
-          version: "v1",
-          auth: oauth2Client,
-        });
-
-        await writeLog(
-            "info",
-            "gmail",
-            "Fetching messages from Gmail",
-            {flowId: inboxFlowId, currentStep: "gmail_inbox_check"},
-        );
-
-        const qAfter = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-        const gmailQuery = [
-          "in:inbox",
-          "is:unread",
-          `after:${qAfter.getFullYear()}/${
-            qAfter.getMonth() + 1}/${qAfter.getDate()}`,
-        ].join(" ");
-
-        const messages = [];
-        let pageToken = null;
-
-        // Cache last known load number for the run.
-        const lastKnownLoadNumber = await getLastKnownLoadNumber();
-
-        // Safety cap to avoid hitting function timeouts if inbox is flooded.
-        const maxMessagesPerRun = 10;
-
-        do {
-          const listResponse = await gmail.users.messages.list({
-            userId: "me",
-            q: gmailQuery,
-            maxResults: 50,
-            includeSpamTrash: false,
-            pageToken: pageToken || undefined,
-          });
-
-          const batch = listResponse.data.messages || [];
-          messages.push(...batch);
-          pageToken = listResponse.data.nextPageToken || null;
-
-          if (messages.length >= maxMessagesPerRun) {
-            messages.splice(maxMessagesPerRun);
-            pageToken = null;
-          }
-        } while (pageToken);
-
-        await writeLog(
-            "info",
-            "gmail",
-            `Found ${messages.length} new invoice email(s)`,
-            {
-              flowId: inboxFlowId,
-              currentStep: "gmail_inbox_check",
-              messageCount: messages.length,
-            },
-        );
-
-        console.log(`Found ${messages.length} new invoice email(s).`);
-
-        for (const message of messages) {
+        const results = [];
+        for (const tenant of tenants) {
           try {
-            // Skip if already processed (deduplication guard).
-            const alreadyProcessed = await db.collection("emailIntake")
-                .where("gmailMessageId", "==", message.id).limit(1).get();
-            if (!alreadyProcessed.empty) {
-              await writeLog("info", "gmail",
-                  `Skipping already-processed message ${message.id}`);
-              continue;
-            }
-
-            await writeLog(
-                "info",
-                "gmail",
-                `Processing message ${message.id}`,
-                {
-                  messageId: message.id,
-                },
-            );
-
-            await processGmailMessage(
-                gmail,
-                message,
-                inboxFlowId,
-                lastKnownLoadNumber,
-            );
-
-            // Mark as read so it won't appear in future unread queries.
-            await gmail.users.messages.modify({
-              userId: "me",
-              id: message.id,
-              requestBody: {removeLabelIds: ["UNREAD"]},
+            const r = await checkGmailInboxForTenant(tenant, inboxFlowId);
+            results.push({tenantId: tenant.tenantId, ...r});
+          } catch (tenantErr) {
+            console.error(
+                `checkGmailInbox tenant ${tenant.tenantId} failed:`,
+                tenantErr);
+            results.push({
+              tenantId: tenant.tenantId,
+              error: tenantErr.message,
             });
-          } catch (error) {
-            await writeLog("error", "gmail", `Error processing message`, {
-              messageId: message.id,
-              error: error.message,
-              stack: error.stack,
-            });
-
-            console.error(`Error processing message ${message.id}:`, error);
-
-            try {
-              let errSubject = "(unknown subject)";
-              let errFrom = "(unknown sender)";
-              let errBody = null;
-              try {
-                const fullErrMsg = await gmail.users.messages.get({
-                  userId: "me",
-                  id: message.id,
-                  format: "full",
-                });
-                const hdrs = fullErrMsg.data.payload?.headers || [];
-                errSubject = hdrs.find((h) => h.name === "Subject")
-                    ?.value || errSubject;
-                errFrom = hdrs.find((h) => h.name === "From")?.value || errFrom;
-                errBody = extractEmailBody(fullErrMsg.data.payload) || null;
-              } catch (fetchErr) {
-                console.error(
-                    `[processInbox] Could not fetch details for message ` +
-                    `${message.id} while building error-review forward:`,
-                    fetchErr,
-                );
-              }
-              await forwardToHumanReview(
-                  gmail,
-                  message.id,
-                  errSubject,
-                  errFrom,
-                  "An unexpected error occurred processing this email",
-                  `I attempted to process this email but encountered an ` +
-                  `unexpected error and was unable to complete the workflow. ` +
-                  `Error: ${error.message}. ` +
-                  `Please review this email and handle it manually.`,
-                  {department: "general", emailBody: errBody},
-              );
-            } catch (fwdErr) {
-              console.error("Failed to forward error email:", fwdErr.message);
-            }
-
-            await db.collection("emailErrors").add({
-              gmailMessageId: message.id,
-              error: error.message,
-              status: "error",
-              createdAt: admin.firestore.FieldValue.serverTimestamp(),
-              deleteAt: getDeleteAt(30),
-            });
-
-            try {
-              await gmail.users.messages.modify({
-                userId: "me",
-                id: message.id,
-                requestBody: {removeLabelIds: ["UNREAD"]},
-              });
-            } catch (markErr) {
-              console.error(
-                  `Failed to mark message ${message.id} as read:`,
-                  markErr.message,
-              );
-            }
           }
         }
 
-        await writeLog("info", "gmail", "Gmail inbox check completed", {
-          processedMessages: messages.length,
-        });
-        return res.json({ok: true, processedMessages: messages.length});
+        return res.json({ok: true, tenants: results});
       } catch (error) {
         console.error("checkGmailInbox error:", error);
         return res.status(500).json({
@@ -4142,6 +4644,69 @@ exports.checkGmailInbox = onRequest(
     },
 );
 
+/**
+ * Drains a single tenant's Gmail processing queue.
+ * @param {object} tenant Tenant config.
+ * @param {string} inboxFlowId Flow id for this queue run.
+ * @return {Promise<object>} {connected, processed}.
+ */
+async function processGmailQueueForTenant(tenant, inboxFlowId) {
+  return runWithTenant(tenant, async () => {
+    const gmail = await getTenantGmailClient(tenant);
+    if (!gmail) {
+      await writeLog("warn", "gmail",
+          `Gmail is not connected for tenant ${tenant.tenantId}`);
+      return {connected: false, processed: 0};
+    }
+
+    const queueSnap = await tcol(tenant, "gmailQueue")
+        .where("status", "==", "queued")
+        .orderBy("claimedAt")
+        .limit(10)
+        .get();
+
+    const lastKnownLoadNumber = await getLastKnownLoadNumber(tenant);
+
+    await writeLog("info", "gmail", "Fetched queued Gmail messages", {
+      queueCount: queueSnap.size,
+      tenantId: tenant.tenantId,
+    });
+
+    let processed = 0;
+    for (const doc of queueSnap.docs) {
+      const queueItem = doc.data() || {};
+      try {
+        const claimed = await claimGmailQueueItem(doc.id, tenant);
+        if (!claimed) {
+          const skippedClaimedMessage =
+              "Skipped queue item already claimed or no longer queued";
+          await writeLog("warn", "gmail", skippedClaimedMessage, {
+            messageId: doc.id,
+          });
+          continue;
+        }
+
+        await processGmailMessage(
+            gmail,
+            {id: doc.id, subject: queueItem.subject, from: queueItem.from},
+            inboxFlowId,
+            lastKnownLoadNumber,
+            {fromQueue: true, queueDocRef: doc.ref, tenant},
+        );
+        processed += 1;
+      } catch (error) {
+        await writeLog("error", "gmail", "Queued message failed", {
+          messageId: doc.id,
+          error: error.message,
+          stack: error.stack,
+        });
+      }
+    }
+
+    return {connected: true, processed};
+  });
+}
+
 exports.processGmailQueue = onRequest(
     {timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
@@ -4152,70 +4717,30 @@ exports.processGmailQueue = onRequest(
           crypto.randomUUID() :
           `queue-${Date.now()}`;
 
-        const gmailDoc = await db.collection("settings").doc("gmail").get();
-        if (!gmailDoc.exists) {
-          await writeLog("warn", "gmail", "Gmail is not connected");
-          return res.status(400).json({
-            ok: false,
-            error: "Gmail is not connected.",
-          });
+        let tenants;
+        if (req.query.tenantId) {
+          tenants = [await getTenant(String(req.query.tenantId))];
+        } else {
+          tenants = await getActiveTenants();
         }
 
-        const gmailSettings = gmailDoc.data();
-        const tokens = gmailSettings.tokens || gmailSettings;
-
-        const oauth2Client = getGmailOAuthClient();
-        oauth2Client.setCredentials(tokens);
-
-        const gmail = google.gmail({
-          version: "v1",
-          auth: oauth2Client,
-        });
-
-        const queueSnap = await db.collection("gmailQueue")
-            .where("status", "==", "queued")
-            .orderBy("claimedAt")
-            .limit(10)
-            .get();
-
-        const lastKnownLoadNumber = await getLastKnownLoadNumber();
-
-        await writeLog("info", "gmail", "Fetched queued Gmail messages", {
-          queueCount: queueSnap.size,
-        });
-
-        let processed = 0;
-        for (const doc of queueSnap.docs) {
-          const queueItem = doc.data() || {};
+        const results = [];
+        for (const tenant of tenants) {
           try {
-            const claimed = await claimGmailQueueItem(doc.id);
-            if (!claimed) {
-              const skippedClaimedMessage =
-                  "Skipped queue item already claimed or no longer queued";
-              await writeLog("warn", "gmail", skippedClaimedMessage, {
-                messageId: doc.id,
-              });
-              continue;
-            }
-
-            await processGmailMessage(
-                gmail,
-                {id: doc.id, subject: queueItem.subject, from: queueItem.from},
-                inboxFlowId,
-                lastKnownLoadNumber,
-                {fromQueue: true, queueDocRef: doc.ref},
-            );
-            processed += 1;
-          } catch (error) {
-            await writeLog("error", "gmail", "Queued message failed", {
-              messageId: doc.id,
-              error: error.message,
-              stack: error.stack,
+            const r = await processGmailQueueForTenant(tenant, inboxFlowId);
+            results.push({tenantId: tenant.tenantId, ...r});
+          } catch (tenantErr) {
+            console.error(
+                `processGmailQueue tenant ${tenant.tenantId} failed:`,
+                tenantErr);
+            results.push({
+              tenantId: tenant.tenantId,
+              error: tenantErr.message,
             });
           }
         }
 
-        return res.json({ok: true, processedQueue: processed});
+        return res.json({ok: true, tenants: results});
       } catch (error) {
         console.error("processGmailQueue error:", error);
         return res.status(500).json({
@@ -4416,6 +4941,26 @@ async function addProNumberToLoad(loadNumber, proNumber, invoiceData = {}) {
 }
 
 /**
+ * Reads the customer sell rate from a booking's accountingInformation.
+ *
+ * Two mutually-exclusive patterns in live data:
+ *   1. Quoted loads   — customerQuoteId set → rate in customerQuoteAmount.
+ *   2. Manual loads   — customerQuoteId null → rate in invoiceAmount.
+ *
+ * @param {object} acct accountingInformation from a Primus booking.
+ * @return {object} Object with rate (number|null) and source (string).
+ */
+function readCustomerRateFromAcct(acct) {
+  if (!acct) return {rate: null, source: "none"};
+  if (acct.customerQuoteId) {
+    const rate = parsePrimusAmount(acct.customerQuoteAmount);
+    return {rate, source: rate ? "customerQuoteAmount" : "none"};
+  }
+  const rate = parsePrimusAmount(acct.invoiceAmount);
+  return {rate, source: rate ? "invoiceAmount" : "none"};
+}
+
+/**
  * Retrieves customer name and rate from a Primus booking.
  * @param {string} loadNumber Load/BOL number.
  * @param {string} proNumber PRO number (used as fallback search key).
@@ -4434,7 +4979,8 @@ async function getCustomerRate(loadNumber, proNumber) {
       return {ok: false, error: "Load not found in Primus"};
     }
     const acct = booking.accountingInformation || {};
-    const customerRate = parsePrimusAmount(acct.customerQuoteAmount);
+    const {rate: customerRate, source: rateSource} =
+        readCustomerRateFromAcct(acct);
     const billTo = booking.billTo || "";
     let customerName = null;
     if (billTo === "thirdparty" && booking.thirdParty) {
@@ -4445,7 +4991,7 @@ async function getCustomerRate(loadNumber, proNumber) {
     if (!customerRate) {
       return {ok: false, customerName, error: "No customer rate in Primus"};
     }
-    return {ok: true, customerName, customerRate};
+    return {ok: true, customerName, customerRate, rateSource};
   } catch (error) {
     await writeLog("error", "primus", "Failed to get customer rate", {
       loadNumber,
@@ -4488,6 +5034,85 @@ async function generateCustomerInvoice(invoiceData) {
     if (!booking || !booking.BOLId) {
       return {ok: false, error: "Load not found in Primus"};
     }
+    const BOLId = booking.BOLId;
+    const expectedRate = Number(invoiceData.customerRate || 0);
+
+    // IDEMPOTENCY GUARD — the #1 safety check.
+    // Primus auto-creates a draft customer invoice (already populated with the
+    // freight charge and customer) when a load is booked. POSTing again creates
+    // a SECOND draft and adds another freight line, doubling
+    // accountingInformation.invoiceAmount. So we always look for an existing
+    // invoice first and reuse it — we only ever POST when none exists.
+    let existing = [];
+    try {
+      const existingData = await primusRequest(
+          "GET",
+          `/invoice/bolnumber/${encodeURIComponent(invoiceData.loadNumber)}`);
+      const list = existingData && existingData.data &&
+          existingData.data.results;
+      if (Array.isArray(list)) existing = list;
+    } catch (_) {
+      // 404 / no invoice yet — fall through to create one.
+    }
+
+    if (existing.length > 0) {
+      // Prefer a generated (issued) invoice over drafts. Primus auto-creates a
+      // draft and we may also create a draft via API — if staff manually issues
+      // one in the Primus UI, that issued invoice is the authoritative one.
+      const issuedInv = existing.find((e) => e.status && e.status.generated);
+      const inv = issuedInv || existing[0];
+      if (existing.length > 1) {
+        await writeLog(issuedInv ? "info" : "warn", "primus",
+            issuedInv ?
+              "Multiple invoices found — using the issued one" :
+              "Multiple invoice drafts found — using first; " +
+              "duplicates need manual cleanup in ShipPrimus", {
+              loadNumber: invoiceData.loadNumber,
+              BOLId,
+              selectedInvoiceId: inv.invoiceId,
+              allInvoiceIds: existing.map((e) => e.invoiceId),
+            });
+      }
+      const total = Number(inv.total || 0);
+      // AMOUNT SANITY CHECK — compare the draft total against the agreed
+      // sell rate. Human-entered rate wins; fall back to whichever Primus
+      // field is correct for this booking type (see readCustomerRateFromAcct).
+      const {rate: primusRateForCheck} =
+          readCustomerRateFromAcct(booking.accountingInformation || {});
+      const rateForCheck = expectedRate || primusRateForCheck || 0;
+      if (rateForCheck > 0 && Math.abs(total - rateForCheck) > 0.5) {
+        const mismatchMsg =
+            `Invoice total ($${total}) does not match expected ` +
+            `customer rate ($${rateForCheck}). Refusing to proceed.`;
+        await writeLog("error", "primus", mismatchMsg, {
+          loadNumber: invoiceData.loadNumber,
+          invoiceId: inv.invoiceId,
+          invoiceTotal: total,
+          expectedRate: rateForCheck,
+          difference: Math.abs(total - rateForCheck),
+          hint: "Check for duplicate invoice drafts in ShipPrimus",
+        });
+        return {
+          ok: false,
+          error: mismatchMsg,
+          customerInvoiceId: inv.invoiceId,
+          invoiceTotal: total,
+          expectedRate: rateForCheck,
+          difference: Math.abs(total - rateForCheck),
+        };
+      }
+      return {
+        ok: true,
+        reused: true,
+        customerInvoiceId: inv.invoiceId,
+        invoiceNumber: inv.invoiceNumber || null,
+        generated: !!(inv.status && inv.status.generated),
+        invoiceTotal: total,
+        invoicePdfUrl: (inv.shipment && inv.shipment.url) || null,
+      };
+    }
+
+    // No invoice exists yet — create the draft.
     const billTo = booking.billTo || "";
     let customerId = null;
     if (billTo === "thirdparty" && booking.thirdParty) {
@@ -4496,8 +5121,11 @@ async function generateCustomerInvoice(invoiceData) {
       customerId = booking.shipper.id || null;
     }
     const acct = booking.accountingInformation || {};
-    const customerRate = parsePrimusAmount(acct.customerQuoteAmount) ||
-        Number(invoiceData.customerRate || 0);
+    const {rate: primusRate} = readCustomerRateFromAcct(acct);
+    // Human-entered rate wins; fall back to Primus field appropriate for
+    // this booking type (customerQuoteAmount for quoted loads, invoiceAmount
+    // for manually-rated loads — see readCustomerRateFromAcct).
+    const customerRate = expectedRate || primusRate;
     // When a customerQuoteId exists Primus uses the stored quote automatically;
     // sending a breakdown would be rejected for "Collect" shipments.
     const body = {customerId};
@@ -4509,24 +5137,22 @@ async function generateCustomerInvoice(invoiceData) {
         rate: customerRate,
       }];
     }
-    const result = await primusRequest(
-        "POST", `/invoice/${booking.BOLId}`, body);
+    const result = await primusRequest("POST", `/invoice/${BOLId}`, body);
     const invoiceResult = result &&
         result.data &&
         result.data.results &&
         (Array.isArray(result.data.results) ?
           result.data.results[0] : result.data.results);
     if (!invoiceResult || !invoiceResult.invoiceId) {
-      return {
-        ok: false,
-        error: "Invoice creation returned no ID",
-        raw: result,
-      };
+      return {ok: false, error: "Invoice creation returned no ID", raw: result};
     }
     return {
       ok: true,
+      reused: false,
       customerInvoiceId: invoiceResult.invoiceId,
       invoiceNumber: invoiceResult.invoiceNumber,
+      generated: !!(invoiceResult.status && invoiceResult.status.generated),
+      invoiceTotal: Number(invoiceResult.total || 0),
       invoicePdfUrl: (invoiceResult.shipment &&
           invoiceResult.shipment.url) || null,
     };
@@ -4565,10 +5191,6 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
-        await writeLog("info", "workflow", "Starting Primus workflow", {
-          invoiceId: invoiceId,
-        });
-
         // Get invoice document
         const invoiceDoc = await db.collection("invoices").doc(invoiceId).get();
 
@@ -4582,6 +5204,12 @@ exports.processPrimusWorkflow = onRequest(
         const invoice = invoiceDoc.data();
 
         if (invoice.finalWorkflowStatus === "completed") {
+          await writeLog("info", "workflow",
+              "Workflow skipped — already completed", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId: invoice.customerInvoiceId || null,
+              });
           return res.status(409).json({
             ok: false,
             error: "ALREADY_COMPLETED",
@@ -4610,12 +5238,29 @@ exports.processPrimusWorkflow = onRequest(
         });
 
         if (!lockAcquired) {
-          await writeLog(
-              "warn", "workflow", "Invoice already being processed", {
+          await writeLog("warn", "workflow",
+              "Workflow skipped — another instance is already running", {
                 invoiceId,
+                loadNumber: invoice.loadNumber,
               });
           return res.status(409).json({ok: false, error: "ALREADY_PROCESSING"});
         }
+
+        await writeLog("info", "workflow",
+            resumeFrom ?
+              `Resuming Primus workflow from step: ${resumeFrom}` :
+              "Starting Primus workflow", {
+              invoiceId,
+              flowId,
+              resumeFrom: resumeFrom || null,
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName || null,
+              invoiceAmount: invoice.invoiceAmount || null,
+              proNumber: invoice.proNumber || null,
+              primusStepsCompleted: Object.entries(
+                  invoice.primusSteps || {},
+              ).filter(([, v]) => v).map(([k]) => k),
+            });
 
         // Note: workflowPausedAt is tracked,
         // but we do not block resume based on age.
@@ -4750,17 +5395,18 @@ exports.processPrimusWorkflow = onRequest(
           },
         });
 
-        await writeLog("info", "workflow", "Validating invoice amount", {
-          invoiceId: invoiceId,
-          flowId: flowId,
-          currentStep: "amount_validation",
-          loadNumber: invoice.loadNumber,
-          invoiceAmount: invoice.invoiceAmount,
-        });
-
         await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validation");
 
         const baseAmount = Number(invoice.invoiceAmount) - approvedChargesTotal;
+
+        await writeLog("info", "workflow", "Validating invoice amount", {
+          invoiceId,
+          flowId,
+          loadNumber: invoice.loadNumber,
+          invoiceAmount: invoice.invoiceAmount,
+          approvedChargesTotal,
+          baseAmountToValidate: baseAmount,
+        });
 
         const amountValidation = await validateAmountWithPrimus(
             invoice.loadNumber,
@@ -4770,10 +5416,28 @@ exports.processPrimusWorkflow = onRequest(
         await logWorkflowStep({
           invoiceId,
           stepName: "amount_validation_completed",
-          stepStatus: amountValidation.ok ? "success" : "failed",
-          output: {validAmount: amountValidation.validAmount},
-          error: amountValidation.ok ? null : "Amount validation failed",
+          stepStatus: amountValidation.ok && amountValidation.validAmount ?
+            "success" : "failed",
+          output: {
+            validAmount: amountValidation.validAmount,
+            submittedAmount: amountValidation.submittedAmount,
+            primusAmount: amountValidation.savedAmount,
+            difference: amountValidation.difference,
+          },
+          error: (amountValidation.ok && amountValidation.validAmount) ?
+            null : (amountValidation.reason || "Amount validation failed"),
         });
+
+        if (amountValidation.ok && amountValidation.validAmount) {
+          await writeLog("info", "workflow", "Amount validation passed", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            submittedAmount: amountValidation.submittedAmount,
+            primusAmount: amountValidation.savedAmount,
+            difference: amountValidation.difference,
+            proNumber: amountValidation.proNumber || null,
+          });
+        }
 
         if (!amountValidation.ok || !amountValidation.validAmount) {
           const primusAmountFromValidation = amountValidation.amount || null;
@@ -4903,12 +5567,6 @@ exports.processPrimusWorkflow = onRequest(
             },
           });
 
-          await writeLog("info", "workflow", "Adding PRO number to load", {
-            invoiceId: invoiceId,
-            loadNumber: invoice.loadNumber,
-            invoicePro: invoice.proNumber,
-          });
-
           const proResult = await addProNumberToLoad(
               invoice.loadNumber,
               invoice.proNumber,
@@ -4922,10 +5580,33 @@ exports.processPrimusWorkflow = onRequest(
           await logWorkflowStep({
             invoiceId,
             stepName: "pro_added",
-            stepStatus: proResult.ok ? "success" : "failed",
-            output: proResult.ok ? {newPro: invoice.proNumber} : null,
+            stepStatus: proResult.ok ? "success" :
+              (proResult.skipped ? "skipped" : "failed"),
+            output: proResult.ok ? {
+              newPro: invoice.proNumber,
+              skipped: proResult.skipped || false,
+              reason: proResult.reason || null,
+            } : null,
             error: proResult.ok ? null : "Failed to add PRO to load",
           });
+          if (proResult.ok) {
+            await writeLog("info", "workflow",
+                proResult.skipped ?
+                  `PRO number step skipped — ${proResult.reason}` :
+                  "PRO number written to Primus booking", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumber: invoice.proNumber,
+                });
+          } else {
+            await writeLog("warn", "workflow",
+                "Failed to write PRO number to Primus — workflow continues", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumber: invoice.proNumber,
+                  error: proResult.error,
+                });
+          }
 
           if (proResult.ok) {
             primusSteps.proAdded = true;
@@ -4970,12 +5651,6 @@ exports.processPrimusWorkflow = onRequest(
               },
             });
 
-            await writeLog("info", "workflow", "Marking shipment delivered", {
-              invoiceId,
-              loadNumber: invoice.loadNumber,
-              proNumber: invoice.proNumber,
-            });
-
             const deliveredRes = await markShipmentDelivered(
                 invoice.loadNumber,
                 workingProNumber,
@@ -4997,13 +5672,15 @@ exports.processPrimusWorkflow = onRequest(
               });
             }
 
-            if (alreadyDelivered) {
-              await writeLog("info", "workflow", "Shipment already delivered", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                details: deliveredRes,
-              });
-            }
+            await writeLog("info", "workflow",
+                alreadyDelivered ?
+                  "Shipment already marked delivered in Primus — skipped" :
+                  "Shipment marked delivered in Primus", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumber: workingProNumber || null,
+                  alreadyDelivered,
+                });
           }
           primusSteps.shipmentDelivered = true;
           await invoiceDoc.ref.update({
@@ -5028,12 +5705,6 @@ exports.processPrimusWorkflow = onRequest(
           input: {loadNumber: invoice.loadNumber, proNumber: workingProNumber},
         });
 
-        await writeLog("info", "workflow", "Checking customer", {
-          invoiceId: invoiceId,
-          loadNumber: invoice.loadNumber,
-          proNumber: invoice.proNumber,
-        });
-
         let customerNameForCheck = invoice.customerName;
         const customerForCheckResult = await getCustomerRate(
             invoice.loadNumber,
@@ -5046,6 +5717,21 @@ exports.processPrimusWorkflow = onRequest(
             customerName: customerNameForCheck,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
+          await writeLog("info", "workflow",
+              "Customer rate fetched from Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerName: customerForCheckResult.customerName,
+                customerRate: customerForCheckResult.customerRate,
+                rateSource: customerForCheckResult.rateSource,
+              });
+        } else {
+          await writeLog("warn", "workflow",
+              "Could not fetch customer rate from Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                error: customerForCheckResult && customerForCheckResult.error,
+              });
         }
 
         if (
@@ -5085,12 +5771,6 @@ exports.processPrimusWorkflow = onRequest(
             workflowStatus: "test_customer_review",
           });
         }
-
-        await writeLog("info", "workflow", "Approving carrier bill", {
-          invoiceId: invoiceId,
-          carrierName: invoice.carrierName,
-          invoiceAmount: invoice.invoiceAmount,
-        });
 
         await logWorkflowStep({
           invoiceId,
@@ -5150,13 +5830,16 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
-        if (alreadyApproved) {
-          await writeLog("info", "workflow", "Carrier bill already approved", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            details: approvalResult,
-          });
-        }
+        await writeLog("info", "workflow",
+            alreadyApproved ?
+              "Carrier bill already approved — skipped" :
+              "Carrier bill approved", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName,
+              invoiceAmount: invoice.invoiceAmount,
+              alreadyApproved,
+            });
 
         primusSteps.billApproved = true;
         await invoiceDoc.ref.update({
@@ -5229,9 +5912,32 @@ exports.processPrimusWorkflow = onRequest(
         }
 
         const customerName = customerRateResult.customerName;
-        const customerRate = Number(customerRateResult.customerRate || 0);
+        // A rate manually entered via setCustomerRate takes priority over
+        // whatever Primus currently reports (which can be stale/doubled).
+        const manualRate = Number(invoice.customerRate || 0);
+        const primusRate = Number(customerRateResult.customerRate || 0);
+        const customerRate = manualRate || primusRate;
+        // Carrier cost: use booking.vendor.cost (the load rate) — this is the
+        // source of truth. invoice.invoiceAmount can be doubled/stale.
+        const bookingCarrierCost = Number(
+            amountValidation.savedAmount || invoice.invoiceAmount || 0,
+        );
         const profit = Number(customerRate || 0) -
-      (Number(invoice.invoiceAmount || 0) - approvedChargesTotal);
+          (bookingCarrierCost - approvedChargesTotal);
+        const marginPctCalc = customerRate > 0 ?
+          Math.round((profit / customerRate) * 100) : 0;
+
+        await writeLog("info", "workflow", "Customer rate and profit check", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          customerName,
+          customerRate,
+          carrierInvoiceAmount: invoice.invoiceAmount,
+          approvedChargesTotal,
+          profit,
+          marginPct: marginPctCalc,
+          willPause: !customerRate || Number(customerRate) <= 0 || profit < 10,
+        });
 
         primusSteps.customerRateChecked = true;
 
@@ -5269,8 +5975,8 @@ exports.processPrimusWorkflow = onRequest(
 
           const baseUrl = `https://${req.get("host")}`;
           const isLowMargin = customerRate > 0;
-          const marginPct = customerRate > 0 ?
-            Math.round((profit / customerRate) * 100) : 0;
+          const marginPct = marginPctCalc;
+          const carrierCost = bookingCarrierCost - approvedChargesTotal;
           await saveOutboundEmail({
             type: "rate_missing",
             invoiceId,
@@ -5279,38 +5985,58 @@ exports.processPrimusWorkflow = onRequest(
               ` for Load ${invoice.loadNumber}`,
             html:
               `<h2>${isLowMargin ?
-                "Low Margin Warning" : "Customer Rate Missing"}</h2>` +
-              `<p>${isLowMargin ?
-                "Margin is below the $10 minimum." :
-                "No customer rate found in Primus."} ` +
-              `Set the customer quote in Primus then click ` +
-              `<strong>Continue Workflow</strong>.</p>` +
-              `<table style="border-collapse:collapse;` +
-              `font-size:14px;margin:12px 0">` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Carrier</strong></td>` +
-              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Load #</strong></td>` +
-              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Carrier Invoice</strong></td>` +
-              `<td>$${invoice.invoiceAmount || "—"}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Customer Rate</strong></td>` +
-              `<td>${customerRate > 0 ?
-                `$${customerRate}` : "Not set"}</td></tr>` +
+                "Low Margin Warning" :
+                "Customer Rate Missing"} — Load ` +
+              `${escapeHtml(invoice.loadNumber || "")}</h2>` +
               (isLowMargin ?
-                `<tr><td style="padding:4px 12px 4px 0">` +
+                `<p>Margin is too low to proceed. Here is the breakdown:</p>` +
+                `<table style="border-collapse:collapse;` +
+                `font-size:15px;margin:12px 0">` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Carrier cost</strong></td>` +
+                `<td style="font-weight:700">` +
+                `$${Number(carrierCost).toFixed(2)}</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Customer rate</strong></td>` +
+                `<td style="font-weight:700">` +
+                `$${Number(customerRate).toFixed(2)}</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
                 `<strong>Profit</strong></td>` +
-                `<td>$${profit} (${marginPct}%)</td></tr>` : "") +
+                `<td style="color:${profit < 0 ?
+                  "#dc2626" : "#d97706"};font-weight:700">` +
+                `$${Number(profit).toFixed(2)} (${marginPct}%)</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Minimum required profit</strong></td>` +
+                `<td>$10.00</td></tr>` +
+                `</table>` :
+                `<p>No customer rate was found for this load in Primus. ` +
+                `Enter the correct rate below to resume.</p>` +
+                `<table style="border-collapse:collapse;` +
+                `font-size:15px;margin:12px 0">` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Carrier cost</strong></td>` +
+                `<td style="font-weight:700">` +
+                `$${Number(carrierCost).toFixed(2)}</td></tr>` +
+                `<tr><td style="padding:6px 16px 6px 0">` +
+                `<strong>Customer rate</strong></td>` +
+                `<td style="color:#dc2626;font-weight:700">Not set</td></tr>` +
+                `</table>`) +
+              `<table style="border-collapse:collapse;` +
+              `font-size:13px;margin:8px 0;color:#555">` +
+              `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
+              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+              `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
+              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+              `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
+              `<td>${escapeHtml(customerName || "—")}</td></tr>` +
               `</table>` +
               `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
               `${encodeURIComponent(invoiceId)}" ` +
               `style="display:inline-block;padding:.6rem 1.25rem;` +
               `background:#4f46e5;color:#fff;border-radius:8px;` +
               `font-weight:600;text-decoration:none;margin-top:.5rem">` +
-              `${isLowMargin ? "Update Customer Rate" : "Set Customer Rate"}` +
+              `${isLowMargin ?
+                "Update Customer Rate" : "Set Customer Rate"}` +
               `</a>`,
           });
 
@@ -5394,6 +6120,70 @@ exports.processPrimusWorkflow = onRequest(
                 },
             );
 
+            await invoiceDoc.ref.update({
+              processingLock: false,
+              finalWorkflowStatus: "needs_invoice_review",
+              decisionStage: "invoice_generation_failed",
+              decisionReason: invoiceGenerationResult.error ||
+                "Customer invoice generation failed",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            const baseUrl = `https://${req.get("host")}`;
+            const primusTotal = invoiceGenerationResult.invoiceTotal || 0;
+            const expectedRateVal =
+              invoiceGenerationResult.expectedRate || customerRate;
+            const diffVal = invoiceGenerationResult.difference ||
+              Math.abs(primusTotal - expectedRateVal);
+            const isMismatch = primusTotal > 0 && expectedRateVal > 0;
+            await saveOutboundEmail({
+              type: "invoice_generation_failed",
+              invoiceId,
+              subject: `Action needed — Rate mismatch on Load` +
+                ` ${invoice.loadNumber}`,
+              html:
+                `<h2>Invoice Amount Mismatch — Load ` +
+                `${escapeHtml(invoice.loadNumber || "")}</h2>` +
+                (isMismatch ?
+                  `<p>The invoice in ShipPrimus does not match the ` +
+                  `expected customer rate:</p>` +
+                  `<table style="border-collapse:collapse;` +
+                  `font-size:15px;margin:12px 0">` +
+                  `<tr><td style="padding:6px 16px 6px 0">` +
+                  `<strong>Rate on the bill (Primus)</strong></td>` +
+                  `<td style="color:#dc2626;font-weight:700">` +
+                  `$${Number(primusTotal).toFixed(2)}</td></tr>` +
+                  `<tr><td style="padding:6px 16px 6px 0">` +
+                  `<strong>Expected customer rate</strong></td>` +
+                  `<td style="color:#16a34a;font-weight:700">` +
+                  `$${Number(expectedRateVal).toFixed(2)}</td></tr>` +
+                  `<tr><td style="padding:6px 16px 6px 0">` +
+                  `<strong>Difference</strong></td>` +
+                  `<td style="color:#dc2626;font-weight:700">` +
+                  `$${Number(diffVal).toFixed(2)}</td></tr>` +
+                  `</table>` :
+                  `<p>${escapeHtml(invoiceGenerationResult.error || "")}</p>`
+                ) +
+                `<table style="border-collapse:collapse;` +
+                `font-size:13px;margin:12px 0;color:#555">` +
+                `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
+                `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+                `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
+                `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+                `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
+                `<td>${escapeHtml(customerName || "—")}</td></tr>` +
+                `</table>` +
+                `<p>Fix the invoice amount in ShipPrimus to ` +
+                `<strong>$${Number(expectedRateVal).toFixed(2)}</strong>` +
+                `, then click Resume.</p>` +
+                `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
+                `${encodeURIComponent(invoiceId)}" ` +
+                `style="display:inline-block;padding:.6rem 1.25rem;` +
+                `background:#4f46e5;color:#fff;border-radius:8px;` +
+                `font-weight:600;text-decoration:none;margin-top:.5rem">` +
+                `Resume Workflow</a>`,
+            });
+
             return res.json({
               ok: false,
               error: "Customer invoice generation failed",
@@ -5408,6 +6198,20 @@ exports.processPrimusWorkflow = onRequest(
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
+          await writeLog("info", "workflow",
+              invoiceGenerationResult.reused ?
+                "Customer invoice already existed in Primus — reused" :
+                "Customer invoice created in Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+                invoiceNumber: invoiceGenerationResult.invoiceNumber || null,
+                invoiceTotal: invoiceGenerationResult.invoiceTotal,
+                generated: invoiceGenerationResult.generated,
+                reused: invoiceGenerationResult.reused || false,
+                pdfUrlAvailable: !!invoiceGenerationResult.invoicePdfUrl,
+              });
+
           await setWorkflowHeartbeat(
               invoiceDoc.ref, "customer_invoice_generated");
         }
@@ -5421,6 +6225,36 @@ exports.processPrimusWorkflow = onRequest(
         // "extra_charges_pending_review"), so finalCustomerInvoiceId only
         // ever reflects the base freight amount.
 
+        // Determine PDF source. Query the Primus document endpoint to get the
+        // real issued invoice URL — only present when the invoice has been
+        // issued/generated. This is more reliable than invoiceGenerationResult
+        // .invoicePdfUrl (which uses a hash that only works in the browser).
+        const primusGenerated =
+            invoiceGenerationResult && invoiceGenerationResult.generated;
+        let primusInvoiceUrl = null;
+        let customerInvoicePdfBase64 = null;
+        try {
+          const docToken = await getPrimusToken();
+          const docResp = await fetch(
+              `${process.env.PRIMUS_BASE_URL}/document/bolnumber/` +
+              `${invoice.loadNumber}`,
+              {headers: {Authorization: `Bearer ${docToken}`}},
+          );
+          const docData = await docResp.json();
+          const allDocs = (docData.data && docData.data.results) || [];
+          const invDoc = allDocs.find((d) => d.type === "INV");
+          if (invDoc && invDoc.url) {
+            primusInvoiceUrl = invDoc.url;
+          }
+        } catch (docErr) {
+          await writeLog("warn", "primus",
+              "Could not fetch Primus document list; will use local PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                error: docErr.message,
+              });
+        }
+
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
           decisionStage: "completed",
@@ -5431,20 +6265,24 @@ exports.processPrimusWorkflow = onRequest(
           primusSteps: primusSteps,
           finalWorkflowStatus: "completed",
           customerInvoiceId: finalCustomerInvoiceId,
+          processingLock: false,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
-        await writeLog(
-            "info",
-            "workflow",
-            "Primus workflow completed",
-            {
-              invoiceId: invoiceId,
-              customerName: customerName,
-              profit: profit,
-              customerInvoiceId: finalCustomerInvoiceId,
-            },
-        );
+        await writeLog("info", "workflow", "Primus workflow completed", {
+          invoiceId,
+          flowId,
+          loadNumber: invoice.loadNumber,
+          carrierName: invoice.carrierName,
+          carrierInvoiceAmount: invoice.invoiceAmount,
+          customerName,
+          customerRate,
+          profit,
+          marginPct: marginPctCalc,
+          customerInvoiceId: finalCustomerInvoiceId,
+          primusSteps,
+          pdfSource: primusInvoiceUrl ? "primus" : "local",
+        });
 
         const podStoragePath =
       (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
@@ -5452,27 +6290,48 @@ exports.processPrimusWorkflow = onRequest(
       null;
 
         const attachmentsToSend = [];
-
-        // Try to use the Primus-generated invoice PDF first; fall back to
-        // locally generated PDF if the URL is unavailable or download fails.
-        const primusInvoiceUrl =
-            (invoiceGenerationResult &&
-            invoiceGenerationResult.invoicePdfUrl) || null;
-        let customerInvoicePdfBase64 = null;
         if (primusInvoiceUrl) {
           try {
-            const token = await getPrimusToken();
-            const pdfResp = await fetch(primusInvoiceUrl, {
-              headers: {Authorization: `Bearer ${token}`},
-            });
+            // The document URL returned by /document/bolnumber/{n}?type=INV
+            // is self-authenticating (no auth header required).
+            const pdfResp = await fetch(primusInvoiceUrl);
             if (pdfResp.ok) {
-              const buf = await pdfResp.arrayBuffer();
-              customerInvoicePdfBase64 =
-                  Buffer.from(buf).toString("base64");
+              const buf = Buffer.from(await pdfResp.arrayBuffer());
+              // Only accept real PDFs (%PDF- magic bytes). The server can
+              // return HTTP 200 HTML for draft/not-found invoices.
+              if (buf.slice(0, 5).toString("latin1") === "%PDF-") {
+                customerInvoicePdfBase64 = buf.toString("base64");
+              } else {
+                await writeLog("warn", "primus",
+                    "Primus document URL did not return a valid PDF; " +
+                    "falling back to locally-built invoice", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      primusInvoiceUrl,
+                      preview: buf.slice(0, 100).toString("latin1"),
+                    });
+              }
             }
-          } catch (_) {
-            // fall through to local build
+          } catch (pdfErr) {
+            await writeLog("warn", "primus",
+                "Error downloading Primus invoice PDF; " +
+                "falling back to locally-built invoice", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  error: pdfErr.message,
+                });
           }
+        } else if (!primusGenerated) {
+          await writeLog("info", "primus",
+              "Primus invoice not yet issued (draft); " +
+              "no INV document found via document API", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerInvoiceId:
+                    invoiceGenerationResult ?
+                    (invoiceGenerationResult.customerInvoiceId || null) :
+                    (invoice.customerInvoiceId || null),
+              });
         }
         if (!customerInvoicePdfBase64) {
           customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
@@ -5483,6 +6342,21 @@ exports.processPrimusWorkflow = onRequest(
             customerRate,
             carrierInvoiceAmount: invoice.invoiceAmount,
           });
+          await writeLog("info", "workflow",
+              "Using locally-built customer invoice PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                reason: primusInvoiceUrl ?
+                  "Primus document URL did not return valid PDF" :
+                  "No issued invoice document found in Primus",
+              });
+        } else {
+          await writeLog("info", "workflow",
+              "Using Primus-generated customer invoice PDF", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                primusInvoiceUrl,
+              });
         }
 
         attachmentsToSend.push({
@@ -5499,7 +6373,23 @@ exports.processPrimusWorkflow = onRequest(
               contentType: "application/pdf",
               contentBase64: podBase64,
             });
+          } else {
+            await writeLog("warn", "workflow",
+                "POD file stored but could not be downloaded for email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  podStoragePath,
+                });
           }
+        } else {
+          await writeLog("warn", "workflow",
+              "No POD attached to customer invoice email — " +
+              "POD was not found or not extracted", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                podFound: invoice.pod && invoice.pod.found,
+                podSource: invoice.pod && invoice.pod.source,
+              });
         }
 
         await logWorkflowStep({
@@ -5591,6 +6481,67 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
+        // Push carrier bill to QuickBooks once the invoice is confirmed.
+        // The payable already exists in Primus (created when the invoice was
+        // issued). We call /quickbooks/billing to sync it to QB. If the
+        // dueDate is missing, we calculate Net 30 from the carrier invoice
+        // date and store it for reference.
+        if (finalCustomerInvoiceId) {
+          try {
+            const qbResult = await primusRequest(
+                "POST", "/quickbooks/billing",
+                {invoiceId: finalCustomerInvoiceId},
+            );
+            const qbBills = qbResult && qbResult.data &&
+                qbResult.data.results && qbResult.data.results.bills;
+            const uploaded = qbBills && qbBills.uploadedBills &&
+                qbBills.uploadedBills.length || 0;
+            const failed = qbBills && qbBills.failedBills &&
+                qbBills.failedBills.length || 0;
+            if (uploaded > 0) {
+              await writeLog("info", "workflow",
+                  "Carrier bill pushed to QuickBooks", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    uploadedBills: uploaded,
+                  });
+            } else {
+              await writeLog("warn", "workflow",
+                  "QB billing call returned no uploaded bills " +
+                  "(QB may not be connected or bill not ready)", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    failedBills: failed,
+                    raw: JSON.stringify(qbResult).slice(0, 300),
+                  });
+            }
+
+            // Calculate and store Net 30 due date for reference
+            const invDateRaw = invoice.dueDate ? null :
+                (invoice.invoiceDate || invoice.receivedAt || null);
+            if (!invoice.dueDate && invDateRaw) {
+              const invDate = new Date(invDateRaw);
+              if (!isNaN(invDate.getTime())) {
+                invDate.setDate(invDate.getDate() + 30);
+                const net30 = invDate.toISOString().split("T")[0];
+                await invoiceDoc.ref.update({
+                  carrierBillDueDate: net30,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              }
+            }
+          } catch (qbErr) {
+            await writeLog("warn", "workflow",
+                "QB billing sync failed — bill still in Primus", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  error: qbErr.message,
+                });
+          }
+        }
+
         await logWorkflowStep({
           invoiceId,
           stepName: "workflow_completed",
@@ -5653,3 +6604,35 @@ exports.processPrimusWorkflow = onRequest(
       }
     },
 );
+
+// ── TAI TMS integration ────────────────────────────────────────────────────
+// Firebase only deploys exports found in the main entry file, so we re-export
+// the TAI webhook receiver, resolver, and workflow defined in ./tai.js.
+//
+// The TAI workflow reuses the TMS-agnostic helpers below (pause/email/logging
+// /POD extraction/PDF building) so its behavior stays identical to the Primus
+// workflow — only the TMS API calls differ. We inject them rather than
+// duplicating them. These are passed by reference and remain closures over
+// this module's scope (db, getBucket, sendViaGmail, etc.).
+const tai = require("./tai");
+
+tai.init({
+  db,
+  writeLog,
+  logWorkflowStep,
+  setWorkflowHeartbeat,
+  pauseWorkflow,
+  saveOutboundEmail,
+  buildContinueButtonHtml,
+  escapeHtml,
+  maybeExtractPodOnlyPdf,
+  isAlreadyDoneResult,
+  downloadStorageFileBase64,
+  buildCustomerInvoicePdfBase64,
+  FieldValue: admin.firestore.FieldValue,
+});
+
+exports.taiWebhook = tai.taiWebhook;
+exports.taiResolveShipment = tai.taiResolveShipment;
+exports.processTaiWorkflow = tai.processTaiWorkflow;
+
