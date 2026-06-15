@@ -96,7 +96,7 @@ function normalizeTenant(tenantId, data) {
   return {
     tenantId: String(tenantId),
     name: d.name || String(tenantId),
-    tms: String(d.tms || "primus").toLowerCase(),
+    tms: String(d.tms || "").toLowerCase(),
     collectionPrefix: String(d.collectionPrefix || "").trim(),
     bqDataset: d.bqDataset || BQ_DATASET,
     gmailDocId: d.gmailDocId || `gmail_${tenantId}`,
@@ -198,20 +198,25 @@ async function getTenantGmailClient(tenant) {
 }
 
 /**
- * Resolves the workflow kickoff URL for a TMS. Falls back to the deployed
- * Cloud Functions URL when the matching env var is not set.
+ * Resolves the workflow kickoff URL for a TMS. There is NO implicit default:
+ * an unrecognized or empty TMS returns null so the caller treats it as a
+ * configuration error instead of silently routing to Primus.
  * @param {string} tms TMS key ("tai" or "primus").
- * @return {string} Absolute workflow endpoint URL.
+ * @return {string|null} Absolute workflow endpoint URL, or null if unknown.
  */
 function workflowUrlForTms(tms) {
   const base =
     "https://us-central1-tai-invoice-automation.cloudfunctions.net";
-  if (String(tms).toLowerCase() === "tai") {
+  const key = String(tms || "").toLowerCase();
+  if (key === "tai") {
     return process.env.PROCESS_TAI_WORKFLOW_URL ||
       `${base}/processTaiWorkflow`;
   }
-  return process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-    `${base}/processPrimusWorkflow`;
+  if (key === "primus") {
+    return process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+      `${base}/processPrimusWorkflow`;
+  }
+  return null;
 }
 
 // Per-company workflow endpoints. Each company file owns its own workflow
@@ -225,9 +230,10 @@ const TENANT_WORKFLOW_FUNCTIONS = Object.freeze({
 /**
  * Resolves the workflow kickoff URL for a specific tenant. Prefers a dedicated
  * per-company endpoint (TENANT_WORKFLOW_FUNCTIONS) and otherwise falls back to
- * the generic per-TMS workflow URL.
+ * the generic per-TMS workflow URL. Returns null when the tenant's TMS is
+ * unknown (no implicit Primus default).
  * @param {object} tenant Tenant config.
- * @return {string} Absolute workflow endpoint URL.
+ * @return {string|null} Absolute workflow endpoint URL, or null if unknown.
  */
 function workflowUrlForTenant(tenant) {
   const base =
@@ -3679,6 +3685,11 @@ async function processGmailMessage(
 
       try {
         const workflowUrl = workflowUrlForTenant(tenant);
+        if (!workflowUrl) {
+          throw new Error(
+              `No workflow endpoint for tenant ${tenant.tenantId} ` +
+              `(tms=${tenant.tms || "none"}); refusing to default to Primus`);
+        }
         const workflowRes = await fetch(
             workflowUrl,
             {
@@ -4049,16 +4060,25 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     customerName,
   });
 
-  const workflowUrl =
-    process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-    "https://us-central1-tai-invoice-automation.cloudfunctions.net" +
-    "/processPrimusWorkflow";
+  // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
+  // hardcoded Primus default.
+  const rateTenant = await getTenant(inv.tenantId);
+  const workflowUrl = workflowUrlForTenant(rateTenant);
 
-  fetch(workflowUrl, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({invoiceId, resumeFrom: "generate_invoice"}),
-  }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
+  if (workflowUrl) {
+    fetch(workflowUrl, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        invoiceId,
+        tenantId: rateTenant.tenantId,
+        resumeFrom: "generate_invoice",
+      }),
+    }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
+  } else {
+    console.error("setCustomerRate: no workflow URL for tenant",
+        rateTenant.tenantId);
+  }
 
   return res.send(`<!DOCTYPE html>
 <html lang="en">
