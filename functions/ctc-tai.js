@@ -292,8 +292,7 @@ async function indexShipment(shipment, eventType, tenant = null) {
  * @return {boolean} True if the request is authorized.
  */
 function isAuthorized(req) {
-  const expected = process.env.TAI_WEBHOOK_SECRET_CTC ||
-    process.env.TAI_WEBHOOK_SECRET;
+  const expected = process.env.TAI_WEBHOOK_SECRET_CTC;
   if (!expected) {
     console.warn(
         "[ctc-tai] webhook secret not set — skipping auth check");
@@ -542,11 +541,11 @@ function s() {
  * @return {Promise<object|Array|string|null>} Parsed response, or null on 404.
  */
 async function taiRequest(method, path, body) {
-  const base = process.env.TAI_BASE_URL_CTC ||
-    process.env.TAI_BASE_URL || "https://www.taibeta.net";
+  // CTC uses ONLY its own credentials — never the shared TAI_* vars, so it can
+  // never call another client's TAI account.
+  const base = process.env.TAI_BASE_URL_CTC || "https://www.taibeta.net";
   const headers = {
-    "x-api-key": process.env.TAI_API_KEY_CTC ||
-      process.env.TAI_API_KEY || "",
+    "x-api-key": process.env.TAI_API_KEY_CTC || "",
     "Content-Type": "application/json",
     "accept": "application/json",
   };

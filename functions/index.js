@@ -93,12 +93,16 @@ const DEFAULT_TENANT = Object.freeze({
  */
 function normalizeTenant(tenantId, data) {
   const d = data || {};
+  // Every default is the tenant's OWN namespace — never root or the default
+  // tenant's dataset. A tenant doc that omits collectionPrefix/bqDataset still
+  // reads/writes only its own (empty-until-used) data, so one client can never
+  // fall back onto another client's collections, logs, or stats.
   return {
     tenantId: String(tenantId),
     name: d.name || String(tenantId),
     tms: String(d.tms || "").toLowerCase(),
-    collectionPrefix: String(d.collectionPrefix || "").trim(),
-    bqDataset: d.bqDataset || BQ_DATASET,
+    collectionPrefix: String(d.collectionPrefix || tenantId).trim(),
+    bqDataset: d.bqDataset || `${BQ_DATASET}_${tenantId}`,
     gmailDocId: d.gmailDocId || `gmail_${tenantId}`,
     alertEmail: d.alertEmail || process.env.ALERT_EMAIL || null,
     active: d.active !== false,
@@ -2023,7 +2027,11 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
  * @return {Promise<object>} Result of the operation.
  */
 async function saveOutboundEmail(email) {
-  const tenant = (email && email.tenant) || DEFAULT_TENANT;
+  // Use the email's tenant, then the ambient tenant bound for this request
+  // (set by runWithTenant/enterTenantContext). Only a genuinely tenant-less
+  // context lands on DEFAULT_TENANT — a client's email is never sent from
+  // another client's mailbox.
+  const tenant = (email && email.tenant) || currentTenant() || DEFAULT_TENANT;
   let sendResult = null;
   const to = tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "";
 
@@ -4137,7 +4145,7 @@ exports.getRecentLogs = onRequest(
       try {
         const tenant = await resolveDashboardTenant(req);
         const limit = Math.min(Number(req.query.limit || 40), 100);
-        const dataset = tenant.bqDataset || BQ_DATASET;
+        const dataset = tenant.bqDataset;
         const [rows] = await bigquery.query({
           query: `
             SELECT timestamp, level, category, message
@@ -4221,7 +4229,7 @@ exports.getDashboardStats = onRequest(async (req, res) => {
 
   try {
     const tenant = await resolveDashboardTenant(req);
-    const dataset = tenant.bqDataset || BQ_DATASET;
+    const dataset = tenant.bqDataset;
     const range = String(req.query.range || "week").toLowerCase();
     const rangeConfig = DASHBOARD_RANGES[range];
     if (!rangeConfig) {
