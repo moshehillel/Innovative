@@ -106,8 +106,34 @@ function normalizeTenant(tenantId, data) {
 }
 
 /**
- * Resolves a tenant by id, falling back to the default (Primus) tenant when the
- * id is missing/"default" or no matching tenant doc exists.
+ * Builds a fail-closed config for a tenant whose `tenants/{id}` doc does not
+ * exist (or could not be read). Crucially it does NOT inherit the default
+ * tenant's data location: it points at the tenant's OWN namespace (prefix =
+ * id, its own dataset + inbox), which is empty until the tenant is configured.
+ * This guarantees an unconfigured/typo'd tenant shows nothing rather than
+ * leaking the default (Innovative) tenant's invoices, logs, and stats.
+ * @param {string} tenantId Tenant identifier.
+ * @return {object} Namespaced, inactive tenant config.
+ */
+function unconfiguredTenant(tenantId) {
+  const id = String(tenantId);
+  return {
+    tenantId: id,
+    name: id,
+    tms: "",
+    collectionPrefix: id,
+    bqDataset: `${BQ_DATASET}_${id}`,
+    gmailDocId: `gmail_${id}`,
+    alertEmail: process.env.ALERT_EMAIL || null,
+    active: false,
+  };
+}
+
+/**
+ * Resolves a tenant by id. Returns the default (Innovative) tenant only for a
+ * missing id or the explicit "default" id. Any other id whose doc does not
+ * exist resolves to a fail-closed, tenant-namespaced config (see
+ * unconfiguredTenant) so it can never read another tenant's data.
  * @param {string|null} tenantId Tenant identifier.
  * @return {Promise<object>} Tenant config.
  */
@@ -118,12 +144,12 @@ async function getTenant(tenantId) {
   try {
     const snap = await db.collection("tenants").doc(String(tenantId)).get();
     if (!snap.exists) {
-      return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+      return unconfiguredTenant(tenantId);
     }
     return normalizeTenant(tenantId, snap.data());
   } catch (error) {
     console.error(`getTenant(${tenantId}) failed:`, error.message);
-    return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+    return unconfiguredTenant(tenantId);
   }
 }
 
