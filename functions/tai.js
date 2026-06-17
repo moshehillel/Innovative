@@ -1104,7 +1104,7 @@ exports.processTaiWorkflow = onRequest(
           });
         }
 
-        const {invoiceId, tenantId} = req.body || {};
+        const {invoiceId, tenantId, resumeFrom} = req.body || {};
         if (!invoiceId) {
           return res.status(400).json({ok: false, error: "invoiceId required"});
         }
@@ -1112,8 +1112,9 @@ exports.processTaiWorkflow = onRequest(
         // ── Tenant + TMS isolation gate ─────────────────────────────────────
         // Resolve the owning tenant and refuse to run unless it is a TAI
         // tenant. getTenant() is fail-closed: an unknown/missing tenant doc
-        // resolves to the default Primus tenant, so this guard rejects rather
-        // than risk running the TAI workflow against the wrong company. The
+        // resolves to a tenant-namespaced, inactive config with tms unset (NOT
+        // the default Primus tenant), so this guard rejects rather than risk
+        // running the TAI workflow against the wrong company. The
         // invoice is then read from the tenant's OWN prefixed collection — the
         // workflow physically cannot see another tenant's invoices.
         const tenant = await resolveTenant(tenantId);
@@ -1193,9 +1194,14 @@ exports.processTaiWorkflow = onRequest(
           return res.status(409).json({ok: false, error: "ALREADY_PROCESSING"});
         }
 
+        // resumeFrom is honored via per-step idempotency: each step below
+        // re-checks already-done state (taiSteps / alreadyApproved / reused
+        // invoice) and no-ops if complete, so a resume converges on the same
+        // result without an explicit step jump.
         await h.writeLog("info", "workflow", "Starting TAI workflow", {
           invoiceId,
           flowId,
+          resumeFrom: resumeFrom || null,
           loadNumber: invoice.loadNumber,
           proNumber: invoice.proNumber || null,
           invoiceAmount: invoice.invoiceAmount || null,
@@ -1258,7 +1264,7 @@ exports.processTaiWorkflow = onRequest(
               `. This usually means the shipment webhook has not arrived ` +
               `yet, or the reference number on the carrier invoice does not ` +
               `match TAI.</p>` +
-              h.buildContinueButtonHtml(baseUrl, invoiceId),
+              h.buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId),
           });
           return res.json({ok: true, workflowStatus: "tai_shipment_not_found"});
         }
@@ -1497,7 +1503,7 @@ exports.processTaiWorkflow = onRequest(
             subject: "Customer requires confirmation",
             html: `<p>Invoice ${invoiceId} is for a test customer ` +
               `(${h.escapeHtml(customerName)}).</p>` +
-              h.buildContinueButtonHtml(baseUrl, invoiceId),
+              h.buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId),
           });
           return res.json({ok: true, workflowStatus: "test_customer_review"});
         }
@@ -1567,7 +1573,9 @@ exports.processTaiWorkflow = onRequest(
               `<p>No customer rate was found in TAI for load ` +
               `${h.escapeHtml(invoice.loadNumber || "")}.</p>` +
               `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-              `${encodeURIComponent(invoiceId)}">Set Customer Rate</a>`,
+              `${encodeURIComponent(invoiceId)}` +
+              `&tenantId=${encodeURIComponent(tenant.tenantId)}` +
+              `">Set Customer Rate</a>`,
           });
           return res.json({
             ok: true,
@@ -1618,7 +1626,9 @@ exports.processTaiWorkflow = onRequest(
               `customer rate $${Number(customerRate).toFixed(2)}, ` +
               `profit $${Number(profit).toFixed(2)} (${marginPct}%).</p>` +
               `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-              `${encodeURIComponent(invoiceId)}">Update Customer Rate</a>`,
+              `${encodeURIComponent(invoiceId)}` +
+              `&tenantId=${encodeURIComponent(tenant.tenantId)}` +
+              `">Update Customer Rate</a>`,
           });
           return res.json({
             ok: true,
@@ -1667,7 +1677,9 @@ exports.processTaiWorkflow = onRequest(
                 `${h.escapeHtml(invoice.loadNumber || "")}</h2>` +
                 `<p>${h.escapeHtml(invoiceGen.error || "")}</p>` +
                 `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-                `${encodeURIComponent(invoiceId)}">Resume Workflow</a>`,
+                `${encodeURIComponent(invoiceId)}` +
+                `&tenantId=${encodeURIComponent(tenant.tenantId)}` +
+                `">Resume Workflow</a>`,
             });
             return res.json({
               ok: false,

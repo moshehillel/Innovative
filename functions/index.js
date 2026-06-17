@@ -110,6 +110,21 @@ function normalizeTenant(tenantId, data) {
 }
 
 /**
+ * Resolves the tenant for an invoice "action" endpoint (continue/resume/email
+ * links) from the request's tenantId (query or body). The links we generate
+ * carry tenantId so a prefixed tenant's invoice is found in its own collection;
+ * with no tenantId it defaults to the default tenant (correct for legacy
+ * single-tenant links).
+ * @param {object} req Express-style request.
+ * @return {Promise<object>} Tenant config.
+ */
+function tenantFromRequest(req) {
+  const tenantId = (req.query && req.query.tenantId) ||
+    (req.body && req.body.tenantId) || null;
+  return getTenant(tenantId);
+}
+
+/**
  * Builds a fail-closed config for a tenant whose `tenants/{id}` doc does not
  * exist (or could not be read). Crucially it does NOT inherit the default
  * tenant's data location: it points at the tenant's OWN namespace (prefix =
@@ -411,7 +426,8 @@ exports.sendCustomerMissingEmail = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -443,7 +459,7 @@ exports.sendCustomerMissingEmail = onRequest(async (req, res) => {
     const htmlContent =
       `<p>Invoice ${invoiceId} is for a test customer ` +
       `(${invoice.customerName}).</p>` +
-      `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
+      `${buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId)}`;
     await saveOutboundEmail({
       type: "customer_missing",
       invoiceId,
@@ -926,7 +942,8 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -966,7 +983,7 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
     const rateStatus = missingRate ? "no customer rate" : "low margin";
     const htmlContent =
       `<p>Invoice ${invoiceId} has ${rateStatus}.</p>` +
-      `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
+      `${buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId)}`;
     await saveOutboundEmail({
       type: "rate_missing",
       invoiceId,
@@ -996,7 +1013,8 @@ exports.continueWorkflow = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -1015,9 +1033,17 @@ exports.continueWorkflow = onRequest(async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
+    // hardcoded Primus default.
+    const workflowUrl = workflowUrlForTenant(tenant);
+    if (!workflowUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: `No workflow configured for tenant ${tenant.tenantId}.`,
+      });
+    }
     const response = await fetch(
-        process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-        "https://us-central1-tai-invoice-automation.cloudfunctions.net/processPrimusWorkflow",
+        workflowUrl,
         {
           method: "POST",
           headers: {
@@ -1025,6 +1051,7 @@ exports.continueWorkflow = onRequest(async (req, res) => {
           },
           body: JSON.stringify({
             invoiceId: invoiceId,
+            tenantId: tenant.tenantId,
             resumeFrom: paused || null,
           }),
         },
@@ -1058,7 +1085,8 @@ exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -1284,7 +1312,10 @@ exports.processInvoice = onRequest(async (req, res) => {
 
     const decisionStage = "pending_primus_check";
 
-    const docRef = await db.collection("invoices").add({
+    const tenant = await tenantFromRequest(req);
+    const docRef = await tcol(tenant, "invoices").add({
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
       carrierName: carrierName,
       invoiceNumber: invoiceNumber,
       proNumber: proNumber,
@@ -1341,7 +1372,8 @@ exports.checkInvoiceAgainstPrimus = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(invoiceId);
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(invoiceId);
     const invoiceSnap = await invoiceRef.get();
 
     if (!invoiceSnap.exists) {
@@ -2239,11 +2271,16 @@ async function buildCustomerInvoicePdfBase64(data) {
  * Builds a continue button HTML for workflow emails.
  * @param {string} baseUrl - The base URL.
  * @param {string} invoiceId - The invoice ID.
+ * @param {string} [tenantId] - Owning tenant, added to the link so the
+ *   prefixed-tenant invoice is found on resume.
  * @return {string} HTML string.
  */
-function buildContinueButtonHtml(baseUrl, invoiceId) {
+function buildContinueButtonHtml(baseUrl, invoiceId, tenantId) {
+  const tq = tenantId ?
+    `&tenantId=${encodeURIComponent(tenantId)}` : "";
   const continueUrl =
-    `${baseUrl}/continueWorkflow?invoiceId=${encodeURIComponent(invoiceId)}`;
+    `${baseUrl}/continueWorkflow?invoiceId=${encodeURIComponent(invoiceId)}` +
+    tq;
   return `<p><a href="${continueUrl}" ` +
     `style="display:inline-block;padding:10px 16px;` +
     `background:#2563eb;color:#fff;text-decoration:none;` +
@@ -3987,7 +4024,8 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     return res.status(400).send("Missing invoiceId.");
   }
 
-  const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+  const tenant = await tenantFromRequest(req);
+  const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
   const snap = await invoiceRef.get();
   if (!snap.exists) {
     return res.status(404).send("Invoice not found.");
@@ -4029,6 +4067,8 @@ exports.setCustomerRate = onRequest(async (req, res) => {
   <h2>Set Customer Rate — Load ${escapeHtml(inv.loadNumber || "—")}</h2>
   <form method="POST">
     <input type="hidden" name="invoiceId" value="${escapeHtml(invoiceId)}"/>
+    <input type="hidden" name="tenantId" value="${escapeHtml(
+      tenant.tenantId)}"/>
     <div class="field">
       <label>Carrier</label>
       <div class="readonly">${escapeHtml(inv.carrierName || "—")}</div>
@@ -4071,16 +4111,16 @@ exports.setCustomerRate = onRequest(async (req, res) => {
   }
 
   const primusSteps = inv.primusSteps || {};
+  const taiSteps = inv.taiSteps || {};
 
-  // The Primus PUT /book/{BOLId} schema does not expose accountingInformation
-  // as a writable field, so there is no API way to store the rate on the
-  // booking record. The rate reaches the invoice via invoiceBreakdown when
-  // generateCustomerInvoice runs later in the workflow.
-
+  // The rate reaches the customer invoice when generateCustomerInvoice runs
+  // later in the workflow. We mark customerRateChecked on whichever TMS step
+  // map the invoice carries so the flag is TMS-agnostic.
   await invoiceRef.update({
     customerRate,
     customerName: customerName || inv.customerName || null,
     primusSteps: {...primusSteps, customerRateChecked: true},
+    taiSteps: {...taiSteps, customerRateChecked: true},
     workflowPausedAtStep: null,
     workflowPausedAt: null,
     finalWorkflowStatus: "running",
@@ -4089,6 +4129,7 @@ exports.setCustomerRate = onRequest(async (req, res) => {
 
   await writeLog("info", "workflow", "Customer rate set manually", {
     invoiceId,
+    tenantId: tenant.tenantId,
     loadNumber: inv.loadNumber,
     customerRate,
     customerName,
@@ -4096,8 +4137,7 @@ exports.setCustomerRate = onRequest(async (req, res) => {
 
   // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
   // hardcoded Primus default.
-  const rateTenant = await getTenant(inv.tenantId);
-  const workflowUrl = workflowUrlForTenant(rateTenant);
+  const workflowUrl = workflowUrlForTenant(tenant);
 
   if (workflowUrl) {
     fetch(workflowUrl, {
@@ -4105,13 +4145,13 @@ exports.setCustomerRate = onRequest(async (req, res) => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({
         invoiceId,
-        tenantId: rateTenant.tenantId,
+        tenantId: tenant.tenantId,
         resumeFrom: "generate_invoice",
       }),
     }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
   } else {
     console.error("setCustomerRate: no workflow URL for tenant",
-        rateTenant.tenantId);
+        tenant.tenantId);
   }
 
   return res.send(`<!DOCTYPE html>
