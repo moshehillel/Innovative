@@ -1980,42 +1980,24 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Do not invent charges.",
         "Any other added charge is unrecognized_charges.",
         "If attachment is not a freight invoice, status is error.",
-        "Detect Proof of Delivery (POD) documents.",
-        "POD may be a separate attachment, a full signed Bill of Lading " +
-        "(BOL) / delivery receipt page, an unsigned POD/delivery receipt " +
-        "form template, the last page of the invoice PDF, or a small POD " +
-        "section at the bottom of an invoice page.",
-        "Look for signed Bill of Lading, delivery receipt, or POD " +
-        "confirmation (signatures, delivery dates, Received stamps).",
-        "When a multi-page PDF contains BOTH an unsigned POD/delivery " +
-        "receipt form template AND a signed BOL or signed delivery " +
-        "confirmation, include BOTH in pod.documents (page order). Use " +
-        "source 'unsigned_pod_template' for blank unsigned forms and " +
-        "'signed_bol' or 'signed_load' for signed pages.",
+        "Detect Proof of Delivery (POD) and shipment document pages.",
+        "Include in pod.documents every post-invoice page that supports " +
+        "delivery: unsigned POD forms, signed BOL, signed delivery receipt.",
+        "Sources: 'unsigned_pod_template', 'signed_bol', 'signed_load', " +
+        "'delivery_receipt', 'signed_pod', 'separate_attachment', " +
+        "'last_page_of_invoice', 'same_page_as_invoice'.",
+        "When a PDF has invoice + POD form + signed BOL + delivery receipt, " +
+        "list ALL of those pages in pod.documents (page order).",
         "pod.documents is an array of {source, page, attachmentFilename, " +
-        "reason}. List every POD-related page after the invoice — not only " +
-        "the signed one. When only one POD page exists, use one entry.",
-        "When the POD is a signed BOL or signed load document — even if " +
-        "it arrived in the same PDF as the carrier invoice — treat the " +
-        "entire page as POD. Use pod.source 'signed_bol' for Bill of " +
-        "Lading / delivery receipt, or 'signed_load' when the page is " +
-        "primarily a signed load confirmation. Both mean full-page " +
-        "extract (1-based page number). Do NOT crop.",
-        "Use source 'unsigned_pod_template' for blank unsigned POD or " +
-        "delivery receipt forms (full page, 1-based page number).",
-        "When POD is its own file in the email, use source " +
+        "reason} with 1-based page numbers.",
+        "NEVER include a page in pod.documents if it shows the carrier " +
+        "invoice Amount Due, bill total, or line-item charges matching " +
+        "invoiceAmount — that is the invoice page, not POD/BOL.",
+        "When POD is its own email attachment file, use source " +
         "'separate_attachment'.",
-        "When POD is the last page of a multi-page invoice PDF, use source " +
-        "'last_page_of_invoice'.",
-        "Use source 'same_page_as_invoice' ONLY when the carrier invoice " +
-        "header/line items occupy the top of the page and a small POD " +
-        "block (signature/stamp only) is clearly in the bottom portion. " +
-        "Set pod.cropFromBottom to the fraction of page height from the " +
-        "bottom containing POD (e.g. 0.35 = bottom 35%). Never use crop " +
-        "when the page is primarily a signed BOL or delivery receipt.",
-        "If unsure between crop and full page, prefer full page " +
-        "(signed_bol or unsigned_pod_template) so the customer receives " +
-        "the complete document.",
+        "Use source 'same_page_as_invoice' ONLY when invoice line items " +
+        "are on top and a small signature/stamp block is at the bottom. " +
+        "Set pod.cropFromBottom to the bottom fraction (e.g. 0.35).",
       ],
       requiredJsonShape: {
         status: "ready_for_primus_validation",
@@ -2441,6 +2423,18 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
         continue;
       }
 
+      if (pdfBytesContainInvoiceAmount(pdfBytes, invoice.invoiceAmount)) {
+        await writeLog("warn", "workflow",
+            "Skipped POD page — contains carrier invoice amount", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              podPage: doc.page,
+              podSource: doc.source,
+              invoiceAmount: invoice.invoiceAmount,
+            });
+        continue;
+      }
+
       const pageLabel = doc.page ? `p${doc.page}` : `part${i + 1}`;
       const partName = `pod-${pageLabel}-${doc.source || "page"}.pdf`
           .replace(/[^a-zA-Z0-9._-]/g, "-");
@@ -2593,15 +2587,73 @@ function normalizeAiChargeArrays(aiResult) {
 const FULL_PAGE_POD_KEYWORDS =
   /\b(signed|signature|bol|bill of lading|delivery receipt|received|consignee|driver|signed load|load document|pod)\b/i; // eslint-disable-line max-len
 
-const FULL_PAGE_POD_SOURCES = new Set([
-  "separate_attachment",
-  "attachment",
+const POD_PACKAGE_SOURCES = new Set([
+  "unsigned_pod_template",
   "signed_bol",
   "signed_load",
   "signed_pod",
-  "unsigned_pod_template",
+  "delivery_receipt",
+  "separate_attachment",
+  "same_page_as_invoice",
   "last_page_of_invoice",
+  "attachment",
 ]);
+
+/**
+ * @param {string} source Document source label.
+ * @return {boolean}
+ */
+function isPodPackageSource(source) {
+  return POD_PACKAGE_SOURCES.has(String(source || "").trim());
+}
+
+/**
+ * Best-effort check: carrier invoice total embedded in a single-page PDF.
+ * @param {Uint8Array|Buffer} pdfBytes PDF bytes.
+ * @param {number} invoiceAmount Carrier invoice amount.
+ * @return {boolean}
+ */
+function pdfBytesContainInvoiceAmount(pdfBytes, invoiceAmount) {
+  const amount = Number(invoiceAmount);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return false;
+  }
+  const haystack = Buffer.from(pdfBytes).toString("latin1");
+  const formatted = amount.toFixed(2);
+  const patterns = [
+    formatted,
+    `$${formatted}`,
+    `Amount Due $${formatted}`,
+    `Amount Due ${formatted}`,
+    `Amount Due $ ${formatted}`,
+  ];
+  return patterns.some((p) => haystack.includes(p));
+}
+
+/**
+ * @param {Array<object>} documents Document entries.
+ * @param {string} fallbackFilename Attachment filename.
+ * @return {Array<object>}
+ */
+function normalizeDocumentEntries(documents, fallbackFilename) {
+  const seen = new Set();
+  return documents
+      .map((doc) => normalizePodDocEntry({
+        ...doc,
+        attachmentFilename: doc.attachmentFilename || fallbackFilename,
+      }))
+      .filter((doc) => {
+        const key = [
+          doc.attachmentFilename,
+          String(doc.page || ""),
+          doc.source,
+        ].join("|");
+        if (seen.has(key) || !doc.source) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => (Number(a.page) || 0) - (Number(b.page) || 0));
+}
 
 /**
  * Upgrades risky POD crop on a single document entry.
@@ -2616,7 +2668,8 @@ function normalizePodDocEntry(doc) {
   const filename = String(doc.attachmentFilename || "").trim();
   const context = `${reason} ${filename}`.toLowerCase();
 
-  if (FULL_PAGE_POD_SOURCES.has(source)) {
+  if (POD_PACKAGE_SOURCES.has(source) ||
+      source === "last_page_of_invoice") {
     return doc;
   }
 
@@ -2687,43 +2740,19 @@ function normalizePodData(pod, options = {}) {
     }];
   }
 
-  documents = documents.map((doc) => {
-    const withFile = {
-      ...doc,
-      attachmentFilename: doc.attachmentFilename || fallbackFilename,
-    };
-    return normalizePodDocEntry(withFile);
-  });
-
-  const seen = new Set();
-  documents = documents.filter((doc) => {
-    const key = [
-      doc.attachmentFilename,
-      String(doc.page || ""),
-      doc.source,
-    ].join("|");
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return Boolean(doc.source);
-  });
-
-  documents.sort(
-      (a, b) => (Number(a.page) || 0) - (Number(b.page) || 0),
-  );
-
+  documents = normalizeDocumentEntries(documents, fallbackFilename);
+  documents = documents.filter((doc) => isPodPackageSource(doc.source));
   documents = enrichPodDocumentsWithTrailingPages(
-      documents,
-      pageCount,
-      fallbackFilename,
-  );
+      documents, pageCount, fallbackFilename);
 
-  const primarySigned = documents.find((d) =>
-    d.source === "signed_bol" || d.source === "signed_load" ||
-    d.source === "signed_pod");
-  const primary = primarySigned || documents[0];
+  const primary = documents.find((d) =>
+    d.source === "signed_load" || d.source === "delivery_receipt" ||
+    d.source === "signed_pod" || d.source === "signed_bol") ||
+    documents[0];
 
   return {
     ...normalized,
+    found: documents.length > 0,
     documents,
     source: (primary && primary.source) || normalized.source || "",
     page: (primary && primary.page) || normalized.page || "",
@@ -2733,8 +2762,28 @@ function normalizePodData(pod, options = {}) {
 }
 
 /**
- * Adds non-invoice pages not listed by the classifier (e.g. unsigned POD form
- * before a signed BOL on the next page).
+ * Merges pod + bol AI blocks into one POD package (user preference).
+ * @param {object} aiResult AI classification result.
+ * @return {object|null}
+ */
+function normalizePodFromClassification(aiResult) {
+  const pod = (aiResult && aiResult.pod) || {};
+  const bol = (aiResult && aiResult.bol) || {};
+  const filename = pod.attachmentFilename || bol.attachmentFilename || "";
+  const docs = [
+    ...(Array.isArray(pod.documents) ? pod.documents.filter(Boolean) : []),
+    ...(Array.isArray(bol.documents) ? bol.documents.filter(Boolean) : []),
+  ];
+  return normalizePodData({
+    ...pod,
+    found: Boolean(pod.found) || docs.length > 0,
+    documents: docs.length > 0 ? docs : pod.documents,
+    attachmentFilename: filename,
+  });
+}
+
+/**
+ * Adds post-invoice pages not listed by the classifier.
  * @param {Array<object>} documents POD document entries.
  * @param {number|null} pageCount Total PDF page count when known.
  * @param {string} attachmentFilename Attachment filename.
@@ -2783,7 +2832,8 @@ function coercePodDocuments(pod, options = {}) {
   if (!normalized || normalized.found !== true) {
     return [];
   }
-  return Array.isArray(normalized.documents) ? normalized.documents : [];
+  return (normalized.documents || [])
+      .filter((doc) => isPodPackageSource(doc.source));
 }
 
 /**
@@ -2837,6 +2887,7 @@ async function extractPodDocumentPdfBytes(loadedDoc, doc) {
     "signed_bol",
     "signed_load",
     "signed_pod",
+    "delivery_receipt",
     "unsigned_pod_template",
   ]);
   if (fullPageSources.has(source)) {
@@ -3458,7 +3509,7 @@ async function processGmailMessage(
     }
 
     const normalizedChargeData = normalizeAiChargeArrays(aiResult);
-    const normalizedPod = normalizePodData(aiResult.pod);
+    const normalizedPod = normalizePodFromClassification(aiResult);
 
     await writeLog("info", "ai", "AI classification completed", {
       event: "AI classification completed",

@@ -53,7 +53,9 @@ function init(bundle) {
   ({
     db, writeLog, logWorkflowStep, setWorkflowHeartbeat, pauseWorkflow,
     saveOutboundEmail, buildContinueButtonHtml, escapeHtml,
-    maybeExtractPodOnlyPdf, isAlreadyDoneResult, downloadStorageFileBase64,
+    maybeExtractPodOnlyPdf,
+    isAlreadyDoneResult,
+    downloadStorageFileBase64,
     buildCustomerInvoicePdfBase64, primusRequest, getPrimusToken,
     fetchPrimusBooking, validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
