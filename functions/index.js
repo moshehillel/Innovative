@@ -1981,20 +1981,41 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Any other added charge is unrecognized_charges.",
         "If attachment is not a freight invoice, status is error.",
         "Detect Proof of Delivery (POD) documents.",
-        "POD may be a separate attachment, on the last page of the invoice, " +
-        "or in the bottom section of the same page as the invoice.",
+        "POD may be a separate attachment, a full signed Bill of Lading " +
+        "(BOL) / delivery receipt page, an unsigned POD/delivery receipt " +
+        "form template, the last page of the invoice PDF, or a small POD " +
+        "section at the bottom of an invoice page.",
         "Look for signed Bill of Lading, delivery receipt, or POD " +
-        "confirmation.",
-        "POD should have signatures, delivery dates, or Received stamps.",
-        "If POD content (signature, stamp, Received mark, or delivery " +
-        "confirmation) appears in the bottom section of an invoice page " +
-        "rather than on its own page, set pod.source to " +
-        "'same_page_as_invoice', pod.attachmentFilename to that file, " +
-        "pod.page to the 1-based page number, and pod.cropFromBottom to " +
-        "the estimated fraction of the page height from the bottom that " +
-        "contains the POD content (e.g. 0.35 means the bottom 35%). " +
-        "Only use when the POD is clearly in the bottom portion of an " +
-        "invoice page.",
+        "confirmation (signatures, delivery dates, Received stamps).",
+        "When a multi-page PDF contains BOTH an unsigned POD/delivery " +
+        "receipt form template AND a signed BOL or signed delivery " +
+        "confirmation, include BOTH in pod.documents (page order). Use " +
+        "source 'unsigned_pod_template' for blank unsigned forms and " +
+        "'signed_bol' or 'signed_load' for signed pages.",
+        "pod.documents is an array of {source, page, attachmentFilename, " +
+        "reason}. List every POD-related page after the invoice — not only " +
+        "the signed one. When only one POD page exists, use one entry.",
+        "When the POD is a signed BOL or signed load document — even if " +
+        "it arrived in the same PDF as the carrier invoice — treat the " +
+        "entire page as POD. Use pod.source 'signed_bol' for Bill of " +
+        "Lading / delivery receipt, or 'signed_load' when the page is " +
+        "primarily a signed load confirmation. Both mean full-page " +
+        "extract (1-based page number). Do NOT crop.",
+        "Use source 'unsigned_pod_template' for blank unsigned POD or " +
+        "delivery receipt forms (full page, 1-based page number).",
+        "When POD is its own file in the email, use source " +
+        "'separate_attachment'.",
+        "When POD is the last page of a multi-page invoice PDF, use source " +
+        "'last_page_of_invoice'.",
+        "Use source 'same_page_as_invoice' ONLY when the carrier invoice " +
+        "header/line items occupy the top of the page and a small POD " +
+        "block (signature/stamp only) is clearly in the bottom portion. " +
+        "Set pod.cropFromBottom to the fraction of page height from the " +
+        "bottom containing POD (e.g. 0.35 = bottom 35%). Never use crop " +
+        "when the page is primarily a signed BOL or delivery receipt.",
+        "If unsure between crop and full page, prefer full page " +
+        "(signed_bol or unsigned_pod_template) so the customer receives " +
+        "the complete document.",
       ],
       requiredJsonShape: {
         status: "ready_for_primus_validation",
@@ -2014,6 +2035,14 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         chargeProofRefs: [{type: "lumper", amount: 0, attachmentFilename: ""}],
         pod: {
           found: false,
+          documents: [
+            {
+              source: "",
+              page: "",
+              attachmentFilename: "",
+              reason: "",
+            },
+          ],
           source: "",
           attachmentFilename: "",
           page: "",
@@ -2317,139 +2346,150 @@ async function pauseWorkflow(
 }
 
 /**
- * Extracts POD-only PDF from invoice attachments.
+ * Extracts POD-only PDF(s) from invoice attachments.
+ * Multiple POD pages are saved individually and merged into pod.pdf.
  * @param {string} invoiceId - The invoice ID.
  * @param {object} invoice - The invoice document.
  * @return {Promise<object|null>} POD file info or null.
  */
 async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
   try {
-    if (!invoice || !invoice.pod || invoice.pod.found !== true) {
+    const rawPod = invoice && invoice.pod;
+    const attachments = Array.isArray(invoice.attachments) ?
+      invoice.attachments : [];
+    let pageCountHint = 0;
+    const hintFilename = rawPod && rawPod.attachmentFilename;
+    const firstAtt = attachments.find(
+        (a) => a && a.filename === hintFilename,
+    ) || attachments.find((a) => a && a.storagePath);
+    if (firstAtt && firstAtt.storagePath) {
+      try {
+        const [fileBuffer] = await getBucket()
+            .file(firstAtt.storagePath).download();
+        const loaded = await PDFDocument.load(fileBuffer);
+        pageCountHint = loaded.getPageCount();
+      } catch (_) {
+        // page count enrichment is best-effort
+      }
+    }
+    const podNormalized = normalizePodData(rawPod, {pageCount: pageCountHint});
+    const documents = coercePodDocuments(rawPod, {pageCount: pageCountHint});
+    if (!invoice || !podNormalized || podNormalized.found !== true ||
+        documents.length === 0) {
       await writeLog("info", "workflow",
           "POD not detected in this invoice — no extraction attempted", {
             invoiceId,
             loadNumber: invoice && invoice.loadNumber,
-            podFound: invoice && invoice.pod && invoice.pod.found,
-            podSource: invoice && invoice.pod && invoice.pod.source,
-            podReason: invoice && invoice.pod && invoice.pod.reason,
+            podFound: podNormalized && podNormalized.found,
+            podSource: podNormalized && podNormalized.source,
+            podDocumentCount: documents.length,
+            podReason: podNormalized && podNormalized.reason,
           });
       return null;
     }
 
-    const attachments = Array.isArray(invoice.attachments) ?
-      invoice.attachments : [];
-    const podAtt = attachments.find(
-        (a) => a && a.filename === invoice.pod.attachmentFilename,
-    );
-
-    if (!podAtt || !podAtt.storagePath) {
-      await writeLog("warn", "workflow",
-          "POD was detected by AI but attachment file not found in storage", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            expectedFilename: invoice.pod.attachmentFilename,
-            availableFilenames: attachments.map((a) => a && a.filename),
-          });
-      return null;
-    }
-
-    if (invoice.pod.source === "separate_attachment") {
+    if (documents.length === 1 &&
+        documents[0].source === "separate_attachment") {
+      const podAtt = attachments.find(
+          (a) => a && a.filename === documents[0].attachmentFilename,
+      );
+      if (!podAtt || !podAtt.storagePath) {
+        return null;
+      }
+      const fileInfo = {
+        storagePath: podAtt.storagePath,
+        source: "separate_attachment",
+        page: null,
+      };
       return {
         storagePath: podAtt.storagePath,
         source: "separate_attachment",
+        files: [fileInfo],
       };
     }
 
-    if (invoice.pod.source === "attachment") {
-      // POD is embedded in invoice PDF at specific page
-      const [fileBuffer] = await getBucket()
-          .file(podAtt.storagePath).download();
-      const doc = await PDFDocument.load(fileBuffer);
-      const pageCount = doc.getPageCount();
+    const files = [];
+    const mergedDoc = await PDFDocument.create();
+    const bufferCache = new Map();
 
-      const podPage = Number(invoice.pod.page) || pageCount;
-      if (podPage < 1 || podPage > pageCount) {
-        return null;
+    for (let i = 0; i < documents.length; i++) {
+      const doc = documents[i];
+      const podAtt = attachments.find(
+          (a) => a && a.filename === doc.attachmentFilename,
+      );
+      if (!podAtt || !podAtt.storagePath) {
+        await writeLog("warn", "workflow",
+            "POD document entry missing attachment in storage", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              expectedFilename: doc.attachmentFilename,
+              podSource: doc.source,
+              podPage: doc.page,
+            });
+        continue;
       }
 
-      const newDoc = await PDFDocument.create();
-      const [page] = await newDoc.copyPages(doc, [podPage - 1]);
-      newDoc.addPage(page);
+      if (!bufferCache.has(podAtt.storagePath)) {
+        const [fileBuffer] = await getBucket()
+            .file(podAtt.storagePath).download();
+        bufferCache.set(podAtt.storagePath, fileBuffer);
+      }
+      const fileBuffer = bufferCache.get(podAtt.storagePath);
+      const loadedDoc = await PDFDocument.load(fileBuffer);
+      const pdfBytes = await extractPodDocumentPdfBytes(loadedDoc, doc);
+      if (!pdfBytes) {
+        continue;
+      }
 
-      const pdfBytes = await newDoc.save();
-      const storagePath = `podOnly/${invoiceId}/pod.pdf`;
+      const pageLabel = doc.page ? `p${doc.page}` : `part${i + 1}`;
+      const partName = `pod-${pageLabel}-${doc.source || "page"}.pdf`
+          .replace(/[^a-zA-Z0-9._-]/g, "-");
+      const storagePath = await savePodPdfBytes(
+          invoiceId, partName, pdfBytes);
 
-      await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
-        metadata: {
-          contentType: "application/pdf",
-        },
-      });
-
-      return {
+      files.push({
         storagePath,
-        source: "attachment",
-      };
-    }
-
-    if (invoice.pod.source === "same_page_as_invoice") {
-      const cropFromBottom = Math.min(
-          Math.max(Number(invoice.pod.cropFromBottom || 0.5), 0.1),
-          0.9,
-      );
-      const pageNum = Number(invoice.pod.page) || 1;
-
-      const [fileBuffer] = await getBucket()
-          .file(podAtt.storagePath).download();
-      const doc = await PDFDocument.load(fileBuffer);
-      const pageCount = doc.getPageCount();
-
-      const pageIndex = Math.max(0, Math.min(pageNum - 1, pageCount - 1));
-
-      const newDoc = await PDFDocument.create();
-      const [copiedPage] = await newDoc.copyPages(doc, [pageIndex]);
-      newDoc.addPage(copiedPage);
-
-      const {width, height} = copiedPage.getSize();
-      copiedPage.setCropBox(0, 0, width, height * cropFromBottom);
-
-      const pdfBytes = await newDoc.save();
-      const storagePath = `podOnly/${invoiceId}/pod.pdf`;
-
-      await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
-        metadata: {contentType: "application/pdf"},
+        source: doc.source,
+        page: doc.page != null && doc.page !== "" ?
+          Number(doc.page) : null,
       });
 
-      return {storagePath, source: "same_page_as_invoice"};
+      const partDoc = await PDFDocument.load(pdfBytes);
+      const partPages = partDoc.getPageIndices();
+      const copied = await mergedDoc.copyPages(partDoc, partPages);
+      for (const page of copied) {
+        mergedDoc.addPage(page);
+      }
     }
 
-    if (invoice.pod.source !== "last_page_of_invoice") {
+    if (files.length === 0) {
+      await writeLog("warn", "workflow",
+          "POD was detected but no pages could be extracted", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            podDocumentCount: documents.length,
+          });
       return null;
     }
 
-    const [fileBuffer] = await getBucket().file(podAtt.storagePath).download();
-    const doc = await PDFDocument.load(fileBuffer);
-    const pageCount = doc.getPageCount();
-
-    if (pageCount < 1) {
-      return null;
+    let combinedPath = files[0].storagePath;
+    if (files.length > 1) {
+      const combinedBytes = await mergedDoc.save();
+      combinedPath = await savePodPdfBytes(invoiceId, "pod.pdf", combinedBytes);
     }
 
-    const newDoc = await PDFDocument.create();
-    const [lastPage] = await newDoc.copyPages(doc, [pageCount - 1]);
-    newDoc.addPage(lastPage);
-
-    const pdfBytes = await newDoc.save();
-    const storagePath = `podOnly/${invoiceId}/pod.pdf`;
-
-    await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
-      metadata: {
-        contentType: "application/pdf",
-      },
+    await writeLog("info", "workflow", "POD extraction completed", {
+      invoiceId,
+      loadNumber: invoice.loadNumber,
+      podPageCount: files.length,
+      podSources: files.map((f) => f.source),
+      combinedStoragePath: combinedPath,
     });
 
     return {
-      storagePath,
-      source: "last_page_of_invoice",
+      storagePath: combinedPath,
+      source: files.length > 1 ? "multi" : files[0].source,
+      files,
     };
   } catch (error) {
     await writeLog("error", "storage", "POD extraction failed", {
@@ -2548,6 +2588,265 @@ function normalizeAiChargeArrays(aiResult) {
     chargesNeedProof,
     chargeProofRefs,
   };
+}
+
+const FULL_PAGE_POD_KEYWORDS =
+  /\b(signed|signature|bol|bill of lading|delivery receipt|received|consignee|driver|signed load|load document|pod)\b/i;
+
+const FULL_PAGE_POD_SOURCES = new Set([
+  "separate_attachment",
+  "attachment",
+  "signed_bol",
+  "signed_load",
+  "signed_pod",
+  "unsigned_pod_template",
+  "last_page_of_invoice",
+]);
+
+/**
+ * Upgrades risky POD crop on a single document entry.
+ * @param {object} doc POD document entry.
+ * @return {object}
+ */
+function normalizePodDocEntry(doc) {
+  if (!doc) return doc;
+
+  const source = String(doc.source || "").trim();
+  const reason = String(doc.reason || "").trim();
+  const filename = String(doc.attachmentFilename || "").trim();
+  const context = `${reason} ${filename}`.toLowerCase();
+
+  if (FULL_PAGE_POD_SOURCES.has(source)) {
+    return doc;
+  }
+
+  if (source === "same_page_as_invoice") {
+    const crop = Number(doc.cropFromBottom || 0);
+    const looksSigned = FULL_PAGE_POD_KEYWORDS.test(context);
+    const largeCrop = crop >= 0.45;
+
+    if (looksSigned || largeCrop) {
+      const upgraded = /\b(signed load|load document|load confirmation)\b/i
+          .test(context) ? "signed_load" : "signed_bol";
+      const upgradeNote =
+        `[upgraded ${source} → ${upgraded}: full signed page preferred]`;
+      return {
+        ...doc,
+        source: upgraded,
+        cropFromBottom: 0,
+        reason: reason ? `${reason} ${upgradeNote}` : upgradeNote.trim(),
+      };
+    }
+  }
+
+  if (!source && doc.attachmentFilename) {
+    return {...doc, source: "signed_bol"};
+  }
+
+  return doc;
+}
+
+/**
+ * Upgrades risky POD crop classifications to full-page signed doc sources.
+ * @param {object|null} pod POD block from AI classification.
+ * @return {object|null}
+ */
+function normalizePodClassification(pod) {
+  if (!pod || pod.found !== true) {
+    return pod;
+  }
+  return normalizePodDocEntry(pod);
+}
+
+/**
+ * Normalizes POD block and builds pod.documents from legacy single-page fields.
+ * @param {object|null} pod POD block from AI classification.
+ * @return {object|null}
+ */
+function normalizePodData(pod, options = {}) {
+  if (!pod || pod.found !== true) {
+    return pod;
+  }
+
+  let normalized = normalizePodClassification(pod);
+  const fallbackFilename = normalized.attachmentFilename || "";
+  const pageCount = Number(options.pageCount || normalized.pageCount || 0);
+
+  let documents = Array.isArray(normalized.documents) ?
+    normalized.documents.filter(Boolean) : [];
+  if (documents.length === 0 &&
+      (normalized.source || normalized.page || normalized.attachmentFilename)) {
+    documents = [{
+      source: normalized.source,
+      page: normalized.page,
+      attachmentFilename: fallbackFilename,
+      cropFromBottom: normalized.cropFromBottom,
+      reason: normalized.reason,
+    }];
+  }
+
+  documents = documents.map((doc) => {
+    const withFile = {
+      ...doc,
+      attachmentFilename: doc.attachmentFilename || fallbackFilename,
+    };
+    return normalizePodDocEntry(withFile);
+  });
+
+  const seen = new Set();
+  documents = documents.filter((doc) => {
+    const key = [
+      doc.attachmentFilename,
+      String(doc.page || ""),
+      doc.source,
+    ].join("|");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return Boolean(doc.source);
+  });
+
+  documents.sort(
+      (a, b) => (Number(a.page) || 0) - (Number(b.page) || 0),
+  );
+
+  documents = enrichPodDocumentsWithTrailingPages(
+      documents,
+      pageCount,
+      fallbackFilename,
+  );
+
+  const primarySigned = documents.find((d) =>
+    d.source === "signed_bol" || d.source === "signed_load" ||
+    d.source === "signed_pod");
+  const primary = primarySigned || documents[0];
+
+  return {
+    ...normalized,
+    documents,
+    source: (primary && primary.source) || normalized.source || "",
+    page: (primary && primary.page) || normalized.page || "",
+    attachmentFilename: fallbackFilename ||
+      (primary && primary.attachmentFilename) || "",
+  };
+}
+
+/**
+ * Adds non-invoice pages not listed by the classifier (e.g. unsigned POD form
+ * before a signed BOL on the next page).
+ * @param {Array<object>} documents POD document entries.
+ * @param {number|null} pageCount Total PDF page count when known.
+ * @param {string} attachmentFilename Attachment filename.
+ * @return {Array<object>}
+ */
+function enrichPodDocumentsWithTrailingPages(
+    documents,
+    pageCount,
+    attachmentFilename,
+) {
+  const totalPages = Number(pageCount);
+  if (!Number.isFinite(totalPages) || totalPages <= 1) {
+    return documents;
+  }
+
+  const listed = new Set(
+      documents.map((d) => Number(d.page)).filter((p) => p > 0),
+  );
+  const enriched = [...documents];
+
+  for (let page = 2; page <= totalPages; page++) {
+    if (listed.has(page)) continue;
+    enriched.push({
+      source: "unsigned_pod_template",
+      page,
+      attachmentFilename,
+      reason: "[auto-included] POD page after invoice",
+    });
+    listed.add(page);
+  }
+
+  return enriched.sort(
+      (a, b) => (Number(a.page) || 0) - (Number(b.page) || 0),
+  );
+}
+
+/**
+ * Returns normalized POD document entries to extract.
+ * @param {object|null} pod POD block.
+ * @return {Array<object>}
+ */
+function coercePodDocuments(pod, options = {}) {
+  const normalized = normalizePodData(pod, options);
+  if (!normalized || normalized.found !== true) {
+    return [];
+  }
+  return Array.isArray(normalized.documents) ? normalized.documents : [];
+}
+
+/**
+ * Saves POD PDF bytes to Storage.
+ * @param {string} invoiceId Invoice id.
+ * @param {string} filename File name under podOnly/{invoiceId}/.
+ * @param {Uint8Array} pdfBytes PDF bytes.
+ * @return {Promise<string>} Storage path.
+ */
+async function savePodPdfBytes(invoiceId, filename, pdfBytes) {
+  const storagePath = `podOnly/${invoiceId}/${filename}`;
+  await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
+    metadata: {contentType: "application/pdf"},
+  });
+  return storagePath;
+}
+
+/**
+ * Extracts one POD document entry into a single-page PDF.
+ * @param {object} loadedDoc Loaded PDF document.
+ * @param {object} doc POD document entry.
+ * @return {Promise<Uint8Array|null>} PDF bytes or null.
+ */
+async function extractPodDocumentPdfBytes(loadedDoc, doc) {
+  const source = String(doc.source || "").trim();
+  const pageCount = loadedDoc.getPageCount();
+
+  if (source === "same_page_as_invoice") {
+    const cropFromBottom = Math.min(
+        Math.max(Number(doc.cropFromBottom || 0.5), 0.1), 0.9);
+    const pageNum = Number(doc.page) || 1;
+    const pageIndex = Math.max(0, Math.min(pageNum - 1, pageCount - 1));
+    const newDoc = await PDFDocument.create();
+    const [copiedPage] = await newDoc.copyPages(loadedDoc, [pageIndex]);
+    newDoc.addPage(copiedPage);
+    const {width, height} = copiedPage.getSize();
+    copiedPage.setCropBox(0, 0, width, height * cropFromBottom);
+    return newDoc.save();
+  }
+
+  if (source === "last_page_of_invoice") {
+    if (pageCount < 1) return null;
+    const newDoc = await PDFDocument.create();
+    const [lastPage] = await newDoc.copyPages(loadedDoc, [pageCount - 1]);
+    newDoc.addPage(lastPage);
+    return newDoc.save();
+  }
+
+  const fullPageSources = new Set([
+    "attachment",
+    "signed_bol",
+    "signed_load",
+    "signed_pod",
+    "unsigned_pod_template",
+  ]);
+  if (fullPageSources.has(source)) {
+    const podPage = Number(doc.page) || pageCount;
+    if (podPage < 1 || podPage > pageCount) {
+      return null;
+    }
+    const newDoc = await PDFDocument.create();
+    const [page] = await newDoc.copyPages(loadedDoc, [podPage - 1]);
+    newDoc.addPage(page);
+    return newDoc.save();
+  }
+
+  return null;
 }
 
 /**
@@ -3155,6 +3454,7 @@ async function processGmailMessage(
     }
 
     const normalizedChargeData = normalizeAiChargeArrays(aiResult);
+    const normalizedPod = normalizePodData(aiResult.pod);
 
     await writeLog("info", "ai", "AI classification completed", {
       event: "AI classification completed",
@@ -3167,7 +3467,7 @@ async function processGmailMessage(
         loadNumber: aiResult.loadNumber,
         charges: aiResult.charges,
         chargesCount: aiResult.charges ? aiResult.charges.length : 0,
-        pod: aiResult.pod,
+        pod: normalizedPod,
         unrecognizedCharges: normalizedChargeData.unrecognizedCharges,
         chargesNeedProof: normalizedChargeData.chargesNeedProof,
         attachments: storedAttachments.map((a) => ({
@@ -3681,7 +3981,7 @@ async function processGmailMessage(
         chargeProofRefs: normalizedChargeData.chargeProofRefs,
         approvedChargeProofFiles: [],
         attachments: invoiceAttachments,
-        pod: aiResult.pod || {
+        pod: normalizedPod || {
           found: false,
           source: "",
           attachmentFilename: "",

@@ -285,7 +285,11 @@ exports.processPrimusWorkflow = onRequest(
           stepName: "pod_extraction_completed",
           stepStatus: extractedPodOnlyFile ? "success" : "failed",
           output: extractedPodOnlyFile ?
-        {storagePath: extractedPodOnlyFile.storagePath} : null,
+        {
+          storagePath: extractedPodOnlyFile.storagePath,
+          fileCount: (extractedPodOnlyFile.files || []).length,
+          files: extractedPodOnlyFile.files || [],
+        } : null,
           error: extractedPodOnlyFile ? null : "POD extraction returned null",
         });
 
@@ -295,6 +299,10 @@ exports.processPrimusWorkflow = onRequest(
               storagePath: extractedPodOnlyFile.storagePath,
               source: extractedPodOnlyFile.source,
             },
+            podOnlyFiles: extractedPodOnlyFile.files || [{
+              storagePath: extractedPodOnlyFile.storagePath,
+              source: extractedPodOnlyFile.source,
+            }],
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
         }
