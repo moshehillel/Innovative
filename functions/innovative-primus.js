@@ -41,6 +41,8 @@ let generateCustomerInvoice;
 let markShipmentDelivered;
 let forwardToHumanReview;
 let getGmailOAuthClient;
+let isManagePhpEnabled;
+let runPrimusUiBillingFlow;
 
 /**
  * Receives the shared + Primus helper bundle from index.js.
@@ -56,9 +58,28 @@ function init(bundle) {
     fetchPrimusBooking, validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
     markShipmentDelivered, forwardToHumanReview, getGmailOAuthClient,
+    isManagePhpEnabled, runPrimusUiBillingFlow,
   } = bundle);
 }
 exports.init = init;
+
+/**
+ * Downloads a Primus document URL (self-authenticating); returns base64 PDF.
+ * @param {string} url Document URL from GET /document/bolnumber.
+ * @return {Promise<string|null>}
+ */
+async function downloadPrimusDocumentPdf(url) {
+  if (!url) return null;
+  try {
+    const pdfResp = await fetch(url);
+    if (!pdfResp.ok) return null;
+    const buf = Buffer.from(await pdfResp.arrayBuffer());
+    if (buf.slice(0, 5).toString("latin1") !== "%PDF-") return null;
+    return buf.toString("base64");
+  } catch (_) {
+    return null;
+  }
+}
 
 exports.processPrimusWorkflow = onRequest(
     {timeoutSeconds: 300, memory: "512MiB"},
@@ -164,6 +185,9 @@ exports.processPrimusWorkflow = onRequest(
           customerRateChecked: false,
           billApproved: false,
           customerInvoiceGenerated: false,
+          uiInvoiceIssued: false,
+          carrierBillUploaded: false,
+          podUploaded: false,
         };
 
         const currentStep = resumeFrom || null;
@@ -961,9 +985,221 @@ exports.processPrimusWorkflow = onRequest(
           null,
         };
 
-        // Check if customer invoice already exists
+        // Customer invoice: REST draft-only, or full UI bridge when enabled.
         let invoiceGenerationResult = null;
-        if (invoice.customerInvoiceId) {
+        const useUiBridge = isManagePhpEnabled && isManagePhpEnabled();
+
+        if (useUiBridge) {
+          if (primusSteps.uiInvoiceIssued) {
+            await writeLog(
+                "info", "workflow", "UI invoice already issued — skipped", {
+                  invoiceId,
+                  customerInvoiceId: invoice.customerInvoiceId,
+                });
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "customer_invoice_generation_completed",
+              stepStatus: "skipped",
+              reason: "UI invoice already issued",
+              output: {customerInvoiceId: invoice.customerInvoiceId},
+            });
+            invoiceGenerationResult = {
+              ok: true,
+              customerInvoiceId: invoice.customerInvoiceId,
+              generated: true,
+              reused: true,
+              invoiceTotal: customerRate,
+            };
+            primusSteps.customerInvoiceGenerated = true;
+            await invoiceDoc.ref.update({
+              primusSteps,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await setWorkflowHeartbeat(
+                invoiceDoc.ref, "customer_invoice_exists");
+          } else {
+            let uiResult;
+            try {
+              const bk = await fetchPrimusBooking(invoice.loadNumber);
+              const attList = Array.isArray(invoice.attachments) ?
+                invoice.attachments : [];
+              const carrierAtt = attList.find((a) => a && a.storagePath) ||
+                null;
+              const podPath =
+                (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+                (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+                null;
+              let carrierBillPdf = null;
+              let podPdf = null;
+              if (carrierAtt && carrierAtt.storagePath) {
+                const b64 = await downloadStorageFileBase64(
+                    carrierAtt.storagePath);
+                if (b64) {
+                  carrierBillPdf = {
+                    buffer: Buffer.from(b64, "base64"),
+                    filename: carrierAtt.filename ||
+                      `carrier-bill-${invoice.loadNumber}.pdf`,
+                  };
+                }
+              }
+              if (podPath) {
+                const podB64 = await downloadStorageFileBase64(podPath);
+                if (podB64) {
+                  podPdf = {
+                    buffer: Buffer.from(podB64, "base64"),
+                    filename: `pod-${invoice.loadNumber}.pdf`,
+                  };
+                }
+              }
+              uiResult = await runPrimusUiBillingFlow({
+                booking: bk,
+                loadNumber: invoice.loadNumber,
+                customerRate,
+                carrierInvoiceAmount: invoice.invoiceAmount,
+                proNumber: workingProNumber || invoice.proNumber,
+                vendorInvoiceNumber: invoice.carrierInvoiceNumber ||
+                  workingProNumber || invoice.proNumber,
+                billDate: invoice.invoiceDate || invoice.receivedAt,
+                billDueDate: invoice.dueDate,
+                customerInvoiceId: invoice.customerInvoiceId || null,
+                generated: false,
+                carrierBillPdf,
+                podPdf,
+                skipCarrierBillUpload: primusSteps.carrierBillUploaded,
+                skipPodUpload: primusSteps.podUploaded,
+              });
+            } catch (uiErr) {
+              uiResult = {ok: false, error: uiErr.message};
+            }
+
+            const uiOk = uiResult.ok ||
+              (uiResult.skipped && uiResult.reason === "already issued");
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "customer_invoice_generation_completed",
+              stepStatus: uiOk ? "success" :
+                (uiResult.skipped ? "skipped" : "failed"),
+              output: uiOk ? {
+                customerInvoiceId: uiResult.customerInvoiceId ||
+                  invoice.customerInvoiceId,
+                invoiceNumber: uiResult.invoiceNumber || null,
+                via: "manage.php",
+              } : null,
+              error: uiOk ? null :
+                (uiResult.error || "UI billing flow failed"),
+            });
+
+            invoiceGenerationResult = {
+              ok: uiOk,
+              customerInvoiceId: uiResult.customerInvoiceId ||
+                invoice.customerInvoiceId,
+              invoiceNumber: uiResult.invoiceNumber || null,
+              invoiceTotal: customerRate,
+              generated: !!(uiResult.issued || uiResult.generated),
+              reused: !!(uiResult.skipped &&
+                uiResult.reason === "already issued"),
+              error: uiResult.error || null,
+              step: uiResult.step || null,
+            };
+
+            if (!uiOk) {
+              await writeLog(
+                  "error",
+                  "workflow",
+                  "UI billing flow failed",
+                  {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    result: uiResult,
+                  },
+              );
+
+              await invoiceDoc.ref.update({
+                processingLock: false,
+                finalWorkflowStatus: "needs_invoice_review",
+                decisionStage: "invoice_generation_failed",
+                decisionReason: uiResult.error || "UI billing flow failed",
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+
+              const baseUrl = `https://${req.get("host")}`;
+              await saveOutboundEmail({
+                type: "invoice_generation_failed",
+                invoiceId,
+                subject: `Action needed — Invoice issue failed on Load` +
+                  ` ${invoice.loadNumber}`,
+                html:
+                  `<h2>ShipPrimus UI Billing Failed — Load ` +
+                  `${escapeHtml(invoice.loadNumber || "")}</h2>` +
+                  `<p>${escapeHtml(uiResult.error || "Unknown error")}</p>` +
+                  (uiResult.step ?
+                    `<p>Failed at step: <strong>` +
+                    `${escapeHtml(uiResult.step)}</strong></p>` : "") +
+                  `<table style="border-collapse:collapse;` +
+                  `font-size:13px;margin:12px 0;color:#555">` +
+                  `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
+                  `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+                  `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
+                  `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+                  `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
+                  `<td>${escapeHtml(customerName || "—")}</td></tr>` +
+                  `</table>` +
+                  `<p>Fix the issue in ShipPrimus, then click Resume.</p>` +
+                  `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
+                  `${encodeURIComponent(invoiceId)}" ` +
+                  `style="display:inline-block;padding:.6rem 1.25rem;` +
+                  `background:#4f46e5;color:#fff;border-radius:8px;` +
+                  `font-weight:600;text-decoration:none;margin-top:.5rem">` +
+                  `Resume Workflow</a>`,
+              });
+
+              return res.json({
+                ok: false,
+                error: "UI billing flow failed",
+                details: uiResult,
+              });
+            }
+
+            primusSteps.customerInvoiceGenerated = true;
+            primusSteps.uiInvoiceIssued = !!(uiResult.issued ||
+              (uiResult.skipped && uiResult.reason === "already issued"));
+            primusSteps.carrierBillUploaded = !!(
+              primusSteps.carrierBillUploaded ||
+              uiResult.carrierBillUploaded ||
+              (uiResult.carrierBillUpload &&
+                (uiResult.carrierBillUpload.uploaded ||
+                  uiResult.carrierBillUpload.skipped)));
+            primusSteps.podUploaded = !!(
+              primusSteps.podUploaded ||
+              uiResult.podUploaded ||
+              (uiResult.podUpload &&
+                (uiResult.podUpload.uploaded || uiResult.podUpload.skipped)));
+            await invoiceDoc.ref.update({
+              primusSteps,
+              customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            await writeLog("info", "workflow",
+                invoiceGenerationResult.reused ?
+                  "Customer invoice already issued in Primus — reused" :
+                  "Carrier bill entered and invoice issued via manage.php", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+                  invoiceNumber: invoiceGenerationResult.invoiceNumber || null,
+                  invoiceTotal: invoiceGenerationResult.invoiceTotal,
+                  generated: invoiceGenerationResult.generated,
+                  reused: invoiceGenerationResult.reused || false,
+                  carrierBillUploaded: primusSteps.carrierBillUploaded,
+                  podUploaded: primusSteps.podUploaded,
+                  uploadSteps: uiResult.steps || null,
+                });
+
+            await setWorkflowHeartbeat(
+                invoiceDoc.ref, "customer_invoice_generated");
+          }
+        } else if (invoice.customerInvoiceId) {
           await writeLog(
               "info", "workflow", "Customer invoice already exists", {
                 invoiceId: invoiceId,
@@ -1115,14 +1351,16 @@ exports.processPrimusWorkflow = onRequest(
         // "extra_charges_pending_review"), so finalCustomerInvoiceId only
         // ever reflects the base freight amount.
 
-        // Determine PDF source. Query the Primus document endpoint to get the
-        // real issued invoice URL — only present when the invoice has been
-        // issued/generated. This is more reliable than invoiceGenerationResult
-        // .invoicePdfUrl (which uses a hash that only works in the browser).
+        // Download customer invoice + POD from Primus document API, then email
+        // via connected Gmail. REST reads only — billing writes use manage.php
+        // when PRIMUS_USE_MANAGE_PHP=true.
         const primusGenerated =
             invoiceGenerationResult && invoiceGenerationResult.generated;
+        const uiIssued = !!primusSteps.uiInvoiceIssued;
         let primusInvoiceUrl = null;
+        let primusPodUrl = null;
         let customerInvoicePdfBase64 = null;
+        let podPdfBase64 = null;
         try {
           const docToken = await getPrimusToken();
           const docResp = await fetch(
@@ -1136,14 +1374,26 @@ exports.processPrimusWorkflow = onRequest(
           if (invDoc && invDoc.url) {
             primusInvoiceUrl = invDoc.url;
           }
+          const podDoc = allDocs.find((d) => {
+            const t = String(d.type || "").toUpperCase();
+            return t === "POD" || t.includes("POD");
+          });
+          if (podDoc && podDoc.url) {
+            primusPodUrl = podDoc.url;
+          }
         } catch (docErr) {
           await writeLog("warn", "primus",
-              "Could not fetch Primus document list; will use local PDF", {
+              "Could not fetch Primus document list", {
                 invoiceId,
                 loadNumber: invoice.loadNumber,
                 error: docErr.message,
               });
         }
+
+        const podStoragePath =
+      (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+      (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+      null;
 
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
@@ -1172,46 +1422,23 @@ exports.processPrimusWorkflow = onRequest(
           customerInvoiceId: finalCustomerInvoiceId,
           primusSteps,
           pdfSource: primusInvoiceUrl ? "primus" : "local",
+          podSource: primusPodUrl ? "primus" :
+            (podStoragePath ? "storage" : "none"),
         });
-
-        const podStoragePath =
-      (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
-      (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
-      null;
 
         const attachmentsToSend = [];
         if (primusInvoiceUrl) {
-          try {
-            // The document URL returned by /document/bolnumber/{n}?type=INV
-            // is self-authenticating (no auth header required).
-            const pdfResp = await fetch(primusInvoiceUrl);
-            if (pdfResp.ok) {
-              const buf = Buffer.from(await pdfResp.arrayBuffer());
-              // Only accept real PDFs (%PDF- magic bytes). The server can
-              // return HTTP 200 HTML for draft/not-found invoices.
-              if (buf.slice(0, 5).toString("latin1") === "%PDF-") {
-                customerInvoicePdfBase64 = buf.toString("base64");
-              } else {
-                await writeLog("warn", "primus",
-                    "Primus document URL did not return a valid PDF; " +
-                    "falling back to locally-built invoice", {
-                      invoiceId,
-                      loadNumber: invoice.loadNumber,
-                      primusInvoiceUrl,
-                      preview: buf.slice(0, 100).toString("latin1"),
-                    });
-              }
-            }
-          } catch (pdfErr) {
+          customerInvoicePdfBase64 =
+            await downloadPrimusDocumentPdf(primusInvoiceUrl);
+          if (!customerInvoicePdfBase64) {
             await writeLog("warn", "primus",
-                "Error downloading Primus invoice PDF; " +
-                "falling back to locally-built invoice", {
+                "Primus invoice URL did not return a valid PDF", {
                   invoiceId,
                   loadNumber: invoice.loadNumber,
-                  error: pdfErr.message,
+                  primusInvoiceUrl,
                 });
           }
-        } else if (!primusGenerated) {
+        } else if (!primusGenerated && !uiIssued) {
           await writeLog("info", "primus",
               "Primus invoice not yet issued (draft); " +
               "no INV document found via document API", {
@@ -1223,7 +1450,7 @@ exports.processPrimusWorkflow = onRequest(
                     (invoice.customerInvoiceId || null),
               });
         }
-        if (!customerInvoicePdfBase64) {
+        if (!customerInvoicePdfBase64 && !uiIssued && !primusGenerated) {
           customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
             invoiceId,
             loadNumber: invoice.loadNumber,
@@ -1240,29 +1467,60 @@ exports.processPrimusWorkflow = onRequest(
                   "Primus document URL did not return valid PDF" :
                   "No issued invoice document found in Primus",
               });
-        } else {
+        } else if (customerInvoicePdfBase64) {
           await writeLog("info", "workflow",
               "Using Primus-generated customer invoice PDF", {
                 invoiceId,
                 loadNumber: invoice.loadNumber,
                 primusInvoiceUrl,
               });
+        } else if (uiIssued || primusGenerated) {
+          await writeLog("warn", "workflow",
+              "Issued invoice but Primus PDF not available yet", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+              });
         }
 
-        attachmentsToSend.push({
-          filename: `customer-invoice-${invoiceId}.pdf`,
-          contentType: "application/pdf",
-          contentBase64: customerInvoicePdfBase64,
-        });
+        if (customerInvoicePdfBase64) {
+          attachmentsToSend.push({
+            filename: `customer-invoice-${invoiceId}.pdf`,
+            contentType: "application/pdf",
+            contentBase64: customerInvoicePdfBase64,
+          });
+        }
 
-        if (podStoragePath) {
+        if (primusPodUrl) {
+          podPdfBase64 = await downloadPrimusDocumentPdf(primusPodUrl);
+          if (podPdfBase64) {
+            attachmentsToSend.push({
+              filename: `pod-${invoice.loadNumber}.pdf`,
+              contentType: "application/pdf",
+              contentBase64: podPdfBase64,
+            });
+            await writeLog("info", "workflow",
+                "Using Primus POD document for email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  primusPodUrl,
+                });
+          }
+        }
+        if (!podPdfBase64 && podStoragePath) {
           const podBase64 = await downloadStorageFileBase64(podStoragePath);
           if (podBase64) {
+            podPdfBase64 = podBase64;
             attachmentsToSend.push({
               filename: `pod-${invoiceId}.pdf`,
               contentType: "application/pdf",
               contentBase64: podBase64,
             });
+            await writeLog("info", "workflow",
+                "Using extracted carrier-email POD for email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  podStoragePath,
+                });
           } else {
             await writeLog("warn", "workflow",
                 "POD file stored but could not be downloaded for email", {
@@ -1271,14 +1529,15 @@ exports.processPrimusWorkflow = onRequest(
                   podStoragePath,
                 });
           }
-        } else {
+        }
+        if (!podPdfBase64) {
           await writeLog("warn", "workflow",
-              "No POD attached to customer invoice email — " +
-              "POD was not found or not extracted", {
+              "No POD attached to customer invoice email", {
                 invoiceId,
                 loadNumber: invoice.loadNumber,
                 podFound: invoice.pod && invoice.pod.found,
                 podSource: invoice.pod && invoice.pod.source,
+                primusPodUrl: primusPodUrl || null,
               });
         }
 

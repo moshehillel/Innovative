@@ -1,4 +1,5 @@
 ﻿const {onRequest} = require("firebase-functions/v2/https");
+const {onSchedule} = require("firebase-functions/v2/scheduler");
 
 const admin = require("firebase-admin");
 const {google} = require("googleapis");
@@ -2065,7 +2066,10 @@ async function saveOutboundEmail(email) {
   // another client's mailbox.
   const tenant = (email && email.tenant) || currentTenant() || DEFAULT_TENANT;
   let sendResult = null;
-  const to = tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "";
+  // Customer invoice emails go to the bill-to party; ops alerts use alertEmail.
+  const to = (email.type === "generated_bill" && email.to) ?
+    email.to :
+    (tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "");
 
   if (to) {
     try {
@@ -3711,6 +3715,9 @@ async function processGmailMessage(
           customerRateChecked: false,
           billApproved: false,
           customerInvoiceGenerated: false,
+          uiInvoiceIssued: false,
+          carrierBillUploaded: false,
+          podUploaded: false,
         },
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -5352,9 +5359,28 @@ const primusBundle = {
   forwardToHumanReview,
   getGmailOAuthClient,
 };
+const primusUiBridge = require("./primus-ui-bridge");
+primusUiBridge.init({db, writeLog});
+
 const innovativePrimus = require("./innovative-primus");
-innovativePrimus.init(primusBundle);
+innovativePrimus.init({
+  ...primusBundle,
+  isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
+  runPrimusUiBillingFlow: primusUiBridge.runPrimusUiBillingFlow,
+});
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
+
+// Renew Primus manage.php PHPSESSID before the 24h cookie expires.
+exports.refreshPrimusUiSession = onSchedule(
+    {schedule: "every 12 hours", timeZone: "America/New_York"},
+    async () => {
+      const result = await primusUiBridge.renewUiSession();
+      if (result.skipped) return;
+      if (!result.ok) {
+        console.error("refreshPrimusUiSession failed:", result.error);
+      }
+    },
+);
 
 const tai = require("./tai");
 tai.init(sharedTmsBundle);
