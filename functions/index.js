@@ -2591,7 +2591,7 @@ function normalizeAiChargeArrays(aiResult) {
 }
 
 const FULL_PAGE_POD_KEYWORDS =
-  /\b(signed|signature|bol|bill of lading|delivery receipt|received|consignee|driver|signed load|load document|pod)\b/i;
+  /\b(signed|signature|bol|bill of lading|delivery receipt|received|consignee|driver|signed load|load document|pod)\b/i; // eslint-disable-line max-len
 
 const FULL_PAGE_POD_SOURCES = new Set([
   "separate_attachment",
@@ -2659,8 +2659,10 @@ function normalizePodClassification(pod) {
 }
 
 /**
- * Normalizes POD block and builds pod.documents from legacy single-page fields.
+ * Normalizes POD block and builds pod.documents from legacy fields.
  * @param {object|null} pod POD block from AI classification.
+ * @param {object} [options] Options.
+ * @param {number} [options.pageCount] PDF page count when known.
  * @return {object|null}
  */
 function normalizePodData(pod, options = {}) {
@@ -2668,7 +2670,7 @@ function normalizePodData(pod, options = {}) {
     return pod;
   }
 
-  let normalized = normalizePodClassification(pod);
+  const normalized = normalizePodClassification(pod);
   const fallbackFilename = normalized.attachmentFilename || "";
   const pageCount = Number(options.pageCount || normalized.pageCount || 0);
 
@@ -2772,6 +2774,8 @@ function enrichPodDocumentsWithTrailingPages(
 /**
  * Returns normalized POD document entries to extract.
  * @param {object|null} pod POD block.
+ * @param {object} [options] Options.
+ * @param {number} [options.pageCount] PDF page count when known.
  * @return {Array<object>}
  */
 function coercePodDocuments(pod, options = {}) {
