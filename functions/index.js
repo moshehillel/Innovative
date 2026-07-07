@@ -5722,6 +5722,7 @@ innovativePrimus.init({
   ...primusBundle,
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
   runPrimusUiBillingFlow: primusUiBridge.runPrimusUiBillingFlow,
+  emailBOLDocs: primusUiBridge.emailBOLDocs,
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
 

@@ -19,6 +19,8 @@
  *   PRIMUS_UI_UPLOAD_FILE_FIELD — multipart file field name (default file)
  *   PRIMUS_UI_SESSION_TTL_HOURS — PHPSESSID cache lifetime (default 24)
  *   PRIMUS_UI_SESSION_RENEW_BEFORE_HOURS — renew when this many hours remain
+ *   PRIMUS_UI_EMAIL_FROM — sender for emailBOLDocs (default accounting@…)
+ *   PRIMUS_UI_EMAIL_DOCS_BODY — HTML body for emailBOLDocs
  */
 
 "use strict";
@@ -542,6 +544,7 @@ function bookingHasFileType(docData, fileType) {
     docData.files,
     docData.documents,
     docData.driveFiles,
+    docData.drive,
     docData.data && docData.data.files,
     docData.data && docData.data.documents,
   ].filter(Array.isArray);
@@ -660,6 +663,325 @@ async function getBookingDocuments({bookingId, bookingBOL}) {
   return {ok: true, data: result.json};
 }
 exports.getBookingDocuments = getBookingDocuments;
+
+const DEFAULT_EMAIL_DOCS_BODY =
+  "<br><br><br>Hi,<br><br>Please see your invoices attached.<br><br>" +
+  "Thank you!<br>";
+
+/**
+ * @param {object} booking Primus booking from GET /book/bolnumber.
+ * @return {{quoteId: (string|number), customerQuoteId: (string|number)}}
+ */
+function resolveBookingQuoteIds(booking) {
+  const acct = booking.accountingInformation || {};
+  const customerQuoteId =
+    acct.customerQuoteId || booking.customerQuoteId || 0;
+  const quoteId =
+    booking.quoteId ||
+    booking.QMSQuoteId ||
+    booking.QMSQuoteID ||
+    acct.quoteId ||
+    booking.vendorQuoteId ||
+    customerQuoteId ||
+    0;
+  return {quoteId, customerQuoteId};
+}
+
+/**
+ * manage.php bookingId for this shipment only — differs from REST BOLId.
+ * Decoded per-booking from that load's BOLDocumentURL ?id= (base64).
+ * Never hardcode or reuse another load's id.
+ * @param {object} booking Primus booking from GET /book/bolnumber/{load}.
+ * @return {string} UI booking id for this shipment, or "" if not derivable.
+ */
+function resolveManageBookingId(booking) {
+  if (!booking) return "";
+  const url = booking.BOLDocumentURL || booking.documentURL || "";
+  const m = String(url).match(/[?&]id=([^&]+)/i);
+  if (!m) return "";
+  try {
+    const decoded = Buffer.from(
+        decodeURIComponent(m[1]), "base64").toString("utf8");
+    return /^\d+$/.test(decoded) ? decoded : "";
+  } catch (_) {
+    return "";
+  }
+}
+
+/**
+ * @param {object} docData getBookingDocuments JSON body.
+ * @return {Array<Array<object>>}
+ */
+function collectDocumentListArrays(docData) {
+  if (!docData || typeof docData !== "object") return [];
+  return [
+    docData.files,
+    docData.documents,
+    docData.driveFiles,
+    docData.drive,
+    docData.data && docData.data.files,
+    docData.data && docData.data.documents,
+    docData.data && docData.data.driveFiles,
+  ].filter(Array.isArray);
+}
+
+/**
+ * @param {object} file Single document row from getBookingDocuments.
+ * @return {string|null}
+ */
+function readDriveFileId(file) {
+  if (!file || typeof file !== "object") return null;
+  const id = file.driveId || file.driveFileId || file.googleDriveId ||
+    file.gDriveId || file.drive || file.fileId || file.id;
+  return id != null ? String(id) : null;
+}
+
+/**
+ * POD drive file ids from getBookingDocuments (by fileType or name).
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string|number} [podFileTypeId] POD fileType id from getFileTypes.
+ * @return {string[]}
+ */
+function listPodDriveFileIds(docData, podFileTypeId) {
+  const ids = [];
+  const podTypeId = podFileTypeId != null ? String(podFileTypeId) : null;
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      const driveId = readDriveFileId(f);
+      if (!driveId) continue;
+      const ft = f.fileType != null ? f.fileType :
+        (f.fileTypeId != null ? f.fileTypeId : f.type);
+      const name = String(
+          f.name || f.fileName || f.description || f.fileDescription || "",
+      ).toUpperCase();
+      const isPodType = podTypeId && String(ft) === podTypeId;
+      const nameLooksPod = /POD|PROOF OF DELIVERY/.test(name);
+      if (isPodType || nameLooksPod) {
+        ids.push(driveId);
+      }
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * Customer-visible drive file ids for emailBOLDocs attachments.
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {object} [opts] podFileTypeId — always include this file type.
+ * @return {string[]}
+ */
+function listCustomerDriveFileIds(docData, opts = {}) {
+  const ids = [];
+  const podTypeId = opts.podFileTypeId != null ?
+    String(opts.podFileTypeId) : null;
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      const driveId = readDriveFileId(f);
+      if (!driveId) continue;
+      const ft = f.fileType != null ? f.fileType :
+        (f.fileTypeId != null ? f.fileTypeId : f.type);
+      const isExternal = f.external === "1" || f.external === 1 ||
+        f.isExternal === true || f.isExternal === "1";
+      if (podTypeId && String(ft) === podTypeId) {
+        ids.push(driveId);
+        continue;
+      }
+      if (isExternal) {
+        ids.push(driveId);
+      }
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * @param {object} json Parsed manage.php JSON body.
+ * @return {boolean}
+ */
+function isEmailBOLDocsSuccess(json) {
+  if (!json || typeof json !== "object") return false;
+  const ok = json.success === true || json.success === "true";
+  return ok && /email has been sent/i.test(String(json.message || ""));
+}
+
+/**
+ * Resolves POD drive file ids for email-docs-drive-{id}=on checkboxes.
+ * @param {object} args booking, loadNumber, podPdf, extraDriveFileIds
+ * @return {Promise<{podDriveIds: string[]}>}
+ */
+async function resolvePodDriveIdsForEmail(args) {
+  const booking = args.booking;
+  const loadNumber = args.loadNumber;
+  const uploadFileTypes = await resolveUploadFileTypes();
+  const podFileTypeId = uploadFileTypes.pod.id;
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const fetchDocData = async () => {
+    const docs = await getBookingDocuments({
+      bookingId,
+      bookingBOL: loadNumber,
+    });
+    return docs.ok ? docs.data : null;
+  };
+
+  let docData = await fetchDocData();
+  let podDriveIds = docData ?
+    listPodDriveFileIds(docData, podFileTypeId) : [];
+
+  for (const id of args.extraDriveFileIds || []) {
+    if (id) podDriveIds.push(String(id));
+  }
+  podDriveIds = [...new Set(podDriveIds)];
+
+  const podOnBooking = docData &&
+    bookingHasFileType(docData, podFileTypeId);
+  const podPdf = args.podPdf;
+  const needsUpload = !podDriveIds.length &&
+    podPdf && podPdf.buffer && podPdf.buffer.length && !podOnBooking;
+
+  if (needsUpload) {
+    const up = await uploadDriveFile({
+      bookingId,
+      bookingBOL: loadNumber,
+      fileType: podFileTypeId,
+      fileBuffer: podPdf.buffer,
+      filename: podPdf.filename || `pod-${loadNumber}.pdf`,
+    });
+    if (up.ok && up.fileId) {
+      podDriveIds.push(String(up.fileId));
+    }
+    docData = await fetchDocData();
+    if (docData) {
+      podDriveIds = [...new Set([
+        ...podDriveIds,
+        ...listPodDriveFileIds(docData, podFileTypeId),
+      ])];
+    }
+  } else if (!podDriveIds.length && docData) {
+    podDriveIds = listPodDriveFileIds(docData, podFileTypeId);
+    if (!podDriveIds.length) {
+      podDriveIds = listCustomerDriveFileIds(docData, {podFileTypeId});
+    }
+  }
+
+  return {podDriveIds};
+}
+
+/**
+ * Sends invoice + BOL + drive docs to the customer via manage.php emailBOLDocs.
+ * Mirrors UI document checkboxes:
+ * email-docs-invoice-{id}, email-docs-drive-{id}.
+ * @param {object} args booking, loadNumber, customerEmail, customerInvoiceId,
+ *   invoiceNumber, chargesTotal, podPdf, extraDriveFileIds, subject
+ * @return {Promise<object>}
+ */
+async function emailBOLDocs(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, skipped: true, reason: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  const booking = args.booking;
+  if (!booking || !booking.BOLId) {
+    return {ok: false, error: "Booking missing BOLId"};
+  }
+  const customerEmail = args.customerEmail;
+  if (!customerEmail) {
+    return {ok: false, error: "No customer email"};
+  }
+  const customerInvoiceId = args.customerInvoiceId;
+  if (!customerInvoiceId) {
+    return {ok: false, error: "No customerInvoiceId"};
+  }
+  const loadNumber = args.loadNumber || booking.BOLNbr || booking.bolNumber;
+  if (!loadNumber) {
+    return {ok: false, error: "No load number"};
+  }
+
+  const {quoteId, customerQuoteId} = resolveBookingQuoteIds(booking);
+  const chargesTotal = args.chargesTotal != null ?
+    Number(args.chargesTotal).toFixed(2) : "0.00";
+  const invoiceNumber = args.invoiceNumber != null ?
+    String(args.invoiceNumber) : "0";
+
+  const {podDriveIds} = await resolvePodDriveIdsForEmail({
+    booking,
+    loadNumber,
+    podPdf: args.podPdf,
+    extraDriveFileIds: [
+      ...(args.extraDriveFileIds || []),
+      ...(Array.isArray(args.driveFileIds) ? args.driveFileIds : []),
+    ],
+  });
+
+  const driveFileIds = [...new Set(podDriveIds)];
+
+  const subject = args.subject ||
+    `Documents for BOL#${loadNumber}`;
+  const body = process.env.PRIMUS_UI_EMAIL_DOCS_BODY ||
+    DEFAULT_EMAIL_DOCS_BODY;
+  const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
+    "accounting@innovativecarriers.com";
+
+  const manageBookingId = resolveManageBookingId(booking);
+  if (!manageBookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const params = {
+    action: "emailBOLDocs",
+    bookingId: manageBookingId,
+    quoteId: String(quoteId || 0),
+    invoiceId: "0",
+    invoiceNumber: "0",
+    invoices: [{
+      id: String(customerInvoiceId),
+      invoiceNumber,
+      chargesTotal,
+    }],
+    customerQuoteId: String(customerQuoteId || 0),
+    fromApplet: "false",
+    consolidate: "true",
+    bookingCreateSingleFile: "false",
+    bookingBOL: String(loadNumber),
+  };
+  params["email-docs-from"] = fromAddr;
+  params["email-docs-to"] = customerEmail;
+  params["email-docs-subject"] = subject;
+  params["email-docs-body"] = body;
+  params["email-docs-bol"] = "on";
+  // UI checkbox: attach issued customer invoice
+  params[`email-docs-invoice-${customerInvoiceId}`] = "on";
+  // UI checkbox(es): attach POD / customer-visible drive file(s)
+  for (const driveId of driveFileIds) {
+    params[`email-docs-drive-${driveId}`] = "on";
+  }
+
+  const result = await managePhpPost(params);
+  const success = isEmailBOLDocsSuccess(result.json);
+  const attachments = {
+    invoiceSelected: true,
+    bolSelected: true,
+    podDriveIdsSelected: driveFileIds,
+    customerInvoiceId: String(customerInvoiceId),
+    invoiceNumber,
+  };
+  return {
+    ok: success,
+    json: result.json,
+    status: result.status,
+    driveFileIds,
+    attachments,
+    to: customerEmail,
+    error: success ? null :
+      ((result.json && result.json.message) ||
+        (result.json && result.json.error) ||
+        "emailBOLDocs failed"),
+    raw: !success ? (result.text || "").slice(0, 500) : undefined,
+  };
+}
+exports.emailBOLDocs = emailBOLDocs;
 
 /**
  * @param {object} json Parsed manage.php JSON body.
@@ -969,7 +1291,10 @@ async function runPrimusUiBillingFlow(args) {
   }
 
   const loadNumber = args.loadNumber ? String(args.loadNumber) : null;
-  const bookingId = String(booking.BOLId);
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
   let bookingDocData = null;
   if (loadNumber) {
     const docs = await getBookingDocuments({
@@ -1093,7 +1418,7 @@ async function runPrimusUiBillingFlow(args) {
     totalEstimatedCosts: totalEstimated,
     totalActualCosts: totalActual,
     billtoId: String(billtoId),
-    bookingId: String(booking.BOLId),
+    bookingId: bookingId,
     ...notes,
     costClosed: "0",
     costActualClosed: "1",
@@ -1156,7 +1481,7 @@ async function runPrimusUiBillingFlow(args) {
   const vendorRef = await managePhpPost({
     action: "addVendorRefNumber",
     invoiceId: String(uiInvoiceId),
-    bookingId: String(booking.BOLId),
+    bookingId: bookingId,
     billsInfo,
     actualCosts: actualCostsWithIds,
     actualProfitUSD: profit,
@@ -1186,7 +1511,7 @@ async function runPrimusUiBillingFlow(args) {
     totalEstimatedCosts: totalEstimated,
     totalActualCosts: totalActual,
     billtoId: String(billtoId),
-    bookingId: String(booking.BOLId),
+    bookingId: bookingId,
     ...notes,
     costClosed: "0",
     costActualClosed: "1",
@@ -1328,4 +1653,10 @@ exports._internal = {
   resolveBilltoId,
   buildBillsInfo,
   buildActualCosts,
+  resolveBookingQuoteIds,
+  resolveManageBookingId,
+  listCustomerDriveFileIds,
+  listPodDriveFileIds,
+  resolvePodDriveIdsForEmail,
+  isEmailBOLDocsSuccess,
 };

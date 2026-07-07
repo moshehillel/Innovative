@@ -43,6 +43,7 @@ let forwardToHumanReview;
 let getGmailOAuthClient;
 let isManagePhpEnabled;
 let runPrimusUiBillingFlow;
+let emailBOLDocs;
 
 /**
  * Receives the shared + Primus helper bundle from index.js.
@@ -60,7 +61,7 @@ function init(bundle) {
     fetchPrimusBooking, validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
     markShipmentDelivered, forwardToHumanReview, getGmailOAuthClient,
-    isManagePhpEnabled, runPrimusUiBillingFlow,
+    isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
   } = bundle);
 }
 exports.init = init;
@@ -1184,6 +1185,9 @@ exports.processPrimusWorkflow = onRequest(
               uiResult.podUploaded ||
               (uiResult.podUpload &&
                 (uiResult.podUpload.uploaded || uiResult.podUpload.skipped)));
+            if (uiResult.podUpload && uiResult.podUpload.fileId) {
+              primusSteps.podUploadFileId = String(uiResult.podUpload.fileId);
+            }
             await invoiceDoc.ref.update({
               primusSteps,
               customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
@@ -1361,43 +1365,70 @@ exports.processPrimusWorkflow = onRequest(
         // "extra_charges_pending_review"), so finalCustomerInvoiceId only
         // ever reflects the base freight amount.
 
-        // Download customer invoice + POD from Primus document API, then email
-        // via connected Gmail. REST reads only — billing writes use manage.php
-        // when PRIMUS_USE_MANAGE_PHP=true.
+        // Customer email: Primus manage.php emailBOLDocs when UI bridge issued
+        // the invoice (invoice + BOL + POD included). Gmail only for legacy
+        // REST-only path when PRIMUS_USE_MANAGE_PHP is off.
         const primusGenerated =
             invoiceGenerationResult && invoiceGenerationResult.generated;
         const uiIssued = !!primusSteps.uiInvoiceIssued;
+        const managePhpActive = isManagePhpEnabled && isManagePhpEnabled();
+        const usePrimusEmail = !!(managePhpActive && uiIssued && emailBOLDocs);
+        const issuedInvoiceNumber =
+            (invoiceGenerationResult &&
+              invoiceGenerationResult.invoiceNumber) ||
+            invoice.issuedInvoiceNumber || null;
+
+        let customerEmail = null;
+        let bookingForEmail = null;
+        try {
+          bookingForEmail = await fetchPrimusBooking(invoice.loadNumber);
+          if (bookingForEmail) {
+            const billTo = bookingForEmail.billTo || "";
+            if (billTo === "thirdparty" && bookingForEmail.thirdParty) {
+              customerEmail = bookingForEmail.thirdParty.email || null;
+            }
+            if (!customerEmail && bookingForEmail.shipper) {
+              customerEmail = bookingForEmail.shipper.email || null;
+            }
+            if (!customerEmail && bookingForEmail.consignee) {
+              customerEmail = bookingForEmail.consignee.email || null;
+            }
+          }
+        } catch (_) {
+          // Non-fatal for legacy Gmail path
+        }
+
         let primusInvoiceUrl = null;
         let primusPodUrl = null;
-        let customerInvoicePdfBase64 = null;
-        let podPdfBase64 = null;
-        try {
-          const docToken = await getPrimusToken();
-          const docResp = await fetch(
-              `${process.env.PRIMUS_BASE_URL}/document/bolnumber/` +
-              `${invoice.loadNumber}`,
-              {headers: {Authorization: `Bearer ${docToken}`}},
-          );
-          const docData = await docResp.json();
-          const allDocs = (docData.data && docData.data.results) || [];
-          const invDoc = allDocs.find((d) => d.type === "INV");
-          if (invDoc && invDoc.url) {
-            primusInvoiceUrl = invDoc.url;
+        if (!usePrimusEmail) {
+          try {
+            const docToken = await getPrimusToken();
+            const docResp = await fetch(
+                `${process.env.PRIMUS_BASE_URL}/document/bolnumber/` +
+                `${invoice.loadNumber}`,
+                {headers: {Authorization: `Bearer ${docToken}`}},
+            );
+            const docData = await docResp.json();
+            const allDocs = (docData.data && docData.data.results) || [];
+            const invDoc = allDocs.find((d) => d.type === "INV");
+            if (invDoc && invDoc.url) {
+              primusInvoiceUrl = invDoc.url;
+            }
+            const podDoc = allDocs.find((d) => {
+              const t = String(d.type || "").toUpperCase();
+              return t === "POD" || t.includes("POD");
+            });
+            if (podDoc && podDoc.url) {
+              primusPodUrl = podDoc.url;
+            }
+          } catch (docErr) {
+            await writeLog("warn", "primus",
+                "Could not fetch Primus document list", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  error: docErr.message,
+                });
           }
-          const podDoc = allDocs.find((d) => {
-            const t = String(d.type || "").toUpperCase();
-            return t === "POD" || t.includes("POD");
-          });
-          if (podDoc && podDoc.url) {
-            primusPodUrl = podDoc.url;
-          }
-        } catch (docErr) {
-          await writeLog("warn", "primus",
-              "Could not fetch Primus document list", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                error: docErr.message,
-              });
         }
 
         const podStoragePath =
@@ -1415,6 +1446,7 @@ exports.processPrimusWorkflow = onRequest(
           primusSteps: primusSteps,
           finalWorkflowStatus: "completed",
           customerInvoiceId: finalCustomerInvoiceId,
+          issuedInvoiceNumber: issuedInvoiceNumber || null,
           processingLock: false,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
@@ -1431,191 +1463,267 @@ exports.processPrimusWorkflow = onRequest(
           marginPct: marginPctCalc,
           customerInvoiceId: finalCustomerInvoiceId,
           primusSteps,
-          pdfSource: primusInvoiceUrl ? "primus" : "local",
-          podSource: primusPodUrl ? "primus" :
-            (podStoragePath ? "storage" : "none"),
+          pdfSource: usePrimusEmail ? "primus_email" :
+            (primusInvoiceUrl ? "primus" : "local"),
+          podSource: usePrimusEmail ? "primus_email" :
+            (primusPodUrl ? "primus" :
+              (podStoragePath ? "storage" : "none")),
         });
-
-        const attachmentsToSend = [];
-        if (primusInvoiceUrl) {
-          customerInvoicePdfBase64 =
-            await downloadPrimusDocumentPdf(primusInvoiceUrl);
-          if (!customerInvoicePdfBase64) {
-            await writeLog("warn", "primus",
-                "Primus invoice URL did not return a valid PDF", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  primusInvoiceUrl,
-                });
-          }
-        } else if (!primusGenerated && !uiIssued) {
-          await writeLog("info", "primus",
-              "Primus invoice not yet issued (draft); " +
-              "no INV document found via document API", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                customerInvoiceId:
-                    invoiceGenerationResult ?
-                    (invoiceGenerationResult.customerInvoiceId || null) :
-                    (invoice.customerInvoiceId || null),
-              });
-        }
-        if (!customerInvoicePdfBase64 && !uiIssued && !primusGenerated) {
-          customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            proNumber: workingProNumber,
-            customerName,
-            customerRate,
-            carrierInvoiceAmount: invoice.invoiceAmount,
-          });
-          await writeLog("info", "workflow",
-              "Using locally-built customer invoice PDF", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                reason: primusInvoiceUrl ?
-                  "Primus document URL did not return valid PDF" :
-                  "No issued invoice document found in Primus",
-              });
-        } else if (customerInvoicePdfBase64) {
-          await writeLog("info", "workflow",
-              "Using Primus-generated customer invoice PDF", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                primusInvoiceUrl,
-              });
-        } else if (uiIssued || primusGenerated) {
-          await writeLog("warn", "workflow",
-              "Issued invoice but Primus PDF not available yet", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-              });
-        }
-
-        if (customerInvoicePdfBase64) {
-          attachmentsToSend.push({
-            filename: `customer-invoice-${invoiceId}.pdf`,
-            contentType: "application/pdf",
-            contentBase64: customerInvoicePdfBase64,
-          });
-        }
-
-        if (primusPodUrl) {
-          podPdfBase64 = await downloadPrimusDocumentPdf(primusPodUrl);
-          if (podPdfBase64) {
-            attachmentsToSend.push({
-              filename: `pod-${invoice.loadNumber}.pdf`,
-              contentType: "application/pdf",
-              contentBase64: podPdfBase64,
-            });
-            await writeLog("info", "workflow",
-                "Using Primus POD document for email", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  primusPodUrl,
-                });
-          }
-        }
-        if (!podPdfBase64 && podStoragePath) {
-          const podBase64 = await downloadStorageFileBase64(podStoragePath);
-          if (podBase64) {
-            podPdfBase64 = podBase64;
-            attachmentsToSend.push({
-              filename: `pod-${invoiceId}.pdf`,
-              contentType: "application/pdf",
-              contentBase64: podBase64,
-            });
-            await writeLog("info", "workflow",
-                "Using extracted carrier-email POD for email", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  podStoragePath,
-                });
-          } else {
-            await writeLog("warn", "workflow",
-                "POD file stored but could not be downloaded for email", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  podStoragePath,
-                });
-          }
-        }
-        if (!podPdfBase64) {
-          await writeLog("warn", "workflow",
-              "No POD attached to customer invoice email", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                podFound: invoice.pod && invoice.pod.found,
-                podSource: invoice.pod && invoice.pod.source,
-                primusPodUrl: primusPodUrl || null,
-              });
-        }
 
         await logWorkflowStep({
           invoiceId,
           stepName: "final_email_started",
           stepStatus: "started",
-          input: {attachmentCount: attachmentsToSend.length},
+          input: {
+            via: usePrimusEmail ? "primus_emailBOLDocs" : "gmail",
+            customerEmail: customerEmail || null,
+          },
         });
 
         await setWorkflowHeartbeat(invoiceDoc.ref, "final_email_sending");
 
-        // Resolve customer email from Primus booking (billTo party).
-        let customerEmail = null;
-        try {
-          const bkData = await fetchPrimusBooking(invoice.loadNumber);
-          if (bkData) {
-            const billTo = bkData.billTo || "";
-            if (billTo === "thirdparty" && bkData.thirdParty) {
-              customerEmail = bkData.thirdParty.email || null;
+        if (usePrimusEmail) {
+          if (!finalCustomerInvoiceId || !customerEmail || !bookingForEmail) {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "final_email_sent",
+              stepStatus: "failed",
+              error: !customerEmail ?
+                "No customer email on Primus booking" :
+                "Missing invoice or booking for Primus email",
+            });
+            await writeLog("warn", "workflow",
+                "Primus emailBOLDocs skipped — missing data", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerInvoiceId: finalCustomerInvoiceId,
+                  customerEmail: customerEmail || null,
+                });
+          } else {
+            const extraDriveIds = [];
+            if (primusSteps.podUploadFileId) {
+              extraDriveIds.push(primusSteps.podUploadFileId);
             }
-            if (!customerEmail && bkData.shipper) {
-              customerEmail = bkData.shipper.email || null;
+            let podPdfForEmail = null;
+            if (podStoragePath) {
+              const podB64 = await downloadStorageFileBase64(podStoragePath);
+              if (podB64) {
+                podPdfForEmail = {
+                  buffer: Buffer.from(podB64, "base64"),
+                  filename: `pod-${invoice.loadNumber}.pdf`,
+                };
+              }
             }
-            if (!customerEmail && bkData.consignee) {
-              customerEmail = bkData.consignee.email || null;
+            const primusEmailResult = await emailBOLDocs({
+              booking: bookingForEmail,
+              loadNumber: invoice.loadNumber,
+              customerEmail,
+              customerInvoiceId: finalCustomerInvoiceId,
+              invoiceNumber: issuedInvoiceNumber || "0",
+              chargesTotal: customerRate,
+              podPdf: podPdfForEmail,
+              extraDriveFileIds: extraDriveIds,
+            });
+            if (primusEmailResult.ok) {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "final_email_sent",
+                stepStatus: "success",
+                output: {
+                  via: "primus_emailBOLDocs",
+                  to: customerEmail,
+                  attachments: primusEmailResult.attachments || null,
+                  driveFileIds: primusEmailResult.driveFileIds || [],
+                  message: primusEmailResult.json &&
+                    primusEmailResult.json.message,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "Customer documents emailed via Primus emailBOLDocs", {
+                    invoiceId,
+                    flowId,
+                    to: customerEmail,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    invoiceNumber: issuedInvoiceNumber,
+                    attachments: primusEmailResult.attachments,
+                    driveFileIds: primusEmailResult.driveFileIds,
+                  });
+            } else {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "final_email_sent",
+                stepStatus: "failed",
+                error: primusEmailResult.error || "emailBOLDocs failed",
+              });
+              await writeLog("error", "workflow",
+                  "Primus emailBOLDocs failed (no Gmail fallback)", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    to: customerEmail,
+                    attachments: primusEmailResult.attachments || null,
+                    error: primusEmailResult.error,
+                    raw: primusEmailResult.raw,
+                  });
             }
           }
-        } catch (_) {
-          // Non-fatal — email will go to ALERT_EMAIL fallback
+        } else {
+          let customerInvoicePdfBase64 = null;
+          let podPdfBase64 = null;
+          const attachmentsToSend = [];
+          if (primusInvoiceUrl) {
+            customerInvoicePdfBase64 =
+              await downloadPrimusDocumentPdf(primusInvoiceUrl);
+            if (!customerInvoicePdfBase64) {
+              await writeLog("warn", "primus",
+                  "Primus invoice URL did not return a valid PDF", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    primusInvoiceUrl,
+                  });
+            }
+          } else if (!primusGenerated && !uiIssued) {
+            await writeLog("info", "primus",
+                "Primus invoice not yet issued (draft); " +
+                "no INV document found via document API", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerInvoiceId:
+                      invoiceGenerationResult ?
+                      (invoiceGenerationResult.customerInvoiceId || null) :
+                      (invoice.customerInvoiceId || null),
+                });
+          }
+          if (!customerInvoicePdfBase64 && !uiIssued && !primusGenerated) {
+            customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              proNumber: workingProNumber,
+              customerName,
+              customerRate,
+              carrierInvoiceAmount: invoice.invoiceAmount,
+            });
+            await writeLog("info", "workflow",
+                "Using locally-built customer invoice PDF", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  reason: primusInvoiceUrl ?
+                    "Primus document URL did not return valid PDF" :
+                    "No issued invoice document found in Primus",
+                });
+          } else if (customerInvoicePdfBase64) {
+            await writeLog("info", "workflow",
+                "Using Primus-generated customer invoice PDF", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  primusInvoiceUrl,
+                });
+          } else if (uiIssued || primusGenerated) {
+            await writeLog("warn", "workflow",
+                "Issued invoice but Primus PDF not available yet", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                });
+          }
+
+          if (customerInvoicePdfBase64) {
+            attachmentsToSend.push({
+              filename: `customer-invoice-${invoiceId}.pdf`,
+              contentType: "application/pdf",
+              contentBase64: customerInvoicePdfBase64,
+            });
+          }
+
+          if (primusPodUrl) {
+            podPdfBase64 = await downloadPrimusDocumentPdf(primusPodUrl);
+            if (podPdfBase64) {
+              attachmentsToSend.push({
+                filename: `pod-${invoice.loadNumber}.pdf`,
+                contentType: "application/pdf",
+                contentBase64: podPdfBase64,
+              });
+              await writeLog("info", "workflow",
+                  "Using Primus POD document for email", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    primusPodUrl,
+                  });
+            }
+          }
+          if (!podPdfBase64 && podStoragePath) {
+            const podBase64 = await downloadStorageFileBase64(podStoragePath);
+            if (podBase64) {
+              podPdfBase64 = podBase64;
+              attachmentsToSend.push({
+                filename: `pod-${invoiceId}.pdf`,
+                contentType: "application/pdf",
+                contentBase64: podBase64,
+              });
+              await writeLog("info", "workflow",
+                  "Using extracted carrier-email POD for email", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    podStoragePath,
+                  });
+            } else {
+              await writeLog("warn", "workflow",
+                  "POD file stored but could not be downloaded for email", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    podStoragePath,
+                  });
+            }
+          }
+          if (!podPdfBase64) {
+            await writeLog("warn", "workflow",
+                "No POD attached to customer invoice email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  podFound: invoice.pod && invoice.pod.found,
+                  podSource: invoice.pod && invoice.pod.source,
+                  primusPodUrl: primusPodUrl || null,
+                });
+          }
+
+          const invoiceEmailSubject =
+              `Invoice — Load ${invoice.loadNumber}` +
+              (workingProNumber ? ` / PRO ${workingProNumber}` : "");
+          const invoiceEmailHtml =
+              `<p>Dear ${escapeHtml(customerName)},</p>` +
+              `<p>Please find attached your invoice for load ` +
+              `<strong>${escapeHtml(invoice.loadNumber)}</strong>` +
+              (workingProNumber ?
+                ` (PRO: ${escapeHtml(workingProNumber)})` : "") +
+              `.</p>` +
+              `<p>Amount: <strong>$${Number(customerRate).toFixed(2)
+              }</strong></p>` +
+              `<p>Thank you for your business.</p>`;
+
+          await saveOutboundEmail({
+            type: "generated_bill",
+            invoiceId,
+            to: customerEmail,
+            subject: invoiceEmailSubject,
+            html: invoiceEmailHtml,
+            attachments: attachmentsToSend,
+          });
+
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "final_email_sent",
+            stepStatus: "success",
+            output: {
+              via: "gmail",
+              attachmentsSent: attachmentsToSend.length,
+            },
+          });
+
+          await writeLog("info", "workflow", "Final email sent via Gmail", {
+            invoiceId: invoiceId,
+            flowId: flowId,
+            currentStep: "final_email_sent",
+            attachmentsSent: attachmentsToSend.length,
+          });
         }
-
-        const invoiceEmailSubject =
-            `Invoice — Load ${invoice.loadNumber}` +
-            (workingProNumber ? ` / PRO ${workingProNumber}` : "");
-        const invoiceEmailHtml =
-            `<p>Dear ${escapeHtml(customerName)},</p>` +
-            `<p>Please find attached your invoice for load ` +
-            `<strong>${escapeHtml(invoice.loadNumber)}</strong>` +
-            (workingProNumber ?
-              ` (PRO: ${escapeHtml(workingProNumber)})` : "") +
-            `.</p>` +
-            `<p>Amount: <strong>$${Number(customerRate).toFixed(2)
-            }</strong></p>` +
-            `<p>Thank you for your business.</p>`;
-
-        await saveOutboundEmail({
-          type: "generated_bill",
-          invoiceId,
-          to: customerEmail,
-          subject: invoiceEmailSubject,
-          html: invoiceEmailHtml,
-          attachments: attachmentsToSend,
-        });
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "final_email_sent",
-          stepStatus: "success",
-          output: {attachmentsSent: attachmentsToSend.length},
-        });
-
-        await writeLog("info", "workflow", "Final email sent", {
-          invoiceId: invoiceId,
-          flowId: flowId,
-          currentStep: "final_email_sent",
-          attachmentsSent: attachmentsToSend.length,
-        });
 
 
         if (invoice.gmailMessageId) {
