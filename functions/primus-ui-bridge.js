@@ -1132,6 +1132,30 @@ function resolveTermsForCarrierBill(billDate, billDueDate, termsList) {
 }
 
 /**
+ * PRO and carrier bill number for manage.php vendor ref fields.
+ * Falls back to load number when both are missing.
+ * @param {object} args proNumber, vendorInvoiceNumber, loadNumber
+ * @param {object} vendor booking.vendor
+ * @return {{proNumber: string, vendorInvoiceNumber: string,
+ *   usedLoadFallback: boolean}}
+ */
+function resolveVendorBillRefs(args, vendor) {
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  let proNumber = String(args.proNumber || vendor.PRO || "").trim();
+  let vendorInvoiceNumber = String(
+      args.vendorInvoiceNumber || proNumber || "").trim();
+  let usedLoadFallback = false;
+  if (!vendorInvoiceNumber && loadNumber) {
+    vendorInvoiceNumber = loadNumber;
+    usedLoadFallback = true;
+  }
+  if (!proNumber) {
+    proNumber = vendorInvoiceNumber;
+  }
+  return {proNumber, vendorInvoiceNumber, usedLoadFallback};
+}
+
+/**
  * @param {string|Date|null} raw Date input.
  * @return {string} YYYY-MM-DD
  */
@@ -1482,9 +1506,15 @@ async function runPrimusUiBillingFlow(args) {
     d.setDate(d.getDate() + 30);
     return d;
   })();
-  const proNumber = String(args.proNumber || vendor.PRO || "");
-  const vendorInvoiceNumber = String(
-      args.vendorInvoiceNumber || proNumber || "");
+  const {proNumber, vendorInvoiceNumber, usedLoadFallback} =
+      resolveVendorBillRefs(args, vendor);
+  if (usedLoadFallback && writeLog) {
+    await writeLog("info", "primus",
+        "No PRO or carrier bill number — using load number as vendor ref", {
+          loadNumber,
+          bookingId,
+        });
+  }
   const carrierTotal = roundMoney(
       args.carrierInvoiceAmount || vendor.cost || 0);
   const customerRate = roundMoney(args.customerRate || 0);
@@ -1800,6 +1830,7 @@ exports._internal = {
   resolveManageBookingId,
   listCustomerDriveFileIds,
   listPodDriveFileIds,
+  resolveVendorBillRefs,
   resolveTermsForCarrierBill,
   parseTermsFromResponse,
   diffCalendarDays,
