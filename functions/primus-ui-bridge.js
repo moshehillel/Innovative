@@ -1027,6 +1027,110 @@ function defaultTermsId() {
   return Number.isFinite(n) ? n : 417;
 }
 
+let cachedTerms = null;
+let cachedTermsAt = 0;
+
+/**
+ * @param {object} json getTerms response.
+ * @return {Array<object>} terms rows with id, days, code, description
+ */
+function parseTermsFromResponse(json) {
+  if (!json || typeof json !== "object") return [];
+  const list = Array.isArray(json.terms) ? json.terms :
+    (json.data && Array.isArray(json.data.terms) ? json.data.terms : []);
+  return list.map((t) => ({
+    id: String(t.id),
+    days: Number(t.days),
+    code: String(t.code || ""),
+    description: String(t.description || ""),
+  })).filter((t) => t.id && Number.isFinite(t.days));
+}
+
+/**
+ * @return {Promise<Array<object>>}
+ */
+async function fetchUiTerms() {
+  const now = Date.now();
+  if (cachedTerms && now - cachedTermsAt < 60 * 60 * 1000) {
+    return cachedTerms;
+  }
+  const result = await managePhpPost({
+    action: "getTerms",
+    active: "1",
+    page: "1",
+    start: "0",
+    limit: "25",
+    sort: JSON.stringify([{property: "description", direction: "ASC"}]),
+  });
+  cachedTerms = parseTermsFromResponse(result.json);
+  cachedTermsAt = now;
+  return cachedTerms;
+}
+
+/**
+ * @param {string|Date} start Bill date.
+ * @param {string|Date} end Due date.
+ * @return {number}
+ */
+function diffCalendarDays(start, end) {
+  const a = new Date(toDateOnly(start));
+  const b = new Date(toDateOnly(end));
+  return Math.round((b.getTime() - a.getTime()) / 86400000);
+}
+
+/**
+ * Match carrier invoice bill/due dates to a Primus terms id via getTerms.
+ * @param {string|Date} billDate Carrier invoice date.
+ * @param {string|Date|null} billDueDate Carrier due date (from email/PDF).
+ * @param {Array<object>} termsList From fetchUiTerms.
+ * @return {object} ok, termsId, source, days, error
+ */
+function resolveTermsForCarrierBill(billDate, billDueDate, termsList) {
+  const fallbackId = defaultTermsId();
+  const fallback = termsList.find((t) => t.id === String(fallbackId));
+
+  if (!billDueDate) {
+    return {
+      ok: true,
+      termsId: fallbackId,
+      source: "default_net30",
+      days: fallback ? fallback.days : 30,
+      description: fallback ? fallback.description : "Net 30",
+    };
+  }
+
+  const days = diffCalendarDays(billDate, billDueDate);
+  if (!Number.isFinite(days) || days < 0) {
+    return {ok: false, error: "Invalid carrier bill date or due date"};
+  }
+
+  const exact = termsList.find((t) => t.days === days);
+  if (exact) {
+    return {
+      ok: true,
+      termsId: Number(exact.id),
+      source: "matched_days",
+      days,
+      code: exact.code,
+      description: exact.description,
+    };
+  }
+
+  return {
+    ok: false,
+    error: `Carrier invoice due date is ${days} day(s) after bill date; ` +
+      `no matching Primus terms (getTerms)`,
+    days,
+    billDate: toDateOnly(billDate),
+    dueDate: toDateOnly(billDueDate),
+    availableTerms: termsList.map((t) => ({
+      id: t.id,
+      days: t.days,
+      code: t.code,
+    })),
+  };
+}
+
 /**
  * @param {string|Date|null} raw Date input.
  * @return {string} YYYY-MM-DD
@@ -1057,9 +1161,10 @@ function roundMoney(amount) {
  * Builds vendor bill JSON for billsInfo from booking vendor + carrier invoice.
  * @param {object} vendor booking.vendor
  * @param {object} bill Carrier bill fields.
+ * @param {number} [termsId] Primus terms id from resolveTermsForCarrierBill.
  * @return {object}
  */
-function buildBillsInfo(vendor, bill) {
+function buildBillsInfo(vendor, bill, termsId) {
   const breakdown = Array.isArray(vendor.breakdown) && vendor.breakdown.length ?
     vendor.breakdown.map((line, idx) => ({
       code: line.code || (idx === 0 ? "FRT" : ""),
@@ -1086,7 +1191,7 @@ function buildBillsInfo(vendor, bill) {
     carrierName: String(vendor.name || ""),
     total: roundMoney(total || bill.total),
     breakdown,
-    terms: defaultTermsId(),
+    terms: termsId != null ? Number(termsId) : defaultTermsId(),
     PRO: String(bill.proNumber || bill.vendorInvoiceNumber),
     billDate: toPrimusDateTime(toDateOnly(bill.billDate)),
     billDueDate: toPrimusDateTime(toDateOnly(bill.billDueDate)),
@@ -1237,10 +1342,12 @@ function extractEstimatedCostsFromStore(storeData) {
  */
 function buildVendorRefExtraFields(args) {
   const key = `${args.carrierId}${args.vendorInvoiceNumber}`;
+  const termsId = args.termsId != null ?
+    Number(args.termsId) : defaultTermsId();
   return {
     [`${key}Total`]: roundMoney(args.total),
     [`${key}Date`]: toDateOnly(args.billDate),
-    [`${key}Terms`]: String(defaultTermsId()),
+    [`${key}Terms`]: String(termsId),
     [`${key}DueDate`]: toDateOnly(args.billDueDate),
     [`${key}PRONumber`]: String(args.proNumber),
   };
@@ -1369,7 +1476,8 @@ async function runPrimusUiBillingFlow(args) {
   }
 
   const billDate = args.billDate || new Date();
-  const billDueDate = args.billDueDate || (() => {
+  const carrierDueDate = args.billDueDate || null;
+  const billDueDate = carrierDueDate || (() => {
     const d = new Date(billDate);
     d.setDate(d.getDate() + 30);
     return d;
@@ -1391,7 +1499,41 @@ async function runPrimusUiBillingFlow(args) {
     billDate,
     billDueDate,
   };
-  const billsInfo = [buildBillsInfo(vendor, bill)];
+
+  let termsList = [];
+  try {
+    termsList = await fetchUiTerms();
+  } catch (termsErr) {
+    return {
+      ok: false,
+      step: "getTerms",
+      error: termsErr.message || "getTerms failed",
+    };
+  }
+  const termsResolution = resolveTermsForCarrierBill(
+      billDate, carrierDueDate, termsList);
+  if (!termsResolution.ok) {
+    return {
+      ok: false,
+      step: "validateTerms",
+      error: termsResolution.error,
+      details: termsResolution,
+    };
+  }
+  const termsId = termsResolution.termsId;
+  if (writeLog && termsResolution.source === "matched_days") {
+    await writeLog("info", "primus", "Carrier bill terms validated", {
+      loadNumber,
+      bookingId,
+      termsId,
+      days: termsResolution.days,
+      description: termsResolution.description || null,
+      billDate: toDateOnly(billDate),
+      dueDate: toDateOnly(carrierDueDate),
+    });
+  }
+
+  const billsInfo = [buildBillsInfo(vendor, bill, termsId)];
   const estimatedCosts = buildEstimatedCosts(vendor);
   const totalEstimated = roundMoney(
       estimatedCosts.reduce((s, l) => s + Number(l.total || 0), 0));
@@ -1476,6 +1618,7 @@ async function runPrimusUiBillingFlow(args) {
     billDate,
     billDueDate,
     proNumber,
+    termsId,
   });
 
   const vendorRef = await managePhpPost({
@@ -1657,6 +1800,7 @@ exports._internal = {
   resolveManageBookingId,
   listCustomerDriveFileIds,
   listPodDriveFileIds,
-  resolvePodDriveIdsForEmail,
-  isEmailBOLDocsSuccess,
+  resolveTermsForCarrierBill,
+  parseTermsFromResponse,
+  diffCalendarDays,
 };
