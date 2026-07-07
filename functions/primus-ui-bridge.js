@@ -47,7 +47,8 @@ exports.init = init;
  * @return {FirebaseFirestore.Firestore}
  */
 function firestore() {
-  return db ? db() : admin.firestore();
+  if (typeof db === "function") return db();
+  return db || admin.firestore();
 }
 
 /**
@@ -311,7 +312,9 @@ async function managePhpUpload(
     fields, fileBuffer, fileName, retryOnAuthFail = true,
 ) {
   let cookie = await getUiSessionCookie();
-  const fileField = process.env.PRIMUS_UI_UPLOAD_FILE_FIELD || "file";
+  // Primus expects the binary under field name "DriveToUpload" (confirmed via
+  // DevTools "Copy as cURL"). Anything else → "The uploaded file is empty".
+  const fileField = process.env.PRIMUS_UI_UPLOAD_FILE_FIELD || "DriveToUpload";
 
   const doUpload = async (sessionCookie) => {
     const form = new FormData();
@@ -319,7 +322,14 @@ async function managePhpUpload(
       if (value == null) continue;
       form.append(key, String(value));
     }
-    const blob = new Blob([fileBuffer], {type: "application/pdf"});
+    // Copy into a standalone ArrayBuffer. Passing a Node Buffer straight to
+    // Blob can serialize as an empty multipart part under undici (manage.php
+    // then reports "The uploaded file is empty. Error# 1025.").
+    const buf = Buffer.isBuffer(fileBuffer) ?
+      fileBuffer : Buffer.from(fileBuffer || []);
+    const ab = buf.buffer.slice(
+        buf.byteOffset, buf.byteOffset + buf.byteLength);
+    const blob = new Blob([ab], {type: "application/pdf"});
     form.append(fileField, blob, fileName || "document.pdf");
 
     const resp = await fetch(manageUrl(), {
@@ -576,7 +586,7 @@ async function uploadDriveFile(args) {
     createdFrom: "BOL",
     fromApplet: "false",
     fileType: String(args.fileType),
-    fileDescription: "DriveToUpload",
+    fileDescription: "",
   }, args.fileBuffer, args.filename || "document.pdf");
 
   const success = isUploadSuccess(result.json, result.text);
@@ -597,8 +607,20 @@ async function uploadDriveFile(args) {
 exports.uploadDriveFile = uploadDriveFile;
 
 /**
+ * @param {Buffer|Uint8Array|null} a
+ * @param {Buffer|Uint8Array|null} b
+ * @return {boolean}
+ */
+function buffersEqual(a, b) {
+  if (!a || !b || !a.length || !b.length) return false;
+  if (a.length !== b.length) return false;
+  return Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
+}
+
+/**
  * Uploads a PDF if provided and not already on the booking.
- * @param {object} args docData, bookingId, bookingBOL, fileType, file, skip
+ * @param {object} args docData, bookingId, bookingBOL, fileType, file, skip,
+ *   forbiddenBuffer — reject upload when file bytes match (e.g. POD=invoice)
  * @return {Promise<object>}
  */
 async function maybeUploadBookingPdf(args) {
@@ -608,6 +630,18 @@ async function maybeUploadBookingPdf(args) {
   const file = args.file;
   if (!file || !file.buffer || !file.buffer.length) {
     return {ok: true, skipped: true, reason: "no file"};
+  }
+  if (args.forbiddenBuffer &&
+      buffersEqual(file.buffer, args.forbiddenBuffer)) {
+    const msg = "Refusing upload: file bytes match carrier invoice PDF";
+    if (writeLog) {
+      await writeLog("error", "primus", msg, {
+        fileType: args.fileType,
+        fileTypeName: args.fileTypeName || null,
+        filename: file.filename || null,
+      });
+    }
+    return {ok: false, error: msg, fileType: args.fileType};
   }
   if (args.docData && bookingHasFileType(args.docData, args.fileType)) {
     return {ok: true, skipped: true, reason: "already uploaded"};
@@ -918,7 +952,7 @@ async function emailBOLDocs(args) {
   const driveFileIds = [...new Set(podDriveIds)];
 
   const subject = args.subject ||
-    `Documents for BOL#${loadNumber}`;
+    `Invoice for BOL#${loadNumber}`;
   const body = process.env.PRIMUS_UI_EMAIL_DOCS_BODY ||
     DEFAULT_EMAIL_DOCS_BODY;
   const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
@@ -999,16 +1033,149 @@ function isManageSuccess(json) {
 }
 
 /**
+ * @param {object} inv Invoice row from getBookingDocuments.
+ * @return {boolean}
+ */
+function isIssuedUiInvoice(inv) {
+  if (!inv) return false;
+  const num = inv.invoiceNumber;
+  return num != null && String(num) !== "" && String(num) !== "0";
+}
+
+/**
+ * @param {object} inv Invoice row from getBookingDocuments.
+ * @return {boolean}
+ */
+function isDraftUiInvoice(inv) {
+  if (!inv || inv.id == null) return false;
+  return !isIssuedUiInvoice(inv);
+}
+
+/**
+ * @param {object} docData getBookingDocuments body.
+ * @return {object|null}
+ */
+function findDraftUiInvoice(docData) {
+  if (!docData || !Array.isArray(docData.invoices)) return null;
+  const drafts = docData.invoices.filter(isDraftUiInvoice);
+  if (drafts.length > 1 && writeLog) {
+    writeLog("warn", "primus",
+        "Multiple draft invoices on booking — reusing first", {
+          draftIds: drafts.map((d) => d.id),
+        }).catch(() => {});
+  }
+  return drafts.length ? drafts[0] : null;
+}
+
+/**
+ * @param {object} storeData getInvoiceStores response object.
+ * @return {number|null}
+ */
+function extractBilltoIdFromStore(storeData) {
+  if (!storeData || typeof storeData !== "object") return null;
+  const candidates = [
+    storeData.billtoId,
+    storeData.billToId,
+    storeData.data && storeData.data.billtoId,
+    storeData.data && storeData.data.billToId,
+    storeData.invoice && storeData.invoice.billtoId,
+    storeData.invoice && storeData.invoice.billToId,
+  ];
+  for (const c of candidates) {
+    if (c == null || String(c) === "" || String(c) === "0") continue;
+    const n = Number(c);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/**
+ * REST drafts for idempotency when Primus UI is still syncing.
+ * @param {string|number} loadNumber BOL number.
+ * @return {Promise<Array<object>>}
+ */
+async function fetchRestDraftInvoices(loadNumber) {
+  const base = process.env.PRIMUS_BASE_URL;
+  if (!base || loadNumber == null) return [];
+  try {
+    const login = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        username: process.env.PRIMUS_USERNAME,
+        password: process.env.PRIMUS_PASSWORD,
+      }),
+    });
+    const loginJson = await login.json();
+    const token = loginJson && loginJson.data && loginJson.data.accessToken;
+    if (!token) return [];
+    const resp = await fetch(
+        `${base}/invoice/bolnumber/${encodeURIComponent(loadNumber)}`,
+        {headers: {Authorization: `Bearer ${token}`}},
+    );
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const list = data && data.data && data.data.results;
+    if (!Array.isArray(list)) return [];
+    return list.filter((inv) => {
+      if (!inv || !inv.invoiceId) return false;
+      return !(inv.status && inv.status.generated);
+    });
+  } catch (_) {
+    return [];
+  }
+}
+
+/**
+ * Picks an existing draft invoice id (UI docs, REST, or workflow state).
+ * @param {object} args loadNumber, customerInvoiceId, bookingDocData
+ * @return {Promise<object>} id and source
+ */
+async function resolveExistingDraftInvoiceId(args) {
+  const seen = new Set();
+  const add = (id, source) => {
+    const n = Number(id);
+    if (!Number.isFinite(n) || n <= 0 || seen.has(n)) return null;
+    seen.add(n);
+    return {id: n, source};
+  };
+
+  if (args.customerInvoiceId) {
+    const hit = add(args.customerInvoiceId, "workflow");
+    if (hit) return hit;
+  }
+
+  const uiDraft = findDraftUiInvoice(args.bookingDocData);
+  if (uiDraft) {
+    const hit = add(uiDraft.id, "ui_documents");
+    if (hit) return hit;
+  }
+
+  const restDrafts = await fetchRestDraftInvoices(args.loadNumber);
+  for (const inv of restDrafts) {
+    const hit = add(inv.invoiceId, "rest_api");
+    if (hit) return hit;
+  }
+
+  return {id: null, source: null};
+}
+
+/**
  * @param {object} booking Primus booking from GET /book/bolnumber.
  * @return {number|null}
  */
 function resolveBilltoId(booking) {
-  const locs = booking.shippingLocations;
-  if (Array.isArray(locs) && locs[0] && locs[0].id != null) {
-    return Number(locs[0].id);
+  const billTo = booking.billTo || "";
+  if (billTo === "thirdparty" && booking.thirdParty &&
+      booking.thirdParty.id != null) {
+    return Number(booking.thirdParty.id);
   }
   if (booking.shipper && booking.shipper.id != null) {
     return Number(booking.shipper.id);
+  }
+  const locs = booking.shippingLocations;
+  if (Array.isArray(locs) && locs[0] && locs[0].id != null) {
+    return Number(locs[0].id);
   }
   if (booking.thirdParty && booking.thirdParty.id != null) {
     return Number(booking.thirdParty.id);
@@ -1113,6 +1280,22 @@ function resolveTermsForCarrierBill(billDate, billDueDate, termsList) {
       days,
       code: exact.code,
       description: exact.description,
+    };
+  }
+
+  // No exact match. Rather than block billing, fall back to the configured
+  // default term (Net 30). A common cause of a near-miss is the bill date
+  // defaulting to the received date instead of the carrier invoice date, which
+  // shifts the day count by a few days (e.g. a Net-30 invoice counted as 25).
+  if (fallback) {
+    return {
+      ok: true,
+      termsId: fallbackId,
+      source: "default_no_exact_match",
+      requestedDays: days,
+      days: fallback.days,
+      code: fallback.code,
+      description: fallback.description,
     };
   }
 
@@ -1436,10 +1619,7 @@ async function runPrimusUiBillingFlow(args) {
       bookingDocData = docs.data;
     }
     if (bookingDocData && Array.isArray(bookingDocData.invoices)) {
-      const issued = bookingDocData.invoices.find((inv) => {
-        const num = inv.invoiceNumber;
-        return num != null && String(num) !== "" && String(num) !== "0";
-      });
+      const issued = bookingDocData.invoices.find(isIssuedUiInvoice);
       if (issued) {
         const podUpload = await maybeUploadBookingPdf({
           docData: bookingDocData,
@@ -1449,6 +1629,8 @@ async function runPrimusUiBillingFlow(args) {
           fileTypeName: uploadFileTypes.pod.name,
           file: args.podPdf,
           skip: args.skipPodUpload,
+          forbiddenBuffer: args.carrierBillPdf &&
+            args.carrierBillPdf.buffer,
         });
         return {
           ok: true,
@@ -1474,14 +1656,20 @@ async function runPrimusUiBillingFlow(args) {
     skip: args.skipCarrierBillUpload,
   });
   if (!carrierBillUpload.ok) {
-    return {
-      ok: false,
-      step: "uploadDriveFile_carrierBill",
-      error: carrierBillUpload.error || "Carrier bill PDF upload failed",
-      raw: carrierBillUpload.raw,
-    };
-  }
-  if (carrierBillUpload.uploaded && writeLog) {
+    // Non-fatal: the carrier bill PDF is an INTERNAL audit attachment
+    // (file type external=0, never sent to the customer). The actual billing
+    // (saveInvoice / consolidateInvoices) does not depend on it, so a document
+    // upload hiccup must not block issuing/emailing the customer invoice.
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Carrier bill PDF upload failed — continuing with billing", {
+            loadNumber,
+            bookingId,
+            error: carrierBillUpload.error,
+            raw: carrierBillUpload.raw,
+          });
+    }
+  } else if (carrierBillUpload.uploaded && writeLog) {
     await writeLog("info", "primus", "Carrier bill PDF uploaded to Primus", {
       loadNumber,
       bookingId,
@@ -1494,9 +1682,42 @@ async function runPrimusUiBillingFlow(args) {
   if (!vendor.id) {
     return {ok: false, error: "Booking missing vendor.id"};
   }
-  const billtoId = resolveBilltoId(booking);
+
+  const draftResolution = await resolveExistingDraftInvoiceId({
+    loadNumber,
+    customerInvoiceId: args.customerInvoiceId || null,
+    bookingDocData,
+  });
+  const existingDraftId = draftResolution.id;
+
+  let billtoId = resolveBilltoId(booking);
   if (!billtoId) {
     return {ok: false, error: "Could not resolve billtoId from booking"};
+  }
+
+  if (existingDraftId) {
+    const draftStores = await getInvoiceStores(existingDraftId);
+    const storedBillto = draftStores.ok ?
+      extractBilltoIdFromStore(draftStores.data) : null;
+    if (storedBillto) {
+      billtoId = storedBillto;
+    } else if (writeLog) {
+      await writeLog("info", "primus",
+          "Reusing draft invoice — setting bill-to party on saveInvoice", {
+            loadNumber,
+            bookingId,
+            draftInvoiceId: existingDraftId,
+            draftSource: draftResolution.source,
+            billtoId,
+          });
+    }
+  } else if (writeLog) {
+    await writeLog("info", "primus",
+        "No draft invoice found — saveInvoice will create one", {
+          loadNumber,
+          bookingId,
+          billtoId,
+        });
   }
 
   const billDate = args.billDate || new Date();
@@ -1561,6 +1782,17 @@ async function runPrimusUiBillingFlow(args) {
       billDate: toDateOnly(billDate),
       dueDate: toDateOnly(carrierDueDate),
     });
+  } else if (writeLog && termsResolution.source === "default_no_exact_match") {
+    await writeLog("warn", "primus",
+        "No exact Primus term for carrier due date — using default term", {
+          loadNumber,
+          bookingId,
+          termsId,
+          requestedDays: termsResolution.requestedDays,
+          defaultDays: termsResolution.days,
+          billDate: toDateOnly(billDate),
+          dueDate: toDateOnly(carrierDueDate),
+        });
   }
 
   const billsInfo = [buildBillsInfo(vendor, bill, termsId)];
@@ -1605,6 +1837,7 @@ async function runPrimusUiBillingFlow(args) {
     vendorTerm: "",
     PRONumber: proNumber,
     invoiceNumber: "0",
+    ...(existingDraftId ? {id: String(existingDraftId)} : {}),
   });
 
   if (!phase1.json || !isManageSuccess(phase1.json)) {
@@ -1617,7 +1850,8 @@ async function runPrimusUiBillingFlow(args) {
     };
   }
 
-  const uiInvoiceId = phase1.json.recordId || args.customerInvoiceId;
+  const uiInvoiceId = phase1.json.recordId || existingDraftId ||
+    args.customerInvoiceId;
   if (!uiInvoiceId) {
     return {ok: false, error: "saveInvoice phase1 returned no recordId"};
   }
@@ -1745,6 +1979,7 @@ async function runPrimusUiBillingFlow(args) {
     fileTypeName: uploadFileTypes.pod.name,
     file: args.podPdf,
     skip: args.skipPodUpload,
+    forbiddenBuffer: args.carrierBillPdf && args.carrierBillPdf.buffer,
   });
   if (!podUpload.ok && writeLog) {
     await writeLog("warn", "primus",
@@ -1772,6 +2007,8 @@ async function runPrimusUiBillingFlow(args) {
     customerInvoiceId: Number(uiInvoiceId),
     invoiceNumber,
     billtoId,
+    reusedDraft: !!existingDraftId,
+    draftSource: draftResolution.source,
     uploadFileTypes,
     carrierBillUploaded: !!(carrierBillUpload.uploaded ||
       carrierBillUpload.skipped),
@@ -1824,6 +2061,11 @@ exports._internal = {
   matchFileTypeByName,
   matchFileTypeByCode,
   resolveBilltoId,
+  isIssuedUiInvoice,
+  isDraftUiInvoice,
+  findDraftUiInvoice,
+  extractBilltoIdFromStore,
+  resolveExistingDraftInvoiceId,
   buildBillsInfo,
   buildActualCosts,
   resolveBookingQuoteIds,

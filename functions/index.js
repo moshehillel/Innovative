@@ -1964,7 +1964,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Beyond PRO, Advance PRO, or freight bill number.",
         "Keep load number and PRO number separate.",
         "Do not use the PRO number as the load number.",
-        "Find invoice total and due date.",
+        "Find invoice total, invoice date, and due date.",
+        "invoiceDate is the date the carrier issued the invoice " +
+        "(YYYY-MM-DD).",
         "Fuel surcharge is not an extra charge.",
         "Recognized extra charges are lumper and detention only.",
         "Detention = driver waiting time charge.",
@@ -2005,6 +2007,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         loadNumber: "",
         proNumber: "",
         invoiceAmount: 0,
+        invoiceDate: "",
         dueDate: "",
         carrierName: "",
         charges: [],
@@ -3601,10 +3604,42 @@ async function processGmailMessage(
       aiResult.loadNumber = normalizedLoadNumber;
     }
 
-    const hasUnrecognizedCharges =
+    let hasUnrecognizedCharges =
       normalizedChargeData.unrecognizedCharges.length > 0;
     const hasChargesNeedProof =
       normalizedChargeData.chargesNeedProof.length > 0;
+
+    // Extra charges the AI can't classify (e.g. LTL accessorials like
+    // "Compliance Services Fee" or "Urgent Care Service") are NOT surprise
+    // add-ons when they are already part of the carrier cost Primus agreed to.
+    // If the invoice total matches Primus's recorded carrier cost, or every
+    // flagged charge already exists in the Primus cost breakdown, auto-approve
+    // them and let the invoice flow into normal billing instead of forwarding
+    // to a human.
+    if (!loadGateFailed && !isTai && hasUnrecognizedCharges) {
+      const reconciled = await reconcileUnrecognizedChargesWithPrimus(
+          aiResult.loadNumber,
+          aiResult.invoiceAmount,
+          normalizedChargeData.unrecognizedCharges,
+      );
+      if (reconciled.override) {
+        await writeLog("info", "primus",
+            "Unrecognized charges reconciled with Primus — auto-approving", {
+              messageId,
+              loadNumber: aiResult.loadNumber,
+              invoiceAmount: aiResult.invoiceAmount,
+              vendorCost: reconciled.vendorCost,
+              totalMatches: reconciled.totalMatches,
+              chargesInPrimus: reconciled.chargesInPrimus,
+              clearedCharges: normalizedChargeData.unrecognizedCharges,
+            });
+        normalizedChargeData.unrecognizedCharges = [];
+        hasUnrecognizedCharges = false;
+        if (aiResult.status === "unrecognized_charges") {
+          aiResult.status = "ready_for_primus_validation";
+        }
+      }
+    }
 
     if (loadGateFailed) {
       // Stop execution: do not attempt Primus lookup or workflow.
@@ -4028,6 +4063,7 @@ async function processGmailMessage(
         proNumber: aiResult.proNumber || null,
         loadNumber: aiResult.loadNumber || null,
         invoiceAmount: aiResult.invoiceAmount,
+        invoiceDate: aiResult.invoiceDate || null,
         dueDate: aiResult.dueDate || null,
         charges: aiResult.charges || [],
         recognizedCharges: normalizedChargeData.recognizedCharges,
@@ -5384,6 +5420,65 @@ async function validateAmountWithPrimus(loadNumber, amount) {
       error: error.message,
     });
     return {ok: false, error: error.message};
+  }
+}
+
+/**
+ * Decides whether AI-flagged "unrecognized" extra charges can be auto-approved
+ * because they are already part of the carrier cost Primus agreed to.
+ *
+ * Override applies when EITHER:
+ *   1. The invoice total matches Primus's recorded carrier cost within
+ *      tolerance (so there are no charges beyond the agreed amount), OR
+ *   2. Every flagged charge is present in the Primus vendor cost breakdown
+ *      (matched by amount or description).
+ *
+ * @param {string} loadNumber Load/BOL number.
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @param {Array<object>} unrecognizedCharges AI-flagged extra charges.
+ * @return {Promise<object>} Reconciliation result with override flag.
+ */
+async function reconcileUnrecognizedChargesWithPrimus(
+    loadNumber, invoiceAmount, unrecognizedCharges) {
+  try {
+    const booking = await fetchPrimusBooking(loadNumber);
+    if (!booking || !booking.vendor) {
+      return {override: false, reason: "no booking/vendor"};
+    }
+    const vendorCost = Number(booking.vendor.cost || 0);
+    const breakdown = Array.isArray(booking.vendor.breakdown) ?
+      booking.vendor.breakdown : [];
+    const amount = Number(invoiceAmount || 0);
+    const tolerance = Math.max(0.50, vendorCost * 0.02);
+    const totalMatches = vendorCost > 0 &&
+      Math.abs(amount - vendorCost) <= tolerance;
+
+    const normalize = (s) =>
+      String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const charges = Array.isArray(unrecognizedCharges) ?
+      unrecognizedCharges : [];
+    const chargesInPrimus = charges.length > 0 && charges.every((c) => {
+      const cAmt = Math.abs(Number(c.amount || 0));
+      const cLabel = normalize(c.label || c.type);
+      return breakdown.some((b) => {
+        const bAmt = Math.abs(Number(b.total != null ? b.total : b.rate || 0));
+        const bDesc = normalize(b.description || b.code);
+        const amtClose = cAmt > 0 &&
+          Math.abs(bAmt - cAmt) <= Math.max(0.50, cAmt * 0.02);
+        const descClose = cLabel && bDesc &&
+          (bDesc.includes(cLabel) || cLabel.includes(bDesc));
+        return amtClose || descClose;
+      });
+    });
+
+    return {
+      override: totalMatches || chargesInPrimus,
+      vendorCost,
+      totalMatches,
+      chargesInPrimus,
+    };
+  } catch (err) {
+    return {override: false, error: err.message};
   }
 }
 
