@@ -485,21 +485,35 @@ function findPdfAttachment(attachments) {
 }
 
 /**
- * Detects a Redkik-style insurance email: a spreadsheet of per-shipment
- * premiums plus (usually) a PDF invoice, from/subject naming the insurer.
- * @param {object} opts {from, subject, attachments}.
+ * Redkik insurance invoices arrive via QuickBooks notification email.
+ * @type {string}
+ */
+const INSURANCE_FROM_EMAIL =
+  process.env.INSURANCE_EMAIL_FROM ||
+  "quickbooks@notification.intuit.com";
+
+/**
+ * Pulls the bare address from a From header value.
+ * @param {string} from Raw From header.
+ * @return {string}
+ */
+function extractFromEmail(from) {
+  const raw = String(from || "").trim();
+  const bracketed = raw.match(/<([^>]+)>/);
+  if (bracketed) return bracketed[1].trim().toLowerCase();
+  const bare = raw.match(/[\w.+-]+@[\w.-]+\.\w+/);
+  return bare ? bare[0].toLowerCase() : raw.toLowerCase();
+}
+
+/**
+ * Insurance intake is keyed off the QuickBooks sender only. All other
+ * senders follow the regular carrier / forward-to-human flow.
+ * @param {object} opts {from}.
  * @return {boolean}
  */
 function isInsuranceEmail(opts) {
-  const from = String((opts && opts.from) || "");
-  const subject = String((opts && opts.subject) || "");
-  const attachments = (opts && opts.attachments) || [];
-  if (!findSpreadsheetAttachment(attachments)) return false;
-  const vendorName = process.env.PRIMUS_INSURANCE_VENDOR_NAME || "Redkik";
-  const nameToken = vendorName.split(/\s+/)[0];
-  const hay = `${from} ${subject}`;
-  const re = new RegExp(`redkik|insurance|premium|${nameToken}`, "i");
-  return re.test(hay);
+  const fromEmail = extractFromEmail(opts && opts.from);
+  return fromEmail === INSURANCE_FROM_EMAIL.toLowerCase();
 }
 
 /**
@@ -601,6 +615,7 @@ module.exports = {
   init,
   findSpreadsheetAttachment,
   findPdfAttachment,
+  extractFromEmail,
   isInsuranceEmail,
   processInsuranceEmail,
 };

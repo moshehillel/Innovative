@@ -3607,13 +3607,9 @@ async function processGmailMessage(
       }
     }
 
-    // Insurance intake (Redkik-style): a premium spreadsheet + invoice PDF.
-    // Route to the insurance allocator before the freight-invoice path, which
-    // would otherwise forward the whole email for review (Excel isn't an
-    // invoice PDF). Only for the Primus/Innovative tenant.
-    if (!isTai && innovativeInsurance.isInsuranceEmail({
-      from, subject, attachments,
-    })) {
+    // Insurance intake: QuickBooks notification sender only (Redkik premiums).
+    // Every other sender follows the regular carrier / forward-to-human flow.
+    if (!isTai && innovativeInsurance.isInsuranceEmail({from})) {
       try {
         const excelAtt =
             innovativeInsurance.findSpreadsheetAttachment(attachments);
@@ -3628,7 +3624,9 @@ async function processGmailMessage(
         });
 
         if (insResult.handled) {
-          await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+          await updateGmailQueueStatus(
+              messageId, "completed", null, {tenant},
+          );
           await tcol(tenant, "emailIntake").doc(messageId).set({
             gmailMessageId: messageId,
             tenantId: tenant.tenantId,
@@ -3642,7 +3640,7 @@ async function processGmailMessage(
         }
 
         await writeLog("warn", "insurance",
-            "Insurance email detected but not handled — forwarding", {
+            "Insurance email from QuickBooks not handled — forwarding", {
               messageId, subject, reason: insResult.reason,
             });
         await forwardWithAnalysis(
