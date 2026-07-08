@@ -71,7 +71,7 @@ function normalizePodData(pod, pageCount, filename) {
 async function classifyPdf(buffer, filename) {
   const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
   const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 4096,
     system: "Return ONLY valid JSON. No markdown.",
     messages: [{role: "user", content: [

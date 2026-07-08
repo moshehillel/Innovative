@@ -44,6 +44,7 @@ let getGmailOAuthClient;
 let isManagePhpEnabled;
 let runPrimusUiBillingFlow;
 let emailBOLDocs;
+let resolveCustomerAccountingEmails;
 
 /**
  * Receives the shared + Primus helper bundle from index.js.
@@ -62,6 +63,7 @@ function init(bundle) {
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
     markShipmentDelivered, forwardToHumanReview, getGmailOAuthClient,
     isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
+    resolveCustomerAccountingEmails,
   } = bundle);
 }
 exports.init = init;
@@ -1379,19 +1381,34 @@ exports.processPrimusWorkflow = onRequest(
             invoice.issuedInvoiceNumber || null;
 
         let customerEmail = null;
+        let customerEmailSource = null;
         let bookingForEmail = null;
         try {
           bookingForEmail = await fetchPrimusBooking(invoice.loadNumber);
           if (bookingForEmail) {
-            const billTo = bookingForEmail.billTo || "";
-            if (billTo === "thirdparty" && bookingForEmail.thirdParty) {
-              customerEmail = bookingForEmail.thirdParty.email || null;
+            if (resolveCustomerAccountingEmails && isManagePhpEnabled &&
+                isManagePhpEnabled()) {
+              const resolved =
+                  await resolveCustomerAccountingEmails(bookingForEmail);
+              if (resolved.emails && resolved.emails.length) {
+                customerEmail = resolved.emails.join(",");
+                customerEmailSource = resolved.source || null;
+              }
             }
-            if (!customerEmail && bookingForEmail.shipper) {
-              customerEmail = bookingForEmail.shipper.email || null;
-            }
-            if (!customerEmail && bookingForEmail.consignee) {
-              customerEmail = bookingForEmail.consignee.email || null;
+            if (!customerEmail) {
+              const billTo = bookingForEmail.billTo || "";
+              if (billTo === "thirdparty" && bookingForEmail.thirdParty) {
+                customerEmail = bookingForEmail.thirdParty.email || null;
+                customerEmailSource = "booking_third_party_email";
+              }
+              if (!customerEmail && bookingForEmail.shipper) {
+                customerEmail = bookingForEmail.shipper.email || null;
+                customerEmailSource = "booking_shipper_email";
+              }
+              if (!customerEmail && bookingForEmail.consignee) {
+                customerEmail = bookingForEmail.consignee.email || null;
+                customerEmailSource = "booking_consignee_email";
+              }
             }
           }
         } catch (_) {
@@ -1436,6 +1453,123 @@ exports.processPrimusWorkflow = onRequest(
       (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
       null;
 
+        // --- Reviewer approval gate before any customer-facing send ---
+        // Final safeguard against a carrier bill / POD reaching the customer:
+        // a designated reviewer must approve the outgoing email. Only an
+        // explicit "approved" lets the send proceed. "rejected" completes the
+        // workflow without emailing; anything else pauses and requests review.
+        const emailApproval = invoice.customerEmailApproval || null;
+        if (customerEmail && emailApproval !== "approved") {
+          if (emailApproval === "rejected") {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "final_email_sent",
+              stepStatus: "skipped",
+              reason: "Customer email rejected by reviewer",
+              output: {to: customerEmail},
+            });
+            await invoiceDoc.ref.update({
+              decisionStage: "customer_email_rejected",
+              decisionReason:
+                  "Reviewer rejected the customer email — not sent",
+              customerInvoiceId: finalCustomerInvoiceId,
+              issuedInvoiceNumber: issuedInvoiceNumber || null,
+              finalWorkflowStatus: "completed_no_customer_email",
+              processingLock: false,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await writeLog("warn", "workflow",
+                "Customer email rejected by reviewer — nothing sent", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerEmail,
+                });
+            return res.json({
+              ok: true,
+              workflowStatus: "customer_email_rejected",
+            });
+          }
+
+          await pauseWorkflow(
+              invoiceDoc.ref,
+              "send_customer_email",
+              "awaiting_customer_email_approval",
+              "Awaiting reviewer approval before emailing the customer",
+          );
+
+          const baseUrl = `https://${req.get("host")}`;
+          const tenantId = (req.body && req.body.tenantId) || null;
+          const tq = tenantId ?
+            `&tenantId=${encodeURIComponent(tenantId)}` : "";
+          const approveUrl =
+            `${baseUrl}/approveCustomerEmail?invoiceId=` +
+            `${encodeURIComponent(invoiceId)}&decision=approve${tq}`;
+          const rejectUrl =
+            `${baseUrl}/approveCustomerEmail?invoiceId=` +
+            `${encodeURIComponent(invoiceId)}&decision=reject${tq}`;
+          const approverEmail =
+            process.env.CUSTOMER_EMAIL_APPROVER_EMAIL ||
+            process.env.ALERT_EMAIL || null;
+
+          await saveOutboundEmail({
+            type: "customer_email_approval",
+            forceRecipient: true,
+            to: approverEmail,
+            invoiceId,
+            subject: `Approve customer email — Load ${invoice.loadNumber}`,
+            html:
+              `<h2>Approval needed before emailing the customer</h2>` +
+              `<p>The customer invoice for load ` +
+              `<strong>${escapeHtml(invoice.loadNumber || "")}</strong> ` +
+              `is ready to send. Please confirm the documents include only ` +
+              `the customer invoice and POD — <strong>never a carrier ` +
+              `bill</strong> — before it goes out.</p>` +
+              `<table style="border-collapse:collapse;font-size:14px;` +
+              `margin:12px 0">` +
+              `<tr><td style="padding:4px 16px 4px 0">Customer</td>` +
+              `<td>${escapeHtml(customerName || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 16px 4px 0">Recipient</td>` +
+              `<td>${escapeHtml(customerEmail)}</td></tr>` +
+              `<tr><td style="padding:4px 16px 4px 0">Load #</td>` +
+              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 16px 4px 0">Carrier</td>` +
+              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+              `<tr><td style="padding:4px 16px 4px 0">Amount</td>` +
+              `<td>$${Number(customerRate).toFixed(2)}</td></tr>` +
+              `</table>` +
+              `<p style="margin-top:16px">` +
+              `<a href="${approveUrl}" style="display:inline-block;` +
+              `padding:10px 20px;background:#16a34a;color:#fff;` +
+              `text-decoration:none;border-radius:8px;font-weight:700;` +
+              `margin-right:10px">Approve &amp; Send</a>` +
+              `<a href="${rejectUrl}" style="display:inline-block;` +
+              `padding:10px 20px;background:#dc2626;color:#fff;` +
+              `text-decoration:none;border-radius:8px;font-weight:700">` +
+              `Reject</a></p>`,
+          });
+
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "customer_email_approval_requested",
+            stepStatus: "stopped",
+            reason: "Awaiting reviewer approval",
+            output: {to: customerEmail, approver: approverEmail},
+          });
+
+          await writeLog("info", "workflow",
+              "Customer email held for reviewer approval", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                customerEmail,
+                approver: approverEmail,
+              });
+
+          return res.json({
+            ok: true,
+            workflowStatus: "awaiting_customer_email_approval",
+          });
+        }
+
         // Update invoice with completed workflow
         await invoiceDoc.ref.update({
           decisionStage: "completed",
@@ -1477,6 +1611,7 @@ exports.processPrimusWorkflow = onRequest(
           input: {
             via: usePrimusEmail ? "primus_emailBOLDocs" : "gmail",
             customerEmail: customerEmail || null,
+            customerEmailSource: customerEmailSource || null,
           },
         });
 
@@ -1532,6 +1667,7 @@ exports.processPrimusWorkflow = onRequest(
                 output: {
                   via: "primus_emailBOLDocs",
                   to: customerEmail,
+                  customerEmailSource: customerEmailSource || null,
                   attachments: primusEmailResult.attachments || null,
                   driveFileIds: primusEmailResult.driveFileIds || [],
                   message: primusEmailResult.json &&

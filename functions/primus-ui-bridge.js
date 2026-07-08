@@ -21,6 +21,8 @@
  *   PRIMUS_UI_SESSION_RENEW_BEFORE_HOURS — renew when this many hours remain
  *   PRIMUS_UI_EMAIL_FROM — sender for emailBOLDocs (default accounting@…)
  *   PRIMUS_UI_EMAIL_DOCS_BODY — HTML body for emailBOLDocs
+ *   PRIMUS_INSURANCE_VENDOR_ID — Redkik vendor id (default 108637)
+ *   PRIMUS_INSURANCE_VENDOR_NAME — Redkik vendor name (default Redkik USA)
  */
 
 "use strict";
@@ -771,24 +773,62 @@ function readDriveFileId(file) {
 }
 
 /**
- * POD drive file ids from getBookingDocuments (by fileType or name).
+ * @param {object} file Single document row from getBookingDocuments.
+ * @return {string|null} fileType id as string, or null.
+ */
+function readFileTypeId(file) {
+  if (!file || typeof file !== "object") return null;
+  const ft = file.fileType != null ? file.fileType :
+    (file.fileTypeId != null ? file.fileTypeId : file.type);
+  return ft != null ? String(ft) : null;
+}
+
+/**
+ * Drive file ids on a booking that belong to a specific fileType.
+ * Used to identify carrier-bill documents so they are NEVER emailed to a
+ * customer (carrier cost must never reach the customer). This is the
+ * deterministic firewall — it does not depend on filename or text scanning.
  * @param {object} docData getBookingDocuments JSON body.
- * @param {string|number} [podFileTypeId] POD fileType id from getFileTypes.
+ * @param {string|number} fileTypeId fileType id to match.
  * @return {string[]}
  */
-function listPodDriveFileIds(docData, podFileTypeId) {
+function listFileTypeDriveIds(docData, fileTypeId) {
+  if (fileTypeId == null) return [];
+  const want = String(fileTypeId);
   const ids = [];
-  const podTypeId = podFileTypeId != null ? String(podFileTypeId) : null;
   for (const list of collectDocumentListArrays(docData)) {
     for (const f of list) {
       const driveId = readDriveFileId(f);
       if (!driveId) continue;
-      const ft = f.fileType != null ? f.fileType :
-        (f.fileTypeId != null ? f.fileTypeId : f.type);
+      if (readFileTypeId(f) === want) ids.push(driveId);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * POD drive file ids from getBookingDocuments (by fileType or name).
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string|number} [podFileTypeId] POD fileType id from getFileTypes.
+ * @param {string|number} [excludeFileTypeId] Carrier-bill type to hard-exclude.
+ * @return {string[]}
+ */
+function listPodDriveFileIds(docData, podFileTypeId, excludeFileTypeId) {
+  const ids = [];
+  const podTypeId = podFileTypeId != null ? String(podFileTypeId) : null;
+  const excludeTypeId = excludeFileTypeId != null ?
+    String(excludeFileTypeId) : null;
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      const driveId = readDriveFileId(f);
+      if (!driveId) continue;
+      const ft = readFileTypeId(f);
+      // Firewall: never treat the carrier bill as a POD, no matter its name.
+      if (excludeTypeId && ft === excludeTypeId) continue;
       const name = String(
           f.name || f.fileName || f.description || f.fileDescription || "",
       ).toUpperCase();
-      const isPodType = podTypeId && String(ft) === podTypeId;
+      const isPodType = podTypeId && ft === podTypeId;
       const nameLooksPod = /POD|PROOF OF DELIVERY/.test(name);
       if (isPodType || nameLooksPod) {
         ids.push(driveId);
@@ -801,22 +841,27 @@ function listPodDriveFileIds(docData, podFileTypeId) {
 /**
  * Customer-visible drive file ids for emailBOLDocs attachments.
  * @param {object} docData getBookingDocuments JSON body.
- * @param {object} [opts] podFileTypeId — always include this file type.
+ * @param {object} [opts] podFileTypeId — always include this file type;
+ *   excludeFileTypeId — carrier-bill type to hard-exclude even if external.
  * @return {string[]}
  */
 function listCustomerDriveFileIds(docData, opts = {}) {
   const ids = [];
   const podTypeId = opts.podFileTypeId != null ?
     String(opts.podFileTypeId) : null;
+  const excludeTypeId = opts.excludeFileTypeId != null ?
+    String(opts.excludeFileTypeId) : null;
   for (const list of collectDocumentListArrays(docData)) {
     for (const f of list) {
       const driveId = readDriveFileId(f);
       if (!driveId) continue;
-      const ft = f.fileType != null ? f.fileType :
-        (f.fileTypeId != null ? f.fileTypeId : f.type);
+      const ft = readFileTypeId(f);
+      // Firewall: the carrier bill is never customer-visible, even if some
+      // Primus flag marks it external. Skip before any inclusion rule.
+      if (excludeTypeId && ft === excludeTypeId) continue;
       const isExternal = f.external === "1" || f.external === 1 ||
         f.isExternal === true || f.isExternal === "1";
-      if (podTypeId && String(ft) === podTypeId) {
+      if (podTypeId && ft === podTypeId) {
         ids.push(driveId);
         continue;
       }
@@ -848,6 +893,7 @@ async function resolvePodDriveIdsForEmail(args) {
   const loadNumber = args.loadNumber;
   const uploadFileTypes = await resolveUploadFileTypes();
   const podFileTypeId = uploadFileTypes.pod.id;
+  const carrierBillTypeId = uploadFileTypes.carrierBill.id;
   const bookingId = resolveManageBookingId(booking);
   if (!bookingId) {
     return {ok: false, error: "Could not resolve manage.php bookingId"};
@@ -863,7 +909,7 @@ async function resolvePodDriveIdsForEmail(args) {
 
   let docData = await fetchDocData();
   let podDriveIds = docData ?
-    listPodDriveFileIds(docData, podFileTypeId) : [];
+    listPodDriveFileIds(docData, podFileTypeId, carrierBillTypeId) : [];
 
   for (const id of args.extraDriveFileIds || []) {
     if (id) podDriveIds.push(String(id));
@@ -891,17 +937,47 @@ async function resolvePodDriveIdsForEmail(args) {
     if (docData) {
       podDriveIds = [...new Set([
         ...podDriveIds,
-        ...listPodDriveFileIds(docData, podFileTypeId),
+        ...listPodDriveFileIds(docData, podFileTypeId, carrierBillTypeId),
       ])];
     }
   } else if (!podDriveIds.length && docData) {
-    podDriveIds = listPodDriveFileIds(docData, podFileTypeId);
+    podDriveIds = listPodDriveFileIds(
+        docData, podFileTypeId, carrierBillTypeId);
     if (!podDriveIds.length) {
-      podDriveIds = listCustomerDriveFileIds(docData, {podFileTypeId});
+      podDriveIds = listCustomerDriveFileIds(docData, {
+        podFileTypeId,
+        excludeFileTypeId: carrierBillTypeId,
+      });
     }
   }
 
-  return {podDriveIds};
+  // FINAL FIREWALL: whatever ended up in the list (including caller-supplied
+  // extraDriveFileIds and freshly uploaded ids), drop anything that Primus
+  // reports as the carrier-bill file type. The carrier cost must NEVER be
+  // emailed to a customer. If we drop something here it is a real incident —
+  // log it at error level so it surfaces immediately.
+  const carrierBillDriveIds = new Set(
+      listFileTypeDriveIds(docData, carrierBillTypeId));
+  const blocked = [];
+  const safeIds = [];
+  for (const id of podDriveIds) {
+    if (carrierBillDriveIds.has(String(id))) {
+      blocked.push(String(id));
+    } else {
+      safeIds.push(id);
+    }
+  }
+  if (blocked.length && writeLog) {
+    await writeLog("error", "primus",
+        "BLOCKED carrier-bill document from customer email attachments", {
+          loadNumber,
+          bookingId,
+          carrierBillTypeId,
+          blockedDriveFileIds: blocked,
+        });
+  }
+
+  return {podDriveIds: safeIds, blockedDriveFileIds: blocked};
 }
 
 /**
@@ -939,7 +1015,7 @@ async function emailBOLDocs(args) {
   const invoiceNumber = args.invoiceNumber != null ?
     String(args.invoiceNumber) : "0";
 
-  const {podDriveIds} = await resolvePodDriveIdsForEmail({
+  const {podDriveIds, blockedDriveFileIds} = await resolvePodDriveIdsForEmail({
     booking,
     loadNumber,
     podPdf: args.podPdf,
@@ -998,6 +1074,7 @@ async function emailBOLDocs(args) {
     invoiceSelected: true,
     bolSelected: true,
     podDriveIdsSelected: driveFileIds,
+    blockedCarrierBillDriveIds: blockedDriveFileIds || [],
     customerInvoiceId: String(customerInvoiceId),
     invoiceNumber,
   };
@@ -1006,6 +1083,7 @@ async function emailBOLDocs(args) {
     json: result.json,
     status: result.status,
     driveFileIds,
+    blockedDriveFileIds: blockedDriveFileIds || [],
     attachments,
     to: customerEmail,
     error: success ? null :
@@ -1065,6 +1143,25 @@ function findDraftUiInvoice(docData) {
         }).catch(() => {});
   }
   return drafts.length ? drafts[0] : null;
+}
+
+/**
+ * Issued invoice preferred; falls back to draft when adding costs.
+ * @param {object} docData getBookingDocuments body.
+ * @return {object|null}
+ */
+function findUiInvoice(docData) {
+  if (!docData || !Array.isArray(docData.invoices) ||
+      !docData.invoices.length) {
+    return null;
+  }
+  const issued = docData.invoices.filter(isIssuedUiInvoice);
+  if (issued.length) {
+    return issued.sort(
+        (a, b) => Number(b.invoiceNumber || 0) - Number(a.invoiceNumber || 0),
+    )[0];
+  }
+  return findDraftUiInvoice(docData);
 }
 
 /**
@@ -1184,6 +1281,167 @@ function resolveBilltoId(booking) {
   if (override) return Number(override);
   return null;
 }
+
+/**
+ * Bill-to party on the booking (name/address used for customer lookup).
+ * @param {object} booking Primus booking from GET /book/bolnumber.
+ * @return {object|null}
+ */
+function resolveBillToParty(booking) {
+  if (!booking || typeof booking !== "object") return null;
+  const billTo = booking.billTo || "";
+  if (billTo === "thirdparty" && booking.thirdParty) {
+    return booking.thirdParty;
+  }
+  if (booking.shipper) return booking.shipper;
+  if (booking.thirdParty) return booking.thirdParty;
+  const locs = booking.shippingLocations;
+  if (Array.isArray(locs) && locs[0]) return locs[0];
+  return null;
+}
+
+/**
+ * @param {string|undefined} value
+ * @return {string}
+ */
+function normalizeLookupText(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+/**
+ * Maps REST bill-to party to manage.php shippingLocationId via name search.
+ * @param {object} party thirdParty or shipper from booking.
+ * @return {Promise<number|null>}
+ */
+async function resolveManageShippingLocationId(party) {
+  if (!party || !party.name) return null;
+  const result = await managePhpPost({
+    action: "getShippingLocations",
+    query: String(party.name).trim(),
+    page: "1",
+    start: "0",
+    limit: "25",
+  });
+  const list = result.json && Array.isArray(result.json.shipping_locations) ?
+    result.json.shipping_locations : [];
+  if (!list.length) return null;
+
+  const partyName = normalizeLookupText(party.name);
+  const partyZip = normalizeLookupText(party.zipCode || party.zipcode);
+  const exactName = list.filter((row) =>
+    normalizeLookupText(row.name) === partyName);
+  if (exactName.length === 1) return Number(exactName[0].id);
+  if (exactName.length > 1 && partyZip) {
+    const zipMatch = exactName.find((row) =>
+      normalizeLookupText(row.zipcode) === partyZip);
+    if (zipMatch) return Number(zipMatch.id);
+    return Number(exactName[0].id);
+  }
+  if (list.length === 1) return Number(list[0].id);
+  if (partyZip) {
+    const zipOnly = list.filter((row) =>
+      normalizeLookupText(row.zipcode) === partyZip);
+    if (zipOnly.length === 1) return Number(zipOnly[0].id);
+  }
+  return null;
+}
+
+/**
+ * Contacts tab rows for a shipping location (manage.php internal id).
+ * @param {number|string} shippingLocationId
+ * @return {Promise<object>}
+ */
+async function getShippingLocationsContacts(shippingLocationId) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, skipped: true, reason: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  if (shippingLocationId == null) {
+    return {ok: false, error: "No shippingLocationId"};
+  }
+  const result = await managePhpPost({
+    action: "getShippingLocationsContacts",
+    shippingLocationId: String(shippingLocationId),
+    page: "1",
+    start: "0",
+    limit: "25",
+  });
+  const contacts = result.json && Array.isArray(result.json.contacts) ?
+    result.json.contacts : [];
+  return {
+    ok: true,
+    contacts,
+    json: result.json,
+    status: result.status,
+  };
+}
+exports.getShippingLocationsContacts = getShippingLocationsContacts;
+
+/**
+ * @param {Array<object>} contacts
+ * @return {string[]}
+ */
+function pickAccountingEmails(contacts) {
+  const seen = new Set();
+  const emails = [];
+  for (const row of contacts || []) {
+    if (normalizeLookupText(row.type) !== "accounting") continue;
+    const email = String(row.email || "").trim();
+    if (!email) continue;
+    const key = email.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    emails.push(email);
+  }
+  return emails;
+}
+
+/**
+ * Accounting contact email(s) for the bill-to customer on a booking.
+ * @param {object} booking Primus booking from GET /book/bolnumber.
+ * @return {Promise<object>} emails, source, manageLocationId
+ */
+async function resolveCustomerAccountingEmails(booking) {
+  const party = resolveBillToParty(booking);
+  if (!party) {
+    return {emails: [], source: null, manageLocationId: null};
+  }
+  if (!isManagePhpEnabled()) {
+    const fallback = String(party.email || "").trim();
+    return {
+      emails: fallback ? [fallback] : [],
+      source: fallback ? "booking_party_email" : null,
+      manageLocationId: null,
+    };
+  }
+
+  const manageLocationId = await resolveManageShippingLocationId(party);
+  if (!manageLocationId) {
+    const fallback = String(party.email || "").trim();
+    return {
+      emails: fallback ? [fallback] : [],
+      source: fallback ? "booking_party_email" : null,
+      manageLocationId: null,
+    };
+  }
+
+  const contactsResult = await getShippingLocationsContacts(manageLocationId);
+  const emails = pickAccountingEmails(contactsResult.contacts);
+  if (emails.length) {
+    return {
+      emails,
+      source: "accounting_contacts",
+      manageLocationId,
+    };
+  }
+
+  const fallback = String(party.email || "").trim();
+  return {
+    emails: fallback ? [fallback] : [],
+    source: fallback ? "booking_party_email" : null,
+    manageLocationId,
+  };
+}
+exports.resolveCustomerAccountingEmails = resolveCustomerAccountingEmails;
 
 /**
  * @return {number}
@@ -1481,6 +1739,9 @@ function buildCustomerCharges(customerRate) {
  */
 function extractActualCostsFromStore(storeData) {
   if (!storeData || typeof storeData !== "object") return null;
+  const breakdown = storeData.breakdowns &&
+    storeData.breakdowns.invoicesActualCostBreakdown;
+  if (Array.isArray(breakdown) && breakdown.length) return breakdown;
   const candidates = [
     storeData.actualCosts,
     storeData.data && storeData.data.actualCosts,
@@ -1514,6 +1775,9 @@ async function getInvoiceStores(invoiceId) {
  */
 function extractChargesFromStore(storeData) {
   if (!storeData || typeof storeData !== "object") return null;
+  const breakdown = storeData.breakdowns &&
+    storeData.breakdowns.invoicesChargesBreakdown;
+  if (Array.isArray(breakdown) && breakdown.length) return breakdown;
   const candidates = [
     storeData.charges,
     storeData.data && storeData.data.charges,
@@ -1531,6 +1795,9 @@ function extractChargesFromStore(storeData) {
  */
 function extractEstimatedCostsFromStore(storeData) {
   if (!storeData || typeof storeData !== "object") return null;
+  const breakdown = storeData.breakdowns &&
+    storeData.breakdowns.invoicesEstimatedCostBreakdown;
+  if (Array.isArray(breakdown) && breakdown.length) return breakdown;
   const candidates = [
     storeData.estimatedCosts,
     storeData.data && storeData.data.estimatedCosts,
@@ -1559,6 +1826,497 @@ function buildVendorRefExtraFields(args) {
     [`${key}PRONumber`]: String(args.proNumber),
   };
 }
+
+/**
+ * Vendor-ref dynamic fields for every billsInfo row (close-cost flow).
+ * @param {Array<object>} billsInfo billsInfo array for manage.php.
+ * @return {object}
+ */
+function buildVendorRefExtraFieldsForBills(billsInfo) {
+  const out = {};
+  for (const bill of billsInfo) {
+    const key = `${bill.carrierId}${bill.vendorInvoiceNumber}`;
+    const termsId = bill.terms != null ?
+      Number(bill.terms) : defaultTermsId();
+    out[`${key}Total`] = roundMoney(bill.total).toFixed(2);
+    out[`${key}Date`] = toDateOnly(bill.billDate);
+    out[`${key}Terms`] = String(termsId);
+    out[`${key}DueDate`] = toDateOnly(bill.billDueDate);
+    out[`${key}PRONumber`] = String(bill.PRO || "");
+  }
+  return out;
+}
+
+/**
+ * @param {object} storeData getInvoiceStores response object.
+ * @return {Array<object>|null}
+ */
+function extractBillsInfoFromStore(storeData) {
+  if (!storeData || typeof storeData !== "object") return null;
+  const candidates = [
+    storeData.billsInfo,
+    storeData.data && storeData.data.billsInfo,
+    storeData.invoice && storeData.invoice.billsInfo,
+  ];
+  for (const c of candidates) {
+    if (Array.isArray(c) && c.length) return c;
+  }
+  return null;
+}
+
+/**
+ * Rebuild billsInfo from actual cost lines when the store omits it.
+ * @param {Array<object>} actualCosts From getInvoiceStores breakdown.
+ * @param {Object<string, object>} [billMetaByKey] Optional per-bill metadata.
+ * @return {Array<object>}
+ */
+function reconstructBillsInfoFromActualCosts(actualCosts, billMetaByKey) {
+  const bills = new Map();
+  for (const line of actualCosts) {
+    const carrierId = String(line.carrierId || "");
+    const invNo = String(line.vendorInvoiceNumber || "");
+    const key = `${carrierId}|${invNo}`;
+    if (!bills.has(key)) {
+      const meta = (billMetaByKey && billMetaByKey[key]) || {};
+      bills.set(key, {
+        code: line.code || "",
+        vendorInvoiceNumber: invNo,
+        carrierId,
+        carrierName: String(line.carrierName || ""),
+        total: 0,
+        breakdown: [],
+        terms: meta.terms != null ? Number(meta.terms) : defaultTermsId(),
+        PRO: String(line.PRO || meta.pro || ""),
+        billDate: toPrimusDateTime(toDateOnly(meta.billDate || new Date())),
+        billDueDate: toPrimusDateTime(toDateOnly(
+            meta.billDueDate || meta.billDate || new Date())),
+      });
+    }
+    const bill = bills.get(key);
+    const lineTotal = roundMoney(line.total);
+    bill.total = roundMoney(bill.total + lineTotal);
+    bill.breakdown.push({
+      code: line.code || "",
+      description: line.description || "",
+      qty: Number(line.qty || 1),
+      rate: roundMoney(line.rate),
+      total: lineTotal,
+      first: bill.breakdown.length === 0,
+    });
+  }
+  return Array.from(bills.values());
+}
+
+/**
+ * @param {object} vendor Insurance vendor {id, name}.
+ * @param {object} bill {vendorInvoiceNumber, total, billDate, billDueDate}.
+ * @param {number} termsId Primus terms id from getTerms.
+ * @return {object}
+ */
+function buildInsuranceBillsInfo(vendor, bill, termsId) {
+  const amount = roundMoney(bill.total);
+  return {
+    code: "",
+    vendorInvoiceNumber: String(bill.vendorInvoiceNumber),
+    carrierId: String(vendor.id),
+    carrierName: String(vendor.name || ""),
+    total: amount,
+    breakdown: [{
+      code: "",
+      description: "",
+      qty: 1,
+      rate: amount,
+      total: amount,
+      first: true,
+    }],
+    terms: termsId != null ? Number(termsId) : defaultTermsId(),
+    PRO: "",
+    billDate: toPrimusDateTime(toDateOnly(bill.billDate)),
+    billDueDate: toPrimusDateTime(toDateOnly(bill.billDueDate)),
+  };
+}
+
+/**
+ * @param {object} vendor Insurance vendor {id, name}.
+ * @param {object} bill {vendorInvoiceNumber, total}.
+ * @param {string|number|null} lineId Existing server line id, if any.
+ * @return {object}
+ */
+function buildInsuranceActualCostLine(vendor, bill, lineId) {
+  const amount = roundMoney(bill.total);
+  return {
+    id: lineId != null ? String(lineId) : "",
+    code: "",
+    description: "",
+    carrierId: String(vendor.id),
+    carrierName: String(vendor.name || ""),
+    qty: 1,
+    rate: amount,
+    total: amount.toFixed(2),
+    vendorInvoiceNumber: String(bill.vendorInvoiceNumber),
+    terms: "",
+    PRO: "",
+    isAccessorial: false,
+  };
+}
+
+/**
+ * @param {object} json getVendors response.
+ * @return {Array<object>}
+ */
+function parseVendorsFromResponse(json) {
+  if (!json || typeof json !== "object") return [];
+  const list = Array.isArray(json.vendors) ? json.vendors :
+    (Array.isArray(json.data) ? json.data :
+      (json.data && Array.isArray(json.data.vendors) ?
+        json.data.vendors : []));
+  return list.map((v) => ({
+    id: String(v.id || v.carrierId || ""),
+    name: String(v.name || v.carrierName || ""),
+  })).filter((v) => v.id);
+}
+
+let cachedInsuranceVendor = null;
+
+/**
+ * Resolves the Redkik insurance vendor via getVendors (env fallback).
+ * @return {Promise<object>} {id, name}
+ */
+async function resolveInsuranceVendor() {
+  if (cachedInsuranceVendor) return cachedInsuranceVendor;
+  const envId = process.env.PRIMUS_INSURANCE_VENDOR_ID || "108637";
+  const envName = process.env.PRIMUS_INSURANCE_VENDOR_NAME || "Redkik USA";
+  try {
+    const result = await managePhpPost({
+      action: "getVendors",
+      page: "1",
+      start: "0",
+      limit: "50",
+      query: "Redkik",
+    });
+    const vendors = parseVendorsFromResponse(result.json);
+    const match = vendors.find((v) => /redkik/i.test(v.name)) || vendors[0];
+    if (match) {
+      cachedInsuranceVendor = match;
+      return match;
+    }
+  } catch (_) {
+    // fall through to env default
+  }
+  cachedInsuranceVendor = {id: envId, name: envName};
+  return cachedInsuranceVendor;
+}
+
+/**
+ * @param {number} a First amount.
+ * @param {number} b Second amount.
+ * @return {boolean}
+ */
+function moneyEquals(a, b) {
+  return Math.abs(Number(a || 0) - Number(b || 0)) <= 0.005;
+}
+
+/**
+ * Close-cost insurance entry — mirrors the manual Primus UI sequence:
+ * getTerms → addVendorRefNumber → saveInvoice (cost closed) → getInvoiceStores.
+ *
+ * Adds a Redkik premium line to an existing load invoice without blocking on
+ * rows that lack a BOL (caller handles batching via innovative-insurance).
+ *
+ * @param {object} args Flow inputs.
+ * @param {object} args.booking Primus booking from GET /book/bolnumber.
+ * @param {string} args.loadNumber BOL / load number.
+ * @param {number} args.premium Per-shipment insurance premium.
+ * @param {string} args.vendorInvoiceNumber Redkik invoice number.
+ * @param {string|Date} args.billDate Insurance invoice date.
+ * @param {string|Date} [args.billDueDate] Insurance due date.
+ * @param {object} [args.insuranceVendor] Optional {id, name} override.
+ * @return {Promise<object>}
+ */
+async function addInsurancePremiumToLoad(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  const premium = roundMoney(args.premium || args.amount || 0);
+  const vendorInvoiceNumber = String(args.vendorInvoiceNumber || "");
+  const billDate = args.billDate || new Date();
+
+  if (!loadNumber) return {ok: false, error: "loadNumber required"};
+  if (premium <= 0) return {ok: false, error: "premium must be > 0"};
+  if (!vendorInvoiceNumber) {
+    return {ok: false, error: "vendorInvoiceNumber required"};
+  }
+
+  const booking = args.booking;
+  if (!booking) {
+    return {ok: false, notFound: true, error: "booking required"};
+  }
+
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const docs = await getBookingDocuments({bookingId, bookingBOL: loadNumber});
+  if (!docs.ok || !docs.data) {
+    return {
+      ok: false,
+      error: docs.error || "getBookingDocuments failed",
+    };
+  }
+
+  const uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {ok: false, notFound: true, error: "No Primus invoice on booking"};
+  }
+
+  const invoiceId = String(uiInvoice.id);
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+
+  let actualCosts = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+
+  const insuranceVendor = args.insuranceVendor ||
+    await resolveInsuranceVendor();
+
+  const existing = actualCosts.find((c) =>
+    String(c.carrierId) === String(insuranceVendor.id) &&
+    String(c.vendorInvoiceNumber) === vendorInvoiceNumber);
+  if (existing && moneyEquals(existing.total, premium)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "already posted",
+      loadNumber,
+      invoiceId,
+      premium,
+    };
+  }
+
+  actualCosts = actualCosts.filter((c) =>
+    !(String(c.carrierId) === String(insuranceVendor.id) &&
+      String(c.vendorInvoiceNumber) === vendorInvoiceNumber));
+
+  let termsList = [];
+  try {
+    termsList = await fetchUiTerms();
+  } catch (termsErr) {
+    return {
+      ok: false,
+      step: "getTerms",
+      error: termsErr.message || "getTerms failed",
+    };
+  }
+
+  const insDueDate = args.billDueDate || (() => {
+    const d = new Date(toDateOnly(billDate));
+    d.setDate(d.getDate() + 30);
+    return d;
+  })();
+
+  const insTerms = resolveTermsForCarrierBill(billDate, insDueDate, termsList);
+  if (!insTerms.ok) {
+    return {
+      ok: false,
+      step: "validateTerms",
+      error: insTerms.error,
+      details: insTerms,
+    };
+  }
+
+  const insBill = {
+    vendorInvoiceNumber,
+    total: premium,
+    billDate,
+    billDueDate: insDueDate,
+  };
+
+  const insuranceBillsInfo = buildInsuranceBillsInfo(
+      insuranceVendor, insBill, insTerms.termsId);
+
+  let billsInfo = extractBillsInfoFromStore(storeData);
+  if (!billsInfo || !billsInfo.length) {
+    billsInfo = reconstructBillsInfoFromActualCosts(actualCosts);
+  } else {
+    billsInfo = billsInfo.filter((b) =>
+      !(String(b.carrierId) === String(insuranceVendor.id) &&
+        String(b.vendorInvoiceNumber) === vendorInvoiceNumber));
+  }
+  billsInfo.push(insuranceBillsInfo);
+
+  const insuranceCostLine = buildInsuranceActualCostLine(
+      insuranceVendor, insBill, existing && existing.id);
+  const carrierActualCosts = actualCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId),
+    carrierName: String(line.carrierName || ""),
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: String(line.PRO || ""),
+    isAccessorial: !!line.isAccessorial,
+  }));
+  const mergedActualCosts = [...carrierActualCosts, insuranceCostLine];
+
+  const totalActual = roundMoney(
+      mergedActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const totalEstimated = roundMoney(
+      estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+  const profit = roundMoney(chargesTotal - totalActual);
+  const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+  const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+
+  const billtoId = extractBilltoIdFromStore(storeData) ||
+    resolveBilltoId(booking);
+  if (!billtoId) {
+    return {ok: false, error: "Could not resolve billtoId"};
+  }
+
+  const notes = {
+    internalNotes: String(booking.internalNotes || ""),
+    externalNotes: String(booking.externalNotes || ""),
+  };
+
+  const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+
+  const vendorRef = await managePhpPost({
+    action: "addVendorRefNumber",
+    invoiceId,
+    bookingId,
+    billsInfo,
+    actualCosts: mergedActualCosts,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    totalActualCost: totalActual,
+    ...refExtra,
+  });
+
+  if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+    return {
+      ok: false,
+      step: "addVendorRefNumber",
+      error: (vendorRef.json && vendorRef.json.message) ||
+        "addVendorRefNumber failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const phase2Estimated = estimatedCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId || ""),
+    carrierName: String(line.carrierName || ""),
+    editable: line.editable != null ? String(line.editable) : "0",
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    isAccessorial: !!line.isAccessorial,
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: "",
+  }));
+
+  const phase2Charges = charges.map((c) => ({
+    id: String(c.id),
+    code: c.code || "",
+    description: c.description || "",
+    qty: Number(c.qty || 1),
+    rate: roundMoney(c.rate),
+    total: roundMoney(c.total).toFixed(2),
+  }));
+
+  const saveResult = await managePhpPost({
+    action: "saveInvoice",
+    billsInfo,
+    charges: phase2Charges,
+    actualCosts: mergedActualCosts,
+    estimatedCosts: phase2Estimated,
+    chargesTotal,
+    totalEstimatedCosts: totalEstimated,
+    totalActualCosts: totalActual,
+    billtoId: String(billtoId),
+    bookingId,
+    ...notes,
+    costClosed: "1",
+    costActualClosed: "1",
+    readyToInvoice: "1",
+    estimatedProfitUSD: profit,
+    estimatedProfitPer: profitPer,
+    estimatedGP: gp,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    vendorInvoiceNumber: "",
+    vendorTerm: "",
+    PRONumber: "",
+    invoiceNumber: uiInvoice.invoiceNumber ?
+      String(uiInvoice.invoiceNumber) : "0",
+    id: invoiceId,
+  });
+
+  if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+    return {
+      ok: false,
+      step: "saveInvoice",
+      error: (saveResult.json && saveResult.json.message) ||
+        "saveInvoice failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const verify = await getInvoiceStores(invoiceId);
+  const verifiedCosts = verify.ok ?
+    extractActualCostsFromStore(verify.data) : null;
+  const verifiedLine = verifiedCosts && verifiedCosts.find((c) =>
+    String(c.carrierId) === String(insuranceVendor.id) &&
+    String(c.vendorInvoiceNumber) === vendorInvoiceNumber);
+
+  if (writeLog) {
+    await writeLog("info", "primus", "Insurance premium posted to load", {
+      loadNumber,
+      invoiceId,
+      premium,
+      vendorInvoiceNumber,
+      insuranceVendorId: insuranceVendor.id,
+      termsId: insTerms.termsId,
+      billDate: toDateOnly(billDate),
+      dueDate: toDateOnly(insDueDate),
+      verified: !!verifiedLine,
+    });
+  }
+
+  return {
+    ok: true,
+    loadNumber,
+    invoiceId,
+    premium,
+    vendorInvoiceNumber,
+    insuranceVendorId: insuranceVendor.id,
+    verifiedLine: verifiedLine || null,
+    steps: {
+      addVendorRefNumber: vendorRef.json.message,
+      saveInvoice: saveResult.json.message,
+    },
+  };
+}
+exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
 
 /**
  * @return {boolean}
@@ -2061,6 +2819,12 @@ exports._internal = {
   matchFileTypeByName,
   matchFileTypeByCode,
   resolveBilltoId,
+  resolveBillToParty,
+  resolveManageShippingLocationId,
+  pickAccountingEmails,
+  listFileTypeDriveIds,
+  listPodDriveFileIds,
+  listCustomerDriveFileIds,
   isIssuedUiInvoice,
   isDraftUiInvoice,
   findDraftUiInvoice,
@@ -2070,10 +2834,13 @@ exports._internal = {
   buildActualCosts,
   resolveBookingQuoteIds,
   resolveManageBookingId,
-  listCustomerDriveFileIds,
-  listPodDriveFileIds,
   resolveVendorBillRefs,
   resolveTermsForCarrierBill,
   parseTermsFromResponse,
   diffCalendarDays,
+  findUiInvoice,
+  extractBillsInfoFromStore,
+  buildInsuranceBillsInfo,
+  buildInsuranceActualCostLine,
+  buildVendorRefExtraFieldsForBills,
 };

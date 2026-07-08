@@ -1075,6 +1075,80 @@ exports.continueWorkflow = onRequest(async (req, res) => {
   }
 });
 
+// Reviewer approval gate for the final customer-facing email. The workflow
+// pauses at "send_customer_email" and emails a designated reviewer an
+// Approve/Reject link. Approving resumes the workflow (which sends); rejecting
+// resumes it into the "not sent" branch. This is the last line of defense
+// against a carrier bill / POD ever reaching the customer.
+exports.approveCustomerEmail = onRequest(async (req, res) => {
+  try {
+    const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
+    const decision = String(
+        (req.body && req.body.decision) || req.query.decision || "",
+    ).toLowerCase();
+
+    if (!invoiceId || (decision !== "approve" && decision !== "reject")) {
+      return res.status(400).send(
+          "Missing invoiceId or a valid decision (approve|reject).");
+    }
+
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
+    const snap = await invoiceRef.get();
+    if (!snap.exists) {
+      return res.status(404).send("Invoice not found.");
+    }
+
+    const approved = decision === "approve";
+    await invoiceRef.update({
+      customerEmailApproval: approved ? "approved" : "rejected",
+      customerEmailApprovalAt: admin.firestore.FieldValue.serverTimestamp(),
+      workflowPausedAtStep: null,
+      workflowPausedAt: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Resume the invoice's own tenant workflow; the send/no-send decision is
+    // enforced by the approval gate inside the workflow itself.
+    const workflowUrl = workflowUrlForTenant(tenant);
+    if (workflowUrl) {
+      fetch(workflowUrl, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          invoiceId: invoiceId,
+          tenantId: tenant.tenantId,
+          resumeFrom: "send_customer_email",
+        }),
+      }).catch((e) =>
+        console.error("approveCustomerEmail: resume failed", e.message));
+    } else {
+      console.error("approveCustomerEmail: no workflow URL for tenant",
+          tenant.tenantId);
+    }
+
+    const title = approved ? "Approved" : "Rejected";
+    const color = approved ? "#16a34a" : "#dc2626";
+    const message = approved ?
+      "The customer email has been approved and is being sent now." :
+      "The customer email has been rejected and will not be sent.";
+    return res.status(200).send(
+        `<!doctype html><html><head><meta charset="utf-8">` +
+        `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+        `<title>${title}</title></head>` +
+        `<body style="font-family:Arial,sans-serif;text-align:center;` +
+        `padding:48px;color:#111827">` +
+        `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
+        `<p style="font-size:16px;color:#374151">${message}</p>` +
+        `<p style="font-size:13px;color:#9ca3af">Load ` +
+        `${escapeHtml(String(snap.data().loadNumber || invoiceId))}</p>` +
+        `</body></html>`);
+  } catch (error) {
+    console.error("approveCustomerEmail error:", error);
+    return res.status(500).send("Internal server error.");
+  }
+});
+
 exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
   try {
     const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
@@ -1995,8 +2069,20 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "NEVER include a page in pod.documents if it shows the carrier " +
         "invoice Amount Due, bill total, or line-item charges matching " +
         "invoiceAmount — that is the invoice page, not POD/BOL.",
-        "When POD is its own email attachment file, use source " +
-        "'separate_attachment'.",
+        "A POD proves the GOODS were DELIVERED: delivery signature, " +
+        "received/delivered date, consignee sign-off, piece/pallet counts. " +
+        "A Rate Confirmation, Rate Agreement, Load Confirmation, Carrier " +
+        "Confirmation or Load Tender proves the agreed CARRIER PAY/RATE and " +
+        "is NOT a POD. NEVER include a rate/load confirmation page in " +
+        "pod.documents, even if it is signed — it exposes carrier cost.",
+        "NEVER include any page that shows a freight rate, line haul, fuel " +
+        "surcharge, carrier pay, agreed rate, or any dollar rate/charge " +
+        "amount. Only include pages proving delivery, with no pricing.",
+        "Use source 'separate_attachment' ONLY when the POD is a DIFFERENT " +
+        "file than the carrier invoice PDF. If the invoice and POD are in " +
+        "the SAME PDF, list the POD pages individually by page number with " +
+        "'signed_bol', 'signed_load', 'delivery_receipt', 'signed_pod', or " +
+        "'unsigned_pod_template' — never 'separate_attachment'.",
         "Use source 'same_page_as_invoice' ONLY when invoice line items " +
         "are on top and a small signature/stamp block is at the bottom. " +
         "Set pod.cropFromBottom to the bottom fraction (e.g. 0.35).",
@@ -2040,7 +2126,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   });
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 4096,
     system: "You classify freight carrier invoice attachments. " +
       "Return ONLY valid JSON. No markdown. " +
@@ -2068,10 +2154,35 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   }
 }
 
+// Identity the AI agent uses to sign the emails it composes. Override with
+// AI_AGENT_NAME. Applied to internal/ops/error notifications, not customer
+// invoice emails (type "generated_bill").
+const AI_AGENT_NAME = process.env.AI_AGENT_NAME || "Jerry";
+const AGENT_GREETING_MARKER = "<!--agent-greeting-->";
+
 /**
- * Saves an outbound email to Firestore and optionally sends it.
- * @param {object} email - The email object.
- * @return {Promise<object>} Result of the operation.
+ * @return {string} HTML greeting that introduces the AI agent by name.
+ */
+function agentGreetingHtml() {
+  return `${AGENT_GREETING_MARKER}<p>Hi, I'm ${escapeHtml(AI_AGENT_NAME)}, ` +
+    `your AI assistant.</p>`;
+}
+
+/**
+ * Prepends the agent greeting to an HTML body unless it's already branded.
+ * @param {string} html Email HTML body.
+ * @return {string}
+ */
+function withAgentGreeting(html) {
+  const body = String(html || "");
+  if (body.includes(AGENT_GREETING_MARKER)) return body;
+  return `${agentGreetingHtml()}${body}`;
+}
+
+/**
+ * Persists and sends an outbound email.
+ * @param {object} email - Email fields (type, subject, html, to, attachments).
+ * @return {Promise<void>}
  */
 async function saveOutboundEmail(email) {
   // Use the email's tenant, then the ambient tenant bound for this request
@@ -2081,16 +2192,26 @@ async function saveOutboundEmail(email) {
   const tenant = (email && email.tenant) || currentTenant() || DEFAULT_TENANT;
   let sendResult = null;
   // Customer invoice emails go to the bill-to party; ops alerts use alertEmail.
-  const to = (email.type === "generated_bill" && email.to) ?
+  // `forceRecipient` pins delivery to an explicit address (e.g. a designated
+  // reviewer for the customer-email approval gate) regardless of type.
+  const to = ((email.type === "generated_bill" || email.forceRecipient) &&
+    email.to) ?
     email.to :
     (tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "");
+
+  // Brand agent-authored notifications (errors, action-needed, forwards, etc.)
+  // as the AI agent. Customer invoice emails and any opt-out are left as-is.
+  const shouldBrand = email.type !== "generated_bill" &&
+    email.skipAgentGreeting !== true;
+  const htmlToSend = shouldBrand ?
+    withAgentGreeting(email.html) : (email.html || "");
 
   if (to) {
     try {
       await sendViaGmail(
           to,
           email.subject || "",
-          email.html || "",
+          htmlToSend,
           Array.isArray(email.attachments) ? email.attachments : [],
           tenant,
       );
@@ -2107,8 +2228,10 @@ async function saveOutboundEmail(email) {
   }
 
   // The tenant object is internal routing metadata; don't persist it.
-  const emailToStore = {...email};
+  const emailToStore = {...email, html: htmlToSend};
   delete emailToStore.tenant;
+  delete emailToStore.skipAgentGreeting;
+  delete emailToStore.forceRecipient;
   await tcol(tenant, "outboundEmails").add({
     ...emailToStore,
     sendResult: sendResult,
@@ -2381,21 +2504,118 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       if (!podAtt || !podAtt.storagePath) {
         return null;
       }
-      const fileInfo = {
-        storagePath: podAtt.storagePath,
-        source: "separate_attachment",
-        page: null,
-      };
+      const [attBuffer] = await getBucket()
+          .file(podAtt.storagePath).download();
+
+      // SAFETY: never send the carrier bill OR the carrier rate/load
+      // confirmation to the customer as POD. When the "separate attachment" is
+      // really the combined invoice+POD PDF (single email attachment),
+      // returning it wholesale leaks carrier cost. Keep only pages whose REAL
+      // text neither shows the invoice amount nor carries rate-confirmation
+      // pricing markers. Text is read from the ORIGINAL buffer (decompressed);
+      // pdf-lib-saved bytes are compressed and cannot be scanned.
+      const srcDoc = await PDFDocument.load(attBuffer);
+      const srcPageCount = srcDoc.getPageCount();
+      const pageTexts = await extractPdfPageTexts(attBuffer);
+      const cleanDoc = await PDFDocument.create();
+      let keptPages = 0;
+      let droppedInvoicePages = 0;
+      let unverifiedPages = 0;
+      const droppedReasons = [];
+      for (let p = 0; p < srcPageCount; p++) {
+        const verdict = textLooksUnsafeForCustomer(
+            pageTexts ? pageTexts[p] : null, invoice.invoiceAmount);
+        if (verdict.unsafe) {
+          droppedInvoicePages++;
+          droppedReasons.push(`p${p + 1}:${verdict.reason}`);
+          continue;
+        }
+        if (!verdict.hasText) unverifiedPages++;
+        const [keep] = await cleanDoc.copyPages(srcDoc, [p]);
+        cleanDoc.addPage(keep);
+        keptPages++;
+      }
+
+      // No readable text anywhere (scanned image) AND more than one page in a
+      // file the AI thought bundled the invoice: we cannot prove the bill/rate
+      // pages are gone. Fail safe — do not auto-send; hold for human review.
+      if (!pageTexts && srcPageCount > 1) {
+        await writeLog("error", "workflow",
+            "POD separate_attachment held — multi-page scanned file with no " +
+            "readable text; cannot verify it is free of carrier cost", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              attachment: podAtt.filename,
+              srcPageCount,
+            });
+        return null;
+      }
+
+      if (keptPages === 0) {
+        await writeLog("warn", "workflow",
+            "POD separate_attachment dropped — every page exposes carrier " +
+            "cost (invoice amount or rate confirmation)", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              attachment: podAtt.filename,
+              srcPageCount,
+              droppedInvoicePages,
+              droppedReasons,
+            });
+        return null;
+      }
+      if (unverifiedPages > 0) {
+        await writeLog("warn", "workflow",
+            "POD separate_attachment kept page(s) with no readable text — " +
+            "verified by AI classification only, not by text scan", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              attachment: podAtt.filename,
+              unverifiedPages,
+            });
+      }
+
+      // No unsafe pages present — genuine standalone POD; keep original file.
+      if (droppedInvoicePages === 0) {
+        return {
+          storagePath: podAtt.storagePath,
+          source: "separate_attachment",
+          files: [{
+            storagePath: podAtt.storagePath,
+            source: "separate_attachment",
+            page: null,
+          }],
+        };
+      }
+
+      // Combined invoice+POD: save the cost-free subset only.
+      const cleanBytes = await cleanDoc.save();
+      const cleanPath = await savePodPdfBytes(
+          invoiceId, "pod.pdf", cleanBytes);
+      await writeLog("info", "workflow",
+          "POD separate_attachment sanitized — removed carrier-cost page(s)", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            attachment: podAtt.filename,
+            keptPages,
+            droppedInvoicePages,
+            droppedReasons,
+          });
       return {
-        storagePath: podAtt.storagePath,
+        storagePath: cleanPath,
         source: "separate_attachment",
-        files: [fileInfo],
+        files: [{
+          storagePath: cleanPath,
+          source: "separate_attachment",
+          page: null,
+        }],
       };
     }
 
     const files = [];
     const mergedDoc = await PDFDocument.create();
     const bufferCache = new Map();
+    const textCache = new Map();
 
     for (let i = 0; i < documents.length; i++) {
       const doc = documents[i];
@@ -2421,19 +2641,38 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       }
       const fileBuffer = bufferCache.get(podAtt.storagePath);
       const loadedDoc = await PDFDocument.load(fileBuffer);
+      if (!textCache.has(podAtt.storagePath)) {
+        textCache.set(podAtt.storagePath,
+            await extractPdfPageTexts(fileBuffer));
+      }
+      const pageTexts = textCache.get(podAtt.storagePath);
       const pdfBytes = await extractPodDocumentPdfBytes(loadedDoc, doc);
       if (!pdfBytes) {
         continue;
       }
 
-      if (pdfBytesContainInvoiceAmount(pdfBytes, invoice.invoiceAmount)) {
+      // Check the REAL text of the source page(s) this doc covers.
+      const pageCount = loadedDoc.getPageCount();
+      let pageIndex;
+      if (doc.source === "last_page_of_invoice") {
+        pageIndex = pageCount - 1;
+      } else {
+        pageIndex = (Number(doc.page) || pageCount) - 1;
+      }
+      const pageText = pageTexts &&
+        pageIndex >= 0 && pageIndex < pageTexts.length ?
+        pageTexts[pageIndex] : null;
+      const verdict =
+          textLooksUnsafeForCustomer(pageText, invoice.invoiceAmount);
+      if (verdict.unsafe) {
         await writeLog("warn", "workflow",
-            "Skipped POD page — contains carrier invoice amount", {
+            "Skipped POD page — exposes carrier cost", {
               invoiceId,
               loadNumber: invoice.loadNumber,
               podPage: doc.page,
               podSource: doc.source,
               invoiceAmount: invoice.invoiceAmount,
+              reason: verdict.reason,
             });
         continue;
       }
@@ -2610,27 +2849,109 @@ function isPodPackageSource(source) {
   return POD_PACKAGE_SOURCES.has(String(source || "").trim());
 }
 
+// Phrases that only appear on carrier-facing pricing documents (rate/load
+// confirmations, rate agreements). These NEVER belong on a clean signed BOL or
+// delivery receipt, so their presence means the page exposes the buy-rate and
+// must not reach the customer — even if the page is signed.
+const RATE_CONFIRMATION_MARKERS = [
+  "rate confirmation",
+  "rate con",
+  "rateconfirmation",
+  "rate and load confirmation",
+  "load and rate confirmation",
+  "load confirmation",
+  "carrier confirmation",
+  "carrier rate confirmation",
+  "rate agreement",
+  "load tender",
+  "line haul",
+  "line-haul",
+  "linehaul",
+  "fuel surcharge",
+  "carrier pay",
+  "total carrier pay",
+  "agreed rate",
+  "carrier freight charges",
+];
+
+let pdfjsModulePromise = null;
+
 /**
- * Best-effort check: carrier invoice total embedded in a single-page PDF.
- * @param {Uint8Array|Buffer} pdfBytes PDF bytes.
- * @param {number} invoiceAmount Carrier invoice amount.
- * @return {boolean}
+ * Lazily loads the ESM pdfjs build from CommonJS via dynamic import.
+ * @return {Promise<object>} pdfjs module.
  */
-function pdfBytesContainInvoiceAmount(pdfBytes, invoiceAmount) {
-  const amount = Number(invoiceAmount);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return false;
+function getPdfjs() {
+  if (!pdfjsModulePromise) {
+    pdfjsModulePromise = import("pdfjs-dist/legacy/build/pdf.mjs");
   }
-  const haystack = Buffer.from(pdfBytes).toString("latin1");
-  const formatted = amount.toFixed(2);
-  const patterns = [
-    formatted,
-    `$${formatted}`,
-    `Amount Due $${formatted}`,
-    `Amount Due ${formatted}`,
-    `Amount Due $ ${formatted}`,
-  ];
-  return patterns.some((p) => haystack.includes(p));
+  return pdfjsModulePromise;
+}
+
+/**
+ * Extracts real per-page text from a PDF, decompressing content streams.
+ * Raw byte scans cannot see Flate-compressed text (nearly all real PDFs),
+ * so this is what makes carrier-cost detection actually work. Returns null
+ * when the PDF has no extractable text layer (e.g. a scanned image).
+ * @param {Buffer|Uint8Array} buffer Original PDF bytes.
+ * @return {Promise<string[]|null>} Page texts (index 0 = page 1) or null.
+ */
+async function extractPdfPageTexts(buffer) {
+  try {
+    const pdfjs = await getPdfjs();
+    // Clone so pdfjs cannot detach the caller's buffer (reused for pdf-lib).
+    const data = Uint8Array.from(buffer);
+    const task = pdfjs.getDocument({
+      data,
+      isEvalSupported: false,
+      useSystemFonts: true,
+    });
+    const pdf = await task.promise;
+    const texts = [];
+    let anyText = false;
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const tc = await page.getTextContent();
+      const txt = tc.items.map((it) => it.str).join(" ").trim();
+      if (txt) anyText = true;
+      texts.push(txt);
+    }
+    await pdf.destroy();
+    return anyText ? texts : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * True when page TEXT exposes carrier cost: it shows the carrier invoice
+ * amount or carries rate/load-confirmation pricing markers.
+ * @param {string|null} text Extracted page text.
+ * @param {number} invoiceAmount Carrier invoice amount.
+ * @return {object} {unsafe, reason, hasText}
+ */
+function textLooksUnsafeForCustomer(text, invoiceAmount) {
+  if (!text) return {unsafe: false, reason: null, hasText: false};
+  const lower = text.toLowerCase();
+  const amount = Number(invoiceAmount);
+  if (Number.isFinite(amount) && amount > 0) {
+    const formatted = amount.toFixed(2);
+    const [intPart, decPart] = formatted.split(".");
+    const withCommas =
+      `${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${decPart}`;
+    const collapsed = lower.replace(/\s+/g, "");
+    if (collapsed.includes(formatted) || collapsed.includes(withCommas)) {
+      return {unsafe: true, reason: "carrier_invoice_amount", hasText: true};
+    }
+  }
+  const marker = RATE_CONFIRMATION_MARKERS.find((m) => lower.includes(m));
+  if (marker) {
+    return {
+      unsafe: true,
+      reason: `rate_confirmation_marker:${marker}`,
+      hasText: true,
+    };
+  }
+  return {unsafe: false, reason: null, hasText: true};
 }
 
 /**
@@ -3235,13 +3556,13 @@ async function processGmailMessage(
       }
 
       const aiNote =
-        `Hi,\n\n` +
-        `I am your AI helper. I just received the following email and I am ` +
+        `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
+        `I just received the following email and I am ` +
         `not sure how to handle it.\n\n` +
         (summary ?
           `Here is what I think this email is about: ${summary}\n\n` : "") +
         `I do not have a rule for this type of email yet. ` +
-        `Please take care of it.\n\nThank you,\nAI Helper`;
+        `Please take care of it.\n\nThank you,\n${AI_AGENT_NAME}`;
 
       return forwardToHumanReview(
           gmail, messageId, subject, from, reason, aiNote,
@@ -3282,6 +3603,63 @@ async function processGmailMessage(
           subject: subject,
           from: from,
         });
+        return;
+      }
+    }
+
+    // Insurance intake (Redkik-style): a premium spreadsheet + invoice PDF.
+    // Route to the insurance allocator before the freight-invoice path, which
+    // would otherwise forward the whole email for review (Excel isn't an
+    // invoice PDF). Only for the Primus/Innovative tenant.
+    if (!isTai && innovativeInsurance.isInsuranceEmail({
+      from, subject, attachments,
+    })) {
+      try {
+        const excelAtt =
+            innovativeInsurance.findSpreadsheetAttachment(attachments);
+        const pdfAtt = innovativeInsurance.findPdfAttachment(attachments);
+        const excelBuffer = excelAtt ? await downloadGmailAttachmentBuffer(
+            gmail, messageId, excelAtt.attachmentId) : null;
+        const pdfBuffer = pdfAtt ? await downloadGmailAttachmentBuffer(
+            gmail, messageId, pdfAtt.attachmentId) : null;
+
+        const insResult = await innovativeInsurance.processInsuranceEmail({
+          excelBuffer, pdfBuffer, from, subject,
+        });
+
+        if (insResult.handled) {
+          await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+          await tcol(tenant, "emailIntake").doc(messageId).set({
+            gmailMessageId: messageId,
+            tenantId: tenant.tenantId,
+            subject, from,
+            finalStatus: "insurance_processed",
+            insuranceReconciliation: insResult.reconciliation || null,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            deleteAt: getDeleteAt(30),
+          }, {merge: true});
+          return;
+        }
+
+        await writeLog("warn", "insurance",
+            "Insurance email detected but not handled — forwarding", {
+              messageId, subject, reason: insResult.reason,
+            });
+        await forwardWithAnalysis(
+            `Insurance email could not be processed automatically ` +
+            `(${insResult.reason || "unknown"})`,
+            {department: "billing"},
+        );
+        await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+        return;
+      } catch (insErr) {
+        await writeLog("error", "insurance",
+            "Insurance intake failed — forwarding for review", {
+              messageId, subject, error: insErr.message, stack: insErr.stack,
+            });
+        await forwardWithAnalysis(
+            "Insurance email processing failed", {department: "billing"});
+        await updateGmailQueueStatus(messageId, "completed", null, {tenant});
         return;
       }
     }
@@ -4227,6 +4605,24 @@ async function processGmailMessage(
 }
 
 /**
+ * Downloads a single Gmail attachment and returns its decoded bytes.
+ * @param {object} gmail Gmail client instance.
+ * @param {string} messageId Gmail message id.
+ * @param {string} attachmentId Gmail attachment id.
+ * @return {Promise<Buffer>} Decoded attachment bytes.
+ */
+async function downloadGmailAttachmentBuffer(gmail, messageId, attachmentId) {
+  const resp = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: attachmentId,
+  });
+  const rawData = (resp.data && resp.data.data) || "";
+  return Buffer.from(
+      rawData.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+}
+
+/**
  * Recursively extracts attachments from Gmail message parts.
  * @param {Array<object>} parts Gmail message parts.
  * @return {Array<object>} Array of attachment objects.
@@ -4762,6 +5158,9 @@ async function sendSupportIssueEmail({clientName, summary, transcript}) {
     `Support chat — ${escapeHtml(clientName)}</div>` +
     `<div style="border:1px solid #e5e7eb;border-top:none;padding:18px;` +
     `border-radius:0 0 6px 6px;">` +
+    `<p style="margin:0 0 16px;color:#374151;line-height:1.6;">` +
+    `Hi, I'm ${escapeHtml(AI_AGENT_NAME)}, your AI assistant. ` +
+    `A support chat was flagged for your attention.</p>` +
     `<h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;` +
     `letter-spacing:.05em;color:#374151;">Issue Summary</h3>` +
     `<p style="margin:0 0 16px;color:#374151;line-height:1.6;` +
@@ -4872,7 +5271,7 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
       "any relevant context from the conversation).";
 
     const aiRes = await client.messages.create({
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
       max_tokens: 800,
       system: systemPrompt,
       messages: history,
@@ -5818,8 +6217,19 @@ innovativePrimus.init({
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
   runPrimusUiBillingFlow: primusUiBridge.runPrimusUiBillingFlow,
   emailBOLDocs: primusUiBridge.emailBOLDocs,
+  resolveCustomerAccountingEmails:
+      primusUiBridge.resolveCustomerAccountingEmails,
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
+
+const innovativeInsurance = require("./innovative-insurance");
+innovativeInsurance.init({
+  writeLog,
+  saveOutboundEmail,
+  fetchPrimusBooking,
+  addInsurancePremiumToLoad: primusUiBridge.addInsurancePremiumToLoad,
+  isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
+});
 
 // Renew Primus manage.php PHPSESSID before the 24h cookie expires.
 exports.refreshPrimusUiSession = onSchedule(
