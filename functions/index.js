@@ -3107,7 +3107,9 @@ function normalizePodFromClassification(aiResult) {
 }
 
 /**
- * Adds post-invoice pages not listed by the classifier.
+ * Adds post-invoice pages not listed by the classifier. When the classifier
+ * listed specific pages, trust its omissions (e.g. rate confirmations between
+ * invoice and BOL) and only auto-add pages after the last listed page.
  * @param {Array<object>} documents POD document entries.
  * @param {number|null} pageCount Total PDF page count when known.
  * @param {string} attachmentFilename Attachment filename.
@@ -3123,18 +3125,24 @@ function enrichPodDocumentsWithTrailingPages(
     return documents;
   }
 
-  const listed = new Set(
-      documents.map((d) => Number(d.page)).filter((p) => p > 0),
-  );
+  const listedPages = documents
+      .map((d) => Number(d.page))
+      .filter((p) => p > 0);
+  if (listedPages.length === 0) {
+    return documents;
+  }
+
+  const lastListed = Math.max(...listedPages);
+  const listed = new Set(listedPages);
   const enriched = [...documents];
 
-  for (let page = 2; page <= totalPages; page++) {
+  for (let page = lastListed + 1; page <= totalPages; page++) {
     if (listed.has(page)) continue;
     enriched.push({
       source: "unsigned_pod_template",
       page,
       attachmentFilename,
-      reason: "[auto-included] POD page after invoice",
+      reason: "[auto-included] POD page after last classified page",
     });
     listed.add(page);
   }
