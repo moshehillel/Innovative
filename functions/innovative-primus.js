@@ -69,6 +69,132 @@ function init(bundle) {
 exports.init = init;
 
 /**
+ * @param {number|null|undefined} amount Money value.
+ * @return {string}
+ */
+function moneyFmt(amount) {
+  if (amount == null || amount === "" || !Number.isFinite(Number(amount))) {
+    return "—";
+  }
+  return `$${Number(amount).toFixed(2)}`;
+}
+
+/**
+ * Builds the reviewer approval email with a full summary of what the agent
+ * did on this load before the customer-facing email is sent.
+ * @param {object} opts Approval context from the workflow.
+ * @return {string} HTML body (Jerry greeting added by saveOutboundEmail).
+ */
+function buildCustomerEmailApprovalHtml(opts) {
+  const {
+    invoice, customerName, customerRate, profit, marginPct,
+    workingProNumber, amountValidation, baseAmount, approvedChargesTotal,
+    finalCustomerInvoiceId, issuedInvoiceNumber, customerEmail,
+    customerEmailSource, usePrimusEmail, podStoragePath,
+    primusSteps, approveUrl, rejectUrl, invoiceGenerationResult,
+  } = opts;
+
+  const row = (label, value) =>
+    `<tr><td style="padding:6px 16px 6px 0;font-weight:600;` +
+    `vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td>` +
+    `<td style="padding:6px 0">${value}</td></tr>`;
+
+  const submitted = amountValidation && amountValidation.submittedAmount;
+  const primusAmt = amountValidation && amountValidation.savedAmount;
+  const amtDiff = amountValidation && amountValidation.difference;
+  const steps = primusSteps || {};
+  const completedSteps = Object.entries(steps)
+      .filter(([, v]) => v === true)
+      .map(([k]) => k
+          .replace(/([A-Z])/g, " $1")
+          .replace(/^./, (c) => c.toUpperCase()))
+      .join(", ") || "—";
+
+  const genVia = invoiceGenerationResult && invoiceGenerationResult.reused ?
+    "Reused existing Primus invoice" :
+    (steps.uiInvoiceIssued ? "manage.php UI bridge" :
+      (invoiceGenerationResult && invoiceGenerationResult.generated ?
+        "Primus REST" : "—"));
+
+  const attachments = usePrimusEmail ?
+    "Customer invoice + BOL + POD (via Primus emailBOLDocs)" :
+    `Customer invoice PDF${podStoragePath ? " + POD" : " (no POD on file)"}`;
+
+  const amtMatch = amtDiff != null && Number(amtDiff) <= 0.5 ?
+    `<span style="color:#16a34a">Matched</span>` :
+    (amtDiff != null ?
+      `<span style="color:#dc2626">${moneyFmt(amtDiff)} off</span>` : "—");
+
+  return (
+    `<h2>Approval needed before emailing the customer</h2>` +
+    `<p>I finished processing this load. Please review everything below ` +
+    `and confirm the outgoing package includes <strong>only the customer ` +
+    `invoice and POD</strong> — never a carrier bill — before approving.</p>` +
+
+    `<h3 style="margin:18px 0 8px;font-size:15px">Load &amp; carrier</h3>` +
+    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
+    row("Load #", escapeHtml(invoice.loadNumber || "—")) +
+    row("PRO #", escapeHtml(
+        workingProNumber || invoice.proNumber || "—")) +
+    row("Carrier", escapeHtml(invoice.carrierName || "—")) +
+    row("Carrier invoice #", escapeHtml(invoice.invoiceNumber || "—")) +
+    row("Carrier bill date", escapeHtml(invoice.invoiceDate || "—")) +
+    row("Carrier due date", escapeHtml(invoice.dueDate || "—")) +
+    row("Gmail subject", escapeHtml(invoice.gmailSubject || "—")) +
+    `</table>` +
+
+    `<h3 style="margin:18px 0 8px;font-size:15px">Amount validation</h3>` +
+    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
+    row("Carrier bill amount (from email)", moneyFmt(invoice.invoiceAmount)) +
+    row("Validated base amount", moneyFmt(baseAmount)) +
+    row("Submitted to Primus", moneyFmt(submitted)) +
+    row("Primus carrier cost", moneyFmt(primusAmt)) +
+    row("Amount check", amtMatch) +
+    row("Extra charges (held, not invoiced)", approvedChargesTotal > 0 ?
+      moneyFmt(approvedChargesTotal) : "None") +
+    `</table>` +
+
+    `<h3 style="margin:18px 0 8px;font-size:15px">Customer invoice</h3>` +
+    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
+    row("Customer", escapeHtml(customerName || "—")) +
+    row("Customer rate", moneyFmt(customerRate)) +
+    row("Profit", `${moneyFmt(profit)} (${Number(marginPct || 0)}% margin)`) +
+    row("Issued invoice #", escapeHtml(issuedInvoiceNumber || "—")) +
+    row("Primus invoice ID", escapeHtml(
+        String(finalCustomerInvoiceId || "—"))) +
+    row("Invoice generated via", escapeHtml(genVia)) +
+    `</table>` +
+
+    `<h3 style="margin:18px 0 8px;font-size:15px">` +
+    `Outgoing customer email</h3>` +
+    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
+    row("Recipient", escapeHtml(customerEmail || "—")) +
+    row("Email resolved from", escapeHtml(customerEmailSource || "—")) +
+    row("Send method", usePrimusEmail ?
+      "Primus emailBOLDocs" : "Gmail (legacy path)") +
+    row("Attachments to send", escapeHtml(attachments)) +
+    row("POD status", podStoragePath ?
+      "Sanitized POD ready" : "No POD file on record") +
+    `</table>` +
+
+    `<h3 style="margin:18px 0 8px;font-size:15px">` +
+    `Workflow steps completed</h3>` +
+    `<p style="font-size:13px;color:#374151;margin:0 0 16px;line-height:1.5">` +
+    escapeHtml(completedSteps) + `</p>` +
+
+    `<p style="margin-top:20px">` +
+    `<a href="${approveUrl}" style="display:inline-block;` +
+    `padding:10px 20px;background:#16a34a;color:#fff;` +
+    `text-decoration:none;border-radius:8px;font-weight:700;` +
+    `margin-right:10px">Approve &amp; Send</a>` +
+    `<a href="${rejectUrl}" style="display:inline-block;` +
+    `padding:10px 20px;background:#dc2626;color:#fff;` +
+    `text-decoration:none;border-radius:8px;font-weight:700">` +
+    `Reject</a></p>`
+  );
+}
+
+/**
  * Downloads a Primus document URL (self-authenticating); returns base64 PDF.
  * @param {string} url Document URL from GET /document/bolnumber.
  * @return {Promise<string|null>}
@@ -1517,35 +1643,27 @@ exports.processPrimusWorkflow = onRequest(
             to: approverEmail,
             invoiceId,
             subject: `Approve customer email — Load ${invoice.loadNumber}`,
-            html:
-              `<h2>Approval needed before emailing the customer</h2>` +
-              `<p>The customer invoice for load ` +
-              `<strong>${escapeHtml(invoice.loadNumber || "")}</strong> ` +
-              `is ready to send. Please confirm the documents include only ` +
-              `the customer invoice and POD — <strong>never a carrier ` +
-              `bill</strong> — before it goes out.</p>` +
-              `<table style="border-collapse:collapse;font-size:14px;` +
-              `margin:12px 0">` +
-              `<tr><td style="padding:4px 16px 4px 0">Customer</td>` +
-              `<td>${escapeHtml(customerName || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 16px 4px 0">Recipient</td>` +
-              `<td>${escapeHtml(customerEmail)}</td></tr>` +
-              `<tr><td style="padding:4px 16px 4px 0">Load #</td>` +
-              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 16px 4px 0">Carrier</td>` +
-              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 16px 4px 0">Amount</td>` +
-              `<td>$${Number(customerRate).toFixed(2)}</td></tr>` +
-              `</table>` +
-              `<p style="margin-top:16px">` +
-              `<a href="${approveUrl}" style="display:inline-block;` +
-              `padding:10px 20px;background:#16a34a;color:#fff;` +
-              `text-decoration:none;border-radius:8px;font-weight:700;` +
-              `margin-right:10px">Approve &amp; Send</a>` +
-              `<a href="${rejectUrl}" style="display:inline-block;` +
-              `padding:10px 20px;background:#dc2626;color:#fff;` +
-              `text-decoration:none;border-radius:8px;font-weight:700">` +
-              `Reject</a></p>`,
+            html: buildCustomerEmailApprovalHtml({
+              invoice,
+              customerName,
+              customerRate,
+              profit,
+              marginPct: marginPctCalc,
+              workingProNumber,
+              amountValidation,
+              baseAmount,
+              approvedChargesTotal,
+              finalCustomerInvoiceId,
+              issuedInvoiceNumber,
+              customerEmail,
+              customerEmailSource,
+              usePrimusEmail,
+              podStoragePath,
+              primusSteps,
+              approveUrl,
+              rejectUrl,
+              invoiceGenerationResult,
+            }),
           });
 
           await logWorkflowStep({
