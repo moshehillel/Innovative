@@ -5745,6 +5745,32 @@ async function primusRequest(method, path, body) {
 }
 
 /**
+ * Reads shipment mode from a Primus booking (GET /book/bolnumber).
+ * @param {object|null} booking Primus booking object.
+ * @return {string} Mode code/name, or empty string.
+ */
+function readShipmentMode(booking) {
+  if (!booking || typeof booking !== "object") return "";
+  const sm = booking.shipmentMode;
+  if (typeof sm === "string") return sm.trim();
+  if (sm && typeof sm === "object") {
+    return String(sm.code || sm.name || sm.description || "").trim();
+  }
+  if (booking.mode != null) return String(booking.mode).trim();
+  return "";
+}
+
+/**
+ * @param {object|null} booking Primus booking object.
+ * @return {boolean} True when Primus marks the load as drayage.
+ */
+function isDrayageShipment(booking) {
+  const mode = readShipmentMode(booking).toLowerCase();
+  if (!mode) return false;
+  return mode === "drayage" || mode.includes("dray");
+}
+
+/**
  * Fetches a Primus booking by BOL/load number.
  * @param {string} loadNumber BOL or load number.
  * @return {Promise<object|null>} Booking object or null.
@@ -6199,6 +6225,8 @@ const primusBundle = {
   primusRequest,
   getPrimusToken,
   fetchPrimusBooking,
+  readShipmentMode,
+  isDrayageShipment,
   validateAmountWithPrimus,
   addProNumberToLoad,
   getCustomerRate,

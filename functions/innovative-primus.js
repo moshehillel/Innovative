@@ -33,6 +33,8 @@ let buildCustomerInvoicePdfBase64;
 let primusRequest;
 let getPrimusToken;
 let fetchPrimusBooking;
+let readShipmentMode;
+let isDrayageShipment;
 let validateAmountWithPrimus;
 let addProNumberToLoad;
 let getCustomerRate;
@@ -59,7 +61,8 @@ function init(bundle) {
     isAlreadyDoneResult,
     downloadStorageFileBase64,
     buildCustomerInvoicePdfBase64, primusRequest, getPrimusToken,
-    fetchPrimusBooking, validateAmountWithPrimus, addProNumberToLoad,
+    fetchPrimusBooking, readShipmentMode, isDrayageShipment,
+    validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
     markShipmentDelivered, forwardToHumanReview, getGmailOAuthClient,
     isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
@@ -400,6 +403,70 @@ exports.processPrimusWorkflow = onRequest(
           approvedChargesTotal: approvedChargesTotal,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
+
+        // Drayage loads are not auto-processed — stop early before POD/AI work.
+        if (invoice.loadNumber && isDrayageShipment && readShipmentMode) {
+          const bookingForMode = await fetchPrimusBooking(invoice.loadNumber);
+          const shipmentMode = readShipmentMode(bookingForMode);
+          if (isDrayageShipment(bookingForMode)) {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "drayage_check",
+              stepStatus: "stopped",
+              reason: "Drayage shipment — workflow not supported",
+              output: {loadNumber: invoice.loadNumber, shipmentMode},
+            });
+
+            await saveOutboundEmail({
+              type: "drayage_stopped",
+              invoiceId,
+              subject: `Stopped — drayage load ${invoice.loadNumber}`,
+              html:
+                `<h2>Drayage load — not processed</h2>` +
+                `<p>I stopped this invoice workflow because Primus shows ` +
+                `this shipment is <strong>drayage</strong>. Drayage loads ` +
+                `are not handled automatically.</p>` +
+                `<table style="border-collapse:collapse;font-size:14px;` +
+                `margin:12px 0">` +
+                `<tr><td style="padding:4px 16px 4px 0">Load #</td>` +
+                `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
+                `<tr><td style="padding:4px 16px 4px 0">Carrier</td>` +
+                `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
+                `<tr><td style="padding:4px 16px 4px 0">Shipment mode</td>` +
+                `<td>${escapeHtml(shipmentMode || "Drayage")}</td></tr>` +
+                `<tr><td style="padding:4px 16px 4px 0">Carrier bill</td>` +
+                `<td>$${Number(invoice.invoiceAmount || 0).toFixed(2)}` +
+                `</td></tr>` +
+                `<tr><td style="padding:4px 16px 4px 0">Gmail subject</td>` +
+                `<td>${escapeHtml(invoice.gmailSubject || "—")}</td></tr>` +
+                `</table>` +
+                `<p>Please process this load manually in ShipPrimus.</p>`,
+            });
+
+            await invoiceDoc.ref.update({
+              decisionStage: "drayage_not_supported",
+              decisionReason: "Drayage shipment — not processed automatically",
+              shipmentMode: shipmentMode || "Drayage",
+              processingLock: false,
+              finalWorkflowStatus: "stopped_drayage",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+
+            await writeLog("info", "workflow",
+                "Workflow stopped — drayage shipment", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  shipmentMode,
+                  carrierName: invoice.carrierName || null,
+                });
+
+            return res.json({
+              ok: false,
+              error: "DRAYAGE_NOT_SUPPORTED",
+              shipmentMode,
+            });
+          }
+        }
 
         const extractedPodOnlyFile =
       await maybeExtractPodOnlyPdf(invoiceId, invoice);
