@@ -1,5 +1,4 @@
 ﻿const {onRequest} = require("firebase-functions/v2/https");
-const {onSchedule} = require("firebase-functions/v2/scheduler");
 
 const admin = require("firebase-admin");
 const {google} = require("googleapis");
@@ -3097,6 +3096,109 @@ async function analyzeEmailForForwarding(subject, from, body) {
   }
 }
 
+const INCOMING_EMAIL_INTENTS = new Set([
+  "carrier_invoice",
+  "insurance_premium",
+  "statement",
+  "unknown",
+]);
+
+/**
+ * Classifies an inbound email before routing to carrier, insurance, or review.
+ * Uses subject, sender, body, and attachment filenames only (no attachment
+ * bytes) so it is cheap to run on every message.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @param {string} body Email plain-text body.
+ * @param {Array<object>} attachments Attachment metadata from Gmail.
+ * @return {Promise<object>} Classification with intent, confidence, and hints.
+ */
+async function classifyIncomingEmail(subject, from, body, attachments) {
+  const fallback = {
+    intent: "unknown",
+    confidence: "low",
+    reasoning: "Classifier unavailable.",
+    spreadsheetFilename: null,
+    invoicePdfFilename: null,
+  };
+  const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
+  const attachmentMeta = (Array.isArray(attachments) ? attachments : [])
+      .map((a) => ({
+        filename: String(a && a.filename || ""),
+        mimeType: String(a && a.mimeType || ""),
+      }));
+
+  const res = await client.messages.create({
+    model: "claude-haiku-4-5",
+    max_tokens: 300,
+    system: [
+      "You classify inbound emails for a freight brokerage automation system.",
+      "Return ONLY valid JSON with these keys:",
+      "- intent: exactly one of carrier_invoice, insurance_premium,",
+      "  statement, unknown",
+      "- confidence: high, medium, or low",
+      "- reasoning: one short sentence",
+      "- spreadsheetFilename: if insurance_premium, the filename of the",
+      "  per-shipment premium breakdown spreadsheet when identifiable,",
+      "  else null",
+      "- invoicePdfFilename: if insurance_premium, the filename of the vendor",
+      "  insurance invoice PDF when identifiable, else null",
+      "",
+      "Rules:",
+      "- insurance_premium: cargo insurance vendor billing (e.g. Redkik) with",
+      "  a per-shipment premium spreadsheet — NOT a motor-carrier freight",
+      "  invoice. Often includes Excel/CSV plus a PDF invoice. Emails from",
+      "  quickbooks@notification.intuit.com may be insurance OR a carrier",
+      "  bill; use subject, body, and filenames — never assume QuickBooks",
+      "  means insurance.",
+      "- carrier_invoice: trucking company freight invoice, usually PDF",
+      "- statement: account statement or payment summary without a freight",
+      "  invoice to process",
+      "- unknown: marketing, unrelated, or unclear",
+    ].join("\n"),
+    messages: [{
+      role: "user",
+      content: JSON.stringify({
+        subject,
+        from,
+        body: String(body || "").slice(0, 3000),
+        attachments: attachmentMeta,
+      }),
+    }],
+  });
+
+  if (!res.content || res.content.length === 0) {
+    return fallback;
+  }
+  const rawText = res.content[0].text || "";
+  const jsonText = rawText
+      .replace(/^```(?:json)?\s*/i, "")
+      .replace(/\s*```$/i, "")
+      .trim();
+  try {
+    const parsed = JSON.parse(jsonText);
+    const intent = INCOMING_EMAIL_INTENTS.has(parsed.intent) ?
+      parsed.intent : "unknown";
+    const confidence = ["high", "medium", "low"].includes(parsed.confidence) ?
+      parsed.confidence : "low";
+    return {
+      intent,
+      confidence,
+      reasoning: String(parsed.reasoning || "").trim() ||
+        "No reasoning provided.",
+      spreadsheetFilename: parsed.spreadsheetFilename ?
+        String(parsed.spreadsheetFilename) : null,
+      invoicePdfFilename: parsed.invoicePdfFilename ?
+        String(parsed.invoicePdfFilename) : null,
+    };
+  } catch (e) {
+    return {
+      ...fallback,
+      reasoning: rawText.slice(0, 200) || fallback.reasoning,
+    };
+  }
+}
+
 /**
  * Processes a Gmail message and ingests it into the invoice workflow.
  * @param {object} gmail - Gmail client instance.
@@ -3207,58 +3309,122 @@ async function processGmailMessage(
       }
     }
 
-    // Insurance intake: QuickBooks notification sender only (Redkik premiums).
-    // Every other sender follows the regular carrier / forward-to-human flow.
-    if (!isTai && innovativeInsurance.isInsuranceEmail({from})) {
+    // Insurance intake: AI classifies the whole email, then a valid premium
+    // spreadsheet must parse before anything is posted to Primus.
+    if (!isTai && attachments.length > 0) {
+      let emailClassification = {
+        intent: "unknown",
+        confidence: "low",
+        reasoning: "not classified",
+        spreadsheetFilename: null,
+        invoicePdfFilename: null,
+      };
       try {
-        const excelAtt =
-            innovativeInsurance.findSpreadsheetAttachment(attachments);
-        const pdfAtt = innovativeInsurance.findPdfAttachment(attachments);
-        const excelBuffer = excelAtt ? await downloadGmailAttachmentBuffer(
-            gmail, messageId, excelAtt.attachmentId) : null;
-        const pdfBuffer = pdfAtt ? await downloadGmailAttachmentBuffer(
-            gmail, messageId, pdfAtt.attachmentId) : null;
-
-        const insResult = await innovativeInsurance.processInsuranceEmail({
-          excelBuffer, pdfBuffer, from, subject,
+        emailClassification = await classifyIncomingEmail(
+            subject, from, emailBody, attachments,
+        );
+        await writeLog("info", "ai", "Incoming email classified", {
+          messageId,
+          subject,
+          from,
+          ...emailClassification,
         });
+      } catch (classifyErr) {
+        await writeLog("warn", "ai", "Email classification failed", {
+          messageId, subject, error: classifyErr.message,
+        });
+      }
 
-        if (insResult.handled) {
-          await updateGmailQueueStatus(
-              messageId, "completed", null, {tenant},
+      if (emailClassification.intent === "insurance_premium") {
+        try {
+          const resolved =
+              await innovativeInsurance.resolveInsuranceAttachments({
+                attachments,
+                spreadsheetFilename:
+                    emailClassification.spreadsheetFilename,
+                invoicePdfFilename:
+                    emailClassification.invoicePdfFilename,
+                downloadAttachment: (att) => downloadGmailAttachmentBuffer(
+                    gmail, messageId, att.attachmentId,
+                ),
+              });
+
+          if (!resolved.excelBuffer) {
+            await writeLog("warn", "insurance",
+                "Insurance classified but workbook invalid — forwarding", {
+                  messageId,
+                  subject,
+                  classification: emailClassification,
+                  validation: resolved.validation,
+                });
+            await forwardWithAnalysis(
+                "Email looks like insurance but the premium spreadsheet " +
+                "could not be parsed for posting",
+                {department: "billing"},
+            );
+            await updateGmailQueueStatus(
+                messageId, "completed", null, {tenant},
+            );
+            return;
+          }
+
+          const insResult = await innovativeInsurance.processInsuranceEmail({
+            excelBuffer: resolved.excelBuffer,
+            pdfBuffer: resolved.pdfBuffer,
+            from,
+            subject,
+          });
+
+          if (insResult.handled) {
+            await updateGmailQueueStatus(
+                messageId, "completed", null, {tenant},
+            );
+            await tcol(tenant, "emailIntake").doc(messageId).set({
+              gmailMessageId: messageId,
+              tenantId: tenant.tenantId,
+              subject,
+              from,
+              finalStatus: "insurance_processed",
+              emailClassification,
+              insuranceAttachments: {
+                excelFilename: resolved.excelFilename,
+                pdfFilename: resolved.pdfFilename,
+              },
+              insuranceReconciliation: insResult.reconciliation || null,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              deleteAt: getDeleteAt(30),
+            }, {merge: true});
+            return;
+          }
+
+          await writeLog("warn", "insurance",
+              "Insurance email not handled — forwarding", {
+                messageId,
+                subject,
+                reason: insResult.reason,
+                classification: emailClassification,
+              });
+          await forwardWithAnalysis(
+              `Insurance email could not be processed automatically ` +
+              `(${insResult.reason || "unknown"})`,
+              {department: "billing"},
           );
-          await tcol(tenant, "emailIntake").doc(messageId).set({
-            gmailMessageId: messageId,
-            tenantId: tenant.tenantId,
-            subject, from,
-            finalStatus: "insurance_processed",
-            insuranceReconciliation: insResult.reconciliation || null,
-            createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            deleteAt: getDeleteAt(30),
-          }, {merge: true});
+          await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+          return;
+        } catch (insErr) {
+          await writeLog("error", "insurance",
+              "Insurance intake failed — forwarding for review", {
+                messageId,
+                subject,
+                error: insErr.message,
+                stack: insErr.stack,
+                classification: emailClassification,
+              });
+          await forwardWithAnalysis(
+              "Insurance email processing failed", {department: "billing"});
+          await updateGmailQueueStatus(messageId, "completed", null, {tenant});
           return;
         }
-
-        await writeLog("warn", "insurance",
-            "Insurance email from QuickBooks not handled — forwarding", {
-              messageId, subject, reason: insResult.reason,
-            });
-        await forwardWithAnalysis(
-            `Insurance email could not be processed automatically ` +
-            `(${insResult.reason || "unknown"})`,
-            {department: "billing"},
-        );
-        await updateGmailQueueStatus(messageId, "completed", null, {tenant});
-        return;
-      } catch (insErr) {
-        await writeLog("error", "insurance",
-            "Insurance intake failed — forwarding for review", {
-              messageId, subject, error: insErr.message, stack: insErr.stack,
-            });
-        await forwardWithAnalysis(
-            "Insurance email processing failed", {department: "billing"});
-        await updateGmailQueueStatus(messageId, "completed", null, {tenant});
-        return;
       }
     }
 
@@ -4392,23 +4558,20 @@ exports.getGmailStatus = onRequest(async (req, res) => {
   }
 });
 
-exports.gmailDisconnect = onRequest(
-    {invoker: "public"},
-    async (req, res) => {
-      if (applyDashboardCors(req, res)) return;
-      if (req.method !== "POST") {
-        return res.status(405).json({ok: false, error: "Method not allowed."});
-      }
-      try {
-        const tenant = await resolveDashboardTenant(req);
-        await db.collection("settings").doc(tenantGmailDocId(tenant)).delete();
-        return res.json({ok: true, tenantId: tenant.tenantId});
-      } catch (error) {
-        console.error("gmailDisconnect error:", error);
-        return res.status(500).json({ok: false, error: error.message});
-      }
-    },
-);
+exports.gmailDisconnect = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    await db.collection("settings").doc(tenantGmailDocId(tenant)).delete();
+    return res.json({ok: true, tenantId: tenant.tenantId});
+  } catch (error) {
+    console.error("gmailDisconnect error:", error);
+    return res.status(500).json({ok: false, error: error.message});
+  }
+});
 
 exports.setCustomerRate = onRequest(async (req, res) => {
   const invoiceId = req.query.invoiceId || (req.body && req.body.invoiceId);
@@ -4570,89 +4733,83 @@ exports.setCustomerRate = onRequest(async (req, res) => {
 </body></html>`);
 });
 
-exports.getRecentLogs = onRequest(
-    {invoker: "public"},
-    async (req, res) => {
-      if (applyDashboardCors(req, res)) return;
-      try {
-        const tenant = await resolveDashboardTenant(req);
-        const limit = Math.min(Number(req.query.limit || 40), 100);
-        const dataset = tenant.bqDataset;
-        const [rows] = await bigquery.query({
-          query: `
-            SELECT timestamp, level, category, message
-            FROM \`${dataset}.${BQ_LOGS_TABLE}\`
-            ORDER BY timestamp DESC
-            LIMIT @limit
-          `,
-          params: {limit},
-        });
-        const logs = rows.map((row) => ({
-          timestamp: row.timestamp && row.timestamp.value ?
-            row.timestamp.value : String(row.timestamp),
-          level: row.level,
-          category: row.category,
-          message: row.message,
-        }));
-        return res.json({ok: true, tenantId: tenant.tenantId, logs});
-      } catch (error) {
-        console.error("getRecentLogs error:", error);
-        return res.status(500).json({
-          ok: false, error: "Failed to load logs.", details: error.message,
-        });
-      }
-    },
-);
+exports.getRecentLogs = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const limit = Math.min(Number(req.query.limit || 40), 100);
+    const dataset = tenant.bqDataset;
+    const [rows] = await bigquery.query({
+      query: `
+        SELECT timestamp, level, category, message
+        FROM \`${dataset}.${BQ_LOGS_TABLE}\`
+        ORDER BY timestamp DESC
+        LIMIT @limit
+      `,
+      params: {limit},
+    });
+    const logs = rows.map((row) => ({
+      timestamp: row.timestamp && row.timestamp.value ?
+        row.timestamp.value : String(row.timestamp),
+      level: row.level,
+      category: row.category,
+      message: row.message,
+    }));
+    return res.json({ok: true, tenantId: tenant.tenantId, logs});
+  } catch (error) {
+    console.error("getRecentLogs error:", error);
+    return res.status(500).json({
+      ok: false, error: "Failed to load logs.", details: error.message,
+    });
+  }
+});
 
-exports.getRecentInvoices = onRequest(
-    {invoker: "public"},
-    async (req, res) => {
-      if (applyDashboardCors(req, res)) return;
-      try {
-        const tenant = await resolveDashboardTenant(req);
-        const limit = Math.min(Number(req.query.limit || 20), 50);
-        const snap = await tcol(tenant, "invoices")
-            .orderBy("createdAt", "desc")
-            .limit(limit)
-            .get();
-        const invoices = snap.docs.map((doc) => {
-          const data = doc.data() || {};
-          const createdAt = data.createdAt && data.createdAt.toDate ?
-            data.createdAt.toDate().toISOString() : null;
-          return {
-            id: doc.id,
-            loadNumber: data.loadNumber || null,
-            proNumber: data.proNumber || null,
-            carrierName: data.carrierName || null,
-            customerName: data.customerName || null,
-            invoiceAmount: data.invoiceAmount || null,
-            customerRate: data.customerRate || null,
-            profit: data.profit || null,
-            tms: data.tms || tenant.tms,
-            taiShipmentId: data.taiShipmentId || null,
-            finalWorkflowStatus: data.finalWorkflowStatus || null,
-            decisionStage: data.decisionStage || null,
-            decisionReason: data.decisionReason || null,
-            currentStep: data.currentStep || null,
-            createdAt,
-          };
-        });
-        return res.json({
-          ok: true,
-          tenantId: tenant.tenantId,
-          tms: tenant.tms,
-          invoices,
-        });
-      } catch (error) {
-        console.error("getRecentInvoices error:", error);
-        return res.status(500).json({
-          ok: false,
-          error: "Failed to load invoices.",
-          details: error.message,
-        });
-      }
-    },
-);
+exports.getRecentInvoices = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const limit = Math.min(Number(req.query.limit || 20), 50);
+    const snap = await tcol(tenant, "invoices")
+        .orderBy("createdAt", "desc")
+        .limit(limit)
+        .get();
+    const invoices = snap.docs.map((doc) => {
+      const data = doc.data() || {};
+      const createdAt = data.createdAt && data.createdAt.toDate ?
+        data.createdAt.toDate().toISOString() : null;
+      return {
+        id: doc.id,
+        loadNumber: data.loadNumber || null,
+        proNumber: data.proNumber || null,
+        carrierName: data.carrierName || null,
+        customerName: data.customerName || null,
+        invoiceAmount: data.invoiceAmount || null,
+        customerRate: data.customerRate || null,
+        profit: data.profit || null,
+        tms: data.tms || tenant.tms,
+        taiShipmentId: data.taiShipmentId || null,
+        finalWorkflowStatus: data.finalWorkflowStatus || null,
+        decisionStage: data.decisionStage || null,
+        decisionReason: data.decisionReason || null,
+        currentStep: data.currentStep || null,
+        createdAt,
+      };
+    });
+    return res.json({
+      ok: true,
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
+      invoices,
+    });
+  } catch (error) {
+    console.error("getRecentInvoices error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to load invoices.",
+      details: error.message,
+    });
+  }
+});
 
 exports.getDashboardStats = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) {
@@ -5121,10 +5278,39 @@ async function checkGmailInboxForTenant(tenant, inboxFlowId) {
   });
 }
 
+const PRIMUS_SESSION_RENEWAL_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Renews the Primus manage.php session at most once every 12 hours.
+ * Runs from checkGmailInbox so we avoid a separate scheduled function.
+ */
+async function renewPrimusUiSessionIfDue() {
+  const bridge = require("./primus-ui-bridge");
+  if (!bridge.isManagePhpEnabled()) return;
+  const ref = db.collection("settings").doc("primusUiSessionRenewal");
+  const snap = await ref.get();
+  const lastRunMs = snap.exists && snap.data().lastRunAt &&
+    snap.data().lastRunAt.toDate ?
+    snap.data().lastRunAt.toDate().getTime() : 0;
+  if (Date.now() - lastRunMs < PRIMUS_SESSION_RENEWAL_MS) return;
+  const result = await bridge.renewUiSession();
+  if (result.skipped) return;
+  if (result.ok) {
+    await ref.set(
+        {lastRunAt: admin.firestore.FieldValue.serverTimestamp()},
+        {merge: true},
+    );
+    return;
+  }
+  console.error("renewPrimusUiSessionIfDue failed:", result.error);
+}
+
 exports.checkGmailInbox = onRequest(
     {timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
       try {
+        await renewPrimusUiSessionIfDue();
+
         await logWorkflowStep({
           stepName: "gmail_email_found",
           stepStatus: "started",
@@ -5856,18 +6042,6 @@ innovativeInsurance.init({
   addInsurancePremiumToLoad: primusUiBridge.addInsurancePremiumToLoad,
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
 });
-
-// Renew Primus manage.php PHPSESSID before the 24h cookie expires.
-exports.refreshPrimusUiSession = onSchedule(
-    {schedule: "every 12 hours", timeZone: "America/New_York"},
-    async () => {
-      const result = await primusUiBridge.renewUiSession();
-      if (result.skipped) return;
-      if (!result.ok) {
-        console.error("refreshPrimusUiSession failed:", result.error);
-      }
-    },
-);
 
 const tai = require("./tai");
 tai.init(sharedTmsBundle);

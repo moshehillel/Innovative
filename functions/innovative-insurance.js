@@ -17,10 +17,9 @@
  *     how many premiums were added, how many were not, the dollar sums on each
  *     side, and the precise reason each skipped row was left out.
  *
- * Business rule (ops): post what we can, email the rest with exact detail.
- *
- * The functions here are pure/injectable so they can be unit-tested and run as
- * a dry run (see scripts/insurance-allocate.js) without touching Primus.
+ * Detection: an early AI email classifier (see index.js classifyIncomingEmail)
+ * routes insurance_premium emails here. Posting still requires a workbook that
+ * passes validateInsuranceWorkbook — sender address alone is never enough.
  */
 
 "use strict";
@@ -506,10 +505,198 @@ function extractFromEmail(from) {
 }
 
 /**
+ * Returns true when a filename loosely matches a classifier hint.
+ * @param {string} filename Attachment filename.
+ * @param {string} hint Filename hint from the email classifier.
+ * @return {boolean}
+ */
+function filenameMatchesHint(filename, hint) {
+  const file = String(filename || "").trim().toLowerCase();
+  const needle = String(hint || "").trim().toLowerCase();
+  if (!file || !needle) return false;
+  if (file === needle) return true;
+  const fileBase = file.replace(/\.[^.]+$/, "");
+  const hintBase = needle.replace(/\.[^.]+$/, "");
+  return file.includes(needle) || needle.includes(file) ||
+    (fileBase && hintBase && fileBase === hintBase);
+}
+
+/**
+ * @param {Array<object>} attachments Attachment metadata.
+ * @return {Array<object>}
+ */
+function listSpreadsheetAttachments(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.filter((a) => a && (
+    SPREADSHEET_EXT.test(String(a.filename || "")) ||
+    /spreadsheet|excel|csv/i.test(String(a.mimeType || ""))));
+}
+
+/**
+ * @param {Array<object>} attachments Attachment metadata.
+ * @return {Array<object>}
+ */
+function listPdfAttachments(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.filter((a) => a && (
+    /\.pdf$/i.test(String(a.filename || "")) ||
+    String(a.mimeType || "") === "application/pdf"));
+}
+
+/**
+ * Validates that a workbook looks like a per-shipment insurance premium sheet.
+ * @param {Buffer} buffer Spreadsheet bytes.
+ * @return {object} Validation summary with rows and postable counts.
+ */
+function validateInsuranceWorkbook(buffer) {
+  const {rows} = parseInsuranceExcel(buffer);
+  const {addable} = classifyRows(rows);
+  const premiumRowCount = rows.filter((r) => r.amount > 0).length;
+  if (!rows.length) {
+    return {
+      valid: false,
+      rows,
+      addableCount: 0,
+      premiumRowCount: 0,
+      rowCount: 0,
+      reason: "no rows parsed from spreadsheet",
+    };
+  }
+  if (addable.length < 1) {
+    return {
+      valid: false,
+      rows,
+      addableCount: 0,
+      premiumRowCount,
+      rowCount: rows.length,
+      reason: "no postable premium rows with BOL and amount",
+    };
+  }
+  return {
+    valid: true,
+    rows,
+    addableCount: addable.length,
+    premiumRowCount,
+    rowCount: rows.length,
+    reason: null,
+  };
+}
+
+/**
+ * Scores a parsed insurance invoice PDF for attachment selection.
+ * @param {object} invoice Parsed invoice fields.
+ * @param {object} att Attachment metadata.
+ * @param {string|null} filenameHint Classifier filename hint.
+ * @return {number}
+ */
+function scoreInsuranceInvoicePdf(invoice, att, filenameHint) {
+  let score = 0;
+  if (invoice.invoiceTotal > 0) score += 3;
+  if (invoice.invoiceNumber) score += 2;
+  if (/redkik|insurance/i.test(invoice.vendorName || "")) score += 2;
+  if (/redkik|insurance|premium/i.test(invoice.rawText || "")) score += 1;
+  if (filenameHint && filenameMatchesHint(att.filename, filenameHint)) {
+    score += 5;
+  }
+  if (/invoice|statement/i.test(String(att.filename || ""))) score += 1;
+  return score;
+}
+
+/**
+ * Downloads spreadsheet/PDF candidates and picks insurance attachments.
+ * @param {object} opts Options.
+ * @param {Array<object>} opts.attachments Attachment metadata from Gmail.
+ * @param {function(object): Promise<Buffer>} opts.downloadAttachment
+ *   Async callback that returns bytes for one attachment object.
+ * @param {string} [opts.spreadsheetFilename] Classifier spreadsheet hint.
+ * @param {string} [opts.invoicePdfFilename] Classifier invoice PDF hint.
+ * @return {Promise<object>} Resolved excel/pdf buffers and validation.
+ */
+async function resolveInsuranceAttachments(opts) {
+  const attachments = (opts && opts.attachments) || [];
+  const downloadAttachment = opts && opts.downloadAttachment;
+  const spreadsheetHint = opts && opts.spreadsheetFilename;
+  const pdfHint = opts && opts.invoicePdfFilename;
+
+  if (typeof downloadAttachment !== "function") {
+    throw new Error("downloadAttachment callback required");
+  }
+
+  const spreadsheets = listSpreadsheetAttachments(attachments);
+  let bestExcel = null;
+  let bestExcelFilename = null;
+  let bestValidation = null;
+  let bestExcelScore = -1;
+
+  for (const att of spreadsheets) {
+    let buffer;
+    try {
+      buffer = await downloadAttachment(att);
+    } catch (err) {
+      continue;
+    }
+    const validation = validateInsuranceWorkbook(buffer);
+    let score = validation.addableCount * 10 + validation.premiumRowCount;
+    if (spreadsheetHint && filenameMatchesHint(att.filename, spreadsheetHint)) {
+      score += 50;
+    }
+    if (score > bestExcelScore) {
+      bestExcelScore = score;
+      bestValidation = validation;
+      if (validation.valid) {
+        bestExcel = buffer;
+        bestExcelFilename = att.filename || null;
+      }
+    }
+  }
+
+  const pdfs = listPdfAttachments(attachments);
+  let bestPdf = null;
+  let bestPdfFilename = null;
+  let bestPdfScore = -1;
+
+  for (const att of pdfs) {
+    let buffer;
+    try {
+      buffer = await downloadAttachment(att);
+    } catch (err) {
+      continue;
+    }
+    try {
+      const invoice = await parseInsuranceInvoicePdf(buffer);
+      const score = scoreInsuranceInvoicePdf(invoice, att, pdfHint);
+      if (score > bestPdfScore) {
+        bestPdfScore = score;
+        bestPdf = buffer;
+        bestPdfFilename = att.filename || null;
+      }
+    } catch (err) {
+      if (pdfHint && filenameMatchesHint(att.filename, pdfHint)) {
+        const hintScore = 4;
+        if (hintScore > bestPdfScore) {
+          bestPdfScore = hintScore;
+          bestPdf = buffer;
+          bestPdfFilename = att.filename || null;
+        }
+      }
+    }
+  }
+
+  return {
+    excelBuffer: bestExcel,
+    pdfBuffer: bestPdf,
+    excelFilename: bestExcelFilename,
+    pdfFilename: bestPdfFilename,
+    validation: bestValidation,
+  };
+}
+
+/**
  * Insurance intake is keyed off the QuickBooks sender only. All other
  * senders follow the regular carrier / forward-to-human flow.
  * @param {object} opts {from}.
  * @return {boolean}
+ * @deprecated Prefer AI email classification plus validateInsuranceWorkbook.
  */
 function isInsuranceEmail(opts) {
   const fromEmail = extractFromEmail(opts && opts.from);
@@ -542,10 +729,12 @@ async function processInsuranceEmail(opts) {
     return {handled: false, reason: "manage.php off"};
   }
 
-  const {rows} = parseInsuranceExcel(opts.excelBuffer);
-  if (!rows.length) {
-    return {handled: false, reason: "no rows parsed from spreadsheet"};
+  const workbookCheck = validateInsuranceWorkbook(opts.excelBuffer);
+  if (!workbookCheck.valid) {
+    return {handled: false, reason: workbookCheck.reason || "invalid workbook"};
   }
+
+  const {rows} = workbookCheck;
 
   let invoice = {};
   let invoiceTotal = 0;
@@ -615,6 +804,10 @@ module.exports = {
   init,
   findSpreadsheetAttachment,
   findPdfAttachment,
+  listSpreadsheetAttachments,
+  listPdfAttachments,
+  validateInsuranceWorkbook,
+  resolveInsuranceAttachments,
   extractFromEmail,
   isInsuranceEmail,
   processInsuranceEmail,
