@@ -1,4 +1,5 @@
 ﻿const {onRequest} = require("firebase-functions/v2/https");
+const {onSchedule} = require("firebase-functions/v2/scheduler");
 
 const admin = require("firebase-admin");
 const {google} = require("googleapis");
@@ -93,12 +94,16 @@ const DEFAULT_TENANT = Object.freeze({
  */
 function normalizeTenant(tenantId, data) {
   const d = data || {};
+  // Every default is the tenant's OWN namespace — never root or the default
+  // tenant's dataset. A tenant doc that omits collectionPrefix/bqDataset still
+  // reads/writes only its own (empty-until-used) data, so one client can never
+  // fall back onto another client's collections, logs, or stats.
   return {
     tenantId: String(tenantId),
     name: d.name || String(tenantId),
-    tms: String(d.tms || "primus").toLowerCase(),
-    collectionPrefix: String(d.collectionPrefix || "").trim(),
-    bqDataset: d.bqDataset || BQ_DATASET,
+    tms: String(d.tms || "").toLowerCase(),
+    collectionPrefix: String(d.collectionPrefix || tenantId).trim(),
+    bqDataset: d.bqDataset || `${BQ_DATASET}_${tenantId}`,
     gmailDocId: d.gmailDocId || `gmail_${tenantId}`,
     alertEmail: d.alertEmail || process.env.ALERT_EMAIL || null,
     active: d.active !== false,
@@ -106,8 +111,49 @@ function normalizeTenant(tenantId, data) {
 }
 
 /**
- * Resolves a tenant by id, falling back to the default (Primus) tenant when the
- * id is missing/"default" or no matching tenant doc exists.
+ * Resolves the tenant for an invoice "action" endpoint (continue/resume/email
+ * links) from the request's tenantId (query or body). The links we generate
+ * carry tenantId so a prefixed tenant's invoice is found in its own collection;
+ * with no tenantId it defaults to the default tenant (correct for legacy
+ * single-tenant links).
+ * @param {object} req Express-style request.
+ * @return {Promise<object>} Tenant config.
+ */
+function tenantFromRequest(req) {
+  const tenantId = (req.query && req.query.tenantId) ||
+    (req.body && req.body.tenantId) || null;
+  return getTenant(tenantId);
+}
+
+/**
+ * Builds a fail-closed config for a tenant whose `tenants/{id}` doc does not
+ * exist (or could not be read). Crucially it does NOT inherit the default
+ * tenant's data location: it points at the tenant's OWN namespace (prefix =
+ * id, its own dataset + inbox), which is empty until the tenant is configured.
+ * This guarantees an unconfigured/typo'd tenant shows nothing rather than
+ * leaking the default (Innovative) tenant's invoices, logs, and stats.
+ * @param {string} tenantId Tenant identifier.
+ * @return {object} Namespaced, inactive tenant config.
+ */
+function unconfiguredTenant(tenantId) {
+  const id = String(tenantId);
+  return {
+    tenantId: id,
+    name: id,
+    tms: "",
+    collectionPrefix: id,
+    bqDataset: `${BQ_DATASET}_${id}`,
+    gmailDocId: `gmail_${id}`,
+    alertEmail: process.env.ALERT_EMAIL || null,
+    active: false,
+  };
+}
+
+/**
+ * Resolves a tenant by id. Returns the default (Innovative) tenant only for a
+ * missing id or the explicit "default" id. Any other id whose doc does not
+ * exist resolves to a fail-closed, tenant-namespaced config (see
+ * unconfiguredTenant) so it can never read another tenant's data.
  * @param {string|null} tenantId Tenant identifier.
  * @return {Promise<object>} Tenant config.
  */
@@ -118,12 +164,12 @@ async function getTenant(tenantId) {
   try {
     const snap = await db.collection("tenants").doc(String(tenantId)).get();
     if (!snap.exists) {
-      return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+      return unconfiguredTenant(tenantId);
     }
     return normalizeTenant(tenantId, snap.data());
   } catch (error) {
     console.error(`getTenant(${tenantId}) failed:`, error.message);
-    return {...DEFAULT_TENANT, tenantId: String(tenantId)};
+    return unconfiguredTenant(tenantId);
   }
 }
 
@@ -198,20 +244,53 @@ async function getTenantGmailClient(tenant) {
 }
 
 /**
- * Resolves the workflow kickoff URL for a TMS. Falls back to the deployed
- * Cloud Functions URL when the matching env var is not set.
+ * Resolves the workflow kickoff URL for a TMS. There is NO implicit default:
+ * an unrecognized or empty TMS returns null so the caller treats it as a
+ * configuration error instead of silently routing to Primus.
  * @param {string} tms TMS key ("tai" or "primus").
- * @return {string} Absolute workflow endpoint URL.
+ * @return {string|null} Absolute workflow endpoint URL, or null if unknown.
  */
 function workflowUrlForTms(tms) {
   const base =
     "https://us-central1-tai-invoice-automation.cloudfunctions.net";
-  if (String(tms).toLowerCase() === "tai") {
+  const key = String(tms || "").toLowerCase();
+  if (key === "tai") {
     return process.env.PROCESS_TAI_WORKFLOW_URL ||
       `${base}/processTaiWorkflow`;
   }
-  return process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-    `${base}/processPrimusWorkflow`;
+  if (key === "primus") {
+    return process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
+      `${base}/processPrimusWorkflow`;
+  }
+  return null;
+}
+
+// Per-company workflow endpoints. Each company file owns its own workflow
+// function, so routing is keyed by tenantId first (a company can have a
+// dedicated endpoint), then falls back to the generic per-TMS workflow. Add a
+// row here when onboarding a company with its own file.
+const TENANT_WORKFLOW_FUNCTIONS = Object.freeze({
+  ctc: "processCtcTaiWorkflow",
+});
+
+/**
+ * Resolves the workflow kickoff URL for a specific tenant. Prefers a dedicated
+ * per-company endpoint (TENANT_WORKFLOW_FUNCTIONS) and otherwise falls back to
+ * the generic per-TMS workflow URL. Returns null when the tenant's TMS is
+ * unknown (no implicit Primus default).
+ * @param {object} tenant Tenant config.
+ * @return {string|null} Absolute workflow endpoint URL, or null if unknown.
+ */
+function workflowUrlForTenant(tenant) {
+  const base =
+    "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+  const fn = tenant && TENANT_WORKFLOW_FUNCTIONS[tenant.tenantId];
+  if (fn) {
+    const envOverride = process.env[
+        `PROCESS_${tenant.tenantId.toUpperCase()}_WORKFLOW_URL`];
+    return envOverride || `${base}/${fn}`;
+  }
+  return workflowUrlForTms(tenant && tenant.tms);
 }
 
 // Tenant context for logging. Routing a tenant through every one of the dozens
@@ -227,6 +306,20 @@ const tenantContext = new AsyncLocalStorage();
  */
 function currentTenant() {
   return tenantContext.getStore() || null;
+}
+
+/**
+ * Binds `tenant` as the ambient logging context for the remainder of the
+ * current async execution, without a callback wrapper. Per-company workflow
+ * handlers call this once after resolving their tenant so every downstream
+ * writeLog/logWorkflowStep routes to that tenant's BigQuery dataset and
+ * Firestore collections — never another company's. Each HTTP invocation runs
+ * in its own async context, so this never leaks across requests.
+ * @param {object} tenant Tenant config.
+ * @return {void}
+ */
+function enterTenantContext(tenant) {
+  tenantContext.enterWith(tenant || DEFAULT_TENANT);
 }
 
 /**
@@ -334,7 +427,8 @@ exports.sendCustomerMissingEmail = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -366,7 +460,7 @@ exports.sendCustomerMissingEmail = onRequest(async (req, res) => {
     const htmlContent =
       `<p>Invoice ${invoiceId} is for a test customer ` +
       `(${invoice.customerName}).</p>` +
-      `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
+      `${buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId)}`;
     await saveOutboundEmail({
       type: "customer_missing",
       invoiceId,
@@ -849,7 +943,8 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -889,7 +984,7 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
     const rateStatus = missingRate ? "no customer rate" : "low margin";
     const htmlContent =
       `<p>Invoice ${invoiceId} has ${rateStatus}.</p>` +
-      `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
+      `${buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId)}`;
     await saveOutboundEmail({
       type: "rate_missing",
       invoiceId,
@@ -919,7 +1014,8 @@ exports.continueWorkflow = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -938,9 +1034,17 @@ exports.continueWorkflow = onRequest(async (req, res) => {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
+    // hardcoded Primus default.
+    const workflowUrl = workflowUrlForTenant(tenant);
+    if (!workflowUrl) {
+      return res.status(400).json({
+        ok: false,
+        error: `No workflow configured for tenant ${tenant.tenantId}.`,
+      });
+    }
     const response = await fetch(
-        process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-        "https://us-central1-tai-invoice-automation.cloudfunctions.net/processPrimusWorkflow",
+        workflowUrl,
         {
           method: "POST",
           headers: {
@@ -948,6 +1052,7 @@ exports.continueWorkflow = onRequest(async (req, res) => {
           },
           body: JSON.stringify({
             invoiceId: invoiceId,
+            tenantId: tenant.tenantId,
             resumeFrom: paused || null,
           }),
         },
@@ -970,6 +1075,80 @@ exports.continueWorkflow = onRequest(async (req, res) => {
   }
 });
 
+// Reviewer approval gate for the final customer-facing email. The workflow
+// pauses at "send_customer_email" and emails a designated reviewer an
+// Approve/Reject link. Approving resumes the workflow (which sends); rejecting
+// resumes it into the "not sent" branch. This is the last line of defense
+// against a carrier bill / POD ever reaching the customer.
+exports.approveCustomerEmail = onRequest(async (req, res) => {
+  try {
+    const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
+    const decision = String(
+        (req.body && req.body.decision) || req.query.decision || "",
+    ).toLowerCase();
+
+    if (!invoiceId || (decision !== "approve" && decision !== "reject")) {
+      return res.status(400).send(
+          "Missing invoiceId or a valid decision (approve|reject).");
+    }
+
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
+    const snap = await invoiceRef.get();
+    if (!snap.exists) {
+      return res.status(404).send("Invoice not found.");
+    }
+
+    const approved = decision === "approve";
+    await invoiceRef.update({
+      customerEmailApproval: approved ? "approved" : "rejected",
+      customerEmailApprovalAt: admin.firestore.FieldValue.serverTimestamp(),
+      workflowPausedAtStep: null,
+      workflowPausedAt: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    // Resume the invoice's own tenant workflow; the send/no-send decision is
+    // enforced by the approval gate inside the workflow itself.
+    const workflowUrl = workflowUrlForTenant(tenant);
+    if (workflowUrl) {
+      fetch(workflowUrl, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          invoiceId: invoiceId,
+          tenantId: tenant.tenantId,
+          resumeFrom: "send_customer_email",
+        }),
+      }).catch((e) =>
+        console.error("approveCustomerEmail: resume failed", e.message));
+    } else {
+      console.error("approveCustomerEmail: no workflow URL for tenant",
+          tenant.tenantId);
+    }
+
+    const title = approved ? "Approved" : "Rejected";
+    const color = approved ? "#16a34a" : "#dc2626";
+    const message = approved ?
+      "The customer email has been approved and is being sent now." :
+      "The customer email has been rejected and will not be sent.";
+    return res.status(200).send(
+        `<!doctype html><html><head><meta charset="utf-8">` +
+        `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+        `<title>${title}</title></head>` +
+        `<body style="font-family:Arial,sans-serif;text-align:center;` +
+        `padding:48px;color:#111827">` +
+        `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
+        `<p style="font-size:16px;color:#374151">${message}</p>` +
+        `<p style="font-size:13px;color:#9ca3af">Load ` +
+        `${escapeHtml(String(snap.data().loadNumber || invoiceId))}</p>` +
+        `</body></html>`);
+  } catch (error) {
+    console.error("approveCustomerEmail error:", error);
+    return res.status(500).send("Internal server error.");
+  }
+});
+
 exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
   try {
     const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
@@ -981,7 +1160,8 @@ exports.sendGeneratedBillEmail = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
 
     if (!snap.exists) {
@@ -1207,7 +1387,10 @@ exports.processInvoice = onRequest(async (req, res) => {
 
     const decisionStage = "pending_primus_check";
 
-    const docRef = await db.collection("invoices").add({
+    const tenant = await tenantFromRequest(req);
+    const docRef = await tcol(tenant, "invoices").add({
+      tenantId: tenant.tenantId,
+      tms: tenant.tms,
       carrierName: carrierName,
       invoiceNumber: invoiceNumber,
       proNumber: proNumber,
@@ -1264,7 +1447,8 @@ exports.checkInvoiceAgainstPrimus = onRequest(async (req, res) => {
       });
     }
 
-    const invoiceRef = db.collection("invoices").doc(invoiceId);
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(invoiceId);
     const invoiceSnap = await invoiceRef.get();
 
     if (!invoiceSnap.exists) {
@@ -1854,7 +2038,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Beyond PRO, Advance PRO, or freight bill number.",
         "Keep load number and PRO number separate.",
         "Do not use the PRO number as the load number.",
-        "Find invoice total and due date.",
+        "Find invoice total, invoice date, and due date.",
+        "invoiceDate is the date the carrier issued the invoice " +
+        "(YYYY-MM-DD).",
         "Fuel surcharge is not an extra charge.",
         "Recognized extra charges are lumper and detention only.",
         "Detention = driver waiting time charge.",
@@ -1870,21 +2056,36 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Do not invent charges.",
         "Any other added charge is unrecognized_charges.",
         "If attachment is not a freight invoice, status is error.",
-        "Detect Proof of Delivery (POD) documents.",
-        "POD may be a separate attachment, on the last page of the invoice, " +
-        "or in the bottom section of the same page as the invoice.",
-        "Look for signed Bill of Lading, delivery receipt, or POD " +
-        "confirmation.",
-        "POD should have signatures, delivery dates, or Received stamps.",
-        "If POD content (signature, stamp, Received mark, or delivery " +
-        "confirmation) appears in the bottom section of an invoice page " +
-        "rather than on its own page, set pod.source to " +
-        "'same_page_as_invoice', pod.attachmentFilename to that file, " +
-        "pod.page to the 1-based page number, and pod.cropFromBottom to " +
-        "the estimated fraction of the page height from the bottom that " +
-        "contains the POD content (e.g. 0.35 means the bottom 35%). " +
-        "Only use when the POD is clearly in the bottom portion of an " +
-        "invoice page.",
+        "Detect Proof of Delivery (POD) and shipment document pages.",
+        "Include in pod.documents every post-invoice page that supports " +
+        "delivery: unsigned POD forms, signed BOL, signed delivery receipt.",
+        "Sources: 'unsigned_pod_template', 'signed_bol', 'signed_load', " +
+        "'delivery_receipt', 'signed_pod', 'separate_attachment', " +
+        "'last_page_of_invoice', 'same_page_as_invoice'.",
+        "When a PDF has invoice + POD form + signed BOL + delivery receipt, " +
+        "list ALL of those pages in pod.documents (page order).",
+        "pod.documents is an array of {source, page, attachmentFilename, " +
+        "reason} with 1-based page numbers.",
+        "NEVER include a page in pod.documents if it shows the carrier " +
+        "invoice Amount Due, bill total, or line-item charges matching " +
+        "invoiceAmount — that is the invoice page, not POD/BOL.",
+        "A POD proves the GOODS were DELIVERED: delivery signature, " +
+        "received/delivered date, consignee sign-off, piece/pallet counts. " +
+        "A Rate Confirmation, Rate Agreement, Load Confirmation, Carrier " +
+        "Confirmation or Load Tender proves the agreed CARRIER PAY/RATE and " +
+        "is NOT a POD. NEVER include a rate/load confirmation page in " +
+        "pod.documents, even if it is signed — it exposes carrier cost.",
+        "NEVER include any page that shows a freight rate, line haul, fuel " +
+        "surcharge, carrier pay, agreed rate, or any dollar rate/charge " +
+        "amount. Only include pages proving delivery, with no pricing.",
+        "Use source 'separate_attachment' ONLY when the POD is a DIFFERENT " +
+        "file than the carrier invoice PDF. If the invoice and POD are in " +
+        "the SAME PDF, list the POD pages individually by page number with " +
+        "'signed_bol', 'signed_load', 'delivery_receipt', 'signed_pod', or " +
+        "'unsigned_pod_template' — never 'separate_attachment'.",
+        "Use source 'same_page_as_invoice' ONLY when invoice line items " +
+        "are on top and a small signature/stamp block is at the bottom. " +
+        "Set pod.cropFromBottom to the bottom fraction (e.g. 0.35).",
       ],
       requiredJsonShape: {
         status: "ready_for_primus_validation",
@@ -1892,6 +2093,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         loadNumber: "",
         proNumber: "",
         invoiceAmount: 0,
+        invoiceDate: "",
         dueDate: "",
         carrierName: "",
         charges: [],
@@ -1904,6 +2106,14 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         chargeProofRefs: [{type: "lumper", amount: 0, attachmentFilename: ""}],
         pod: {
           found: false,
+          documents: [
+            {
+              source: "",
+              page: "",
+              attachmentFilename: "",
+              reason: "",
+            },
+          ],
           source: "",
           attachmentFilename: "",
           page: "",
@@ -1916,7 +2126,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   });
 
   const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 4096,
     system: "You classify freight carrier invoice attachments. " +
       "Return ONLY valid JSON. No markdown. " +
@@ -1944,22 +2154,64 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   }
 }
 
+// Identity the AI agent uses to sign the emails it composes. Override with
+// AI_AGENT_NAME. Applied to internal/ops/error notifications, not customer
+// invoice emails (type "generated_bill").
+const AI_AGENT_NAME = process.env.AI_AGENT_NAME || "Jerry";
+const AGENT_GREETING_MARKER = "<!--agent-greeting-->";
+
 /**
- * Saves an outbound email to Firestore and optionally sends it.
- * @param {object} email - The email object.
- * @return {Promise<object>} Result of the operation.
+ * @return {string} HTML greeting that introduces the AI agent by name.
+ */
+function agentGreetingHtml() {
+  return `${AGENT_GREETING_MARKER}<p>Hi, I'm ${escapeHtml(AI_AGENT_NAME)}, ` +
+    `your AI assistant.</p>`;
+}
+
+/**
+ * Prepends the agent greeting to an HTML body unless it's already branded.
+ * @param {string} html Email HTML body.
+ * @return {string}
+ */
+function withAgentGreeting(html) {
+  const body = String(html || "");
+  if (body.includes(AGENT_GREETING_MARKER)) return body;
+  return `${agentGreetingHtml()}${body}`;
+}
+
+/**
+ * Persists and sends an outbound email.
+ * @param {object} email - Email fields (type, subject, html, to, attachments).
+ * @return {Promise<void>}
  */
 async function saveOutboundEmail(email) {
-  const tenant = (email && email.tenant) || DEFAULT_TENANT;
+  // Use the email's tenant, then the ambient tenant bound for this request
+  // (set by runWithTenant/enterTenantContext). Only a genuinely tenant-less
+  // context lands on DEFAULT_TENANT — a client's email is never sent from
+  // another client's mailbox.
+  const tenant = (email && email.tenant) || currentTenant() || DEFAULT_TENANT;
   let sendResult = null;
-  const to = tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "";
+  // Customer invoice emails go to the bill-to party; ops alerts use alertEmail.
+  // `forceRecipient` pins delivery to an explicit address (e.g. a designated
+  // reviewer for the customer-email approval gate) regardless of type.
+  const to = ((email.type === "generated_bill" || email.forceRecipient) &&
+    email.to) ?
+    email.to :
+    (tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "");
+
+  // Brand agent-authored notifications (errors, action-needed, forwards, etc.)
+  // as the AI agent. Customer invoice emails and any opt-out are left as-is.
+  const shouldBrand = email.type !== "generated_bill" &&
+    email.skipAgentGreeting !== true;
+  const htmlToSend = shouldBrand ?
+    withAgentGreeting(email.html) : (email.html || "");
 
   if (to) {
     try {
       await sendViaGmail(
           to,
           email.subject || "",
-          email.html || "",
+          htmlToSend,
           Array.isArray(email.attachments) ? email.attachments : [],
           tenant,
       );
@@ -1976,8 +2228,10 @@ async function saveOutboundEmail(email) {
   }
 
   // The tenant object is internal routing metadata; don't persist it.
-  const emailToStore = {...email};
+  const emailToStore = {...email, html: htmlToSend};
   delete emailToStore.tenant;
+  delete emailToStore.skipAgentGreeting;
+  delete emailToStore.forceRecipient;
   await tcol(tenant, "outboundEmails").add({
     ...emailToStore,
     sendResult: sendResult,
@@ -2158,11 +2412,16 @@ async function buildCustomerInvoicePdfBase64(data) {
  * Builds a continue button HTML for workflow emails.
  * @param {string} baseUrl - The base URL.
  * @param {string} invoiceId - The invoice ID.
+ * @param {string} [tenantId] - Owning tenant, added to the link so the
+ *   prefixed-tenant invoice is found on resume.
  * @return {string} HTML string.
  */
-function buildContinueButtonHtml(baseUrl, invoiceId) {
+function buildContinueButtonHtml(baseUrl, invoiceId, tenantId) {
+  const tq = tenantId ?
+    `&tenantId=${encodeURIComponent(tenantId)}` : "";
   const continueUrl =
-    `${baseUrl}/continueWorkflow?invoiceId=${encodeURIComponent(invoiceId)}`;
+    `${baseUrl}/continueWorkflow?invoiceId=${encodeURIComponent(invoiceId)}` +
+    tq;
   return `<p><a href="${continueUrl}" ` +
     `style="display:inline-block;padding:10px 16px;` +
     `background:#2563eb;color:#fff;text-decoration:none;` +
@@ -2195,139 +2454,278 @@ async function pauseWorkflow(
 }
 
 /**
- * Extracts POD-only PDF from invoice attachments.
+ * Extracts POD-only PDF(s) from invoice attachments.
+ * Multiple POD pages are saved individually and merged into pod.pdf.
  * @param {string} invoiceId - The invoice ID.
  * @param {object} invoice - The invoice document.
  * @return {Promise<object|null>} POD file info or null.
  */
 async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
   try {
-    if (!invoice || !invoice.pod || invoice.pod.found !== true) {
+    const rawPod = invoice && invoice.pod;
+    const attachments = Array.isArray(invoice.attachments) ?
+      invoice.attachments : [];
+    let pageCountHint = 0;
+    const hintFilename = rawPod && rawPod.attachmentFilename;
+    const firstAtt = attachments.find(
+        (a) => a && a.filename === hintFilename,
+    ) || attachments.find((a) => a && a.storagePath);
+    if (firstAtt && firstAtt.storagePath) {
+      try {
+        const [fileBuffer] = await getBucket()
+            .file(firstAtt.storagePath).download();
+        const loaded = await PDFDocument.load(fileBuffer);
+        pageCountHint = loaded.getPageCount();
+      } catch (_) {
+        // page count enrichment is best-effort
+      }
+    }
+    const podNormalized = normalizePodData(rawPod, {pageCount: pageCountHint});
+    const documents = coercePodDocuments(rawPod, {pageCount: pageCountHint});
+    if (!invoice || !podNormalized || podNormalized.found !== true ||
+        documents.length === 0) {
       await writeLog("info", "workflow",
           "POD not detected in this invoice — no extraction attempted", {
             invoiceId,
             loadNumber: invoice && invoice.loadNumber,
-            podFound: invoice && invoice.pod && invoice.pod.found,
-            podSource: invoice && invoice.pod && invoice.pod.source,
-            podReason: invoice && invoice.pod && invoice.pod.reason,
+            podFound: podNormalized && podNormalized.found,
+            podSource: podNormalized && podNormalized.source,
+            podDocumentCount: documents.length,
+            podReason: podNormalized && podNormalized.reason,
           });
       return null;
     }
 
-    const attachments = Array.isArray(invoice.attachments) ?
-      invoice.attachments : [];
-    const podAtt = attachments.find(
-        (a) => a && a.filename === invoice.pod.attachmentFilename,
-    );
-
-    if (!podAtt || !podAtt.storagePath) {
-      await writeLog("warn", "workflow",
-          "POD was detected by AI but attachment file not found in storage", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            expectedFilename: invoice.pod.attachmentFilename,
-            availableFilenames: attachments.map((a) => a && a.filename),
-          });
-      return null;
-    }
-
-    if (invoice.pod.source === "separate_attachment") {
-      return {
-        storagePath: podAtt.storagePath,
-        source: "separate_attachment",
-      };
-    }
-
-    if (invoice.pod.source === "attachment") {
-      // POD is embedded in invoice PDF at specific page
-      const [fileBuffer] = await getBucket()
+    if (documents.length === 1 &&
+        documents[0].source === "separate_attachment") {
+      const podAtt = attachments.find(
+          (a) => a && a.filename === documents[0].attachmentFilename,
+      );
+      if (!podAtt || !podAtt.storagePath) {
+        return null;
+      }
+      const [attBuffer] = await getBucket()
           .file(podAtt.storagePath).download();
-      const doc = await PDFDocument.load(fileBuffer);
-      const pageCount = doc.getPageCount();
 
-      const podPage = Number(invoice.pod.page) || pageCount;
-      if (podPage < 1 || podPage > pageCount) {
+      // SAFETY: never send the carrier bill OR the carrier rate/load
+      // confirmation to the customer as POD. When the "separate attachment" is
+      // really the combined invoice+POD PDF (single email attachment),
+      // returning it wholesale leaks carrier cost. Keep only pages whose REAL
+      // text neither shows the invoice amount nor carries rate-confirmation
+      // pricing markers. Text is read from the ORIGINAL buffer (decompressed);
+      // pdf-lib-saved bytes are compressed and cannot be scanned.
+      const srcDoc = await PDFDocument.load(attBuffer);
+      const srcPageCount = srcDoc.getPageCount();
+      const pageTexts = await extractPdfPageTexts(attBuffer);
+      const cleanDoc = await PDFDocument.create();
+      let keptPages = 0;
+      let droppedInvoicePages = 0;
+      let unverifiedPages = 0;
+      const droppedReasons = [];
+      for (let p = 0; p < srcPageCount; p++) {
+        const verdict = textLooksUnsafeForCustomer(
+            pageTexts ? pageTexts[p] : null, invoice.invoiceAmount);
+        if (verdict.unsafe) {
+          droppedInvoicePages++;
+          droppedReasons.push(`p${p + 1}:${verdict.reason}`);
+          continue;
+        }
+        if (!verdict.hasText) unverifiedPages++;
+        const [keep] = await cleanDoc.copyPages(srcDoc, [p]);
+        cleanDoc.addPage(keep);
+        keptPages++;
+      }
+
+      // No readable text anywhere (scanned image) AND more than one page in a
+      // file the AI thought bundled the invoice: we cannot prove the bill/rate
+      // pages are gone. Fail safe — do not auto-send; hold for human review.
+      if (!pageTexts && srcPageCount > 1) {
+        await writeLog("error", "workflow",
+            "POD separate_attachment held — multi-page scanned file with no " +
+            "readable text; cannot verify it is free of carrier cost", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              attachment: podAtt.filename,
+              srcPageCount,
+            });
         return null;
       }
 
-      const newDoc = await PDFDocument.create();
-      const [page] = await newDoc.copyPages(doc, [podPage - 1]);
-      newDoc.addPage(page);
+      if (keptPages === 0) {
+        await writeLog("warn", "workflow",
+            "POD separate_attachment dropped — every page exposes carrier " +
+            "cost (invoice amount or rate confirmation)", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              attachment: podAtt.filename,
+              srcPageCount,
+              droppedInvoicePages,
+              droppedReasons,
+            });
+        return null;
+      }
+      if (unverifiedPages > 0) {
+        await writeLog("warn", "workflow",
+            "POD separate_attachment kept page(s) with no readable text — " +
+            "verified by AI classification only, not by text scan", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              attachment: podAtt.filename,
+              unverifiedPages,
+            });
+      }
 
-      const pdfBytes = await newDoc.save();
-      const storagePath = `podOnly/${invoiceId}/pod.pdf`;
+      // No unsafe pages present — genuine standalone POD; keep original file.
+      if (droppedInvoicePages === 0) {
+        return {
+          storagePath: podAtt.storagePath,
+          source: "separate_attachment",
+          files: [{
+            storagePath: podAtt.storagePath,
+            source: "separate_attachment",
+            page: null,
+          }],
+        };
+      }
 
-      await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
-        metadata: {
-          contentType: "application/pdf",
-        },
-      });
-
+      // Combined invoice+POD: save the cost-free subset only.
+      const cleanBytes = await cleanDoc.save();
+      const cleanPath = await savePodPdfBytes(
+          invoiceId, "pod.pdf", cleanBytes);
+      await writeLog("info", "workflow",
+          "POD separate_attachment sanitized — removed carrier-cost page(s)", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            attachment: podAtt.filename,
+            keptPages,
+            droppedInvoicePages,
+            droppedReasons,
+          });
       return {
-        storagePath,
-        source: "attachment",
+        storagePath: cleanPath,
+        source: "separate_attachment",
+        files: [{
+          storagePath: cleanPath,
+          source: "separate_attachment",
+          page: null,
+        }],
       };
     }
 
-    if (invoice.pod.source === "same_page_as_invoice") {
-      const cropFromBottom = Math.min(
-          Math.max(Number(invoice.pod.cropFromBottom || 0.5), 0.1),
-          0.9,
+    const files = [];
+    const mergedDoc = await PDFDocument.create();
+    const bufferCache = new Map();
+    const textCache = new Map();
+
+    for (let i = 0; i < documents.length; i++) {
+      const doc = documents[i];
+      const podAtt = attachments.find(
+          (a) => a && a.filename === doc.attachmentFilename,
       );
-      const pageNum = Number(invoice.pod.page) || 1;
+      if (!podAtt || !podAtt.storagePath) {
+        await writeLog("warn", "workflow",
+            "POD document entry missing attachment in storage", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              expectedFilename: doc.attachmentFilename,
+              podSource: doc.source,
+              podPage: doc.page,
+            });
+        continue;
+      }
 
-      const [fileBuffer] = await getBucket()
-          .file(podAtt.storagePath).download();
-      const doc = await PDFDocument.load(fileBuffer);
-      const pageCount = doc.getPageCount();
+      if (!bufferCache.has(podAtt.storagePath)) {
+        const [fileBuffer] = await getBucket()
+            .file(podAtt.storagePath).download();
+        bufferCache.set(podAtt.storagePath, fileBuffer);
+      }
+      const fileBuffer = bufferCache.get(podAtt.storagePath);
+      const loadedDoc = await PDFDocument.load(fileBuffer);
+      if (!textCache.has(podAtt.storagePath)) {
+        textCache.set(podAtt.storagePath,
+            await extractPdfPageTexts(fileBuffer));
+      }
+      const pageTexts = textCache.get(podAtt.storagePath);
+      const pdfBytes = await extractPodDocumentPdfBytes(loadedDoc, doc);
+      if (!pdfBytes) {
+        continue;
+      }
 
-      const pageIndex = Math.max(0, Math.min(pageNum - 1, pageCount - 1));
+      // Check the REAL text of the source page(s) this doc covers.
+      const pageCount = loadedDoc.getPageCount();
+      let pageIndex;
+      if (doc.source === "last_page_of_invoice") {
+        pageIndex = pageCount - 1;
+      } else {
+        pageIndex = (Number(doc.page) || pageCount) - 1;
+      }
+      const pageText = pageTexts &&
+        pageIndex >= 0 && pageIndex < pageTexts.length ?
+        pageTexts[pageIndex] : null;
+      const verdict =
+          textLooksUnsafeForCustomer(pageText, invoice.invoiceAmount);
+      if (verdict.unsafe) {
+        await writeLog("warn", "workflow",
+            "Skipped POD page — exposes carrier cost", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              podPage: doc.page,
+              podSource: doc.source,
+              invoiceAmount: invoice.invoiceAmount,
+              reason: verdict.reason,
+            });
+        continue;
+      }
 
-      const newDoc = await PDFDocument.create();
-      const [copiedPage] = await newDoc.copyPages(doc, [pageIndex]);
-      newDoc.addPage(copiedPage);
+      const pageLabel = doc.page ? `p${doc.page}` : `part${i + 1}`;
+      const partName = `pod-${pageLabel}-${doc.source || "page"}.pdf`
+          .replace(/[^a-zA-Z0-9._-]/g, "-");
+      const storagePath = await savePodPdfBytes(
+          invoiceId, partName, pdfBytes);
 
-      const {width, height} = copiedPage.getSize();
-      copiedPage.setCropBox(0, 0, width, height * cropFromBottom);
-
-      const pdfBytes = await newDoc.save();
-      const storagePath = `podOnly/${invoiceId}/pod.pdf`;
-
-      await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
-        metadata: {contentType: "application/pdf"},
+      files.push({
+        storagePath,
+        source: doc.source,
+        page: doc.page != null && doc.page !== "" ?
+          Number(doc.page) : null,
       });
 
-      return {storagePath, source: "same_page_as_invoice"};
+      const partDoc = await PDFDocument.load(pdfBytes);
+      const partPages = partDoc.getPageIndices();
+      const copied = await mergedDoc.copyPages(partDoc, partPages);
+      for (const page of copied) {
+        mergedDoc.addPage(page);
+      }
     }
 
-    if (invoice.pod.source !== "last_page_of_invoice") {
+    if (files.length === 0) {
+      await writeLog("warn", "workflow",
+          "POD was detected but no pages could be extracted", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            podDocumentCount: documents.length,
+          });
       return null;
     }
 
-    const [fileBuffer] = await getBucket().file(podAtt.storagePath).download();
-    const doc = await PDFDocument.load(fileBuffer);
-    const pageCount = doc.getPageCount();
-
-    if (pageCount < 1) {
-      return null;
+    let combinedPath = files[0].storagePath;
+    if (files.length > 1) {
+      const combinedBytes = await mergedDoc.save();
+      combinedPath = await savePodPdfBytes(invoiceId, "pod.pdf", combinedBytes);
     }
 
-    const newDoc = await PDFDocument.create();
-    const [lastPage] = await newDoc.copyPages(doc, [pageCount - 1]);
-    newDoc.addPage(lastPage);
-
-    const pdfBytes = await newDoc.save();
-    const storagePath = `podOnly/${invoiceId}/pod.pdf`;
-
-    await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
-      metadata: {
-        contentType: "application/pdf",
-      },
+    await writeLog("info", "workflow", "POD extraction completed", {
+      invoiceId,
+      loadNumber: invoice.loadNumber,
+      podPageCount: files.length,
+      podSources: files.map((f) => f.source),
+      combinedStoragePath: combinedPath,
     });
 
     return {
-      storagePath,
-      source: "last_page_of_invoice",
+      storagePath: combinedPath,
+      source: files.length > 1 ? "multi" : files[0].source,
+      files,
     };
   } catch (error) {
     await writeLog("error", "storage", "POD extraction failed", {
@@ -2426,6 +2824,416 @@ function normalizeAiChargeArrays(aiResult) {
     chargesNeedProof,
     chargeProofRefs,
   };
+}
+
+const FULL_PAGE_POD_KEYWORDS =
+  /\b(signed|signature|bol|bill of lading|delivery receipt|received|consignee|driver|signed load|load document|pod)\b/i; // eslint-disable-line max-len
+
+const POD_PACKAGE_SOURCES = new Set([
+  "unsigned_pod_template",
+  "signed_bol",
+  "signed_load",
+  "signed_pod",
+  "delivery_receipt",
+  "separate_attachment",
+  "same_page_as_invoice",
+  "last_page_of_invoice",
+  "attachment",
+]);
+
+/**
+ * @param {string} source Document source label.
+ * @return {boolean}
+ */
+function isPodPackageSource(source) {
+  return POD_PACKAGE_SOURCES.has(String(source || "").trim());
+}
+
+// Phrases that only appear on carrier-facing pricing documents (rate/load
+// confirmations, rate agreements). These NEVER belong on a clean signed BOL or
+// delivery receipt, so their presence means the page exposes the buy-rate and
+// must not reach the customer — even if the page is signed.
+const RATE_CONFIRMATION_MARKERS = [
+  "rate confirmation",
+  "rate con",
+  "rateconfirmation",
+  "rate and load confirmation",
+  "load and rate confirmation",
+  "load confirmation",
+  "carrier confirmation",
+  "carrier rate confirmation",
+  "rate agreement",
+  "load tender",
+  "line haul",
+  "line-haul",
+  "linehaul",
+  "fuel surcharge",
+  "carrier pay",
+  "total carrier pay",
+  "agreed rate",
+  "carrier freight charges",
+];
+
+let pdfjsModulePromise = null;
+
+/**
+ * Lazily loads the ESM pdfjs build from CommonJS via dynamic import.
+ * @return {Promise<object>} pdfjs module.
+ */
+function getPdfjs() {
+  if (!pdfjsModulePromise) {
+    pdfjsModulePromise = import("pdfjs-dist/legacy/build/pdf.mjs");
+  }
+  return pdfjsModulePromise;
+}
+
+/**
+ * Extracts real per-page text from a PDF, decompressing content streams.
+ * Raw byte scans cannot see Flate-compressed text (nearly all real PDFs),
+ * so this is what makes carrier-cost detection actually work. Returns null
+ * when the PDF has no extractable text layer (e.g. a scanned image).
+ * @param {Buffer|Uint8Array} buffer Original PDF bytes.
+ * @return {Promise<string[]|null>} Page texts (index 0 = page 1) or null.
+ */
+async function extractPdfPageTexts(buffer) {
+  try {
+    const pdfjs = await getPdfjs();
+    // Clone so pdfjs cannot detach the caller's buffer (reused for pdf-lib).
+    const data = Uint8Array.from(buffer);
+    const task = pdfjs.getDocument({
+      data,
+      isEvalSupported: false,
+      useSystemFonts: true,
+    });
+    const pdf = await task.promise;
+    const texts = [];
+    let anyText = false;
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      const tc = await page.getTextContent();
+      const txt = tc.items.map((it) => it.str).join(" ").trim();
+      if (txt) anyText = true;
+      texts.push(txt);
+    }
+    await pdf.destroy();
+    return anyText ? texts : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * True when page TEXT exposes carrier cost: it shows the carrier invoice
+ * amount or carries rate/load-confirmation pricing markers.
+ * @param {string|null} text Extracted page text.
+ * @param {number} invoiceAmount Carrier invoice amount.
+ * @return {object} {unsafe, reason, hasText}
+ */
+function textLooksUnsafeForCustomer(text, invoiceAmount) {
+  if (!text) return {unsafe: false, reason: null, hasText: false};
+  const lower = text.toLowerCase();
+  const amount = Number(invoiceAmount);
+  if (Number.isFinite(amount) && amount > 0) {
+    const formatted = amount.toFixed(2);
+    const [intPart, decPart] = formatted.split(".");
+    const withCommas =
+      `${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${decPart}`;
+    const collapsed = lower.replace(/\s+/g, "");
+    if (collapsed.includes(formatted) || collapsed.includes(withCommas)) {
+      return {unsafe: true, reason: "carrier_invoice_amount", hasText: true};
+    }
+  }
+  const marker = RATE_CONFIRMATION_MARKERS.find((m) => lower.includes(m));
+  if (marker) {
+    return {
+      unsafe: true,
+      reason: `rate_confirmation_marker:${marker}`,
+      hasText: true,
+    };
+  }
+  return {unsafe: false, reason: null, hasText: true};
+}
+
+/**
+ * @param {Array<object>} documents Document entries.
+ * @param {string} fallbackFilename Attachment filename.
+ * @return {Array<object>}
+ */
+function normalizeDocumentEntries(documents, fallbackFilename) {
+  const seen = new Set();
+  return documents
+      .map((doc) => normalizePodDocEntry({
+        ...doc,
+        attachmentFilename: doc.attachmentFilename || fallbackFilename,
+      }))
+      .filter((doc) => {
+        const key = [
+          doc.attachmentFilename,
+          String(doc.page || ""),
+          doc.source,
+        ].join("|");
+        if (seen.has(key) || !doc.source) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => (Number(a.page) || 0) - (Number(b.page) || 0));
+}
+
+/**
+ * Upgrades risky POD crop on a single document entry.
+ * @param {object} doc POD document entry.
+ * @return {object}
+ */
+function normalizePodDocEntry(doc) {
+  if (!doc) return doc;
+
+  const source = String(doc.source || "").trim();
+  const reason = String(doc.reason || "").trim();
+  const filename = String(doc.attachmentFilename || "").trim();
+  const context = `${reason} ${filename}`.toLowerCase();
+
+  if (POD_PACKAGE_SOURCES.has(source) ||
+      source === "last_page_of_invoice") {
+    return doc;
+  }
+
+  if (source === "same_page_as_invoice") {
+    const crop = Number(doc.cropFromBottom || 0);
+    const looksSigned = FULL_PAGE_POD_KEYWORDS.test(context);
+    const largeCrop = crop >= 0.45;
+
+    if (looksSigned || largeCrop) {
+      const upgraded = /\b(signed load|load document|load confirmation)\b/i
+          .test(context) ? "signed_load" : "signed_bol";
+      const upgradeNote =
+        `[upgraded ${source} → ${upgraded}: full signed page preferred]`;
+      return {
+        ...doc,
+        source: upgraded,
+        cropFromBottom: 0,
+        reason: reason ? `${reason} ${upgradeNote}` : upgradeNote.trim(),
+      };
+    }
+  }
+
+  if (!source && doc.attachmentFilename) {
+    return {...doc, source: "signed_bol"};
+  }
+
+  return doc;
+}
+
+/**
+ * Upgrades risky POD crop classifications to full-page signed doc sources.
+ * @param {object|null} pod POD block from AI classification.
+ * @return {object|null}
+ */
+function normalizePodClassification(pod) {
+  if (!pod || pod.found !== true) {
+    return pod;
+  }
+  return normalizePodDocEntry(pod);
+}
+
+/**
+ * Normalizes POD block and builds pod.documents from legacy fields.
+ * @param {object|null} pod POD block from AI classification.
+ * @param {object} [options] Options.
+ * @param {number} [options.pageCount] PDF page count when known.
+ * @return {object|null}
+ */
+function normalizePodData(pod, options = {}) {
+  if (!pod || pod.found !== true) {
+    return pod;
+  }
+
+  const normalized = normalizePodClassification(pod);
+  const fallbackFilename = normalized.attachmentFilename || "";
+  const pageCount = Number(options.pageCount || normalized.pageCount || 0);
+
+  let documents = Array.isArray(normalized.documents) ?
+    normalized.documents.filter(Boolean) : [];
+  if (documents.length === 0 &&
+      (normalized.source || normalized.page || normalized.attachmentFilename)) {
+    documents = [{
+      source: normalized.source,
+      page: normalized.page,
+      attachmentFilename: fallbackFilename,
+      cropFromBottom: normalized.cropFromBottom,
+      reason: normalized.reason,
+    }];
+  }
+
+  documents = normalizeDocumentEntries(documents, fallbackFilename);
+  documents = documents.filter((doc) => isPodPackageSource(doc.source));
+  documents = enrichPodDocumentsWithTrailingPages(
+      documents, pageCount, fallbackFilename);
+
+  const primary = documents.find((d) =>
+    d.source === "signed_load" || d.source === "delivery_receipt" ||
+    d.source === "signed_pod" || d.source === "signed_bol") ||
+    documents[0];
+
+  return {
+    ...normalized,
+    found: documents.length > 0,
+    documents,
+    source: (primary && primary.source) || normalized.source || "",
+    page: (primary && primary.page) || normalized.page || "",
+    attachmentFilename: fallbackFilename ||
+      (primary && primary.attachmentFilename) || "",
+  };
+}
+
+/**
+ * Merges pod + bol AI blocks into one POD package (user preference).
+ * @param {object} aiResult AI classification result.
+ * @return {object|null}
+ */
+function normalizePodFromClassification(aiResult) {
+  const pod = (aiResult && aiResult.pod) || {};
+  const bol = (aiResult && aiResult.bol) || {};
+  const filename = pod.attachmentFilename || bol.attachmentFilename || "";
+  const docs = [
+    ...(Array.isArray(pod.documents) ? pod.documents.filter(Boolean) : []),
+    ...(Array.isArray(bol.documents) ? bol.documents.filter(Boolean) : []),
+  ];
+  return normalizePodData({
+    ...pod,
+    found: Boolean(pod.found) || docs.length > 0,
+    documents: docs.length > 0 ? docs : pod.documents,
+    attachmentFilename: filename,
+  });
+}
+
+/**
+ * Adds post-invoice pages not listed by the classifier. When the classifier
+ * listed specific pages, trust its omissions (e.g. rate confirmations between
+ * invoice and BOL) and only auto-add pages after the last listed page.
+ * @param {Array<object>} documents POD document entries.
+ * @param {number|null} pageCount Total PDF page count when known.
+ * @param {string} attachmentFilename Attachment filename.
+ * @return {Array<object>}
+ */
+function enrichPodDocumentsWithTrailingPages(
+    documents,
+    pageCount,
+    attachmentFilename,
+) {
+  const totalPages = Number(pageCount);
+  if (!Number.isFinite(totalPages) || totalPages <= 1) {
+    return documents;
+  }
+
+  const listedPages = documents
+      .map((d) => Number(d.page))
+      .filter((p) => p > 0);
+  if (listedPages.length === 0) {
+    return documents;
+  }
+
+  const lastListed = Math.max(...listedPages);
+  const listed = new Set(listedPages);
+  const enriched = [...documents];
+
+  for (let page = lastListed + 1; page <= totalPages; page++) {
+    if (listed.has(page)) continue;
+    enriched.push({
+      source: "unsigned_pod_template",
+      page,
+      attachmentFilename,
+      reason: "[auto-included] POD page after last classified page",
+    });
+    listed.add(page);
+  }
+
+  return enriched.sort(
+      (a, b) => (Number(a.page) || 0) - (Number(b.page) || 0),
+  );
+}
+
+/**
+ * Returns normalized POD document entries to extract.
+ * @param {object|null} pod POD block.
+ * @param {object} [options] Options.
+ * @param {number} [options.pageCount] PDF page count when known.
+ * @return {Array<object>}
+ */
+function coercePodDocuments(pod, options = {}) {
+  const normalized = normalizePodData(pod, options);
+  if (!normalized || normalized.found !== true) {
+    return [];
+  }
+  return (normalized.documents || [])
+      .filter((doc) => isPodPackageSource(doc.source));
+}
+
+/**
+ * Saves POD PDF bytes to Storage.
+ * @param {string} invoiceId Invoice id.
+ * @param {string} filename File name under podOnly/{invoiceId}/.
+ * @param {Uint8Array} pdfBytes PDF bytes.
+ * @return {Promise<string>} Storage path.
+ */
+async function savePodPdfBytes(invoiceId, filename, pdfBytes) {
+  const storagePath = `podOnly/${invoiceId}/${filename}`;
+  await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
+    metadata: {contentType: "application/pdf"},
+  });
+  return storagePath;
+}
+
+/**
+ * Extracts one POD document entry into a single-page PDF.
+ * @param {object} loadedDoc Loaded PDF document.
+ * @param {object} doc POD document entry.
+ * @return {Promise<Uint8Array|null>} PDF bytes or null.
+ */
+async function extractPodDocumentPdfBytes(loadedDoc, doc) {
+  const source = String(doc.source || "").trim();
+  const pageCount = loadedDoc.getPageCount();
+
+  if (source === "same_page_as_invoice") {
+    const cropFromBottom = Math.min(
+        Math.max(Number(doc.cropFromBottom || 0.5), 0.1), 0.9);
+    const pageNum = Number(doc.page) || 1;
+    const pageIndex = Math.max(0, Math.min(pageNum - 1, pageCount - 1));
+    const newDoc = await PDFDocument.create();
+    const [copiedPage] = await newDoc.copyPages(loadedDoc, [pageIndex]);
+    newDoc.addPage(copiedPage);
+    const {width, height} = copiedPage.getSize();
+    copiedPage.setCropBox(0, 0, width, height * cropFromBottom);
+    return newDoc.save();
+  }
+
+  if (source === "last_page_of_invoice") {
+    if (pageCount < 1) return null;
+    const newDoc = await PDFDocument.create();
+    const [lastPage] = await newDoc.copyPages(loadedDoc, [pageCount - 1]);
+    newDoc.addPage(lastPage);
+    return newDoc.save();
+  }
+
+  const fullPageSources = new Set([
+    "attachment",
+    "signed_bol",
+    "signed_load",
+    "signed_pod",
+    "delivery_receipt",
+    "unsigned_pod_template",
+  ]);
+  if (fullPageSources.has(source)) {
+    const podPage = Number(doc.page) || pageCount;
+    if (podPage < 1 || podPage > pageCount) {
+      return null;
+    }
+    const newDoc = await PDFDocument.create();
+    const [page] = await newDoc.copyPages(loadedDoc, [podPage - 1]);
+    newDoc.addPage(page);
+    return newDoc.save();
+  }
+
+  return null;
 }
 
 /**
@@ -2756,13 +3564,13 @@ async function processGmailMessage(
       }
 
       const aiNote =
-        `Hi,\n\n` +
-        `I am your AI helper. I just received the following email and I am ` +
+        `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
+        `I just received the following email and I am ` +
         `not sure how to handle it.\n\n` +
         (summary ?
           `Here is what I think this email is about: ${summary}\n\n` : "") +
         `I do not have a rule for this type of email yet. ` +
-        `Please take care of it.\n\nThank you,\nAI Helper`;
+        `Please take care of it.\n\nThank you,\n${AI_AGENT_NAME}`;
 
       return forwardToHumanReview(
           gmail, messageId, subject, from, reason, aiNote,
@@ -2803,6 +3611,61 @@ async function processGmailMessage(
           subject: subject,
           from: from,
         });
+        return;
+      }
+    }
+
+    // Insurance intake: QuickBooks notification sender only (Redkik premiums).
+    // Every other sender follows the regular carrier / forward-to-human flow.
+    if (!isTai && innovativeInsurance.isInsuranceEmail({from})) {
+      try {
+        const excelAtt =
+            innovativeInsurance.findSpreadsheetAttachment(attachments);
+        const pdfAtt = innovativeInsurance.findPdfAttachment(attachments);
+        const excelBuffer = excelAtt ? await downloadGmailAttachmentBuffer(
+            gmail, messageId, excelAtt.attachmentId) : null;
+        const pdfBuffer = pdfAtt ? await downloadGmailAttachmentBuffer(
+            gmail, messageId, pdfAtt.attachmentId) : null;
+
+        const insResult = await innovativeInsurance.processInsuranceEmail({
+          excelBuffer, pdfBuffer, from, subject,
+        });
+
+        if (insResult.handled) {
+          await updateGmailQueueStatus(
+              messageId, "completed", null, {tenant},
+          );
+          await tcol(tenant, "emailIntake").doc(messageId).set({
+            gmailMessageId: messageId,
+            tenantId: tenant.tenantId,
+            subject, from,
+            finalStatus: "insurance_processed",
+            insuranceReconciliation: insResult.reconciliation || null,
+            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+            deleteAt: getDeleteAt(30),
+          }, {merge: true});
+          return;
+        }
+
+        await writeLog("warn", "insurance",
+            "Insurance email from QuickBooks not handled — forwarding", {
+              messageId, subject, reason: insResult.reason,
+            });
+        await forwardWithAnalysis(
+            `Insurance email could not be processed automatically ` +
+            `(${insResult.reason || "unknown"})`,
+            {department: "billing"},
+        );
+        await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+        return;
+      } catch (insErr) {
+        await writeLog("error", "insurance",
+            "Insurance intake failed — forwarding for review", {
+              messageId, subject, error: insErr.message, stack: insErr.stack,
+            });
+        await forwardWithAnalysis(
+            "Insurance email processing failed", {department: "billing"});
+        await updateGmailQueueStatus(messageId, "completed", null, {tenant});
         return;
       }
     }
@@ -3033,6 +3896,7 @@ async function processGmailMessage(
     }
 
     const normalizedChargeData = normalizeAiChargeArrays(aiResult);
+    const normalizedPod = normalizePodFromClassification(aiResult);
 
     await writeLog("info", "ai", "AI classification completed", {
       event: "AI classification completed",
@@ -3045,7 +3909,7 @@ async function processGmailMessage(
         loadNumber: aiResult.loadNumber,
         charges: aiResult.charges,
         chargesCount: aiResult.charges ? aiResult.charges.length : 0,
-        pod: aiResult.pod,
+        pod: normalizedPod,
         unrecognizedCharges: normalizedChargeData.unrecognizedCharges,
         chargesNeedProof: normalizedChargeData.chargesNeedProof,
         attachments: storedAttachments.map((a) => ({
@@ -3124,10 +3988,42 @@ async function processGmailMessage(
       aiResult.loadNumber = normalizedLoadNumber;
     }
 
-    const hasUnrecognizedCharges =
+    let hasUnrecognizedCharges =
       normalizedChargeData.unrecognizedCharges.length > 0;
     const hasChargesNeedProof =
       normalizedChargeData.chargesNeedProof.length > 0;
+
+    // Extra charges the AI can't classify (e.g. LTL accessorials like
+    // "Compliance Services Fee" or "Urgent Care Service") are NOT surprise
+    // add-ons when they are already part of the carrier cost Primus agreed to.
+    // If the invoice total matches Primus's recorded carrier cost, or every
+    // flagged charge already exists in the Primus cost breakdown, auto-approve
+    // them and let the invoice flow into normal billing instead of forwarding
+    // to a human.
+    if (!loadGateFailed && !isTai && hasUnrecognizedCharges) {
+      const reconciled = await reconcileUnrecognizedChargesWithPrimus(
+          aiResult.loadNumber,
+          aiResult.invoiceAmount,
+          normalizedChargeData.unrecognizedCharges,
+      );
+      if (reconciled.override) {
+        await writeLog("info", "primus",
+            "Unrecognized charges reconciled with Primus — auto-approving", {
+              messageId,
+              loadNumber: aiResult.loadNumber,
+              invoiceAmount: aiResult.invoiceAmount,
+              vendorCost: reconciled.vendorCost,
+              totalMatches: reconciled.totalMatches,
+              chargesInPrimus: reconciled.chargesInPrimus,
+              clearedCharges: normalizedChargeData.unrecognizedCharges,
+            });
+        normalizedChargeData.unrecognizedCharges = [];
+        hasUnrecognizedCharges = false;
+        if (aiResult.status === "unrecognized_charges") {
+          aiResult.status = "ready_for_primus_validation";
+        }
+      }
+    }
 
     if (loadGateFailed) {
       // Stop execution: do not attempt Primus lookup or workflow.
@@ -3551,6 +4447,7 @@ async function processGmailMessage(
         proNumber: aiResult.proNumber || null,
         loadNumber: aiResult.loadNumber || null,
         invoiceAmount: aiResult.invoiceAmount,
+        invoiceDate: aiResult.invoiceDate || null,
         dueDate: aiResult.dueDate || null,
         charges: aiResult.charges || [],
         recognizedCharges: normalizedChargeData.recognizedCharges,
@@ -3559,7 +4456,7 @@ async function processGmailMessage(
         chargeProofRefs: normalizedChargeData.chargeProofRefs,
         approvedChargeProofFiles: [],
         attachments: invoiceAttachments,
-        pod: aiResult.pod || {
+        pod: normalizedPod || {
           found: false,
           source: "",
           attachmentFilename: "",
@@ -3593,6 +4490,9 @@ async function processGmailMessage(
           customerRateChecked: false,
           billApproved: false,
           customerInvoiceGenerated: false,
+          uiInvoiceIssued: false,
+          carrierBillUploaded: false,
+          podUploaded: false,
         },
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -3637,7 +4537,12 @@ async function processGmailMessage(
       );
 
       try {
-        const workflowUrl = workflowUrlForTms(tenant.tms);
+        const workflowUrl = workflowUrlForTenant(tenant);
+        if (!workflowUrl) {
+          throw new Error(
+              `No workflow endpoint for tenant ${tenant.tenantId} ` +
+              `(tms=${tenant.tms || "none"}); refusing to default to Primus`);
+        }
         const workflowRes = await fetch(
             workflowUrl,
             {
@@ -3703,6 +4608,24 @@ async function processGmailMessage(
     await updateGmailQueueStatus(messageId, "failed", error.message, {tenant});
     throw error;
   }
+}
+
+/**
+ * Downloads a single Gmail attachment and returns its decoded bytes.
+ * @param {object} gmail Gmail client instance.
+ * @param {string} messageId Gmail message id.
+ * @param {string} attachmentId Gmail attachment id.
+ * @return {Promise<Buffer>} Decoded attachment bytes.
+ */
+async function downloadGmailAttachmentBuffer(gmail, messageId, attachmentId) {
+  const resp = await gmail.users.messages.attachments.get({
+    userId: "me",
+    messageId,
+    id: attachmentId,
+  });
+  const rawData = (resp.data && resp.data.data) || "";
+  return Buffer.from(
+      rawData.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 
 /**
@@ -3901,7 +4824,8 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     return res.status(400).send("Missing invoiceId.");
   }
 
-  const invoiceRef = db.collection("invoices").doc(String(invoiceId));
+  const tenant = await tenantFromRequest(req);
+  const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
   const snap = await invoiceRef.get();
   if (!snap.exists) {
     return res.status(404).send("Invoice not found.");
@@ -3943,6 +4867,8 @@ exports.setCustomerRate = onRequest(async (req, res) => {
   <h2>Set Customer Rate — Load ${escapeHtml(inv.loadNumber || "—")}</h2>
   <form method="POST">
     <input type="hidden" name="invoiceId" value="${escapeHtml(invoiceId)}"/>
+    <input type="hidden" name="tenantId" value="${escapeHtml(
+      tenant.tenantId)}"/>
     <div class="field">
       <label>Carrier</label>
       <div class="readonly">${escapeHtml(inv.carrierName || "—")}</div>
@@ -3985,16 +4911,16 @@ exports.setCustomerRate = onRequest(async (req, res) => {
   }
 
   const primusSteps = inv.primusSteps || {};
+  const taiSteps = inv.taiSteps || {};
 
-  // The Primus PUT /book/{BOLId} schema does not expose accountingInformation
-  // as a writable field, so there is no API way to store the rate on the
-  // booking record. The rate reaches the invoice via invoiceBreakdown when
-  // generateCustomerInvoice runs later in the workflow.
-
+  // The rate reaches the customer invoice when generateCustomerInvoice runs
+  // later in the workflow. We mark customerRateChecked on whichever TMS step
+  // map the invoice carries so the flag is TMS-agnostic.
   await invoiceRef.update({
     customerRate,
     customerName: customerName || inv.customerName || null,
     primusSteps: {...primusSteps, customerRateChecked: true},
+    taiSteps: {...taiSteps, customerRateChecked: true},
     workflowPausedAtStep: null,
     workflowPausedAt: null,
     finalWorkflowStatus: "running",
@@ -4003,21 +4929,30 @@ exports.setCustomerRate = onRequest(async (req, res) => {
 
   await writeLog("info", "workflow", "Customer rate set manually", {
     invoiceId,
+    tenantId: tenant.tenantId,
     loadNumber: inv.loadNumber,
     customerRate,
     customerName,
   });
 
-  const workflowUrl =
-    process.env.PROCESS_PRIMUS_WORKFLOW_URL ||
-    "https://us-central1-tai-invoice-automation.cloudfunctions.net" +
-    "/processPrimusWorkflow";
+  // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
+  // hardcoded Primus default.
+  const workflowUrl = workflowUrlForTenant(tenant);
 
-  fetch(workflowUrl, {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({invoiceId, resumeFrom: "generate_invoice"}),
-  }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
+  if (workflowUrl) {
+    fetch(workflowUrl, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        invoiceId,
+        tenantId: tenant.tenantId,
+        resumeFrom: "generate_invoice",
+      }),
+    }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
+  } else {
+    console.error("setCustomerRate: no workflow URL for tenant",
+        tenant.tenantId);
+  }
 
   return res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -4050,7 +4985,7 @@ exports.getRecentLogs = onRequest(
       try {
         const tenant = await resolveDashboardTenant(req);
         const limit = Math.min(Number(req.query.limit || 40), 100);
-        const dataset = tenant.bqDataset || BQ_DATASET;
+        const dataset = tenant.bqDataset;
         const [rows] = await bigquery.query({
           query: `
             SELECT timestamp, level, category, message
@@ -4134,7 +5069,7 @@ exports.getDashboardStats = onRequest(async (req, res) => {
 
   try {
     const tenant = await resolveDashboardTenant(req);
-    const dataset = tenant.bqDataset || BQ_DATASET;
+    const dataset = tenant.bqDataset;
     const range = String(req.query.range || "week").toLowerCase();
     const rangeConfig = DASHBOARD_RANGES[range];
     if (!rangeConfig) {
@@ -4229,6 +5164,9 @@ async function sendSupportIssueEmail({clientName, summary, transcript}) {
     `Support chat — ${escapeHtml(clientName)}</div>` +
     `<div style="border:1px solid #e5e7eb;border-top:none;padding:18px;` +
     `border-radius:0 0 6px 6px;">` +
+    `<p style="margin:0 0 16px;color:#374151;line-height:1.6;">` +
+    `Hi, I'm ${escapeHtml(AI_AGENT_NAME)}, your AI assistant. ` +
+    `A support chat was flagged for your attention.</p>` +
     `<h3 style="margin:0 0 8px;font-size:13px;text-transform:uppercase;` +
     `letter-spacing:.05em;color:#374151;">Issue Summary</h3>` +
     `<p style="margin:0 0 16px;color:#374151;line-height:1.6;` +
@@ -4339,7 +5277,7 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
       "any relevant context from the conversation).";
 
     const aiRes = await client.messages.create({
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
       max_tokens: 800,
       system: systemPrompt,
       messages: history,
@@ -4813,6 +5751,32 @@ async function primusRequest(method, path, body) {
 }
 
 /**
+ * Reads shipment mode from a Primus booking (GET /book/bolnumber).
+ * @param {object|null} booking Primus booking object.
+ * @return {string} Mode code/name, or empty string.
+ */
+function readShipmentMode(booking) {
+  if (!booking || typeof booking !== "object") return "";
+  const sm = booking.shipmentMode;
+  if (typeof sm === "string") return sm.trim();
+  if (sm && typeof sm === "object") {
+    return String(sm.code || sm.name || sm.description || "").trim();
+  }
+  if (booking.mode != null) return String(booking.mode).trim();
+  return "";
+}
+
+/**
+ * @param {object|null} booking Primus booking object.
+ * @return {boolean} True when Primus marks the load as drayage.
+ */
+function isDrayageShipment(booking) {
+  const mode = readShipmentMode(booking).toLowerCase();
+  if (!mode) return false;
+  return mode === "drayage" || mode.includes("dray");
+}
+
+/**
  * Fetches a Primus booking by BOL/load number.
  * @param {string} loadNumber BOL or load number.
  * @return {Promise<object|null>} Booking object or null.
@@ -4887,6 +5851,65 @@ async function validateAmountWithPrimus(loadNumber, amount) {
       error: error.message,
     });
     return {ok: false, error: error.message};
+  }
+}
+
+/**
+ * Decides whether AI-flagged "unrecognized" extra charges can be auto-approved
+ * because they are already part of the carrier cost Primus agreed to.
+ *
+ * Override applies when EITHER:
+ *   1. The invoice total matches Primus's recorded carrier cost within
+ *      tolerance (so there are no charges beyond the agreed amount), OR
+ *   2. Every flagged charge is present in the Primus vendor cost breakdown
+ *      (matched by amount or description).
+ *
+ * @param {string} loadNumber Load/BOL number.
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @param {Array<object>} unrecognizedCharges AI-flagged extra charges.
+ * @return {Promise<object>} Reconciliation result with override flag.
+ */
+async function reconcileUnrecognizedChargesWithPrimus(
+    loadNumber, invoiceAmount, unrecognizedCharges) {
+  try {
+    const booking = await fetchPrimusBooking(loadNumber);
+    if (!booking || !booking.vendor) {
+      return {override: false, reason: "no booking/vendor"};
+    }
+    const vendorCost = Number(booking.vendor.cost || 0);
+    const breakdown = Array.isArray(booking.vendor.breakdown) ?
+      booking.vendor.breakdown : [];
+    const amount = Number(invoiceAmount || 0);
+    const tolerance = Math.max(0.50, vendorCost * 0.02);
+    const totalMatches = vendorCost > 0 &&
+      Math.abs(amount - vendorCost) <= tolerance;
+
+    const normalize = (s) =>
+      String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const charges = Array.isArray(unrecognizedCharges) ?
+      unrecognizedCharges : [];
+    const chargesInPrimus = charges.length > 0 && charges.every((c) => {
+      const cAmt = Math.abs(Number(c.amount || 0));
+      const cLabel = normalize(c.label || c.type);
+      return breakdown.some((b) => {
+        const bAmt = Math.abs(Number(b.total != null ? b.total : b.rate || 0));
+        const bDesc = normalize(b.description || b.code);
+        const amtClose = cAmt > 0 &&
+          Math.abs(bAmt - cAmt) <= Math.max(0.50, cAmt * 0.02);
+        const descClose = cLabel && bDesc &&
+          (bDesc.includes(cLabel) || cLabel.includes(bDesc));
+        return amtClose || descClose;
+      });
+    });
+
+    return {
+      override: totalMatches || chargesInPrimus,
+      vendorCost,
+      totalMatches,
+      chargesInPrimus,
+    };
+  } catch (err) {
+    return {override: false, error: err.message};
   }
 }
 
@@ -5165,1445 +6188,9 @@ async function generateCustomerInvoice(invoiceData) {
   }
 }
 
-/**
- * Processes invoice through complete Primus workflow.
- * @param {string} invoiceId Invoice document ID.
- * @return {Promise<object>} Workflow result.
- */
-exports.processPrimusWorkflow = onRequest(
-    {timeoutSeconds: 300, memory: "512MiB"},
-    async (req, res) => {
-      try {
-        if (req.method !== "POST") {
-          return res.status(405).json({
-            ok: false,
-            error: "Method not allowed. Use POST.",
-          });
-        }
-
-
-        const {invoiceId, resumeFrom} = req.body || {};
-
-        if (!invoiceId) {
-          return res.status(400).json({
-            ok: false,
-            error: "invoiceId is required.",
-          });
-        }
-
-        // Get invoice document
-        const invoiceDoc = await db.collection("invoices").doc(invoiceId).get();
-
-        if (!invoiceDoc.exists) {
-          return res.status(404).json({
-            ok: false,
-            error: "Invoice not found.",
-          });
-        }
-
-        const invoice = invoiceDoc.data();
-
-        if (invoice.finalWorkflowStatus === "completed") {
-          await writeLog("info", "workflow",
-              "Workflow skipped — already completed", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                customerInvoiceId: invoice.customerInvoiceId || null,
-              });
-          return res.status(409).json({
-            ok: false,
-            error: "ALREADY_COMPLETED",
-            customerInvoiceId: invoice.customerInvoiceId || null,
-          });
-        }
-
-        const flowId = invoice.flowId || invoice.gmailMessageId || invoiceId;
-
-        const lockAcquired = await db.runTransaction(async (tx) => {
-          const snap = await tx.get(invoiceDoc.ref);
-          if (!snap.exists) return false;
-          const data = snap.data() || {};
-          if (data.processingLock === true) return false;
-          tx.update(invoiceDoc.ref, {
-            processingLock: true,
-            lastHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(),
-            currentStep: resumeFrom || "start",
-            processingStartedAt: data.processingStartedAt ||
-          admin.firestore.FieldValue.serverTimestamp(),
-            flowId: flowId,
-            finalWorkflowStatus: "running",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          return true;
-        });
-
-        if (!lockAcquired) {
-          await writeLog("warn", "workflow",
-              "Workflow skipped — another instance is already running", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-              });
-          return res.status(409).json({ok: false, error: "ALREADY_PROCESSING"});
-        }
-
-        await writeLog("info", "workflow",
-            resumeFrom ?
-              `Resuming Primus workflow from step: ${resumeFrom}` :
-              "Starting Primus workflow", {
-              invoiceId,
-              flowId,
-              resumeFrom: resumeFrom || null,
-              loadNumber: invoice.loadNumber,
-              carrierName: invoice.carrierName || null,
-              invoiceAmount: invoice.invoiceAmount || null,
-              proNumber: invoice.proNumber || null,
-              primusStepsCompleted: Object.entries(
-                  invoice.primusSteps || {},
-              ).filter(([, v]) => v).map(([k]) => k),
-            });
-
-        // Note: workflowPausedAt is tracked,
-        // but we do not block resume based on age.
-
-        let workingProNumber = invoice.proNumber;
-        // Load primusSteps from invoice document to track completed steps
-        const primusSteps = invoice.primusSteps || {
-          amountValidated: false,
-          proAdded: false,
-          shipmentDelivered: false,
-          customerRateChecked: false,
-          billApproved: false,
-          customerInvoiceGenerated: false,
-        };
-
-        const currentStep = resumeFrom || null;
-
-        if (
-          Array.isArray(invoice.unrecognizedCharges) &&
-      invoice.unrecognizedCharges.length > 0
-        ) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "unrecognized_charges_check",
-            stepStatus: "failed",
-            reason: "Unrecognized charges detected",
-            input: {unrecognizedCharges: invoice.unrecognizedCharges},
-            error: "UNRECOGNIZED_CHARGES",
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "unrecognized_charges",
-            decisionReason: "Unrecognized charges detected",
-            processingLock: false,
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "UNRECOGNIZED_CHARGES",
-          });
-        }
-
-        if (Array.isArray(invoice.chargesNeedProof) &&
-        invoice.chargesNeedProof.length > 0) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "charges_proof_check",
-            stepStatus: "failed",
-            reason: "Extra charges present with no proof",
-            input: {chargesNeedProof: invoice.chargesNeedProof},
-            error: "CHARGES_NO_PROOF",
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "charges_no_proof",
-            decisionReason: "Extra charges present with no proof",
-            processingLock: false,
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "CHARGES_NO_PROOF",
-          });
-        }
-
-        const proofRefs = Array.isArray(invoice.chargeProofRefs) ?
-      invoice.chargeProofRefs : [];
-        const attachments = Array.isArray(invoice.attachments) ?
-      invoice.attachments : [];
-        const approvedChargeProofFiles = proofRefs
-            .map((ref) => {
-              const att = attachments.find(
-                  (a) => a && a.filename === ref.attachmentFilename,
-              );
-              return {
-                type: ref.type,
-                amount: Number(ref.amount || 0),
-                storagePath: (att && att.storagePath) || null,
-              };
-            })
-            .filter((x) => x.storagePath);
-
-        const approvedChargesTotal = approvedChargeProofFiles
-            .reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
-
-        await invoiceDoc.ref.update({
-          approvedChargeProofFiles: approvedChargeProofFiles,
-          approvedChargesTotal: approvedChargesTotal,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        const extractedPodOnlyFile =
-      await maybeExtractPodOnlyPdf(invoiceId, invoice);
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "pod_extraction_started",
-          stepStatus: "started",
-          input: {podSource: (invoice.pod && invoice.pod.source) || null},
-        });
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "pod_extraction_completed",
-          stepStatus: extractedPodOnlyFile ? "success" : "failed",
-          output: extractedPodOnlyFile ?
-        {storagePath: extractedPodOnlyFile.storagePath} : null,
-          error: extractedPodOnlyFile ? null : "POD extraction returned null",
-        });
-
-        if (extractedPodOnlyFile) {
-          await invoiceDoc.ref.update({
-            podOnlyFile: {
-              storagePath: extractedPodOnlyFile.storagePath,
-              source: extractedPodOnlyFile.source,
-            },
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-        }
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "amount_validation_started",
-          stepStatus: "started",
-          input: {
-            loadNumber: invoice.loadNumber,
-            invoiceAmount: invoice.invoiceAmount,
-          },
-        });
-
-        await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validation");
-
-        const baseAmount = Number(invoice.invoiceAmount) - approvedChargesTotal;
-
-        await writeLog("info", "workflow", "Validating invoice amount", {
-          invoiceId,
-          flowId,
-          loadNumber: invoice.loadNumber,
-          invoiceAmount: invoice.invoiceAmount,
-          approvedChargesTotal,
-          baseAmountToValidate: baseAmount,
-        });
-
-        const amountValidation = await validateAmountWithPrimus(
-            invoice.loadNumber,
-            baseAmount,
-        );
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "amount_validation_completed",
-          stepStatus: amountValidation.ok && amountValidation.validAmount ?
-            "success" : "failed",
-          output: {
-            validAmount: amountValidation.validAmount,
-            submittedAmount: amountValidation.submittedAmount,
-            primusAmount: amountValidation.savedAmount,
-            difference: amountValidation.difference,
-          },
-          error: (amountValidation.ok && amountValidation.validAmount) ?
-            null : (amountValidation.reason || "Amount validation failed"),
-        });
-
-        if (amountValidation.ok && amountValidation.validAmount) {
-          await writeLog("info", "workflow", "Amount validation passed", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            submittedAmount: amountValidation.submittedAmount,
-            primusAmount: amountValidation.savedAmount,
-            difference: amountValidation.difference,
-            proNumber: amountValidation.proNumber || null,
-          });
-        }
-
-        if (!amountValidation.ok || !amountValidation.validAmount) {
-          const primusAmountFromValidation = amountValidation.amount || null;
-          const submitted = amountValidation.submittedAmount ||
-          invoice.invoiceAmount;
-          const saved = amountValidation.savedAmount ||
-            primusAmountFromValidation;
-          const diff = amountValidation.difference ||
-          (saved ? Math.abs(submitted - saved) : null);
-
-          await writeLog("error", "workflow", "Amount validation failed", {
-            event: "Amount validation failed",
-            invoiceId: invoiceId,
-            details: {
-              submittedAmount: submitted,
-              savedAmount: saved,
-              difference: diff,
-              reason: amountValidation.reason ||
-                "Amount does not match Primus record",
-              decision: "UNMATCHED_AMOUNT",
-              invoiceAmount: invoice.invoiceAmount,
-              primusAmount: primusAmountFromValidation,
-              baseAmount: baseAmount,
-            },
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "unmatched_amount",
-            decisionReason: "Amount validation failed",
-            baseAmountValidated: baseAmount,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "UNMATCHED_AMOUNT",
-            details: amountValidation,
-          });
-        }
-
-        primusSteps.amountValidated = true;
-        await invoiceDoc.ref.update({
-          primusSteps: primusSteps,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validated");
-
-        // Extra charges (e.g. lumper) are never auto-added to the customer
-        // invoice, even when their proof checks out — a human must decide
-        // whether to invoice them or dispute them with the carrier.
-        if (approvedChargeProofFiles.length > 0) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "extra_charges_held_for_review",
-            stepStatus: "failed",
-            reason: "Extra charges require human approval before invoicing",
-            input: {approvedChargeProofFiles, approvedChargesTotal},
-            error: "EXTRA_CHARGES_PENDING_REVIEW",
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "extra_charges_pending_review",
-            decisionReason:
-                "Extra charges verified but held for human approval",
-            processingLock: false,
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          if (invoice.gmailMessageId) {
-            const gmailDoc =
-              await db.collection("settings").doc("gmail").get();
-            if (gmailDoc.exists) {
-              const gmailSettings = gmailDoc.data();
-              const tokens = gmailSettings.tokens || gmailSettings;
-              const oauth2Client = getGmailOAuthClient();
-              oauth2Client.setCredentials(tokens);
-              const gmail =
-                google.gmail({version: "v1", auth: oauth2Client});
-
-              await forwardToHumanReview(
-                  gmail,
-                  invoice.gmailMessageId,
-                  invoice.gmailSubject,
-                  invoice.gmailFrom,
-                  "Extra charges verified — approval needed before " +
-                  "invoicing",
-                  `The amount and proof both check out, but the extra ` +
-                  `charges on this invoice are being held for manual ` +
-                  `review before adding them to the customer's invoice. ` +
-                  `Please confirm whether to invoice them or dispute ` +
-                  `them with the carrier.`,
-                  {
-                    department: "billing",
-                    extractedData: {
-                      "Carrier": invoice.carrierName || "—",
-                      "Load Number": invoice.loadNumber || "—",
-                      "Extra Charges": approvedChargeProofFiles
-                          .map((c) => `${c.type}: $${c.amount.toFixed(2)}`)
-                          .join(", "),
-                      "Total Extra Charges":
-                          `$${approvedChargesTotal.toFixed(2)}`,
-                    },
-                  },
-              );
-            }
-          }
-
-          return res.json({
-            ok: false,
-            error: "EXTRA_CHARGES_PENDING_REVIEW",
-          });
-        }
-
-        // PRO Number Handling - use Primus response proNumber
-        const primusProNumber = amountValidation.proNumber || "";
-        if (invoice.proNumber &&
-            invoice.proNumber.trim() !== "" && !primusProNumber) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "pro_check_started",
-            stepStatus: "started",
-            input: {
-              invoicePro: invoice.proNumber,
-              taiPro: primusProNumber,
-            },
-          });
-
-          const proResult = await addProNumberToLoad(
-              invoice.loadNumber,
-              invoice.proNumber,
-              {
-                invoiceNumber: invoice.invoiceNumber,
-                dueDate: invoice.dueDate,
-                carrierName: invoice.carrierName,
-              },
-          );
-
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "pro_added",
-            stepStatus: proResult.ok ? "success" :
-              (proResult.skipped ? "skipped" : "failed"),
-            output: proResult.ok ? {
-              newPro: invoice.proNumber,
-              skipped: proResult.skipped || false,
-              reason: proResult.reason || null,
-            } : null,
-            error: proResult.ok ? null : "Failed to add PRO to load",
-          });
-          if (proResult.ok) {
-            await writeLog("info", "workflow",
-                proResult.skipped ?
-                  `PRO number step skipped — ${proResult.reason}` :
-                  "PRO number written to Primus booking", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  proNumber: invoice.proNumber,
-                });
-          } else {
-            await writeLog("warn", "workflow",
-                "Failed to write PRO number to Primus — workflow continues", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  proNumber: invoice.proNumber,
-                  error: proResult.error,
-                });
-          }
-
-          if (proResult.ok) {
-            primusSteps.proAdded = true;
-            workingProNumber = invoice.proNumber;
-            await invoiceDoc.ref.update({
-              proNumber: workingProNumber,
-              primusSteps: primusSteps,
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-
-            await setWorkflowHeartbeat(invoiceDoc.ref, "pro_added");
-          }
-        } else {
-          // Use Primus proNumber if available, otherwise use workingProNumber
-          workingProNumber = primusProNumber || workingProNumber;
-        }
-
-        // PRO is optional for FTL; workflow proceeds on load number alone.
-
-        if (!currentStep || currentStep === "mark_delivered" ||
-        currentStep === "check_customer" ||
-        currentStep === "approve_bill" ||
-        currentStep === "get_rate" ||
-        currentStep === "generate_invoice") {
-          // Skip if already marked delivered (from primusSteps or
-          // Primus duplicate)
-          if (primusSteps.shipmentDelivered) {
-            await logWorkflowStep({
-              invoiceId,
-              stepName: "shipment_mark_delivered_started",
-              stepStatus: "skipped",
-              output: {reason: "Already marked delivered"},
-            });
-          } else {
-            await logWorkflowStep({
-              invoiceId,
-              stepName: "shipment_mark_delivered_started",
-              stepStatus: "started",
-              input: {
-                loadNumber: invoice.loadNumber,
-                proNumber: workingProNumber,
-              },
-            });
-
-            const deliveredRes = await markShipmentDelivered(
-                invoice.loadNumber,
-                workingProNumber,
-            );
-
-            // Treat "already delivered" as success, not error
-            const alreadyDelivered = isAlreadyDoneResult(deliveredRes);
-            if (!deliveredRes.ok && !alreadyDelivered) {
-              await invoiceDoc.ref.update({
-                decisionStage: "mark_delivered_failed",
-                decisionReason: "Failed to mark shipment delivered",
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              });
-
-              return res.json({
-                ok: false,
-                error: "MARK_DELIVERED_FAILED",
-                details: deliveredRes,
-              });
-            }
-
-            await writeLog("info", "workflow",
-                alreadyDelivered ?
-                  "Shipment already marked delivered in Primus — skipped" :
-                  "Shipment marked delivered in Primus", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  proNumber: workingProNumber || null,
-                  alreadyDelivered,
-                });
-          }
-          primusSteps.shipmentDelivered = true;
-          await invoiceDoc.ref.update({
-            primusSteps: primusSteps,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          await setWorkflowHeartbeat(invoiceDoc.ref, "shipment_delivered");
-
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "shipment_mark_delivered_completed",
-            stepStatus: "success",
-            output: {status: "delivered"},
-          });
-        }
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "customer_check_started",
-          stepStatus: "started",
-          input: {loadNumber: invoice.loadNumber, proNumber: workingProNumber},
-        });
-
-        let customerNameForCheck = invoice.customerName;
-        const customerForCheckResult = await getCustomerRate(
-            invoice.loadNumber,
-            workingProNumber,
-        );
-
-        if (customerForCheckResult && customerForCheckResult.ok) {
-          customerNameForCheck = customerForCheckResult.customerName;
-          await invoiceDoc.ref.update({
-            customerName: customerNameForCheck,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          await writeLog("info", "workflow",
-              "Customer rate fetched from Primus", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                customerName: customerForCheckResult.customerName,
-                customerRate: customerForCheckResult.customerRate,
-                rateSource: customerForCheckResult.rateSource,
-              });
-        } else {
-          await writeLog("warn", "workflow",
-              "Could not fetch customer rate from Primus", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                error: customerForCheckResult && customerForCheckResult.error,
-              });
-        }
-
-        if (
-          customerNameForCheck &&
-      String(customerNameForCheck).toLowerCase().includes("test")
-        ) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "customer_check_paused",
-            stepStatus: "stopped",
-            reason: "Test customer detected - manual review required",
-            output: {customerName: customerNameForCheck},
-            error: "TEST_CUSTOMER",
-          });
-
-          await pauseWorkflow(
-              invoiceDoc.ref,
-              "check_customer",
-              "test_customer_review",
-              "Test customer detected - paused",
-          );
-
-          const baseUrl = `https://${req.get("host")}`;
-          const htmlContent =
-        `<p>Invoice ${invoiceId} is for a test customer ` +
-        `(${customerNameForCheck}).</p>` +
-        `${buildContinueButtonHtml(baseUrl, invoiceId)}`;
-          await saveOutboundEmail({
-            type: "customer_missing",
-            invoiceId,
-            subject: "Customer requires confirmation",
-            html: htmlContent,
-          });
-
-          return res.json({
-            ok: true,
-            workflowStatus: "test_customer_review",
-          });
-        }
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "bill_approval_started",
-          stepStatus: "started",
-          input: {
-            loadNumber: invoice.loadNumber,
-            carrierName: invoice.carrierName,
-            invoiceAmount: invoice.invoiceAmount,
-          },
-        });
-
-        const billApprovalData = {
-          loadNumber: invoice.loadNumber,
-          proNumber: workingProNumber,
-          carrierName: invoice.carrierName,
-          invoiceNumber: invoice.invoiceNumber,
-          invoiceAmount: invoice.invoiceAmount,
-          podStoragePath:
-          (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
-          (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
-          null,
-        };
-
-        const approvalResult = await approveCarrierBill(billApprovalData);
-
-        // Treat "already approved" as success, not error
-        const alreadyApproved = isAlreadyDoneResult(approvalResult);
-        const isSuccess = approvalResult.ok || alreadyApproved;
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "bill_approval_completed",
-          stepStatus: isSuccess ? "success" : "failed",
-          output: isSuccess ?
-        {billId: approvalResult.billId, alreadyApproved} : null,
-          error: isSuccess ? null : "Carrier bill approval failed",
-        });
-
-        if (!isSuccess) {
-          await writeLog("error", "workflow", "Carrier bill approval failed", {
-            invoiceId: invoiceId,
-            approvalResult: approvalResult,
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "approval_failed",
-            decisionReason: "Carrier bill approval failed",
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "Carrier bill approval failed",
-            details: approvalResult,
-          });
-        }
-
-        await writeLog("info", "workflow",
-            alreadyApproved ?
-              "Carrier bill already approved — skipped" :
-              "Carrier bill approved", {
-              invoiceId,
-              loadNumber: invoice.loadNumber,
-              carrierName: invoice.carrierName,
-              invoiceAmount: invoice.invoiceAmount,
-              alreadyApproved,
-            });
-
-        primusSteps.billApproved = true;
-        await invoiceDoc.ref.update({
-          primusSteps: primusSteps,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        await setWorkflowHeartbeat(invoiceDoc.ref, "bill_approved");
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "customer_rate_check_started",
-          stepStatus: "started",
-          input: {loadNumber: invoice.loadNumber, proNumber: workingProNumber},
-        });
-
-        const customerRateResult = customerForCheckResult;
-
-        if (!customerRateResult.ok) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "customer_rate_check_paused",
-            stepStatus: "stopped",
-            reason: "Missing customer rate",
-            error: "MISSING_RATE",
-          });
-
-          await pauseWorkflow(
-              invoiceDoc.ref,
-              "get_rate",
-              "needs_customer_rate_review",
-              "Missing customer rate",
-          );
-
-          const baseUrl = `https://${req.get("host")}`;
-          await saveOutboundEmail({
-            type: "rate_missing",
-            invoiceId,
-            subject: `Action needed — No customer rate` +
-              ` for Load ${invoice.loadNumber}`,
-            html:
-              `<h2>Customer Rate Missing</h2>` +
-              `<p>No customer rate was found for this load. ` +
-              `Click the button below to enter the rate and ` +
-              `resume the workflow automatically.</p>` +
-              `<table style="border-collapse:collapse;` +
-              `font-size:14px;margin:12px 0">` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Carrier</strong></td>` +
-              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Load #</strong></td>` +
-              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
-              `<tr><td style="padding:4px 12px 4px 0">` +
-              `<strong>Carrier Invoice</strong></td>` +
-              `<td>$${invoice.invoiceAmount || "—"}</td></tr>` +
-              `</table>` +
-              `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-              `${encodeURIComponent(invoiceId)}" ` +
-              `style="display:inline-block;padding:.6rem 1.25rem;` +
-              `background:#4f46e5;color:#fff;border-radius:8px;` +
-              `font-weight:600;text-decoration:none;margin-top:.5rem">` +
-              `Set Customer Rate</a>`,
-          });
-
-          return res.json({
-            ok: true,
-            workflowStatus: "needs_customer_rate_review",
-          });
-        }
-
-        const customerName = customerRateResult.customerName;
-        // A rate manually entered via setCustomerRate takes priority over
-        // whatever Primus currently reports (which can be stale/doubled).
-        const manualRate = Number(invoice.customerRate || 0);
-        const primusRate = Number(customerRateResult.customerRate || 0);
-        const customerRate = manualRate || primusRate;
-        // Carrier cost: use booking.vendor.cost (the load rate) — this is the
-        // source of truth. invoice.invoiceAmount can be doubled/stale.
-        const bookingCarrierCost = Number(
-            amountValidation.savedAmount || invoice.invoiceAmount || 0,
-        );
-        const profit = Number(customerRate || 0) -
-          (bookingCarrierCost - approvedChargesTotal);
-        const marginPctCalc = customerRate > 0 ?
-          Math.round((profit / customerRate) * 100) : 0;
-
-        await writeLog("info", "workflow", "Customer rate and profit check", {
-          invoiceId,
-          loadNumber: invoice.loadNumber,
-          customerName,
-          customerRate,
-          carrierInvoiceAmount: invoice.invoiceAmount,
-          approvedChargesTotal,
-          profit,
-          marginPct: marginPctCalc,
-          willPause: !customerRate || Number(customerRate) <= 0 || profit < 10,
-        });
-
-        primusSteps.customerRateChecked = true;
-
-        await invoiceDoc.ref.update({
-          customerName: customerName,
-          customerRate: customerRate,
-          profit: profit,
-          primusSteps: {
-            ...primusSteps,
-            customerRateChecked: true,
-          },
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        await setWorkflowHeartbeat(invoiceDoc.ref, "customer_rate_checked");
-
-        if (!customerRate || Number(customerRate) <= 0 || profit < 10) {
-          const pauseReason = !customerRate || Number(customerRate) <= 0 ?
-        "Missing customer rate" : "Customer rate too low";
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "customer_rate_check_paused",
-            stepStatus: "stopped",
-            reason: pauseReason,
-            output: {customerRate, profit},
-            error: "LOW_MARGIN",
-          });
-
-          await pauseWorkflow(
-              invoiceDoc.ref,
-              "get_rate",
-              "needs_customer_rate_review",
-              pauseReason,
-          );
-
-          const baseUrl = `https://${req.get("host")}`;
-          const isLowMargin = customerRate > 0;
-          const marginPct = marginPctCalc;
-          const carrierCost = bookingCarrierCost - approvedChargesTotal;
-          await saveOutboundEmail({
-            type: "rate_missing",
-            invoiceId,
-            subject: `Action needed — ` +
-              `${isLowMargin ? "Low margin" : "No customer rate"}` +
-              ` for Load ${invoice.loadNumber}`,
-            html:
-              `<h2>${isLowMargin ?
-                "Low Margin Warning" :
-                "Customer Rate Missing"} — Load ` +
-              `${escapeHtml(invoice.loadNumber || "")}</h2>` +
-              (isLowMargin ?
-                `<p>Margin is too low to proceed. Here is the breakdown:</p>` +
-                `<table style="border-collapse:collapse;` +
-                `font-size:15px;margin:12px 0">` +
-                `<tr><td style="padding:6px 16px 6px 0">` +
-                `<strong>Carrier cost</strong></td>` +
-                `<td style="font-weight:700">` +
-                `$${Number(carrierCost).toFixed(2)}</td></tr>` +
-                `<tr><td style="padding:6px 16px 6px 0">` +
-                `<strong>Customer rate</strong></td>` +
-                `<td style="font-weight:700">` +
-                `$${Number(customerRate).toFixed(2)}</td></tr>` +
-                `<tr><td style="padding:6px 16px 6px 0">` +
-                `<strong>Profit</strong></td>` +
-                `<td style="color:${profit < 0 ?
-                  "#dc2626" : "#d97706"};font-weight:700">` +
-                `$${Number(profit).toFixed(2)} (${marginPct}%)</td></tr>` +
-                `<tr><td style="padding:6px 16px 6px 0">` +
-                `<strong>Minimum required profit</strong></td>` +
-                `<td>$10.00</td></tr>` +
-                `</table>` :
-                `<p>No customer rate was found for this load in Primus. ` +
-                `Enter the correct rate below to resume.</p>` +
-                `<table style="border-collapse:collapse;` +
-                `font-size:15px;margin:12px 0">` +
-                `<tr><td style="padding:6px 16px 6px 0">` +
-                `<strong>Carrier cost</strong></td>` +
-                `<td style="font-weight:700">` +
-                `$${Number(carrierCost).toFixed(2)}</td></tr>` +
-                `<tr><td style="padding:6px 16px 6px 0">` +
-                `<strong>Customer rate</strong></td>` +
-                `<td style="color:#dc2626;font-weight:700">Not set</td></tr>` +
-                `</table>`) +
-              `<table style="border-collapse:collapse;` +
-              `font-size:13px;margin:8px 0;color:#555">` +
-              `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
-              `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
-              `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
-              `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
-              `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
-              `<td>${escapeHtml(customerName || "—")}</td></tr>` +
-              `</table>` +
-              `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-              `${encodeURIComponent(invoiceId)}" ` +
-              `style="display:inline-block;padding:.6rem 1.25rem;` +
-              `background:#4f46e5;color:#fff;border-radius:8px;` +
-              `font-weight:600;text-decoration:none;margin-top:.5rem">` +
-              `${isLowMargin ?
-                "Update Customer Rate" : "Set Customer Rate"}` +
-              `</a>`,
-          });
-
-          return res.json({
-            ok: true,
-            workflowStatus: "needs_customer_rate_review",
-          });
-        }
-
-        await writeLog("info", "workflow", "Generating customer invoice", {
-          invoiceId: invoiceId,
-          customerName: customerName,
-          customerRate: customerRate,
-        });
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "customer_invoice_generation_started",
-          stepStatus: "started",
-          input: {customerName, customerRate},
-        });
-
-        const customerInvoiceData = {
-          loadNumber: invoice.loadNumber,
-          proNumber: workingProNumber,
-          customerName: customerName,
-          customerRate: customerRate,
-          carrierInvoiceAmount: invoice.invoiceAmount,
-          podPdfStoragePath:
-          (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
-          (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
-          null,
-        };
-
-        // Check if customer invoice already exists
-        let invoiceGenerationResult = null;
-        if (invoice.customerInvoiceId) {
-          await writeLog(
-              "info", "workflow", "Customer invoice already exists", {
-                invoiceId: invoiceId,
-                customerInvoiceId: invoice.customerInvoiceId,
-              });
-
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "customer_invoice_generation_completed",
-            stepStatus: "skipped",
-            reason: "Customer invoice already exists",
-            output: {customerInvoiceId: invoice.customerInvoiceId},
-          });
-
-          primusSteps.customerInvoiceGenerated = true;
-          await invoiceDoc.ref.update({
-            primusSteps: primusSteps,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          await setWorkflowHeartbeat(invoiceDoc.ref, "customer_invoice_exists");
-        } else {
-          invoiceGenerationResult =
-          await generateCustomerInvoice(customerInvoiceData);
-
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "customer_invoice_generation_completed",
-            stepStatus: invoiceGenerationResult.ok ? "success" : "failed",
-            output: invoiceGenerationResult.ok ?
-          {customerInvoiceId: invoiceGenerationResult.customerInvoiceId} : null,
-            error: invoiceGenerationResult.ok ? null :
-          "Customer invoice generation failed",
-          });
-
-          if (!invoiceGenerationResult.ok) {
-            await writeLog(
-                "error",
-                "workflow",
-                "Customer invoice generation failed",
-                {
-                  invoiceId: invoiceId,
-                  result: invoiceGenerationResult,
-                },
-            );
-
-            await invoiceDoc.ref.update({
-              processingLock: false,
-              finalWorkflowStatus: "needs_invoice_review",
-              decisionStage: "invoice_generation_failed",
-              decisionReason: invoiceGenerationResult.error ||
-                "Customer invoice generation failed",
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-
-            const baseUrl = `https://${req.get("host")}`;
-            const primusTotal = invoiceGenerationResult.invoiceTotal || 0;
-            const expectedRateVal =
-              invoiceGenerationResult.expectedRate || customerRate;
-            const diffVal = invoiceGenerationResult.difference ||
-              Math.abs(primusTotal - expectedRateVal);
-            const isMismatch = primusTotal > 0 && expectedRateVal > 0;
-            await saveOutboundEmail({
-              type: "invoice_generation_failed",
-              invoiceId,
-              subject: `Action needed — Rate mismatch on Load` +
-                ` ${invoice.loadNumber}`,
-              html:
-                `<h2>Invoice Amount Mismatch — Load ` +
-                `${escapeHtml(invoice.loadNumber || "")}</h2>` +
-                (isMismatch ?
-                  `<p>The invoice in ShipPrimus does not match the ` +
-                  `expected customer rate:</p>` +
-                  `<table style="border-collapse:collapse;` +
-                  `font-size:15px;margin:12px 0">` +
-                  `<tr><td style="padding:6px 16px 6px 0">` +
-                  `<strong>Rate on the bill (Primus)</strong></td>` +
-                  `<td style="color:#dc2626;font-weight:700">` +
-                  `$${Number(primusTotal).toFixed(2)}</td></tr>` +
-                  `<tr><td style="padding:6px 16px 6px 0">` +
-                  `<strong>Expected customer rate</strong></td>` +
-                  `<td style="color:#16a34a;font-weight:700">` +
-                  `$${Number(expectedRateVal).toFixed(2)}</td></tr>` +
-                  `<tr><td style="padding:6px 16px 6px 0">` +
-                  `<strong>Difference</strong></td>` +
-                  `<td style="color:#dc2626;font-weight:700">` +
-                  `$${Number(diffVal).toFixed(2)}</td></tr>` +
-                  `</table>` :
-                  `<p>${escapeHtml(invoiceGenerationResult.error || "")}</p>`
-                ) +
-                `<table style="border-collapse:collapse;` +
-                `font-size:13px;margin:12px 0;color:#555">` +
-                `<tr><td style="padding:3px 12px 3px 0">Load #</td>` +
-                `<td>${escapeHtml(invoice.loadNumber || "—")}</td></tr>` +
-                `<tr><td style="padding:3px 12px 3px 0">Carrier</td>` +
-                `<td>${escapeHtml(invoice.carrierName || "—")}</td></tr>` +
-                `<tr><td style="padding:3px 12px 3px 0">Customer</td>` +
-                `<td>${escapeHtml(customerName || "—")}</td></tr>` +
-                `</table>` +
-                `<p>Fix the invoice amount in ShipPrimus to ` +
-                `<strong>$${Number(expectedRateVal).toFixed(2)}</strong>` +
-                `, then click Resume.</p>` +
-                `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-                `${encodeURIComponent(invoiceId)}" ` +
-                `style="display:inline-block;padding:.6rem 1.25rem;` +
-                `background:#4f46e5;color:#fff;border-radius:8px;` +
-                `font-weight:600;text-decoration:none;margin-top:.5rem">` +
-                `Resume Workflow</a>`,
-            });
-
-            return res.json({
-              ok: false,
-              error: "Customer invoice generation failed",
-              details: invoiceGenerationResult,
-            });
-          }
-
-          primusSteps.customerInvoiceGenerated = true;
-          await invoiceDoc.ref.update({
-            primusSteps: primusSteps,
-            customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          await writeLog("info", "workflow",
-              invoiceGenerationResult.reused ?
-                "Customer invoice already existed in Primus — reused" :
-                "Customer invoice created in Primus", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
-                invoiceNumber: invoiceGenerationResult.invoiceNumber || null,
-                invoiceTotal: invoiceGenerationResult.invoiceTotal,
-                generated: invoiceGenerationResult.generated,
-                reused: invoiceGenerationResult.reused || false,
-                pdfUrlAvailable: !!invoiceGenerationResult.invoicePdfUrl,
-              });
-
-          await setWorkflowHeartbeat(
-              invoiceDoc.ref, "customer_invoice_generated");
-        }
-
-        const finalCustomerInvoiceId =
-      (invoiceGenerationResult && invoiceGenerationResult.customerInvoiceId) ||
-      invoice.customerInvoiceId || null;
-
-        // Note: extra charges (lumper, etc.) are never auto-added here —
-        // they're held for human review earlier in the workflow (see
-        // "extra_charges_pending_review"), so finalCustomerInvoiceId only
-        // ever reflects the base freight amount.
-
-        // Determine PDF source. Query the Primus document endpoint to get the
-        // real issued invoice URL — only present when the invoice has been
-        // issued/generated. This is more reliable than invoiceGenerationResult
-        // .invoicePdfUrl (which uses a hash that only works in the browser).
-        const primusGenerated =
-            invoiceGenerationResult && invoiceGenerationResult.generated;
-        let primusInvoiceUrl = null;
-        let customerInvoicePdfBase64 = null;
-        try {
-          const docToken = await getPrimusToken();
-          const docResp = await fetch(
-              `${process.env.PRIMUS_BASE_URL}/document/bolnumber/` +
-              `${invoice.loadNumber}`,
-              {headers: {Authorization: `Bearer ${docToken}`}},
-          );
-          const docData = await docResp.json();
-          const allDocs = (docData.data && docData.data.results) || [];
-          const invDoc = allDocs.find((d) => d.type === "INV");
-          if (invDoc && invDoc.url) {
-            primusInvoiceUrl = invDoc.url;
-          }
-        } catch (docErr) {
-          await writeLog("warn", "primus",
-              "Could not fetch Primus document list; will use local PDF", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                error: docErr.message,
-              });
-        }
-
-        // Update invoice with completed workflow
-        await invoiceDoc.ref.update({
-          decisionStage: "completed",
-          decisionReason: "Primus workflow completed successfully",
-          customerName: customerName,
-          customerRate: customerRate,
-          profit: profit,
-          primusSteps: primusSteps,
-          finalWorkflowStatus: "completed",
-          customerInvoiceId: finalCustomerInvoiceId,
-          processingLock: false,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        });
-
-        await writeLog("info", "workflow", "Primus workflow completed", {
-          invoiceId,
-          flowId,
-          loadNumber: invoice.loadNumber,
-          carrierName: invoice.carrierName,
-          carrierInvoiceAmount: invoice.invoiceAmount,
-          customerName,
-          customerRate,
-          profit,
-          marginPct: marginPctCalc,
-          customerInvoiceId: finalCustomerInvoiceId,
-          primusSteps,
-          pdfSource: primusInvoiceUrl ? "primus" : "local",
-        });
-
-        const podStoragePath =
-      (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
-      (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
-      null;
-
-        const attachmentsToSend = [];
-        if (primusInvoiceUrl) {
-          try {
-            // The document URL returned by /document/bolnumber/{n}?type=INV
-            // is self-authenticating (no auth header required).
-            const pdfResp = await fetch(primusInvoiceUrl);
-            if (pdfResp.ok) {
-              const buf = Buffer.from(await pdfResp.arrayBuffer());
-              // Only accept real PDFs (%PDF- magic bytes). The server can
-              // return HTTP 200 HTML for draft/not-found invoices.
-              if (buf.slice(0, 5).toString("latin1") === "%PDF-") {
-                customerInvoicePdfBase64 = buf.toString("base64");
-              } else {
-                await writeLog("warn", "primus",
-                    "Primus document URL did not return a valid PDF; " +
-                    "falling back to locally-built invoice", {
-                      invoiceId,
-                      loadNumber: invoice.loadNumber,
-                      primusInvoiceUrl,
-                      preview: buf.slice(0, 100).toString("latin1"),
-                    });
-              }
-            }
-          } catch (pdfErr) {
-            await writeLog("warn", "primus",
-                "Error downloading Primus invoice PDF; " +
-                "falling back to locally-built invoice", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  error: pdfErr.message,
-                });
-          }
-        } else if (!primusGenerated) {
-          await writeLog("info", "primus",
-              "Primus invoice not yet issued (draft); " +
-              "no INV document found via document API", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                customerInvoiceId:
-                    invoiceGenerationResult ?
-                    (invoiceGenerationResult.customerInvoiceId || null) :
-                    (invoice.customerInvoiceId || null),
-              });
-        }
-        if (!customerInvoicePdfBase64) {
-          customerInvoicePdfBase64 = await buildCustomerInvoicePdfBase64({
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            proNumber: workingProNumber,
-            customerName,
-            customerRate,
-            carrierInvoiceAmount: invoice.invoiceAmount,
-          });
-          await writeLog("info", "workflow",
-              "Using locally-built customer invoice PDF", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                reason: primusInvoiceUrl ?
-                  "Primus document URL did not return valid PDF" :
-                  "No issued invoice document found in Primus",
-              });
-        } else {
-          await writeLog("info", "workflow",
-              "Using Primus-generated customer invoice PDF", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                primusInvoiceUrl,
-              });
-        }
-
-        attachmentsToSend.push({
-          filename: `customer-invoice-${invoiceId}.pdf`,
-          contentType: "application/pdf",
-          contentBase64: customerInvoicePdfBase64,
-        });
-
-        if (podStoragePath) {
-          const podBase64 = await downloadStorageFileBase64(podStoragePath);
-          if (podBase64) {
-            attachmentsToSend.push({
-              filename: `pod-${invoiceId}.pdf`,
-              contentType: "application/pdf",
-              contentBase64: podBase64,
-            });
-          } else {
-            await writeLog("warn", "workflow",
-                "POD file stored but could not be downloaded for email", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  podStoragePath,
-                });
-          }
-        } else {
-          await writeLog("warn", "workflow",
-              "No POD attached to customer invoice email — " +
-              "POD was not found or not extracted", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                podFound: invoice.pod && invoice.pod.found,
-                podSource: invoice.pod && invoice.pod.source,
-              });
-        }
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "final_email_started",
-          stepStatus: "started",
-          input: {attachmentCount: attachmentsToSend.length},
-        });
-
-        await setWorkflowHeartbeat(invoiceDoc.ref, "final_email_sending");
-
-        // Resolve customer email from Primus booking (billTo party).
-        let customerEmail = null;
-        try {
-          const bkData = await fetchPrimusBooking(invoice.loadNumber);
-          if (bkData) {
-            const billTo = bkData.billTo || "";
-            if (billTo === "thirdparty" && bkData.thirdParty) {
-              customerEmail = bkData.thirdParty.email || null;
-            }
-            if (!customerEmail && bkData.shipper) {
-              customerEmail = bkData.shipper.email || null;
-            }
-            if (!customerEmail && bkData.consignee) {
-              customerEmail = bkData.consignee.email || null;
-            }
-          }
-        } catch (_) {
-          // Non-fatal — email will go to ALERT_EMAIL fallback
-        }
-
-        const invoiceEmailSubject =
-            `Invoice — Load ${invoice.loadNumber}` +
-            (workingProNumber ? ` / PRO ${workingProNumber}` : "");
-        const invoiceEmailHtml =
-            `<p>Dear ${escapeHtml(customerName)},</p>` +
-            `<p>Please find attached your invoice for load ` +
-            `<strong>${escapeHtml(invoice.loadNumber)}</strong>` +
-            (workingProNumber ?
-              ` (PRO: ${escapeHtml(workingProNumber)})` : "") +
-            `.</p>` +
-            `<p>Amount: <strong>$${Number(customerRate).toFixed(2)
-            }</strong></p>` +
-            `<p>Thank you for your business.</p>`;
-
-        await saveOutboundEmail({
-          type: "generated_bill",
-          invoiceId,
-          to: customerEmail,
-          subject: invoiceEmailSubject,
-          html: invoiceEmailHtml,
-          attachments: attachmentsToSend,
-        });
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "final_email_sent",
-          stepStatus: "success",
-          output: {attachmentsSent: attachmentsToSend.length},
-        });
-
-        await writeLog("info", "workflow", "Final email sent", {
-          invoiceId: invoiceId,
-          flowId: flowId,
-          currentStep: "final_email_sent",
-          attachmentsSent: attachmentsToSend.length,
-        });
-
-
-        if (invoice.gmailMessageId) {
-          await writeLog("info", "workflow", "Invoice approved and completed", {
-            event: "Workflow completed - APPROVED",
-            invoiceId: invoiceId,
-            details: {
-              finalStatus: "APPROVED",
-              invoiceAmount: invoice.invoiceAmount,
-              primusAmount: invoice.primusAmount,
-              carrierName: invoice.carrierName,
-              loadNumber: invoice.loadNumber,
-              proNumber: invoice.proNumber,
-              customerInvoiceId: finalCustomerInvoiceId,
-              decision: "APPROVED",
-              reason: "All validations passed and customer invoice generated",
-              approvedChargesTotal: invoice.approvedChargesTotal || 0,
-              baseAmountValidated: invoice.baseAmountValidated,
-              approvedChargeProofFiles: invoice.approvedChargeProofFiles ?
-            invoice.approvedChargeProofFiles.length : 0,
-            },
-          });
-        }
-
-        // Push carrier bill to QuickBooks once the invoice is confirmed.
-        // The payable already exists in Primus (created when the invoice was
-        // issued). We call /quickbooks/billing to sync it to QB. If the
-        // dueDate is missing, we calculate Net 30 from the carrier invoice
-        // date and store it for reference.
-        if (finalCustomerInvoiceId) {
-          try {
-            const qbResult = await primusRequest(
-                "POST", "/quickbooks/billing",
-                {invoiceId: finalCustomerInvoiceId},
-            );
-            const qbBills = qbResult && qbResult.data &&
-                qbResult.data.results && qbResult.data.results.bills;
-            const uploaded = qbBills && qbBills.uploadedBills &&
-                qbBills.uploadedBills.length || 0;
-            const failed = qbBills && qbBills.failedBills &&
-                qbBills.failedBills.length || 0;
-            if (uploaded > 0) {
-              await writeLog("info", "workflow",
-                  "Carrier bill pushed to QuickBooks", {
-                    invoiceId,
-                    loadNumber: invoice.loadNumber,
-                    customerInvoiceId: finalCustomerInvoiceId,
-                    uploadedBills: uploaded,
-                  });
-            } else {
-              await writeLog("warn", "workflow",
-                  "QB billing call returned no uploaded bills " +
-                  "(QB may not be connected or bill not ready)", {
-                    invoiceId,
-                    loadNumber: invoice.loadNumber,
-                    customerInvoiceId: finalCustomerInvoiceId,
-                    failedBills: failed,
-                    raw: JSON.stringify(qbResult).slice(0, 300),
-                  });
-            }
-
-            // Calculate and store Net 30 due date for reference
-            const invDateRaw = invoice.dueDate ? null :
-                (invoice.invoiceDate || invoice.receivedAt || null);
-            if (!invoice.dueDate && invDateRaw) {
-              const invDate = new Date(invDateRaw);
-              if (!isNaN(invDate.getTime())) {
-                invDate.setDate(invDate.getDate() + 30);
-                const net30 = invDate.toISOString().split("T")[0];
-                await invoiceDoc.ref.update({
-                  carrierBillDueDate: net30,
-                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                });
-              }
-            }
-          } catch (qbErr) {
-            await writeLog("warn", "workflow",
-                "QB billing sync failed — bill still in Primus", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  error: qbErr.message,
-                });
-          }
-        }
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "workflow_completed",
-          stepStatus: "success",
-          output: {
-            customerName,
-            profit,
-            customerInvoiceId: finalCustomerInvoiceId,
-          },
-        });
-
-        return res.json({
-          ok: true,
-          message: "Primus workflow completed successfully",
-          customerName: customerName,
-          customerRate: customerRate,
-          profit: profit,
-          customerInvoiceId: finalCustomerInvoiceId,
-          workflowStatus: "completed",
-        });
-      } catch (error) {
-        const invoiceId = (req.body && req.body.invoiceId) || null;
-
-        await logWorkflowStep({
-          invoiceId,
-          stepName: "workflow_failed",
-          stepStatus: "failed",
-          reason: error.message,
-          error: error.message,
-        });
-
-        await writeLog("error", "workflow", "Primus workflow failed", {
-          invoiceId,
-          error: error.message,
-          stack: error.stack,
-        });
-        console.error("processPrimusWorkflow error:", error);
-
-        // Apply ERROR label and keep email unread + release processing lock
-        if (invoiceId) {
-          const invoiceDoc =
-            await db.collection("invoices").doc(invoiceId).get();
-          if (invoiceDoc.exists) {
-            const inv = invoiceDoc.data();
-            await invoiceDoc.ref.update({
-              processingLock: false,
-              finalWorkflowStatus: "failed",
-              lastHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(),
-              currentStep: inv.currentStep || "failed",
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-          }
-        }
-
-        return res.status(500).json({
-          ok: false,
-          error: "Internal server error.",
-          details: error.message,
-        });
-      }
-    },
-);
+// The Primus invoice workflow (processPrimusWorkflow) now lives in its own
+// company file, ./innovative-primus.js, and is wired up below. The Primus API
+// client helpers above remain here because the base intake also uses them.
 
 // ── TAI TMS integration ────────────────────────────────────────────────────
 // Firebase only deploys exports found in the main entry file, so we re-export
@@ -6614,10 +6201,14 @@ exports.processPrimusWorkflow = onRequest(
 // workflow — only the TMS API calls differ. We inject them rather than
 // duplicating them. These are passed by reference and remain closures over
 // this module's scope (db, getBucket, sendViaGmail, etc.).
-const tai = require("./tai");
-
-tai.init({
+// Shared, company-agnostic helper bundle injected into every per-company TMS
+// module. index.js is the base: it owns intake + these helpers; each company
+// file owns its own workflow and is fed the same bundle.
+const sharedTmsBundle = {
   db,
+  tcol,
+  getTenant,
+  enterTenantContext,
   writeLog,
   logWorkflowStep,
   setWorkflowHeartbeat,
@@ -6630,9 +6221,72 @@ tai.init({
   downloadStorageFileBase64,
   buildCustomerInvoicePdfBase64,
   FieldValue: admin.firestore.FieldValue,
+};
+
+// Innovative Carriers — dedicated Primus workflow file. It needs the shared
+// helpers plus the Primus API client helpers (which stay here because the base
+// intake also calls them).
+const primusBundle = {
+  ...sharedTmsBundle,
+  primusRequest,
+  getPrimusToken,
+  fetchPrimusBooking,
+  readShipmentMode,
+  isDrayageShipment,
+  validateAmountWithPrimus,
+  addProNumberToLoad,
+  getCustomerRate,
+  approveCarrierBill,
+  generateCustomerInvoice,
+  markShipmentDelivered,
+  forwardToHumanReview,
+  getGmailOAuthClient,
+};
+const primusUiBridge = require("./primus-ui-bridge");
+primusUiBridge.init({db, writeLog});
+
+const innovativePrimus = require("./innovative-primus");
+innovativePrimus.init({
+  ...primusBundle,
+  isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
+  runPrimusUiBillingFlow: primusUiBridge.runPrimusUiBillingFlow,
+  emailBOLDocs: primusUiBridge.emailBOLDocs,
+  resolveCustomerAccountingEmails:
+      primusUiBridge.resolveCustomerAccountingEmails,
+});
+exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
+
+const innovativeInsurance = require("./innovative-insurance");
+innovativeInsurance.init({
+  writeLog,
+  saveOutboundEmail,
+  fetchPrimusBooking,
+  addInsurancePremiumToLoad: primusUiBridge.addInsurancePremiumToLoad,
+  isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
 });
 
+// Renew Primus manage.php PHPSESSID before the 24h cookie expires.
+exports.refreshPrimusUiSession = onSchedule(
+    {schedule: "every 12 hours", timeZone: "America/New_York"},
+    async () => {
+      const result = await primusUiBridge.renewUiSession();
+      if (result.skipped) return;
+      if (!result.ok) {
+        console.error("refreshPrimusUiSession failed:", result.error);
+      }
+    },
+);
+
+const tai = require("./tai");
+tai.init(sharedTmsBundle);
 exports.taiWebhook = tai.taiWebhook;
 exports.taiResolveShipment = tai.taiResolveShipment;
 exports.processTaiWorkflow = tai.processTaiWorkflow;
+
+// Coast to Coast Carriers — dedicated, self-contained TAI workflow file.
+const ctcTai = require("./ctc-tai");
+ctcTai.init(sharedTmsBundle);
+exports.ctcTaiWebhook = ctcTai.ctcTaiWebhook;
+exports.ctcTaiResolveShipment = ctcTai.ctcTaiResolveShipment;
+exports.processCtcTaiWorkflow = ctcTai.processCtcTaiWorkflow;
 

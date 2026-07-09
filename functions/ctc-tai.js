@@ -1,4 +1,18 @@
 /**
+ * Coast to Coast Carriers — dedicated TAI TMS integration.
+ *
+ * A COMPLETE, self-contained copy of the TAI workflow bound to the
+ * `ctc` tenant. Per the per-company file model, each company owns
+ * its own file so its TAI credentials, webhook secret, endpoints, and workflow
+ * stay fully isolated from every other client. Shared, company-agnostic
+ * helpers (logging, email, PDF, POD, storage) still come from index.js via
+ * init().
+ *
+ * Exports (re-exported from index.js): ctcTaiWebhook, ctcTaiResolveShipment,
+ * processCtcTaiWorkflow. Credentials (env, falling back to the shared TAI_*
+ * vars): TAI_BASE_URL_CTC, TAI_API_KEY_CTC, TAI_WEBHOOK_SECRET_CTC.
+ *
+ * ── Original module notes ───────────────────────────────────────────────────
  * TAI TMS integration — webhook receiver and shipment index.
  *
  * Unlike Primus (where we look up a booking by load/BOL number on demand),
@@ -30,6 +44,9 @@
 
 const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
+
+/** The tenant this file is dedicated to. */
+const CTC_TENANT_ID = "ctc";
 
 /**
  * Returns the Firestore client. Lazily resolved so this module can be
@@ -275,9 +292,10 @@ async function indexShipment(shipment, eventType, tenant = null) {
  * @return {boolean} True if the request is authorized.
  */
 function isAuthorized(req) {
-  const expected = process.env.TAI_WEBHOOK_SECRET;
+  const expected = process.env.TAI_WEBHOOK_SECRET_CTC;
   if (!expected) {
-    console.warn("[tai] TAI_WEBHOOK_SECRET not set — skipping auth check");
+    console.warn(
+        "[ctc-tai] webhook secret not set — skipping auth check");
     return true;
   }
   const header = req.get("authorization") || req.get("Authorization") || "";
@@ -321,7 +339,7 @@ function extractShipmentDetails(body) {
  * Responds 200 quickly and does the (small) indexing work inline. TAI uses a
  * ~100s client timeout and never retries, so we must not hang.
  */
-exports.taiWebhook = onRequest(
+exports.ctcTaiWebhook = onRequest(
     {timeoutSeconds: 60, memory: "256MiB"},
     async (req, res) => {
       const eventType = (req.query && req.query.event) ?
@@ -332,7 +350,7 @@ exports.taiWebhook = onRequest(
       // The tenant namespaces the shipment index so two TAI companies sharing
       // this deployment can never resolve each other's load numbers.
       const tenantId = (req.query && req.query.tenant) ?
-        String(req.query.tenant) : "default";
+        String(req.query.tenant) : CTC_TENANT_ID;
       const tenant = await resolveTenant(tenantId);
 
       if (req.method !== "POST") {
@@ -442,13 +460,14 @@ exports.resolveTaiShipmentId = resolveTaiShipmentId;
  * number. Useful for testing the index and for manual reconciliation.
  * Query/body params: loadNumber, proNumber.
  */
-exports.taiResolveShipment = onRequest(
+exports.ctcTaiResolveShipment = onRequest(
     {timeoutSeconds: 30, memory: "256MiB"},
     async (req, res) => {
       const src = req.method === "POST" ? (req.body || {}) : (req.query || {});
       const loadNumber = src.loadNumber || null;
       const proNumber = src.proNumber || null;
-      const tenant = await resolveTenant(src.tenantId || src.tenant || null);
+      const tenant = await resolveTenant(
+          src.tenantId || src.tenant || CTC_TENANT_ID);
 
       if (!loadNumber && !proNumber) {
         return res.status(400).json({
@@ -522,9 +541,11 @@ function s() {
  * @return {Promise<object|Array|string|null>} Parsed response, or null on 404.
  */
 async function taiRequest(method, path, body) {
-  const base = process.env.TAI_BASE_URL || "https://www.taibeta.net";
+  // CTC uses ONLY its own credentials — never the shared TAI_* vars, so it can
+  // never call another client's TAI account.
+  const base = process.env.TAI_BASE_URL_CTC || "https://www.taibeta.net";
   const headers = {
-    "x-api-key": process.env.TAI_API_KEY || "",
+    "x-api-key": process.env.TAI_API_KEY_CTC || "",
     "Content-Type": "application/json",
     "accept": "application/json",
   };
@@ -1092,7 +1113,7 @@ async function loadSnapshot(shipmentId, tenant = null) {
  *
  * Body: { invoiceId, resumeFrom? }.
  */
-exports.processTaiWorkflow = onRequest(
+exports.processCtcTaiWorkflow = onRequest(
     {timeoutSeconds: 300, memory: "512MiB"},
     async (req, res) => {
       const h = s();
@@ -1117,7 +1138,7 @@ exports.processTaiWorkflow = onRequest(
         // running the TAI workflow against the wrong company. The
         // invoice is then read from the tenant's OWN prefixed collection — the
         // workflow physically cannot see another tenant's invoices.
-        const tenant = await resolveTenant(tenantId);
+        const tenant = await resolveTenant(tenantId || CTC_TENANT_ID);
         if (!tenant || String(tenant.tms).toLowerCase() !== "tai") {
           await h.writeLog("error", "workflow",
               "Refused TAI workflow for non-TAI tenant", {
@@ -1800,7 +1821,8 @@ exports.processTaiWorkflow = onRequest(
           if (invoiceId) {
             // Re-resolve the tenant so the lock is released on the SAME
             // (prefixed) collection the workflow read from, never the root.
-            const cleanupTenant = await resolveTenant(tenantId);
+            const cleanupTenant = await resolveTenant(
+                tenantId || CTC_TENANT_ID);
             const ref =
               tcolFor(cleanupTenant, "invoices").doc(String(invoiceId));
             const snap = await ref.get();
