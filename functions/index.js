@@ -6,6 +6,17 @@ const {google} = require("googleapis");
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
 const {PDFDocument, StandardFonts, rgb} = require("pdf-lib");
+const podUtils = require("./pod-utils");
+const {
+  extractPdfPageTexts,
+  textLooksUnsafeForCustomer,
+  normalizePodFromClassification,
+  resolvePodDocuments,
+  extractPodDocumentPdfBytes,
+  parseClassificationResponse,
+  resolvePodPageIndex,
+  POD_BLOCK_SHAPE,
+} = podUtils;
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
 
@@ -2104,22 +2115,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         unrecognizedCharges: [{type: "", amount: 0, label: ""}],
         chargesNeedProof: [{type: "lumper", amount: 0, reason: ""}],
         chargeProofRefs: [{type: "lumper", amount: 0, attachmentFilename: ""}],
-        pod: {
-          found: false,
-          documents: [
-            {
-              source: "",
-              page: "",
-              attachmentFilename: "",
-              reason: "",
-            },
-          ],
-          source: "",
-          attachmentFilename: "",
-          page: "",
-          cropFromBottom: 0,
-          reason: "",
-        },
+        pod: POD_BLOCK_SHAPE,
         reason: "",
       },
     }),
@@ -2136,22 +2132,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
     messages: [{role: "user", content: contentBlocks}],
   });
 
-  if (!response.content || response.content.length === 0) {
-    throw new Error(
-        "Claude returned an empty response for invoice classification");
-  }
-  const rawText = response.content[0].text;
-  const jsonText = rawText
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/i, "")
-      .trim();
-  try {
-    return JSON.parse(jsonText);
-  } catch (e) {
-    throw new Error(
-        `Claude returned non-JSON response: ${rawText.slice(0, 200)}`,
-    );
-  }
+  return parseClassificationResponse(response.content);
 }
 
 // Identity the AI agent uses to sign the emails it composes. Override with
@@ -2480,8 +2461,9 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
         // page count enrichment is best-effort
       }
     }
-    const podNormalized = normalizePodData(rawPod, {pageCount: pageCountHint});
-    const documents = coercePodDocuments(rawPod, {pageCount: pageCountHint});
+    const {normalized: podNormalized, documents} = resolvePodDocuments(
+        rawPod, {pageCount: pageCountHint},
+    );
     if (!invoice || !podNormalized || podNormalized.found !== true ||
         documents.length === 0) {
       await writeLog("info", "workflow",
@@ -2653,11 +2635,16 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
 
       // Check the REAL text of the source page(s) this doc covers.
       const pageCount = loadedDoc.getPageCount();
-      let pageIndex;
-      if (doc.source === "last_page_of_invoice") {
-        pageIndex = pageCount - 1;
-      } else {
-        pageIndex = (Number(doc.page) || pageCount) - 1;
+      const pageIndex = resolvePodPageIndex(doc, pageCount);
+      if (pageIndex === null) {
+        await writeLog("warn", "workflow",
+            "Skipped POD page — invalid or missing page number", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              podPage: doc.page,
+              podSource: doc.source,
+            });
+        continue;
       }
       const pageText = pageTexts &&
         pageIndex >= 0 && pageIndex < pageTexts.length ?
@@ -2826,348 +2813,6 @@ function normalizeAiChargeArrays(aiResult) {
   };
 }
 
-const FULL_PAGE_POD_KEYWORDS =
-  /\b(signed|signature|bol|bill of lading|delivery receipt|received|consignee|driver|signed load|load document|pod)\b/i; // eslint-disable-line max-len
-
-const POD_PACKAGE_SOURCES = new Set([
-  "unsigned_pod_template",
-  "signed_bol",
-  "signed_load",
-  "signed_pod",
-  "delivery_receipt",
-  "separate_attachment",
-  "same_page_as_invoice",
-  "last_page_of_invoice",
-  "attachment",
-]);
-
-/**
- * @param {string} source Document source label.
- * @return {boolean}
- */
-function isPodPackageSource(source) {
-  return POD_PACKAGE_SOURCES.has(String(source || "").trim());
-}
-
-// Phrases that only appear on carrier-facing pricing documents (rate/load
-// confirmations, rate agreements). These NEVER belong on a clean signed BOL or
-// delivery receipt, so their presence means the page exposes the buy-rate and
-// must not reach the customer — even if the page is signed.
-const RATE_CONFIRMATION_MARKERS = [
-  "rate confirmation",
-  "rate con",
-  "rateconfirmation",
-  "rate and load confirmation",
-  "load and rate confirmation",
-  "load confirmation",
-  "carrier confirmation",
-  "carrier rate confirmation",
-  "rate agreement",
-  "load tender",
-  "line haul",
-  "line-haul",
-  "linehaul",
-  "fuel surcharge",
-  "carrier pay",
-  "total carrier pay",
-  "agreed rate",
-  "carrier freight charges",
-];
-
-let pdfjsModulePromise = null;
-
-/**
- * Lazily loads the ESM pdfjs build from CommonJS via dynamic import.
- * @return {Promise<object>} pdfjs module.
- */
-function getPdfjs() {
-  if (!pdfjsModulePromise) {
-    pdfjsModulePromise = import("pdfjs-dist/legacy/build/pdf.mjs");
-  }
-  return pdfjsModulePromise;
-}
-
-/**
- * Extracts real per-page text from a PDF, decompressing content streams.
- * Raw byte scans cannot see Flate-compressed text (nearly all real PDFs),
- * so this is what makes carrier-cost detection actually work. Returns null
- * when the PDF has no extractable text layer (e.g. a scanned image).
- * @param {Buffer|Uint8Array} buffer Original PDF bytes.
- * @return {Promise<string[]|null>} Page texts (index 0 = page 1) or null.
- */
-async function extractPdfPageTexts(buffer) {
-  try {
-    const pdfjs = await getPdfjs();
-    // Clone so pdfjs cannot detach the caller's buffer (reused for pdf-lib).
-    const data = Uint8Array.from(buffer);
-    const task = pdfjs.getDocument({
-      data,
-      isEvalSupported: false,
-      useSystemFonts: true,
-    });
-    const pdf = await task.promise;
-    const texts = [];
-    let anyText = false;
-    for (let i = 1; i <= pdf.numPages; i++) {
-      const page = await pdf.getPage(i);
-      const tc = await page.getTextContent();
-      const txt = tc.items.map((it) => it.str).join(" ").trim();
-      if (txt) anyText = true;
-      texts.push(txt);
-    }
-    await pdf.destroy();
-    return anyText ? texts : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-/**
- * True when page TEXT exposes carrier cost: it shows the carrier invoice
- * amount or carries rate/load-confirmation pricing markers.
- * @param {string|null} text Extracted page text.
- * @param {number} invoiceAmount Carrier invoice amount.
- * @return {object} {unsafe, reason, hasText}
- */
-function textLooksUnsafeForCustomer(text, invoiceAmount) {
-  if (!text) return {unsafe: false, reason: null, hasText: false};
-  const lower = text.toLowerCase();
-  const amount = Number(invoiceAmount);
-  if (Number.isFinite(amount) && amount > 0) {
-    const formatted = amount.toFixed(2);
-    const [intPart, decPart] = formatted.split(".");
-    const withCommas =
-      `${intPart.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}.${decPart}`;
-    const collapsed = lower.replace(/\s+/g, "");
-    if (collapsed.includes(formatted) || collapsed.includes(withCommas)) {
-      return {unsafe: true, reason: "carrier_invoice_amount", hasText: true};
-    }
-  }
-  const marker = RATE_CONFIRMATION_MARKERS.find((m) => lower.includes(m));
-  if (marker) {
-    return {
-      unsafe: true,
-      reason: `rate_confirmation_marker:${marker}`,
-      hasText: true,
-    };
-  }
-  return {unsafe: false, reason: null, hasText: true};
-}
-
-/**
- * @param {Array<object>} documents Document entries.
- * @param {string} fallbackFilename Attachment filename.
- * @return {Array<object>}
- */
-function normalizeDocumentEntries(documents, fallbackFilename) {
-  const seen = new Set();
-  return documents
-      .map((doc) => normalizePodDocEntry({
-        ...doc,
-        attachmentFilename: doc.attachmentFilename || fallbackFilename,
-      }))
-      .filter((doc) => {
-        const key = [
-          doc.attachmentFilename,
-          String(doc.page || ""),
-          doc.source,
-        ].join("|");
-        if (seen.has(key) || !doc.source) return false;
-        seen.add(key);
-        return true;
-      })
-      .sort((a, b) => (Number(a.page) || 0) - (Number(b.page) || 0));
-}
-
-/**
- * Upgrades risky POD crop on a single document entry.
- * @param {object} doc POD document entry.
- * @return {object}
- */
-function normalizePodDocEntry(doc) {
-  if (!doc) return doc;
-
-  const source = String(doc.source || "").trim();
-  const reason = String(doc.reason || "").trim();
-  const filename = String(doc.attachmentFilename || "").trim();
-  const context = `${reason} ${filename}`.toLowerCase();
-
-  if (POD_PACKAGE_SOURCES.has(source) ||
-      source === "last_page_of_invoice") {
-    return doc;
-  }
-
-  if (source === "same_page_as_invoice") {
-    const crop = Number(doc.cropFromBottom || 0);
-    const looksSigned = FULL_PAGE_POD_KEYWORDS.test(context);
-    const largeCrop = crop >= 0.45;
-
-    if (looksSigned || largeCrop) {
-      const upgraded = /\b(signed load|load document|load confirmation)\b/i
-          .test(context) ? "signed_load" : "signed_bol";
-      const upgradeNote =
-        `[upgraded ${source} → ${upgraded}: full signed page preferred]`;
-      return {
-        ...doc,
-        source: upgraded,
-        cropFromBottom: 0,
-        reason: reason ? `${reason} ${upgradeNote}` : upgradeNote.trim(),
-      };
-    }
-  }
-
-  if (!source && doc.attachmentFilename) {
-    return {...doc, source: "signed_bol"};
-  }
-
-  return doc;
-}
-
-/**
- * Upgrades risky POD crop classifications to full-page signed doc sources.
- * @param {object|null} pod POD block from AI classification.
- * @return {object|null}
- */
-function normalizePodClassification(pod) {
-  if (!pod || pod.found !== true) {
-    return pod;
-  }
-  return normalizePodDocEntry(pod);
-}
-
-/**
- * Normalizes POD block and builds pod.documents from legacy fields.
- * @param {object|null} pod POD block from AI classification.
- * @param {object} [options] Options.
- * @param {number} [options.pageCount] PDF page count when known.
- * @return {object|null}
- */
-function normalizePodData(pod, options = {}) {
-  if (!pod || pod.found !== true) {
-    return pod;
-  }
-
-  const normalized = normalizePodClassification(pod);
-  const fallbackFilename = normalized.attachmentFilename || "";
-  const pageCount = Number(options.pageCount || normalized.pageCount || 0);
-
-  let documents = Array.isArray(normalized.documents) ?
-    normalized.documents.filter(Boolean) : [];
-  if (documents.length === 0 &&
-      (normalized.source || normalized.page || normalized.attachmentFilename)) {
-    documents = [{
-      source: normalized.source,
-      page: normalized.page,
-      attachmentFilename: fallbackFilename,
-      cropFromBottom: normalized.cropFromBottom,
-      reason: normalized.reason,
-    }];
-  }
-
-  documents = normalizeDocumentEntries(documents, fallbackFilename);
-  documents = documents.filter((doc) => isPodPackageSource(doc.source));
-  documents = enrichPodDocumentsWithTrailingPages(
-      documents, pageCount, fallbackFilename);
-
-  const primary = documents.find((d) =>
-    d.source === "signed_load" || d.source === "delivery_receipt" ||
-    d.source === "signed_pod" || d.source === "signed_bol") ||
-    documents[0];
-
-  return {
-    ...normalized,
-    found: documents.length > 0,
-    documents,
-    source: (primary && primary.source) || normalized.source || "",
-    page: (primary && primary.page) || normalized.page || "",
-    attachmentFilename: fallbackFilename ||
-      (primary && primary.attachmentFilename) || "",
-  };
-}
-
-/**
- * Merges pod + bol AI blocks into one POD package (user preference).
- * @param {object} aiResult AI classification result.
- * @return {object|null}
- */
-function normalizePodFromClassification(aiResult) {
-  const pod = (aiResult && aiResult.pod) || {};
-  const bol = (aiResult && aiResult.bol) || {};
-  const filename = pod.attachmentFilename || bol.attachmentFilename || "";
-  const docs = [
-    ...(Array.isArray(pod.documents) ? pod.documents.filter(Boolean) : []),
-    ...(Array.isArray(bol.documents) ? bol.documents.filter(Boolean) : []),
-  ];
-  return normalizePodData({
-    ...pod,
-    found: Boolean(pod.found) || docs.length > 0,
-    documents: docs.length > 0 ? docs : pod.documents,
-    attachmentFilename: filename,
-  });
-}
-
-/**
- * Adds post-invoice pages not listed by the classifier. When the classifier
- * listed specific pages, trust its omissions (e.g. rate confirmations between
- * invoice and BOL) and only auto-add pages after the last listed page.
- * @param {Array<object>} documents POD document entries.
- * @param {number|null} pageCount Total PDF page count when known.
- * @param {string} attachmentFilename Attachment filename.
- * @return {Array<object>}
- */
-function enrichPodDocumentsWithTrailingPages(
-    documents,
-    pageCount,
-    attachmentFilename,
-) {
-  const totalPages = Number(pageCount);
-  if (!Number.isFinite(totalPages) || totalPages <= 1) {
-    return documents;
-  }
-
-  const listedPages = documents
-      .map((d) => Number(d.page))
-      .filter((p) => p > 0);
-  if (listedPages.length === 0) {
-    return documents;
-  }
-
-  const lastListed = Math.max(...listedPages);
-  const listed = new Set(listedPages);
-  const enriched = [...documents];
-
-  for (let page = lastListed + 1; page <= totalPages; page++) {
-    if (listed.has(page)) continue;
-    enriched.push({
-      source: "unsigned_pod_template",
-      page,
-      attachmentFilename,
-      reason: "[auto-included] POD page after last classified page",
-    });
-    listed.add(page);
-  }
-
-  return enriched.sort(
-      (a, b) => (Number(a.page) || 0) - (Number(b.page) || 0),
-  );
-}
-
-/**
- * Returns normalized POD document entries to extract.
- * @param {object|null} pod POD block.
- * @param {object} [options] Options.
- * @param {number} [options.pageCount] PDF page count when known.
- * @return {Array<object>}
- */
-function coercePodDocuments(pod, options = {}) {
-  const normalized = normalizePodData(pod, options);
-  if (!normalized || normalized.found !== true) {
-    return [];
-  }
-  return (normalized.documents || [])
-      .filter((doc) => isPodPackageSource(doc.source));
-}
-
 /**
  * Saves POD PDF bytes to Storage.
  * @param {string} invoiceId Invoice id.
@@ -3181,59 +2826,6 @@ async function savePodPdfBytes(invoiceId, filename, pdfBytes) {
     metadata: {contentType: "application/pdf"},
   });
   return storagePath;
-}
-
-/**
- * Extracts one POD document entry into a single-page PDF.
- * @param {object} loadedDoc Loaded PDF document.
- * @param {object} doc POD document entry.
- * @return {Promise<Uint8Array|null>} PDF bytes or null.
- */
-async function extractPodDocumentPdfBytes(loadedDoc, doc) {
-  const source = String(doc.source || "").trim();
-  const pageCount = loadedDoc.getPageCount();
-
-  if (source === "same_page_as_invoice") {
-    const cropFromBottom = Math.min(
-        Math.max(Number(doc.cropFromBottom || 0.5), 0.1), 0.9);
-    const pageNum = Number(doc.page) || 1;
-    const pageIndex = Math.max(0, Math.min(pageNum - 1, pageCount - 1));
-    const newDoc = await PDFDocument.create();
-    const [copiedPage] = await newDoc.copyPages(loadedDoc, [pageIndex]);
-    newDoc.addPage(copiedPage);
-    const {width, height} = copiedPage.getSize();
-    copiedPage.setCropBox(0, 0, width, height * cropFromBottom);
-    return newDoc.save();
-  }
-
-  if (source === "last_page_of_invoice") {
-    if (pageCount < 1) return null;
-    const newDoc = await PDFDocument.create();
-    const [lastPage] = await newDoc.copyPages(loadedDoc, [pageCount - 1]);
-    newDoc.addPage(lastPage);
-    return newDoc.save();
-  }
-
-  const fullPageSources = new Set([
-    "attachment",
-    "signed_bol",
-    "signed_load",
-    "signed_pod",
-    "delivery_receipt",
-    "unsigned_pod_template",
-  ]);
-  if (fullPageSources.has(source)) {
-    const podPage = Number(doc.page) || pageCount;
-    if (podPage < 1 || podPage > pageCount) {
-      return null;
-    }
-    const newDoc = await PDFDocument.create();
-    const [page] = await newDoc.copyPages(loadedDoc, [podPage - 1]);
-    newDoc.addPage(page);
-    return newDoc.save();
-  }
-
-  return null;
 }
 
 /**
