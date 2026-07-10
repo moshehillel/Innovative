@@ -1347,6 +1347,41 @@ async function resolveManageShippingLocationId(party) {
 }
 
 /**
+ * Bill-to id for manage.php saveInvoice / consolidateInvoices.
+ * REST party ids are not valid; map bill-to party to manage.php location.
+ * @param {object} booking Primus booking from GET /book/bolnumber.
+ * @return {Promise<object>} id, source, partyName
+ */
+async function resolveManageBilltoId(booking) {
+  const party = resolveBillToParty(booking);
+  const partyName = party && party.name ? String(party.name).trim() : null;
+  if (party && party.name) {
+    const manageLocationId = await resolveManageShippingLocationId(party);
+    if (manageLocationId) {
+      return {
+        id: manageLocationId,
+        source: "manage_shipping_location",
+        partyName,
+      };
+    }
+  }
+  const restId = resolveBilltoId(booking);
+  if (restId && writeLog) {
+    await writeLog("warn", "primus",
+        "Bill-to manage.php location lookup failed — using REST party id", {
+          partyName,
+          restPartyId: restId,
+          billTo: booking && booking.billTo,
+        }).catch(() => {});
+  }
+  return {
+    id: restId,
+    source: restId ? "rest_party_id" : null,
+    partyName,
+  };
+}
+
+/**
  * Contacts tab rows for a shipping location (manage.php internal id).
  * @param {number|string} shippingLocationId
  * @return {Promise<object>}
@@ -2179,10 +2214,23 @@ async function addInsurancePremiumToLoad(args) {
   const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
   const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
 
-  const billtoId = extractBilltoIdFromStore(storeData) ||
-    resolveBilltoId(booking);
+  const billtoResolution = await resolveManageBilltoId(booking);
+  const storedBillto = extractBilltoIdFromStore(storeData);
+  const billtoId = billtoResolution.id || storedBillto;
   if (!billtoId) {
     return {ok: false, error: "Could not resolve billtoId"};
+  }
+  if (writeLog && billtoResolution.id && storedBillto &&
+      Number(storedBillto) !== Number(billtoResolution.id)) {
+    await writeLog("info", "primus",
+        "Overriding draft bill-to with manage.php shipping location", {
+          loadNumber,
+          invoiceId,
+          storedBillto,
+          billtoId: billtoResolution.id,
+          source: billtoResolution.source,
+          partyName: billtoResolution.partyName,
+        });
   }
 
   const notes = {
@@ -2448,34 +2496,59 @@ async function runPrimusUiBillingFlow(args) {
   });
   const existingDraftId = draftResolution.id;
 
-  let billtoId = resolveBilltoId(booking);
-  if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
-  }
+  const billtoResolution = await resolveManageBilltoId(booking);
+  let billtoId = billtoResolution.id;
+  let billtoSource = billtoResolution.source;
 
   if (existingDraftId) {
     const draftStores = await getInvoiceStores(existingDraftId);
     const storedBillto = draftStores.ok ?
       extractBilltoIdFromStore(draftStores.data) : null;
-    if (storedBillto) {
+    if (!billtoId && storedBillto) {
       billtoId = storedBillto;
-    } else if (writeLog) {
+      billtoSource = "draft_store";
+    } else if (billtoId && storedBillto &&
+        Number(storedBillto) !== Number(billtoId) && writeLog) {
       await writeLog("info", "primus",
-          "Reusing draft invoice — setting bill-to party on saveInvoice", {
+          "Overriding draft bill-to with manage.php shipping location", {
             loadNumber,
             bookingId,
             draftInvoiceId: existingDraftId,
             draftSource: draftResolution.source,
+            storedBillto,
             billtoId,
+            source: billtoSource,
+            partyName: billtoResolution.partyName,
+          });
+    } else if (writeLog) {
+      await writeLog("info", "primus",
+          existingDraftId ?
+            "Reusing draft invoice — setting bill-to on saveInvoice" :
+            "No draft invoice found — saveInvoice will create one", {
+            loadNumber,
+            bookingId,
+            draftInvoiceId: existingDraftId || null,
+            draftSource: draftResolution.source,
+            billtoId,
+            billtoSource,
+            partyName: billtoResolution.partyName,
           });
     }
+  } else if (!billtoId) {
+    return {ok: false, error: "Could not resolve billtoId from booking"};
   } else if (writeLog) {
     await writeLog("info", "primus",
         "No draft invoice found — saveInvoice will create one", {
           loadNumber,
           bookingId,
           billtoId,
+          billtoSource,
+          partyName: billtoResolution.partyName,
         });
+  }
+
+  if (!billtoId) {
+    return {ok: false, error: "Could not resolve billtoId from booking"};
   }
 
   const billDate = args.billDate || new Date();
@@ -2820,6 +2893,7 @@ exports._internal = {
   matchFileTypeByCode,
   resolveBilltoId,
   resolveBillToParty,
+  resolveManageBilltoId,
   resolveManageShippingLocationId,
   pickAccountingEmails,
   listFileTypeDriveIds,

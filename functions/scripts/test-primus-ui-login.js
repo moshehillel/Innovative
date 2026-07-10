@@ -2,24 +2,14 @@
 /**
  * One-off: POST manage.php action=login and report PHPSESSID (masked).
  * Usage: node scripts/test-primus-ui-login.js
+ *
+ * Note: manage.php UI login is separate from sandbox REST API.
+ * REST tests use scripts/primus-test-env.js (sandbox-api.shipprimus.com).
  */
 "use strict";
 
-const fs = require("fs");
-const path = require("path");
-
-const envFile = path.join(__dirname, "..", ".env.tai-invoice-automation");
-if (fs.existsSync(envFile)) {
-  for (const line of fs.readFileSync(envFile, "utf8").split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq < 1) continue;
-    const key = trimmed.slice(0, eq).trim();
-    const val = trimmed.slice(eq + 1).trim();
-    if (!process.env[key]) process.env[key] = val;
-  }
-}
+const {applyPrimusSandboxTestEnv} = require("./primus-test-env");
+applyPrimusSandboxTestEnv();
 
 const manageUrl = process.env.PRIMUS_UI_MANAGE_URL ||
   "https://shipprimus.com/PRIMUS/trunk/manage.php";
