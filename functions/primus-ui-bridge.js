@@ -20,12 +20,18 @@
  *   PRIMUS_UI_SESSION_TTL_HOURS — PHPSESSID cache lifetime (default 24)
  *   PRIMUS_UI_SESSION_RENEW_BEFORE_HOURS — renew when this many hours remain
  *   PRIMUS_UI_EMAIL_FROM — sender for emailBOLDocs (default accounting@…)
- *   PRIMUS_UI_EMAIL_DOCS_BODY — HTML body for emailBOLDocs
+ *   PRIMUS_UI_EMAIL_DOCS_BODY — full HTML body override for emailBOLDocs
+ *     (include payment signature yourself if you override the default)
  *   PRIMUS_INSURANCE_VENDOR_ID — Redkik vendor id (default 108637)
  *   PRIMUS_INSURANCE_VENDOR_NAME — Redkik vendor name (default Redkik USA)
  */
 
 "use strict";
+
+const {
+  defaultPrimusEmailDocsBody,
+  appendCustomerInvoiceEmailSignature,
+} = require("./customer-invoice-email-body");
 
 const admin = require("firebase-admin");
 
@@ -700,9 +706,7 @@ async function getBookingDocuments({bookingId, bookingBOL}) {
 }
 exports.getBookingDocuments = getBookingDocuments;
 
-const DEFAULT_EMAIL_DOCS_BODY =
-  "<br><br><br>Hi,<br><br>Please see your invoices attached.<br><br>" +
-  "Thank you!<br>";
+const DEFAULT_EMAIL_DOCS_BODY = defaultPrimusEmailDocsBody();
 
 /**
  * @param {object} booking Primus booking from GET /book/bolnumber.
@@ -1029,7 +1033,11 @@ async function emailBOLDocs(args) {
 
   const subject = args.subject ||
     `Invoice for BOL#${loadNumber}`;
-  const body = process.env.PRIMUS_UI_EMAIL_DOCS_BODY ||
+  const customBody = process.env.PRIMUS_UI_EMAIL_DOCS_BODY;
+  const body = customBody ?
+    (customBody.includes("cardknox.com/innovativecarriers") ?
+      customBody :
+      appendCustomerInvoiceEmailSignature(customBody)) :
     DEFAULT_EMAIL_DOCS_BODY;
   const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
     "accounting@innovativecarriers.com";
@@ -1315,32 +1323,50 @@ function normalizeLookupText(value) {
  */
 async function resolveManageShippingLocationId(party) {
   if (!party || !party.name) return null;
+  const partyZip = String(party.zipCode || party.zipcode || "").trim();
   const result = await managePhpPost({
     action: "getShippingLocations",
-    query: String(party.name).trim(),
+    item_id: "0",
+    excludeSLId: "0",
+    zipcode: partyZip,
+    fromStop: "false",
+    fromDrayage: "false",
+    fromBooking: "false",
+    fromInvoice: "false",
+    fromLTLQuote: "false",
+    fromFTLQuote: "false",
+    fromCustomerQuote: "false",
+    fromCopyCarriers: "false",
+    filterCountries: "false",
+    filterCountry: "",
     page: "1",
+    query: String(party.name).trim(),
+    forcelimit: "",
+    fromApplet: "false",
+    onlyCustomers: "true",
     start: "0",
     limit: "25",
+    sort: JSON.stringify([{property: "name", direction: "ASC"}]),
   });
   const list = result.json && Array.isArray(result.json.shipping_locations) ?
     result.json.shipping_locations : [];
   if (!list.length) return null;
 
   const partyName = normalizeLookupText(party.name);
-  const partyZip = normalizeLookupText(party.zipCode || party.zipcode);
+  const normZip = normalizeLookupText(partyZip);
   const exactName = list.filter((row) =>
     normalizeLookupText(row.name) === partyName);
   if (exactName.length === 1) return Number(exactName[0].id);
-  if (exactName.length > 1 && partyZip) {
+  if (exactName.length > 1 && normZip) {
     const zipMatch = exactName.find((row) =>
-      normalizeLookupText(row.zipcode) === partyZip);
+      normalizeLookupText(row.zipcode) === normZip);
     if (zipMatch) return Number(zipMatch.id);
     return Number(exactName[0].id);
   }
   if (list.length === 1) return Number(list[0].id);
-  if (partyZip) {
+  if (normZip) {
     const zipOnly = list.filter((row) =>
-      normalizeLookupText(row.zipcode) === partyZip);
+      normalizeLookupText(row.zipcode) === normZip);
     if (zipOnly.length === 1) return Number(zipOnly[0].id);
   }
   return null;
@@ -2011,35 +2037,77 @@ function parseVendorsFromResponse(json) {
   })).filter((v) => v.id);
 }
 
-let cachedInsuranceVendor = null;
+let cachedRedkikVendor = null;
 
 /**
- * Resolves the Redkik insurance vendor via getVendors (env fallback).
+ * Picks the best vendor match for a name hint from a getVendors result.
+ * @param {Array<object>} vendors Parsed vendor list.
+ * @param {string} hint Vendor name from invoice PDF.
+ * @return {object|null}
+ */
+function pickVendorByNameHint(vendors, hint) {
+  const query = String(hint || "").trim();
+  if (!query || !vendors.length) return vendors[0] || null;
+  const queryLower = query.toLowerCase();
+  const firstToken = query.split(/[,\n]/)[0].trim().toLowerCase();
+  return vendors.find((v) => v.name.toLowerCase() === queryLower) ||
+    vendors.find((v) => v.name.toLowerCase() === firstToken) ||
+    vendors.find((v) => v.name.toLowerCase().includes(firstToken) ||
+      firstToken.includes(v.name.toLowerCase())) ||
+    vendors[0] || null;
+}
+
+/**
+ * Resolves the insurance vendor via getVendors (env fallback for Redkik).
+ * Redkik is cached process-wide; other vendors are looked up per call
+ * (caller should resolve once per invoice sheet and reuse).
+ *
+ * @param {string} [vendorNameHint] Vendor name from invoice PDF.
  * @return {Promise<object>} {id, name}
  */
-async function resolveInsuranceVendor() {
-  if (cachedInsuranceVendor) return cachedInsuranceVendor;
-  const envId = process.env.PRIMUS_INSURANCE_VENDOR_ID || "108637";
-  const envName = process.env.PRIMUS_INSURANCE_VENDOR_NAME || "Redkik USA";
-  try {
-    const result = await managePhpPost({
-      action: "getVendors",
-      page: "1",
-      start: "0",
-      limit: "50",
-      query: "Redkik",
-    });
-    const vendors = parseVendorsFromResponse(result.json);
-    const match = vendors.find((v) => /redkik/i.test(v.name)) || vendors[0];
-    if (match) {
-      cachedInsuranceVendor = match;
-      return match;
+async function resolveInsuranceVendor(vendorNameHint) {
+  const hint = String(vendorNameHint || "").trim();
+  const isRedkik = !hint || /redkik/i.test(hint);
+
+  if (isRedkik) {
+    if (cachedRedkikVendor) return cachedRedkikVendor;
+    const envId = process.env.PRIMUS_INSURANCE_VENDOR_ID || "108637";
+    const envName = process.env.PRIMUS_INSURANCE_VENDOR_NAME || "Redkik USA";
+    try {
+      const result = await managePhpPost({
+        action: "getVendors",
+        page: "1",
+        start: "0",
+        limit: "50",
+        query: "Redkik",
+      });
+      const vendors = parseVendorsFromResponse(result.json);
+      const match = vendors.find((v) => /redkik/i.test(v.name)) || vendors[0];
+      if (match) {
+        cachedRedkikVendor = match;
+        return match;
+      }
+    } catch (_) {
+      // fall through to env default
     }
-  } catch (_) {
-    // fall through to env default
+    cachedRedkikVendor = {id: envId, name: envName};
+    return cachedRedkikVendor;
   }
-  cachedInsuranceVendor = {id: envId, name: envName};
-  return cachedInsuranceVendor;
+
+  const query = hint.split(/[,\n]/)[0].trim();
+  const result = await managePhpPost({
+    action: "getVendors",
+    page: "1",
+    start: "0",
+    limit: "50",
+    query,
+  });
+  const vendors = parseVendorsFromResponse(result.json);
+  const match = pickVendorByNameHint(vendors, hint);
+  if (!match || !match.id) {
+    throw new Error(`Insurance vendor not found in Primus: ${query}`);
+  }
+  return match;
 }
 
 /**
@@ -2365,6 +2433,7 @@ async function addInsurancePremiumToLoad(args) {
   };
 }
 exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
+exports.resolveInsuranceVendor = resolveInsuranceVendor;
 
 /**
  * @return {boolean}

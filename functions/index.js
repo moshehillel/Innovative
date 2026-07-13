@@ -4,6 +4,7 @@ const admin = require("firebase-admin");
 const {google} = require("googleapis");
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
+const OpenAI = require("openai");
 const {PDFDocument, StandardFonts, rgb} = require("pdf-lib");
 const podUtils = require("./pod-utils");
 const {
@@ -16,6 +17,7 @@ const {
   resolvePodPageIndex,
   POD_BLOCK_SHAPE,
 } = podUtils;
+const workflowErrors = require("./workflow-error-messages");
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
 
@@ -467,15 +469,21 @@ exports.sendCustomerMissingEmail = onRequest(async (req, res) => {
     );
 
     const baseUrl = `https://${req.get("host")}`;
-    const htmlContent =
-      `<p>Invoice ${invoiceId} is for a test customer ` +
-      `(${invoice.customerName}).</p>` +
-      `${buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId)}`;
+    const alert = workflowErrors.buildWorkflowAlertEmail({
+      code: "TEST_CUSTOMER",
+      context: {
+        loadNumber: invoiceId,
+        customerName: invoice.customerName,
+      },
+      baseUrl,
+      invoiceId,
+      tenantId: tenant.tenantId,
+    });
     await saveOutboundEmail({
       type: "customer_missing",
       invoiceId,
-      subject: "Customer requires confirmation",
-      html: htmlContent,
+      subject: alert.subject,
+      html: alert.html,
     });
 
     return res.json({ok: true, sent: true});
@@ -898,27 +906,21 @@ exports.checkStuckFlows = onRequest(async (req, res) => {
         `<p><strong>Recommended fix:</strong> ` +
         `${escapeHtml(aiSum.recommendedFix)}</p>` : "";
 
+      const stuckAlert = workflowErrors.buildWorkflowAlertEmail({
+        code: "STUCK_FLOW",
+        context: {
+          loadNumber: loadNum,
+          carrierName: carrier,
+          stuckStep: lastStep,
+          stuckMinutes: stuckMins,
+          invoiceAmount: amount,
+        },
+      });
       await saveOutboundEmail({
         type: "stuck_flow",
         invoiceId: doc.id,
-        subject: `Workflow stuck — Load ${loadNum} (${carrier})`,
-        html:
-          `<h2>Workflow Stuck</h2>` +
-          `<table style="border-collapse:collapse;font-size:14px">` +
-          `<tr><td style="padding:4px 12px 4px 0">` +
-          `<strong>Carrier</strong></td>` +
-          `<td>${escapeHtml(carrier)}</td></tr>` +
-          `<tr><td style="padding:4px 12px 4px 0">` +
-          `<strong>Load #</strong></td>` +
-          `<td>${escapeHtml(loadNum)}</td></tr>` +
-          `<tr><td style="padding:4px 12px 4px 0">` +
-          `<strong>Invoice Amount</strong></td>` +
-          `<td>${escapeHtml(amount)}</td></tr>` +
-          `<tr><td style="padding:4px 12px 4px 0">` +
-          `<strong>Stuck at</strong></td>` +
-          `<td>${escapeHtml(lastStep)} (${stuckMins} min ago)</td></tr>` +
-          `</table>` +
-          summaryText + fixText +
+        subject: stuckAlert.subject,
+        html: stuckAlert.html + summaryText + fixText +
           `<p style="color:#6b7280;font-size:12px">` +
           `Invoice ID: ${doc.id}</p>`,
       });
@@ -991,15 +993,26 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
     );
 
     const baseUrl = `https://${req.get("host")}`;
-    const rateStatus = missingRate ? "no customer rate" : "low margin";
-    const htmlContent =
-      `<p>Invoice ${invoiceId} has ${rateStatus}.</p>` +
-      `${buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId)}`;
+    const alert = workflowErrors.buildWorkflowAlertEmail({
+      code: missingRate ? "MISSING_RATE" : "LOW_MARGIN",
+      context: {
+        loadNumber: invoice.loadNumber || invoiceId,
+        carrierName: invoice.carrierName,
+        customerRate,
+        profit,
+        marginPct: customerRate > 0 ?
+          Math.round((profit / customerRate) * 100) : 0,
+        invoiceAmount,
+      },
+      baseUrl,
+      invoiceId,
+      tenantId: tenant.tenantId,
+    });
     await saveOutboundEmail({
       type: "rate_missing",
       invoiceId,
-      subject: "Customer rate needs attention",
-      html: htmlContent,
+      subject: alert.subject,
+      html: alert.html,
     });
 
     return res.json({ok: true, sent: true});
@@ -1986,14 +1999,73 @@ async function getPrimusShipment(loadNumber, proNumber) {
 
 /**
  * Adjusts broker commission in Primus for low-margin loads.
- * @param {string} loadNumber - Load number.
- * @param {number} margin - Current margin percentage.
- * @return {Promise<void>}
+ * When the broker has no 10% sales-rep code, sends an informational email
+ * (no Continue button) and allows invoicing to proceed.
+ * @param {object} opts
+ * @param {string} opts.loadNumber Load number.
+ * @param {number} opts.margin Margin percentage.
+ * @param {number} [opts.profit] Profit dollars.
+ * @param {string} [opts.brokerName] Current sales rep / broker name.
+ * @param {string} [opts.carrierName] Carrier name for the email.
+ * @return {Promise<object>}
  */
-async function adjustBrokerCommission(loadNumber, margin) {
-  // TODO: Implement Primus broker commission adjustment
-  await writeLog("info", "primus",
-      "TODO: adjustBrokerCommission stub called", {loadNumber, margin});
+async function adjustBrokerCommission(opts) {
+  const loadNumber = opts && opts.loadNumber ?
+    String(opts.loadNumber) : "";
+  const margin = Number(opts && opts.margin || 0);
+  const profit = Number(opts && opts.profit || 0);
+  const brokerName = opts && opts.brokerName ?
+    String(opts.brokerName).trim() : "";
+  const carrierName = opts && opts.carrierName || "";
+
+  if (!loadNumber || margin >= 10) {
+    return {adjusted: false, notified: false, reason: "margin_ok"};
+  }
+
+  let needsNotify = false;
+  const mapJson = process.env.BROKER_10PCT_MAP_JSON;
+  if (mapJson && brokerName) {
+    try {
+      const map = JSON.parse(mapJson);
+      const entry = Object.values(map).find((row) =>
+        row && String(row.name || "").toLowerCase() ===
+        brokerName.toLowerCase());
+      if (entry && !entry.tenPctId) needsNotify = true;
+    } catch (parseErr) {
+      await writeLog("warn", "primus",
+          "BROKER_10PCT_MAP_JSON parse failed", {
+            error: parseErr.message,
+          });
+    }
+  }
+
+  if (!needsNotify) {
+    await writeLog("info", "primus",
+        "Low margin — broker commission adjust pending mapping", {
+          loadNumber,
+          margin,
+          profit,
+          brokerName: brokerName || null,
+        });
+    return {adjusted: false, notified: false, reason: "mapping_pending"};
+  }
+
+  const alert = workflowErrors.buildWorkflowAlertEmail({
+    code: "BROKER_NO_10PCT_CODE",
+    context: {
+      loadNumber,
+      marginPct: margin,
+      profit,
+      brokerName: brokerName || "Unknown broker",
+      carrierName,
+    },
+  });
+  await saveOutboundEmail({
+    type: "broker_no_10pct_code",
+    subject: alert.subject,
+    html: alert.html,
+  });
+  return {adjusted: false, notified: true, reason: "no_10pct_code"};
 }
 
 /**
@@ -3969,9 +4041,22 @@ async function processGmailMessage(
           );
           finalStatus = "no_rate";
         } else if (profitCheck.lowMargin) {
-          // Margin < 10%: flag for broker commission adjustment
-          await adjustBrokerCommission(
-              aiResult.loadNumber, profitCheck.margin);
+          let brokerName = "";
+          try {
+            const booking = await fetchPrimusBooking(aiResult.loadNumber);
+            const contact = booking && booking.contactInformation;
+            brokerName = (contact && (contact.salesRepName ||
+              (contact.salesRep && contact.salesRep.name))) || "";
+          } catch (_) {
+            // best-effort broker name for the notification email
+          }
+          await adjustBrokerCommission({
+            loadNumber: aiResult.loadNumber,
+            margin: profitCheck.margin,
+            profit: profitCheck.profit,
+            brokerName,
+            carrierName: aiResult.carrierName,
+          });
           await writeLog("info", "primus",
               "Low margin flagged for broker commission", {
                 messageId, loadNumber: aiResult.loadNumber,
@@ -4962,6 +5047,71 @@ async function sendSupportIssueEmail({clientName, summary, transcript}) {
 // that a confused user can't run up an unbounded bill.
 const SUPPORT_CHAT_MAX_TURNS = 24;
 const SUPPORT_CHAT_MAX_MESSAGE_LENGTH = 4000;
+const SUPPORT_CHAT_DEFAULT_MODEL = "gpt-4o-mini";
+
+/**
+ * Runs one dashboard support-chat turn via OpenAI (cheap model by default).
+ * Set OPENAI_API_KEY in the functions environment. Optional SUPPORT_CHAT_MODEL
+ * overrides the default gpt-4o-mini.
+ *
+ * @param {object} opts
+ * @param {string} opts.clientName Dashboard client display name.
+ * @param {Array<{role: string, content: string}>} opts.history Chat turns.
+ * @return {Promise<string>} Raw JSON text from the model.
+ */
+async function runSupportChatTurn({clientName, history}) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is not configured");
+  }
+  const client = new OpenAI({apiKey});
+  const model = process.env.SUPPORT_CHAT_MODEL || SUPPORT_CHAT_DEFAULT_MODEL;
+  const systemPrompt =
+    `You are the support assistant on ${clientName}'s invoice-` +
+    "automation dashboard. Customers come to you when something looks " +
+    "wrong — e.g. an invoice they expected to see is missing, the " +
+    "stats or chart look off, a reply or forward never went out, or " +
+    "Gmail shows as disconnected. " +
+    "Have a natural, brief conversation: ask short, focused follow-up " +
+    "questions — one or two at a time, in plain language — until you " +
+    "understand what the customer expected, what actually happened, " +
+    "roughly when, and any identifying details (load number, invoice " +
+    "number, carrier name, email subject, date/time, the time-range " +
+    "tab they were viewing). Don't interrogate — once you have enough " +
+    "to write a useful report for an engineer, stop and wrap up. " +
+    "Reply with ONLY valid JSON (no markdown fences) in this exact " +
+    "shape: {\"reply\": string, \"status\": \"asking\" | \"ready\", " +
+    "\"summary\": string}. " +
+    "\"reply\" is what you say to the customer next — for \"ready\" " +
+    "turns, a short, friendly note that you've passed this along. " +
+    "\"status\" is \"ready\" only once you can write a complete " +
+    "report; otherwise \"asking\". " +
+    "\"summary\" stays empty while \"status\" is \"asking\", and — " +
+    "only on the turn you switch to \"ready\" — becomes a clear, " +
+    "complete written report of the issue for an internal engineer " +
+    "(what's wrong, what was expected, key identifying details, and " +
+    "any relevant context from the conversation).";
+
+  const completion = await client.chat.completions.create({
+    model,
+    max_tokens: 800,
+    response_format: {type: "json_object"},
+    messages: [
+      {role: "system", content: systemPrompt},
+      ...history.map((turn) => ({
+        role: turn.role === "assistant" ? "assistant" : "user",
+        content: turn.content,
+      })),
+    ],
+  });
+
+  return String(
+      completion.choices &&
+      completion.choices[0] &&
+      completion.choices[0].message &&
+      completion.choices[0].message.content || "",
+  ).trim();
+}
 
 exports.dashboardSupportChat = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) {
@@ -4997,45 +5147,14 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
       return res.status(400).json({ok: false, error: "Empty message."});
     }
 
-    const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
+    if (!process.env.OPENAI_API_KEY) {
+      return res.status(503).json({
+        ok: false,
+        error: "Support chat is not configured (OPENAI_API_KEY missing).",
+      });
+    }
 
-    const systemPrompt =
-      `You are the support assistant on ${clientName}'s invoice-` +
-      "automation dashboard. Customers come to you when something looks " +
-      "wrong — e.g. an invoice they expected to see is missing, the " +
-      "stats or chart look off, a reply or forward never went out, or " +
-      "Gmail shows as disconnected. " +
-      "Have a natural, brief conversation: ask short, focused follow-up " +
-      "questions — one or two at a time, in plain language — until you " +
-      "understand what the customer expected, what actually happened, " +
-      "roughly when, and any identifying details (load number, invoice " +
-      "number, carrier name, email subject, date/time, the time-range " +
-      "tab they were viewing). Don't interrogate — once you have enough " +
-      "to write a useful report for an engineer, stop and wrap up. " +
-      "Reply with ONLY valid JSON (no markdown fences) in this exact " +
-      "shape: {\"reply\": string, \"status\": \"asking\" | \"ready\", " +
-      "\"summary\": string}. " +
-      "\"reply\" is what you say to the customer next — for \"ready\" " +
-      "turns, a short, friendly note that you've passed this along. " +
-      "\"status\" is \"ready\" only once you can write a complete " +
-      "report; otherwise \"asking\". " +
-      "\"summary\" stays empty while \"status\" is \"asking\", and — " +
-      "only on the turn you switch to \"ready\" — becomes a clear, " +
-      "complete written report of the issue for an internal engineer " +
-      "(what's wrong, what was expected, key identifying details, and " +
-      "any relevant context from the conversation).";
-
-    const aiRes = await client.messages.create({
-      model: "claude-sonnet-5",
-      max_tokens: 800,
-      system: systemPrompt,
-      messages: history,
-    });
-
-    const block = aiRes.content && aiRes.content.find(
-        (c) => c.type === "text",
-    );
-    const rawText = block && block.text ? block.text.trim() : "";
+    const rawText = await runSupportChatTurn({clientName, history});
 
     let parsed;
     try {
@@ -5235,11 +5354,15 @@ async function checkGmailInboxForTenant(tenant, inboxFlowId) {
               message.id,
               errSubject,
               errFrom,
-              "An unexpected error occurred processing this email",
-              `I attempted to process this email but encountered an ` +
-              `unexpected error and was unable to complete the workflow. ` +
-              `Error: ${error.message}. ` +
-              `Please review this email and handle it manually.`,
+              "System error while processing this email",
+              `Jerry encountered an unexpected automation error and could ` +
+              `not finish processing this carrier invoice email.\n\n` +
+              `What this means: this is not something you can fix with a ` +
+              `Continue button — the workflow stopped before completion.\n\n` +
+              `Technical detail: ${error.message}\n\n` +
+              `Please review the original email below and handle the load ` +
+              `manually in ShipPrimus, or contact Advanced Automations if ` +
+              `this keeps happening.`,
               {department: "general", emailBody: errBody},
           );
         } catch (fwdErr) {
@@ -5993,6 +6116,7 @@ const sharedTmsBundle = {
   pauseWorkflow,
   saveOutboundEmail,
   buildContinueButtonHtml,
+  buildWorkflowAlertEmail: workflowErrors.buildWorkflowAlertEmail,
   escapeHtml,
   maybeExtractPodOnlyPdf,
   isAlreadyDoneResult,
@@ -6040,6 +6164,7 @@ innovativeInsurance.init({
   saveOutboundEmail,
   fetchPrimusBooking,
   addInsurancePremiumToLoad: primusUiBridge.addInsurancePremiumToLoad,
+  resolveInsuranceVendor: primusUiBridge.resolveInsuranceVendor,
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
 });
 

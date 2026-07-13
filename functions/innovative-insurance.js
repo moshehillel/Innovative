@@ -451,7 +451,7 @@ let deps = {};
 /**
  * Receives shared helpers from index.js.
  * @param {object} bundle {writeLog, saveOutboundEmail, fetchPrimusBooking,
- *   addInsurancePremiumToLoad, isManagePhpEnabled}.
+ *   addInsurancePremiumToLoad, resolveInsuranceVendor, isManagePhpEnabled}.
  * @return {void}
  */
 function init(bundle) {
@@ -718,7 +718,7 @@ function isInsuranceEmail(opts) {
 async function processInsuranceEmail(opts) {
   const {
     writeLog, saveOutboundEmail, fetchPrimusBooking,
-    addInsurancePremiumToLoad, isManagePhpEnabled,
+    addInsurancePremiumToLoad, resolveInsuranceVendor, isManagePhpEnabled,
   } = deps;
   const log = writeLog || (async () => {});
 
@@ -753,12 +753,32 @@ async function processInsuranceEmail(opts) {
   const vendorInvoiceNumber = invoice.invoiceNumber ||
     `REDKIK-${roundMoney(new Date(billDate).getTime())}`;
 
+  let insuranceVendor = null;
+  if (!opts.dryRun) {
+    if (typeof resolveInsuranceVendor !== "function") {
+      return {handled: false, reason: "resolveInsuranceVendor not configured"};
+    }
+    try {
+      insuranceVendor = await resolveInsuranceVendor(invoice.vendorName);
+    } catch (err) {
+      await log("warn", "insurance", "Insurance vendor lookup failed", {
+        vendorName: invoice.vendorName || null,
+        error: err && err.message,
+      });
+      return {
+        handled: false,
+        reason: err && err.message || "insurance vendor lookup failed",
+      };
+    }
+  }
+
   const postPremiumToLoad = opts.dryRun ? undefined :
     createInsurancePostAdapter({
       fetchPrimusBooking,
       addInsurancePremiumToLoad,
       vendorInvoiceNumber,
       billDate,
+      insuranceVendor,
     });
 
   const result = await allocateInsurancePremiums({
@@ -777,6 +797,8 @@ async function processInsuranceEmail(opts) {
     from: opts.from || null,
     subject: opts.subject || null,
     vendorInvoiceNumber,
+    insuranceVendorId: insuranceVendor && insuranceVendor.id || null,
+    insuranceVendorName: insuranceVendor && insuranceVendor.name || null,
     ...result.reconciliation,
   });
 
@@ -823,6 +845,7 @@ module.exports = {
  * @param {string} deps.vendorInvoiceNumber Redkik invoice number for all rows.
  * @param {string|Date} deps.billDate Insurance invoice date.
  * @param {string|Date} [deps.billDueDate] Insurance due date.
+ * @param {object} deps.insuranceVendor Resolved {id, name} for the whole sheet.
  * @return {function(object): Promise<object>}
  */
 function createInsurancePostAdapter(deps) {
@@ -832,6 +855,7 @@ function createInsurancePostAdapter(deps) {
     vendorInvoiceNumber,
     billDate,
     billDueDate,
+    insuranceVendor,
   } = deps;
 
   return async function postPremiumToLoad(row) {
@@ -855,6 +879,7 @@ function createInsurancePostAdapter(deps) {
       vendorInvoiceNumber,
       billDate,
       billDueDate,
+      insuranceVendor,
     });
     if (result.notFound) {
       return {ok: false, notFound: true, error: result.error};
