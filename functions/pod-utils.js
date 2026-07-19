@@ -432,16 +432,346 @@ async function extractPodDocumentPdfBytes(loadedDoc, doc) {
 }
 
 /**
+ * Extracts balanced {...} objects from text that look like invoice items.
+ * Used when Claude truncates mid-JSON so we can still recover complete loads.
+ * @param {string} text Raw model text.
+ * @return {Array<object>}
+ */
+function salvageInvoiceObjects(text) {
+  const out = [];
+  const src = String(text || "");
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] !== "{") {
+      i += 1;
+      continue;
+    }
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let end = -1;
+    for (let j = i; j < src.length; j++) {
+      const c = src[j];
+      if (inStr) {
+        if (esc) {
+          esc = false;
+        } else if (c === "\\") {
+          esc = true;
+        } else if (c === "\"") {
+          inStr = false;
+        }
+        continue;
+      }
+      if (c === "\"") {
+        inStr = true;
+        continue;
+      }
+      if (c === "{") depth += 1;
+      else if (c === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (end < 0) {
+      // Outer/truncated object never closed — skip this "{" and keep
+      // searching for complete nested invoice objects.
+      i += 1;
+      continue;
+    }
+    const chunk = src.slice(i, end + 1);
+    try {
+      const obj = JSON.parse(chunk);
+      if (obj && typeof obj === "object" && !Array.isArray(obj) &&
+          (obj.loadNumber != null || obj.invoiceAmount != null ||
+            obj.status != null || obj.invoiceNumber != null)) {
+        out.push(obj);
+      }
+    } catch (_) {
+      // ignore non-invoice objects (e.g. nested pods) that parse fail
+    }
+    i = end + 1;
+  }
+  return out;
+}
+
+/**
  * @param {string} rawText Claude text response.
  * @return {object} Parsed JSON.
  */
 function parseClassificationJson(rawText) {
-  const trimmed = String(rawText || "").trim();
-  const jsonText = trimmed
-      .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```\s*$/i, "")
-      .trim();
-  return JSON.parse(jsonText);
+  let text = String(rawText || "").trim();
+  // Strip markdown fences even when the closing fence was truncated.
+  text = text.replace(/^```(?:json)?\s*/i, "");
+  text = text.replace(/\s*```\s*$/i, "").trim();
+
+  try {
+    return JSON.parse(text);
+  } catch (firstErr) {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(text.slice(start, end + 1));
+      } catch (_) {
+        // fall through to salvage
+      }
+    }
+    const salvaged = salvageInvoiceObjects(text);
+    if (salvaged.length > 0) {
+      return {invoices: salvaged};
+    }
+    throw firstErr;
+  }
+}
+
+/**
+ * Normalizes classifier output to an invoices[] array.
+ * Legacy single-invoice objects become a one-element array.
+ * @param {object} parsed Raw classifier JSON.
+ * @return {Array<object>}
+ */
+function normalizeClassificationToInvoices(parsed) {
+  if (!parsed || typeof parsed !== "object") {
+    return [];
+  }
+  if (Array.isArray(parsed.invoices) && parsed.invoices.length > 0) {
+    return parsed.invoices.filter((item) => item && typeof item === "object");
+  }
+  if (parsed.loadNumber != null || parsed.invoiceAmount != null ||
+      parsed.status != null) {
+    return [parsed];
+  }
+  return [];
+}
+
+/**
+ * Digits-only load / PRO key for grouping related invoices.
+ * @param {string|number|null|undefined} value Raw value.
+ * @return {string}
+ */
+function normalizeInvoiceGroupKey(value) {
+  return String(value || "").replace(/[\s-]/g, "").trim();
+}
+
+/**
+ * Scores how "revised/corrected" an invoice item looks from PDF text.
+ * Central Transport (and similar) stamp ORIGINAL vs CORRECTED/REVISED.
+ * @param {object} item Classifier invoice item.
+ * @param {Array<object>} pdfAttachments PDFs with filename/buffer.
+ * @return {Promise<{score: number, markers: string[]}>}
+ */
+async function scoreInvoiceRevisionPreference(item, pdfAttachments) {
+  const markers = [];
+  let score = 0;
+  const filename = String(item && item.attachmentFilename || "").toLowerCase();
+  if (/correct|revis|amend|adjusted|dispute/i.test(filename)) {
+    score += 40;
+    markers.push("filename");
+  }
+
+  const attList = Array.isArray(pdfAttachments) ? pdfAttachments : [];
+  let att = attList.find((a) => a && a.filename === item.attachmentFilename);
+  if (!att) {
+    att = attList.find((a) => a && a.docType !== "POD") || attList[0];
+  }
+  if (!att || !att.buffer) {
+    return {score, markers};
+  }
+
+  let pageTexts = null;
+  try {
+    pageTexts = await extractPdfPageTexts(att.buffer);
+  } catch (_) {
+    return {score, markers};
+  }
+  if (!pageTexts || !pageTexts.length) {
+    return {score, markers};
+  }
+
+  const scoped = collectInvoiceScopedPages(item);
+  const pagesToScan = scoped.length > 0 ?
+    scoped.map((p) => p - 1).filter((i) => i >= 0 && i < pageTexts.length) :
+    pageTexts.map((_, i) => i);
+  const blob = pagesToScan.map((i) => pageTexts[i] || "").join("\n");
+
+  const correctedRe =
+    /\b(CORRECTED|REVISED|AMENDED)\s+INVOICE\b|\bCORRECTED\s+BILL\b/i;
+  const originalRe = /\bORIGINAL\s+INVOICE\b/i;
+  if (correctedRe.test(blob)) {
+    score += 100;
+    markers.push("corrected_label");
+  }
+  if (originalRe.test(blob)) {
+    // ORIGINAL alone means prefer the sibling; ORIGINAL+CORRECTED on same
+    // scoped pages still keeps the corrected boost above.
+    score -= 60;
+    markers.push("original_label");
+  }
+  return {score, markers};
+}
+
+/**
+ * When the same load (or PRO) has multiple invoices in one email/PDF —
+ * typically ORIGINAL plus CORRECTED/REVISED after a dispute — keep the
+ * corrected/revised copy and drop the originals.
+ * @param {Array<object>} invoiceItems Classifier invoice items.
+ * @param {Array<object>} pdfAttachments PDFs with buffers.
+ * @return {Promise<{items: Array<object>, dropped: Array<object>}>}
+ */
+async function preferRevisedInvoicesForSameLoad(invoiceItems, pdfAttachments) {
+  const items = Array.isArray(invoiceItems) ?
+    invoiceItems.filter((i) => i && typeof i === "object") : [];
+  if (items.length <= 1) {
+    return {items, dropped: []};
+  }
+
+  const scored = [];
+  for (const item of items) {
+    const revision = await scoreInvoiceRevisionPreference(
+        item, pdfAttachments);
+    scored.push({item, revision});
+  }
+
+  const groups = new Map();
+  scored.forEach((entry, index) => {
+    const loadKey = normalizeInvoiceGroupKey(entry.item.loadNumber);
+    const proKey = normalizeInvoiceGroupKey(entry.item.proNumber);
+    const key = loadKey ?
+      `load:${loadKey}` :
+      (proKey ? `pro:${proKey}` : `unique:${index}`);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(entry);
+  });
+
+  const kept = [];
+  const dropped = [];
+  for (const [, group] of groups) {
+    if (group.length === 1) {
+      kept.push(group[0].item);
+      continue;
+    }
+    const hasCorrected = group.some((g) =>
+      g.revision.markers.includes("corrected_label") ||
+      g.revision.score >= 40);
+    if (!hasCorrected) {
+      // No clear revised copy — keep all (safer than guessing).
+      group.forEach((g) => kept.push(g.item));
+      continue;
+    }
+    group.sort((a, b) => {
+      if (b.revision.score !== a.revision.score) {
+        return b.revision.score - a.revision.score;
+      }
+      // Prefer the lower total when scores tie (dispute settlement cuts).
+      return Number(a.item.invoiceAmount || 0) -
+        Number(b.item.invoiceAmount || 0);
+    });
+    kept.push(group[0].item);
+    for (let i = 1; i < group.length; i++) {
+      dropped.push({
+        loadNumber: group[i].item.loadNumber || null,
+        proNumber: group[i].item.proNumber || null,
+        invoiceAmount: group[i].item.invoiceAmount || null,
+        attachmentFilename: group[i].item.attachmentFilename || null,
+        revisionScore: group[i].revision.score,
+        keptAmount: group[0].item.invoiceAmount || null,
+        keptAttachment: group[0].item.attachmentFilename || null,
+        keptScore: group[0].revision.score,
+        reason: "prefer_corrected_or_revised_invoice",
+      });
+    }
+  }
+
+  return {items: kept, dropped};
+}
+
+/**
+ * Slices a PDF to the given 1-based page numbers (order preserved, unique).
+ * Returns null when pages are empty/invalid or would keep the entire PDF.
+ * @param {Buffer|Uint8Array} pdfBuffer Source PDF.
+ * @param {Array<number|string>} pages 1-based page numbers.
+ * @return {Promise<Buffer|null>}
+ */
+async function slicePdfByPages(pdfBuffer, pages) {
+  if (!pdfBuffer || !Array.isArray(pages) || pages.length === 0) {
+    return null;
+  }
+  const src = await PDFDocument.load(pdfBuffer, {ignoreEncryption: true});
+  const pageCount = src.getPageCount();
+  const indices = [...new Set(pages
+      .map((p) => Math.trunc(Number(p)))
+      .filter((p) => Number.isFinite(p) && p >= 1 && p <= pageCount)
+      .map((p) => p - 1))];
+  if (indices.length === 0) {
+    return null;
+  }
+  if (indices.length === pageCount) {
+    return null;
+  }
+  const out = await PDFDocument.create();
+  const copied = await out.copyPages(src, indices);
+  for (const page of copied) {
+    out.addPage(page);
+  }
+  const bytes = await out.save();
+  return Buffer.from(bytes);
+}
+
+/**
+ * Collects unique 1-based pages for an invoice item (invoice + POD pages).
+ * @param {object} item Classifier invoice item.
+ * @return {number[]}
+ */
+function collectInvoiceScopedPages(item) {
+  const pages = [];
+  const push = (p) => {
+    const n = Math.trunc(Number(p));
+    if (Number.isFinite(n) && n >= 1) pages.push(n);
+  };
+  if (Array.isArray(item.invoicePages)) {
+    item.invoicePages.forEach(push);
+  }
+  const pod = item.pod || {};
+  if (pod.page) push(pod.page);
+  if (Array.isArray(pod.documents)) {
+    for (const doc of pod.documents) {
+      if (doc && doc.page) push(doc.page);
+    }
+  }
+  return [...new Set(pages)].sort((a, b) => a - b);
+}
+
+/**
+ * Remaps pod document page numbers after slicing so page 1 is the first
+ * page of the sliced PDF.
+ * @param {object} item Invoice item (mutated).
+ * @param {number[]} originalPages Scoped pages used for the slice.
+ * @return {void}
+ */
+function remapPodPagesAfterSlice(item, originalPages) {
+  if (!item || !Array.isArray(originalPages) || originalPages.length === 0) {
+    return;
+  }
+  const map = new Map();
+  originalPages.forEach((p, idx) => map.set(p, idx + 1));
+  if (item.pod && item.pod.page != null && map.has(Number(item.pod.page))) {
+    item.pod.page = map.get(Number(item.pod.page));
+  }
+  if (item.pod && Array.isArray(item.pod.documents)) {
+    for (const doc of item.pod.documents) {
+      if (doc && doc.page != null && map.has(Number(doc.page))) {
+        doc.page = map.get(Number(doc.page));
+      }
+    }
+  }
+  if (Array.isArray(item.invoicePages)) {
+    item.invoicePages = item.invoicePages
+        .map((p) => map.get(Number(p)))
+        .filter((p) => p != null);
+  }
 }
 
 /**
@@ -553,5 +883,12 @@ module.exports = {
   extractPodDocumentPdfBytes,
   parseClassificationJson,
   parseClassificationResponse,
+  salvageInvoiceObjects,
+  normalizeClassificationToInvoices,
+  preferRevisedInvoicesForSameLoad,
+  scoreInvoiceRevisionPreference,
+  slicePdfByPages,
+  collectInvoiceScopedPages,
+  remapPodPagesAfterSlice,
   buildPodClassifierRules,
 };

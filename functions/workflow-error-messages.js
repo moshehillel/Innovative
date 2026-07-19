@@ -161,6 +161,17 @@ function buildWorkflowAlertEmail(opts) {
       action = ACTION.CONTINUE;
       break;
 
+    case "MISSING_POD":
+      subject = `Action needed — No POD for Load ${loadNumber}`;
+      title = "Proof of Delivery missing";
+      summary = "Jerry could not extract a POD from the carrier invoice and " +
+        "none is on file in ShipPrimus for this load.";
+      explanation = "Upload the POD in ShipPrimus (or re-forward the " +
+        "carrier email with a clear POD), then resume the workflow. " +
+        "Customer email will not send until a POD is on the booking.";
+      action = ACTION.RESUME;
+      break;
+
     case "MISSING_RATE":
       subject = `Action needed — No customer rate for Load ${loadNumber}`;
       title = "Customer rate missing";
@@ -254,12 +265,38 @@ function buildWorkflowAlertEmail(opts) {
       action = ACTION.RESUME;
       break;
 
+    case "QB_BILLING_FAILED":
+      subject = `Action needed — QuickBooks sync failed — Load ${loadNumber}`;
+      title = "Carrier bill did not reach QuickBooks";
+      summary = "The payable is in ShipPrimus, but QuickBooks sync failed.";
+      explanation = (ctx.errorMessage ?
+        `${esc(ctx.errorMessage)} ` : "") +
+        (ctx.customerInvoiceId ?
+          `Primus invoice id: ${esc(ctx.customerInvoiceId)}. ` : "") +
+        (ctx.raw ?
+          `Primus response: ${esc(String(ctx.raw).slice(0, 200))}. ` : "") +
+        "Push the bill to QuickBooks from ShipPrimus, or retry after " +
+        "confirming the QB connection.";
+      action = ACTION.NONE;
+      break;
+
     case "DRAYAGE_STOPPED":
       subject = `Stopped — drayage load ${loadNumber}`;
       title = "Drayage load — not processed";
       summary = "This shipment is marked as drayage in ShipPrimus.";
       explanation = "Drayage loads are not handled automatically. Please " +
       "process this load manually.";
+      action = ACTION.NONE;
+      break;
+
+    case "TL_POD_ESCALATED":
+      subject = `Escalation — no POD from carrier — Load ${loadNumber}`;
+      title = "Truckload POD still missing";
+      summary = "Jerry requested a POD from the carrier (and sent a " +
+        "3-business-day reminder) but nothing arrived within 10 business days.";
+      explanation = "Follow up with the carrier, or forward the POD to " +
+        "the invoice mailbox so Jerry can upload it and release the " +
+        "customer email. The customer invoice is still held.";
       action = ACTION.NONE;
       break;
 

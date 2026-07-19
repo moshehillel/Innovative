@@ -30,19 +30,34 @@
  * @type {Object<string, RegExp[]>}
  */
 const COLUMN_MATCHERS = {
-  carrier: [/carrier/i, /vendor/i, /scac/i],
-  tracking: [/tracking/i, /\bpro\b/i, /\bbol\b/i, /reference/i, /\bload\b/i],
-  description: [/description/i, /notes?/i, /detail/i, /memo/i, /commodity/i],
-  amount: [/premium/i, /\bamount\b/i, /\btotal\b/i, /\bcost\b/i, /charge/i,
-    /price/i],
+  // Prefer real party/carrier labels; avoid Status/Organization false hits.
+  carrier: [/carrier/i, /insured\s*party/i, /vendor/i, /scac/i],
+  // "Tracking Code" before "Reference" (Redkik refs look like RED-RHP-#####).
+  tracking: [
+    /tracking\s*code/i, /tracking/i, /\bbol\b/i, /\bpro\b/i, /\bload\b/i,
+  ],
+  description: [
+    /commodity\s*description/i, /description/i, /notes?/i, /detail/i,
+    /memo/i, /commodity/i,
+  ],
+  // Never match "Cost Center" — premium lives in Total / Premium / Amount.
+  amount: [
+    /premium/i, /\btotal\b/i, /\bamount\b/i, /charge/i, /price/i,
+  ],
 };
 
 /**
  * Positional fallback used when header names cannot be matched. These indices
- * come from the observed Redkik "Innovative Carriers" workbook layout.
+ * come from the observed Redkik "Innovative Carriers" workbook layout
+ * (Tracking Code=7, Commodity Description=15, Total=25, Insured Party=18).
  * @type {Object<string, number>}
  */
-const FALLBACK_COLUMNS = {carrier: 5, tracking: 7, description: 15, amount: 25};
+const FALLBACK_COLUMNS = {
+  carrier: 18,
+  tracking: 7,
+  description: 15,
+  amount: 25,
+};
 
 /** Money tolerance (cents) when comparing sums. @type {number} */
 const MONEY_EPSILON = 0.005;
@@ -160,10 +175,14 @@ function extractBol(row, cols) {
   const track = String(row[cols.tracking] == null ? "" : row[cols.tracking]);
   const desc = String(
       row[cols.description] == null ? "" : row[cols.description]);
-  const match = track.match(/(\d{5,})/) ||
-    desc.match(/BOL#?\s*:?\s*(\d{5,})/i) ||
-    desc.match(/\b(\d{6,})\b/);
-  return match ? match[1] : "";
+  // Prefer explicit BOL# in the description over other digit runs (e.g.
+  // Redkik Reference RED-RHP-301549).
+  const fromDesc = desc.match(/BOL#?\s*:?\s*(\d{5,})/i);
+  if (fromDesc) return fromDesc[1];
+  const fromTrack = track.match(/(\d{5,})/);
+  if (fromTrack) return fromTrack[1];
+  const looseDesc = desc.match(/\b(\d{6,})\b/);
+  return looseDesc ? looseDesc[1] : "";
 }
 
 /**

@@ -16,6 +16,8 @@
  *   PRIMUS_UI_CARRIER_BILL_TYPE_NAME — match name in getFileTypes (default
  *     "carrier bill"); customer must NOT see this type in portal
  *   PRIMUS_UI_POD_TYPE_NAME — match name in getFileTypes (default "pod")
+ *   PRIMUS_UI_FILETYPE_QUOTE_APPROVAL — override Quote Approval type id
+ *   PRIMUS_UI_QUOTE_APPROVAL_TYPE_NAME — match name in getFileTypes
  *   PRIMUS_UI_UPLOAD_FILE_FIELD — multipart file field name (default file)
  *   PRIMUS_UI_SESSION_TTL_HOURS — PHPSESSID cache lifetime (default 24)
  *   PRIMUS_UI_SESSION_RENEW_BEFORE_HOURS — renew when this many hours remain
@@ -502,9 +504,10 @@ async function fetchUiFileTypes() {
 }
 
 /**
- * Resolves numeric fileType ids for Carrier Bill (internal) vs POD (customer).
+ * Resolves numeric fileType ids for Carrier Bill (internal) vs POD (customer)
+ * and optional Quote Approval (Miworld customer emails).
  * Env overrides win; otherwise matches getFileTypes by name.
- * @return {Promise<{carrierBill: object, pod: object}>}
+ * @return {Promise<object>} carrierBill, pod, quoteApproval (or null).
  */
 async function resolveUploadFileTypes() {
   const envCarrier = process.env.PRIMUS_UI_FILETYPE_CARRIER_BILL;
@@ -547,7 +550,71 @@ async function resolveUploadFileTypes() {
           fileTypeName: pod.name,
         });
   }
-  return {carrierBill: carrier, pod};
+
+  const envQuote = process.env.PRIMUS_UI_FILETYPE_QUOTE_APPROVAL;
+  const quoteNameHint = process.env.PRIMUS_UI_QUOTE_APPROVAL_TYPE_NAME ||
+    "quote approval";
+  const quoteApproval = envQuote ?
+    {id: String(envQuote), name: "Quote Approval (env)", external: "1"} :
+    (matchFileTypeByName(types, [
+      quoteNameHint,
+      "quote approval",
+      "approved quote",
+      "customer quote approval",
+    ]) || null);
+
+  return {carrierBill: carrier, pod, quoteApproval};
+}
+
+/**
+ * True when bill-to / customer name is Miworld (spacing/case variants).
+ * @param {string|null|undefined} name Customer display name.
+ * @return {boolean}
+ */
+function isMiworldCustomer(name) {
+  const compact = String(name || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return compact.includes("miworld");
+}
+
+/**
+ * Best-effort customer display name from a Primus booking.
+ * @param {object|null} booking Primus booking.
+ * @return {string}
+ */
+function customerNameFromBooking(booking) {
+  const party = resolveBillToParty(booking);
+  if (!party) return "";
+  return String(
+      party.name || party.companyName || party.company ||
+      party.customerName || "",
+  ).trim();
+}
+
+/**
+ * Quote-approval drive file ids (by fileType and/or filename).
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string|number|null} [quoteApprovalFileTypeId] Optional type id.
+ * @return {string[]}
+ */
+function listQuoteApprovalDriveFileIds(docData, quoteApprovalFileTypeId) {
+  const ids = [];
+  const wantType = quoteApprovalFileTypeId != null ?
+    String(quoteApprovalFileTypeId) : null;
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      const driveId = readDriveFileId(f);
+      if (!driveId) continue;
+      const ft = readFileTypeId(f);
+      const name = String(
+          f.name || f.fileName || f.description || f.fileDescription || "",
+      ).toUpperCase();
+      const isType = wantType && ft === wantType;
+      const nameLooks = /QUOTE\s*APPROVAL|APPROVED\s*QUOTE|QUOTE\s*APPROV/
+          .test(name);
+      if (isType || nameLooks) ids.push(driveId);
+    }
+  }
+  return [...new Set(ids)];
 }
 
 /**
@@ -888,16 +955,22 @@ function isEmailBOLDocsSuccess(json) {
 }
 
 /**
- * Resolves POD drive file ids for email-docs-drive-{id}=on checkboxes.
- * @param {object} args booking, loadNumber, podPdf, extraDriveFileIds
- * @return {Promise<{podDriveIds: string[]}>}
+ * Resolves POD (+ Miworld quote-approval) drive file ids for email-docs-drive.
+ * @param {object} args booking, loadNumber, podPdf, extraDriveFileIds,
+ *   customerName
+ * @return {Promise<object>}
  */
 async function resolvePodDriveIdsForEmail(args) {
   const booking = args.booking;
   const loadNumber = args.loadNumber;
+  const customerName = args.customerName || customerNameFromBooking(booking);
+  const miworld = isMiworldCustomer(customerName);
   const uploadFileTypes = await resolveUploadFileTypes();
   const podFileTypeId = uploadFileTypes.pod.id;
   const carrierBillTypeId = uploadFileTypes.carrierBill.id;
+  const quoteApprovalTypeId = uploadFileTypes.quoteApproval &&
+      uploadFileTypes.quoteApproval.id ?
+    uploadFileTypes.quoteApproval.id : null;
   const bookingId = resolveManageBookingId(booking);
   if (!bookingId) {
     return {ok: false, error: "Could not resolve manage.php bookingId"};
@@ -945,13 +1018,33 @@ async function resolvePodDriveIdsForEmail(args) {
       ])];
     }
   } else if (!podDriveIds.length && docData) {
+    // Do not fall back to arbitrary customer-visible drive files —
+    // that can email the wrong document or proceed with no real POD.
     podDriveIds = listPodDriveFileIds(
         docData, podFileTypeId, carrierBillTypeId);
-    if (!podDriveIds.length) {
-      podDriveIds = listCustomerDriveFileIds(docData, {
-        podFileTypeId,
-        excludeFileTypeId: carrierBillTypeId,
-      });
+  }
+
+  let quoteApprovalDriveIds = [];
+  if (miworld && docData) {
+    quoteApprovalDriveIds = listQuoteApprovalDriveFileIds(
+        docData, quoteApprovalTypeId);
+    if (!quoteApprovalDriveIds.length && writeLog) {
+      await writeLog("warn", "primus",
+          "Miworld invoice email — quote approval doc not found on load", {
+            loadNumber,
+            bookingId,
+            customerName,
+            quoteApprovalTypeId,
+          });
+    } else if (quoteApprovalDriveIds.length && writeLog) {
+      await writeLog("info", "primus",
+          "Miworld invoice email — including quote approval attachment(s)", {
+            loadNumber,
+            bookingId,
+            customerName,
+            quoteApprovalDriveIds,
+            quoteApprovalTypeId,
+          });
     }
   }
 
@@ -963,12 +1056,20 @@ async function resolvePodDriveIdsForEmail(args) {
   const carrierBillDriveIds = new Set(
       listFileTypeDriveIds(docData, carrierBillTypeId));
   const blocked = [];
-  const safeIds = [];
+  const safePodIds = [];
   for (const id of podDriveIds) {
     if (carrierBillDriveIds.has(String(id))) {
       blocked.push(String(id));
     } else {
-      safeIds.push(id);
+      safePodIds.push(id);
+    }
+  }
+  const safeQuoteIds = [];
+  for (const id of quoteApprovalDriveIds) {
+    if (carrierBillDriveIds.has(String(id))) {
+      blocked.push(String(id));
+    } else {
+      safeQuoteIds.push(id);
     }
   }
   if (blocked.length && writeLog) {
@@ -981,7 +1082,14 @@ async function resolvePodDriveIdsForEmail(args) {
         });
   }
 
-  return {podDriveIds: safeIds, blockedDriveFileIds: blocked};
+  return {
+    podDriveIds: safePodIds,
+    quoteApprovalDriveIds: safeQuoteIds,
+    driveFileIds: [...new Set([...safePodIds, ...safeQuoteIds])],
+    blockedDriveFileIds: blocked,
+    miworld,
+    customerName,
+  };
 }
 
 /**
@@ -1019,17 +1127,44 @@ async function emailBOLDocs(args) {
   const invoiceNumber = args.invoiceNumber != null ?
     String(args.invoiceNumber) : "0";
 
-  const {podDriveIds, blockedDriveFileIds} = await resolvePodDriveIdsForEmail({
+  const {
+    podDriveIds,
+    quoteApprovalDriveIds,
+    driveFileIds: resolvedDriveIds,
+    blockedDriveFileIds,
+    miworld,
+    customerName: resolvedCustomerName,
+  } = await resolvePodDriveIdsForEmail({
     booking,
     loadNumber,
     podPdf: args.podPdf,
+    customerName: args.customerName || null,
     extraDriveFileIds: [
       ...(args.extraDriveFileIds || []),
       ...(Array.isArray(args.driveFileIds) ? args.driveFileIds : []),
     ],
   });
 
-  const driveFileIds = [...new Set(podDriveIds)];
+  const driveFileIds = [...new Set(resolvedDriveIds || podDriveIds || [])];
+  if (!podDriveIds || !podDriveIds.length) {
+    return {
+      ok: false,
+      error: "No POD document on Primus — customer email blocked",
+      driveFileIds: [],
+      blockedDriveFileIds: blockedDriveFileIds || [],
+      attachments: {
+        invoiceSelected: true,
+        bolSelected: true,
+        podDriveIdsSelected: [],
+        quoteApprovalDriveIdsSelected: quoteApprovalDriveIds || [],
+        miworld: !!miworld,
+        customerName: resolvedCustomerName || null,
+        blockedCarrierBillDriveIds: blockedDriveFileIds || [],
+        customerInvoiceId: String(customerInvoiceId),
+        invoiceNumber,
+      },
+    };
+  }
 
   const subject = args.subject ||
     `Invoice for BOL#${loadNumber}`;
@@ -1071,7 +1206,7 @@ async function emailBOLDocs(args) {
   params["email-docs-bol"] = "on";
   // UI checkbox: attach issued customer invoice
   params[`email-docs-invoice-${customerInvoiceId}`] = "on";
-  // UI checkbox(es): attach POD / customer-visible drive file(s)
+  // UI checkbox(es): attach POD / quote approval / customer drive file(s)
   for (const driveId of driveFileIds) {
     params[`email-docs-drive-${driveId}`] = "on";
   }
@@ -1081,7 +1216,10 @@ async function emailBOLDocs(args) {
   const attachments = {
     invoiceSelected: true,
     bolSelected: true,
-    podDriveIdsSelected: driveFileIds,
+    podDriveIdsSelected: podDriveIds || [],
+    quoteApprovalDriveIdsSelected: quoteApprovalDriveIds || [],
+    miworld: !!miworld,
+    customerName: resolvedCustomerName || null,
     blockedCarrierBillDriveIds: blockedDriveFileIds || [],
     customerInvoiceId: String(customerInvoiceId),
     invoiceNumber,
@@ -2950,6 +3088,192 @@ async function maybeIssueInvoiceViaUi(args) {
 }
 exports.maybeIssueInvoiceViaUi = maybeIssueInvoiceViaUi;
 
+/**
+ * Looks up Primus UI users via manage.php getUsers.
+ * @param {string} query Username, last name, or free-text search.
+ * @return {Promise<object>} {ok, users, error}.
+ */
+async function lookupPrimusUsers(query) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, users: [], error: "manage.php off"};
+  }
+  const q = String(query || "").trim();
+  if (!q) {
+    return {ok: false, users: [], error: "empty query"};
+  }
+  try {
+    const result = await managePhpPost({
+      action: "getUsers",
+      page: "1",
+      start: "0",
+      limit: "25",
+      query: q,
+      forcelimit: "",
+      item_id: "",
+      locationType: "",
+      sort: JSON.stringify([
+        {property: "lastName", direction: "ASC"},
+      ]),
+    });
+    if (!result.json || !Array.isArray(result.json.users)) {
+      return {
+        ok: false,
+        users: [],
+        error: (result.json && result.json.message) ||
+          "getUsers returned no users list",
+      };
+    }
+    return {ok: true, users: result.json.users};
+  } catch (err) {
+    return {ok: false, users: [], error: err.message};
+  }
+}
+exports.lookupPrimusUsers = lookupPrimusUsers;
+
+/**
+ * Resolves the load dispatcher contact (username + email) from a booking.
+ * Uses booking.dispatchedByUser / userName, then getUsers by username.
+ * @param {object} args Args.
+ * @param {object} [args.booking] Primus booking (optional if loadNumber set).
+ * @param {string|number} [args.loadNumber] BOL / load number.
+ * @param {Function} [args.fetchBooking] Optional booking loader.
+ * @return {Promise<object>} {ok, email, userName, displayName, ...}
+ */
+async function resolveDispatcherEmail(args = {}) {
+  let booking = args.booking || null;
+  const loadNumber = args.loadNumber != null ? String(args.loadNumber) : "";
+  if (!booking && loadNumber && typeof args.fetchBooking === "function") {
+    booking = await args.fetchBooking(loadNumber);
+  }
+  if (!booking) {
+    return {ok: false, error: "missing booking"};
+  }
+
+  const userName = String(
+      booking.dispatchedByUser || booking.userName || "",
+  ).trim();
+  const control = booking.contactInformation &&
+    booking.contactInformation.controlUser;
+  const controlName = control && control.name ?
+    String(control.name).trim() : "";
+
+  if (!userName && !controlName) {
+    return {ok: false, error: "no dispatcher username on booking"};
+  }
+
+  // Username query is the reliable match (verified with getUsers).
+  const queries = [];
+  if (userName) queries.push(userName);
+  if (controlName && controlName.toLowerCase() !== userName.toLowerCase()) {
+    queries.push(controlName);
+  }
+
+  for (const query of queries) {
+    const looked = await lookupPrimusUsers(query);
+    if (!looked.ok || !looked.users.length) continue;
+    const want = query.toLowerCase();
+    const matched = looked.users.find((u) =>
+      String(u.userName || "").toLowerCase() === want,
+    ) || looked.users.find((u) => {
+      const full = `${u.firstName || ""} ${u.lastName || ""}`.trim()
+          .toLowerCase().replace(/\s+/g, " ");
+      return full === want.replace(/\s+/g, " ") ||
+        full.includes(want.replace(/\s+/g, " "));
+    }) || (looked.users.length === 1 ? looked.users[0] : null);
+
+    if (!matched) continue;
+    const email = String(matched.email || matched.mailEmail || "").trim();
+    if (!email || !email.includes("@")) {
+      return {
+        ok: false,
+        userName: matched.userName || userName,
+        displayName: matched.displayName ||
+          `${matched.firstName || ""} ${matched.lastName || ""}`.trim(),
+        error: "dispatcher user found but has no email",
+      };
+    }
+    return {
+      ok: true,
+      email,
+      userName: matched.userName || userName,
+      displayName: matched.displayName ||
+        `${matched.firstName || ""} ${matched.lastName || ""}`.trim() ||
+        controlName || userName,
+      userId: matched.id || null,
+      query,
+    };
+  }
+
+  return {
+    ok: false,
+    userName: userName || null,
+    displayName: controlName || null,
+    error: "getUsers did not return a matching dispatcher",
+  };
+}
+exports.resolveDispatcherEmail = resolveDispatcherEmail;
+
+/**
+ * Checks whether a Primus booking already has a POD document on file.
+ * Used when local POD extraction failed so the workflow can continue
+ * without treating POD as missing.
+ * @param {object} args Args.
+ * @param {object} args.booking Primus booking from GET /book/bolnumber.
+ * @param {string|number} args.loadNumber Load / BOL number.
+ * @return {Promise<object>} {found, driveIds, reason}.
+ */
+async function checkBookingHasPod({booking, loadNumber}) {
+  if (!isManagePhpEnabled()) {
+    return {found: false, driveIds: [], reason: "manage.php off"};
+  }
+  if (!booking || !loadNumber) {
+    return {found: false, driveIds: [], reason: "missing booking or load"};
+  }
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {
+      found: false,
+      driveIds: [],
+      reason: "Could not resolve manage.php bookingId",
+    };
+  }
+
+  let uploadFileTypes;
+  try {
+    uploadFileTypes = await resolveUploadFileTypes();
+  } catch (err) {
+    return {
+      found: false,
+      driveIds: [],
+      reason: err && err.message || "resolveUploadFileTypes failed",
+    };
+  }
+
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: String(loadNumber),
+  });
+  if (!docs.ok || !docs.data) {
+    return {
+      found: false,
+      driveIds: [],
+      reason: docs.error || "getBookingDocuments failed",
+    };
+  }
+
+  const podFileTypeId = uploadFileTypes.pod.id;
+  const carrierBillTypeId = uploadFileTypes.carrierBill.id;
+  const driveIds = listPodDriveFileIds(
+      docs.data, podFileTypeId, carrierBillTypeId,
+  );
+  const hasType = bookingHasFileType(docs.data, podFileTypeId);
+  if (hasType || driveIds.length > 0) {
+    return {found: true, driveIds};
+  }
+  return {found: false, driveIds: [], reason: "no POD on booking"};
+}
+exports.checkBookingHasPod = checkBookingHasPod;
+
 exports._internal = {
   parsePhpSessId,
   extractSessionFromResponse,
@@ -2968,6 +3292,10 @@ exports._internal = {
   listFileTypeDriveIds,
   listPodDriveFileIds,
   listCustomerDriveFileIds,
+  listQuoteApprovalDriveFileIds,
+  isMiworldCustomer,
+  customerNameFromBooking,
+  fetchUiFileTypes,
   isIssuedUiInvoice,
   isDraftUiInvoice,
   findDraftUiInvoice,

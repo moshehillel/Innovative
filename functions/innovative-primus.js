@@ -14,7 +14,6 @@
 
 const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
-const {google} = require("googleapis");
 const workflowErrors = require("./workflow-error-messages");
 
 // Injected from index.js (see init). Declared at module scope so the moved
@@ -27,24 +26,26 @@ let pauseWorkflow;
 let saveOutboundEmail;
 let escapeHtml;
 let maybeExtractPodOnlyPdf;
+let maybeBuildPodFromTrailerImages;
 let isAlreadyDoneResult;
 let downloadStorageFileBase64;
 let primusRequest;
 let fetchPrimusBooking;
 let readShipmentMode;
 let isDrayageShipment;
+let isPowerOnlyShipment;
+let isTruckloadShipment;
 let validateAmountWithPrimus;
 let addProNumberToLoad;
 let getCustomerRate;
 let approveCarrierBill;
 let generateCustomerInvoice;
 let markShipmentDelivered;
-let forwardToHumanReview;
-let getGmailOAuthClient;
 let isManagePhpEnabled;
 let runPrimusUiBillingFlow;
 let emailBOLDocs;
 let resolveCustomerAccountingEmails;
+let checkBookingHasPod;
 
 /**
  * Receives the shared + Primus helper bundle from index.js.
@@ -56,14 +57,16 @@ function init(bundle) {
     db, writeLog, logWorkflowStep, setWorkflowHeartbeat, pauseWorkflow,
     saveOutboundEmail, escapeHtml,
     maybeExtractPodOnlyPdf,
+    maybeBuildPodFromTrailerImages,
     isAlreadyDoneResult,
     downloadStorageFileBase64,
     primusRequest, fetchPrimusBooking, readShipmentMode, isDrayageShipment,
+    isPowerOnlyShipment, isTruckloadShipment,
     validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
-    markShipmentDelivered, forwardToHumanReview, getGmailOAuthClient,
+    markShipmentDelivered,
     isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
-    resolveCustomerAccountingEmails,
+    resolveCustomerAccountingEmails, checkBookingHasPod,
   } = bundle);
 }
 exports.init = init;
@@ -77,6 +80,16 @@ function moneyFmt(amount) {
     return "—";
   }
   return `$${Number(amount).toFixed(2)}`;
+}
+
+/**
+ * Miworld bill-to variants (spacing/case).
+ * @param {string|null|undefined} name Customer name.
+ * @return {boolean}
+ */
+function isMiworldCustomer(name) {
+  const compact = String(name || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return compact.includes("miworld");
 }
 
 /**
@@ -109,6 +122,169 @@ async function sendWorkflowAlert(opts) {
 }
 
 /**
+ * Pushes the carrier payable to QuickBooks via Primus REST.
+ * Idempotent via primusSteps.qbBillingSynced. Alerts ops on failure.
+ * @param {object} args Args.
+ * @param {object} args.req Express request (for alert links).
+ * @param {object} args.invoiceDoc Firestore invoice snapshot.
+ * @param {string} args.invoiceId Firestore invoice id.
+ * @param {object} args.invoice Invoice data.
+ * @param {object} args.primusSteps Mutable primusSteps map (updated in place).
+ * @param {string|number} args.customerInvoiceId Primus customer invoice id.
+ * @return {Promise<object>} {synced, skipped, uploaded, failed, error}.
+ */
+async function pushCarrierBillToQuickBooks(args) {
+  const {
+    req,
+    invoiceDoc,
+    invoiceId,
+    invoice,
+    primusSteps,
+    customerInvoiceId,
+  } = args;
+  if (!customerInvoiceId) {
+    return {synced: false, skipped: true, reason: "no customerInvoiceId"};
+  }
+  if (primusSteps && primusSteps.qbBillingSynced) {
+    return {synced: true, skipped: true, reason: "already synced"};
+  }
+
+  try {
+    const qbResult = await primusRequest(
+        "POST", "/quickbooks/billing",
+        {invoiceId: customerInvoiceId},
+    );
+    const qbResults = qbResult && qbResult.data && qbResult.data.results;
+    const qbBills = qbResults && qbResults.bills;
+    const primusQbError = (qbResults && typeof qbResults.error === "string" &&
+        qbResults.error) || null;
+    const uploaded = (qbBills && qbBills.uploadedBills &&
+        qbBills.uploadedBills.length) || 0;
+    const failed = (qbBills && qbBills.failedBills &&
+        qbBills.failedBills.length) || 0;
+    const rawSnippet = JSON.stringify(qbResult || {}).slice(0, 400);
+
+    if (uploaded > 0) {
+      if (primusSteps) {
+        primusSteps.qbBillingSynced = true;
+        primusSteps.qbBillingSyncedAt =
+          new Date().toISOString();
+      }
+      const updatePayload = {
+        "primusSteps.qbBillingSynced": true,
+        "primusSteps.qbBillingSyncedAt":
+          admin.firestore.FieldValue.serverTimestamp(),
+        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+      };
+      // Calculate and store Net 30 due date for reference when missing.
+      const invDateRaw = invoice.dueDate ? null :
+        (invoice.invoiceDate || invoice.receivedAt || null);
+      if (!invoice.dueDate && invDateRaw) {
+        const invDate = new Date(invDateRaw);
+        if (!isNaN(invDate.getTime())) {
+          invDate.setDate(invDate.getDate() + 30);
+          updatePayload.carrierBillDueDate =
+            invDate.toISOString().split("T")[0];
+        }
+      }
+      await invoiceDoc.ref.update(updatePayload);
+      await writeLog("info", "workflow",
+          "Carrier bill pushed to QuickBooks", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            customerInvoiceId,
+            uploadedBills: uploaded,
+          });
+      await logWorkflowStep({
+        invoiceId,
+        stepName: "qb_billing_sync",
+        stepStatus: "success",
+        output: {customerInvoiceId, uploadedBills: uploaded},
+      });
+      return {synced: true, uploaded, failed};
+    }
+
+    const failMsg = primusQbError ||
+        (failed > 0 ?
+          `${failed} bill(s) failed to upload to QuickBooks` :
+          "Primus returned no uploaded bills (QB may not be connected " +
+          "or the payable is not ready)");
+    await writeLog("error", "workflow",
+        "QB billing call returned no uploaded bills", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          customerInvoiceId,
+          failedBills: failed,
+          primusError: primusQbError,
+          raw: rawSnippet,
+        });
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "qb_billing_sync",
+      stepStatus: "failed",
+      reason: failMsg,
+      error: "QB_BILLING_FAILED",
+      output: {
+        customerInvoiceId,
+        failedBills: failed,
+        primusError: primusQbError,
+        raw: rawSnippet,
+      },
+    });
+    if (req) {
+      await sendWorkflowAlert({
+        req,
+        code: "QB_BILLING_FAILED",
+        invoiceId,
+        type: "qb_billing_failed",
+        context: {
+          loadNumber: invoice.loadNumber,
+          carrierName: invoice.carrierName,
+          customerInvoiceId,
+          errorMessage: failMsg,
+          raw: rawSnippet,
+        },
+      });
+    }
+    return {
+      synced: false,
+      uploaded: 0,
+      failed,
+      error: primusQbError || "no_uploaded_bills",
+    };
+  } catch (qbErr) {
+    await writeLog("error", "workflow",
+        "QB billing sync failed — bill still in Primus", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          customerInvoiceId,
+          error: qbErr.message,
+        });
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "qb_billing_sync",
+      stepStatus: "failed",
+      error: qbErr.message,
+    });
+    if (req) {
+      await sendWorkflowAlert({
+        req,
+        code: "QB_BILLING_FAILED",
+        invoiceId,
+        type: "qb_billing_failed",
+        context: {
+          loadNumber: invoice.loadNumber,
+          carrierName: invoice.carrierName,
+          customerInvoiceId,
+          errorMessage: qbErr.message,
+        },
+      });
+    }
+    return {synced: false, error: qbErr.message};
+  }
+}
+
+/**
  * Builds the reviewer approval email with a full summary of what the agent
  * did on this load before the customer-facing email is sent.
  * @param {object} opts Approval context from the workflow.
@@ -119,7 +295,7 @@ function buildCustomerEmailApprovalHtml(opts) {
     invoice, customerName, customerRate, profit, marginPct,
     workingProNumber, amountValidation, baseAmount, approvedChargesTotal,
     finalCustomerInvoiceId, issuedInvoiceNumber, customerEmail,
-    customerEmailSource, podStoragePath,
+    customerEmailSource, podStoragePath, podOnPrimusAlready,
     primusSteps, approveUrl, rejectUrl, invoiceGenerationResult,
   } = opts;
 
@@ -146,7 +322,10 @@ function buildCustomerEmailApprovalHtml(opts) {
         "Primus REST" : "—"));
 
   const attachments =
-    "Customer invoice + BOL + POD (via Primus emailBOLDocs)";
+    "Customer invoice + BOL + POD" +
+    (isMiworldCustomer(customerName) ?
+      " + Quote Approval (Miworld)" : "") +
+    " (via Primus emailBOLDocs)";
 
   const amtMatch = amtDiff != null && Number(amtDiff) <= 0.5 ?
     `<span style="color:#16a34a">Matched</span>` :
@@ -156,8 +335,11 @@ function buildCustomerEmailApprovalHtml(opts) {
   return (
     `<h2>Approval needed before emailing the customer</h2>` +
     `<p>I finished processing this load. Please review everything below ` +
-    `and confirm the outgoing package includes <strong>only the customer ` +
-    `invoice and POD</strong> — never a carrier bill — before approving.</p>` +
+    `and confirm the outgoing package includes ` +
+    (isMiworldCustomer(customerName) ?
+      `<strong>the customer invoice, POD, and quote approval</strong>` :
+      `<strong>only the customer invoice and POD</strong>`) +
+    ` — never a carrier bill — before approving.</p>` +
 
     `<h3 style="margin:18px 0 8px;font-size:15px">Load &amp; carrier</h3>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
@@ -201,7 +383,9 @@ function buildCustomerEmailApprovalHtml(opts) {
     row("Send method", "Primus emailBOLDocs") +
     row("Attachments to send", escapeHtml(attachments)) +
     row("POD status", podStoragePath ?
-      "Sanitized POD ready" : "No POD file on record") +
+      "Sanitized POD ready" :
+      (podOnPrimusAlready ?
+        "POD already on Primus" : "No POD file on record")) +
     `</table>` +
 
     `<h3 style="margin:18px 0 8px;font-size:15px">` +
@@ -328,9 +512,31 @@ exports.processPrimusWorkflow = onRequest(
           uiInvoiceIssued: false,
           carrierBillUploaded: false,
           podUploaded: false,
+          qbBillingSynced: false,
         };
 
         const currentStep = resumeFrom || null;
+
+        // An invoice awaiting the A/B/C/D additional-charge decision must
+        // not be failed — the decision buttons clear the charge arrays and
+        // restart the workflow.
+        if (invoice.additionalCharge &&
+            !invoice.additionalCharge.decision) {
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "additional_charge_gate",
+            stepStatus: "skipped",
+            reason: "Awaiting A/B/C/D additional-charge decision",
+          });
+          await invoiceDoc.ref.update({
+            processingLock: false,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          return res.json({
+            ok: false,
+            error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
+          });
+        }
 
         if (
           Array.isArray(invoice.unrecognizedCharges) &&
@@ -401,8 +607,19 @@ exports.processPrimusWorkflow = onRequest(
             })
             .filter((x) => x.storagePath);
 
+        // Human-approved additional charge (A/B/C buttons). Charges that
+        // originated as unrecognized line items are excluded from the base
+        // amount so validation against the Primus cost still passes.
+        const additionalCharge = invoice.additionalCharge || null;
+        const additionalChargeApproved =
+          !!(additionalCharge && additionalCharge.approved);
+        const additionalApprovedExtra = (additionalChargeApproved &&
+          additionalCharge.source === "unrecognized_charges") ?
+          (Number(additionalCharge.amount) || 0) : 0;
+
         const approvedChargesTotal = approvedChargeProofFiles
-            .reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+            .reduce((sum, c) => sum + (Number(c.amount) || 0), 0) +
+            additionalApprovedExtra;
 
         await invoiceDoc.ref.update({
           approvedChargeProofFiles: approvedChargeProofFiles,
@@ -461,7 +678,7 @@ exports.processPrimusWorkflow = onRequest(
           }
         }
 
-        const extractedPodOnlyFile =
+        let extractedPodOnlyFile =
       await maybeExtractPodOnlyPdf(invoiceId, invoice);
 
         await logWorkflowStep({
@@ -496,6 +713,252 @@ exports.processPrimusWorkflow = onRequest(
             }],
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
+        } else if (invoice.loadNumber && isManagePhpEnabled &&
+            isManagePhpEnabled() && checkBookingHasPod) {
+          try {
+            const bookingForPod =
+                await fetchPrimusBooking(invoice.loadNumber);
+            const podCheck = await checkBookingHasPod({
+              booking: bookingForPod,
+              loadNumber: invoice.loadNumber,
+            });
+            if (podCheck && podCheck.found) {
+              const steps = Object.assign({}, invoice.primusSteps || {}, {
+                podUploaded: true,
+              });
+              await invoiceDoc.ref.update({
+                podOnPrimusAlready: true,
+                podPrimusDriveIds: podCheck.driveIds || [],
+                primusSteps: steps,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              invoice.podOnPrimusAlready = true;
+              invoice.podPrimusDriveIds = podCheck.driveIds || [];
+              invoice.primusSteps = steps;
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "pod_on_primus_check",
+                stepStatus: "success",
+                reason: "already on booking",
+                output: {
+                  driveIds: podCheck.driveIds || [],
+                  loadNumber: invoice.loadNumber,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "POD already on Primus — local extraction not required", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    driveIds: podCheck.driveIds || [],
+                  });
+            } else {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "pod_on_primus_check",
+                stepStatus: "failed",
+                reason: (podCheck && podCheck.reason) || "no POD on booking",
+                output: {loadNumber: invoice.loadNumber},
+              });
+            }
+          } catch (podCheckErr) {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "pod_on_primus_check",
+              stepStatus: "failed",
+              reason: podCheckErr.message || "check failed",
+              error: podCheckErr.message,
+            });
+            await writeLog("warn", "workflow",
+                "Primus POD presence check failed", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  error: podCheckErr.message,
+                });
+          }
+        }
+
+        // POD is required before billing / customer email — with exceptions:
+        // Power Only: trailer images on the email become the POD.
+        // Truckload: continue billing, chase carrier for POD, hold customer
+        // email until it arrives.
+        let hasLocalPod = Boolean(
+            (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+            (invoice.podOnlyFile && invoice.podOnlyFile.storagePath),
+        );
+        const hasPrimusPod = Boolean(invoice.podOnPrimusAlready ||
+            (invoice.primusSteps && invoice.primusSteps.podUploaded));
+
+        let bookingForMode = null;
+        if ((!hasLocalPod && !hasPrimusPod) && invoice.loadNumber) {
+          try {
+            bookingForMode = await fetchPrimusBooking(invoice.loadNumber);
+          } catch (_) {
+            bookingForMode = null;
+          }
+        }
+
+        // Power Only — convert trailer images attached to the email into a
+        // POD PDF when no other POD exists.
+        if (!hasLocalPod && !hasPrimusPod && bookingForMode &&
+            isPowerOnlyShipment && isPowerOnlyShipment(bookingForMode) &&
+            maybeBuildPodFromTrailerImages) {
+          const imgPod = await maybeBuildPodFromTrailerImages(
+              invoiceId, invoice);
+          if (imgPod && imgPod.storagePath) {
+            extractedPodOnlyFile = imgPod;
+            hasLocalPod = true;
+            await invoiceDoc.ref.update({
+              podOnlyFile: {
+                storagePath: imgPod.storagePath,
+                source: imgPod.source || "trailer_images",
+              },
+              podOnlyFiles: [{
+                storagePath: imgPod.storagePath,
+                source: imgPod.source || "trailer_images",
+              }],
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "power_only_trailer_pod",
+              stepStatus: "success",
+              output: {
+                storagePath: imgPod.storagePath,
+                pageCount: imgPod.pageCount || null,
+              },
+            });
+            await writeLog("info", "workflow",
+                "Power Only — trailer images converted to POD", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  storagePath: imgPod.storagePath,
+                });
+          }
+        }
+
+        if (!hasLocalPod && !hasPrimusPod) {
+          const isTl = bookingForMode && isTruckloadShipment &&
+            isTruckloadShipment(bookingForMode);
+          // Power Only without usable images falls through to MISSING_POD
+          // unless it also qualifies as TL chase (it doesn't — Power Only
+          // is excluded from isTruckloadShipment).
+          if (isTl) {
+            const podFollowup = require("./pod-followup");
+            const carrier = podFollowup.resolveCarrierEmail(bookingForMode);
+            const lisa = process.env.LOW_PROFIT_CC_EMAIL ||
+              podFollowup.LISA_EMAIL;
+            const request = podFollowup.buildCarrierPodRequestEmail({
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName,
+              proNumber: invoice.proNumber,
+              invoiceNumber: invoice.invoiceNumber,
+              isReminder: false,
+            });
+            const emailPayload = {
+              type: "tl_pod_request",
+              invoiceId,
+              subject: request.subject,
+              html: request.html,
+            };
+            if (carrier.email) {
+              emailPayload.forceRecipient = true;
+              emailPayload.to = carrier.email;
+              emailPayload.cc = lisa;
+            } else {
+              emailPayload.forceRecipient = true;
+              emailPayload.to = lisa;
+              emailPayload.html = request.html +
+                `<p style="color:#b45309"><em>Note: no carrier email on ` +
+                `the Primus booking — sent to Lisa only.</em></p>`;
+            }
+            await saveOutboundEmail(emailPayload);
+
+            await invoiceDoc.ref.update({
+              podFollowUp: {
+                status: podFollowup.POD_FOLLOW_UP_STATUS.AWAITING_CARRIER,
+                holdCustomerEmail: true,
+                carrierEmail: carrier.email || null,
+                carrierEmailSource: carrier.source || null,
+                firstEmailedAt:
+                  admin.firestore.FieldValue.serverTimestamp(),
+                reminderSentAt: null,
+                escalatedAt: null,
+              },
+              shipmentMode: readShipmentMode(bookingForMode) || "TL",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            invoice.podFollowUp = {
+              status: podFollowup.POD_FOLLOW_UP_STATUS.AWAITING_CARRIER,
+              holdCustomerEmail: true,
+              carrierEmail: carrier.email || null,
+            };
+
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "tl_pod_chase_started",
+              stepStatus: "success",
+              reason: "TL missing POD — billing continues; customer held",
+              output: {
+                carrierEmail: carrier.email || null,
+                toLisaOnly: !carrier.email,
+              },
+            });
+            await writeLog("warn", "workflow",
+                "TL missing POD — carrier chased; customer email held", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  carrierEmail: carrier.email || null,
+                });
+            // Fall through — do NOT return; continue amount validation.
+          } else {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "pod_required_check",
+              stepStatus: "stopped",
+              reason: "No local POD and no POD on Primus booking",
+              error: "MISSING_POD",
+              output: {
+                loadNumber: invoice.loadNumber,
+                podFound: invoice.pod && invoice.pod.found,
+                podSource: invoice.pod && invoice.pod.source,
+              },
+            });
+
+            await pauseWorkflow(
+                invoiceDoc.ref,
+                "pod_extraction",
+                "missing_pod",
+                "Carrier invoice has no POD — cannot continue without one",
+            );
+
+            await sendWorkflowAlert({
+              req,
+              code: "MISSING_POD",
+              invoiceId,
+              type: "missing_pod",
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                proNumber: invoice.proNumber || null,
+                gmailSubject: invoice.gmailSubject || null,
+              },
+            });
+
+            await writeLog("error", "workflow",
+                "Workflow stopped — POD missing " +
+                "(not extracted, not on Primus)", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  carrierName: invoice.carrierName || null,
+                  pod: invoice.pod || null,
+                });
+
+            return res.json({
+              ok: false,
+              error: "MISSING_POD",
+              workflowStatus: "missing_pod",
+            });
+          }
         }
 
         await logWorkflowStep({
@@ -601,64 +1064,122 @@ exports.processPrimusWorkflow = onRequest(
 
         // Extra charges (e.g. lumper) are never auto-added to the customer
         // invoice, even when their proof checks out — a human must decide
-        // whether to invoice them or dispute them with the carrier.
-        if (approvedChargeProofFiles.length > 0) {
+        // via the A/B/C/D approval email. Once decided, the workflow
+        // proceeds (additionalCharge.approved is set by the buttons).
+        if (approvedChargeProofFiles.length > 0 && !additionalChargeApproved) {
+          if (additionalCharge && additionalCharge.decision) {
+            // Already decided "not approved" (D) — dispute in progress.
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "extra_charges_held_for_review",
+              stepStatus: "failed",
+              reason: "Charge was not approved (dispute in progress)",
+              error: "ADDITIONAL_CHARGE_DISPUTED",
+            });
+            await invoiceDoc.ref.update({
+              processingLock: false,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            return res.json({
+              ok: false,
+              error: "ADDITIONAL_CHARGE_DISPUTED",
+            });
+          }
+          const additionalChargesMod = require("./additional-charges");
+          const proofChargeRows = approvedChargeProofFiles.map((c) => ({
+            label: c.type,
+            amount: c.amount,
+          }));
+          const proofTotal = approvedChargeProofFiles
+              .reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
+
           await logWorkflowStep({
             invoiceId,
             stepName: "extra_charges_held_for_review",
             stepStatus: "failed",
-            reason: "Extra charges require human approval before invoicing",
+            reason: "Extra charges require A/B/C/D approval before invoicing",
             input: {approvedChargeProofFiles, approvedChargesTotal},
             error: "EXTRA_CHARGES_PENDING_REVIEW",
           });
 
           await invoiceDoc.ref.update({
-            decisionStage: "extra_charges_pending_review",
+            additionalCharge: {
+              status: "pending_approval",
+              source: "proofed_charges",
+              category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
+              charges: proofChargeRows,
+              amount: proofTotal,
+              approved: false,
+              decision: null,
+            },
+            decisionStage: "additional_charge_pending_approval",
             decisionReason:
-                "Extra charges verified but held for human approval",
+                "Extra charges verified — awaiting A/B/C/D decision",
             processingLock: false,
-            finalWorkflowStatus: "failed",
+            finalWorkflowStatus: "additional_charge_pending_approval",
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
-          if (invoice.gmailMessageId) {
-            const gmailDoc =
-              await db.collection("settings").doc("gmail").get();
-            if (gmailDoc.exists) {
-              const gmailSettings = gmailDoc.data();
-              const tokens = gmailSettings.tokens || gmailSettings;
-              const oauth2Client = getGmailOAuthClient();
-              oauth2Client.setCredentials(tokens);
-              const gmail =
-                google.gmail({version: "v1", auth: oauth2Client});
-
-              await forwardToHumanReview(
-                  gmail,
-                  invoice.gmailMessageId,
-                  invoice.gmailSubject,
-                  invoice.gmailFrom,
-                  "Extra charges verified — approval needed before " +
-                  "invoicing",
-                  `The amount and proof both check out, but the extra ` +
-                  `charges on this invoice are being held for manual ` +
-                  `review before adding them to the customer's invoice. ` +
-                  `Please confirm whether to invoice them or dispute ` +
-                  `them with the carrier.`,
-                  {
-                    department: "billing",
-                    extractedData: {
-                      "Carrier": invoice.carrierName || "—",
-                      "Load Number": invoice.loadNumber || "—",
-                      "Extra Charges": approvedChargeProofFiles
-                          .map((c) => `${c.type}: $${c.amount.toFixed(2)}`)
-                          .join(", "),
-                      "Total Extra Charges":
-                          `$${approvedChargesTotal.toFixed(2)}`,
-                    },
-                  },
-              );
+          const dispatcherForEmail = await (async () => {
+            try {
+              const bridge = require("./primus-ui-bridge");
+              return await bridge.resolveDispatcherEmail({
+                loadNumber: invoice.loadNumber,
+                fetchBooking: fetchPrimusBooking,
+              });
+            } catch (_) {
+              return {ok: false};
             }
+          })();
+
+          const approvalEmail =
+            additionalChargesMod.buildAdditionalChargeApprovalEmail({
+              baseUrl: `https://${req.get("host")}`,
+              invoiceId,
+              tenantId: (req.body && req.body.tenantId) || null,
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName,
+              customerName: invoice.customerName || null,
+              invoiceAmount: invoice.invoiceAmount,
+              primusAmount: invoice.primusAmount || null,
+              charges: proofChargeRows,
+              chargesTotal: proofTotal,
+              category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
+              dispatcherName: dispatcherForEmail.displayName ||
+                dispatcherForEmail.userName || null,
+            });
+
+          const podFollowupMod = require("./pod-followup");
+          const approver =
+            process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+            podFollowupMod.SARAH_EMAIL;
+          const approvalPayload = {
+            type: "additional_charge_approval",
+            invoiceId,
+            subject: approvalEmail.subject,
+            html: approvalEmail.html,
+            forceRecipient: true,
+            to: approver,
+          };
+          if (dispatcherForEmail.ok && dispatcherForEmail.email &&
+              dispatcherForEmail.email.toLowerCase() !==
+              approver.toLowerCase()) {
+            approvalPayload.cc = dispatcherForEmail.email;
           }
+          await saveOutboundEmail(approvalPayload);
+
+          await additionalChargesMod.createFollowUp(db, {
+            loadNumber: invoice.loadNumber,
+            carrierName: invoice.carrierName,
+            customerName: invoice.customerName || null,
+            invoiceId,
+            tenantId: (req.body && req.body.tenantId) || null,
+            category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
+            charges: proofChargeRows,
+            chargesTotal: proofTotal,
+            invoiceAmount: invoice.invoiceAmount,
+            status: additionalChargesMod.FOLLOW_UP_STATUS.PENDING_APPROVAL,
+          });
 
           return res.json({
             ok: false,
@@ -1149,6 +1670,15 @@ exports.processPrimusWorkflow = onRequest(
             });
             await setWorkflowHeartbeat(
                 invoiceDoc.ref, "customer_invoice_exists");
+            // Backfill QB if this load was issued before sync moved earlier.
+            await pushCarrierBillToQuickBooks({
+              req,
+              invoiceDoc,
+              invoiceId,
+              invoice,
+              primusSteps,
+              customerInvoiceId: invoice.customerInvoiceId,
+            });
           } else {
             let uiResult;
             try {
@@ -1316,6 +1846,18 @@ exports.processPrimusWorkflow = onRequest(
 
             await setWorkflowHeartbeat(
                 invoiceDoc.ref, "customer_invoice_generated");
+
+            // Push carrier bill to QB immediately — do not wait for
+            // customer-email approval (loads parked at that gate never
+            // reached the old end-of-workflow QB call).
+            await pushCarrierBillToQuickBooks({
+              req,
+              invoiceDoc,
+              invoiceId,
+              invoice,
+              primusSteps,
+              customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+            });
           }
         } else if (invoice.customerInvoiceId) {
           await writeLog(
@@ -1339,6 +1881,14 @@ exports.processPrimusWorkflow = onRequest(
           });
 
           await setWorkflowHeartbeat(invoiceDoc.ref, "customer_invoice_exists");
+          await pushCarrierBillToQuickBooks({
+            req,
+            invoiceDoc,
+            invoiceId,
+            invoice,
+            primusSteps,
+            customerInvoiceId: invoice.customerInvoiceId,
+          });
         } else {
           invoiceGenerationResult =
           await generateCustomerInvoice(customerInvoiceData);
@@ -1426,6 +1976,15 @@ exports.processPrimusWorkflow = onRequest(
 
           await setWorkflowHeartbeat(
               invoiceDoc.ref, "customer_invoice_generated");
+
+          await pushCarrierBillToQuickBooks({
+            req,
+            invoiceDoc,
+            invoiceId,
+            invoice,
+            primusSteps,
+            customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+          });
         }
 
         const finalCustomerInvoiceId =
@@ -1488,6 +2047,32 @@ exports.processPrimusWorkflow = onRequest(
       (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
       (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
       null;
+
+        // TL missing-POD chase: hold customer email until a POD arrives.
+        const followUp = invoice.podFollowUp || null;
+        const hasPodForCustomer = Boolean(podStoragePath ||
+          invoice.podOnPrimusAlready ||
+          (invoice.primusSteps && invoice.primusSteps.podUploaded));
+        const stillHoldingPod = followUp && followUp.holdCustomerEmail &&
+          followUp.status !== "resolved" && !hasPodForCustomer;
+        if (stillHoldingPod) {
+          await pauseWorkflow(
+              invoiceDoc.ref,
+              "send_customer_email",
+              "awaiting_tl_pod",
+              "TL invoice held — waiting for carrier POD before customer email",
+          );
+          await writeLog("info", "workflow",
+              "Customer email held — awaiting TL carrier POD", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                podFollowUpStatus: followUp.status,
+              });
+          return res.json({
+            ok: true,
+            workflowStatus: "awaiting_tl_pod",
+          });
+        }
 
         // --- Reviewer approval gate before any customer-facing send ---
         // Final safeguard against a carrier bill / POD reaching the customer:
@@ -1568,6 +2153,7 @@ exports.processPrimusWorkflow = onRequest(
               customerEmail,
               customerEmailSource,
               podStoragePath,
+              podOnPrimusAlready: Boolean(invoice.podOnPrimusAlready),
               primusSteps,
               approveUrl,
               rejectUrl,
@@ -1652,6 +2238,7 @@ exports.processPrimusWorkflow = onRequest(
             booking: bookingForEmail,
             loadNumber: invoice.loadNumber,
             customerEmail,
+            customerName,
             customerInvoiceId: finalCustomerInvoiceId,
             invoiceNumber: issuedInvoiceNumber || "0",
             chargesTotal: customerRate,
@@ -1794,65 +2381,17 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
-        // Push carrier bill to QuickBooks once the invoice is confirmed.
-        // The payable already exists in Primus (created when the invoice was
-        // issued). We call /quickbooks/billing to sync it to QB. If the
-        // dueDate is missing, we calculate Net 30 from the carrier invoice
-        // date and store it for reference.
-        if (finalCustomerInvoiceId) {
-          try {
-            const qbResult = await primusRequest(
-                "POST", "/quickbooks/billing",
-                {invoiceId: finalCustomerInvoiceId},
-            );
-            const qbBills = qbResult && qbResult.data &&
-                qbResult.data.results && qbResult.data.results.bills;
-            const uploaded = qbBills && qbBills.uploadedBills &&
-                qbBills.uploadedBills.length || 0;
-            const failed = qbBills && qbBills.failedBills &&
-                qbBills.failedBills.length || 0;
-            if (uploaded > 0) {
-              await writeLog("info", "workflow",
-                  "Carrier bill pushed to QuickBooks", {
-                    invoiceId,
-                    loadNumber: invoice.loadNumber,
-                    customerInvoiceId: finalCustomerInvoiceId,
-                    uploadedBills: uploaded,
-                  });
-            } else {
-              await writeLog("warn", "workflow",
-                  "QB billing call returned no uploaded bills " +
-                  "(QB may not be connected or bill not ready)", {
-                    invoiceId,
-                    loadNumber: invoice.loadNumber,
-                    customerInvoiceId: finalCustomerInvoiceId,
-                    failedBills: failed,
-                    raw: JSON.stringify(qbResult).slice(0, 300),
-                  });
-            }
-
-            // Calculate and store Net 30 due date for reference
-            const invDateRaw = invoice.dueDate ? null :
-                (invoice.invoiceDate || invoice.receivedAt || null);
-            if (!invoice.dueDate && invDateRaw) {
-              const invDate = new Date(invDateRaw);
-              if (!isNaN(invDate.getTime())) {
-                invDate.setDate(invDate.getDate() + 30);
-                const net30 = invDate.toISOString().split("T")[0];
-                await invoiceDoc.ref.update({
-                  carrierBillDueDate: net30,
-                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                });
-              }
-            }
-          } catch (qbErr) {
-            await writeLog("warn", "workflow",
-                "QB billing sync failed — bill still in Primus", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  error: qbErr.message,
-                });
-          }
+        // Backstop: push to QB if early sync was skipped (older invoices)
+        // or failed transiently. Idempotent via primusSteps.qbBillingSynced.
+        if (finalCustomerInvoiceId && !primusSteps.qbBillingSynced) {
+          await pushCarrierBillToQuickBooks({
+            req,
+            invoiceDoc,
+            invoiceId,
+            invoice,
+            primusSteps,
+            customerInvoiceId: finalCustomerInvoiceId,
+          });
         }
 
         await logWorkflowStep({
@@ -1874,6 +2413,7 @@ exports.processPrimusWorkflow = onRequest(
           profit: profit,
           customerInvoiceId: finalCustomerInvoiceId,
           workflowStatus: "completed",
+          qbBillingSynced: !!primusSteps.qbBillingSynced,
         });
       } catch (error) {
         const invoiceId = (req.body && req.body.invoiceId) || null;
