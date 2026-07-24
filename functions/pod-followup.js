@@ -1,6 +1,6 @@
 /**
  * TL / Power Only POD helpers:
- *  - business-day math for carrier chase (3bd reminder / 10bd escalate)
+ *  - business-day math for carrier chase (every 3bd × 3 reminders → Lisa)
  *  - JPEG/PNG → multi-page PDF for trailer-image PODs
  *  - carrier POD-request email HTML
  *
@@ -243,24 +243,27 @@ function buildCarrierPodRequestEmail(opts) {
 }
 
 /**
- * Lisa escalation email when carrier never sent a POD.
+ * Lisa escalation email when carrier never sent a POD after 3 reminders.
  * @param {object} opts loadNumber, carrierName, proNumber, carrierEmail,
- *   businessDays, invoiceId.
+ *   businessDays, reminderCount, invoiceId.
  * @return {{subject: string, html: string}}
  */
 function buildTlPodEscalationEmail(opts) {
   const {
     loadNumber, carrierName, proNumber, carrierEmail, businessDays,
+    reminderCount,
   } = opts || {};
+  const reminders = reminderCount != null ? Number(reminderCount) : 3;
   const subject =
-    `Escalation — no POD from carrier after ${businessDays || 10} ` +
-    `business days — Load ${loadNumber || "—"}`;
+    `Escalation — no POD after ${reminders} carrier reminders — ` +
+    `Load ${loadNumber || "—"}`;
   const html =
     `<p>Hi Lisa,</p>` +
     `<p>Jerry requested a POD from the carrier on this <strong>truckload` +
-    `</strong> invoice and has not received one after ` +
-    `<strong>${esc(String(businessDays || 10))} business days</strong> ` +
-    `(reminder was also sent at 3 business days).</p>` +
+    `</strong> invoice and followed up every 3 business days. After ` +
+    `<strong>${esc(String(reminders))} reminders</strong> ` +
+    `(~${esc(String(businessDays || "—"))} business days open) the POD ` +
+    `is still not in Primus and the carrier has not replied.</p>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
     `<tr><td style="padding:4px 16px 4px 0;font-weight:600">Load / BOL</td>` +
     `<td>${esc(String(loadNumber || "—"))}</td></tr>` +

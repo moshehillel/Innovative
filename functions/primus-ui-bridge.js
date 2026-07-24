@@ -1918,14 +1918,20 @@ function buildActualCosts(vendor, bill, withIds = null) {
 
 /**
  * @param {number} customerRate Customer sell rate.
+ * @param {string} [billToReference] Bill-to Reference# (e.g. Unit #256255).
  * @return {Array<object>}
  */
-function buildCustomerCharges(customerRate) {
+function buildCustomerCharges(customerRate, billToReference) {
+  let description = "FREIGHT CHARGE";
+  const ref = String(billToReference || "").trim();
+  if (ref) {
+    description += ` - ${ref}`;
+  }
   return [{
     id: 1,
     code: "",
     qty: 1,
-    description: "FREIGHT CHARGE",
+    description,
     rate: roundMoney(customerRate),
     total: roundMoney(customerRate).toFixed(2),
     chargeType: "",
@@ -2853,7 +2859,7 @@ async function runPrimusUiBillingFlow(args) {
   const phase1 = await managePhpPost({
     action: "saveInvoice",
     billsInfo,
-    charges: buildCustomerCharges(customerRate),
+    charges: buildCustomerCharges(customerRate, args.billToReferenceNumber),
     actualCosts: actualCostsFirst,
     estimatedCosts,
     chargesTotal: customerRate,
@@ -2900,13 +2906,30 @@ async function runPrimusUiBillingFlow(args) {
   const actualCostsWithIds = buildActualCosts(
       vendor, bill, storedCosts || actualCostsFirst);
   const storedCharges = extractChargesFromStore(storeData);
-  const phase2Charges = storedCharges || [{
-    code: "",
-    description: "FREIGHT CHARGE",
-    qty: 1,
-    rate: customerRate,
-    total: roundMoney(customerRate).toFixed(2),
-  }];
+  const phase2Charges = (storedCharges ||
+    buildCustomerCharges(customerRate, args.billToReferenceNumber))
+      .map((c) => ({
+        id: String(c.id != null ? c.id : 1),
+        code: c.code || "",
+        description: c.description || "FREIGHT CHARGE",
+        qty: Number(c.qty || 1),
+        rate: roundMoney(c.rate),
+        total: roundMoney(c.total).toFixed(2),
+      }));
+  if (args.billToReferenceNumber &&
+      !invoiceChargesIncludeReference(
+          phase2Charges, args.billToReferenceNumber)) {
+    const withRef = buildCustomerCharges(
+        customerRate, args.billToReferenceNumber);
+    phase2Charges.splice(0, phase2Charges.length, ...withRef.map((c) => ({
+      id: String(c.id),
+      code: c.code || "",
+      description: c.description,
+      qty: Number(c.qty || 1),
+      rate: roundMoney(c.rate),
+      total: roundMoney(c.total).toFixed(2),
+    })));
+  }
   const storedEstimated = extractEstimatedCostsFromStore(storeData);
   const phase2Estimated = storedEstimated || estimatedCosts.map((line) => ({
     ...line,
@@ -2982,6 +3005,23 @@ async function runPrimusUiBillingFlow(args) {
         "Second saveInvoice failed",
       customerInvoiceId: uiInvoiceId,
     };
+  }
+
+  if (args.billToReferenceNumber) {
+    const verifyStores = await getInvoiceStores(uiInvoiceId);
+    const verifyCharges = verifyStores.ok ?
+      extractChargesFromStore(verifyStores.data) : null;
+    if (!invoiceChargesIncludeReference(
+        verifyCharges, args.billToReferenceNumber)) {
+      return {
+        ok: false,
+        step: "unit_reference_on_invoice",
+        error: "Customer invoice is missing the Bill To Reference# " +
+          "(unit number) on the charge lines",
+        customerInvoiceId: uiInvoiceId,
+        billToReferenceNumber: args.billToReferenceNumber,
+      };
+    }
   }
 
   const genAction = process.env.PRIMUS_UI_GENERATE_ACTION ||
@@ -3273,6 +3313,80 @@ async function checkBookingHasPod({booking, loadNumber}) {
   return {found: false, driveIds: [], reason: "no POD on booking"};
 }
 exports.checkBookingHasPod = checkBookingHasPod;
+
+/**
+ * Uploads a POD PDF to Primus (POD file type) when missing, so the load is
+ * "marked POD" before Power Only billing continues.
+ * @param {object} args booking, loadNumber, podPdf {buffer, filename}.
+ * @return {Promise<object>}
+ */
+async function ensurePodMarkedOnPrimus(args) {
+  const {booking, loadNumber, podPdf} = args || {};
+  if (!isManagePhpEnabled()) {
+    return {ok: true, hasPod: false, skipped: true, reason: "manage.php off"};
+  }
+  if (!booking || !loadNumber) {
+    return {ok: false, error: "Missing booking or loadNumber"};
+  }
+  let check = await checkBookingHasPod({booking, loadNumber});
+  if (check.found) {
+    return {ok: true, hasPod: true, uploaded: false, driveIds: check.driveIds};
+  }
+  const buf = podPdf && podPdf.buffer;
+  if (!buf || !buf.length) {
+    return {ok: true, hasPod: false, uploaded: false, reason: "no pod pdf"};
+  }
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  let uploadFileTypes;
+  try {
+    uploadFileTypes = await resolveUploadFileTypes();
+  } catch (err) {
+    return {ok: false, error: err.message || String(err)};
+  }
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: String(loadNumber),
+  });
+  const upload = await maybeUploadBookingPdf({
+    docData: docs.ok ? docs.data : null,
+    bookingId,
+    bookingBOL: String(loadNumber),
+    fileType: uploadFileTypes.pod.id,
+    fileTypeName: uploadFileTypes.pod.name,
+    file: {
+      buffer: buf,
+      filename: podPdf.filename || `pod-${loadNumber}.pdf`,
+    },
+  });
+  if (!upload.ok) {
+    return {ok: false, hasPod: false, uploaded: false, error: upload.error};
+  }
+  check = await checkBookingHasPod({booking, loadNumber});
+  return {
+    ok: true,
+    hasPod: !!check.found,
+    uploaded: !!upload.uploaded,
+    upload,
+    driveIds: check.driveIds || [],
+  };
+}
+exports.ensurePodMarkedOnPrimus = ensurePodMarkedOnPrimus;
+
+/**
+ * True when issued invoice charge lines include the bill-to reference text.
+ * @param {Array<object>} charges Invoice charge rows.
+ * @param {string} billToReference Bill-to Reference# text.
+ * @return {boolean}
+ */
+function invoiceChargesIncludeReference(charges, billToReference) {
+  const ref = String(billToReference || "").trim().toLowerCase();
+  if (!ref) return true;
+  return (Array.isArray(charges) ? charges : []).some((c) =>
+    String(c.description || "").toLowerCase().includes(ref));
+}
 
 exports._internal = {
   parsePhpSessId,

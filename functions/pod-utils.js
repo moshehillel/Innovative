@@ -60,6 +60,12 @@ const POD_BLOCK_SHAPE = {
   page: 1,
   cropFromBottom: 0,
   reason: "",
+  discrepancies: {
+    found: false,
+    damageNoted: false,
+    missingCartons: false,
+    details: "",
+  },
 };
 
 let pdfjsModulePromise = null;
@@ -338,6 +344,7 @@ function normalizePodData(pod, options = {}) {
       (primary && primary.attachmentFilename) || "",
     cropFromBottom: pod.cropFromBottom || 0,
     reason: pod.reason || "",
+    discrepancies: normalizePodDiscrepancies(pod.discrepancies),
   };
 }
 
@@ -362,6 +369,112 @@ function normalizePodFromClassification(aiResult, options = {}) {
  */
 function coercePodDocuments(pod, options = {}) {
   return resolvePodDocuments(pod, options).documents;
+}
+
+const POD_DAMAGE_PATTERNS = [
+  /\bdamag(?:e|ed|es)\b/i,
+  /\bdent(?:ed|s)?\b/i,
+  /\bbroken\b/i,
+  /\bcrush(?:ed|es)?\b/i,
+  /\btorn\b/i,
+  /\bfreight\s+damage\b/i,
+  /\bcargo\s+damage\b/i,
+  /\brefused\s+due\s+to\s+damage\b/i,
+];
+
+const POD_SHORTAGE_PATTERNS = [
+  /\bmissing\s+cartons?\b/i,
+  /\bmissing\s+pieces?\b/i,
+  /\bmissing\s+pallets?\b/i,
+  /\bshortage\b/i,
+  /\bshortages\b/i,
+  /\bshort\s+shipped\b/i,
+  /\bshort\s+ship\b/i,
+  /\bpieces?\s+short\b/i,
+  /\bcartons?\s+short\b/i,
+  /\bpartial\s+delivery\b/i,
+  /\bos\s*&\s*d\b/i,
+  /\bover\s*[/.-]?\s*short\b/i,
+  /\bquantity\s+short\b/i,
+  /\bqty\s+short\b/i,
+];
+
+/**
+ * Normalizes POD discrepancy flags from AI or text scan.
+ * @param {object|null} raw Raw discrepancy object.
+ * @return {object}
+ */
+function normalizePodDiscrepancies(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  const damageNoted = d.damageNoted === true;
+  const missingCartons = d.missingCartons === true;
+  const details = String(d.details || d.otherNotes || d.summary || "")
+      .trim();
+  const found = d.found === true || damageNoted || missingCartons ||
+    Boolean(details);
+  return {found, damageNoted, missingCartons, details};
+}
+
+/**
+ * Scans POD text for damage / shortage language.
+ * @param {string} text Combined POD page text.
+ * @return {object} Normalized discrepancy object.
+ */
+function detectPodDiscrepanciesInText(text) {
+  const blob = String(text || "").trim();
+  if (!blob) return normalizePodDiscrepancies(null);
+  const damageNoted = POD_DAMAGE_PATTERNS.some((p) => p.test(blob));
+  const missingCartons = POD_SHORTAGE_PATTERNS.some((p) => p.test(blob));
+  const found = damageNoted || missingCartons;
+  let details = "";
+  if (found) {
+    const lines = blob.split(/\r?\n/);
+    const hit = lines.find((line) => {
+      const sample = String(line || "");
+      return POD_DAMAGE_PATTERNS.some((p) => p.test(sample)) ||
+        POD_SHORTAGE_PATTERNS.some((p) => p.test(sample));
+    });
+    details = (hit || blob).trim().slice(0, 300);
+  }
+  return {found, damageNoted, missingCartons, details};
+}
+
+/**
+ * Reads a POD PDF buffer and scans for discrepancy language.
+ * @param {Buffer|Uint8Array} buffer POD PDF bytes.
+ * @return {Promise<object>}
+ */
+async function scanPodBufferForDiscrepancies(buffer) {
+  if (!buffer || !buffer.length) {
+    return normalizePodDiscrepancies(null);
+  }
+  const pageTexts = await extractPdfPageTexts(buffer);
+  if (!pageTexts || !pageTexts.length) {
+    return normalizePodDiscrepancies(null);
+  }
+  return detectPodDiscrepanciesInText(pageTexts.join("\n"));
+}
+
+/**
+ * Merges two discrepancy objects (AI + text scan).
+ * @param {object|null} a First discrepancies.
+ * @param {object|null} b Second discrepancies.
+ * @return {object}
+ */
+function mergePodDiscrepancies(a, b) {
+  const left = normalizePodDiscrepancies(a);
+  const right = normalizePodDiscrepancies(b);
+  if (!left.found && !right.found) return normalizePodDiscrepancies(null);
+  const details = [left.details, right.details]
+      .filter(Boolean)
+      .filter((v, i, arr) => arr.indexOf(v) === i)
+      .join(" | ");
+  return {
+    found: true,
+    damageNoted: left.damageNoted || right.damageNoted,
+    missingCartons: left.missingCartons || right.missingCartons,
+    details: details.slice(0, 500),
+  };
 }
 
 /**
@@ -891,4 +1004,8 @@ module.exports = {
   collectInvoiceScopedPages,
   remapPodPagesAfterSlice,
   buildPodClassifierRules,
+  normalizePodDiscrepancies,
+  detectPodDiscrepanciesInText,
+  scanPodBufferForDiscrepancies,
+  mergePodDiscrepancies,
 };

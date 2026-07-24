@@ -164,11 +164,30 @@ function buildWorkflowAlertEmail(opts) {
     case "MISSING_POD":
       subject = `Action needed — No POD for Load ${loadNumber}`;
       title = "Proof of Delivery missing";
-      summary = "Jerry could not extract a POD from the carrier invoice and " +
+      summary = ctx.shipmentMode === "Power Only" ?
+        "This Power Only load does not have a POD marked on the shipment in " +
+        "ShipPrimus. Jerry will not process the carrier invoice until a POD " +
+        "is uploaded and marked POD on the booking." :
+        "Jerry could not extract a POD from the carrier invoice and " +
         "none is on file in ShipPrimus for this load.";
-      explanation = "Upload the POD in ShipPrimus (or re-forward the " +
+      explanation = ctx.shipmentMode === "Power Only" ?
+        "Upload the POD in ShipPrimus (POD file type on the booking), or " +
+        "re-forward the carrier email with trailer photos / a clear POD, " +
+        "then resume the workflow." :
+        "Upload the POD in ShipPrimus (or re-forward the " +
         "carrier email with a clear POD), then resume the workflow. " +
         "Customer email will not send until a POD is on the booking.";
+      action = ACTION.RESUME;
+      break;
+
+    case "MISSING_UNIT_NUMBER":
+      subject = `Action needed — No unit # on Bill To for Load ${loadNumber}`;
+      title = "Bill-to Reference# missing";
+      summary = "This Power Only load is missing the unit number in the " +
+        "Bill To Reference# field in ShipPrimus.";
+      explanation = "Enter the unit number (e.g. Unit #256255) in the " +
+        "Bill To Reference# on the shipment, then resume the workflow. " +
+        "Jerry will print that reference on the customer invoice.";
       action = ACTION.RESUME;
       break;
 
@@ -292,8 +311,9 @@ function buildWorkflowAlertEmail(opts) {
     case "TL_POD_ESCALATED":
       subject = `Escalation — no POD from carrier — Load ${loadNumber}`;
       title = "Truckload POD still missing";
-      summary = "Jerry requested a POD from the carrier (and sent a " +
-        "3-business-day reminder) but nothing arrived within 10 business days.";
+      summary = "Jerry requested a POD from the carrier and sent 3 " +
+        "reminders (every 3 business days). The POD is still not in " +
+        "Primus and the carrier has not replied.";
       explanation = "Follow up with the carrier, or forward the POD to " +
         "the invoice mailbox so Jerry can upload it and release the " +
         "customer email. The customer invoice is still held.";

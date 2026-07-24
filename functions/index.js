@@ -20,9 +20,13 @@ const {
   collectInvoiceScopedPages,
   remapPodPagesAfterSlice,
   resolvePodPageIndex,
+  mergePodDiscrepancies,
+  scanPodBufferForDiscrepancies,
+  normalizePodDiscrepancies,
 } = podUtils;
 const workflowErrors = require("./workflow-error-messages");
 const additionalCharges = require("./additional-charges");
+const fedexFreightPod = require("./fedex-freight-pod");
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
 
@@ -1004,15 +1008,22 @@ async function handleCheckPodFollowUps(req, res) {
   }
 }
 /**
- * Scans invoices with an open podFollowUp and sends 3bd reminders / 10bd
- * Lisa escalations. Mon–Fri business days only.
- * @return {Promise<object>} {reminded, escalated, checked}
+ * Scans invoices with an open podFollowUp.
+ *
+ * Schedule (business days Mon–Fri):
+ *   - Initial carrier POD request is sent when the chase starts
+ *   - Every 3bd with no POD / no reply → carrier reminder
+ *   - After 3 reminders still missing → escalate to Lisa
+ *
+ * Also resolves chases when POD has since been uploaded.
+ * @return {Promise<object>} {reminded, escalated, resolved, checked}
  */
 async function runPodFollowUpChecks() {
   const podFollowup = require("./pod-followup");
   const statuses = [
     podFollowup.POD_FOLLOW_UP_STATUS.AWAITING_CARRIER,
     podFollowup.POD_FOLLOW_UP_STATUS.REMINDED,
+    podFollowup.POD_FOLLOW_UP_STATUS.ESCALATED,
   ];
   const snap = await db.collection("invoices")
       .where("podFollowUp.status", "in", statuses)
@@ -1022,7 +1033,10 @@ async function runPodFollowUpChecks() {
   const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
   const reminded = [];
   const escalated = [];
+  const resolved = [];
   const now = new Date();
+  const MAX_REMINDERS = 3;
+  const REMIND_INTERVAL_BD = 3;
 
   for (const doc of snap.docs) {
     const inv = doc.data();
@@ -1032,10 +1046,27 @@ async function runPodFollowUpChecks() {
         new Date(fu.firstEmailedAt) : null);
     if (!firstAt || isNaN(firstAt.getTime())) continue;
 
-    // Already has POD — mark resolved quietly.
-    if ((inv.podOnlyFile && inv.podOnlyFile.storagePath) ||
+    // POD arrived locally or already marked on Primus — resolve.
+    let hasPod = Boolean(
+        (inv.podOnlyFile && inv.podOnlyFile.storagePath) ||
         inv.podOnPrimusAlready ||
-        (inv.primusSteps && inv.primusSteps.podUploaded)) {
+        (inv.primusSteps && inv.primusSteps.podUploaded));
+    if (!hasPod && primusUiBridge && primusUiBridge.checkBookingHasPod &&
+        inv.loadNumber) {
+      try {
+        const booking = await fetchPrimusBooking(inv.loadNumber);
+        if (booking) {
+          const podCheck = await primusUiBridge.checkBookingHasPod({
+            booking,
+            loadNumber: inv.loadNumber,
+          });
+          hasPod = Boolean(podCheck && podCheck.found);
+        }
+      } catch (_) {
+        // Best-effort Primus check — fall through on failure.
+      }
+    }
+    if (hasPod) {
       await doc.ref.update({
         "podFollowUp.status": podFollowup.POD_FOLLOW_UP_STATUS.RESOLVED,
         "podFollowUp.holdCustomerEmail": false,
@@ -1043,19 +1074,40 @@ async function runPodFollowUpChecks() {
           admin.firestore.FieldValue.serverTimestamp(),
         "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
       });
+      resolved.push(doc.id);
       continue;
     }
 
+    // Already escalated — only watch for POD arrival above.
+    if (fu.status === podFollowup.POD_FOLLOW_UP_STATUS.ESCALATED) {
+      continue;
+    }
+
+    const lastEmailedRaw = fu.lastEmailedAt || fu.reminderSentAt ||
+      fu.firstEmailedAt;
+    const lastEmailed = lastEmailedRaw && lastEmailedRaw.toDate ?
+      lastEmailedRaw.toDate() :
+      (lastEmailedRaw ? new Date(lastEmailedRaw) : firstAt);
+    const daysSinceEmail =
+      podFollowup.businessDaysBetween(lastEmailed, now);
+    if (daysSinceEmail < REMIND_INTERVAL_BD) continue;
+
+    const reminderCountRaw = Number(fu.reminderCount || 0);
+    // Legacy rows marked REMINDED before reminderCount existed count as 1.
+    const reminderCount =
+      (fu.status === podFollowup.POD_FOLLOW_UP_STATUS.REMINDED &&
+        reminderCountRaw === 0) ? 1 : reminderCountRaw;
     const bd = podFollowup.businessDaysBetween(firstAt, now);
 
-    if (bd >= 10 &&
-        fu.status !== podFollowup.POD_FOLLOW_UP_STATUS.ESCALATED) {
+    // 3 reminders already sent → escalate Lisa, stop chasing carrier.
+    if (reminderCount >= MAX_REMINDERS) {
       const escEmail = podFollowup.buildTlPodEscalationEmail({
         loadNumber: inv.loadNumber,
         carrierName: inv.carrierName,
         proNumber: inv.proNumber,
         carrierEmail: fu.carrierEmail,
         businessDays: bd,
+        reminderCount,
       });
       await saveOutboundEmail({
         type: "tl_pod_escalation",
@@ -1086,10 +1138,12 @@ async function runPodFollowUpChecks() {
           podFollowup.POD_FOLLOW_UP_STATUS.ESCALATED,
         "podFollowUp.escalatedAt":
           admin.firestore.FieldValue.serverTimestamp(),
+        "podFollowUp.lastEmailedAt":
+          admin.firestore.FieldValue.serverTimestamp(),
         "podFollowUp.businessDaysElapsed": bd,
         "decisionStage": "tl_pod_escalated",
         "decisionReason":
-          "No POD from carrier after 10 business days",
+          "No POD from carrier after 3 reminders (every 3 business days)",
         "finalWorkflowStatus": "tl_pod_escalated",
         "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -1097,42 +1151,44 @@ async function runPodFollowUpChecks() {
       continue;
     }
 
-    if (bd >= 3 &&
-        fu.status === podFollowup.POD_FOLLOW_UP_STATUS.AWAITING_CARRIER) {
-      const request = podFollowup.buildCarrierPodRequestEmail({
-        loadNumber: inv.loadNumber,
-        carrierName: inv.carrierName,
-        proNumber: inv.proNumber,
-        invoiceNumber: inv.invoiceNumber,
-        isReminder: true,
-      });
-      const payload = {
-        type: "tl_pod_request_reminder",
-        invoiceId: doc.id,
-        subject: request.subject,
-        html: request.html,
-        forceRecipient: true,
-      };
-      if (fu.carrierEmail) {
-        payload.to = fu.carrierEmail;
-        payload.cc = lisa;
-      } else {
-        payload.to = lisa;
-      }
-      await saveOutboundEmail(payload);
-      await doc.ref.update({
-        "podFollowUp.status":
-          podFollowup.POD_FOLLOW_UP_STATUS.REMINDED,
-        "podFollowUp.reminderSentAt":
-          admin.firestore.FieldValue.serverTimestamp(),
-        "podFollowUp.businessDaysElapsed": bd,
-        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-      });
-      reminded.push(doc.id);
+    // Send next carrier reminder (1st / 2nd / 3rd).
+    const nextReminder = reminderCount + 1;
+    const request = podFollowup.buildCarrierPodRequestEmail({
+      loadNumber: inv.loadNumber,
+      carrierName: inv.carrierName,
+      proNumber: inv.proNumber,
+      invoiceNumber: inv.invoiceNumber,
+      isReminder: true,
+    });
+    const payload = {
+      type: "tl_pod_request_reminder",
+      invoiceId: doc.id,
+      subject: request.subject,
+      html: request.html,
+      forceRecipient: true,
+    };
+    if (fu.carrierEmail) {
+      payload.to = fu.carrierEmail;
+      payload.cc = lisa;
+    } else {
+      payload.to = lisa;
     }
+    await saveOutboundEmail(payload);
+    await doc.ref.update({
+      "podFollowUp.status":
+        podFollowup.POD_FOLLOW_UP_STATUS.REMINDED,
+      "podFollowUp.reminderCount": nextReminder,
+      "podFollowUp.reminderSentAt":
+        admin.firestore.FieldValue.serverTimestamp(),
+      "podFollowUp.lastEmailedAt":
+        admin.firestore.FieldValue.serverTimestamp(),
+      "podFollowUp.businessDaysElapsed": bd,
+      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    });
+    reminded.push(doc.id);
   }
 
-  return {checked: snap.size, reminded, escalated};
+  return {checked: snap.size, reminded, escalated, resolved};
 }
 
 /**
@@ -1301,9 +1357,12 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
         missingRate ? "Missing customer rate" : "Customer rate too low",
     );
 
-    const baseUrl = `https://${req.get("host")}`;
-    const alert = workflowErrors.buildWorkflowAlertEmail({
+    await notifyDispatcherRateIssue({
+      req,
       code: missingRate ? "MISSING_RATE" : "LOW_MARGIN",
+      invoiceId,
+      tenantId: tenant.tenantId,
+      loadNumber: invoice.loadNumber || invoiceId,
       context: {
         loadNumber: invoice.loadNumber || invoiceId,
         carrierName: invoice.carrierName,
@@ -1313,15 +1372,6 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
           Math.round((profit / customerRate) * 100) : 0,
         invoiceAmount,
       },
-      baseUrl,
-      invoiceId,
-      tenantId: tenant.tenantId,
-    });
-    await saveOutboundEmail({
-      type: "rate_missing",
-      invoiceId,
-      subject: alert.subject,
-      html: alert.html,
     });
 
     return res.json({ok: true, sent: true});
@@ -1604,7 +1654,11 @@ async function handleAdditionalChargeAction(req, res) {
 
     // Options a/b/c — the charge is approved for the carrier side.
     const billCustomer = option === "a" || option === "b";
-    await invoiceRef.update({
+
+    // A/B: auto-bump customer sell rate by the approved charge amount so
+    // the customer invoice reflects the extras without a manual set-rate.
+    let rateBumpNote = "";
+    const approvalUpdate = {
       "additionalCharge.decision": decision,
       "additionalCharge.approved": true,
       "additionalCharge.billCustomer": billCustomer,
@@ -1623,9 +1677,45 @@ async function handleAdditionalChargeAction(req, res) {
       "workflowPausedAtStep": null,
       "workflowPausedAt": null,
       "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-    });
+    };
 
-    let extraNote = "";
+    if (billCustomer && chargesTotal > 0) {
+      let baseRate = Number(invoice.customerRate || 0);
+      if (!baseRate) {
+        try {
+          const rateResult = await getCustomerRate(
+              invoice.loadNumber, invoice.proNumber);
+          if (rateResult && rateResult.ok) {
+            baseRate = Number(rateResult.customerRate || 0);
+          }
+        } catch (_) {
+          baseRate = 0;
+        }
+      }
+      if (!baseRate && booking) {
+        const {rate} = readCustomerRateFromAcct(
+            booking.accountingInformation || {});
+        baseRate = Number(rate || 0);
+      }
+      if (baseRate > 0) {
+        const bumpedRate =
+          Math.round((baseRate + chargesTotal) * 100) / 100;
+        approvalUpdate.customerRate = bumpedRate;
+        approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
+        approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
+        approvalUpdate["additionalCharge.rateBumpAmount"] = chargesTotal;
+        rateBumpNote = ` Customer rate auto-bumped from ` +
+          `$${baseRate.toFixed(2)} to $${bumpedRate.toFixed(2)}.`;
+        invoice.customerRate = bumpedRate;
+      } else {
+        rateBumpNote = " Could not resolve the current customer rate — " +
+          "please bump it manually before invoicing.";
+      }
+    }
+
+    await invoiceRef.update(approvalUpdate);
+
+    let extraNote = rateBumpNote;
     if (option === "a") {
       // Auto-notify the customer contact on file.
       let customerEmail = null;
@@ -1653,9 +1743,9 @@ async function handleAdditionalChargeAction(req, res) {
           html: note.html,
           skipAgentGreeting: true,
         });
-        extraNote = ` The customer was notified at ${customerEmail}.`;
+        extraNote += ` The customer was notified at ${customerEmail}.`;
       } else {
-        extraNote = " Could not resolve the customer email from Primus — " +
+        extraNote += " Could not resolve the customer email from Primus — " +
           "please notify the customer manually.";
       }
       await additionalCharges.updateFollowUp(db, {
@@ -1697,10 +1787,10 @@ async function handleAdditionalChargeAction(req, res) {
         reminderPayload.forceRecipient = true;
         reminderPayload.to = dispatcher.email;
         if (approver) reminderPayload.cc = approver;
-        extraNote = ` The dispatcher (${dispatcher.email}) was reminded ` +
+        extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
           `to notify the customer.`;
       } else {
-        extraNote = " Could not resolve the dispatcher email — the " +
+        extraNote += " Could not resolve the dispatcher email — the " +
           "reminder went to the ops mailbox instead.";
       }
       await saveOutboundEmail(reminderPayload);
@@ -2647,11 +2737,11 @@ async function notifyDispatcherLowProfit(opts) {
   } = opts || {};
   const ccLisa = process.env.LOW_PROFIT_CC_EMAIL ||
     "Lisa@innovativecarriers.com";
-  const primusUiBridge = require("./primus-ui-bridge");
+  const primusUiBridgeLocal = require("./primus-ui-bridge");
 
   let dispatcher = {ok: false};
   try {
-    dispatcher = await primusUiBridge.resolveDispatcherEmail({
+    dispatcher = await primusUiBridgeLocal.resolveDispatcherEmail({
       loadNumber,
       fetchBooking: fetchPrimusBooking,
     });
@@ -2720,6 +2810,213 @@ async function notifyDispatcherLowProfit(opts) {
       });
 
   return {ok: true, to, cc, dispatcher};
+}
+
+/**
+ * Emails the load dispatcher (CC Lisa) when customer rate is missing or
+ * margin is too low to auto-invoice. Includes the set-rate / resume links
+ * from the standard workflow alert. Falls back to Lisa as To.
+ * @param {object} opts Notification context.
+ * @return {Promise<object>} Delivery result.
+ */
+async function notifyDispatcherRateIssue(opts) {
+  const {
+    req,
+    code,
+    invoiceId,
+    tenantId,
+    loadNumber,
+    context,
+  } = opts || {};
+  const ccLisa = process.env.LOW_PROFIT_CC_EMAIL ||
+    "Lisa@innovativecarriers.com";
+  const primusUiBridgeLocal = require("./primus-ui-bridge");
+
+  let dispatcher = {ok: false};
+  try {
+    dispatcher = await primusUiBridgeLocal.resolveDispatcherEmail({
+      loadNumber,
+      fetchBooking: fetchPrimusBooking,
+    });
+  } catch (err) {
+    dispatcher = {ok: false, error: err.message};
+  }
+
+  const to = (dispatcher.ok && dispatcher.email) ?
+    dispatcher.email : ccLisa;
+  const cc = (dispatcher.ok && dispatcher.email &&
+    to.toLowerCase() !== ccLisa.toLowerCase()) ? ccLisa : null;
+
+  const baseUrl = req && req.get ? `https://${req.get("host")}` : "";
+  const alert = workflowErrors.buildWorkflowAlertEmail({
+    code: code || "MISSING_RATE",
+    context: context || {loadNumber},
+    baseUrl,
+    invoiceId,
+    tenantId: tenantId || null,
+  });
+
+  let html = alert.html;
+  if (dispatcher.displayName) {
+    html = `<p>Hi ${escapeHtml(dispatcher.displayName.trim())},</p>` + html;
+  } else if (dispatcher.ok && dispatcher.email) {
+    html = `<p>Hi,</p>` + html;
+  }
+  if (!dispatcher.ok) {
+    html += `<p style="color:#b45309"><em>Note: could not resolve ` +
+      `dispatcher email from Primus` +
+      (dispatcher.error ? ` (${escapeHtml(dispatcher.error)})` : "") +
+      `; sent to Lisa only.</em></p>`;
+  }
+
+  await saveOutboundEmail({
+    type: code === "LOW_MARGIN" ? "low_margin" : "rate_missing",
+    invoiceId,
+    forceRecipient: true,
+    to,
+    cc,
+    subject: alert.subject,
+    html,
+  });
+
+  await writeLog("info", "email",
+      "Rate/margin alert sent to dispatcher", {
+        invoiceId: invoiceId || null,
+        loadNumber: loadNumber || null,
+        code,
+        to,
+        cc,
+        dispatcherOk: Boolean(dispatcher.ok),
+        dispatcherUserName: dispatcher.userName || null,
+      });
+
+  return {ok: true, to, cc, dispatcher};
+}
+
+/**
+ * Emails Lisa when a POD shows damage, shortage, or missing cartons.
+ * Idempotent via podDiscrepancyNotifiedAt on the invoice.
+ * @param {object} opts Notification context.
+ * @return {Promise<object>}
+ */
+async function notifyLisaPodDiscrepancy(opts) {
+  const {
+    invoiceId,
+    loadNumber,
+    carrierName,
+    proNumber,
+    discrepancies,
+  } = opts || {};
+  const podFollowup = require("./pod-followup");
+  const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
+  const disc = normalizePodDiscrepancies(discrepancies);
+  if (!disc.found) {
+    return {ok: true, sent: false, reason: "no discrepancies"};
+  }
+
+  const flags = [];
+  if (disc.damageNoted) flags.push("Damage noted");
+  if (disc.missingCartons) flags.push("Missing cartons / shortage");
+  const flagLabel = flags.length ? flags.join("; ") : "Discrepancy noted";
+
+  const html =
+    `<p>Hi Lisa,</p>` +
+    `<p>Jerry flagged load <strong>${escapeHtml(String(loadNumber || ""))}` +
+    `</strong> because the POD shows <strong>${escapeHtml(flagLabel)}` +
+    `</strong> and needs your review before we treat delivery as clean.</p>` +
+    (disc.details ?
+      `<p style="margin:12px 0"><em>${escapeHtml(disc.details)}</em></p>` :
+      "") +
+    `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
+    `<tr><td style="padding:4px 16px 4px 0;font-weight:600">Carrier</td>` +
+    `<td>${escapeHtml(carrierName || "—")}</td></tr>` +
+    (proNumber ?
+      `<tr><td style="padding:4px 16px 4px 0;font-weight:600">PRO</td>` +
+      `<td>${escapeHtml(String(proNumber))}</td></tr>` : "") +
+    `<tr><td style="padding:4px 16px 4px 0;font-weight:600">` +
+    `Damage</td><td>${disc.damageNoted ? "Yes" : "No"}</td></tr>` +
+    `<tr><td style="padding:4px 16px 4px 0;font-weight:600">` +
+    `Missing cartons</td><td>${disc.missingCartons ? "Yes" : "No"}` +
+    `</td></tr>` +
+    `</table>` +
+    `<p>Please review the POD on the load and follow up with the customer ` +
+    `or carrier as needed.</p>`;
+
+  await saveOutboundEmail({
+    type: "pod_discrepancy_review",
+    invoiceId: invoiceId || null,
+    forceRecipient: true,
+    to: lisa,
+    subject: `Review POD — ${flagLabel} — Load ${loadNumber || "—"}`,
+    html,
+  });
+
+  await writeLog("info", "email", "POD discrepancy review sent to Lisa", {
+    invoiceId: invoiceId || null,
+    loadNumber,
+    to: lisa,
+    damageNoted: disc.damageNoted,
+    missingCartons: disc.missingCartons,
+  });
+
+  return {ok: true, sent: true, to: lisa, discrepancies: disc};
+}
+
+/**
+ * Scans POD bytes / stored classification and notifies Lisa once per invoice.
+ * @param {object} opts invoiceId, invoice, invoiceRef, podStoragePath.
+ * @return {Promise<object>}
+ */
+async function maybeNotifyLisaPodDiscrepancy(opts) {
+  const {invoiceId, invoice, invoiceRef, podStoragePath} = opts || {};
+  if (!invoice || invoice.podDiscrepancyNotifiedAt) {
+    return {ok: true, sent: false, reason: "already notified"};
+  }
+
+  let discrepancies = normalizePodDiscrepancies(
+      invoice.pod && invoice.pod.discrepancies);
+
+  const path = podStoragePath ||
+    (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+    null;
+  if (path) {
+    try {
+      const [buf] = await getBucket().file(path).download();
+      const scanned = await scanPodBufferForDiscrepancies(buf);
+      discrepancies = mergePodDiscrepancies(discrepancies, scanned);
+    } catch (err) {
+      await writeLog("warn", "workflow",
+          "POD discrepancy scan failed — using AI flags only", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            path,
+            error: err.message,
+          });
+    }
+  }
+
+  if (!discrepancies.found) {
+    return {ok: true, sent: false, reason: "no discrepancies"};
+  }
+
+  const notify = await notifyLisaPodDiscrepancy({
+    invoiceId,
+    loadNumber: invoice.loadNumber,
+    carrierName: invoice.carrierName,
+    proNumber: invoice.proNumber,
+    discrepancies,
+  });
+
+  if (notify.sent && invoiceRef) {
+    await invoiceRef.update({
+      "podDiscrepancyNotifiedAt":
+        admin.firestore.FieldValue.serverTimestamp(),
+      "pod.discrepancies": discrepancies,
+      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+
+  return notify;
 }
 
 /**
@@ -2973,6 +3270,12 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
       page: 1,
       cropFromBottom: 0,
       reason: "",
+      discrepancies: {
+        found: false,
+        damageNoted: false,
+        missingCartons: false,
+        details: "",
+      },
     },
     reason: "",
   };
@@ -3025,6 +3328,10 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "empty string.",
         "PRO number may appear as PRO #, Carrier PRO, " +
         "Beyond PRO, Advance PRO, or freight bill number.",
+        "For FedEx Freight invoices, the PRO number is the same as the " +
+        "carrier invoice number / tracking number (often 9–12 digits). " +
+        "Set proNumber to that tracking number even when a separate broker " +
+        "load number is also shown.",
         "Keep load number and PRO number separate.",
         "Do not use the PRO number as the load number.",
         "Find invoice total, invoice date, and due date.",
@@ -3088,6 +3395,12 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Keep JSON compact: use empty arrays when a list has no items. " +
         "Do not invent placeholder charge objects. Cap pod.documents " +
         "at the pages that prove delivery (usually 1–4).",
+        "On POD / delivery pages, populate pod.discrepancies when the " +
+        "signed delivery paperwork notes damage, shortage, missing " +
+        "cartons/pieces, partial delivery, or OS&D. Set " +
+        "pod.discrepancies.found=true, damageNoted and/or " +
+        "missingCartons as appropriate, and a brief details summary " +
+        "(e.g. '2 cartons short', 'damage noted on skid').",
       ],
       requiredJsonShape: {
         invoices: [invoiceItemShape],
@@ -3424,6 +3737,76 @@ async function pauseWorkflow(
 }
 
 /**
+ * Pulls FedEx Freight POD from the public tracking API when missing locally.
+ * @param {string} invoiceId Invoice id.
+ * @param {object} invoice Invoice document.
+ * @return {Promise<object|null>} POD file info or null.
+ */
+async function maybeFetchFedExFreightPod(invoiceId, invoice) {
+  if (!invoice || !fedexFreightPod.isFedExFreightCarrier(invoice.carrierName)) {
+    return null;
+  }
+  const proNumber = fedexFreightPod.resolveFedExFreightPro({
+    proNumber: invoice.proNumber,
+    invoiceNumber: invoice.invoiceNumber,
+  });
+  if (!proNumber) {
+    await writeLog("info", "workflow",
+        "FedEx Freight invoice — no PRO/invoice number for POD fetch", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          carrierName: invoice.carrierName,
+        });
+    return null;
+  }
+
+  let result;
+  try {
+    result = await fedexFreightPod.fetchFedExFreightPodPdf(proNumber);
+  } catch (err) {
+    await writeLog("warn", "workflow", "FedEx Freight POD fetch failed", {
+      invoiceId,
+      loadNumber: invoice.loadNumber,
+      proNumber,
+      error: err.message,
+    });
+    return null;
+  }
+
+  if (!result.ok || !result.pdfBuffer) {
+    await writeLog("warn", "workflow", "FedEx Freight POD not available", {
+      invoiceId,
+      loadNumber: invoice.loadNumber,
+      proNumber,
+      accountNumber: result.accountNumber || null,
+      error: result.error || "unknown",
+    });
+    return null;
+  }
+
+  const filename = `fedex-pod-${proNumber}.pdf`;
+  const storagePath = await savePodPdfBytes(
+      invoiceId, filename, result.pdfBuffer);
+  await writeLog("info", "workflow",
+      "FedEx Freight POD downloaded from tracking site", {
+        invoiceId,
+        loadNumber: invoice.loadNumber,
+        proNumber,
+        accountNumber: result.accountNumber,
+        storagePath,
+        keyStatus: result.keyStatus || null,
+      });
+  return {
+    storagePath,
+    source: "fedex_freight_tracking",
+    files: [{
+      storagePath,
+      source: "fedex_freight_tracking",
+    }],
+  };
+}
+
+/**
  * Extracts POD-only PDF(s) from invoice attachments.
  * Multiple POD pages are saved individually and merged into pod.pdf.
  * @param {string} invoiceId - The invoice ID.
@@ -3455,6 +3838,10 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
     );
     if (!invoice || !podNormalized || podNormalized.found !== true ||
         documents.length === 0) {
+      const fedexPod = await maybeFetchFedExFreightPod(invoiceId, invoice);
+      if (fedexPod) {
+        return fedexPod;
+      }
       await writeLog("info", "workflow",
           "POD not detected in this invoice — no extraction attempted", {
             invoiceId,
@@ -4107,6 +4494,15 @@ async function handlePodOnlyDeliveryEmail(opts) {
         uploaded,
         driveFileId,
       });
+
+  await maybeNotifyLisaPodDiscrepancy({
+    invoiceId,
+    invoice: Object.assign({}, invoice, {
+      podOnlyFile: {storagePath, source: "pod_delivery_email"},
+    }),
+    invoiceRef: invoiceDoc.ref,
+    podStoragePath: storagePath,
+  });
 
   // Resume workflow so held customer email can proceed.
   const workflowUrl = workflowUrlForTenant(tenant);
@@ -5354,6 +5750,16 @@ async function processGmailMessage(
 
       const normalizedChargeData = normalizeAiChargeArrays(aiResult);
       const normalizedPod = normalizePodFromClassification(aiResult);
+
+      if (fedexFreightPod.isFedExFreightCarrier(aiResult.carrierName)) {
+        const fedexPro = fedexFreightPod.resolveFedExFreightPro({
+          proNumber: aiResult.proNumber,
+          invoiceNumber: aiResult.invoiceNumber,
+        });
+        if (fedexPro) {
+          aiResult.proNumber = fedexPro;
+        }
+      }
 
       await writeLog("info", "ai", "AI classification completed", {
         event: "AI classification completed",
@@ -8255,6 +8661,29 @@ function readCustomerRateFromAcct(acct) {
 }
 
 /**
+ * Reads the Bill-to Reference# from a Primus booking (Power Only unit number
+ * lives here when billTo is third party — see shipment Bill To panel).
+ * @param {object|null} booking Primus booking from GET /book.
+ * @return {string|null} Trimmed reference text or null.
+ */
+function readBillToReferenceNumber(booking) {
+  if (!booking || typeof booking !== "object") return null;
+  const billTo = booking.billTo || "";
+  let party = null;
+  if (billTo === "thirdparty" && booking.thirdParty) {
+    party = booking.thirdParty;
+  } else if (booking.shipper) {
+    party = booking.shipper;
+  } else if (booking.thirdParty) {
+    party = booking.thirdParty;
+  }
+  if (!party) return null;
+  const ref = party.referenceNumber;
+  const text = ref != null ? String(ref).trim() : "";
+  return text || null;
+}
+
+/**
  * Retrieves customer name and rate from a Primus booking.
  * @param {string} loadNumber Load/BOL number.
  * @param {string} proNumber PRO number (used as fallback search key).
@@ -8417,13 +8846,16 @@ async function generateCustomerInvoice(invoiceData) {
     // this booking type (customerQuoteAmount for quoted loads, invoiceAmount
     // for manually-rated loads — see readCustomerRateFromAcct).
     const customerRate = expectedRate || primusRate;
+    const billToReference = invoiceData.billToReferenceNumber || null;
+    const freightDescription = billToReference ?
+      `Freight Charges - ${billToReference}` : "Freight Charges";
     // When a customerQuoteId exists Primus uses the stored quote automatically;
     // sending a breakdown would be rejected for "Collect" shipments.
     const body = {customerId};
     if (!acct.customerQuoteId) {
       body.invoiceBreakdown = [{
         code: "FREIGHT",
-        description: "Freight Charges",
+        description: freightDescription,
         qty: 1,
         rate: customerRate,
       }];
@@ -8502,6 +8934,7 @@ const primusBundle = {
   getPrimusToken,
   fetchPrimusBooking,
   readShipmentMode,
+  readBillToReferenceNumber,
   isDrayageShipment,
   isPowerOnlyShipment,
   isTruckloadShipment,
@@ -8513,6 +8946,8 @@ const primusBundle = {
   markShipmentDelivered,
   forwardToHumanReview,
   getGmailOAuthClient,
+  notifyDispatcherRateIssue,
+  maybeNotifyLisaPodDiscrepancy,
 };
 const primusUiBridge = require("./primus-ui-bridge");
 primusUiBridge.init({db, writeLog});
@@ -8526,6 +8961,7 @@ innovativePrimus.init({
   resolveCustomerAccountingEmails:
       primusUiBridge.resolveCustomerAccountingEmails,
   checkBookingHasPod: primusUiBridge.checkBookingHasPod,
+  ensurePodMarkedOnPrimus: primusUiBridge.ensurePodMarkedOnPrimus,
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
 

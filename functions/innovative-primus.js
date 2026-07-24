@@ -32,6 +32,7 @@ let downloadStorageFileBase64;
 let primusRequest;
 let fetchPrimusBooking;
 let readShipmentMode;
+let readBillToReferenceNumber;
 let isDrayageShipment;
 let isPowerOnlyShipment;
 let isTruckloadShipment;
@@ -46,6 +47,9 @@ let runPrimusUiBillingFlow;
 let emailBOLDocs;
 let resolveCustomerAccountingEmails;
 let checkBookingHasPod;
+let ensurePodMarkedOnPrimus;
+let notifyDispatcherRateIssue;
+let maybeNotifyLisaPodDiscrepancy;
 
 /**
  * Receives the shared + Primus helper bundle from index.js.
@@ -60,13 +64,18 @@ function init(bundle) {
     maybeBuildPodFromTrailerImages,
     isAlreadyDoneResult,
     downloadStorageFileBase64,
-    primusRequest, fetchPrimusBooking, readShipmentMode, isDrayageShipment,
+    primusRequest, fetchPrimusBooking, readShipmentMode,
+    readBillToReferenceNumber,
+    isDrayageShipment,
     isPowerOnlyShipment, isTruckloadShipment,
     validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
     markShipmentDelivered,
     isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
     resolveCustomerAccountingEmails, checkBookingHasPod,
+    ensurePodMarkedOnPrimus,
+    notifyDispatcherRateIssue,
+    maybeNotifyLisaPodDiscrepancy,
   } = bundle);
 }
 exports.init = init;
@@ -778,18 +787,19 @@ exports.processPrimusWorkflow = onRequest(
         }
 
         // POD is required before billing / customer email — with exceptions:
-        // Power Only: trailer images on the email become the POD.
+        // Power Only: POD must be marked on the Primus booking (upload trailer
+        //   images / extracted POD first when possible).
         // Truckload: continue billing, chase carrier for POD, hold customer
         // email until it arrives.
         let hasLocalPod = Boolean(
             (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
             (invoice.podOnlyFile && invoice.podOnlyFile.storagePath),
         );
-        const hasPrimusPod = Boolean(invoice.podOnPrimusAlready ||
+        let hasPrimusPod = Boolean(invoice.podOnPrimusAlready ||
             (invoice.primusSteps && invoice.primusSteps.podUploaded));
 
         let bookingForMode = null;
-        if ((!hasLocalPod && !hasPrimusPod) && invoice.loadNumber) {
+        if (invoice.loadNumber) {
           try {
             bookingForMode = await fetchPrimusBooking(invoice.loadNumber);
           } catch (_) {
@@ -797,43 +807,139 @@ exports.processPrimusWorkflow = onRequest(
           }
         }
 
-        // Power Only — convert trailer images attached to the email into a
-        // POD PDF when no other POD exists.
-        if (!hasLocalPod && !hasPrimusPod && bookingForMode &&
-            isPowerOnlyShipment && isPowerOnlyShipment(bookingForMode) &&
-            maybeBuildPodFromTrailerImages) {
-          const imgPod = await maybeBuildPodFromTrailerImages(
-              invoiceId, invoice);
-          if (imgPod && imgPod.storagePath) {
-            extractedPodOnlyFile = imgPod;
-            hasLocalPod = true;
-            await invoiceDoc.ref.update({
-              podOnlyFile: {
-                storagePath: imgPod.storagePath,
-                source: imgPod.source || "trailer_images",
-              },
-              podOnlyFiles: [{
-                storagePath: imgPod.storagePath,
-                source: imgPod.source || "trailer_images",
-              }],
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
-            await logWorkflowStep({
-              invoiceId,
-              stepName: "power_only_trailer_pod",
-              stepStatus: "success",
-              output: {
-                storagePath: imgPod.storagePath,
-                pageCount: imgPod.pageCount || null,
-              },
-            });
-            await writeLog("info", "workflow",
-                "Power Only — trailer images converted to POD", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
+        const isPowerOnly = bookingForMode && isPowerOnlyShipment &&
+          isPowerOnlyShipment(bookingForMode);
+
+        // Power Only — upload POD to Primus when missing so the load is
+        // marked POD before any billing steps run.
+        if (isPowerOnly && !hasPrimusPod && ensurePodMarkedOnPrimus) {
+          let podStoragePath =
+            (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+            (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+            null;
+          if (!podStoragePath && maybeBuildPodFromTrailerImages) {
+            const imgPod = await maybeBuildPodFromTrailerImages(
+                invoiceId, invoice);
+            if (imgPod && imgPod.storagePath) {
+              podStoragePath = imgPod.storagePath;
+              extractedPodOnlyFile = imgPod;
+              hasLocalPod = true;
+              await invoiceDoc.ref.update({
+                podOnlyFile: {
                   storagePath: imgPod.storagePath,
-                });
+                  source: imgPod.source || "trailer_images",
+                },
+                podOnlyFiles: [{
+                  storagePath: imgPod.storagePath,
+                  source: imgPod.source || "trailer_images",
+                }],
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "power_only_trailer_pod",
+                stepStatus: "success",
+                output: {
+                  storagePath: imgPod.storagePath,
+                  pageCount: imgPod.pageCount || null,
+                },
+              });
+            }
           }
+          if (podStoragePath) {
+            const podB64 = await downloadStorageFileBase64(podStoragePath);
+            if (podB64) {
+              const marked = await ensurePodMarkedOnPrimus({
+                booking: bookingForMode,
+                loadNumber: invoice.loadNumber,
+                podPdf: {
+                  buffer: Buffer.from(podB64, "base64"),
+                  filename: `pod-${invoice.loadNumber}.pdf`,
+                },
+              });
+              if (marked.hasPod) {
+                hasPrimusPod = true;
+                const steps = Object.assign({}, invoice.primusSteps || {}, {
+                  podUploaded: true,
+                });
+                await invoiceDoc.ref.update({
+                  podOnPrimusAlready: true,
+                  podPrimusDriveIds: marked.driveIds || [],
+                  primusSteps: steps,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                invoice.podOnPrimusAlready = true;
+                invoice.primusSteps = steps;
+              }
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "power_only_pod_marked",
+                stepStatus: marked.hasPod ? "success" : "failed",
+                output: {
+                  uploaded: marked.uploaded || false,
+                  hasPod: marked.hasPod || false,
+                  reason: marked.reason || marked.error || null,
+                },
+              });
+            }
+          }
+        }
+
+        // Power Only without POD marked on Primus — do not process invoice.
+        if (isPowerOnly && !hasPrimusPod) {
+          if (isManagePhpEnabled && isManagePhpEnabled() &&
+              checkBookingHasPod) {
+            try {
+              const podCheck = await checkBookingHasPod({
+                booking: bookingForMode,
+                loadNumber: invoice.loadNumber,
+              });
+              hasPrimusPod = !!(podCheck && podCheck.found);
+            } catch (_) {
+              hasPrimusPod = false;
+            }
+          }
+        }
+        if (isPowerOnly && !hasPrimusPod) {
+          const shipmentMode = readShipmentMode(bookingForMode) || "Power Only";
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "power_only_pod_required",
+            stepStatus: "stopped",
+            reason: "Power Only load has no POD marked on Primus",
+            error: "MISSING_POD",
+            output: {loadNumber: invoice.loadNumber, shipmentMode},
+          });
+          await pauseWorkflow(
+              invoiceDoc.ref,
+              "pod_extraction",
+              "missing_pod",
+              "Power Only — POD must be marked on the shipment",
+          );
+          await sendWorkflowAlert({
+            req,
+            code: "MISSING_POD",
+            invoiceId,
+            type: "missing_pod",
+            context: {
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName,
+              proNumber: invoice.proNumber || null,
+              shipmentMode,
+            },
+          });
+          await writeLog("error", "workflow",
+              "Power Only — stopped; POD not marked on Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName || null,
+              });
+          return res.json({
+            ok: false,
+            error: "MISSING_POD",
+            workflowStatus: "missing_pod",
+            shipmentMode,
+          });
         }
 
         if (!hasLocalPod && !hasPrimusPod) {
@@ -881,6 +987,9 @@ exports.processPrimusWorkflow = onRequest(
                 carrierEmailSource: carrier.source || null,
                 firstEmailedAt:
                   admin.firestore.FieldValue.serverTimestamp(),
+                lastEmailedAt:
+                  admin.firestore.FieldValue.serverTimestamp(),
+                reminderCount: 0,
                 reminderSentAt: null,
                 escalatedAt: null,
               },
@@ -891,6 +1000,7 @@ exports.processPrimusWorkflow = onRequest(
               status: podFollowup.POD_FOLLOW_UP_STATUS.AWAITING_CARRIER,
               holdCustomerEmail: true,
               carrierEmail: carrier.email || null,
+              reminderCount: 0,
             };
 
             await logWorkflowStep({
@@ -959,6 +1069,19 @@ exports.processPrimusWorkflow = onRequest(
               workflowStatus: "missing_pod",
             });
           }
+        }
+
+        if (maybeNotifyLisaPodDiscrepancy) {
+          const podPathForReview =
+            (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+            (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+            null;
+          await maybeNotifyLisaPodDiscrepancy({
+            invoiceId,
+            invoice,
+            invoiceRef: invoiceDoc.ref,
+            podStoragePath: podPathForReview,
+          });
         }
 
         await logWorkflowStep({
@@ -1507,17 +1630,32 @@ exports.processPrimusWorkflow = onRequest(
               "Missing customer rate",
           );
 
-          await sendWorkflowAlert({
-            req,
-            code: "MISSING_RATE",
-            invoiceId,
-            type: "rate_missing",
-            context: {
+          if (notifyDispatcherRateIssue) {
+            await notifyDispatcherRateIssue({
+              req,
+              code: "MISSING_RATE",
+              invoiceId,
+              tenantId: (req.body && req.body.tenantId) || null,
               loadNumber: invoice.loadNumber,
-              carrierName: invoice.carrierName,
-              invoiceAmount: invoice.invoiceAmount,
-            },
-          });
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                invoiceAmount: invoice.invoiceAmount,
+              },
+            });
+          } else {
+            await sendWorkflowAlert({
+              req,
+              code: "MISSING_RATE",
+              invoiceId,
+              type: "rate_missing",
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                invoiceAmount: invoice.invoiceAmount,
+              },
+            });
+          }
 
           return res.json({
             ok: true,
@@ -1590,22 +1728,42 @@ exports.processPrimusWorkflow = onRequest(
           const isLowMargin = customerRate > 0;
           const marginPct = marginPctCalc;
           const carrierCost = bookingCarrierCost - approvedChargesTotal;
-          await sendWorkflowAlert({
-            req,
-            code: isLowMargin ? "LOW_MARGIN" : "MISSING_RATE",
-            invoiceId,
-            type: "rate_missing",
-            context: {
+          if (notifyDispatcherRateIssue) {
+            await notifyDispatcherRateIssue({
+              req,
+              code: isLowMargin ? "LOW_MARGIN" : "MISSING_RATE",
+              invoiceId,
+              tenantId: (req.body && req.body.tenantId) || null,
               loadNumber: invoice.loadNumber,
-              carrierName: invoice.carrierName,
-              customerName,
-              customerRate,
-              carrierCost,
-              profit,
-              marginPct,
-              invoiceAmount: invoice.invoiceAmount,
-            },
-          });
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                customerName,
+                customerRate,
+                carrierCost,
+                profit,
+                marginPct,
+                invoiceAmount: invoice.invoiceAmount,
+              },
+            });
+          } else {
+            await sendWorkflowAlert({
+              req,
+              code: isLowMargin ? "LOW_MARGIN" : "MISSING_RATE",
+              invoiceId,
+              type: "rate_missing",
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                customerName,
+                customerRate,
+                carrierCost,
+                profit,
+                marginPct,
+                invoiceAmount: invoice.invoiceAmount,
+              },
+            });
+          }
 
           return res.json({
             ok: true,
@@ -1613,17 +1771,83 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
+        let billToReferenceNumber = invoice.billToReferenceNumber || null;
+        let bookingForInvoice = bookingForMode;
+        if (!bookingForInvoice && invoice.loadNumber) {
+          try {
+            bookingForInvoice = await fetchPrimusBooking(invoice.loadNumber);
+          } catch (_) {
+            bookingForInvoice = null;
+          }
+        }
+        const isPowerOnlyForInvoice = bookingForInvoice &&
+          isPowerOnlyShipment && isPowerOnlyShipment(bookingForInvoice);
+        if (isPowerOnlyForInvoice && readBillToReferenceNumber) {
+          billToReferenceNumber =
+            readBillToReferenceNumber(bookingForInvoice) ||
+            billToReferenceNumber;
+          if (!billToReferenceNumber) {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "power_only_unit_check",
+              stepStatus: "stopped",
+              reason: "Bill To Reference# missing (unit number)",
+              error: "MISSING_UNIT_NUMBER",
+              output: {loadNumber: invoice.loadNumber},
+            });
+            await pauseWorkflow(
+                invoiceDoc.ref,
+                "customer_invoice",
+                "missing_unit_number",
+                "Power Only — Bill To Reference# (unit #) required",
+            );
+            await sendWorkflowAlert({
+              req,
+              code: "MISSING_UNIT_NUMBER",
+              invoiceId,
+              type: "missing_unit_number",
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                customerName,
+                shipmentMode: readShipmentMode(bookingForInvoice) ||
+                  "Power Only",
+              },
+            });
+            await writeLog("warn", "workflow",
+                "Power Only — Bill To Reference# missing before invoice", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                });
+            return res.json({
+              ok: true,
+              workflowStatus: "missing_unit_number",
+            });
+          }
+          await invoiceDoc.ref.update({
+            billToReferenceNumber,
+            shipmentMode: readShipmentMode(bookingForInvoice) || "Power Only",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          invoice.billToReferenceNumber = billToReferenceNumber;
+        }
+
         await writeLog("info", "workflow", "Generating customer invoice", {
           invoiceId: invoiceId,
           customerName: customerName,
           customerRate: customerRate,
+          billToReferenceNumber: billToReferenceNumber || null,
         });
 
         await logWorkflowStep({
           invoiceId,
           stepName: "customer_invoice_generation_started",
           stepStatus: "started",
-          input: {customerName, customerRate},
+          input: {
+            customerName,
+            customerRate,
+            billToReferenceNumber: billToReferenceNumber || null,
+          },
         });
 
         const customerInvoiceData = {
@@ -1632,6 +1856,7 @@ exports.processPrimusWorkflow = onRequest(
           customerName: customerName,
           customerRate: customerRate,
           carrierInvoiceAmount: invoice.invoiceAmount,
+          billToReferenceNumber: billToReferenceNumber || null,
           podPdfStoragePath:
           (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
           (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
@@ -1727,6 +1952,7 @@ exports.processPrimusWorkflow = onRequest(
                 generated: false,
                 carrierBillPdf,
                 podPdf,
+                billToReferenceNumber: billToReferenceNumber || null,
                 skipCarrierBillUpload: primusSteps.carrierBillUploaded,
                 skipPodUpload: primusSteps.podUploaded,
               });
