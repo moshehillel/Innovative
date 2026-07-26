@@ -814,6 +814,167 @@ function resolveManageBookingId(booking) {
     return "";
   }
 }
+exports.resolveManageBookingId = resolveManageBookingId;
+
+/**
+ * Fetches all corporate sales people from manage.php (includes commission %).
+ * @return {Promise<Array<object>>}
+ */
+async function fetchAllCorporateSalesPeople() {
+  const all = [];
+  let start = 0;
+  const limit = 100;
+  for (let page = 1; page <= 20; page++) {
+    const result = await managePhpPost({
+      action: "getCorporateSalesPeople",
+      page: String(page),
+      start: String(start),
+      limit: String(limit),
+    });
+    const rows = result.json && result.json.salespeople;
+    const list = Array.isArray(rows) ? rows : [];
+    if (!list.length) break;
+    all.push(...list);
+    if (list.length < limit) break;
+    start += limit;
+  }
+  return all;
+}
+exports.fetchAllCorporateSalesPeople = fetchAllCorporateSalesPeople;
+
+/**
+ * Reads sales reps assigned to a booking (manage.php booking id).
+ * @param {string|number} recordId manage.php booking id.
+ * @return {Promise<Array<object>>}
+ */
+async function getBookingSalesRep(recordId) {
+  if (!recordId) return [];
+  const result = await managePhpPost({
+    action: "getBookingSalesRep",
+    recordId: String(recordId),
+  });
+  const reps = result.json && result.json.salesReps;
+  return Array.isArray(reps) ? reps : [];
+}
+exports.getBookingSalesRep = getBookingSalesRep;
+
+/**
+ * Swaps a load's sales rep to the broker's 10% variant via saveBookingSalesRep.
+ * @param {object} args
+ * @param {string|number} args.bookingId manage.php booking id.
+ * @param {object} args.tenPctRow Row from getCorporateSalesPeople (10%).
+ * @param {Array<object>} [args.removedReps] Current reps being replaced.
+ * @return {Promise<object>}
+ */
+async function swapBookingSalesRep(args) {
+  const bookingId = args && args.bookingId ?
+    String(args.bookingId) : "";
+  const tenPctRow = args && args.tenPctRow;
+  if (!bookingId || !tenPctRow || !tenPctRow.id) {
+    return {ok: false, error: "missing bookingId or tenPctRow"};
+  }
+
+  const salesReps = [{
+    salesPersonId: String(tenPctRow.id),
+    firstName: tenPctRow.firstName || "",
+    lastName: tenPctRow.lastName || "",
+    display: tenPctRow.display ||
+      `${tenPctRow.firstName || ""} ${tenPctRow.lastName || ""}`.trim(),
+  }];
+
+  const params = {
+    action: "saveBookingSalesRep",
+    recordId: bookingId,
+    salesReps,
+  };
+
+  const removedReps = args && args.removedReps;
+  if (Array.isArray(removedReps) && removedReps.length) {
+    params.removedSalesReps = removedReps.map((rep) => ({
+      salesPersonId: String(rep.salesPersonId || rep.id || ""),
+      firstName: rep.firstName || "",
+      lastName: rep.lastName || "",
+      display: rep.display || "",
+    }));
+  }
+
+  const result = await managePhpPost(params);
+  if (!isManageSuccess(result.json)) {
+    return {
+      ok: false,
+      error: (result.json && result.json.message) ||
+        result.text ||
+        "saveBookingSalesRep failed",
+      response: result.json || null,
+    };
+  }
+
+  const after = await getBookingSalesRep(bookingId);
+  const changed = after.some((rep) =>
+    String(rep.salesPersonId) === String(tenPctRow.id));
+  return {
+    ok: changed,
+    after,
+    response: result.json || null,
+    error: changed ? null : "sales rep unchanged after save",
+  };
+}
+exports.swapBookingSalesRep = swapBookingSalesRep;
+
+/**
+ * Fetches shipment rows from manage.php getBookingsForTracking (paginated).
+ * @param {object} [opts]
+ * @param {Date|string} [opts.dateFrom] Start of dateSaved window.
+ * @param {Date|string} [opts.dateTo] End of dateSaved window.
+ * @param {number} [opts.pageSize] Page size (default 100).
+ * @param {number} [opts.maxPages] Safety cap (default 50).
+ * @return {Promise<Array<object>>}
+ */
+async function fetchBookingsForTracking(opts) {
+  const pageSize = Number(opts && opts.pageSize || 100);
+  const maxPages = Number(opts && opts.maxPages || 120);
+  const dateTo = opts && opts.dateTo ? new Date(opts.dateTo) : new Date();
+  const dateFrom = opts && opts.dateFrom ?
+    new Date(opts.dateFrom) :
+    new Date(dateTo.getTime() - 180 * 24 * 60 * 60 * 1000);
+  const iso = (d) => d.toISOString().slice(0, 10);
+
+  const all = [];
+  for (let page = 0; page < maxPages; page++) {
+    const start = page * pageSize;
+    const params = {
+      action: "getBookingsForTracking",
+      page: String(page + 1),
+      query: "",
+      forcelimit: "",
+      dateFrom: iso(dateFrom),
+      dateTo: iso(dateTo),
+      criteria: "[]",
+      user: "null",
+      shipmentMode: "null",
+      searchFields: "[]",
+      customer: "[]",
+      office: "[]",
+      start: String(start),
+      limit: String(pageSize),
+      sort: JSON.stringify([{property: "dateSaved", direction: "DESC"}]),
+    };
+    let result = await managePhpPost(params);
+    let rows = result.json && result.json.bookingsfortracking;
+    let list = Array.isArray(rows) ? rows : [];
+    if (page > 0 && !list.length) {
+      await loginUi();
+      result = await managePhpPost(params, false);
+      rows = result.json && result.json.bookingsfortracking;
+      list = Array.isArray(rows) ? rows : [];
+    }
+    if (!list.length) break;
+    all.push(...list);
+    if (list.length < pageSize) break;
+  }
+  return all;
+}
+exports.fetchBookingsForTracking = fetchBookingsForTracking;
 
 /**
  * @param {object} docData getBookingDocuments JSON body.

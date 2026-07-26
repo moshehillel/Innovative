@@ -147,7 +147,24 @@ function buildWorkflowAlertEmail(opts) {
       `${esc(ctx.brokerName || "This broker")} does not have a 10% option ` +
       "configured, so the commission was left unchanged. " +
       "Customer invoicing was allowed to continue — this is informational " +
-      "only and does not block billing.";
+      "only and does not block billing." +
+      (ctx.note ? ` ${esc(ctx.note)}` : "");
+      action = ACTION.NONE;
+      break;
+
+    case "BROKER_SWAP_FAILED":
+      subject = `Notice — broker 10% swap failed — Load ${loadNumber}`;
+      title = "Broker commission swap failed";
+      summary = "This shipment's profit margin is below 10%. Jerry found a " +
+      "10% sales-rep code for this broker but could not update the load in " +
+      "ShipPrimus.";
+      explanation =
+      `${esc(ctx.brokerName || "This broker")} should be on the 10% code ` +
+      `(${esc(ctx.tenPctName || "10% variant")}), but the ShipPrimus update ` +
+      "did not succeed" +
+      (ctx.error ? `: ${esc(ctx.error)}` : ".") +
+      " Customer invoicing was allowed to continue — please verify the sales " +
+      "rep on this load manually.";
       action = ACTION.NONE;
       break;
 
@@ -191,12 +208,23 @@ function buildWorkflowAlertEmail(opts) {
       action = ACTION.RESUME;
       break;
 
+    case "MISSING_CUSTOMER":
+      subject = `Action needed — No customer on Load ${loadNumber}`;
+      title = "Customer missing";
+      summary = "No customer is assigned to this load in ShipPrimus.";
+      explanation = "Enter the customer on the shipment in ShipPrimus, or " +
+        "use the button below to set the customer name and rate so Jerry " +
+        "can continue invoicing.";
+      action = ACTION.SET_RATE;
+      actionLabel = "Set Customer & Rate";
+      break;
+
     case "MISSING_RATE":
       subject = `Action needed — No customer rate for Load ${loadNumber}`;
       title = "Customer rate missing";
       summary = "No customer rate was found for this load in ShipPrimus.";
-      explanation = "Enter the correct customer rate, then resume the " +
-        "workflow.";
+      explanation = "Enter the correct customer rate in ShipPrimus, or use " +
+        "the button below to set the customer name and rate.";
       action = ACTION.SET_RATE;
       actionLabel = "Set Customer Rate";
       break;
@@ -383,6 +411,7 @@ function buildWorkflowAlertEmail(opts) {
     extraRows.push(["Margin", `${Number(ctx.marginPct).toFixed(1)}%`]);
   }
   if (ctx.brokerName) extraRows.push(["Broker / sales rep", ctx.brokerName]);
+  if (ctx.tenPctName) extraRows.push(["10% code", ctx.tenPctName]);
   if (ctx.recipient) extraRows.push(["Email recipient", ctx.recipient]);
   if (ctx.invoiceDocId) {
     extraRows.push(["Primus invoice ID", String(ctx.invoiceDocId)]);

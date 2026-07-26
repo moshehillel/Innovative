@@ -798,6 +798,8 @@ async function processInsuranceEmail(opts) {
       vendorInvoiceNumber,
       billDate,
       insuranceVendor,
+      maybeAdjustBrokerAfterInsurance: deps.maybeAdjustBrokerAfterInsurance,
+      writeLog,
     });
 
   const result = await allocateInsurancePremiums({
@@ -875,6 +877,7 @@ function createInsurancePostAdapter(deps) {
     billDate,
     billDueDate,
     insuranceVendor,
+    maybeAdjustBrokerAfterInsurance,
   } = deps;
 
   return async function postPremiumToLoad(row) {
@@ -909,6 +912,24 @@ function createInsurancePostAdapter(deps) {
         error: result.error || result.step || "post failed",
       };
     }
+
+    if (typeof maybeAdjustBrokerAfterInsurance === "function") {
+      try {
+        await maybeAdjustBrokerAfterInsurance({
+          loadNumber,
+          booking,
+          premium: row.amount,
+        });
+      } catch (marginErr) {
+        const log = deps.writeLog || (async () => {});
+        await log("warn", "insurance",
+            "Post-insurance broker commission check failed", {
+              loadNumber,
+              error: marginErr && marginErr.message,
+            });
+      }
+    }
+
     return {
       ok: true,
       loadNumber: result.loadNumber,

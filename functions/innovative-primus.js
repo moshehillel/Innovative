@@ -1483,6 +1483,13 @@ exports.processPrimusWorkflow = onRequest(
                 rateSource: customerForCheckResult.rateSource,
               });
         } else {
+          if (customerForCheckResult && customerForCheckResult.customerName) {
+            customerNameForCheck = customerForCheckResult.customerName;
+            await invoiceDoc.ref.update({
+              customerName: customerNameForCheck,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
           await writeLog("warn", "workflow",
               "Could not fetch customer rate from Primus", {
                 invoiceId,
@@ -1491,40 +1498,56 @@ exports.processPrimusWorkflow = onRequest(
               });
         }
 
-        if (
-          customerNameForCheck &&
-      String(customerNameForCheck).toLowerCase().includes("test")
-        ) {
+        const hasCustomerName = Boolean(
+            customerNameForCheck &&
+            String(customerNameForCheck).trim(),
+        );
+        if (!hasCustomerName) {
           await logWorkflowStep({
             invoiceId,
             stepName: "customer_check_paused",
             stepStatus: "stopped",
-            reason: "Test customer detected - manual review required",
-            output: {customerName: customerNameForCheck},
-            error: "TEST_CUSTOMER",
+            reason: "No customer on load",
+            error: "MISSING_CUSTOMER",
           });
 
           await pauseWorkflow(
               invoiceDoc.ref,
               "check_customer",
-              "test_customer_review",
-              "Test customer detected - paused",
+              "needs_customer_review",
+              "No customer on load",
           );
 
-          await sendWorkflowAlert({
-            req,
-            code: "TEST_CUSTOMER",
-            invoiceId,
-            type: "customer_missing",
-            context: {
+          if (notifyDispatcherRateIssue) {
+            await notifyDispatcherRateIssue({
+              req,
+              code: "MISSING_CUSTOMER",
+              invoiceId,
+              tenantId: (req.body && req.body.tenantId) || null,
               loadNumber: invoice.loadNumber,
-              customerName: customerNameForCheck,
-            },
-          });
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                invoiceAmount: invoice.invoiceAmount,
+              },
+            });
+          } else {
+            await sendWorkflowAlert({
+              req,
+              code: "MISSING_CUSTOMER",
+              invoiceId,
+              type: "customer_missing",
+              context: {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                invoiceAmount: invoice.invoiceAmount,
+              },
+            });
+          }
 
           return res.json({
             ok: true,
-            workflowStatus: "test_customer_review",
+            workflowStatus: "needs_customer_review",
           });
         }
 

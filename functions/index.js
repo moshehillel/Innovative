@@ -1,4 +1,5 @@
 const {onRequest} = require("firebase-functions/v2/https");
+const {onSchedule} = require("firebase-functions/v2/scheduler");
 
 const admin = require("firebase-admin");
 const {google} = require("googleapis");
@@ -25,6 +26,8 @@ const {
   normalizePodDiscrepancies,
 } = podUtils;
 const workflowErrors = require("./workflow-error-messages");
+const brokerCommission = require("./broker-commission");
+const undeliveredReport = require("./undelivered-shipment-report");
 const additionalCharges = require("./additional-charges");
 const fedexFreightPod = require("./fedex-freight-pod");
 const crypto = require("crypto");
@@ -981,6 +984,88 @@ exports.summarizeFlowLogs = onRequest(async (req, res) => {
  */
 exports.checkPodFollowUps = onRequest(
     {invoker: "public"}, handleCheckPodFollowUps);
+
+/**
+ * Weekly undelivered shipment report — pickup > 14 days, no delivery date.
+ * Wire Cloud Scheduler to POST weekly (e.g. Monday 8am ET).
+ * Query: ?dryRun=1 to preview without sending email.
+ */
+exports.reportUndeliveredShipments = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "512MiB"},
+    handleReportUndeliveredShipments);
+
+/** Weekly Mon 8:00 AM ET — stale pickup, no delivery date. */
+exports.reportUndeliveredShipmentsWeekly = onSchedule({
+  schedule: "0 8 * * 1",
+  timeZone: "America/New_York",
+}, async () => {
+  await undeliveredReport.runUndeliveredShipmentReport({});
+});
+
+/**
+ * @param {object} req HTTPS request.
+ * @param {object} res HTTPS response.
+ * @return {Promise<object>}
+ */
+async function handleReportUndeliveredShipments(req, res) {
+  try {
+    if (req.method !== "POST" && req.method !== "GET") {
+      return res.status(405).json({ok: false, error: "Use GET or POST"});
+    }
+    const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true";
+    const result = await undeliveredReport.runUndeliveredShipmentReport({
+      dryRun,
+    });
+    return res.json(result);
+  } catch (error) {
+    console.error("reportUndeliveredShipments error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Smoke-test FedEx Freight POD pull from Cloud Functions (bypasses NetFree).
+ * GET ?pro=7338614695 — returns PDF or JSON error.
+ */
+exports.testFedExFreightPod = onRequest(
+    {invoker: "public", timeoutSeconds: 60},
+    async (req, res) => {
+      try {
+        const bodyPro = req.body && (req.body.pro || req.body.proNumber);
+        const pro = String(
+            req.query.pro || bodyPro || req.get("X-Pro-Number") ||
+            "7338614695",
+        ).replace(/\D/g, "");
+        const asJson = req.query.format === "json" ||
+          (req.body && req.body.format === "json");
+        const result = await fedexFreightPod.fetchFedExFreightPodPdf(pro);
+        if (!result.ok || !result.pdfBuffer) {
+          return res.status(502).json({
+            ok: false,
+            proNumber: pro,
+            error: result.error || "POD fetch failed",
+          });
+        }
+        if (asJson) {
+          return res.json({
+            ok: true,
+            proNumber: pro,
+            bytes: result.pdfBuffer.length,
+            pdfBase64: result.pdfBuffer.toString("base64"),
+          });
+        }
+        res.set("Content-Type", "application/pdf");
+        res.set("Content-Disposition",
+            `inline; filename="fedex-pod-${pro}.pdf"`);
+        return res.send(result.pdfBuffer);
+      } catch (error) {
+        console.error("testFedExFreightPod error:", error);
+        return res.status(500).json({ok: false, error: error.message});
+      }
+    });
 
 /**
  * Implementation for checkPodFollowUps.
@@ -2869,8 +2954,10 @@ async function notifyDispatcherRateIssue(opts) {
       `; sent to Lisa only.</em></p>`;
   }
 
+  const emailType = code === "LOW_MARGIN" ? "low_margin" :
+    code === "MISSING_CUSTOMER" ? "customer_missing" : "rate_missing";
   await saveOutboundEmail({
-    type: code === "LOW_MARGIN" ? "low_margin" : "rate_missing",
+    type: emailType,
     invoiceId,
     forceRecipient: true,
     to,
@@ -2880,7 +2967,7 @@ async function notifyDispatcherRateIssue(opts) {
   });
 
   await writeLog("info", "email",
-      "Rate/margin alert sent to dispatcher", {
+      "Customer/rate alert sent to dispatcher", {
         invoiceId: invoiceId || null,
         loadNumber: loadNumber || null,
         code,
@@ -3153,73 +3240,22 @@ async function getPrimusShipment(loadNumber, proNumber) {
 
 /**
  * Adjusts broker commission in Primus for low-margin loads.
- * When the broker has no 10% sales-rep code, sends an informational email
- * (no Continue button) and allows invoicing to proceed.
+ * Karen Adams is exempt. Others swap to 10% when available; otherwise Lisa
+ * is notified and invoicing continues.
  * @param {object} opts
  * @param {string} opts.loadNumber Load number.
  * @param {number} opts.margin Margin percentage.
  * @param {number} [opts.profit] Profit dollars.
  * @param {string} [opts.brokerName] Current sales rep / broker name.
  * @param {string} [opts.carrierName] Carrier name for the email.
+ * @param {object} [opts.booking] Primus REST booking when already loaded.
  * @return {Promise<object>}
  */
 async function adjustBrokerCommission(opts) {
-  const loadNumber = opts && opts.loadNumber ?
-    String(opts.loadNumber) : "";
-  const margin = Number(opts && opts.margin || 0);
-  const profit = Number(opts && opts.profit || 0);
-  const brokerName = opts && opts.brokerName ?
-    String(opts.brokerName).trim() : "";
-  const carrierName = opts && opts.carrierName || "";
-
-  if (!loadNumber || margin >= 10) {
-    return {adjusted: false, notified: false, reason: "margin_ok"};
-  }
-
-  let needsNotify = false;
-  const mapJson = process.env.BROKER_10PCT_MAP_JSON;
-  if (mapJson && brokerName) {
-    try {
-      const map = JSON.parse(mapJson);
-      const entry = Object.values(map).find((row) =>
-        row && String(row.name || "").toLowerCase() ===
-        brokerName.toLowerCase());
-      if (entry && !entry.tenPctId) needsNotify = true;
-    } catch (parseErr) {
-      await writeLog("warn", "primus",
-          "BROKER_10PCT_MAP_JSON parse failed", {
-            error: parseErr.message,
-          });
-    }
-  }
-
-  if (!needsNotify) {
-    await writeLog("info", "primus",
-        "Low margin — broker commission adjust pending mapping", {
-          loadNumber,
-          margin,
-          profit,
-          brokerName: brokerName || null,
-        });
-    return {adjusted: false, notified: false, reason: "mapping_pending"};
-  }
-
-  const alert = workflowErrors.buildWorkflowAlertEmail({
-    code: "BROKER_NO_10PCT_CODE",
-    context: {
-      loadNumber,
-      marginPct: margin,
-      profit,
-      brokerName: brokerName || "Unknown broker",
-      carrierName,
-    },
+  return brokerCommission.adjustBrokerCommissionForLowMargin({
+    ...(opts || {}),
+    trigger: "invoice_intake",
   });
-  await saveOutboundEmail({
-    type: "broker_no_10pct_code",
-    subject: alert.subject,
-    html: alert.html,
-  });
-  return {adjusted: false, notified: true, reason: "no_10pct_code"};
 }
 
 /**
@@ -8952,6 +8988,22 @@ const primusBundle = {
 const primusUiBridge = require("./primus-ui-bridge");
 primusUiBridge.init({db, writeLog});
 
+brokerCommission.init({
+  writeLog,
+  saveOutboundEmail,
+  workflowErrors,
+  primusUiBridge,
+  fetchPrimusBooking,
+  checkProfitMargin,
+  readCustomerRateFromAcct,
+});
+
+undeliveredReport.init({
+  writeLog,
+  saveOutboundEmail,
+  primusUiBridge,
+});
+
 const innovativePrimus = require("./innovative-primus");
 innovativePrimus.init({
   ...primusBundle,
@@ -8973,6 +9025,8 @@ innovativeInsurance.init({
   addInsurancePremiumToLoad: primusUiBridge.addInsurancePremiumToLoad,
   resolveInsuranceVendor: primusUiBridge.resolveInsuranceVendor,
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
+  maybeAdjustBrokerAfterInsurance:
+      brokerCommission.maybeAdjustAfterInsurancePremium,
 });
 
 const tai = require("./tai");
@@ -8987,4 +9041,10 @@ ctcTai.init(sharedTmsBundle);
 exports.ctcTaiWebhook = ctcTai.ctcTaiWebhook;
 exports.ctcTaiResolveShipment = ctcTai.ctcTaiResolveShipment;
 exports.processCtcTaiWorkflow = ctcTai.processCtcTaiWorkflow;
+
+// Renew Primus manage.php PHPSESSID on a schedule (every 12 hours).
+exports.refreshPrimusUiSession = onSchedule("every 12 hours", async () => {
+  if (!primusUiBridge.isManagePhpEnabled()) return;
+  await primusUiBridge.renewUiSession();
+});
 
