@@ -1,5 +1,7 @@
 /* Quick smoke test for additional-charges.js (no Firebase needed for
  * the pure functions). Run: node scripts/test-additional-charges.js */
+process.env.EMAIL_ACTION_SECRET = process.env.EMAIL_ACTION_SECRET ||
+  "test-secret";
 const ac = require("../additional-charges");
 
 let failures = 0;
@@ -81,7 +83,7 @@ const noMatch = ac.evaluateRequoteMatch({
 });
 check("rate mismatch over $10", noMatch.matched, false);
 
-// 3. Approval email contains all four buttons
+// 3. Approval email contains all four buttons (signed confirm links)
 const email = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
   invoiceId: "inv123",
@@ -108,10 +110,12 @@ check("email shows re-rate mismatch",
 check("email shows quote number",
     email.html.includes("48025106"), true);
 for (const opt of ["a", "b", "c", "d"]) {
-  check(`button ${opt} link`,
-      email.html.includes(
-          `additionalChargeAction?invoiceId=inv123&option=${opt}` +
-          `&tenantId=innovative`), true);
+  check(`button ${opt} has action`,
+      email.html.includes("additionalChargeAction") &&
+      email.html.includes(`invoiceId=inv123`) &&
+      email.html.includes(`option=${opt}`), true);
+  check(`button ${opt} signed`,
+      email.html.includes("&sig=") && email.html.includes("&exp="), true);
 }
 check("subject has load", email.subject.includes("264172"), true);
 

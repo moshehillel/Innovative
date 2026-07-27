@@ -29,6 +29,7 @@ const workflowErrors = require("./workflow-error-messages");
 const brokerCommission = require("./broker-commission");
 const undeliveredReport = require("./undelivered-shipment-report");
 const additionalCharges = require("./additional-charges");
+const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
@@ -1551,29 +1552,104 @@ exports.approveCustomerEmail = onRequest(async (req, res) => {
   try {
     const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
     const decision = String(
-        (req.body && req.body.decision) || req.query.decision || "",
+        (req.body && req.body.decision) || req.query.decision ||
+        (req.body && req.body.option) || req.query.option || "",
     ).toLowerCase();
+    const tenantId = (req.body && req.body.tenantId) || req.query.tenantId ||
+      null;
+    const exp = (req.body && req.body.exp) || req.query.exp;
+    const sig = (req.body && req.body.sig) || req.query.sig;
 
     if (!invoiceId || (decision !== "approve" && decision !== "reject")) {
       return res.status(400).send(
           "Missing invoiceId or a valid decision (approve|reject).");
     }
 
-    const tenant = await tenantFromRequest(req);
-    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
-    const snap = await invoiceRef.get();
-    if (!snap.exists) {
-      return res.status(404).send("Invoice not found.");
+    const tokenOk = emailActionTokens.verify({
+      action: "customerEmailApproval",
+      invoiceId: String(invoiceId),
+      option: decision,
+      tenantId,
+      exp,
+      sig,
+    });
+    if (!tokenOk) {
+      return res.status(403).send(
+          "This approval link is invalid or expired. Ask Jerry to resend " +
+          "the approval email.");
     }
 
+    if (req.method !== "POST") {
+      const tenant = await tenantFromRequest(req);
+      const snap = await tcol(tenant, "invoices").doc(String(invoiceId)).get();
+      const loadNumber = snap.exists ?
+        (snap.data().loadNumber || invoiceId) : invoiceId;
+      const prior = snap.exists ? snap.data().customerEmailApproval : null;
+      if (prior === "approved" || prior === "rejected") {
+        const title = prior === "approved" ? "Already approved" :
+          "Already rejected";
+        const color = prior === "approved" ? "#16a34a" : "#dc2626";
+        return res.status(200).send(
+            `<!doctype html><html><head><meta charset="utf-8">` +
+            `<meta name="viewport" content="width=device-width,` +
+            `initial-scale=1"><title>${title}</title></head>` +
+            `<body style="font-family:Arial,sans-serif;text-align:center;` +
+            `padding:48px;color:#111827">` +
+            `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
+            `<p style="font-size:16px;color:#374151">This customer email ` +
+            `was already ${prior}.</p>` +
+            `<p style="font-size:13px;color:#9ca3af">Load ` +
+            `${escapeHtml(String(loadNumber))}</p></body></html>`);
+      }
+      const label = decision === "approve" ?
+        "Approve and send the customer email" :
+        "Reject — do not send the customer email";
+      return res.status(200).send(buildEmailActionConfirmPage({
+        title: decision === "approve" ? "Approve customer email" :
+          "Reject customer email",
+        description: `Load ${loadNumber}: ${label}.`,
+        confirmLabel: decision === "approve" ?
+          "Approve & send" : "Reject email",
+        confirmColor: decision === "approve" ? "#16a34a" : "#dc2626",
+        actionPath: "approveCustomerEmail",
+        fields: {
+          invoiceId: String(invoiceId),
+          decision,
+          option: decision,
+          tenantId: tenantId || "",
+          exp: String(exp),
+          sig: String(sig),
+        },
+      }));
+    }
+
+    const tenant = await tenantFromRequest(req);
+    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const approved = decision === "approve";
-    await invoiceRef.update({
-      customerEmailApproval: approved ? "approved" : "rejected",
-      customerEmailApprovalAt: admin.firestore.FieldValue.serverTimestamp(),
-      workflowPausedAtStep: null,
-      workflowPausedAt: null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
+    const claim = await claimCustomerEmailApproval(invoiceRef, approved);
+    if (!claim.ok) {
+      if (claim.reason === "not_found") {
+        return res.status(404).send("Invoice not found.");
+      }
+      if (claim.reason === "already") {
+        const title = claim.prior === "approved" ? "Already approved" :
+          "Already rejected";
+        const color = claim.prior === "approved" ? "#16a34a" : "#dc2626";
+        return res.status(200).send(
+            `<!doctype html><html><head><meta charset="utf-8">` +
+            `<meta name="viewport" content="width=device-width,` +
+            `initial-scale=1"><title>${title}</title></head>` +
+            `<body style="font-family:Arial,sans-serif;text-align:center;` +
+            `padding:48px;color:#111827">` +
+            `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
+            `<p style="font-size:16px;color:#374151">This customer email ` +
+            `was already ${claim.prior}.</p>` +
+            `<p style="font-size:13px;color:#9ca3af">Load ` +
+            `${escapeHtml(String(claim.loadNumber || invoiceId))}</p>` +
+            `</body></html>`);
+      }
+      return res.status(400).send("Could not process this approval.");
+    }
 
     // Resume the invoice's own tenant workflow; the send/no-send decision is
     // enforced by the approval gate inside the workflow itself.
@@ -1608,13 +1684,108 @@ exports.approveCustomerEmail = onRequest(async (req, res) => {
         `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
         `<p style="font-size:16px;color:#374151">${message}</p>` +
         `<p style="font-size:13px;color:#9ca3af">Load ` +
-        `${escapeHtml(String(snap.data().loadNumber || invoiceId))}</p>` +
+        `${escapeHtml(String(claim.invoice.loadNumber || invoiceId))}</p>` +
         `</body></html>`);
   } catch (error) {
     console.error("approveCustomerEmail error:", error);
     return res.status(500).send("Internal server error.");
   }
 });
+
+/**
+ * HTML confirmation page for email action links. Scanners that prefetch GET
+ * URLs stop here; only an explicit POST Confirm executes the action.
+ * @param {object} opts Page options.
+ * @return {string} HTML.
+ */
+function buildEmailActionConfirmPage(opts) {
+  const fields = opts.fields || {};
+  const btnColor = opts.confirmColor || "#2563eb";
+  const hidden = Object.entries(fields)
+      .map(([name, value]) =>
+        `<input type="hidden" name="${escapeHtml(name)}" ` +
+        `value="${escapeHtml(String(value ?? ""))}">`)
+      .join("");
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${escapeHtml(opts.title || "Confirm")}</title></head>` +
+    `<body style="font-family:Arial,sans-serif;max-width:520px;` +
+    `margin:48px auto;padding:0 16px;color:#111827">` +
+    `<h1 style="font-size:22px;margin-bottom:12px">` +
+    `${escapeHtml(opts.title || "Confirm action")}</h1>` +
+    `<p style="font-size:16px;color:#374151;line-height:1.5">` +
+    `${opts.description || ""}</p>` +
+    `<form method="POST" action="/${escapeHtml(opts.actionPath)}" ` +
+    `style="margin-top:24px">` +
+    hidden +
+    `<button type="submit" style="background:${btnColor};` +
+    `color:#fff;border:none;padding:12px 20px;border-radius:8px;` +
+    `font-size:16px;font-weight:600;cursor:pointer">` +
+    `${escapeHtml(opts.confirmLabel || "Confirm")}</button>` +
+    `</form>` +
+    `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
+    `If you did not request this, close this page — nothing has been ` +
+    `changed yet.</p></body></html>`;
+}
+
+/**
+ * Atomically claims a customer-email approval (blocks double-execute).
+ * @param {object} invoiceRef Firestore invoice document reference.
+ * @param {boolean} approved True to approve send, false to reject.
+ * @return {Promise<object>} Claim result with ok flag.
+ */
+async function claimCustomerEmailApproval(invoiceRef, approved) {
+  const value = approved ? "approved" : "rejected";
+  return admin.firestore().runTransaction(async (tx) => {
+    const snap = await tx.get(invoiceRef);
+    if (!snap.exists) return {ok: false, reason: "not_found"};
+    const invoice = snap.data();
+    const prior = invoice.customerEmailApproval;
+    if (prior === "approved" || prior === "rejected") {
+      return {
+        ok: false,
+        reason: "already",
+        prior,
+        loadNumber: invoice.loadNumber,
+      };
+    }
+    tx.update(invoiceRef, {
+      customerEmailApproval: value,
+      customerEmailApprovalAt:
+        admin.firestore.FieldValue.serverTimestamp(),
+      workflowPausedAtStep: null,
+      workflowPausedAt: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return {ok: true, invoice};
+  });
+}
+
+/**
+ * Atomically claims an additional-charge decision (blocks double-execute).
+ * @param {object} invoiceRef Firestore invoice document reference.
+ * @param {string} decision Decision letter A, B, C, or D.
+ * @return {Promise<object>} Claim result with ok flag.
+ */
+async function claimAdditionalChargeDecision(invoiceRef, decision) {
+  return admin.firestore().runTransaction(async (tx) => {
+    const snap = await tx.get(invoiceRef);
+    if (!snap.exists) return {ok: false, reason: "not_found"};
+    const invoice = snap.data();
+    const charge = invoice.additionalCharge;
+    if (!charge) return {ok: false, reason: "no_charge"};
+    if (charge.decision) {
+      return {ok: false, reason: "already", decision: charge.decision};
+    }
+    tx.update(invoiceRef, {
+      "additionalCharge.decision": decision,
+      "additionalCharge.decidedAt":
+        admin.firestore.FieldValue.serverTimestamp(),
+      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return {ok: true, invoice};
+  });
+}
 
 /**
  * Handles the A/B/C/D decision buttons from the additional-charge approval
@@ -1640,10 +1811,28 @@ async function handleAdditionalChargeAction(req, res) {
     const option = String(
         (req.body && req.body.option) || req.query.option || "",
     ).toLowerCase();
+    const tenantId = (req.body && req.body.tenantId) || req.query.tenantId ||
+      null;
+    const exp = (req.body && req.body.exp) || req.query.exp;
+    const sig = (req.body && req.body.sig) || req.query.sig;
 
     if (!invoiceId || !["a", "b", "c", "d"].includes(option)) {
       return res.status(400).send(
           "Missing invoiceId or a valid option (a|b|c|d).");
+    }
+
+    const tokenOk = emailActionTokens.verify({
+      action: "additionalCharge",
+      invoiceId: String(invoiceId),
+      option,
+      tenantId,
+      exp,
+      sig,
+    });
+    if (!tokenOk) {
+      return res.status(403).send(
+          "This decision link is invalid or expired. Ask Jerry to resend " +
+          "the approval email.");
     }
 
     const tenant = await tenantFromRequest(req);
@@ -1677,7 +1866,44 @@ async function handleAdditionalChargeAction(req, res) {
           `${escapeHtml(String(charge.decision).toUpperCase())}).`);
     }
 
+    const optionLabels = {
+      a: "A — Pay carrier + bill customer (auto-email customer)",
+      b: "B — Pay carrier + bill customer (dispatcher notifies customer)",
+      c: "C — Pay carrier only (customer rate unchanged)",
+      d: "D — Not approved (dispute with carrier)",
+    };
+
+    if (req.method !== "POST") {
+      return res.status(200).send(buildEmailActionConfirmPage({
+        title: `Confirm option ${option.toUpperCase()}`,
+        description:
+          `Load ${invoice.loadNumber || invoiceId}: ` +
+          `${optionLabels[option]}. Nothing is sent until you click Confirm.`,
+        confirmLabel: `Confirm option ${option.toUpperCase()}`,
+        confirmColor: option === "d" ? "#dc2626" :
+          (option === "c" ? "#2563eb" : "#16a34a"),
+        actionPath: "additionalChargeAction",
+        fields: {
+          invoiceId: String(invoiceId),
+          option,
+          tenantId: tenantId || "",
+          exp: String(exp),
+          sig: String(sig),
+        },
+      }));
+    }
+
     const decision = option.toUpperCase();
+    const claim = await claimAdditionalChargeDecision(invoiceRef, decision);
+    if (!claim.ok) {
+      if (claim.reason === "already") {
+        return htmlPage("Already decided", "#6b7280",
+            `This charge was already handled (option ` +
+            `${escapeHtml(String(claim.decision).toUpperCase())}).`);
+      }
+      return res.status(400).send("Could not process this decision.");
+    }
+
     const chargesTotal = Number(charge.amount) || 0;
     const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
 
@@ -2431,7 +2657,9 @@ async function preCheckDocumentType(pdfBuffer) {
         {
           type: "text",
           text: "What type of document is this? Reply with exactly one word: " +
-            "INVOICE, STATEMENT, INSURANCE, POD, or OTHER",
+            "INVOICE, STATEMENT, INSURANCE, POD, or OTHER. " +
+            "Use INVOICE when the PDF contains carrier freight bill(s) " +
+            "to pay, even if the first page is a statement summary.",
         },
       ],
     }],
@@ -2443,6 +2671,31 @@ async function preCheckDocumentType(pdfBuffer) {
   const word = block.text.trim().toUpperCase().split(/\s+/)[0];
   return ["INVOICE", "STATEMENT", "INSURANCE", "POD"].includes(word) ?
     word : "OTHER";
+}
+
+/**
+ * Maps cheap first-page pre-check labels to attachment processing types.
+ * Carrier statement PDFs (e.g. AAA Cooper Stmt) often bundle several freight
+ * invoices — still run full multi-invoice extraction for those.
+ * @param {string} docType Pre-check label.
+ * @param {object} [context] Optional subject/filename hints.
+ * @return {string} Attachment docType for intake.
+ */
+function normalizePreCheckDocType(docType, context = {}) {
+  const label = String(docType || "").toUpperCase();
+  if (label === "STATEMENT") return "INVOICE";
+  if (label === "OTHER") {
+    const hints = [
+      context.subject,
+      context.filename,
+      context.from,
+    ].map((s) => String(s || "")).join(" ");
+    if (/stmt|stmd|statement|freight\s*inv|carrier\s*inv|transportation/i
+        .test(hints)) {
+      return "INVOICE";
+    }
+  }
+  return label;
 }
 
 /**
@@ -4890,13 +5143,14 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  choose this intent. A QuickBooks \"Pay invoice\" / payment-link",
       "  email from Redkik with only a PDF (no spreadsheet) is NOT",
       "  insurance_premium; classify that as statement or unknown instead.",
-      "- carrier_invoice: trucking company freight invoice, usually PDF",
+      "- carrier_invoice: trucking company freight invoice, usually PDF.",
+      "  Also use when an LTL carrier sends a Stmt/statement PDF that",
+      "  includes freight bills to pay (may contain multiple invoices).",
       "- pod_delivery: reply with only Proof of Delivery / signed BOL /",
       "  delivery or trailer photos — NO freight invoice amount due. Often a",
       "  reply to a POD request.",
-      "- statement: account statement, payment summary, or pay-invoice link",
-      "  without a freight invoice or insurance premium spreadsheet to",
-      "  process",
+      "- statement: account summary or pay-online notice only — no freight",
+      "  invoice PDF to extract (not a carrier Stmt packet of bills)",
       "- unknown: marketing, unrelated, or unclear",
     ].join("\n"),
     messages: [{
@@ -5369,11 +5623,24 @@ async function processGmailMessage(
         });
       }
 
+      const preCheckLabel = docType;
+      docType = normalizePreCheckDocType(docType, {
+        subject, from, filename: attachment.filename,
+      });
+      if (preCheckLabel !== docType && docType === "INVOICE") {
+        await writeLog("info", "gmail",
+            "Carrier statement PDF — attempting multi-invoice extraction", {
+              messageId, filename: attachment.filename,
+              preCheckLabel,
+            });
+      }
       if (docType !== "INVOICE" && docType !== "POD") {
-        await writeLog("info", "gmail", `Attachment is ${docType}, skipping`, {
-          messageId, filename: attachment.filename, docType,
-        });
-        skippedDocTypes.push(docType);
+        await writeLog("info", "gmail",
+            `Attachment is ${preCheckLabel}, skipping`, {
+              messageId, filename: attachment.filename,
+              docType: preCheckLabel,
+            });
+        skippedDocTypes.push(preCheckLabel);
         continue;
       }
 
@@ -5438,8 +5705,19 @@ async function processGmailMessage(
                   error: preCheckErr.message,
                 });
           }
+          const preCheckLabel = docType;
+          docType = normalizePreCheckDocType(docType, {
+            subject, from, filename: attachment.filename,
+          });
+          if (preCheckLabel !== docType && docType === "INVOICE") {
+            await writeLog("info", "gmail",
+                "Carrier statement PDF from raw MIME — multi-invoice", {
+                  messageId, filename: attachment.filename,
+                  preCheckLabel,
+                });
+          }
           if (docType !== "INVOICE" && docType !== "POD") {
-            skippedDocTypes.push(docType);
+            skippedDocTypes.push(preCheckLabel);
             continue;
           }
           const safeFilename =
@@ -8141,6 +8419,58 @@ exports.checkGmailInbox = onRequest(
 );
 
 /**
+ * Clears prior intake state so a Gmail message can be processed again.
+ * @param {string} messageId Gmail message ID.
+ * @param {object} [tenant] Tenant config.
+ * @return {Promise<void>}
+ */
+async function resetGmailMessageForReprocessing(
+    messageId,
+    tenant = DEFAULT_TENANT,
+) {
+  await tcol(tenant, "emailIntake").doc(messageId).delete();
+  const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
+  const queueSnap = await queueRef.get();
+  if (queueSnap.exists) {
+    await queueRef.set({
+      status: "queued",
+      reprocessRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, {merge: true});
+  }
+}
+
+/**
+ * Re-runs intake for one Gmail message (e.g. after a classifier fix).
+ * @param {object} tenant Tenant config.
+ * @param {string} messageId Gmail message ID.
+ * @param {string} inboxFlowId Flow id for this run.
+ * @return {Promise<object>}
+ */
+async function reprocessGmailMessageForTenant(tenant, messageId, inboxFlowId) {
+  return runWithTenant(tenant, async () => {
+    const gmail = await getTenantGmailClient(tenant);
+    if (!gmail) {
+      return {connected: false, processed: 0, error: "Gmail not connected"};
+    }
+    await resetGmailMessageForReprocessing(messageId, tenant);
+    const lastKnownLoadNumber = await getLastKnownLoadNumber(tenant);
+    await writeLog("info", "gmail", "Reprocessing Gmail message", {
+      messageId,
+      tenantId: tenant.tenantId,
+    });
+    await processGmailMessage(
+        gmail,
+        {id: messageId},
+        inboxFlowId,
+        lastKnownLoadNumber,
+        {fromQueue: true, tenant},
+    );
+    return {connected: true, processed: 1, messageId};
+  });
+}
+
+/**
  * Drains a single tenant's Gmail processing queue.
  * @param {object} tenant Tenant config.
  * @param {string} inboxFlowId Flow id for this queue run.
@@ -8220,9 +8550,18 @@ exports.processGmailQueue = onRequest(
           tenants = await getActiveTenants();
         }
 
+        const reprocessMessageId = req.query.reprocessMessageId ?
+          String(req.query.reprocessMessageId).trim() : "";
+
         const results = [];
         for (const tenant of tenants) {
           try {
+            if (reprocessMessageId) {
+              const r = await reprocessGmailMessageForTenant(
+                  tenant, reprocessMessageId, inboxFlowId);
+              results.push({tenantId: tenant.tenantId, ...r});
+              continue;
+            }
             const r = await processGmailQueueForTenant(tenant, inboxFlowId);
             results.push({tenantId: tenant.tenantId, ...r});
           } catch (tenantErr) {

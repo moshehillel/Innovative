@@ -340,18 +340,29 @@ function buildAdditionalChargeApprovalEmail(opts) {
     baseUrl, invoiceId, tenantId, loadNumber, carrierName, customerName,
     invoiceAmount, primusAmount, charges, chargesTotal, category,
     freightMismatch, hasCertificate, dispatcherName, rateValidation,
+    actionUrl: actionUrlFn,
   } = opts;
 
-  const actionUrl = (option) =>
-    `${baseUrl}/additionalChargeAction?invoiceId=` +
-    `${encodeURIComponent(invoiceId)}&option=${option}` +
-    (tenantId ? `&tenantId=${encodeURIComponent(tenantId)}` : "");
+  const emailTokens = require("./email-action-tokens");
+  const actionUrl = typeof actionUrlFn === "function" ?
+    actionUrlFn :
+    (option) => emailTokens.buildConfirmUrl({
+      baseUrl,
+      path: "additionalChargeAction",
+      action: "additionalCharge",
+      invoiceId,
+      option,
+      tenantId,
+    });
 
   const btn = (option, color, label) =>
     `<p style="margin:10px 0"><a href="${actionUrl(option)}" ` +
     `style="background:${color};color:#ffffff;padding:10px 16px;` +
     `border-radius:6px;text-decoration:none;font-weight:600;` +
-    `display:inline-block">${label}</a></p>`;
+    `display:inline-block">${label}</a></p>` +
+    `<p style="font-size:11px;color:#9ca3af;margin:0 0 8px">` +
+    `Opens a confirmation page — nothing happens until you click ` +
+    `Confirm.</p>`;
 
   const mm = freightMismatch || {};
   const mmDetails = mm.details || {};

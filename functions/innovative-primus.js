@@ -410,7 +410,10 @@ function buildCustomerEmailApprovalHtml(opts) {
     `<a href="${rejectUrl}" style="display:inline-block;` +
     `padding:10px 20px;background:#dc2626;color:#fff;` +
     `text-decoration:none;border-radius:8px;font-weight:700">` +
-    `Reject</a></p>`
+    `Reject</a></p>` +
+    `<p style="font-size:12px;color:#6b7280;margin-top:14px">` +
+    `Each button opens a confirmation page — nothing is sent until you ` +
+    `click Confirm.</p>`
   );
 }
 
@@ -2369,14 +2372,23 @@ exports.processPrimusWorkflow = onRequest(
 
           const baseUrl = `https://${req.get("host")}`;
           const tenantId = (req.body && req.body.tenantId) || null;
-          const tq = tenantId ?
-            `&tenantId=${encodeURIComponent(tenantId)}` : "";
-          const approveUrl =
-            `${baseUrl}/approveCustomerEmail?invoiceId=` +
-            `${encodeURIComponent(invoiceId)}&decision=approve${tq}`;
-          const rejectUrl =
-            `${baseUrl}/approveCustomerEmail?invoiceId=` +
-            `${encodeURIComponent(invoiceId)}&decision=reject${tq}`;
+          const emailActionTokens = require("./email-action-tokens");
+          const approveUrl = emailActionTokens.buildConfirmUrl({
+            baseUrl,
+            path: "approveCustomerEmail",
+            action: "customerEmailApproval",
+            invoiceId,
+            option: "approve",
+            tenantId,
+          });
+          const rejectUrl = emailActionTokens.buildConfirmUrl({
+            baseUrl,
+            path: "approveCustomerEmail",
+            action: "customerEmailApproval",
+            invoiceId,
+            option: "reject",
+            tenantId,
+          });
           const approverEmail =
             process.env.CUSTOMER_EMAIL_APPROVER_EMAIL ||
             process.env.ALERT_EMAIL || null;
