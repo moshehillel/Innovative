@@ -32,5 +32,22 @@ const resolved = ins.resolveInsuranceVendorInvoiceNumber(
 check("email wins over bad pdf", resolved.invoiceNumber, "556677");
 check("source email", resolved.invoiceNumberSource, "email");
 
+const {addable, skipped} = ins.classifyRows([
+  {rowIndex: 1, bol: "264100", carrier: "Acme", amount: 35},
+  {rowIndex: 58, bol: "261835", carrier: "Aviva", amount: -35},
+  {rowIndex: 55, bol: "", carrier: "", amount: 2643.88, description: "Total"},
+]);
+check("credit skipped", skipped.filter(
+    (r) => r.reason === ins.SKIP_REASON.CREDIT_MANUAL).length, 1);
+check("credit reason", skipped.find(
+    (r) => r.reason === ins.SKIP_REASON.CREDIT_MANUAL).bol, "261835");
+check("premium addable", addable.length, 1);
+
+check("summary row excluded",
+    ins.isInsuranceSummaryRow(
+        {carrier: "", bol: "", amount: 2643.88, description: "Invoice Total"},
+        ["", "", "Invoice Total", 2643.88]),
+    true);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

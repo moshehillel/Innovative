@@ -70,6 +70,8 @@ const SKIP_REASON = {
   NO_BOL: "NO_BOL",
   LOAD_NOT_FOUND: "LOAD_NOT_FOUND",
   ZERO_AMOUNT: "ZERO_AMOUNT",
+  CREDIT_MANUAL: "CREDIT_MANUAL",
+  DUPLICATE_INSURANCE: "DUPLICATE_INSURANCE",
   POST_FAILED: "POST_FAILED",
 };
 
@@ -89,6 +91,16 @@ function skipReasonText(code, ctx = {}) {
         "Primus.";
     case SKIP_REASON.ZERO_AMOUNT:
       return "Premium amount is zero or unreadable on the Excel row.";
+    case SKIP_REASON.CREDIT_MANUAL:
+      return "Credit for a canceled premium — enter manually in Primus " +
+        "(Jerry does not auto-post credits).";
+    case SKIP_REASON.DUPLICATE_INSURANCE:
+      return "This load already has an insurance charge in Primus" +
+        (ctx.existingBill ? ` (bill # ${ctx.existingBill}` +
+          (ctx.existingAmount != null ?
+            `, $${Number(ctx.existingAmount).toFixed(2)}` : "") +
+          ")" : "") +
+        " — review before adding another.";
     case SKIP_REASON.POST_FAILED:
       return "Premium could not be posted to Primus" +
         (ctx.error ? `: ${ctx.error}` : ".");
@@ -186,6 +198,29 @@ function extractBol(row, cols) {
 }
 
 /**
+ * True when an Excel row is a subtotal / invoice-total footer, not a shipment.
+ * @param {object} row Normalized row {carrier, description, bol, amount}.
+ * @param {Array<*>} raw Raw sheet row cells.
+ * @return {boolean}
+ */
+function isInsuranceSummaryRow(row, raw) {
+  const cells = Array.isArray(raw) ? raw : [];
+  const combined = [
+    row.carrier, row.description, row.bol,
+    ...cells.map((c) => String(c == null ? "" : c)),
+  ].join(" ").toLowerCase();
+  if (/sub\s*total|subtotal|invoice\s*total|grand\s*total/.test(combined) ||
+      /total\s*due|amount\s*due|total\s*invoice/.test(combined)) {
+    return true;
+  }
+  // Footer rows: dollar total with no carrier and no BOL (Redkik sheet totals).
+  if (!row.bol && !String(row.carrier || "").trim() && Number(row.amount) > 0) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Parses the per-shipment insurance Excel into normalized rows.
  * @param {Buffer|string} input Workbook buffer or a file path.
  * @return {{columns: Object<string, number>, rows: Array<object>}}
@@ -211,16 +246,20 @@ function parseInsuranceExcel(input) {
     const amount = parseAmount(raw[columns.amount]);
     const carrier = String(raw[columns.carrier] == null ?
       "" : raw[columns.carrier]).trim();
-    // Skip fully blank trailing rows that carry neither carrier nor amount.
-    if (!carrier && amount === 0) continue;
-    rows.push({
+    const description = String(raw[columns.description] == null ?
+      "" : raw[columns.description]).trim();
+    const bol = extractBol(raw, columns);
+    const row = {
       rowIndex: i + 1,
-      bol: extractBol(raw, columns),
+      bol,
       carrier,
       amount,
-      description: String(raw[columns.description] == null ?
-        "" : raw[columns.description]).trim(),
-    });
+      description,
+    };
+    if (isInsuranceSummaryRow(row, raw)) continue;
+    // Skip fully blank trailing rows that carry neither carrier nor amount.
+    if (!carrier && amount === 0) continue;
+    rows.push(row);
   }
   return {columns, rows};
 }
@@ -365,7 +404,9 @@ function classifyRows(rows) {
   const addable = [];
   const skipped = [];
   for (const row of rows) {
-    if (row.amount <= 0) {
+    if (row.amount < 0) {
+      skipped.push({...row, reason: SKIP_REASON.CREDIT_MANUAL});
+    } else if (row.amount <= 0) {
       skipped.push({...row, reason: SKIP_REASON.ZERO_AMOUNT});
     } else if (!row.bol) {
       skipped.push({...row, reason: SKIP_REASON.NO_BOL});
@@ -411,7 +452,19 @@ async function applyPremiums(opts) {
       result = {ok: false, error: err && err.message};
     }
     if (result && result.ok) {
-      posted.push({...row, loadNumber: result.loadNumber || null});
+      posted.push({
+        ...row,
+        loadNumber: result.loadNumber || null,
+        alreadyPosted: !!result.skipped,
+      });
+    } else if (result && result.duplicate) {
+      failed.push({
+        ...row,
+        reason: SKIP_REASON.DUPLICATE_INSURANCE,
+        existingBill: result.existingBill || null,
+        existingAmount: result.existingAmount,
+        error: result.error,
+      });
     } else if (result && result.notFound) {
       failed.push({...row, reason: SKIP_REASON.LOAD_NOT_FOUND});
     } else {
@@ -471,22 +524,50 @@ function buildReconciliationEmail(opts) {
   const invNo = invoice.invoiceNumber ? ` #${invoice.invoiceNumber}` : "";
 
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
-  const skippedRowsHtml = skipped.length ?
-    skipped.map((r) =>
-      `<tr>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `${escapeHtml(r.carrier || "—")}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `${escapeHtml(r.bol || "(none)")}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee;` +
-      `text-align:right">${money(r.amount)}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `Row ${r.rowIndex}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `${escapeHtml(skipReasonText(r.reason, r))}</td>` +
-      `</tr>`).join("") :
-    `<tr><td colspan="5" style="padding:8px 12px;color:#16a34a">` +
-      `Every premium was posted — nothing skipped.</td></tr>`;
+  const rowTable = (rows, emptyMsg) => {
+    if (!rows.length) {
+      return `<p style="color:#6b7280;font-size:14px">${emptyMsg}</p>`;
+    }
+    return `<table style="border-collapse:collapse;font-size:13px;` +
+      `min-width:640px;margin:8px 0 16px">` +
+      `<thead><tr>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">Carrier</th>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">BOL</th>` +
+      `<th style="padding:4px 12px;text-align:right;border-bottom:2px solid ` +
+      `#ccc">Premium</th>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">Excel</th>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">Action</th>` +
+      `</tr></thead><tbody>` +
+      rows.map((r) =>
+        `<tr>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `${escapeHtml(r.carrier || "—")}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `${escapeHtml(r.bol || "(none)")}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee;` +
+        `text-align:right">${money(r.amount)}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `Row ${r.rowIndex}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `${escapeHtml(skipReasonText(r.reason, r))}</td>` +
+        `</tr>`).join("") +
+      `</tbody></table>`;
+  };
+
+  const credits = skipped.filter((r) => r.reason === SKIP_REASON.CREDIT_MANUAL);
+  const duplicates = skipped.filter(
+      (r) => r.reason === SKIP_REASON.DUPLICATE_INSURANCE);
+  const missingLoad = skipped.filter((r) =>
+    r.reason === SKIP_REASON.NO_BOL || r.reason === SKIP_REASON.LOAD_NOT_FOUND);
+  const otherSkipped = skipped.filter((r) =>
+    r.reason !== SKIP_REASON.CREDIT_MANUAL &&
+    r.reason !== SKIP_REASON.DUPLICATE_INSURANCE &&
+    r.reason !== SKIP_REASON.NO_BOL &&
+    r.reason !== SKIP_REASON.LOAD_NOT_FOUND);
 
   const reconLine = rec.matchesInvoice ?
     `<span style="color:#16a34a;font-weight:700">` +
@@ -516,26 +597,38 @@ function buildReconciliationEmail(opts) {
     `<tr><td style="padding:4px 16px 4px 0">Premiums NOT posted</td>` +
     `<td style="font-weight:700">${rec.skippedCount} ` +
     `(${money(rec.skippedSum)})</td></tr>` +
-    `<tr><td style="padding:4px 16px 4px 0">Excel total (all rows)</td>` +
+    `<tr><td style="padding:4px 16px 4px 0">Excel total (shipment rows)</td>` +
     `<td>${money(rec.excelSum)} across ${rec.excelRowCount} rows</td></tr>` +
     `</table>` +
-    `<h3>Rows not posted (${rec.skippedCount})</h3>` +
-    `<table style="border-collapse:collapse;font-size:13px;min-width:640px">` +
-    `<thead><tr>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">Carrier</th>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">BOL</th>` +
-    `<th style="padding:4px 12px;text-align:right;border-bottom:2px solid ` +
-    `#ccc">Premium</th>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">Excel</th>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">Why not posted</th>` +
-    `</tr></thead><tbody>${skippedRowsHtml}</tbody></table>`;
+    (credits.length ?
+      `<h3 style="color:#b45309">Credits — enter manually (${credits.length})` +
+      `</h3>` +
+      `<p style="font-size:14px">These are canceled-premium credits. Jerry ` +
+      `did not post them — please enter in Primus yourself.</p>` +
+      rowTable(credits, "") : "") +
+    (duplicates.length ?
+      `<h3 style="color:#dc2626">Duplicate insurance on load (` +
+      `${duplicates.length})</h3>` +
+      `<p style="font-size:14px">These loads already had an insurance charge ` +
+      `in Primus. Jerry did not add a second premium.</p>` +
+      rowTable(duplicates, "") : "") +
+    (missingLoad.length ?
+      `<h3>Could not find load — needs review (${missingLoad.length})</h3>` +
+      `<p style="font-size:14px">No BOL on the Excel row, or the BOL did ` +
+      `not match a load in Primus. Please locate the shipment and handle ` +
+      `manually.</p>` +
+      rowTable(missingLoad, "") : "") +
+    (otherSkipped.length ?
+      `<h3>Other rows not posted (${otherSkipped.length})</h3>` +
+      rowTable(otherSkipped, "") : "") +
+    (!skipped.length ?
+      `<p style="color:#16a34a;font-weight:600">Every premium was posted — ` +
+      `nothing skipped.</p>` : "");
 
   const subject = `Insurance reconciliation — ${vendor}${invNo}: ` +
-    `${rec.postedCount} posted, ${rec.skippedCount} skipped`;
+    `${rec.postedCount} posted, ${rec.skippedCount} skipped` +
+    (credits.length ? `, ${credits.length} credit(s)` : "") +
+    (duplicates.length ? `, ${duplicates.length} duplicate(s)` : "");
   return {subject, html};
 }
 
@@ -965,6 +1058,7 @@ module.exports = {
   parseInsuranceExcel,
   parseInsuranceInvoicePdf,
   classifyRows,
+  isInsuranceSummaryRow,
   sumAmounts,
   applyPremiums,
   buildReconciliation,
@@ -1031,6 +1125,15 @@ function createInsurancePostAdapter(deps) {
     });
     if (result.notFound) {
       return {ok: false, notFound: true, error: result.error};
+    }
+    if (result.duplicate) {
+      return {
+        ok: false,
+        duplicate: true,
+        error: result.error,
+        existingBill: result.existingBill,
+        existingAmount: result.existingAmount,
+      };
     }
     if (!result.ok) {
       return {

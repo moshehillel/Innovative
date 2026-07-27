@@ -2289,7 +2289,7 @@ function buildInsuranceBillsInfo(vendor, bill, termsId) {
     total: amount,
     breakdown: [{
       code: "",
-      description: "",
+      description: "insurance",
       qty: 1,
       rate: amount,
       total: amount,
@@ -2313,7 +2313,7 @@ function buildInsuranceActualCostLine(vendor, bill, lineId) {
   return {
     id: lineId != null ? String(lineId) : "",
     code: "",
-    description: "",
+    description: "insurance",
     carrierId: String(vendor.id),
     carrierName: String(vendor.name || ""),
     qty: 1,
@@ -2494,8 +2494,9 @@ async function addInsurancePremiumToLoad(args) {
   const insuranceVendor = args.insuranceVendor ||
     await resolveInsuranceVendor();
 
-  const existing = actualCosts.find((c) =>
-    String(c.carrierId) === String(insuranceVendor.id) &&
+  const insuranceLines = actualCosts.filter((c) =>
+    String(c.carrierId) === String(insuranceVendor.id));
+  const existing = insuranceLines.find((c) =>
     String(c.vendorInvoiceNumber) === vendorInvoiceNumber);
   if (existing && moneyEquals(existing.total, premium)) {
     return {
@@ -2505,6 +2506,18 @@ async function addInsurancePremiumToLoad(args) {
       loadNumber,
       invoiceId,
       premium,
+    };
+  }
+  if (insuranceLines.length > 0) {
+    const prior = insuranceLines[0];
+    return {
+      ok: false,
+      duplicate: true,
+      error: `Load ${loadNumber} already has insurance in Primus`,
+      existingBill: prior.vendorInvoiceNumber || null,
+      existingAmount: prior.total,
+      loadNumber,
+      invoiceId,
     };
   }
 
