@@ -31,6 +31,7 @@ const undeliveredReport = require("./undelivered-shipment-report");
 const additionalCharges = require("./additional-charges");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
+const loadResolution = require("./invoice-load-resolution");
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
 
@@ -287,6 +288,112 @@ function isCarrierInvoicePastDue(item, asOf) {
   const todayUtc = Date.UTC(
       ref.getUTCFullYear(), ref.getUTCMonth(), ref.getUTCDate());
   return dueUtc < todayUtc;
+}
+
+/**
+ * True when the carrier bill for this load appears already entered in
+ * Primus (vendor ref / PRO match, carrier-bill document, or REST invoice).
+ * @param {object} item AI invoice item.
+ * @return {Promise<boolean>}
+ */
+async function isCarrierBillAlreadyEnteredInPrimus(item) {
+  const loadNumber = item && item.loadNumber;
+  if (!loadNumber) return false;
+  const carrierInvNum = String(item.invoiceNumber || "").trim();
+  const proNumber = String(item.proNumber || "").trim();
+  const carrierBol = String(item.carrierBolNumber || "").trim();
+  const invoiceAmount = Number(item.invoiceAmount || 0);
+
+  try {
+    let booking = await fetchPrimusBooking(loadNumber);
+    if (!booking && proNumber) {
+      booking = await fetchPrimusBookingByPro(proNumber);
+    }
+    if (!booking && carrierBol) {
+      booking = await fetchPrimusBookingByPro(carrierBol);
+    }
+    if (!booking) return false;
+
+    const carrierRef = String(
+        (booking.vendor && booking.vendor.carrierRef) ||
+        booking.carrierRef || "").trim();
+    const bookingPro = String(
+        (booking.vendor && booking.vendor.PRO) || "").trim();
+
+    if (carrierInvNum && carrierRef && carrierInvNum === carrierRef) {
+      return true;
+    }
+    if (proNumber && bookingPro && proNumber === bookingPro) {
+      return true;
+    }
+
+    const vendorCost = Number(booking.vendor && booking.vendor.cost || 0);
+    if (vendorCost > 0 && invoiceAmount > 0 && (carrierRef || bookingPro)) {
+      const diff = Math.abs(vendorCost - invoiceAmount);
+      const tolerance = Math.max(0.50, vendorCost * 0.02);
+      if (diff <= tolerance) return true;
+    }
+
+    if (process.env.PRIMUS_USE_MANAGE_PHP === "true") {
+      try {
+        const bridge = require("./primus-ui-bridge");
+        const bookingId = bridge.resolveManageBookingId(booking);
+        if (bookingId) {
+          const docs = await bridge.getBookingDocuments({
+            bookingId,
+            bookingBOL: String(loadNumber),
+          });
+          if (docs.ok && docs.data) {
+            const fileLists = [
+              docs.data.files,
+              docs.data.documents,
+              docs.data.bookingDocuments,
+            ].filter(Array.isArray);
+            for (const list of fileLists) {
+              for (const f of list) {
+                const name = String(
+                    f.name || f.fileName || f.description || "",
+                ).toLowerCase();
+                if (/carrier bill|vendor bill/.test(name)) return true;
+              }
+            }
+          }
+        }
+      } catch (_) {
+        // UI lookup is best-effort.
+      }
+    }
+
+    const invData = await primusRequest(
+        "GET",
+        `/invoice/bolnumber/${encodeURIComponent(loadNumber)}`);
+    const results = invData && invData.data && invData.data.results;
+    const list = Array.isArray(results) ?
+      results : (results ? [results] : []);
+    for (const inv of list) {
+      const vin = String(
+          inv.vendorInvoiceNumber || inv.carrierInvoiceNumber || "",
+      ).trim();
+      if (carrierInvNum && vin && carrierInvNum === vin) return true;
+    }
+
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Reads customer sell rate from a Primus booking when available.
+ * @param {object|null} booking Primus booking.
+ * @return {number|null}
+ */
+function customerRateFromBooking(booking) {
+  if (!booking) return null;
+  const {rate} = readCustomerRateFromAcct(
+      booking.accountingInformation || {});
+  const n = Number(rate);
+  return Number.isFinite(n) && n > 0 ? n : null;
 }
 
 /**
@@ -601,24 +708,8 @@ function checkSafeToSummarize(logs) {
   return {safe: true, reason: `Idle for ${Math.round(minutesSinceLastLog)}m`};
 }
 
-/**
- * Normalizes a load number by stripping spaces and dashes.
- * @param {string|null|undefined} loadNumber Raw load number.
- * @return {string} Normalized load number.
- */
-function normalizeLoadNumber(loadNumber) {
-  return String(loadNumber || "").replace(/[\s-]/g, "").trim();
-}
-
-/**
- * Validates a load number is 5–9 digits.
- * @param {string|null|undefined} loadNumber Raw load number.
- * @return {boolean} True if valid.
- */
-function isValidLoadNumber(loadNumber) {
-  const normalized = normalizeLoadNumber(loadNumber);
-  return /^\d{5,9}$/.test(normalized);
-}
+const normalizeLoadNumber = loadResolution.normalizeLoadNumber;
+const isValidLoadNumber = loadResolution.isValidLoadNumber;
 
 /**
  * Builds PRO search string variants (with/without dashes).
@@ -712,6 +803,97 @@ async function resolveLoadNumberFromPrimusPro(proNumber) {
   const matchedPro = (booking.vendor && booking.vendor.PRO) ||
     String(proNumber || "").trim() || null;
   return {loadNumber, booking, matchedPro};
+}
+
+/**
+ * Tries Primus BOL and vendorPro lookups for a carrier reference value.
+ * @param {string} ref Reference digits or dashed form.
+ * @return {Promise<object|null>} {loadNumber, booking, source, matchedPro?}
+ */
+async function resolveLoadNumberFromCarrierReference(ref) {
+  const raw = String(ref || "").trim();
+  if (!raw) return null;
+
+  try {
+    const booking = await fetchPrimusBooking(raw);
+    if (booking) {
+      const loadNumber = readBolFromBooking(booking);
+      if (loadNumber) {
+        return {loadNumber, booking, source: "bolnumber", matchedPro: null};
+      }
+    }
+  } catch (_) {
+    // BOL lookup is best-effort.
+  }
+
+  try {
+    const resolved = await resolveLoadNumberFromPrimusPro(raw);
+    if (resolved.loadNumber) {
+      return {
+        loadNumber: resolved.loadNumber,
+        booking: resolved.booking,
+        source: "vendor_pro",
+        matchedPro: resolved.matchedPro,
+      };
+    }
+  } catch (_) {
+    // PRO lookup is best-effort.
+  }
+
+  return null;
+}
+
+/**
+ * Sanitizes carrier reference fields and resolves a Primus load when possible.
+ * @param {object} aiResult AI classification row.
+ * @param {number|null} lastKnownLoadNumber Recent Primus load, if known.
+ * @return {Promise<object>} {aiResult, gateFailed, loadResolvedFrom}
+ */
+async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
+  const refs = loadResolution.normalizeCarrierReferenceFields(aiResult);
+  const normalizedProNumber = refs.proNumber || "";
+
+  const direct = loadResolution.evaluateLoadCandidate(
+      refs.loadNumber, normalizedProNumber, lastKnownLoadNumber);
+  if (direct.ok) {
+    return {
+      aiResult: {...refs, loadNumber: direct.loadNumber},
+      gateFailed: false,
+      loadResolvedFrom: null,
+    };
+  }
+
+  const lookupKeys = loadResolution.buildPrimusLookupKeys(refs);
+  for (const {ref, label} of lookupKeys) {
+    const found = await resolveLoadNumberFromCarrierReference(ref);
+    if (!found || !found.loadNumber) continue;
+
+    const accepted = loadResolution.evaluateLoadCandidate(
+        found.loadNumber, normalizedProNumber, lastKnownLoadNumber);
+    if (!accepted.ok) continue;
+
+    return {
+      aiResult: {
+        ...refs,
+        loadNumber: accepted.loadNumber,
+        loadNumberSource: `primus_${label}_${found.source}`,
+      },
+      gateFailed: false,
+      loadResolvedFrom: {
+        via: label,
+        ref,
+        matchedPro: found.matchedPro || null,
+        primusSource: found.source,
+      },
+    };
+  }
+
+  return {
+    aiResult: refs,
+    gateFailed: true,
+    loadResolvedFrom: null,
+    gateReason: direct.reason || "lookup_failed",
+  };
 }
 
 /**
@@ -1706,6 +1888,28 @@ function buildEmailActionConfirmPage(opts) {
         `<input type="hidden" name="${escapeHtml(name)}" ` +
         `value="${escapeHtml(String(value ?? ""))}">`)
       .join("");
+  const inputFields = Array.isArray(opts.inputFields) ? opts.inputFields : [];
+  const inputs = inputFields.map((field) => {
+    const attrs = [
+      `type="${escapeHtml(field.type || "text")}"`,
+      `name="${escapeHtml(field.name)}"`,
+      `id="${escapeHtml(field.name)}"`,
+      field.value != null && field.value !== "" ?
+        `value="${escapeHtml(String(field.value))}"` : "",
+      field.required ? "required" : "",
+      field.min != null ? `min="${escapeHtml(String(field.min))}"` : "",
+      field.step != null ? `step="${escapeHtml(String(field.step))}"` : "",
+      field.placeholder ?
+        `placeholder="${escapeHtml(field.placeholder)}"` : "",
+    ].filter(Boolean).join(" ");
+    return `<label for="${escapeHtml(field.name)}" ` +
+      `style="display:block;font-size:14px;font-weight:600;` +
+      `color:#374151;margin-bottom:6px">` +
+      `${escapeHtml(field.label || field.name)}</label>` +
+      `<input ${attrs} style="width:100%;max-width:240px;padding:10px 12px;` +
+      `border:1px solid #d1d5db;border-radius:8px;font-size:16px;` +
+      `margin-bottom:16px">`;
+  }).join("");
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${escapeHtml(opts.title || "Confirm")}</title></head>` +
@@ -1718,6 +1922,7 @@ function buildEmailActionConfirmPage(opts) {
     `<form method="POST" action="/${escapeHtml(opts.actionPath)}" ` +
     `style="margin-top:24px">` +
     hidden +
+    inputs +
     `<button type="submit" style="background:${btnColor};` +
     `color:#fff;border:none;padding:12px 20px;border-radius:8px;` +
     `font-size:16px;font-weight:600;cursor:pointer">` +
@@ -1726,6 +1931,36 @@ function buildEmailActionConfirmPage(opts) {
     `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
     `If you did not request this, close this page — nothing has been ` +
     `changed yet.</p></body></html>`;
+}
+
+/**
+ * Resolves the current customer sell rate for an invoice (Primus / doc).
+ * @param {object} invoice Invoice document data.
+ * @param {object|null} booking Primus booking, if already loaded.
+ * @return {Promise<number>} Customer rate, or 0 if unknown.
+ */
+async function resolveCurrentCustomerRate(invoice, booking) {
+  let baseRate = Number(invoice.customerRate || 0);
+  if (!baseRate) {
+    try {
+      const rateResult = await getCustomerRate(
+          invoice.loadNumber, invoice.proNumber);
+      if (rateResult && rateResult.ok) {
+        baseRate = Number(rateResult.customerRate || 0);
+      }
+    } catch (_) {
+      baseRate = 0;
+    }
+  }
+  if (!baseRate && booking) {
+    const {rate} = readCustomerRateFromAcct(
+        booking.accountingInformation || {});
+    baseRate = Number(rate || 0);
+  }
+  if (!baseRate && booking) {
+    baseRate = Number(customerRateFromBooking(booking) || 0);
+  }
+  return baseRate > 0 ? baseRate : 0;
 }
 
 /**
@@ -1874,7 +2109,7 @@ async function handleAdditionalChargeAction(req, res) {
     };
 
     if (req.method !== "POST") {
-      return res.status(200).send(buildEmailActionConfirmPage({
+      const confirmOpts = {
         title: `Confirm option ${option.toUpperCase()}`,
         description:
           `Load ${invoice.loadNumber || invoiceId}: ` +
@@ -1890,10 +2125,53 @@ async function handleAdditionalChargeAction(req, res) {
           exp: String(exp),
           sig: String(sig),
         },
-      }));
+      };
+      if (option === "b") {
+        let bookingForRate = null;
+        try {
+          bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
+        } catch (_) {
+          // Best-effort default for the amount field.
+        }
+        const chargesTotalPreview = Number(charge.amount) || 0;
+        const currentRate = await resolveCurrentCustomerRate(
+            invoice, bookingForRate);
+        const suggestedRate = currentRate > 0 ?
+          Math.round((currentRate + chargesTotalPreview) * 100) / 100 :
+          (chargesTotalPreview > 0 ? chargesTotalPreview : "");
+        confirmOpts.description =
+          `Load ${invoice.loadNumber || invoiceId}: ` +
+          `${optionLabels[option]}. Enter the updated customer rate ` +
+          `(total amount to bill the customer). The dispatcher will be ` +
+          `asked to notify the customer of that amount.`;
+        confirmOpts.inputFields = [{
+          name: "updatedCustomerRate",
+          label: "Updated customer rate ($)",
+          type: "number",
+          min: "0.01",
+          step: "0.01",
+          value: suggestedRate,
+          required: true,
+          placeholder: "0.00",
+        }];
+        if (currentRate > 0) {
+          confirmOpts.description +=
+            ` Current rate in Primus: $${currentRate.toFixed(2)}.`;
+        }
+      }
+      return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
     }
 
     const decision = option.toUpperCase();
+    if (option === "b") {
+      const updatedRate = Number(
+          (req.body && req.body.updatedCustomerRate) || 0);
+      if (!updatedRate || updatedRate <= 0 || !Number.isFinite(updatedRate)) {
+        return res.status(400).send(
+            "Option B requires a valid updated customer rate amount.");
+      }
+    }
+
     const claim = await claimAdditionalChargeDecision(invoiceRef, decision);
     if (!claim.ok) {
       if (claim.reason === "already") {
@@ -1930,13 +2208,15 @@ async function handleAdditionalChargeAction(req, res) {
         charges: chargeRows,
         category: charge.category,
         freightMismatch: charge.freightMismatch,
+        customerRate: invoice.customerRate ||
+          customerRateFromBooking(booking),
       });
-      await saveOutboundEmail({
+      await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
         type: "carrier_dispute_draft",
         invoiceId: String(invoiceId),
         subject: dispute.subject,
         html: dispute.html,
-      });
+      }));
       await invoiceRef.update({
         "additionalCharge.decision": decision,
         "additionalCharge.approved": false,
@@ -1966,8 +2246,8 @@ async function handleAdditionalChargeAction(req, res) {
     // Options a/b/c — the charge is approved for the carrier side.
     const billCustomer = option === "a" || option === "b";
 
-    // A/B: auto-bump customer sell rate by the approved charge amount so
-    // the customer invoice reflects the extras without a manual set-rate.
+    // A: auto-bump customer sell rate by the approved charge amount.
+    // B: approver enters the updated customer rate on the confirm page.
     let rateBumpNote = "";
     const approvalUpdate = {
       "additionalCharge.decision": decision,
@@ -1991,36 +2271,39 @@ async function handleAdditionalChargeAction(req, res) {
     };
 
     if (billCustomer && chargesTotal > 0) {
-      let baseRate = Number(invoice.customerRate || 0);
-      if (!baseRate) {
-        try {
-          const rateResult = await getCustomerRate(
-              invoice.loadNumber, invoice.proNumber);
-          if (rateResult && rateResult.ok) {
-            baseRate = Number(rateResult.customerRate || 0);
-          }
-        } catch (_) {
-          baseRate = 0;
+      if (option === "b") {
+        const updatedRate = Math.round(
+            Number((req.body && req.body.updatedCustomerRate) || 0) * 100) /
+          100;
+        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+        approvalUpdate.customerRate = updatedRate;
+        approvalUpdate["additionalCharge.originalCustomerRate"] =
+          baseRate > 0 ? baseRate : null;
+        approvalUpdate["additionalCharge.bumpedCustomerRate"] = updatedRate;
+        approvalUpdate["additionalCharge.rateBumpAmount"] =
+          baseRate > 0 ?
+            Math.round((updatedRate - baseRate) * 100) / 100 :
+            updatedRate;
+        rateBumpNote = ` Customer rate set to $${updatedRate.toFixed(2)}` +
+          (baseRate > 0 ?
+            ` (was $${baseRate.toFixed(2)}).` : ".");
+        invoice.customerRate = updatedRate;
+      } else if (option === "a") {
+        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+        if (baseRate > 0) {
+          const bumpedRate =
+            Math.round((baseRate + chargesTotal) * 100) / 100;
+          approvalUpdate.customerRate = bumpedRate;
+          approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
+          approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
+          approvalUpdate["additionalCharge.rateBumpAmount"] = chargesTotal;
+          rateBumpNote = ` Customer rate auto-bumped from ` +
+            `$${baseRate.toFixed(2)} to $${bumpedRate.toFixed(2)}.`;
+          invoice.customerRate = bumpedRate;
+        } else {
+          rateBumpNote = " Could not resolve the current customer rate — " +
+            "please bump it manually before invoicing.";
         }
-      }
-      if (!baseRate && booking) {
-        const {rate} = readCustomerRateFromAcct(
-            booking.accountingInformation || {});
-        baseRate = Number(rate || 0);
-      }
-      if (baseRate > 0) {
-        const bumpedRate =
-          Math.round((baseRate + chargesTotal) * 100) / 100;
-        approvalUpdate.customerRate = bumpedRate;
-        approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
-        approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
-        approvalUpdate["additionalCharge.rateBumpAmount"] = chargesTotal;
-        rateBumpNote = ` Customer rate auto-bumped from ` +
-          `$${baseRate.toFixed(2)} to $${bumpedRate.toFixed(2)}.`;
-        invoice.customerRate = bumpedRate;
-      } else {
-        rateBumpNote = " Could not resolve the current customer rate — " +
-          "please bump it manually before invoicing.";
       }
     }
 
@@ -2044,16 +2327,19 @@ async function handleAdditionalChargeAction(req, res) {
           charges: chargeRows,
           chargesTotal,
           category: charge.category,
+          customerRate: invoice.customerRate ||
+            customerRateFromBooking(booking),
         });
-        await saveOutboundEmail({
-          type: "additional_charge_customer_notice",
-          invoiceId: String(invoiceId),
-          forceRecipient: true,
-          to: customerEmail,
-          subject: note.subject,
-          html: note.html,
-          skipAgentGreeting: true,
-        });
+        await saveOutboundEmail(
+            additionalCharges.applyAdditionalChargeEmailCc({
+              type: "additional_charge_customer_notice",
+              invoiceId: String(invoiceId),
+              forceRecipient: true,
+              to: customerEmail,
+              subject: note.subject,
+              html: note.html,
+              skipAgentGreeting: true,
+            }));
         extraNote += ` The customer was notified at ${customerEmail}.`;
       } else {
         extraNote += " Could not resolve the customer email from Primus — " +
@@ -2084,6 +2370,10 @@ async function handleAdditionalChargeAction(req, res) {
         customerName,
         charges: chargeRows,
         chargesTotal,
+        customerRate: invoice.customerRate ||
+          customerRateFromBooking(booking),
+        originalCustomerRate:
+          approvalUpdate["additionalCharge.originalCustomerRate"] || null,
       });
       const podFollowup = require("./pod-followup");
       const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
@@ -2104,7 +2394,8 @@ async function handleAdditionalChargeAction(req, res) {
         extraNote += " Could not resolve the dispatcher email — the " +
           "reminder went to the ops mailbox instead.";
       }
-      await saveOutboundEmail(reminderPayload);
+      await saveOutboundEmail(
+          additionalCharges.applyAdditionalChargeEmailCc(reminderPayload));
       await additionalCharges.updateFollowUp(db, {
         invoiceId: String(invoiceId),
         status: additionalCharges.FOLLOW_UP_STATUS
@@ -3397,6 +3688,18 @@ async function sendAdditionalChargeApprovalEmail(opts) {
   }
 
   const customerName = customerNameFromPrimusBooking(pending.booking);
+  let customerRate = customerRateFromBooking(pending.booking);
+  if (!customerRate && aiResult.loadNumber) {
+    try {
+      const rateResult = await getCustomerRate(
+          aiResult.loadNumber, aiResult.proNumber);
+      if (rateResult.ok && rateResult.customerRate) {
+        customerRate = Number(rateResult.customerRate);
+      }
+    } catch (_) {
+      // optional
+    }
+  }
 
   const followUpId = await additionalCharges.createFollowUp(db, {
     loadNumber: aiResult.loadNumber,
@@ -3427,6 +3730,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     hasCertificate: pending.hasCertificate,
     dispatcherName: dispatcher.displayName || dispatcher.userName || null,
     rateValidation: pending.rateValidation || null,
+    customerRate,
   });
 
   const podFollowup = require("./pod-followup");
@@ -3434,18 +3738,15 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     podFollowup.SARAH_EMAIL;
   const dispatcherEmail = (dispatcher.ok && dispatcher.email) ?
     dispatcher.email : null;
-  const emailPayload = {
+  const emailPayload = additionalCharges.applyAdditionalChargeEmailCc({
     type: "additional_charge_approval",
     invoiceId,
     subject: email.subject,
     html: email.html,
     forceRecipient: true,
     to: approver,
-  };
-  if (dispatcherEmail &&
-      dispatcherEmail.toLowerCase() !== approver.toLowerCase()) {
-    emailPayload.cc = dispatcherEmail;
-  }
+    cc: dispatcherEmail || undefined,
+  });
   await saveOutboundEmail(emailPayload);
 
   await writeLog("info", "email",
@@ -3456,6 +3757,8 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         category: pending.category,
         to: approver,
         ccDispatcher: dispatcherEmail || null,
+        ccLisa: additionalCharges.LISA_EMAIL,
+        customerRate,
       });
 }
 
@@ -3538,6 +3841,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
     invoiceNumber: "",
     loadNumber: "",
     proNumber: "",
+    carrierBolNumber: "",
+    carrierOrderNumber: "",
+    poNumber: "",
     invoiceAmount: 0,
     invoiceDate: "",
     dueDate: "",
@@ -3605,24 +3911,37 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Each invoice gets its OWN pod.documents limited to that load's " +
         "delivery pages only.",
         "Find the actual carrier invoice.",
-        "Load number may appear as Load #, Reference #, " +
-        "Reference Number, Customer Ref, Broker Ref, or Bill of Lading Number.",
-        "Load number may also appear as SHIPPER B/L NUMBER, " +
-        "Invoice Number, B/L, Broker Ref, BOL Number.",
-        "If you cannot find loadNumber using labeled fields, scan for any " +
-        "5–9 digit number (ignoring spaces and dashes).",
-        "If lastKnownLoadNumber is provided, prefer a 5–9 digit candidate " +
-        "where abs(candidate - lastKnownLoadNumber) <= 100000.",
-        "If no valid 5–9 digit candidate is found, return loadNumber as " +
-        "empty string.",
-        "PRO number may appear as PRO #, Carrier PRO, " +
-        "Beyond PRO, Advance PRO, or freight bill number.",
+        "loadNumber is ONLY the broker/customer shipment ID that matches " +
+        "Primus (often labeled Load #, Customer Ref, Broker Ref, Reference " +
+        "#, Reference Number). It is usually 5–9 digits.",
+        "carrierBolNumber is the carrier's Bill of Lading / BOL # when " +
+        "labeled Bill of Lading #, BOL#, Master Bill of Lading, or B/L #. " +
+        "Do NOT put carrier BOL in proNumber or loadNumber unless it is also " +
+        "clearly the broker's Primus load number.",
+        "carrierOrderNumber is the carrier's order / shipment ID when " +
+        "labeled Order Number, Order #, Shipment ID, or similar (any " +
+        "length).",
+        "poNumber is the purchase order when labeled PO # or P.O.",
+        "proNumber is ONLY when the invoice labels PRO #, Carrier PRO, " +
+        "Beyond PRO, Advance PRO, or (LTL only) freight bill number. " +
+        "Leave proNumber empty when no PRO / freight bill field is shown " +
+        "(common on FTL / truckload invoices). Never put Bill of Lading # " +
+        "in proNumber.",
+        "If you cannot find a broker loadNumber using labeled broker fields, " +
+        "scan for a 5–9 digit broker reference (ignoring spaces/dashes).",
+        "If lastKnownLoadNumber is provided, prefer a 5–9 digit broker " +
+        "candidate where abs(candidate - lastKnownLoadNumber) <= 100000.",
+        "If no valid broker loadNumber candidate is found, return loadNumber " +
+        "as empty string.",
+        "Do not put carrier order numbers or 10+ digit carrier IDs in " +
+        "loadNumber — use carrierOrderNumber instead.",
+        "Keep broker loadNumber, carrier BOL, carrier order, PO, and PRO in " +
+        "separate fields.",
+        "Do not use proNumber as loadNumber.",
         "For FedEx Freight invoices, the PRO number is the same as the " +
         "carrier invoice number / tracking number (often 9–12 digits). " +
         "Set proNumber to that tracking number even when a separate broker " +
         "load number is also shown.",
-        "Keep load number and PRO number separate.",
-        "Do not use the PRO number as the load number.",
         "Find invoice total, invoice date, and due date.",
         "invoiceDate is the date the carrier issued the invoice " +
         "(YYYY-MM-DD).",
@@ -4849,6 +5168,67 @@ async function hasEmailBeenProcessed(messageId, tenant = DEFAULT_TENANT) {
 }
 
 /**
+ * Atomically claims an insurance intake so the same Gmail message is not
+ * posted or emailed twice when inbox polling overlaps.
+ * @param {string} messageId Gmail message ID.
+ * @param {object} tenant Tenant config.
+ * @param {object} meta Optional subject/from metadata.
+ * @return {Promise<object>} {ok, reason?, status?}
+ */
+async function claimInsuranceIntake(messageId, tenant, meta = {}) {
+  const ref = tcol(tenant, "emailIntake").doc(String(messageId));
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists) {
+        const status = (snap.data() || {}).finalStatus;
+        if (status === "insurance_processed" ||
+            status === "insurance_processing") {
+          return {ok: false, reason: "already", status};
+        }
+      }
+      tx.set(ref, {
+        gmailMessageId: String(messageId),
+        tenantId: tenant.tenantId,
+        subject: String(meta.subject || "").slice(0, 500),
+        from: String(meta.from || "").slice(0, 500),
+        finalStatus: "insurance_processing",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      return {ok: true};
+    });
+  } catch (err) {
+    await writeLog("warn", "insurance", "Insurance intake claim failed", {
+      messageId,
+      error: err.message,
+    });
+    return {ok: false, reason: "claim_error", error: err.message};
+  }
+}
+
+/**
+ * Removes UNREAD so overlapping inbox polls cannot pick up the same message.
+ * @param {object} gmail Gmail client.
+ * @param {string} messageId Gmail message ID.
+ * @return {Promise<void>}
+ */
+async function markGmailMessageRead(gmail, messageId) {
+  if (!gmail || !messageId) return;
+  try {
+    await gmail.users.messages.modify({
+      userId: "me",
+      id: String(messageId),
+      requestBody: {removeLabelIds: ["UNREAD"]},
+    });
+  } catch (err) {
+    await writeLog("warn", "gmail", "Failed to mark Gmail message read", {
+      messageId,
+      error: err.message,
+    });
+  }
+}
+
+/**
  * Updates the status of a Gmail queue item.
  * @param {string} messageId - Gmail message ID.
  * @param {string} status - Queue item status.
@@ -5316,6 +5696,10 @@ async function processGmailMessage(
       }
     }
 
+    // Drop UNREAD immediately so a second inbox poll cannot start the same
+    // message while insurance posting / AI classification is still running.
+    await markGmailMessageRead(gmail, messageId);
+
     // Insurance intake: AI classifies the whole email, then a valid premium
     // spreadsheet must parse before anything is posted to Primus.
     if (!isTai && attachments.length > 0) {
@@ -5399,11 +5783,30 @@ async function processGmailMessage(
             return;
           }
 
+          const insClaim = await claimInsuranceIntake(messageId, tenant, {
+            subject, from,
+          });
+          if (!insClaim.ok) {
+            await writeLog("warn", "insurance",
+                "Skipped duplicate insurance intake", {
+                  messageId,
+                  subject,
+                  reason: insClaim.reason,
+                  priorStatus: insClaim.status || null,
+                });
+            await updateGmailQueueStatus(
+                messageId, "completed", null, {tenant},
+            );
+            return;
+          }
+
           const insResult = await innovativeInsurance.processInsuranceEmail({
             excelBuffer: resolved.excelBuffer,
             pdfBuffer: resolved.pdfBuffer,
             from,
             subject,
+            emailBody,
+            gmailMessageId: messageId,
           });
 
           if (insResult.handled) {
@@ -5422,6 +5825,9 @@ async function processGmailMessage(
                 pdfFilename: resolved.pdfFilename,
               },
               insuranceReconciliation: insResult.reconciliation || null,
+              insuranceVendorInvoiceNumber:
+                (insResult.invoice && insResult.invoice.invoiceNumber) ||
+                null,
               createdAt: admin.firestore.FieldValue.serverTimestamp(),
               deleteAt: getDeleteAt(30),
             }, {merge: true});
@@ -5435,6 +5841,11 @@ async function processGmailMessage(
                 reason: insResult.reason,
                 classification: emailClassification,
               });
+          await tcol(tenant, "emailIntake").doc(messageId).set({
+            finalStatus: "insurance_failed",
+            insuranceFailureReason: insResult.reason || "unknown",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, {merge: true});
           await forwardWithAnalysis(
               `Insurance email could not be processed automatically ` +
               `(${insResult.reason || "unknown"})`,
@@ -5891,35 +6302,56 @@ async function processGmailMessage(
     }
 
     // Carriers often re-send a packet of old unpaid invoices with a new one.
-    // Only process invoices that are not past due (dueDate < today).
+    // Skip past-due lines only when that bill is already in Primus; otherwise
+    // still process (old unpaid invoices need entry too).
     {
       const beforePastDue = invoiceItems.length;
       const pastDueDropped = [];
-      invoiceItems = invoiceItems.filter((item) => {
-        if (!item || typeof item !== "object") return false;
-        if (!isCarrierInvoicePastDue(item)) return true;
-        pastDueDropped.push({
+      const pastDueKept = [];
+      const kept = [];
+      for (const item of invoiceItems) {
+        if (!item || typeof item !== "object") continue;
+        if (!isCarrierInvoicePastDue(item)) {
+          kept.push(item);
+          continue;
+        }
+        const alreadyInPrimus = await isCarrierBillAlreadyEnteredInPrimus(item);
+        if (alreadyInPrimus) {
+          pastDueDropped.push({
+            loadNumber: item.loadNumber || null,
+            invoiceNumber: item.invoiceNumber || null,
+            dueDate: item.dueDate || null,
+            invoiceAmount: item.invoiceAmount || null,
+            reason: "already_in_primus",
+          });
+          continue;
+        }
+        pastDueKept.push({
           loadNumber: item.loadNumber || null,
           invoiceNumber: item.invoiceNumber || null,
           dueDate: item.dueDate || null,
-          invoiceAmount: item.invoiceAmount || null,
         });
-        return false;
-      });
-      if (pastDueDropped.length > 0) {
+        kept.push(item);
+      }
+      invoiceItems = kept;
+      if (pastDueDropped.length > 0 || pastDueKept.length > 0) {
         await writeLog("info", "ai",
-            "Skipped past-due carrier invoice(s) in email packet", {
+            "Past-due carrier invoice filter", {
               messageId,
-              droppedCount: pastDueDropped.length,
+              droppedAlreadyInPrimus: pastDueDropped.length,
+              keptPastDueNotInPrimus: pastDueKept.length,
               keptCount: invoiceItems.length,
               beforeCount: beforePastDue,
               dropped: pastDueDropped,
+              keptPastDue: pastDueKept,
             });
       }
-      if (invoiceItems.length === 0 && pastDueDropped.length > 0) {
+      if (invoiceItems.length === 0 && pastDueDropped.length > 0 &&
+          pastDueKept.length === 0) {
         await forwardWithAnalysis(
-            "This email only contained past-due carrier invoice(s); " +
-            "nothing current was processed. Dropped: " +
+            "This email only contained past-due carrier invoice(s) " +
+            "already entered in Primus; nothing new was processed. " +
+            "Skipped: " +
             pastDueDropped.map((d) =>
               `load ${d.loadNumber || "—"} ` +
               `(due ${d.dueDate || "—"})`).join("; "),
@@ -6100,74 +6532,42 @@ async function processGmailMessage(
       });
 
 
-      let normalizedLoadNumber =
-        normalizeLoadNumber(aiResult.loadNumber);
-      const normalizedProNumber = normalizeLoadNumber(aiResult.proNumber);
-      let isLoadNumberValid = isValidLoadNumber(normalizedLoadNumber) &&
-        (!normalizedProNumber ||
-        normalizedLoadNumber !== normalizedProNumber);
-      let loadNumberInt = Number(normalizedLoadNumber);
+      let loadResolvedFrom = null;
+      let loadGateFailed = false;
+      let loadGateReason = null;
 
-      let sameDigitLength = lastKnownLoadNumber === null ? true :
-        String(loadNumberInt).length === String(lastKnownLoadNumber).length;
-      let withinRange = lastKnownLoadNumber === null ? true :
-        (!sameDigitLength || (Number.isFinite(loadNumberInt) &&
-        Math.abs(loadNumberInt - lastKnownLoadNumber) <= 100000));
-
-      let loadGateFailed = !isLoadNumberValid || !withinRange;
-      let loadResolvedFromPro = null;
-
-      // LTL invoices (e.g. Estes) often print PRO but omit our BOL. When the
-      // load gate would fail and we have a PRO, look up the booking in Primus.
-      if (loadGateFailed && !isTai &&
-          String(aiResult.proNumber || "").trim()) {
-        try {
-          const resolved = await resolveLoadNumberFromPrimusPro(
-              aiResult.proNumber);
-          if (resolved.loadNumber) {
-            const candidate = normalizeLoadNumber(resolved.loadNumber);
-            const candidateValid = isValidLoadNumber(candidate) &&
-              (!normalizedProNumber || candidate !== normalizedProNumber);
-            const candidateInt = Number(candidate);
-            const candidateSameLen = lastKnownLoadNumber === null ? true :
-              String(candidateInt).length ===
-                String(lastKnownLoadNumber).length;
-            const candidateInRange = lastKnownLoadNumber === null ? true :
-              (!candidateSameLen || (Number.isFinite(candidateInt) &&
-              Math.abs(candidateInt - lastKnownLoadNumber) <= 100000));
-
-            if (candidateValid && candidateInRange) {
-              await writeLog("info", "primus",
-                  "Resolved load number from carrier PRO", {
-                    messageId,
-                    proNumber: aiResult.proNumber,
-                    matchedPro: resolved.matchedPro,
-                    previousLoadNumber: aiResult.loadNumber || null,
-                    resolvedLoadNumber: candidate,
-                  });
-              aiResult.loadNumber = candidate;
-              normalizedLoadNumber = candidate;
-              isLoadNumberValid = true;
-              loadNumberInt = candidateInt;
-              sameDigitLength = candidateSameLen;
-              withinRange = candidateInRange;
-              loadGateFailed = false;
-              loadResolvedFromPro = {
-                proNumber: aiResult.proNumber,
-                matchedPro: resolved.matchedPro,
-                loadNumber: candidate,
-              };
-            }
-          }
-        } catch (proResolveErr) {
-          await writeLog("warn", "primus",
-              "PRO→BOL resolve failed; keeping load-gate failure", {
+      if (!isTai) {
+        const loadResolve = await resolveInvoiceLoadNumber(
+            aiResult, lastKnownLoadNumber);
+        aiResult = loadResolve.aiResult;
+        loadGateFailed = loadResolve.gateFailed;
+        loadGateReason = loadResolve.gateReason || null;
+        loadResolvedFrom = loadResolve.loadResolvedFrom;
+        if (loadResolvedFrom) {
+          await writeLog("info", "primus",
+              "Resolved load number from carrier reference", {
                 messageId,
-                proNumber: aiResult.proNumber,
-                error: proResolveErr.message,
+                via: loadResolvedFrom.via,
+                ref: loadResolvedFrom.ref,
+                matchedPro: loadResolvedFrom.matchedPro,
+                primusSource: loadResolvedFrom.primusSource,
+                resolvedLoadNumber: aiResult.loadNumber,
               });
         }
+      } else {
+        const normalizedLoadNumber =
+          normalizeLoadNumber(aiResult.loadNumber);
+        const normalizedProNumber = normalizeLoadNumber(aiResult.proNumber);
+        const direct = loadResolution.evaluateLoadCandidate(
+            normalizedLoadNumber, normalizedProNumber, lastKnownLoadNumber);
+        loadGateFailed = !direct.ok;
+        loadGateReason = direct.reason || null;
+        if (direct.ok) aiResult.loadNumber = direct.loadNumber;
       }
+
+      const normalizedLoadNumber =
+        normalizeLoadNumber(aiResult.loadNumber);
+      const normalizedProNumber = normalizeLoadNumber(aiResult.proNumber);
 
       if (loadGateFailed) {
         finalStatus = "no_load_number";
@@ -6178,9 +6578,10 @@ async function processGmailMessage(
             `I processed the invoice from ` +
             `${aiResult.carrierName || "this carrier"} but could not find ` +
             `a valid load number` +
-            (aiResult.proNumber ?
-              ` (and Primus had no booking for PRO ` +
-              `${aiResult.proNumber})` : "") +
+            (loadResolvedFrom || aiResult.proNumber ||
+              aiResult.carrierBolNumber || aiResult.carrierOrderNumber ?
+              ` (Primus lookup tried carrier PRO, BOL, order #, and PO — ` +
+              `no matching shipment)` : "") +
             `. Without a load number I cannot ` +
             `match this invoice to a shipment in Primus. Please verify the ` +
             `load number with the carrier and reprocess, or handle this ` +
@@ -6191,8 +6592,7 @@ async function processGmailMessage(
                 "Carrier": aiResult.carrierName || "—",
                 "Invoice Amount": aiResult.invoiceAmount ?
                   `$${aiResult.invoiceAmount}` : "—",
-                "PRO Number Found": aiResult.proNumber || "none",
-                "Raw Load # Found": aiResult.loadNumber || "none",
+                ...loadResolution.carrierReferenceReviewFields(aiResult),
               },
             },
         );
@@ -6204,23 +6604,22 @@ async function processGmailMessage(
             loadNumberRaw: aiResult.loadNumber || null,
             loadNumberNormalized: normalizedLoadNumber || null,
             proNumber: aiResult.proNumber || null,
+            carrierBolNumber: aiResult.carrierBolNumber || null,
+            carrierOrderNumber: aiResult.carrierOrderNumber || null,
+            poNumber: aiResult.poNumber || null,
             proNumberNormalized: normalizedProNumber || null,
             expectedFormat: "^\\d{5,9}$",
             lastKnownLoadNumber: lastKnownLoadNumber,
-            within100k: withinRange,
             decision: "NO_LOAD_NUMBER",
-            reason: !isLoadNumberValid ?
-              "Load number must be 5–9 digits " +
-              "(spaces/dashes ignored) " +
-              "and not equal to PRO" :
-              "Load number is not within 100,000 of last known " +
-              "load number",
+            reason: loadGateReason ||
+              "Could not resolve a Primus load from broker or carrier refs",
           },
         });
       } else {
         aiResult.loadNumber = normalizedLoadNumber;
-        if (loadResolvedFromPro) {
-          aiResult.loadNumberSource = "primus_pro_lookup";
+        if (loadResolvedFrom) {
+          aiResult.loadNumberSource = aiResult.loadNumberSource ||
+            `primus_${loadResolvedFrom.via}`;
         }
       }
 
@@ -6334,12 +6733,14 @@ async function processGmailMessage(
             charges: normalizedChargeData.unrecognizedCharges,
             category: chargeCategory,
             freightMismatch,
+            customerRate: customerRateFromBooking(bookingForCharges),
           });
-          await saveOutboundEmail({
-            type: "carrier_dispute_draft",
-            subject: dispute.subject,
-            html: dispute.html,
-          });
+          await saveOutboundEmail(
+              additionalCharges.applyAdditionalChargeEmailCc({
+                type: "carrier_dispute_draft",
+                subject: dispute.subject,
+                html: dispute.html,
+              }));
           await additionalCharges.createFollowUp(db, {
             loadNumber: aiResult.loadNumber,
             carrierName: aiResult.carrierName,
@@ -6411,6 +6812,7 @@ async function processGmailMessage(
             primusVendorCost,
             booking: bookingForCharges,
             rateValidation,
+            customerRate: customerRateFromBooking(bookingForCharges),
           };
           await writeLog("warn", "ai",
               "Additional charge needs approval (4-option email)", {
@@ -6836,6 +7238,9 @@ async function processGmailMessage(
           carrierName: aiResult.carrierName || null,
           invoiceNumber: aiResult.invoiceNumber || null,
           proNumber: aiResult.proNumber || null,
+          carrierBolNumber: aiResult.carrierBolNumber || null,
+          carrierOrderNumber: aiResult.carrierOrderNumber || null,
+          poNumber: aiResult.poNumber || null,
           loadNumber: aiResult.loadNumber || null,
           invoiceAmount: aiResult.invoiceAmount,
           invoiceDate: aiResult.invoiceDate || null,
@@ -6849,6 +7254,8 @@ async function processGmailMessage(
           freightDetails: aiResult.freightDetails || null,
           hasWeightInspectionCertificate:
             !!aiResult.hasWeightInspectionCertificate,
+          customerRate: isPendingChargeApproval && pendingAdditionalCharge ?
+            (pendingAdditionalCharge.customerRate || null) : null,
           additionalCharge: isPendingChargeApproval ? {
             status: "pending_approval",
             source: "unrecognized_charges",
@@ -8222,11 +8629,12 @@ async function checkGmailInboxForTenant(tenant, inboxFlowId) {
     for (const message of messages) {
       try {
         // Skip if already processed (deduplication guard).
-        const alreadyProcessed = await tcol(tenant, "emailIntake")
-            .where("gmailMessageId", "==", message.id).limit(1).get();
-        if (!alreadyProcessed.empty) {
+        const alreadyProcessed =
+            await hasEmailBeenProcessed(message.id, tenant);
+        if (alreadyProcessed) {
           await writeLog("info", "gmail",
               `Skipping already-processed message ${message.id}`);
+          await markGmailMessageRead(gmail, message.id);
           continue;
         }
 
@@ -8247,12 +8655,8 @@ async function checkGmailInboxForTenant(tenant, inboxFlowId) {
             {tenant},
         );
 
-        // Mark as read so it won't appear in future unread queries.
-        await gmail.users.messages.modify({
-          userId: "me",
-          id: message.id,
-          requestBody: {removeLabelIds: ["UNREAD"]},
-        });
+        // Mark as read (also done at start of processGmailMessage; harmless).
+        await markGmailMessageRead(gmail, message.id);
       } catch (error) {
         await writeLog("error", "gmail", `Error processing message`, {
           messageId: message.id,

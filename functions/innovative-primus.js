@@ -1273,25 +1273,26 @@ exports.processPrimusWorkflow = onRequest(
               category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
               dispatcherName: dispatcherForEmail.displayName ||
                 dispatcherForEmail.userName || null,
+              customerRate: invoice.customerRate || null,
             });
 
           const podFollowupMod = require("./pod-followup");
           const approver =
             process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
             podFollowupMod.SARAH_EMAIL;
-          const approvalPayload = {
-            type: "additional_charge_approval",
-            invoiceId,
-            subject: approvalEmail.subject,
-            html: approvalEmail.html,
-            forceRecipient: true,
-            to: approver,
-          };
-          if (dispatcherForEmail.ok && dispatcherForEmail.email &&
-              dispatcherForEmail.email.toLowerCase() !==
-              approver.toLowerCase()) {
-            approvalPayload.cc = dispatcherForEmail.email;
-          }
+          const approvalPayload =
+            additionalChargesMod.applyAdditionalChargeEmailCc({
+              type: "additional_charge_approval",
+              invoiceId,
+              subject: approvalEmail.subject,
+              html: approvalEmail.html,
+              forceRecipient: true,
+              to: approver,
+              cc: (dispatcherForEmail.ok && dispatcherForEmail.email &&
+                dispatcherForEmail.email.toLowerCase() !==
+                approver.toLowerCase()) ?
+                dispatcherForEmail.email : undefined,
+            });
           await saveOutboundEmail(approvalPayload);
 
           await additionalChargesMod.createFollowUp(db, {

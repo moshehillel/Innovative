@@ -30,6 +30,9 @@ const admin = require("firebase-admin");
 
 const FOLLOW_UP_COLLECTION = "additionalCharges";
 
+const LISA_EMAIL = process.env.LOW_PROFIT_CC_EMAIL ||
+  "Lisa@innovativecarriers.com";
+
 /** Follow-up lifecycle statuses. */
 const FOLLOW_UP_STATUS = Object.freeze({
   PENDING_APPROVAL: "pending_approval",
@@ -72,6 +75,49 @@ function esc(text) {
 function money(amount) {
   const n = Number(amount);
   return Number.isFinite(n) ? `$${n.toFixed(2)}` : "—";
+}
+
+/**
+ * Lisa is always copied on additional-charge ops emails (even when Sarah
+ * is To and a dispatcher is also CC'd).
+ * @param {string|string[]|null|undefined} cc Existing CC list.
+ * @return {string} Comma-separated CC including Lisa.
+ */
+function mergeLisaOnCc(cc) {
+  const lisaLower = LISA_EMAIL.toLowerCase();
+  const list = [];
+  if (cc) {
+    const raw = Array.isArray(cc) ? cc : String(cc).split(/[,;]/);
+    for (const part of raw) {
+      const email = String(part).trim();
+      if (email) list.push(email);
+    }
+  }
+  if (!list.some((e) => e.toLowerCase() === lisaLower)) {
+    list.push(LISA_EMAIL);
+  }
+  return list.join(", ");
+}
+
+/**
+ * Ensures Lisa is on CC for any additional-charge outbound email payload.
+ * @param {object} payload saveOutboundEmail fields.
+ * @return {object} Payload with Lisa merged into cc.
+ */
+function applyAdditionalChargeEmailCc(payload) {
+  return Object.assign({}, payload, {
+    cc: mergeLisaOnCc(payload && payload.cc),
+  });
+}
+
+/**
+ * Formats the customer sell rate for additional-charge emails.
+ * @param {number|string|null} amount Money value.
+ * @return {string}
+ */
+function formatCustomerRate(amount) {
+  const n = Number(amount);
+  return Number.isFinite(n) && n > 0 ? money(n) : "—";
 }
 
 /**
@@ -332,7 +378,7 @@ function chargesHtml(charges) {
  * @param {object} opts baseUrl, invoiceId, tenantId, loadNumber, carrierName,
  *   customerName, invoiceAmount, primusAmount, charges, chargesTotal,
  *   category, freightMismatch, hasCertificate, dispatcherName,
- *   rateValidation (optional W&I re-rate result).
+ *   rateValidation (optional W&I re-rate result), customerRate.
  * @return {{subject: string, html: string}}
  */
 function buildAdditionalChargeApprovalEmail(opts) {
@@ -340,6 +386,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     baseUrl, invoiceId, tenantId, loadNumber, carrierName, customerName,
     invoiceAmount, primusAmount, charges, chargesTotal, category,
     freightMismatch, hasCertificate, dispatcherName, rateValidation,
+    customerRate,
     actionUrl: actionUrlFn,
   } = opts;
 
@@ -423,6 +470,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Load #", esc(String(loadNumber || "—"))) +
     row("Carrier", esc(carrierName || "—")) +
     row("Customer", esc(customerName || "—")) +
+    row("Customer rate (Primus)", formatCustomerRate(customerRate)) +
     row("Carrier invoice", money(invoiceAmount)) +
     row("Amount on file (Primus)", money(primusAmount)) +
     row("Additional charges", money(chargesTotal)) +
@@ -441,16 +489,18 @@ function buildAdditionalChargeApprovalEmail(opts) {
         "A — Approve: pay carrier + bill customer (auto-email customer)") +
     btn("b", "#0d9488",
         "B — Approve: pay carrier + bill customer " +
-        "(dispatcher notifies customer)") +
+        "(enter updated rate; dispatcher notifies customer)") +
     btn("c", "#2563eb",
         "C — Approve: pay carrier only (customer rate unchanged)") +
     btn("d", "#dc2626",
         "D — Not approved: dispute with carrier") +
-    `<p style="font-size:12px;color:#6b7280">A/B: remember the customer ` +
-    `invoice in Primus must reflect the added charge before it is issued. ` +
-    `C: the carrier bill is entered at the full carrier amount and the ` +
-    `customer rate stays the same (no itemization needed). D: Jerry will ` +
-    `draft the dispute wording for manual submission.</p>`;
+    `<p style="font-size:12px;color:#6b7280">A: customer rate is auto-bumped ` +
+    `by the charge amount and the customer is emailed. B: you enter the ` +
+    `updated customer rate on the confirm page and the dispatcher notifies ` +
+    `the customer of that amount. C: the carrier bill is entered at the full ` +
+    `carrier amount and the customer rate stays the same (no itemization ` +
+    `needed). D: Jerry will draft the dispute wording for manual submission.` +
+    `</p>`;
 
   return {
     subject: `Approval needed — additional charge on Load ${loadNumber} ` +
@@ -471,6 +521,7 @@ function buildDisputeEmailDraft(opts) {
   const {
     loadNumber, carrierName, proNumber, invoiceNumber,
     invoiceAmount, expectedAmount, charges, category, freightMismatch,
+    customerRate,
   } = opts;
 
   const mm = freightMismatch || {};
@@ -526,7 +577,10 @@ function buildDisputeEmailDraft(opts) {
 
   const html =
     `<p>Dispute draft for <strong>${esc(carrierName || "carrier")}</strong> ` +
-    `— Load ${esc(String(loadNumber || "—"))}. For LTL carriers, paste ` +
+    `— Load ${esc(String(loadNumber || "—"))}` +
+    (customerRate != null && Number(customerRate) > 0 ?
+      ` (customer rate in Primus: ${formatCustomerRate(customerRate)})` : "") +
+    `. For LTL carriers, paste ` +
     `this into the carrier's dispute portal; for TL, email it to the ` +
     `carrier contact on file.</p>` +
     `<div style="border:1px solid #e5e7eb;border-radius:8px;padding:16px;` +
@@ -549,12 +603,16 @@ function buildDisputeEmailDraft(opts) {
  * @return {{subject: string, html: string}}
  */
 function buildCustomerChargeNotificationEmail(opts) {
-  const {customerName, loadNumber, charges, chargesTotal, category} = opts;
+  const {customerName, loadNumber, charges, chargesTotal, category,
+    customerRate} = opts;
   const html =
     `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
     `<p>We were billed an additional charge by the carrier on your ` +
     `shipment (our reference <strong>${esc(String(loadNumber || ""))}` +
     `</strong>).</p>` +
+    (customerRate != null && Number(customerRate) > 0 ?
+      `<p><strong>Your rate for this shipment:</strong> ` +
+      `${formatCustomerRate(customerRate)}</p>` : "") +
     `<p><strong>Reason:</strong> ${esc(categoryLabel(category))}</p>` +
     chargesHtml(charges) +
     `<p>The additional amount of <strong>${money(chargesTotal)}</strong> ` +
@@ -575,7 +633,7 @@ function buildCustomerChargeNotificationEmail(opts) {
 function buildDispatcherNotifyReminderEmail(opts) {
   const {
     dispatcherName, loadNumber, carrierName, customerName,
-    charges, chargesTotal,
+    charges, chargesTotal, customerRate, originalCustomerRate,
   } = opts;
   const html =
     `<p>Hi${dispatcherName ? ` ${esc(dispatcherName)}` : ""},</p>` +
@@ -585,11 +643,19 @@ function buildDispatcherNotifyReminderEmail(opts) {
     `customer, and it was decided that <strong>you will notify the ` +
     `customer</strong>${customerName ? ` (${esc(customerName)})` : ""} ` +
     `about it yourself.</p>` +
+    (customerRate != null && Number(customerRate) > 0 ?
+      `<p><strong>Updated customer rate to bill: ` +
+      `${formatCustomerRate(customerRate)}</strong>` +
+      (originalCustomerRate != null && Number(originalCustomerRate) > 0 &&
+        Number(originalCustomerRate) !== Number(customerRate) ?
+        ` (was ${formatCustomerRate(originalCustomerRate)})` : "") +
+      `</p>` +
+      `<p>Please notify the customer of this updated amount.</p>` : "") +
     chargesHtml(charges) +
     `<p>Total additional: <strong>${money(chargesTotal)}</strong></p>` +
     `<p><strong>Action needed:</strong> please email the customer about ` +
-    `this charge. This item stays on your task list (Additional Charges ` +
-    `Follow-Up) until done.</p>`;
+    `this charge and the updated rate above. This item stays on your task ` +
+    `list (Additional Charges Follow-Up) until done.</p>`;
   return {
     subject: `Task — notify customer of additional charge on ` +
       `Load ${loadNumber}`,
@@ -663,6 +729,10 @@ module.exports = {
   FOLLOW_UP_STATUS,
   CHARGE_CATEGORY,
   RATE_MATCH_TOLERANCE,
+  LISA_EMAIL,
+  mergeLisaOnCc,
+  applyAdditionalChargeEmailCc,
+  formatCustomerRate,
   isWeightInspectionLabel,
   sumCharges,
   detectFreightMismatch,

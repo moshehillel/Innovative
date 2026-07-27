@@ -225,6 +225,97 @@ function parseInsuranceExcel(input) {
   return {columns, rows};
 }
 
+/** Words that PDF regex must not treat as an invoice number. */
+const INVALID_INVOICE_TOKENS = new Set([
+  "can", "cad", "usd", "due", "net", "the", "from", "date", "total",
+  "amount", "bill", "paid", "pay", "com", "www", "redkik", "invoice",
+]);
+
+/**
+ * True when a candidate looks like a real vendor invoice / bill number.
+ * @param {string} candidate Raw match.
+ * @return {boolean}
+ */
+function isPlausibleInsuranceInvoiceNumber(candidate) {
+  const value = String(candidate || "").trim();
+  if (!value) return false;
+  const lower = value.toLowerCase();
+  if (INVALID_INVOICE_TOKENS.has(lower)) return false;
+  if (/^redkik/i.test(value)) return false;
+  if (/\.com$/i.test(value)) return false;
+  const digits = value.replace(/\D/g, "");
+  if (/^\d+$/.test(value)) return digits.length >= 3;
+  if (value.length < 4) return false;
+  if (/\d/.test(value)) return true;
+  return value.length >= 5;
+}
+
+/**
+ * Pulls the best insurance vendor invoice number from PDF text and/or email
+ * subject/body (QuickBooks notices often carry the number outside the PDF).
+ * @param {string} text Combined searchable text.
+ * @return {string|null}
+ */
+function extractInsuranceInvoiceNumber(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) return null;
+
+  const patterns = [
+    /\binvoice\s+(\d{4,})\s+from\b/gi,
+    /invoice\s*(?:#|no\.?|number)\s*:?\s*([A-Z0-9][\w-]{2,})/gi,
+    /invoice\s+#?\s*(\d{3,})/gi,
+    /inv(?:oice)?\s*#\s*(\d{3,})/gi,
+    /bill\s*(?:#|no\.?)\s*:?\s*([A-Z0-9][\w-]{3,})/gi,
+    /reference\s*(?:#|no\.?)\s*:?\s*([A-Z0-9][\w-]{3,})/gi,
+  ];
+
+  const candidates = [];
+  for (const pattern of patterns) {
+    for (const match of raw.matchAll(pattern)) {
+      const token = String(match[1] || "").trim();
+      if (isPlausibleInsuranceInvoiceNumber(token)) {
+        candidates.push(token);
+      }
+    }
+  }
+
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => {
+    const aDigits = /^\d+$/.test(a) ? 1 : 0;
+    const bDigits = /^\d+$/.test(b) ? 1 : 0;
+    if (bDigits !== aDigits) return bDigits - aDigits;
+    return b.length - a.length;
+  });
+  return candidates[0];
+}
+
+/**
+ * Resolves vendor invoice number from PDF parse plus email context.
+ * @param {object} invoice Parsed PDF header fields.
+ * @param {object} [emailCtx] {subject, body}.
+ * @return {{invoiceNumber: string, invoiceNumberSource: string}}
+ */
+function resolveInsuranceVendorInvoiceNumber(invoice, emailCtx) {
+  const pdfNum = invoice && invoice.invoiceNumber &&
+    isPlausibleInsuranceInvoiceNumber(invoice.invoiceNumber) ?
+    String(invoice.invoiceNumber).trim() : "";
+  if (pdfNum) {
+    return {invoiceNumber: pdfNum, invoiceNumberSource: "pdf"};
+  }
+
+  const emailText = [
+    emailCtx && emailCtx.subject,
+    emailCtx && emailCtx.body,
+  ].filter(Boolean).join("\n");
+  const fromEmail = extractInsuranceInvoiceNumber(emailText);
+  if (fromEmail) {
+    return {invoiceNumber: fromEmail, invoiceNumberSource: "email"};
+  }
+
+  return {invoiceNumber: "", invoiceNumberSource: ""};
+}
+
 /**
  * Best-effort extraction of the invoice header fields from the PDF text.
  * @param {Buffer|string} input PDF buffer or a file path.
@@ -250,14 +341,14 @@ async function parseInsuranceInvoicePdf(input) {
       .filter((n) => n > 0);
   // The invoice total is the largest money figure on a Redkik statement.
   const invoiceTotal = totals.length ? Math.max(...totals) : 0;
-  const invNumMatch = text.match(/invoice\s*#?\s*:?\s*(\w[\w-]*)/i);
+  const invoiceNumber = extractInsuranceInvoiceNumber(text) || "";
   const dateMatch = text.match(
       /(\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2})/);
   const vendorMatch = text.match(/\b(Redkik[\w,.\s]*?)(?:\n|Invoice|$)/i);
 
   return {
     vendorName: vendorMatch ? vendorMatch[1].trim() : "",
-    invoiceNumber: invNumMatch ? invNumMatch[1] : "",
+    invoiceNumber,
     invoiceTotal,
     invoiceDate: dateMatch ? dateMatch[1] : "",
     rawText: text,
@@ -410,6 +501,13 @@ function buildReconciliationEmail(opts) {
     `${escapeHtml(invNo)}</h2>` +
     `<p>${reconLine}</p>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
+    (invoice.invoiceNumber ?
+      `<tr><td style="padding:4px 16px 4px 0">Vendor bill # (Primus)</td>` +
+      `<td style="font-weight:700">${escapeHtml(invoice.invoiceNumber)}` +
+      `${invoice.invoiceNumberSource ?
+        ` <span style="font-weight:400;color:#6b7280">(` +
+        `${escapeHtml(invoice.invoiceNumberSource)})</span>` : ""}` +
+      `</td></tr>` : "") +
     `<tr><td style="padding:4px 16px 4px 0">Invoice total (PDF)</td>` +
     `<td style="font-weight:700">${money(rec.invoiceTotal)}</td></tr>` +
     `<tr><td style="padding:4px 16px 4px 0">Premiums posted</td>` +
@@ -769,8 +867,32 @@ async function processInsuranceEmail(opts) {
   }
 
   const billDate = invoice.invoiceDate || new Date();
-  const vendorInvoiceNumber = invoice.invoiceNumber ||
-    `REDKIK-${roundMoney(new Date(billDate).getTime())}`;
+  const resolvedInv = resolveInsuranceVendorInvoiceNumber(invoice, {
+    subject: opts.subject,
+    body: opts.emailBody,
+  });
+  let vendorInvoiceNumber = resolvedInv.invoiceNumber;
+  if (!vendorInvoiceNumber) {
+    vendorInvoiceNumber = `REDKIK-${roundMoney(new Date(billDate).getTime())}`;
+    await log("warn", "insurance",
+        "Could not parse Redkik invoice number — using fallback ref", {
+          subject: opts.subject || null,
+          pdfInvoiceNumber: invoice.invoiceNumber || null,
+          fallback: vendorInvoiceNumber,
+        });
+  } else if (invoice.invoiceNumber &&
+      !isPlausibleInsuranceInvoiceNumber(invoice.invoiceNumber)) {
+    await log("warn", "insurance",
+        "Ignored implausible PDF invoice number", {
+          rejected: invoice.invoiceNumber,
+          used: vendorInvoiceNumber,
+          source: resolvedInv.invoiceNumberSource,
+          subject: opts.subject || null,
+        });
+  }
+  invoice.invoiceNumber = vendorInvoiceNumber;
+  invoice.invoiceNumberSource = resolvedInv.invoiceNumberSource ||
+    (vendorInvoiceNumber.startsWith("REDKIK-") ? "fallback" : "pdf");
 
   let insuranceVendor = null;
   if (!opts.dryRun) {
@@ -811,6 +933,7 @@ async function processInsuranceEmail(opts) {
       type: "insurance_reconciliation",
       subject: result.email.subject,
       html: result.email.html,
+      gmailMessageId: opts.gmailMessageId || null,
     });
   }
 
@@ -836,6 +959,9 @@ module.exports = {
   parseAmount,
   detectColumns,
   extractBol,
+  isPlausibleInsuranceInvoiceNumber,
+  extractInsuranceInvoiceNumber,
+  resolveInsuranceVendorInvoiceNumber,
   parseInsuranceExcel,
   parseInsuranceInvoicePdf,
   classifyRows,

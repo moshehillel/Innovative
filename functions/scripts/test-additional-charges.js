@@ -96,6 +96,7 @@ const email = ac.buildAdditionalChargeApprovalEmail({
   charges: [{label: "Reweigh Fee", amount: 120}],
   chargesTotal: 120,
   category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  customerRate: 545,
   freightMismatch: mismatch,
   hasCertificate: true,
   dispatcherName: "John D",
@@ -109,6 +110,9 @@ check("email shows re-rate mismatch",
     email.html.includes("does NOT match"), true);
 check("email shows quote number",
     email.html.includes("48025106"), true);
+check("email shows customer rate", email.html.includes("$545.00"), true);
+check("email shows customer rate label",
+    email.html.includes("Customer rate (Primus)"), true);
 for (const opt of ["a", "b", "c", "d"]) {
   check(`button ${opt} has action`,
       email.html.includes("additionalChargeAction") &&
