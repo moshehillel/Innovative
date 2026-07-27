@@ -977,6 +977,44 @@ async function fetchBookingsForTracking(opts) {
 exports.fetchBookingsForTracking = fetchBookingsForTracking;
 
 /**
+ * Searches manage.php getBookingsForTracking by free-text query (FBA ref,
+ * shipper ref, BOL fragment, etc.).
+ * @param {string} query Search text.
+ * @param {object} [opts] dateFrom, dateTo, limit.
+ * @return {Promise<Array<object>>}
+ */
+async function searchBookingsForTrackingQuery(query, opts = {}) {
+  const q = String(query || "").trim();
+  if (!q) return [];
+  const dateTo = opts.dateTo ? new Date(opts.dateTo) : new Date();
+  const dateFrom = opts.dateFrom ?
+    new Date(opts.dateFrom) :
+    new Date(dateTo.getTime() - 365 * 24 * 60 * 60 * 1000);
+  const iso = (d) => d.toISOString().slice(0, 10);
+  const limit = Number(opts.limit || 25);
+  const result = await managePhpPost({
+    action: "getBookingsForTracking",
+    page: "1",
+    query: q,
+    forcelimit: "",
+    dateFrom: iso(dateFrom),
+    dateTo: iso(dateTo),
+    criteria: "[]",
+    user: "null",
+    shipmentMode: "[]",
+    searchFields: "[]",
+    customer: "[]",
+    office: "[]",
+    start: "0",
+    limit: String(limit),
+    sort: JSON.stringify([{property: "dateSaved", direction: "DESC"}]),
+  });
+  const rows = result.json && result.json.bookingsfortracking;
+  return Array.isArray(rows) ? rows : [];
+}
+exports.searchBookingsForTrackingQuery = searchBookingsForTrackingQuery;
+
+/**
  * @param {object} docData getBookingDocuments JSON body.
  * @return {Array<Array<object>>}
  */

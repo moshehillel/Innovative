@@ -60,6 +60,33 @@ check("lookup key order",
     keys.map((k) => k.label),
     ["carrier_bol", "carrier_order", "po"]);
 
+const flock = lr.normalizeCarrierReferenceFields({
+  loadNumber: "FBA19FXCCFZT",
+  carrierName: "Flock Freight Inc.",
+  invoiceAmount: 1017,
+});
+check("FBA ref moved to shipmentReference",
+    flock.shipmentReference, "FBA19FXCCFZT");
+check("FBA ref clears broker load", flock.loadNumber, "");
+
+const flockKeys = lr.buildPrimusLookupKeys({
+  shipmentReference: "FBA19FXCCFZT",
+});
+check("FBA in lookup keys", flockKeys[0].ref, "FBA19FXCCFZT");
+
+const trackingRow = {
+  BOL: "263750",
+  bookingTotal: "1017",
+  vendorName: "Flock Freight ",
+  consigneeReferenceNumber: "FBA19FXCCFZT",
+};
+const picked = lr.pickTrackingSearchMatch([trackingRow], {
+  invoiceAmount: 1017,
+  carrierName: "Flock Freight Inc.",
+});
+check("tracking search resolves load",
+    picked && picked.loadNumber, "263750");
+
 const review = lr.carrierReferenceReviewFields({
   loadNumber: "",
   proNumber: "",
@@ -67,6 +94,8 @@ const review = lr.carrierReferenceReviewFields({
   carrierOrderNumber: "2054707475",
   poNumber: "012030303437",
 });
+check("review shows shipment ref",
+    review["Shipment / customer ref"], "none");
 check("review shows BOL not PRO",
     review["Carrier PRO"], "none");
 check("review shows carrier BOL",

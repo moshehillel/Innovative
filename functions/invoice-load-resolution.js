@@ -24,8 +24,32 @@ function isValidLoadNumber(loadNumber) {
 }
 
 /**
- * Separates broker load, carrier BOL, order number, PO, and PRO fields.
- * Fixes common AI mis-bucketing (e.g. Schneider order → load, BOL → PRO).
+ * True for Amazon FBA IDs, PT# shipper refs, and similar shipment keys.
+ * @param {string|null|undefined} value Raw reference.
+ * @return {boolean}
+ */
+function looksLikeShipmentReference(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  const upper = raw.toUpperCase();
+  if (/^FBA[A-Z0-9]{8,}$/.test(upper.replace(/[\s-]/g, ""))) return true;
+  if (/^PT#?\s*\d+/i.test(raw)) return true;
+  if (/^[A-Z]{2,5}\d{5,}[A-Z0-9]*$/i.test(raw.replace(/[\s-]/g, ""))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @param {string|null|undefined} value Raw reference.
+ * @return {string}
+ */
+function normalizeShipmentReference(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+/**
+ * Separates broker load, carrier BOL, order, PO, PRO, and shipment ref fields.
  * @param {object} aiResult AI classification row.
  * @return {object} Sanitized copy.
  */
@@ -36,6 +60,7 @@ function normalizeCarrierReferenceFields(aiResult) {
   out.carrierBolNumber = normalizeLoadNumber(out.carrierBolNumber);
   out.carrierOrderNumber = normalizeLoadNumber(out.carrierOrderNumber);
   out.poNumber = normalizeLoadNumber(out.poNumber);
+  out.shipmentReference = normalizeShipmentReference(out.shipmentReference);
 
   // BOL duplicated in proNumber — keep BOL, clear PRO.
   if (out.proNumber && out.carrierBolNumber &&
@@ -51,13 +76,25 @@ function normalizeCarrierReferenceFields(aiResult) {
     out.proNumber = "";
   }
 
-  // Order number mis-placed as broker load.
+  // Alphanumeric shipment ref mis-placed as broker load (e.g. FBA19FXCCFZT).
   if (out.loadNumber && !isValidLoadNumber(out.loadNumber)) {
-    if (!out.carrierOrderNumber) out.carrierOrderNumber = out.loadNumber;
+    if (looksLikeShipmentReference(out.loadNumber)) {
+      if (!out.shipmentReference) {
+        out.shipmentReference = normalizeShipmentReference(out.loadNumber);
+      }
+    } else if (!out.carrierOrderNumber) {
+      out.carrierOrderNumber = out.loadNumber;
+    }
     out.loadNumber = "";
   } else if (out.carrierOrderNumber &&
       out.loadNumber === out.carrierOrderNumber) {
     out.loadNumber = "";
+  }
+
+  if (out.carrierOrderNumber &&
+      looksLikeShipmentReference(out.carrierOrderNumber) &&
+      !out.shipmentReference) {
+    out.shipmentReference = normalizeShipmentReference(out.carrierOrderNumber);
   }
 
   return out;
@@ -98,17 +135,64 @@ function evaluateLoadCandidate(
  */
 function buildPrimusLookupKeys(refs) {
   const keys = [];
-  const add = (ref, label) => {
+  const addDigits = (ref, label) => {
     const value = normalizeLoadNumber(ref);
     if (!value) return;
     if (keys.some((k) => k.ref === value)) return;
     keys.push({ref: value, label});
   };
-  add(refs.proNumber, "pro");
-  add(refs.carrierBolNumber, "carrier_bol");
-  add(refs.carrierOrderNumber, "carrier_order");
-  add(refs.poNumber, "po");
+  const addText = (ref, label) => {
+    const value = normalizeShipmentReference(ref);
+    if (!value) return;
+    if (keys.some((k) => k.ref === value)) return;
+    keys.push({ref: value, label});
+  };
+  addDigits(refs.proNumber, "pro");
+  addDigits(refs.carrierBolNumber, "carrier_bol");
+  addText(refs.shipmentReference, "shipment_ref");
+  addText(refs.carrierOrderNumber, "carrier_order");
+  addDigits(refs.poNumber, "po");
   return keys;
+}
+
+/**
+ * Picks the best getBookingsForTracking row for a reference search.
+ * @param {Array<object>} rows Tracking search results.
+ * @param {object} [hints] invoiceAmount, carrierName.
+ * @return {object|null} {loadNumber, row, source}
+ */
+function pickTrackingSearchMatch(rows, hints = {}) {
+  if (!Array.isArray(rows) || !rows.length) return null;
+  let candidates = rows.slice();
+  const amt = Number(hints.invoiceAmount);
+  if (Number.isFinite(amt) && amt > 0) {
+    const tol = Math.max(1, amt * 0.02);
+    const byAmt = candidates.filter((r) =>
+      Math.abs(Number(r.bookingTotal || r.total || 0) - amt) <= tol);
+    if (byAmt.length) candidates = byAmt;
+  }
+  if (hints.carrierName) {
+    const needle = String(hints.carrierName).toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ");
+    const tokens = needle.split(/\s+/).filter((t) => t.length > 2);
+    if (tokens.length) {
+      const byCarrier = candidates.filter((r) => {
+        const hay = [
+          r.vendorName,
+          r.carrierName,
+          r.carrierNameOriginal,
+          r.carrierSCAC,
+        ].map((s) => String(s || "").toLowerCase()).join(" ");
+        return tokens.some((t) => hay.includes(t));
+      });
+      if (byCarrier.length) candidates = byCarrier;
+    }
+  }
+  const row = candidates[0];
+  if (!row || !row.BOL) return null;
+  const loadNumber = normalizeLoadNumber(row.BOL);
+  if (!isValidLoadNumber(loadNumber)) return null;
+  return {loadNumber, row, source: "tracking_search"};
 }
 
 /**
@@ -121,6 +205,7 @@ function carrierReferenceReviewFields(refs) {
     "Broker load # (Primus)": refs.loadNumber || "none",
     "Carrier PRO": refs.proNumber || "none",
     "Carrier BOL #": refs.carrierBolNumber || "none",
+    "Shipment / customer ref": refs.shipmentReference || "none",
     "Carrier order #": refs.carrierOrderNumber || "none",
     "PO #": refs.poNumber || "none",
   };
@@ -129,8 +214,11 @@ function carrierReferenceReviewFields(refs) {
 module.exports = {
   normalizeLoadNumber,
   isValidLoadNumber,
+  looksLikeShipmentReference,
+  normalizeShipmentReference,
   normalizeCarrierReferenceFields,
   evaluateLoadCandidate,
   buildPrimusLookupKeys,
+  pickTrackingSearchMatch,
   carrierReferenceReviewFields,
 };

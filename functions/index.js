@@ -805,11 +805,12 @@ async function resolveLoadNumberFromPrimusPro(proNumber) {
 }
 
 /**
- * Tries Primus BOL and vendorPro lookups for a carrier reference value.
- * @param {string} ref Reference digits or dashed form.
+ * Tries Primus BOL, vendor PRO, and tracking search for a carrier reference.
+ * @param {string} ref Reference from the invoice.
+ * @param {object} [hints] invoiceAmount, carrierName for disambiguation.
  * @return {Promise<object|null>} {loadNumber, booking, source, matchedPro?}
  */
-async function resolveLoadNumberFromCarrierReference(ref) {
+async function resolveLoadNumberFromCarrierReference(ref, hints = {}) {
   const raw = String(ref || "").trim();
   if (!raw) return null;
 
@@ -839,6 +840,34 @@ async function resolveLoadNumberFromCarrierReference(ref) {
     // PRO lookup is best-effort.
   }
 
+  try {
+    if (primusUiBridge.searchBookingsForTrackingQuery) {
+      const rows = await primusUiBridge.searchBookingsForTrackingQuery(raw, {
+        limit: 25,
+      });
+      const match = loadResolution.pickTrackingSearchMatch(rows, hints);
+      if (match && match.loadNumber) {
+        let booking = null;
+        try {
+          booking = await fetchPrimusBooking(match.loadNumber);
+        } catch (_) {
+          booking = null;
+        }
+        return {
+          loadNumber: match.loadNumber,
+          booking,
+          source: "tracking_search",
+          matchedPro: null,
+        };
+      }
+    }
+  } catch (err) {
+    await writeLog("warn", "primus", "Tracking search lookup failed", {
+      ref: raw,
+      error: err.message,
+    });
+  }
+
   return null;
 }
 
@@ -863,8 +892,12 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
   }
 
   const lookupKeys = loadResolution.buildPrimusLookupKeys(refs);
+  const lookupHints = {
+    invoiceAmount: aiResult.invoiceAmount,
+    carrierName: aiResult.carrierName,
+  };
   for (const {ref, label} of lookupKeys) {
-    const found = await resolveLoadNumberFromCarrierReference(ref);
+    const found = await resolveLoadNumberFromCarrierReference(ref, lookupHints);
     if (!found || !found.loadNumber) continue;
 
     const accepted = loadResolution.evaluateLoadCandidate(
@@ -3931,6 +3964,7 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
     carrierBolNumber: "",
     carrierOrderNumber: "",
     poNumber: "",
+    shipmentReference: "",
     invoiceAmount: 0,
     invoiceDate: "",
     dueDate: "",
@@ -4009,6 +4043,10 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "labeled Order Number, Order #, Shipment ID, or similar (any " +
         "length).",
         "poNumber is the purchase order when labeled PO # or P.O.",
+        "shipmentReference is the shipper, consignee, or customer shipment " +
+        "reference when labeled Reference #, Ref, Shipment ID, FBA ID, " +
+        "Amazon FBA (e.g. FBA19FXCCFZT), PT# shipper ref, or similar " +
+        "alphanumeric key — NOT the broker Primus load number.",
         "proNumber is ONLY when the invoice labels PRO #, Carrier PRO, " +
         "Beyond PRO, Advance PRO, or (LTL only) freight bill number. " +
         "Leave proNumber empty when no PRO / freight bill field is shown " +
@@ -4022,8 +4060,8 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "as empty string.",
         "Do not put carrier order numbers or 10+ digit carrier IDs in " +
         "loadNumber — use carrierOrderNumber instead.",
-        "Keep broker loadNumber, carrier BOL, carrier order, PO, and PRO in " +
-        "separate fields.",
+        "Keep broker loadNumber, carrier BOL, carrier order, PO, shipment " +
+        "reference, and PRO in separate fields.",
         "Do not use proNumber as loadNumber.",
         "For FedEx Freight invoices, the PRO number is the same as the " +
         "carrier invoice number / tracking number (often 9–12 digits). " +
@@ -6694,8 +6732,8 @@ async function processGmailMessage(
             `a valid load number` +
             (loadResolvedFrom || aiResult.proNumber ||
               aiResult.carrierBolNumber || aiResult.carrierOrderNumber ?
-              ` (Primus lookup tried carrier PRO, BOL, order #, and PO — ` +
-              `no matching shipment)` : "") +
+              ` (Primus lookup tried carrier PRO, BOL, shipment ref, ` +
+              `order #, PO, and tracking search — no matching shipment)` : "") +
             `. Without a load number I cannot ` +
             `match this invoice to a shipment in Primus. Please verify the ` +
             `load number with the carrier and reprocess, or handle this ` +
@@ -6721,6 +6759,7 @@ async function processGmailMessage(
             carrierBolNumber: aiResult.carrierBolNumber || null,
             carrierOrderNumber: aiResult.carrierOrderNumber || null,
             poNumber: aiResult.poNumber || null,
+            shipmentReference: aiResult.shipmentReference || null,
             proNumberNormalized: normalizedProNumber || null,
             expectedFormat: "^\\d{5,9}$",
             lastKnownLoadNumber: lastKnownLoadNumber,
@@ -7355,6 +7394,7 @@ async function processGmailMessage(
           carrierBolNumber: aiResult.carrierBolNumber || null,
           carrierOrderNumber: aiResult.carrierOrderNumber || null,
           poNumber: aiResult.poNumber || null,
+          shipmentReference: aiResult.shipmentReference || null,
           loadNumber: aiResult.loadNumber || null,
           invoiceAmount: aiResult.invoiceAmount,
           invoiceDate: aiResult.invoiceDate || null,
