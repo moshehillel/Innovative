@@ -119,7 +119,8 @@ for (const opt of ["a", "b", "c", "d"]) {
       email.html.includes(`invoiceId=inv123`) &&
       email.html.includes(`option=${opt}`), true);
   check(`button ${opt} signed`,
-      email.html.includes("&sig=") && email.html.includes("&exp="), true);
+      email.html.includes("&amp;sig=") && email.html.includes("&amp;exp="),
+      true);
 }
 check("subject has load", email.subject.includes("264172"), true);
 

@@ -401,8 +401,7 @@ function customerRateFromBooking(booking) {
  * @return {string}
  */
 function functionsBaseUrl() {
-  return process.env.PUBLIC_FUNCTIONS_BASE_URL ||
-    "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+  return emailActionTokens.publicFunctionsBaseUrl();
 }
 
 /**
@@ -1883,6 +1882,7 @@ exports.approveCustomerEmail = onRequest(async (req, res) => {
 function buildEmailActionConfirmPage(opts) {
   const fields = opts.fields || {};
   const btnColor = opts.confirmColor || "#2563eb";
+  const formAction = `${functionsBaseUrl()}/${opts.actionPath}`;
   const hidden = Object.entries(fields)
       .map(([name, value]) =>
         `<input type="hidden" name="${escapeHtml(name)}" ` +
@@ -1919,7 +1919,7 @@ function buildEmailActionConfirmPage(opts) {
     `${escapeHtml(opts.title || "Confirm action")}</h1>` +
     `<p style="font-size:16px;color:#374151;line-height:1.5">` +
     `${opts.description || ""}</p>` +
-    `<form method="POST" action="/${escapeHtml(opts.actionPath)}" ` +
+    `<form method="POST" action="${escapeHtml(formAction)}" ` +
     `style="margin-top:24px">` +
     hidden +
     inputs +
@@ -2310,6 +2310,7 @@ async function handleAdditionalChargeAction(req, res) {
     await invoiceRef.update(approvalUpdate);
 
     let extraNote = rateBumpNote;
+    let skipDispatcherNotify = false;
     if (option === "a") {
       // Auto-notify the customer contact on file.
       let customerEmail = null;
@@ -2352,54 +2353,88 @@ async function handleAdditionalChargeAction(req, res) {
         notes: extraNote.trim(),
       });
     } else if (option === "b") {
-      // Dispatcher must notify the customer — remind them / task it.
-      let dispatcher = {ok: false};
+      // Dispatcher notifies the customer — unless Primus already reconciles
+      // the carrier total (line item is breakdown only, not a real overage).
       try {
-        dispatcher = await primusUiBridge.resolveDispatcherEmail({
-          booking,
+        const reCheck = await reconcileUnrecognizedChargesWithPrimus(
+            invoice.loadNumber,
+            invoice.invoiceAmount,
+            chargeRows);
+        if (reCheck.override) {
+          skipDispatcherNotify = true;
+          extraNote += " Carrier invoice total already matches Primus" +
+            (reCheck.totalMatches ? " (within $10)" :
+              reCheck.chargesInPrimus ?
+                " (charge already in vendor breakdown)" :
+                " (invoice at/under Primus cost)") +
+            " — dispatcher customer notification skipped.";
+          await writeLog("info", "workflow",
+              "Option B: skipped dispatcher notify — Primus reconciled", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                invoiceAmount: invoice.invoiceAmount,
+                vendorCost: reCheck.vendorCost,
+                totalMatches: reCheck.totalMatches,
+                chargesInPrimus: reCheck.chargesInPrimus,
+              });
+        }
+      } catch (_) {
+        // Best-effort; still notify dispatcher if re-check fails.
+      }
+
+      if (!skipDispatcherNotify) {
+        // Dispatcher must notify the customer — remind them / task it.
+        let dispatcher = {ok: false};
+        try {
+          dispatcher = await primusUiBridge.resolveDispatcherEmail({
+            booking,
+            loadNumber: invoice.loadNumber,
+            fetchBooking: fetchPrimusBooking,
+          });
+        } catch (err) {
+          dispatcher = {ok: false, error: err.message};
+        }
+        const reminder = additionalCharges.buildDispatcherNotifyReminderEmail({
+          dispatcherName: dispatcher.displayName || dispatcher.userName || null,
           loadNumber: invoice.loadNumber,
-          fetchBooking: fetchPrimusBooking,
+          carrierName: invoice.carrierName,
+          customerName,
+          charges: chargeRows,
+          chargesTotal,
+          customerRate: invoice.customerRate ||
+            customerRateFromBooking(booking),
+          originalCustomerRate:
+            approvalUpdate["additionalCharge.originalCustomerRate"] || null,
         });
-      } catch (err) {
-        dispatcher = {ok: false, error: err.message};
+        const podFollowup = require("./pod-followup");
+        const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+          podFollowup.SARAH_EMAIL;
+        const reminderPayload = {
+          type: "additional_charge_dispatcher_task",
+          invoiceId: String(invoiceId),
+          subject: reminder.subject,
+          html: reminder.html,
+        };
+        if (dispatcher.ok && dispatcher.email) {
+          reminderPayload.forceRecipient = true;
+          reminderPayload.to = dispatcher.email;
+          if (approver) reminderPayload.cc = approver;
+          extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
+            `to notify the customer.`;
+        } else {
+          extraNote += " Could not resolve the dispatcher email — the " +
+            "reminder went to the ops mailbox instead.";
+        }
+        await saveOutboundEmail(
+            additionalCharges.applyAdditionalChargeEmailCc(reminderPayload));
       }
-      const reminder = additionalCharges.buildDispatcherNotifyReminderEmail({
-        dispatcherName: dispatcher.displayName || dispatcher.userName || null,
-        loadNumber: invoice.loadNumber,
-        carrierName: invoice.carrierName,
-        customerName,
-        charges: chargeRows,
-        chargesTotal,
-        customerRate: invoice.customerRate ||
-          customerRateFromBooking(booking),
-        originalCustomerRate:
-          approvalUpdate["additionalCharge.originalCustomerRate"] || null,
-      });
-      const podFollowup = require("./pod-followup");
-      const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-        podFollowup.SARAH_EMAIL;
-      const reminderPayload = {
-        type: "additional_charge_dispatcher_task",
-        invoiceId: String(invoiceId),
-        subject: reminder.subject,
-        html: reminder.html,
-      };
-      if (dispatcher.ok && dispatcher.email) {
-        reminderPayload.forceRecipient = true;
-        reminderPayload.to = dispatcher.email;
-        if (approver) reminderPayload.cc = approver;
-        extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
-          `to notify the customer.`;
-      } else {
-        extraNote += " Could not resolve the dispatcher email — the " +
-          "reminder went to the ops mailbox instead.";
-      }
-      await saveOutboundEmail(
-          additionalCharges.applyAdditionalChargeEmailCc(reminderPayload));
+
       await additionalCharges.updateFollowUp(db, {
         invoiceId: String(invoiceId),
-        status: additionalCharges.FOLLOW_UP_STATUS
-            .APPROVED_BILLED_DISPATCHER_NOTIFIES,
+        status: skipDispatcherNotify ?
+          additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED :
+          additionalCharges.FOLLOW_UP_STATUS
+              .APPROVED_BILLED_DISPATCHER_NOTIFIES,
         decision,
         notes: extraNote.trim(),
       });
@@ -2437,7 +2472,9 @@ async function handleAdditionalChargeAction(req, res) {
 
     const titles = {
       a: "Approved — customer will be notified automatically",
-      b: "Approved — dispatcher will notify the customer",
+      b: skipDispatcherNotify ?
+        "Approved — carrier matches Primus; no dispatcher notify needed" :
+        "Approved — dispatcher will notify the customer",
       c: "Approved — carrier only",
     };
     const messages = {
@@ -9340,11 +9377,24 @@ async function reconcileUnrecognizedChargesWithPrimus(
 
     const normalize = (s) =>
       String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const chargeKeywords = (label) => {
+      const n = normalize(label);
+      const keys = [];
+      if (/compliance|csf/.test(n)) keys.push("compliance", "csf");
+      if (/reweigh|reclass|weight/.test(n)) {
+        keys.push("reweigh", "weight", "inspection");
+      }
+      if (/liftgate|lumper|detention|appointment/.test(n)) {
+        keys.push("liftgate", "lumper", "detention", "appointment");
+      }
+      return keys;
+    };
     const charges = Array.isArray(unrecognizedCharges) ?
       unrecognizedCharges : [];
     const chargesInPrimus = charges.length > 0 && charges.every((c) => {
       const cAmt = Math.abs(Number(c.amount || 0));
       const cLabel = normalize(c.label || c.type);
+      const keywords = chargeKeywords(c.label || c.type);
       return breakdown.some((b) => {
         const bAmt = Math.abs(Number(b.total != null ? b.total : b.rate || 0));
         const bDesc = normalize(b.description || b.code);
@@ -9352,7 +9402,9 @@ async function reconcileUnrecognizedChargesWithPrimus(
           Math.abs(bAmt - cAmt) <= Math.max(0.50, cAmt * 0.02);
         const descClose = cLabel && bDesc &&
           (bDesc.includes(cLabel) || cLabel.includes(bDesc));
-        return amtClose || descClose;
+        const keywordClose = keywords.length > 0 && keywords.some((kw) =>
+          bDesc.includes(kw));
+        return amtClose || descClose || keywordClose;
       });
     });
 

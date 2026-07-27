@@ -15,6 +15,7 @@
 const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const workflowErrors = require("./workflow-error-messages");
+const emailActionTokens = require("./email-action-tokens");
 
 // Injected from index.js (see init). Declared at module scope so the moved
 // workflow code below can call them by their original bare names, unchanged.
@@ -403,11 +404,13 @@ function buildCustomerEmailApprovalHtml(opts) {
     escapeHtml(completedSteps) + `</p>` +
 
     `<p style="margin-top:20px">` +
-    `<a href="${approveUrl}" style="display:inline-block;` +
+    `<a href="${emailActionTokens.escapeHtmlAttr(approveUrl)}" ` +
+    `style="display:inline-block;` +
     `padding:10px 20px;background:#16a34a;color:#fff;` +
     `text-decoration:none;border-radius:8px;font-weight:700;` +
     `margin-right:10px">Approve &amp; Send</a>` +
-    `<a href="${rejectUrl}" style="display:inline-block;` +
+    `<a href="${emailActionTokens.escapeHtmlAttr(rejectUrl)}" ` +
+    `style="display:inline-block;` +
     `padding:10px 20px;background:#dc2626;color:#fff;` +
     `text-decoration:none;border-radius:8px;font-weight:700">` +
     `Reject</a></p>` +
@@ -2371,9 +2374,8 @@ exports.processPrimusWorkflow = onRequest(
               "Awaiting reviewer approval before emailing the customer",
           );
 
-          const baseUrl = `https://${req.get("host")}`;
+          const baseUrl = emailActionTokens.publicFunctionsBaseUrl();
           const tenantId = (req.body && req.body.tenantId) || null;
-          const emailActionTokens = require("./email-action-tokens");
           const approveUrl = emailActionTokens.buildConfirmUrl({
             baseUrl,
             path: "approveCustomerEmail",

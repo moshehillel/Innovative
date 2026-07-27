@@ -403,7 +403,8 @@ function buildAdditionalChargeApprovalEmail(opts) {
     });
 
   const btn = (option, color, label) =>
-    `<p style="margin:10px 0"><a href="${actionUrl(option)}" ` +
+    `<p style="margin:10px 0"><a href="` +
+    `${emailTokens.escapeHtmlAttr(actionUrl(option))}" ` +
     `style="background:${color};color:#ffffff;padding:10px 16px;` +
     `border-radius:6px;text-decoration:none;font-weight:600;` +
     `display:inline-block">${label}</a></p>` +

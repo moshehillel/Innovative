@@ -8,6 +8,31 @@ const crypto = require("crypto");
 
 const DEFAULT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+const DEFAULT_PUBLIC_BASE_URL =
+  "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+
+/**
+ * HTTPS base URL for signed action links embedded in outbound emails.
+ * Always use this (not req.get("host")) so links target cloudfunctions.net
+ * function paths, not a workflow function's run.app host.
+ * @return {string}
+ */
+function publicFunctionsBaseUrl() {
+  return process.env.PUBLIC_FUNCTIONS_BASE_URL || DEFAULT_PUBLIC_BASE_URL;
+}
+
+/**
+ * Escapes a URL for use in an HTML href attribute (email-safe ampersands).
+ * @param {string} value Raw URL.
+ * @return {string}
+ */
+function escapeHtmlAttr(value) {
+  return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/</g, "&lt;");
+}
+
 /**
  * @return {string} HMAC secret.
  */
@@ -96,6 +121,9 @@ function buildConfirmUrl(opts) {
 
 module.exports = {
   DEFAULT_TTL_MS,
+  DEFAULT_PUBLIC_BASE_URL,
+  publicFunctionsBaseUrl,
+  escapeHtmlAttr,
   sign,
   verify,
   buildConfirmUrl,
