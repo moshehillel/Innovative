@@ -49,6 +49,7 @@ let emailBOLDocs;
 let resolveCustomerAccountingEmails;
 let checkBookingHasPod;
 let ensurePodMarkedOnPrimus;
+let ensureCarrierBillUploadedToPrimus;
 let notifyDispatcherRateIssue;
 let maybeNotifyLisaPodDiscrepancy;
 
@@ -75,6 +76,7 @@ function init(bundle) {
     isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
     resolveCustomerAccountingEmails, checkBookingHasPod,
     ensurePodMarkedOnPrimus,
+    ensureCarrierBillUploadedToPrimus,
     notifyDispatcherRateIssue,
     maybeNotifyLisaPodDiscrepancy,
   } = bundle);
@@ -100,6 +102,93 @@ function moneyFmt(amount) {
 function isMiworldCustomer(name) {
   const compact = String(name || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
   return compact.includes("miworld");
+}
+
+/**
+ * Loads the carrier invoice PDF from invoice attachments in Storage.
+ * @param {object} invoice Invoice document data.
+ * @return {Promise<{buffer: Buffer, filename: string}|null>}
+ */
+async function loadCarrierBillPdfFromInvoice(invoice) {
+  const attList = Array.isArray(invoice.attachments) ?
+    invoice.attachments : [];
+  const carrierAtt = attList.find((a) => a && a.storagePath) || null;
+  if (!carrierAtt || !carrierAtt.storagePath) return null;
+  const b64 = await downloadStorageFileBase64(carrierAtt.storagePath);
+  if (!b64) return null;
+  return {
+    buffer: Buffer.from(b64, "base64"),
+    filename: carrierAtt.filename ||
+      `carrier-bill-${invoice.loadNumber}.pdf`,
+  };
+}
+
+/**
+ * Uploads carrier bill PDF to Primus immediately after amount validation.
+ * Non-fatal: billing can retry upload later if this fails.
+ * @param {object} args Workflow context.
+ * @return {Promise<void>}
+ */
+async function uploadCarrierBillEarly(args) {
+  const {invoice, invoiceDoc, invoiceId, primusSteps} = args;
+  if (!isManagePhpEnabled || !isManagePhpEnabled() ||
+      !ensureCarrierBillUploadedToPrimus ||
+      primusSteps.carrierBillUploaded) {
+    return;
+  }
+  try {
+    const carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
+    if (!carrierBillPdf) return;
+    const booking = await fetchPrimusBooking(invoice.loadNumber);
+    if (!booking) return;
+    const result = await ensureCarrierBillUploadedToPrimus({
+      booking,
+      loadNumber: invoice.loadNumber,
+      carrierBillPdf,
+    });
+    const alreadyOnPrimus = result.skipped &&
+      result.reason === "already uploaded";
+    if (result.uploaded || alreadyOnPrimus) {
+      primusSteps.carrierBillUploaded = true;
+      await invoiceDoc.ref.update({
+        primusSteps,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await logWorkflowStep({
+        invoiceId,
+        stepName: "carrier_bill_upload_completed",
+        stepStatus: "success",
+        output: {
+          uploaded: !!result.uploaded,
+          skipped: !!result.skipped,
+          reason: result.reason || null,
+        },
+      });
+      await writeLog("info", "workflow",
+          result.uploaded ?
+            "Carrier bill PDF uploaded to Primus (early)" :
+            "Carrier bill PDF already on Primus — skipped", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            uploaded: !!result.uploaded,
+            skipped: !!result.skipped,
+          });
+    } else if (!result.ok && result.error) {
+      await writeLog("warn", "workflow",
+          "Early carrier bill upload failed — will retry at invoice step", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            error: result.error,
+          });
+    }
+  } catch (err) {
+    await writeLog("warn", "workflow",
+        "Early carrier bill upload error — will retry at invoice step", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          error: err.message || String(err),
+        });
+  }
 }
 
 /**
@@ -1191,6 +1280,13 @@ exports.processPrimusWorkflow = onRequest(
 
         await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validated");
 
+        await uploadCarrierBillEarly({
+          invoice,
+          invoiceDoc,
+          invoiceId,
+          primusSteps,
+        });
+
         // Extra charges (e.g. lumper) are never auto-added to the customer
         // invoice, even when their proof checks out — a human must decide
         // via the A/B/C/D approval email. Once decided, the workflow
@@ -1938,27 +2034,13 @@ exports.processPrimusWorkflow = onRequest(
             let uiResult;
             try {
               const bk = await fetchPrimusBooking(invoice.loadNumber);
-              const attList = Array.isArray(invoice.attachments) ?
-                invoice.attachments : [];
-              const carrierAtt = attList.find((a) => a && a.storagePath) ||
-                null;
               const podPath =
                 (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
                 (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
                 null;
               let carrierBillPdf = null;
               let podPdf = null;
-              if (carrierAtt && carrierAtt.storagePath) {
-                const b64 = await downloadStorageFileBase64(
-                    carrierAtt.storagePath);
-                if (b64) {
-                  carrierBillPdf = {
-                    buffer: Buffer.from(b64, "base64"),
-                    filename: carrierAtt.filename ||
-                      `carrier-bill-${invoice.loadNumber}.pdf`,
-                  };
-                }
-              }
+              carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
               if (podPath) {
                 const podB64 = await downloadStorageFileBase64(podPath);
                 if (podB64) {

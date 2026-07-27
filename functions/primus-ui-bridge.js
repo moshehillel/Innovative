@@ -3550,6 +3550,72 @@ async function ensurePodMarkedOnPrimus(args) {
 exports.ensurePodMarkedOnPrimus = ensurePodMarkedOnPrimus;
 
 /**
+ * Uploads the carrier bill PDF to Primus (internal Carrier Bill file type)
+ * as soon as the invoice PDF is available — does not wait for customer
+ * invoice generation or rate check.
+ * @param {object} args booking, loadNumber, carrierBillPdf {buffer, filename}.
+ * @return {Promise<object>}
+ */
+async function ensureCarrierBillUploadedToPrimus(args) {
+  const {booking, loadNumber, carrierBillPdf} = args || {};
+  if (!isManagePhpEnabled()) {
+    return {ok: true, skipped: true, reason: "manage.php off"};
+  }
+  if (!booking || !loadNumber) {
+    return {ok: false, error: "Missing booking or loadNumber"};
+  }
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  let uploadFileTypes;
+  try {
+    uploadFileTypes = await resolveUploadFileTypes();
+  } catch (err) {
+    return {ok: false, error: err.message || String(err)};
+  }
+  const carrierBillTypeId = uploadFileTypes.carrierBill.id;
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: String(loadNumber),
+  });
+  if (docs.ok && bookingHasFileType(docs.data, carrierBillTypeId)) {
+    return {
+      ok: true,
+      uploaded: false,
+      skipped: true,
+      reason: "already uploaded",
+    };
+  }
+  const buf = carrierBillPdf && carrierBillPdf.buffer;
+  if (!buf || !buf.length) {
+    return {ok: true, skipped: true, reason: "no carrier bill pdf"};
+  }
+  const upload = await maybeUploadBookingPdf({
+    docData: docs.ok ? docs.data : null,
+    bookingId,
+    bookingBOL: String(loadNumber),
+    fileType: carrierBillTypeId,
+    fileTypeName: uploadFileTypes.carrierBill.name,
+    file: {
+      buffer: buf,
+      filename: carrierBillPdf.filename ||
+        `carrier-bill-${loadNumber}.pdf`,
+    },
+  });
+  if (!upload.ok) {
+    return {ok: false, uploaded: false, error: upload.error, upload};
+  }
+  return {
+    ok: true,
+    uploaded: !!upload.uploaded,
+    skipped: !!upload.skipped,
+    upload,
+  };
+}
+exports.ensureCarrierBillUploadedToPrimus = ensureCarrierBillUploadedToPrimus;
+
+/**
  * True when issued invoice charge lines include the bill-to reference text.
  * @param {Array<object>} charges Invoice charge rows.
  * @param {string} billToReference Bill-to Reference# text.

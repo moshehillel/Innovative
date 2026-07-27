@@ -9809,6 +9809,8 @@ innovativePrimus.init({
       primusUiBridge.resolveCustomerAccountingEmails,
   checkBookingHasPod: primusUiBridge.checkBookingHasPod,
   ensurePodMarkedOnPrimus: primusUiBridge.ensurePodMarkedOnPrimus,
+  ensureCarrierBillUploadedToPrimus:
+      primusUiBridge.ensureCarrierBillUploadedToPrimus,
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
 
