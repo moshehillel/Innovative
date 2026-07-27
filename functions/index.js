@@ -2987,7 +2987,9 @@ async function preCheckDocumentType(pdfBuffer) {
           text: "What type of document is this? Reply with exactly one word: " +
             "INVOICE, STATEMENT, INSURANCE, POD, or OTHER. " +
             "Use INVOICE when the PDF contains carrier freight bill(s) " +
-            "to pay, even if the first page is a statement summary.",
+            "to pay, even if the first page is only a statement summary " +
+            "(common for Saia, AAA Cooper, and other LTL carriers — " +
+            "later pages are the actual invoices).",
         },
       ],
     }],
@@ -2996,34 +2998,82 @@ async function preCheckDocumentType(pdfBuffer) {
   if (!response.content || response.content.length === 0) return "OTHER";
   const block = response.content[0];
   if (!block || block.type !== "text" || !block.text) return "OTHER";
-  const word = block.text.trim().toUpperCase().split(/\s+/)[0];
+  const word = block.text.trim().toUpperCase().split(/\s+/)[0]
+      .replace(/[^A-Z]/g, "");
   return ["INVOICE", "STATEMENT", "INSURANCE", "POD"].includes(word) ?
     word : "OTHER";
 }
 
 /**
+ * Normalizes a first-page pre-check label (strip punctuation / whitespace).
+ * @param {string} docType Raw label.
+ * @return {string}
+ */
+function sanitizePreCheckLabel(docType) {
+  return String(docType || "").trim().toUpperCase().replace(/[^A-Z]/g, "");
+}
+
+/**
+ * @param {Buffer} pdfBuffer Full PDF buffer.
+ * @return {Promise<number>} Page count, or 0 on failure.
+ */
+async function getPdfPageCount(pdfBuffer) {
+  try {
+    const pdf = await PDFDocument.load(pdfBuffer);
+    return pdf.getPageCount();
+  } catch (_) {
+    return 0;
+  }
+}
+
+/**
+ * True when the email subject/sender looks like a carrier invoice packet
+ * (possibly with a statement summary cover page before the bills).
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeCarrierInvoiceEmail(subject, from) {
+  const hints = `${subject || ""} ${from || ""}`.toLowerCase();
+  const invoicePacket = new RegExp(
+      "invoice from|your invoice|is attached|acct no|account no|" +
+      "carrier invoice|ltl invoice", "i");
+  const carrierName = new RegExp(
+      "freight line|motor freight|freight system|freightways", "i");
+  return invoicePacket.test(hints) || carrierName.test(hints);
+}
+
+/**
  * Maps cheap first-page pre-check labels to attachment processing types.
- * Carrier statement PDFs (e.g. AAA Cooper Stmt) often bundle several freight
- * invoices — still run full multi-invoice extraction for those.
+ * Carrier statement PDFs (e.g. AAA Cooper / Saia Stmt) often bundle several
+ * freight invoices — still run full multi-invoice extraction for those.
  * @param {string} docType Pre-check label.
  * @param {object} [context] Optional subject/filename hints.
+ * @param {number} [context.pageCount] PDF page count when known.
  * @return {string} Attachment docType for intake.
  */
 function normalizePreCheckDocType(docType, context = {}) {
-  const label = String(docType || "").toUpperCase();
+  const label = sanitizePreCheckLabel(docType);
   if (label === "STATEMENT") return "INVOICE";
-  if (label === "OTHER") {
-    const hints = [
-      context.subject,
-      context.filename,
-      context.from,
-    ].map((s) => String(s || "")).join(" ");
+  const hints = [
+    context.subject,
+    context.filename,
+    context.from,
+  ].map((s) => String(s || "")).join(" ");
+  const pageCount = Number(context.pageCount) || 0;
+  if (label === "OTHER" || label === "STATEMENT") {
     if (/stmt|stmd|statement|freight\s*inv|carrier\s*inv|transportation/i
         .test(hints)) {
       return "INVOICE";
     }
+    if (looksLikeCarrierInvoiceEmail(context.subject, context.from)) {
+      return "INVOICE";
+    }
+    if (pageCount > 1) {
+      return "INVOICE";
+    }
   }
-  return label;
+  return label || "OTHER";
 }
 
 /**
@@ -5563,6 +5613,9 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "- carrier_invoice: trucking company freight invoice, usually PDF.",
       "  Also use when an LTL carrier sends a Stmt/statement PDF that",
       "  includes freight bills to pay (may contain multiple invoices).",
+      "  Saia and similar carriers often email 'Your Invoice From …' with",
+      "  a PDF whose first page is a statement summary and later pages are",
+      "  the freight bills — that is carrier_invoice, not statement.",
       "- pod_delivery: reply with only Proof of Delivery / signed BOL /",
       "  delivery or trailer photos — NO freight invoice amount due. Often a",
       "  reply to a POD request.",
@@ -6072,24 +6125,39 @@ async function processGmailMessage(
       }
 
       const preCheckLabel = docType;
+      const pageCount = await getPdfPageCount(fileBuffer);
       docType = normalizePreCheckDocType(docType, {
         subject, from, filename: attachment.filename,
+        pageCount,
       });
       if (preCheckLabel !== docType && docType === "INVOICE") {
         await writeLog("info", "gmail",
             "Carrier statement PDF — attempting multi-invoice extraction", {
               messageId, filename: attachment.filename,
               preCheckLabel,
+              pageCount,
             });
       }
       if (docType !== "INVOICE" && docType !== "POD") {
-        await writeLog("info", "gmail",
-            `Attachment is ${preCheckLabel}, skipping`, {
-              messageId, filename: attachment.filename,
-              docType: preCheckLabel,
-            });
-        skippedDocTypes.push(preCheckLabel);
-        continue;
+        if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT" ||
+            (pageCount > 1 && looksLikeCarrierInvoiceEmail(subject, from))) {
+          docType = "INVOICE";
+          await writeLog("info", "gmail",
+              "Statement-cover PDF treated as invoice bundle", {
+                messageId,
+                filename: attachment.filename,
+                preCheckLabel,
+                pageCount,
+              });
+        } else {
+          await writeLog("info", "gmail",
+              `Attachment is ${preCheckLabel}, skipping`, {
+                messageId, filename: attachment.filename,
+                docType: preCheckLabel,
+              });
+          skippedDocTypes.push(preCheckLabel);
+          continue;
+        }
       }
 
       const safeFilename =
@@ -6154,19 +6222,28 @@ async function processGmailMessage(
                 });
           }
           const preCheckLabel = docType;
+          const pageCount = await getPdfPageCount(attachment.buffer);
           docType = normalizePreCheckDocType(docType, {
             subject, from, filename: attachment.filename,
+            pageCount,
           });
           if (preCheckLabel !== docType && docType === "INVOICE") {
             await writeLog("info", "gmail",
                 "Carrier statement PDF from raw MIME — multi-invoice", {
                   messageId, filename: attachment.filename,
                   preCheckLabel,
+                  pageCount,
                 });
           }
           if (docType !== "INVOICE" && docType !== "POD") {
-            skippedDocTypes.push(preCheckLabel);
-            continue;
+            if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT" ||
+                (pageCount > 1 &&
+                  looksLikeCarrierInvoiceEmail(subject, from))) {
+              docType = "INVOICE";
+            } else {
+              skippedDocTypes.push(preCheckLabel);
+              continue;
+            }
           }
           const safeFilename =
               String(attachment.filename || "invoice.pdf")
