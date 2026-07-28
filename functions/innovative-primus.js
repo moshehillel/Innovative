@@ -255,8 +255,18 @@ async function pushCarrierBillToQuickBooks(args) {
     );
     const qbResults = qbResult && qbResult.data && qbResult.data.results;
     const qbBills = qbResults && qbResults.bills;
-    const primusQbError = (qbResults && typeof qbResults.error === "string" &&
-        qbResults.error) || null;
+    let primusQbError = null;
+    if (qbResults && qbResults.error != null) {
+      const err = qbResults.error;
+      if (typeof err === "string") {
+        primusQbError = err;
+      } else if (typeof err === "object") {
+        primusQbError = err.message || err.error ||
+          JSON.stringify(err);
+      } else {
+        primusQbError = String(err);
+      }
+    }
     const uploaded = (qbBills && qbBills.uploadedBills &&
         qbBills.uploadedBills.length) || 0;
     const failed = (qbBills && qbBills.failedBills &&
@@ -2063,6 +2073,7 @@ exports.processPrimusWorkflow = onRequest(
                 loadNumber: invoice.loadNumber,
                 customerRate,
                 carrierInvoiceAmount: invoice.invoiceAmount,
+                carrierName: invoice.carrierName || null,
                 proNumber: workingProNumber || invoice.proNumber,
                 vendorInvoiceNumber: invoice.invoiceNumber ||
                   invoice.carrierInvoiceNumber ||

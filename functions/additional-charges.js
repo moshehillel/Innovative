@@ -803,6 +803,24 @@ async function createFollowUp(db, data) {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+
+  try {
+    const dashboardTasks = require("./dashboard-tasks");
+    await dashboardTasks.createDashboardTask(db, {
+      tenantId: data.tenantId || "default",
+      type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+      title: `Additional charge — Load ${data.loadNumber || "—"}`,
+      description: data.notes || null,
+      loadNumber: data.loadNumber || null,
+      carrierName: data.carrierName || null,
+      invoiceId: data.invoiceId || null,
+      followUpId: doc.id,
+      reason: data.category || data.status || null,
+    });
+  } catch (taskErr) {
+    console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+  }
+
   return doc.id;
 }
 

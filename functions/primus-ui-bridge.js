@@ -1441,6 +1441,104 @@ async function emailBOLDocs(args) {
 exports.emailBOLDocs = emailBOLDocs;
 
 /**
+ * Sends POD document(s) from Primus to a recipient (no customer invoice).
+ * Uses manage.php emailBOLDocs with only POD drive file checkboxes.
+ * @param {object} args booking, loadNumber, recipientEmail, subject, body
+ * @return {Promise<object>}
+ */
+async function emailPodDocs(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, skipped: true, reason: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  const booking = args.booking;
+  if (!booking || !booking.BOLId) {
+    return {ok: false, error: "Booking missing BOLId"};
+  }
+  const recipientEmail = args.recipientEmail;
+  if (!recipientEmail) {
+    return {ok: false, error: "No recipient email"};
+  }
+  const loadNumber = args.loadNumber || booking.BOLNbr || booking.bolNumber;
+  if (!loadNumber) {
+    return {ok: false, error: "No load number"};
+  }
+
+  const {quoteId, customerQuoteId} = resolveBookingQuoteIds(booking);
+  const {
+    podDriveIds,
+    blockedDriveFileIds,
+    customerName: resolvedCustomerName,
+  } = await resolvePodDriveIdsForEmail({
+    booking,
+    loadNumber,
+    podPdf: args.podPdf || null,
+    customerName: args.customerName || null,
+    extraDriveFileIds: args.extraDriveFileIds || [],
+  });
+
+  if (!podDriveIds || !podDriveIds.length) {
+    return {
+      ok: false,
+      error: "No POD document on Primus",
+      blockedDriveFileIds: blockedDriveFileIds || [],
+    };
+  }
+
+  const manageBookingId = resolveManageBookingId(booking);
+  if (!manageBookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
+    "accounting@innovativecarriers.com";
+  const subject = args.subject ||
+    `Proof of Delivery — Load #${loadNumber}`;
+  const body = args.body ||
+    `<p>Please find the Proof of Delivery for load ` +
+    `<strong>#${loadNumber}</strong> attached.</p>` +
+    `<p>Thank you,<br>Innovative Carriers Accounting</p>`;
+
+  const params = {
+    action: "emailBOLDocs",
+    bookingId: manageBookingId,
+    quoteId: String(quoteId || 0),
+    invoiceId: "0",
+    invoiceNumber: "0",
+    invoices: [],
+    customerQuoteId: String(customerQuoteId || 0),
+    fromApplet: "false",
+    consolidate: "true",
+    bookingCreateSingleFile: "false",
+    bookingBOL: String(loadNumber),
+  };
+  params["email-docs-from"] = fromAddr;
+  params["email-docs-to"] = recipientEmail;
+  params["email-docs-subject"] = subject;
+  params["email-docs-body"] = body;
+  for (const driveId of podDriveIds) {
+    params[`email-docs-drive-${driveId}`] = "on";
+  }
+
+  const result = await managePhpPost(params);
+  const success = isEmailBOLDocsSuccess(result.json);
+  return {
+    ok: success,
+    json: result.json,
+    status: result.status,
+    driveFileIds: podDriveIds,
+    blockedDriveFileIds: blockedDriveFileIds || [],
+    to: recipientEmail,
+    customerName: resolvedCustomerName || null,
+    error: success ? null :
+      ((result.json && result.json.message) ||
+        (result.json && result.json.error) ||
+        "emailPodDocs failed"),
+    raw: !success ? (result.text || "").slice(0, 500) : undefined,
+  };
+}
+exports.emailPodDocs = emailPodDocs;
+
+/**
  * @param {object} json Parsed manage.php JSON body.
  * @return {boolean}
  */
@@ -2446,6 +2544,79 @@ function pickVendorByNameHint(vendors, hint) {
 }
 
 /**
+ * Strict name match for master vendor lookup (no fallback to vendors[0]).
+ * @param {Array<object>} vendors Parsed getVendors list.
+ * @param {string} hint Carrier name.
+ * @return {object|null}
+ */
+function findMasterVendorByName(vendors, hint) {
+  const query = String(hint || "").trim();
+  if (!query || !vendors.length) return null;
+  const queryLower = query.toLowerCase();
+  const firstToken = query.split(/[,\n/]/)[0].trim().toLowerCase();
+  return vendors.find((v) => (v.name || "").toLowerCase() === queryLower) ||
+    vendors.find((v) => (v.name || "").toLowerCase() === firstToken) ||
+    vendors.find((v) => {
+      const n = (v.name || "").toLowerCase();
+      return firstToken.length >= 6 &&
+        (n.includes(firstToken) || firstToken.includes(n));
+    }) ||
+    null;
+}
+
+/**
+ * Resolves the Primus master vendor id (getVendors) for billing/QB sync.
+ * Manual UI uses master ids (~82651 Estes); REST booking.vendor.id is a
+ * different large assignment id Jerry must not send in billsInfo.carrierId.
+ *
+ * @param {object} bookingVendor booking.vendor from GET /book.
+ * @param {string} [nameHint] Carrier name from invoice PDF/email.
+ * @return {Promise<object>} vendor-shaped object with master id + name.
+ */
+async function resolveMasterVendorForBilling(bookingVendor, nameHint) {
+  const hint = String(nameHint || bookingVendor.name || "").trim();
+  if (!hint) return bookingVendor;
+
+  const maxPages = 160;
+  for (let page = 0; page < maxPages; page++) {
+    const start = page * 25;
+    const result = await managePhpPost({
+      action: "getVendors",
+      page: "1",
+      start: String(start),
+      limit: "25",
+    });
+    const vendors = parseVendorsFromResponse(result.json);
+    if (!vendors.length) break;
+    const match = findMasterVendorByName(vendors, hint);
+    if (match && match.id) {
+      if (writeLog) {
+        await writeLog("info", "primus", "Resolved master vendor for billing", {
+          bookingVendorId: bookingVendor.id,
+          masterVendorId: match.id,
+          carrierName: match.name || hint,
+        });
+      }
+      return {
+        ...bookingVendor,
+        id: match.id,
+        name: match.name || hint,
+        bookingVendorId: bookingVendor.id,
+      };
+    }
+  }
+
+  if (writeLog) {
+    await writeLog("warn", "primus",
+        "Master vendor not found — using booking vendor id", {
+          bookingVendorId: bookingVendor.id,
+          hint,
+        });
+  }
+  return bookingVendor;
+}
+
+/**
  * Resolves the insurance vendor via getVendors (env fallback for Redkik).
  * Redkik is cached process-wide; other vendors are looked up per call
  * (caller should resolve once per invoice sheet and reuse).
@@ -2833,7 +3004,252 @@ async function addInsurancePremiumToLoad(args) {
     },
   };
 }
+
+/**
+ * Removes Redkik (insurance vendor) actual-cost lines from a load invoice.
+ * Mirrors addInsurancePremiumToLoad save sequence without adding a new line.
+ *
+ * @param {object} args Flow inputs.
+ * @param {object} args.booking Primus booking from GET /book/bolnumber.
+ * @param {string} args.loadNumber BOL / load number.
+ * @param {object} [args.insuranceVendor] Optional {id, name} override.
+ * @return {Promise<object>}
+ */
+async function removeInsurancePremiumFromLoad(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  if (!loadNumber) return {ok: false, error: "loadNumber required"};
+
+  const booking = args.booking;
+  if (!booking) {
+    return {ok: false, notFound: true, error: "booking required"};
+  }
+
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const docs = await getBookingDocuments({bookingId, bookingBOL: loadNumber});
+  if (!docs.ok || !docs.data) {
+    return {
+      ok: false,
+      error: docs.error || "getBookingDocuments failed",
+    };
+  }
+
+  const uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {ok: false, notFound: true, error: "No Primus invoice on booking"};
+  }
+
+  const invoiceId = String(uiInvoice.id);
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+
+  const actualCostsRaw = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+
+  const insuranceVendor = args.insuranceVendor ||
+    await resolveInsuranceVendor();
+
+  const insuranceLines = actualCostsRaw.filter((c) =>
+    String(c.carrierId) === String(insuranceVendor.id));
+  if (!insuranceLines.length) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "no insurance",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const removedTotal = roundMoney(
+      insuranceLines.reduce((s, l) => s + Number(l.total || 0), 0));
+  const removedBills = insuranceLines.map((l) =>
+    l.vendorInvoiceNumber || "").filter(Boolean);
+
+  const actualCosts = actualCostsRaw.filter((c) =>
+    String(c.carrierId) !== String(insuranceVendor.id));
+
+  let billsInfo = extractBillsInfoFromStore(storeData);
+  if (!billsInfo || !billsInfo.length) {
+    billsInfo = reconstructBillsInfoFromActualCosts(actualCosts);
+  } else {
+    billsInfo = billsInfo.filter((b) =>
+      String(b.carrierId) !== String(insuranceVendor.id));
+  }
+
+  const carrierActualCosts = actualCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId),
+    carrierName: String(line.carrierName || ""),
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: String(line.PRO || ""),
+    isAccessorial: !!line.isAccessorial,
+  }));
+
+  const totalActual = roundMoney(
+      carrierActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const totalEstimated = roundMoney(
+      estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+  const profit = roundMoney(chargesTotal - totalActual);
+  const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+  const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+
+  const billtoResolution = await resolveManageBilltoId(booking);
+  const storedBillto = extractBilltoIdFromStore(storeData);
+  const billtoId = billtoResolution.id || storedBillto;
+  if (!billtoId) {
+    return {ok: false, error: "Could not resolve billtoId"};
+  }
+
+  const notes = {
+    internalNotes: String(booking.internalNotes || ""),
+    externalNotes: String(booking.externalNotes || ""),
+  };
+
+  const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+
+  const vendorRef = await managePhpPost({
+    action: "addVendorRefNumber",
+    invoiceId,
+    bookingId,
+    billsInfo,
+    actualCosts: carrierActualCosts,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    totalActualCost: totalActual,
+    ...refExtra,
+  });
+
+  if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+    return {
+      ok: false,
+      step: "addVendorRefNumber",
+      error: (vendorRef.json && vendorRef.json.message) ||
+        "addVendorRefNumber failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const phase2Estimated = estimatedCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId || ""),
+    carrierName: String(line.carrierName || ""),
+    editable: line.editable != null ? String(line.editable) : "0",
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    isAccessorial: !!line.isAccessorial,
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: "",
+  }));
+
+  const phase2Charges = charges.map((c) => ({
+    id: String(c.id),
+    code: c.code || "",
+    description: c.description || "",
+    qty: Number(c.qty || 1),
+    rate: roundMoney(c.rate),
+    total: roundMoney(c.total).toFixed(2),
+  }));
+
+  const saveResult = await managePhpPost({
+    action: "saveInvoice",
+    billsInfo,
+    charges: phase2Charges,
+    actualCosts: carrierActualCosts,
+    estimatedCosts: phase2Estimated,
+    chargesTotal,
+    totalEstimatedCosts: totalEstimated,
+    totalActualCosts: totalActual,
+    billtoId: String(billtoId),
+    bookingId,
+    ...notes,
+    costClosed: "1",
+    costActualClosed: "1",
+    readyToInvoice: "1",
+    estimatedProfitUSD: profit,
+    estimatedProfitPer: profitPer,
+    estimatedGP: gp,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    vendorInvoiceNumber: "",
+    vendorTerm: "",
+    PRONumber: "",
+    invoiceNumber: uiInvoice.invoiceNumber ?
+      String(uiInvoice.invoiceNumber) : "0",
+    id: invoiceId,
+  });
+
+  if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+    return {
+      ok: false,
+      step: "saveInvoice",
+      error: (saveResult.json && saveResult.json.message) ||
+        "saveInvoice failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const verify = await getInvoiceStores(invoiceId);
+  const verifiedCosts = verify.ok ?
+    extractActualCostsFromStore(verify.data) : null;
+  const stillHasInsurance = verifiedCosts && verifiedCosts.some((c) =>
+    String(c.carrierId) === String(insuranceVendor.id));
+
+  if (writeLog) {
+    await writeLog("info", "primus", "Insurance premium removed from load", {
+      loadNumber,
+      invoiceId,
+      removedTotal,
+      removedBills,
+      insuranceVendorId: insuranceVendor.id,
+      verifiedRemoved: !stillHasInsurance,
+    });
+  }
+
+  return {
+    ok: true,
+    loadNumber,
+    invoiceId,
+    removedTotal,
+    removedBills,
+    removedLineCount: insuranceLines.length,
+    insuranceVendorId: insuranceVendor.id,
+    verifiedRemoved: !stillHasInsurance,
+    steps: {
+      addVendorRefNumber: vendorRef.json.message,
+      saveInvoice: saveResult.json.message,
+    },
+  };
+}
 exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
+exports.removeInsurancePremiumFromLoad = removeInsurancePremiumFromLoad;
 exports.resolveInsuranceVendor = resolveInsuranceVendor;
 
 /**
@@ -2954,9 +3370,21 @@ async function runPrimusUiBillingFlow(args) {
     });
   }
 
-  const vendor = booking.vendor || {};
+  let vendor = booking.vendor || {};
   if (!vendor.id) {
     return {ok: false, error: "Booking missing vendor.id"};
+  }
+  try {
+    vendor = await resolveMasterVendorForBilling(
+        vendor,
+        args.carrierName || vendor.name || "",
+    );
+  } catch (vendorErr) {
+    return {
+      ok: false,
+      step: "resolveMasterVendor",
+      error: vendorErr.message || "resolveMasterVendorForBilling failed",
+    };
   }
 
   const draftResolution = await resolveExistingDraftInvoiceId({

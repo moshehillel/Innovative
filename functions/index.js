@@ -32,6 +32,10 @@ const additionalCharges = require("./additional-charges");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
 const loadResolution = require("./invoice-load-resolution");
+const apexCapitalIntake = require("./apex-capital-intake");
+const podRequestIntake = require("./pod-request-intake");
+const administrativeEmailIntake = require("./administrative-email-intake");
+const dashboardTasks = require("./dashboard-tasks");
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
 
@@ -2540,6 +2544,7 @@ exports.getAdditionalCharges = onRequest(
  * @return {Promise<object>} Express response.
  */
 async function handleGetAdditionalCharges(req, res) {
+  if (applyDashboardCors(req, res)) return;
   try {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const snap = await db.collection(additionalCharges.FOLLOW_UP_COLLECTION)
@@ -3237,6 +3242,36 @@ async function handleStatementOnlyEmail(args) {
 }
 
 /**
+ * Marks an administrative email as intentionally ignored (no forward).
+ * @param {object} args Handler arguments.
+ * @return {Promise<void>}
+ */
+async function completeAdministrativeIgnore(args) {
+  const {
+    messageId, subject, from, tenant, finalStatus, reason, extra,
+  } = args;
+  await writeLog("info", "gmail", reason || "Administrative email ignored", {
+    messageId,
+    subject,
+    from,
+    finalStatus,
+    ...(extra || {}),
+  });
+  await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+  await tcol(tenant, "emailIntake").doc(messageId).set({
+    gmailMessageId: messageId,
+    tenantId: tenant.tenantId,
+    subject,
+    from,
+    finalStatus: finalStatus || "administrative_ignored",
+    ignoreReason: reason || null,
+    ...(extra || {}),
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    deleteAt: getDeleteAt(30),
+  }, {merge: true});
+}
+
+/**
  * Forwards an email to the human review address with context notes.
  * @param {object} gmail - Authenticated Gmail client.
  * @param {string} messageId - Original Gmail message ID.
@@ -3486,6 +3521,20 @@ async function forwardToHumanReview(
     reviewEmail: departmentEmail,
     department,
     originalAttached: Boolean(originalRawBuffer),
+  });
+
+  const loadHint = extractedData && (
+    extractedData.loadNumber || extractedData["Load #"] ||
+    extractedData.load);
+  await dashboardTasks.createDashboardTask(db, {
+    tenantId: (currentTenant() && currentTenant().tenantId) || "default",
+    type: dashboardTasks.TASK_TYPE.HUMAN_REVIEW,
+    title: `[Review] ${safeReason}`,
+    description: notes || null,
+    loadNumber: loadHint ? String(loadHint) : null,
+    messageId,
+    department,
+    reason: safeReason,
   });
 }
 
@@ -3839,6 +3888,18 @@ async function notifyLisaPodDiscrepancy(opts) {
     to: lisa,
     damageNoted: disc.damageNoted,
     missingCartons: disc.missingCartons,
+  });
+
+  await dashboardTasks.createDashboardTask(db, {
+    tenantId: (opts && opts.tenant && opts.tenant.tenantId) || "default",
+    type: dashboardTasks.TASK_TYPE.POD_DISCREPANCY,
+    title: `Review POD — ${flagLabel}`,
+    description: disc.details || null,
+    loadNumber: loadNumber || null,
+    proNumber: proNumber || null,
+    carrierName: carrierName || null,
+    invoiceId: invoiceId || null,
+    reason: flagLabel,
   });
 
   return {ok: true, sent: true, to: lisa, discrepancies: disc};
@@ -5163,6 +5224,210 @@ function extractLoadHintsFromEmail(subject, body, hints) {
 }
 
 /**
+ * Emails Lisa when someone requests a signed POD we may not have on file.
+ * @param {object} opts Request context.
+ * @return {Promise<object>}
+ */
+async function notifyLisaSignedPodRequest(opts) {
+  const podFollowup = require("./pod-followup");
+  const {
+    messageId,
+    subject,
+    from,
+    loadNumber,
+    proNumber,
+    requesterEmail,
+    emailBody,
+  } = opts || {};
+  const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
+  const html =
+    `<p>Hi Lisa,</p>` +
+    `<p>Someone asked for a <strong>signed POD</strong> on load ` +
+    `<strong>${escapeHtml(String(loadNumber || "—"))}</strong>. ` +
+    `Jerry did not auto-send a document — please obtain the signed POD ` +
+    `and send it to the requester.</p>` +
+    `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
+    `<tr><td style="padding:4px 16px 4px 0;font-weight:600">From</td>` +
+    `<td>${escapeHtml(from || "—")}</td></tr>` +
+    `<tr><td style="padding:4px 16px 4px 0;font-weight:600">Reply to</td>` +
+    `<td>${escapeHtml(requesterEmail || "—")}</td></tr>` +
+    (proNumber ?
+      `<tr><td style="padding:4px 16px 4px 0;font-weight:600">PRO</td>` +
+      `<td>${escapeHtml(String(proNumber))}</td></tr>` : "") +
+    `<tr><td style="padding:4px 16px 4px 0;font-weight:600">Subject</td>` +
+    `<td>${escapeHtml(subject || "—")}</td></tr>` +
+    `</table>` +
+    (emailBody ?
+      `<p style="margin:12px 0"><em>${escapeHtml(
+          String(emailBody).slice(0, 800))}</em></p>` : "");
+
+  await saveOutboundEmail({
+    type: "signed_pod_request",
+    forceRecipient: true,
+    to: lisa,
+    subject: `Signed POD requested — Load ${loadNumber || "—"}`,
+    html,
+    tenant: opts && opts.tenant,
+  });
+
+  await writeLog("info", "email", "Signed POD request escalated to Lisa", {
+    messageId,
+    loadNumber,
+    proNumber: proNumber || null,
+    requesterEmail,
+    to: lisa,
+  });
+
+  await dashboardTasks.createDashboardTask(db, {
+    tenantId: (opts && opts.tenant && opts.tenant.tenantId) || "default",
+    type: dashboardTasks.TASK_TYPE.SIGNED_POD,
+    title: `Signed POD requested — Load ${loadNumber || "—"}`,
+    description: requesterEmail ?
+      `Reply to ${requesterEmail}` : null,
+    loadNumber: loadNumber || null,
+    proNumber: proNumber || null,
+    messageId: messageId || null,
+    reason: "signed_pod_request",
+  });
+
+  return {ok: true, sent: true, to: lisa};
+}
+
+/**
+ * Handles inbound emails asking us to send a POD from Primus.
+ * Signed-POD requests escalate to Lisa instead of auto-sending.
+ * @param {object} opts gmail, messageId, subject, from, emailBody, tenant,
+ *   emailClassification.
+ * @return {Promise<object>} {handled, status, loadNumber, error?}
+ */
+async function handlePodRequestEmail(opts) {
+  const {
+    messageId, subject, from, emailBody, tenant, emailClassification,
+  } = opts;
+
+  const intent = emailClassification && emailClassification.intent;
+  if (!podRequestIntake.isPodRequestEmail(subject, emailBody, intent)) {
+    return {handled: false};
+  }
+
+  const hints = {
+    loadNumberHint: emailClassification && emailClassification.loadNumberHint,
+    proNumberHint: emailClassification && emailClassification.proNumberHint,
+  };
+  const extracted = extractLoadHintsFromEmail(subject, emailBody, hints);
+  let loadNumber = extracted.loadNumber;
+  const proNumber = extracted.proNumber;
+
+  if (!loadNumber && proNumber) {
+    try {
+      const booking = await fetchPrimusBookingByPro(proNumber);
+      if (booking) {
+        loadNumber = String(
+            booking.BOLNumber || booking.bolNumber || "").trim() || null;
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  if (!loadNumber) {
+    await writeLog("warn", "gmail",
+        "POD request email — could not resolve load/BOL", {
+          messageId, subject, hints,
+        });
+    return {handled: false};
+  }
+
+  const requesterEmail = podRequestIntake.parseEmailAddressFromHeader(from);
+  const wantsSignedPod = podRequestIntake.looksLikeSignedPodRequest(
+      subject, emailBody);
+
+  if (wantsSignedPod) {
+    await notifyLisaSignedPodRequest({
+      messageId,
+      subject,
+      from,
+      loadNumber,
+      proNumber,
+      requesterEmail,
+      emailBody,
+      tenant,
+    });
+    return {
+      handled: true,
+      status: "signed_pod_escalated",
+      loadNumber,
+      escalatedToLisa: true,
+    };
+  }
+
+  const bridge = require("./primus-ui-bridge");
+  if (!bridge.isManagePhpEnabled || !bridge.isManagePhpEnabled()) {
+    await writeLog("warn", "gmail",
+        "POD request — Primus UI bridge disabled", {messageId, loadNumber});
+    return {handled: false};
+  }
+
+  let booking;
+  try {
+    booking = await fetchPrimusBooking(loadNumber);
+  } catch (bookErr) {
+    await writeLog("warn", "gmail", "POD request — booking lookup failed", {
+      messageId, loadNumber, error: bookErr.message,
+    });
+    return {handled: false};
+  }
+  if (!booking || !booking.BOLId) {
+    await writeLog("warn", "gmail", "POD request — booking not found", {
+      messageId, loadNumber,
+    });
+    return {handled: false};
+  }
+
+  if (!requesterEmail) {
+    await writeLog("warn", "gmail",
+        "POD request — no requester email address", {
+          messageId, loadNumber, from,
+        });
+    return {handled: false};
+  }
+
+  const sendResult = await bridge.emailPodDocs({
+    booking,
+    loadNumber,
+    recipientEmail: requesterEmail,
+    subject: `Proof of Delivery — Load #${loadNumber}`,
+  });
+
+  if (!sendResult.ok) {
+    await writeLog("warn", "gmail", "POD request — Primus send failed", {
+      messageId,
+      loadNumber,
+      requesterEmail,
+      error: sendResult.error,
+      raw: sendResult.raw,
+    });
+    return {handled: false, loadNumber, error: sendResult.error};
+  }
+
+  await writeLog("info", "gmail",
+      "POD request fulfilled — sent from Primus", {
+        messageId,
+        loadNumber,
+        requesterEmail,
+        driveFileIds: sendResult.driveFileIds || [],
+      });
+
+  return {
+    handled: true,
+    status: "pod_request_sent",
+    loadNumber,
+    requesterEmail,
+    driveFileIds: sendResult.driveFileIds || [],
+  };
+}
+
+/**
  * Handles a POD-only inbound email: never creates an invoice. Looks up the
  * waiting TL invoice (or any recent invoice by BOL), uploads the POD to
  * Primus, and resumes the held customer-email workflow when applicable.
@@ -5725,6 +5990,8 @@ const INCOMING_EMAIL_INTENTS = new Set([
   "carrier_invoice",
   "insurance_premium",
   "statement",
+  "pod_delivery",
+  "pod_request",
   "unknown",
 ]);
 
@@ -5760,7 +6027,7 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "You classify inbound emails for a freight brokerage automation system.",
       "Return ONLY valid JSON with these keys:",
       "- intent: exactly one of carrier_invoice, insurance_premium,",
-      "  statement, pod_delivery, unknown",
+      "  statement, pod_delivery, pod_request, unknown",
       "- confidence: high, medium, or low",
       "- reasoning: one short sentence",
       "- spreadsheetFilename: if insurance_premium, the filename of the",
@@ -5768,9 +6035,10 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  else null",
       "- invoicePdfFilename: if insurance_premium, the filename of the vendor",
       "  insurance invoice PDF when identifiable, else null",
-      "- loadNumberHint: if pod_delivery, any load/BOL number visible in",
-      "  the subject or body, else null",
-      "- proNumberHint: if pod_delivery, any PRO number visible, else null",
+      "- loadNumberHint: if pod_delivery or pod_request, any load/BOL number",
+      "  visible in the subject or body, else null",
+      "- proNumberHint: if pod_delivery or pod_request, any PRO number",
+      "  visible, else null",
       "",
       "Rules:",
       "- insurance_premium: cargo insurance vendor billing (e.g. Redkik) that",
@@ -5785,9 +6053,12 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  Saia and similar carriers often email 'Your Invoice From …' with",
       "  a PDF whose first page is a statement summary and later pages are",
       "  the freight bills — that is carrier_invoice, not statement.",
-      "- pod_delivery: reply with only Proof of Delivery / signed BOL /",
-      "  delivery or trailer photos — NO freight invoice amount due. Often a",
-      "  reply to a POD request.",
+      "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",
+      "  delivery photos — not asking us to send one.",
+      "- pod_request: sender asks Innovative to SEND or provide a POD /",
+      "  proof of delivery for a load (usually no invoice PDF attached).",
+      "  Examples: \"please send POD for load 264091\", \"need proof of",
+      "  delivery for BOL 12345\".",
       "- statement: account summary or pay-online notice only — no freight",
       "  invoice PDF to extract (not a carrier Stmt packet of bills)",
       "- unknown: marketing, unrelated, or unclear",
@@ -5826,6 +6097,10 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
         String(parsed.spreadsheetFilename) : null,
       invoicePdfFilename: parsed.invoicePdfFilename ?
         String(parsed.invoicePdfFilename) : null,
+      loadNumberHint: parsed.loadNumberHint ?
+        String(parsed.loadNumberHint) : null,
+      proNumberHint: parsed.proNumberHint ?
+        String(parsed.proNumberHint) : null,
     };
   } catch (e) {
     return {
@@ -5958,6 +6233,19 @@ async function processGmailMessage(
     // Drop UNREAD immediately so a second inbox poll cannot start the same
     // message while insurance posting / AI classification is still running.
     await markGmailMessageRead(gmail, messageId);
+
+    if (!isTai && administrativeEmailIntake.isEmodalBroadcast(
+        subject, from, emailBody)) {
+      await completeAdministrativeIgnore({
+        messageId,
+        subject,
+        from,
+        tenant,
+        finalStatus: "emodal_broadcast_ignored",
+        reason: "eModal / terminal broadcast — ignored",
+      });
+      return;
+    }
 
     let emailClassification = {
       intent: "unknown",
@@ -6157,6 +6445,70 @@ async function processGmailMessage(
               messageId,
               error: rawErr.message,
             });
+      }
+    }
+
+    if (!isTai) {
+      const podRequestCandidate = podRequestIntake.looksLikePodRequest(
+          subject, emailBody);
+      if (podRequestCandidate ||
+          (emailClassification.intent === "pod_request")) {
+        try {
+          if (podRequestCandidate && emailClassification.intent === "unknown") {
+            emailClassification = await classifyIncomingEmail(
+                subject, from, emailBody, attachments);
+          }
+          const podReqResult = await handlePodRequestEmail({
+            messageId,
+            subject,
+            from,
+            emailBody,
+            tenant,
+            emailClassification,
+          });
+          if (podReqResult.handled) {
+            await updateGmailQueueStatus(messageId, "completed", null, {
+              tenant,
+            });
+            await tcol(tenant, "emailIntake").doc(messageId).set({
+              gmailMessageId: messageId,
+              tenantId: tenant.tenantId,
+              subject,
+              from,
+              finalStatus: podReqResult.status || "pod_request",
+              loadNumber: podReqResult.loadNumber || null,
+              requesterEmail: podReqResult.requesterEmail || null,
+              escalatedToLisa: !!podReqResult.escalatedToLisa,
+              emailClassification,
+              createdAt: admin.firestore.FieldValue.serverTimestamp(),
+              deleteAt: getDeleteAt(30),
+            }, {merge: true});
+            return;
+          }
+        } catch (podReqErr) {
+          await writeLog("warn", "gmail", "POD request handler failed", {
+            messageId,
+            subject,
+            error: podReqErr.message,
+          });
+        }
+      }
+    }
+
+    if (!isTai) {
+      const adminIgnore =
+          administrativeEmailIntake.evaluateAdministrativeIgnore(
+              subject, from, emailBody, attachments);
+      if (adminIgnore.ignore) {
+        await completeAdministrativeIgnore({
+          messageId,
+          subject,
+          from,
+          tenant,
+          finalStatus: adminIgnore.status,
+          reason: adminIgnore.reason,
+        });
+        return;
       }
     }
 
@@ -6470,6 +6822,81 @@ async function processGmailMessage(
               error: rawErr.message,
             });
       }
+
+      // Apex Capital factoring: PDFs are linked in the body, not attached.
+      if (pdfAttachments.filter((a) => a.docType !== "POD").length === 0) {
+        try {
+          const apexResult = await apexCapitalIntake.fetchInvoicePdfsFromEmail({
+            payload,
+            subject,
+            from,
+          });
+          if (apexResult.handled) {
+            await writeLog("info", "gmail", "Apex Capital email detected", {
+              messageId,
+              subject,
+              urlCount: (apexResult.urls || []).length,
+              downloaded: (apexResult.pdfs || []).length,
+              errors: apexResult.errors || null,
+            });
+          }
+          if (apexResult.handled && apexResult.pdfs &&
+              apexResult.pdfs.length > 0) {
+            for (const downloaded of apexResult.pdfs) {
+              if (!downloaded.buffer || !downloaded.buffer.length) {
+                continue;
+              }
+              if (!apexCapitalIntake.isPdfBuffer(downloaded.buffer)) {
+                continue;
+              }
+              const safeFilename =
+                  String(downloaded.filename || "apex-invoice.pdf")
+                      .replace(/[^a-zA-Z0-9._-]/g, "_");
+              const storagePath =
+                  `emailAttachments/${messageId}/${Date.now()}-${safeFilename}`;
+              await getBucket().file(storagePath).save(downloaded.buffer, {
+                metadata: {contentType: "application/pdf"},
+              });
+              await writeLog("info", "storage",
+                  "Saved Apex invoice PDF from portal link", {
+                    messageId,
+                    filename: downloaded.filename,
+                    storagePath,
+                    fileSize: downloaded.buffer.length,
+                    barCode: downloaded.barCode || null,
+                  });
+              pdfAttachments.push({
+                filename: downloaded.filename,
+                mimeType: "application/pdf",
+                buffer: downloaded.buffer,
+                storagePath,
+                docType: "INVOICE",
+                source: "apex_capital_link",
+              });
+              storedAttachments.push({
+                filename: downloaded.filename,
+                mimeType: "application/pdf",
+                storagePath,
+                docType: "INVOICE",
+                source: "apex_capital_link",
+              });
+            }
+          } else if (apexResult.handled && !apexResult.ok) {
+            await writeLog("warn", "gmail",
+                "Apex email had no downloadable invoice PDFs", {
+                  messageId,
+                  subject,
+                  urls: apexResult.urls || [],
+                  errors: apexResult.errors || null,
+                });
+          }
+        } catch (apexErr) {
+          await writeLog("warn", "gmail", "Apex Capital intake failed", {
+            messageId,
+            error: apexErr.message,
+          });
+        }
+      }
     }
 
     // If no processable invoice PDFs found — try POD-only delivery path
@@ -6513,6 +6940,19 @@ async function processGmailMessage(
           gmail, messageId, subject, from, emailBody, tenant, headers,
           emailClassification,
           reason: "Email contained a carrier statement but no freight invoice",
+        });
+        return;
+      }
+      if (administrativeEmailIntake.isRtsNoaEmail(subject, from, emailBody) &&
+          invoicePdfCount === 0) {
+        await completeAdministrativeIgnore({
+          messageId,
+          subject,
+          from,
+          tenant,
+          finalStatus: "rts_noa_ignored",
+          reason: "RTS Notice of Assignment — no carrier invoice attached",
+          extra: {skippedAttachmentTypes: skippedDocTypes},
         });
         return;
       }
@@ -8178,6 +8618,7 @@ async function resolveDashboardTenant(req) {
 // granularity to bucket results into. Kept as a whitelist so the range
 // query param can never reach the SQL string directly.
 const DASHBOARD_RANGES = {
+  day: {days: 1, truncUnit: "HOUR"},
   week: {days: 7, truncUnit: "DAY"},
   month: {days: 30, truncUnit: "DAY"},
   year: {days: 365, truncUnit: "MONTH"},
@@ -8422,6 +8863,66 @@ exports.getRecentLogs = onRequest(async (req, res) => {
   }
 });
 
+/**
+ * Returns AI-summarized flow logs for the dashboard activity feed.
+ * Defaults to 20 summaries; use offset/limit for "Show more".
+ */
+exports.getRecentSummaries = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const limit = Math.min(Number(req.query.limit || 20), 100);
+    const offset = Math.max(Number(req.query.offset || 0), 0);
+    const dataset = tenant.bqDataset;
+    const [rows] = await bigquery.query({
+      query: `
+        SELECT
+          createdAt,
+          flowId,
+          messageId,
+          invoiceId,
+          finalStatus,
+          lastStep,
+          failureReason,
+          recommendedFix,
+          aiSummary
+        FROM \`${dataset}.${BQ_SUMMARIES_TABLE}\`
+        ORDER BY createdAt DESC
+        LIMIT @limit
+        OFFSET @offset
+      `,
+      params: {limit, offset},
+    });
+    const summaries = rows.map((row) => ({
+      createdAt: row.createdAt && row.createdAt.value ?
+        row.createdAt.value : String(row.createdAt),
+      flowId: row.flowId || null,
+      messageId: row.messageId || null,
+      invoiceId: row.invoiceId || null,
+      finalStatus: row.finalStatus || null,
+      lastStep: row.lastStep || null,
+      failureReason: row.failureReason || null,
+      recommendedFix: row.recommendedFix || null,
+      aiSummary: row.aiSummary || null,
+    }));
+    return res.json({
+      ok: true,
+      tenantId: tenant.tenantId,
+      summaries,
+      limit,
+      offset,
+      hasMore: summaries.length === limit,
+    });
+  } catch (error) {
+    console.error("getRecentSummaries error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to load summaries.",
+      details: error.message,
+    });
+  }
+});
+
 exports.getRecentInvoices = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
@@ -8482,7 +8983,7 @@ exports.getDashboardStats = onRequest(async (req, res) => {
     if (!rangeConfig) {
       return res.status(400).json({
         ok: false,
-        error: "Invalid range. Use week, month, or year.",
+        error: "Invalid range. Use day, week, month, or year.",
       });
     }
 
@@ -8492,6 +8993,18 @@ exports.getDashboardStats = onRequest(async (req, res) => {
         COUNTIF(
           category = "gmail" AND message = "Email processing completed"
         ) AS invoicesProcessed,
+        COUNTIF(
+          category = "workflow" AND (
+            message = "Primus workflow completed" OR
+            message = "TAI workflow completed"
+          )
+        ) AS workflowsCompleted,
+        COUNTIF(
+          category = "gmail" AND (
+            message LIKE "Additional charge%" OR
+            message = "Additional charge needs approval (4-option email)"
+          )
+        ) AS invoicesWithAddedCharges,
         COUNTIF(
           category = "email" AND message = "Outbound email sent"
         ) AS emailsReplied,
@@ -8516,15 +9029,26 @@ exports.getDashboardStats = onRequest(async (req, res) => {
       period: row.period && row.period.value ?
         row.period.value : row.period,
       invoicesProcessed: Number(row.invoicesProcessed || 0),
+      workflowsCompleted: Number(row.workflowsCompleted || 0),
+      invoicesWithAddedCharges: Number(row.invoicesWithAddedCharges || 0),
       emailsReplied: Number(row.emailsReplied || 0),
       emailsForwarded: Number(row.emailsForwarded || 0),
     }));
 
     const totals = series.reduce((acc, row) => ({
       invoicesProcessed: acc.invoicesProcessed + row.invoicesProcessed,
+      workflowsCompleted: acc.workflowsCompleted + row.workflowsCompleted,
+      invoicesWithAddedCharges:
+        acc.invoicesWithAddedCharges + row.invoicesWithAddedCharges,
       emailsReplied: acc.emailsReplied + row.emailsReplied,
       emailsForwarded: acc.emailsForwarded + row.emailsForwarded,
-    }), {invoicesProcessed: 0, emailsReplied: 0, emailsForwarded: 0});
+    }), {
+      invoicesProcessed: 0,
+      workflowsCompleted: 0,
+      invoicesWithAddedCharges: 0,
+      emailsReplied: 0,
+      emailsForwarded: 0,
+    });
 
     return res.json({
       ok: true,
@@ -8539,6 +9063,62 @@ exports.getDashboardStats = onRequest(async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Failed to load dashboard stats.",
+      details: error.message,
+    });
+  }
+});
+
+exports.getDashboardTasks = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const limit = Math.min(Number(req.query.limit || 50), 100);
+    const result = await dashboardTasks.listDashboardTasks(
+        db, additionalCharges, {
+          tenantId: tenant.tenantId,
+          limit,
+        });
+    return res.json({
+      ok: true,
+      tenantId: tenant.tenantId,
+      tasks: result.tasks,
+      openCount: result.openCount,
+    });
+  } catch (error) {
+    console.error("getDashboardTasks error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to load tasks.",
+      details: error.message,
+    });
+  }
+});
+
+exports.dismissDashboardTask = onRequest(async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const body = req.body || {};
+    const taskId = body.taskId || req.query.taskId;
+    const source = body.source || req.query.source || "dashboardTasks";
+    const result = await dashboardTasks.dismissDashboardTask(
+        db, additionalCharges, {
+          taskId,
+          source,
+          tenantId: tenant.tenantId,
+        });
+    if (!result.ok) {
+      return res.status(400).json(result);
+    }
+    return res.json({ok: true, tenantId: tenant.tenantId});
+  } catch (error) {
+    console.error("dismissDashboardTask error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to dismiss task.",
       details: error.message,
     });
   }
@@ -8628,12 +9208,17 @@ const SUPPORT_CHAT_PRODUCT_KNOWLEDGE =
   "never mention source code, repos, or internal engineering): " +
   "This dashboard monitors automated carrier-invoice processing for " +
   "the customer's TMS workflow. Gmail must stay connected so inbound " +
-  "invoice emails can be read. The stats chart (Week / Month / Year) " +
-  "shows invoices processed, outbound reply emails sent, and emails " +
-  "forwarded for human review. The recent-invoices table lists loads " +
+  "invoice emails can be read. The stats chart (Day / Week / Month / Year) " +
+  "shows invoices processed, workflows completed, invoices with additional " +
+  "charges, outbound reply emails sent, and emails forwarded for human " +
+  "review. The activity log shows AI-summarized processing events (not raw " +
+  "engine logs) with a Show more button. The task manager lists open items " +
+  "for Lisa and ops (additional charges, human-review forwards, signed POD " +
+  "requests) and each task can be dismissed when handled. " +
+  "The recent-invoices table lists loads " +
   "with load #, pro #, carrier, customer, amount, and workflow status. " +
-  "The activity log shows processing events (received, classified, " +
-  "matched, billed, errors). Typical flow: a carrier invoice email " +
+  "The raw activity log (legacy) is replaced by summarized flow logs. " +
+  "Typical flow: a carrier invoice email " +
   "arrives in Gmail → PDF is read → load/amount/POD pages are " +
   "extracted → the load is matched in the TMS → billing steps run. " +
   "If something is missing on the dashboard it may still be in the " +
@@ -8671,9 +9256,14 @@ function formatSupportChatDashboardContext(ctx) {
     parts.push(
         "Stats totals: " +
         `${Number(t.invoicesProcessed || 0)} invoices processed, ` +
+        `${Number(t.workflowsCompleted || 0)} workflows completed, ` +
+        `${Number(t.invoicesWithAddedCharges || 0)} with added charges, ` +
         `${Number(t.emailsReplied || 0)} emails replied, ` +
         `${Number(t.emailsForwarded || 0)} forwarded for review`,
     );
+  }
+  if (typeof ctx.openTaskCount === "number") {
+    parts.push(`Open dashboard tasks: ${ctx.openTaskCount}`);
   }
   if (ctx.tms) {
     parts.push(`TMS: ${String(ctx.tms)}`);
