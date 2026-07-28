@@ -50,12 +50,20 @@ const CHARGE_CATEGORY = Object.freeze({
   RATE_INCREASE: "rate_increase",
 });
 
-const WNI_LABEL_PATTERN =
-  /re-?weigh|w\s*&\s*i\b|weight\s*(?:&|and)\s*inspect|inspect(?:ion)?\s*(?:cert|fee|charge)|re-?class(?:ification)?|cubic|density|re-?dim/i;
+const WNI_LABEL_PATTERN = new RegExp(
+    "re-?weigh|w\\s*&\\s*i\\b|weight\\s*(?:&|and)\\s*inspect|" +
+    "inspect(?:ion)?\\s*(?:cert|fee|charge)|re-?class(?:ification)?|" +
+    "cubic|density|re-?dim", "i");
 
 /** Accessorial / service fee labels (not weight/reclass). */
-const ACCESSORIAL_LABEL_PATTERN =
-  /school|notify|detention|delivery|liftgate|lumper|appointment|residential|inside|limited\s*access|accessorial|sort(?:ing)?|seg(?:regat)?|re-?deliver|notification|call\s*ahead|reschedule|storage|redelivery|hazmat|oversize|overlength|single\s*shipment|construction|military|farm|church|mine|prison|utility|airport|trade\s*show|exhibition|pallet|handling|chassis|drop|stop\s*off|driver\s*assist|tailgate|residential|non-?commercial/i;
+const ACCESSORIAL_LABEL_PATTERN = new RegExp(
+    "school|notify|detention|delivery|liftgate|lumper|appointment|" +
+    "residential|inside|limited\\s*access|accessorial|sort(?:ing)?|" +
+    "seg(?:regat)?|re-?deliver|notification|call\\s*ahead|reschedule|" +
+    "storage|redelivery|hazmat|oversize|overlength|single\\s*shipment|" +
+    "construction|military|farm|church|mine|prison|utility|airport|" +
+    "trade\\s*show|exhibition|pallet|handling|chassis|drop|stop\\s*off|" +
+    "driver\\s*assist|tailgate|non-?commercial", "i");
 
 /** Dollars: Primus re-rate vs carrier invoice is a match within this. */
 const RATE_MATCH_TOLERANCE = 10;
@@ -148,7 +156,9 @@ function isAccessorialLabel(label) {
 function displayChargeLabel(label) {
   const raw = String(label || "").trim();
   if (!raw) return "Additional charge";
-  const key = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  const key = raw.toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "");
   const aliases = {
     school_delivery: "School delivery fee",
     notify_charge: "Notify charge",
