@@ -1148,6 +1148,7 @@ function createInsurancePostAdapter(deps) {
           loadNumber,
           booking,
           premium: row.amount,
+          invoiceId: result.invoiceId || null,
         });
       } catch (marginErr) {
         const log = deps.writeLog || (async () => {});

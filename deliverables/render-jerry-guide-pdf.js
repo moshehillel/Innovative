@@ -18,7 +18,24 @@ if (!fs.existsSync(logoPath)) {
   throw new Error(`Logo not found: ${logoPath}`);
 }
 const logoB64 = fs.readFileSync(logoPath).toString("base64");
-html = html.replace("__AA_LOGO_BASE64__", logoB64);
+html = html.replace(/__AA_LOGO_BASE64__/g, logoB64);
+
+const footerTemplate = [
+  "<div style=\"width:100%;box-sizing:border-box;",
+  "padding:6px 48px 0;font-size:8px;font-family:'Segoe UI',Arial,sans-serif;",
+  "display:flex;align-items:center;justify-content:space-between;",
+  "border-top:2px solid #153a9e;background:linear-gradient(90deg,#08111f,#0f2340 55%,#153a9e);",
+  "color:rgba(255,255,255,0.85);height:36px;\">",
+  "<img src=\"data:image/png;base64," + logoB64 + "\" ",
+  "style=\"height:20px;width:auto;display:block;\" alt=\"AA\"/>",
+  "<span style=\"letter-spacing:0.06em;text-transform:uppercase;",
+  "font-size:7px;opacity:0.9;\">",
+  "Jerry Program Guide &middot; Innovative Carriers</span>",
+  "<span style=\"color:#42d392;font-weight:600;font-size:8px;\">",
+  "AdvancedAutomations.net &middot; Page <span class=\"pageNumber\"></span>",
+  " of <span class=\"totalPages\"></span></span>",
+  "</div>",
+].join("");
 
 const script = `
 const puppeteer = require('puppeteer');
@@ -34,7 +51,15 @@ const puppeteer = require('puppeteer');
     format: 'Letter',
     printBackground: true,
     preferCSSPageSize: true,
-    margin: {top: '0', right: '0', bottom: '0', left: '0'},
+    displayHeaderFooter: true,
+    headerTemplate: '<div></div>',
+    footerTemplate: ${JSON.stringify(footerTemplate)},
+    margin: {
+      top: '0.55in',
+      right: '0.65in',
+      bottom: '0.72in',
+      left: '0.65in',
+    },
   });
   await browser.close();
 })();

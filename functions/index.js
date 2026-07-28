@@ -3622,7 +3622,8 @@ function validateLumperAmount(aiResult, primusRate) {
 /**
  * Checks profit and margin thresholds against business rules.
  * profit < $10 = no rate scenario; margin < 10% = broker commission
- * adjustment needed.
+ * GP% check for dispatcher low-profit alerts (profit / revenue).
+ * Broker commission uses Primus Profit % (profit / cost) instead.
  * @param {number} primusRate - Customer rate from Primus.
  * @param {number} invoiceAmount - Carrier invoice amount.
  * @return {object} Margin check result (noRate, profit, margin,
@@ -7727,6 +7728,12 @@ async function processGmailMessage(
         if (primusData.rate) {
           const profitCheck = checkProfitMargin(
               primusData.rate, primusValidationAmount);
+          const brokerProfitCheck =
+              await brokerCommission.resolveBrokerProfitCheck({
+                loadNumber: aiResult.loadNumber,
+                customerRate: primusData.rate,
+                vendorCost: primusValidationAmount,
+              });
           if (profitCheck.noRate || profitCheck.lowProfit) {
             const hasLumpers =
                 primusValidationAmount !== aiResult.invoiceAmount;
@@ -7775,7 +7782,7 @@ async function processGmailMessage(
               );
             }
             finalStatus = "no_rate";
-          } else if (profitCheck.lowMargin) {
+          } else if (brokerProfitCheck.lowMargin) {
             let brokerName = "";
             try {
               const booking = await fetchPrimusBooking(aiResult.loadNumber);
@@ -7787,15 +7794,17 @@ async function processGmailMessage(
             }
             await adjustBrokerCommission({
               loadNumber: aiResult.loadNumber,
-              margin: profitCheck.margin,
-              profit: profitCheck.profit,
+              margin: brokerProfitCheck.margin,
+              profit: brokerProfitCheck.profit,
               brokerName,
               carrierName: aiResult.carrierName,
             });
             await writeLog("info", "primus",
-                "Low margin flagged for broker commission", {
+                "Low Profit % flagged for broker commission", {
                   messageId, loadNumber: aiResult.loadNumber,
-                  margin: profitCheck.margin, profit: profitCheck.profit,
+                  profitPct: brokerProfitCheck.margin,
+                  profit: brokerProfitCheck.profit,
+                  source: brokerProfitCheck.source,
                 });
           }
         }

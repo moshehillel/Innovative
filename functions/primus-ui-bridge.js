@@ -1630,11 +1630,11 @@ function extractBilltoIdFromStore(storeData) {
 }
 
 /**
- * REST drafts for idempotency when Primus UI is still syncing.
+ * REST invoice list for a load (drafts and issued).
  * @param {string|number} loadNumber BOL number.
  * @return {Promise<Array<object>>}
  */
-async function fetchRestDraftInvoices(loadNumber) {
+async function fetchRestInvoicesByLoad(loadNumber) {
   const base = process.env.PRIMUS_BASE_URL;
   if (!base || loadNumber == null) return [];
   try {
@@ -1657,13 +1657,33 @@ async function fetchRestDraftInvoices(loadNumber) {
     const data = await resp.json();
     const list = data && data.data && data.data.results;
     if (!Array.isArray(list)) return [];
-    return list.filter((inv) => {
-      if (!inv || !inv.invoiceId) return false;
-      return !(inv.status && inv.status.generated);
-    });
+    return list.filter((inv) => inv && inv.invoiceId);
   } catch (_) {
     return [];
   }
+}
+
+/**
+ * REST drafts for idempotency when Primus UI is still syncing.
+ * @param {string|number} loadNumber BOL number.
+ * @return {Promise<Array<object>>}
+ */
+async function fetchRestDraftInvoices(loadNumber) {
+  const list = await fetchRestInvoicesByLoad(loadNumber);
+  return list.filter((inv) => !(inv.status && inv.status.generated));
+}
+
+/**
+ * Issued customer invoice id for broker Profit % lookup (REST).
+ * @param {string|number} loadNumber BOL number.
+ * @return {Promise<string|null>}
+ */
+async function resolveIssuedInvoiceIdForLoad(loadNumber) {
+  const list = await fetchRestInvoicesByLoad(loadNumber);
+  if (!list.length) return null;
+  const issued = list.find((inv) => inv.status && inv.status.generated);
+  const pick = issued || list[0];
+  return pick && pick.invoiceId ? String(pick.invoiceId) : null;
 }
 
 /**
@@ -2315,6 +2335,88 @@ async function getInvoiceStores(invoiceId) {
   }
   return {ok: true, data: result.json};
 }
+
+/**
+ * Reads Primus Summary "Profit %" (actualProfitPer) from getInvoiceStores.
+ * @param {object} storeData getInvoiceStores response object.
+ * @return {number|null}
+ */
+function extractActualProfitPerFromStore(storeData) {
+  if (!storeData || typeof storeData !== "object") return null;
+  const candidates = [
+    storeData.actualProfitPer,
+    storeData.data && storeData.data.actualProfitPer,
+    storeData.invoice && storeData.invoice.actualProfitPer,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * Reads Primus Summary actual profit USD from getInvoiceStores.
+ * @param {object} storeData getInvoiceStores response object.
+ * @return {number|null}
+ */
+function extractActualProfitUsdFromStore(storeData) {
+  if (!storeData || typeof storeData !== "object") return null;
+  const candidates = [
+    storeData.actualProfitUSD,
+    storeData.actualProfitUsd,
+    storeData.data && storeData.data.actualProfitUSD,
+    storeData.invoice && storeData.invoice.actualProfitUSD,
+  ];
+  for (const c of candidates) {
+    const n = Number(c);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/**
+ * Profit metrics from issued invoice — uses Primus Summary Profit %
+ * (profit / actual cost), not GP% (profit / revenue).
+ * @param {string|number} invoiceId Primus invoice id.
+ * @return {Promise<object|null>}
+ */
+async function computeInvoiceMarginFromStore(invoiceId) {
+  if (invoiceId == null || invoiceId === "") return null;
+  const stores = await getInvoiceStores(String(invoiceId));
+  if (!stores.ok || !stores.data) return null;
+
+  const charges = extractChargesFromStore(stores.data) || [];
+  const actualCosts = extractActualCostsFromStore(stores.data) || [];
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const actualTotal = roundMoney(
+      actualCosts.reduce((s, c) => s + Number(c.total || 0), 0));
+  if (actualTotal <= 0 && chargesTotal <= 0) return null;
+
+  const computedProfit = roundMoney(chargesTotal - actualTotal);
+  const storedProfit = extractActualProfitUsdFromStore(stores.data);
+  const profit = storedProfit != null ?
+    roundMoney(storedProfit) : computedProfit;
+
+  const storedProfitPct = extractActualProfitPerFromStore(stores.data);
+  const profitPct = storedProfitPct != null ?
+    roundMoney(storedProfitPct) :
+    (actualTotal > 0 ? roundMoney((profit / actualTotal) * 100) : 0);
+  const gpPct = chargesTotal > 0 ?
+    roundMoney((profit / chargesTotal) * 100) : 0;
+
+  return {
+    profit,
+    margin: profitPct,
+    profitPct,
+    gpPct,
+    chargesTotal,
+    actualTotal,
+  };
+}
+exports.computeInvoiceMarginFromStore = computeInvoiceMarginFromStore;
+exports.resolveIssuedInvoiceIdForLoad = resolveIssuedInvoiceIdForLoad;
 
 /**
  * @param {object} storeData getInvoiceStores response object.

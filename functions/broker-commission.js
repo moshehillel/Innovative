@@ -3,7 +3,8 @@
 /**
  * Low-margin broker commission rules:
  * - Karen Adams: never change her rate.
- * - Other brokers with a 10% Primus variant: swap when margin < 10%.
+ * - Other brokers with a 10% Primus variant: swap when Profit % < 10%.
+ *   (Primus Summary "Profit %" = profit / actual cost — not GP%.)
  * - No 10% variant: email Lisa and continue invoicing.
  */
 
@@ -363,6 +364,99 @@ function lisaEmail() {
 }
 
 /**
+ * Resolves Profit % for broker commission (Primus Summary, not GP%).
+ * Prefers issued invoice store; falls back to profit / vendor cost.
+ * @param {object} opts
+ * @param {string} opts.loadNumber
+ * @param {string} [opts.invoiceId]
+ * @param {number} opts.customerRate
+ * @param {number} opts.vendorCost Carrier bill (lumper-adjusted when
+ *   applicable).
+ * @return {Promise<object>}
+ */
+async function resolveBrokerProfitCheck(opts) {
+  const loadNumber = opts && opts.loadNumber ?
+    String(opts.loadNumber).trim() : "";
+  const customerRate = Number(opts && opts.customerRate || 0);
+  const vendorCost = Number(opts && opts.vendorCost || 0);
+  let invoiceId = opts && opts.invoiceId ?
+    String(opts.invoiceId).trim() : "";
+  const bridge = deps.primusUiBridge;
+  const log = deps.writeLog || (async () => {});
+
+  if (!invoiceId && loadNumber && bridge &&
+      typeof bridge.resolveIssuedInvoiceIdForLoad === "function") {
+    try {
+      invoiceId = await bridge.resolveIssuedInvoiceIdForLoad(loadNumber) || "";
+    } catch (err) {
+      await log("warn", "primus",
+          "Issued invoice lookup failed for broker Profit %", {
+            loadNumber, error: err.message,
+          });
+    }
+  }
+
+  if (invoiceId && bridge &&
+      typeof bridge.computeInvoiceMarginFromStore === "function") {
+    try {
+      const invMargin = await bridge.computeInvoiceMarginFromStore(invoiceId);
+      if (invMargin) {
+        return {
+          source: "primus_invoice",
+          invoiceId,
+          profit: invMargin.profit,
+          margin: invMargin.margin,
+          profitPct: invMargin.profitPct,
+          gpPct: invMargin.gpPct,
+          lowProfit: invMargin.profit < 10,
+          lowMargin: invMargin.margin < 10,
+          noRate: false,
+        };
+      }
+    } catch (err) {
+      await log("warn", "primus",
+          "Invoice Profit % lookup failed — using cost fallback", {
+            loadNumber, invoiceId, error: err.message,
+          });
+    }
+  }
+
+  if (!customerRate || customerRate <= 0) {
+    return {
+      source: "no_rate",
+      profit: 0,
+      margin: 0,
+      lowProfit: true,
+      lowMargin: true,
+      noRate: true,
+    };
+  }
+  if (vendorCost <= 0) {
+    return {
+      source: "no_vendor_cost",
+      profit: 0,
+      margin: 0,
+      lowProfit: true,
+      lowMargin: true,
+      noRate: false,
+    };
+  }
+
+  const profit = Math.round((customerRate - vendorCost) * 100) / 100;
+  const margin = Math.round((profit / vendorCost) * 10000) / 100;
+  return {
+    source: "cost_fallback",
+    profit,
+    margin,
+    profitPct: margin,
+    lowProfit: profit < 10,
+    lowMargin: margin < 10,
+    noRate: false,
+  };
+}
+exports.resolveBrokerProfitCheck = resolveBrokerProfitCheck;
+
+/**
  * Recomputes margin after insurance premium posted; applies swap rules.
  * @param {object} opts
  * @param {string} opts.loadNumber
@@ -371,12 +465,52 @@ function lisaEmail() {
  * @return {Promise<object|null>}
  */
 async function maybeAdjustAfterInsurancePremium(opts) {
-  const checkProfitMargin = deps.checkProfitMargin;
-  if (!checkProfitMargin || !opts || !opts.booking) return null;
+  if (!opts || !opts.booking) return null;
 
   const loadNumber = String(opts.loadNumber || "").trim();
   const premium = Number(opts.premium || 0);
   if (!loadNumber || premium <= 0) return null;
+
+  const log = deps.writeLog || (async () => {});
+  const trigger = "insurance_post";
+  const bridge = deps.primusUiBridge;
+  const invoiceId = opts.invoiceId ? String(opts.invoiceId) : "";
+
+  if (invoiceId && bridge &&
+      typeof bridge.computeInvoiceMarginFromStore === "function") {
+    try {
+      const invMargin = await bridge.computeInvoiceMarginFromStore(invoiceId);
+      if (invMargin) {
+        if (invMargin.margin >= 10) {
+          await log("info", "primus",
+              "Post-insurance Profit % OK on Primus invoice", {
+                loadNumber,
+                invoiceId,
+                profitPct: invMargin.profitPct,
+                gpPct: invMargin.gpPct,
+                profit: invMargin.profit,
+                chargesTotal: invMargin.chargesTotal,
+                actualTotal: invMargin.actualTotal,
+                trigger,
+              });
+          return {adjusted: false, notified: false,
+            reason: "margin_ok_invoice"};
+        }
+        return adjustBrokerCommissionForLowMargin({
+          loadNumber,
+          margin: invMargin.margin,
+          profit: invMargin.profit,
+          booking: opts.booking,
+          trigger,
+        });
+      }
+    } catch (err) {
+      await log("warn", "primus",
+          "Post-insurance invoice margin lookup failed — using REST fallback", {
+            loadNumber, invoiceId, error: err.message, trigger,
+          });
+    }
+  }
 
   const acct = opts.booking.accountingInformation || {};
   const rateInfo = deps.readCustomerRateFromAcct ?
@@ -386,15 +520,17 @@ async function maybeAdjustAfterInsurancePremium(opts) {
 
   const vendorCost = Number(
       (opts.booking.vendor && opts.booking.vendor.cost) || 0) + premium;
-  const profitCheck = checkProfitMargin(customerRate, vendorCost);
-  if (!profitCheck.lowMargin || profitCheck.lowProfit) return null;
+  if (vendorCost <= 0) return null;
+  const profit = Math.round((customerRate - vendorCost) * 100) / 100;
+  const profitPct = Math.round((profit / vendorCost) * 10000) / 100;
+  if (profitPct >= 10 && profit >= 10) return null;
 
   return adjustBrokerCommissionForLowMargin({
     loadNumber,
-    margin: profitCheck.margin,
-    profit: profitCheck.profit,
+    margin: profitPct,
+    profit,
     booking: opts.booking,
-    trigger: "insurance_post",
+    trigger,
   });
 }
 exports.maybeAdjustAfterInsurancePremium = maybeAdjustAfterInsurancePremium;

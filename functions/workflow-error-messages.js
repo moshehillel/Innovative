@@ -138,7 +138,7 @@ function buildWorkflowAlertEmail(opts) {
       subject = `Notice — broker has no 10% commission code — ` +
         `Load ${loadNumber}`;
       title = "Broker commission could not be adjusted";
-      summary = "This shipment's profit margin is below 10%, but Jerry could " +
+      summary = "This shipment's Profit % is below 10%, but Jerry could " +
       "not switch the broker to a 10% commission rate in ShipPrimus.";
       explanation =
       "Each broker may appear in ShipPrimus multiple times at different " +
@@ -155,7 +155,7 @@ function buildWorkflowAlertEmail(opts) {
     case "BROKER_SWAP_FAILED":
       subject = `Notice — broker 10% swap failed — Load ${loadNumber}`;
       title = "Broker commission swap failed";
-      summary = "This shipment's profit margin is below 10%. Jerry found a " +
+      summary = "This shipment's Profit % is below 10%. Jerry found a " +
       "10% sales-rep code for this broker but could not update the load in " +
       "ShipPrimus.";
       explanation =
@@ -408,7 +408,10 @@ function buildWorkflowAlertEmail(opts) {
     extraRows.push(["Profit", `$${Number(ctx.profit).toFixed(2)}`]);
   }
   if (ctx.marginPct != null) {
-    extraRows.push(["Margin", `${Number(ctx.marginPct).toFixed(1)}%`]);
+    const pctLabel = (code === "BROKER_NO_10PCT_CODE" ||
+      code === "BROKER_SWAP_FAILED") ?
+      "Profit %" : "Margin";
+    extraRows.push([pctLabel, `${Number(ctx.marginPct).toFixed(1)}%`]);
   }
   if (ctx.brokerName) extraRows.push(["Broker / sales rep", ctx.brokerName]);
   if (ctx.tenPctName) extraRows.push(["10% code", ctx.tenPctName]);
