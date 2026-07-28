@@ -9134,6 +9134,30 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
 });
 
 /**
+ * Recipients for support-chat issue reports (comma-separated env + Lisa CC).
+ * @return {string} Comma-separated To addresses for MIME.
+ */
+function resolveSupportIssueRecipients() {
+  const raw = process.env.SUPPORT_ISSUE_EMAIL || "mshglck@gmail.com";
+  const also = process.env.SUPPORT_ISSUE_CC ||
+    process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+  const recipients = [];
+  const seen = new Set();
+  const add = (addr) => {
+    const a = String(addr || "").trim();
+    if (!a) return;
+    const key = a.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    recipients.push(a);
+  };
+  raw.split(/[,;]/).forEach(add);
+  also.split(/[,;]/).forEach(add);
+  if (!recipients.length) add("mshglck@gmail.com");
+  return recipients.join(", ");
+}
+
+/**
  * Emails a captured support-chat issue summary to the support inbox.
  * @param {object} data Issue data.
  * @param {string} data.clientName Display name of the client whose
@@ -9144,7 +9168,7 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
  * @return {Promise<void>}
  */
 async function sendSupportIssueEmail({clientName, summary, transcript}) {
-  const to = process.env.SUPPORT_ISSUE_EMAIL || "mshglck@gmail.com";
+  const to = resolveSupportIssueRecipients();
 
   const transcriptHtml = transcript.map((turn) =>
     `<p style="margin:0 0 8px;line-height:1.5;">` +
