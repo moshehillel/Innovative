@@ -34,6 +34,16 @@ check("liftgate accessorial",
       charges: [{label: "Liftgate Service", amount: 75}],
     }), ac.CHARGE_CATEGORY.ACCESSORIAL);
 
+check("school delivery + notify = accessorial (not reweigh)",
+    ac.classifyAdditionalChargeReason({
+      charges: [
+        {label: "school_delivery", amount: 80},
+        {label: "notify_charge", amount: 8},
+      ],
+      hasCertificate: true,
+      freightMismatch: {mismatch: false},
+    }), ac.CHARGE_CATEGORY.ACCESSORIAL);
+
 check("no rows = rate increase",
     ac.classifyAdditionalChargeReason({charges: []}),
     ac.CHARGE_CATEGORY.RATE_INCREASE);
@@ -138,6 +148,37 @@ const dispute = ac.buildDisputeEmailDraft({
 check("dispute mentions difference", dispute.html.includes("$120.00"), true);
 check("dispute mentions agreed rate",
     dispute.html.includes("agreed rate"), true);
+
+const accessorialDispute = ac.buildDisputeEmailDraft({
+  loadNumber: "264186",
+  carrierName: "AAA Cooper Transportation",
+  proNumber: "73373011",
+  invoiceNumber: "73373011",
+  invoiceAmount: 298.26,
+  expectedAmount: 210.26,
+  charges: [
+    {label: "school_delivery", amount: 80},
+    {label: "notify_charge", amount: 8},
+  ],
+  category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  freightMismatch: {
+    mismatch: false,
+    details: {
+      primusWeightLbs: 456,
+      primusClass: "125",
+      invoiceWeightLbs: 456,
+      invoiceClass: "125",
+    },
+  },
+  hasCertificate: true,
+});
+check("accessorial dispute not reweigh wording",
+    accessorialDispute.html.includes("reweigh/reclassification that does not"),
+    false);
+check("accessorial dispute names school delivery",
+    accessorialDispute.html.includes("School delivery fee"), true);
+check("accessorial dispute uses unauthorized wording",
+    accessorialDispute.html.includes("not authorized"), true);
 
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

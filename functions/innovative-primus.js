@@ -404,7 +404,11 @@ function buildCustomerEmailApprovalHtml(opts) {
     `<td style="padding:6px 0">${value}</td></tr>`;
 
   const submitted = amountValidation && amountValidation.submittedAmount;
-  const primusAmt = amountValidation && amountValidation.savedAmount;
+  const primusAmt = amountValidation &&
+    (amountValidation.primusQuotedAmount || amountValidation.amount);
+  const enteredAmt = amountValidation &&
+    (amountValidation.enteredAmount || amountValidation.savedAmount ||
+      submitted);
   const amtDiff = amountValidation && amountValidation.difference;
   const steps = primusSteps || {};
   const completedSteps = Object.entries(steps)
@@ -456,8 +460,8 @@ function buildCustomerEmailApprovalHtml(opts) {
     `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
     row("Carrier bill amount (from email)", moneyFmt(invoice.invoiceAmount)) +
     row("Validated base amount", moneyFmt(baseAmount)) +
-    row("Submitted to Primus", moneyFmt(submitted)) +
-    row("Primus carrier cost", moneyFmt(primusAmt)) +
+    row("Amount entered in Primus", moneyFmt(enteredAmt)) +
+    row("Primus quoted carrier cost", moneyFmt(primusAmt)) +
     row("Amount check", amtMatch) +
     row("Extra charges (held, not invoiced)", approvedChargesTotal > 0 ?
       moneyFmt(approvedChargesTotal) : "None") +
@@ -1215,7 +1219,8 @@ exports.processPrimusWorkflow = onRequest(
           output: {
             validAmount: amountValidation.validAmount,
             submittedAmount: amountValidation.submittedAmount,
-            primusAmount: amountValidation.savedAmount,
+            primusAmount: amountValidation.primusQuotedAmount ||
+              amountValidation.amount,
             difference: amountValidation.difference,
           },
           error: (amountValidation.ok && amountValidation.validAmount) ?
@@ -1227,7 +1232,8 @@ exports.processPrimusWorkflow = onRequest(
             invoiceId,
             loadNumber: invoice.loadNumber,
             submittedAmount: amountValidation.submittedAmount,
-            primusAmount: amountValidation.savedAmount,
+            primusAmount: amountValidation.primusQuotedAmount ||
+              amountValidation.amount,
             difference: amountValidation.difference,
             proNumber: amountValidation.proNumber || null,
           });
@@ -1795,10 +1801,12 @@ exports.processPrimusWorkflow = onRequest(
         const manualRate = Number(invoice.customerRate || 0);
         const primusRate = Number(customerRateResult.customerRate || 0);
         const customerRate = manualRate || primusRate;
-        // Carrier cost: use booking.vendor.cost (the load rate) — this is the
-        // source of truth. invoice.invoiceAmount can be doubled/stale.
+        // Carrier cost for profit: use the amount Jerry enters (carrier
+        // invoice), not the Primus quoted cost on the booking.
         const bookingCarrierCost = Number(
-            amountValidation.savedAmount || invoice.invoiceAmount || 0,
+            amountValidation.enteredAmount ||
+            amountValidation.submittedAmount ||
+            invoice.invoiceAmount || 0,
         );
         const profit = Number(customerRate || 0) -
           (bookingCarrierCost - approvedChargesTotal);
@@ -2056,7 +2064,8 @@ exports.processPrimusWorkflow = onRequest(
                 customerRate,
                 carrierInvoiceAmount: invoice.invoiceAmount,
                 proNumber: workingProNumber || invoice.proNumber,
-                vendorInvoiceNumber: invoice.carrierInvoiceNumber ||
+                vendorInvoiceNumber: invoice.invoiceNumber ||
+                  invoice.carrierInvoiceNumber ||
                   workingProNumber || invoice.proNumber,
                 billDate: invoice.invoiceDate || invoice.receivedAt,
                 billDueDate: invoice.dueDate,

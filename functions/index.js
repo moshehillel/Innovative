@@ -2241,6 +2241,7 @@ async function handleAdditionalChargeAction(req, res) {
         charges: chargeRows,
         category: charge.category,
         freightMismatch: charge.freightMismatch,
+        hasCertificate: charge.hasCertificate,
         customerRate: invoice.customerRate ||
           customerRateFromBooking(booking),
       });
@@ -3076,10 +3077,75 @@ function looksLikeCarrierInvoiceEmail(subject, from) {
   return invoicePacket.test(hints) || carrierName.test(hints);
 }
 
+const STATEMENT_FORWARD_EMAIL_DEFAULT = "abe@innovativecarriers.com";
+
+/**
+ * Parses email addresses from a RFC822 To/Cc header value.
+ * @param {string} headerValue Raw header value.
+ * @return {string[]} Lowercase email addresses.
+ */
+function parseEmailAddressesFromHeaderValue(headerValue) {
+  const raw = String(headerValue || "");
+  const matches = raw.match(
+      /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+  return matches ? matches.map((addr) => addr.toLowerCase()) : [];
+}
+
+/**
+ * True when Abe is already on the original email (To or Cc).
+ * @param {Array<object>} headers Gmail payload headers.
+ * @return {boolean}
+ */
+function isAbeCopiedOnEmail(headers) {
+  const abeEmail = String(
+      process.env.REVIEW_EMAIL_STATEMENT ||
+      STATEMENT_FORWARD_EMAIL_DEFAULT,
+  ).trim().toLowerCase();
+  const list = Array.isArray(headers) ? headers : [];
+  for (const header of list) {
+    const name = String(header && header.name || "").toLowerCase();
+    if (name !== "to" && name !== "cc") continue;
+    const addrs = parseEmailAddressesFromHeaderValue(header.value);
+    if (addrs.includes(abeEmail)) return true;
+  }
+  return false;
+}
+
+/**
+ * True when a first-page STATEMENT label should still run invoice extraction
+ * (Saia-style multi-page packet with freight bills after the summary page).
+ * @param {object} context Subject/filename hints and optional preCheckLabel.
+ * @return {boolean}
+ */
+function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
+  const label = sanitizePreCheckLabel(
+      context.preCheckLabel || context.docType);
+  if (label !== "STATEMENT" && label !== "OTHER") return false;
+
+  const pageCount = Number(context.pageCount) || 0;
+  const hints = [
+    context.subject,
+    context.filename,
+    context.from,
+  ].map((s) => String(s || "")).join(" ");
+
+  if (pageCount > 1 &&
+      looksLikeCarrierInvoiceEmail(context.subject, context.from)) {
+    return true;
+  }
+
+  if (/freight\s*inv|carrier\s*inv|transportation\s*inv/i.test(hints) &&
+      /stmt|stmd|statement/i.test(hints)) {
+    return true;
+  }
+
+  return false;
+}
+
 /**
  * Maps cheap first-page pre-check labels to attachment processing types.
- * Carrier statement PDFs (e.g. AAA Cooper / Saia Stmt) often bundle several
- * freight invoices — still run full multi-invoice extraction for those.
+ * Standalone carrier statements are ignored; multi-page Saia-style packets
+ * that bundle freight bills still run full invoice extraction.
  * @param {string} docType Pre-check label.
  * @param {object} [context] Optional subject/filename hints.
  * @param {number} [context.pageCount] PDF page count when known.
@@ -3087,26 +3153,87 @@ function looksLikeCarrierInvoiceEmail(subject, from) {
  */
 function normalizePreCheckDocType(docType, context = {}) {
   const label = sanitizePreCheckLabel(docType);
-  if (label === "STATEMENT") return "INVOICE";
+  if (label === "INVOICE" || label === "POD") return label;
+
+  if (shouldTreatStatementCoverAsInvoiceBundle({
+    preCheckLabel: label,
+    ...context,
+  })) {
+    return "INVOICE";
+  }
+
   const hints = [
     context.subject,
     context.filename,
     context.from,
   ].map((s) => String(s || "")).join(" ");
-  const pageCount = Number(context.pageCount) || 0;
-  if (label === "OTHER" || label === "STATEMENT") {
-    if (/stmt|stmd|statement|freight\s*inv|carrier\s*inv|transportation/i
-        .test(hints)) {
+  if (label === "OTHER") {
+    if (/freight\s*inv|carrier\s*inv|transportation/i.test(hints)) {
       return "INVOICE";
     }
     if (looksLikeCarrierInvoiceEmail(context.subject, context.from)) {
       return "INVOICE";
     }
-    if (pageCount > 1) {
-      return "INVOICE";
-    }
   }
   return label || "OTHER";
+}
+
+/**
+ * Completes or forwards a statement-only email (no freight invoice to enter).
+ * @param {object} args Handler arguments.
+ * @return {Promise<void>}
+ */
+async function handleStatementOnlyEmail(args) {
+  const {
+    gmail, messageId, subject, from, emailBody, tenant, headers,
+    emailClassification, reason,
+  } = args;
+
+  if (isAbeCopiedOnEmail(headers)) {
+    await writeLog("info", "gmail",
+        "Statement-only email — Abe already copied, ignoring", {
+          messageId,
+          subject,
+          classification: emailClassification || null,
+        });
+    await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+    await tcol(tenant, "emailIntake").doc(messageId).set({
+      gmailMessageId: messageId,
+      tenantId: tenant.tenantId,
+      subject,
+      from,
+      finalStatus: "statement_ignored_abe_cc",
+      emailClassification: emailClassification || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      deleteAt: getDeleteAt(30),
+    }, {merge: true});
+    return;
+  }
+
+  const classifierNote = emailClassification &&
+    emailClassification.reasoning ?
+    `\nClassifier note: ${emailClassification.reasoning}` : "";
+  await forwardToHumanReview(
+      gmail, messageId, subject, from,
+      reason || "Carrier account statement — no freight invoice to process",
+      `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
+      `This email appears to be a carrier account statement only — ` +
+      `there is no freight invoice for me to enter. Please verify in ` +
+      `Primus whether these charges are already entered.${classifierNote}\n\n` +
+      `Thank you,\n${AI_AGENT_NAME}`,
+      {department: "statement", emailBody},
+  );
+  await updateGmailQueueStatus(messageId, "completed", null, {tenant});
+  await tcol(tenant, "emailIntake").doc(messageId).set({
+    gmailMessageId: messageId,
+    tenantId: tenant.tenantId,
+    subject,
+    from,
+    finalStatus: "statement_forwarded",
+    emailClassification: emailClassification || null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    deleteAt: getDeleteAt(30),
+  }, {merge: true});
 }
 
 /**
@@ -3211,11 +3338,15 @@ async function forwardToHumanReview(
   const departmentEmail =
     (department === "billing" && process.env.REVIEW_EMAIL_BILLING) ||
     (department === "operations" && process.env.REVIEW_EMAIL_OPERATIONS) ||
+    (department === "statement" &&
+      (process.env.REVIEW_EMAIL_STATEMENT ||
+        STATEMENT_FORWARD_EMAIL_DEFAULT)) ||
     process.env.HUMAN_REVIEW_EMAIL;
 
   if (!departmentEmail) {
     const missingVar = department === "billing" ? "REVIEW_EMAIL_BILLING" :
       department === "operations" ? "REVIEW_EMAIL_OPERATIONS" :
+      department === "statement" ? "REVIEW_EMAIL_STATEMENT" :
       "HUMAN_REVIEW_EMAIL";
     console.error(
         `[forwardToHumanReview] ${missingVar} env var not set — ` +
@@ -5828,16 +5959,17 @@ async function processGmailMessage(
     // message while insurance posting / AI classification is still running.
     await markGmailMessageRead(gmail, messageId);
 
+    let emailClassification = {
+      intent: "unknown",
+      confidence: "low",
+      reasoning: "not classified",
+      spreadsheetFilename: null,
+      invoicePdfFilename: null,
+    };
+
     // Insurance intake: AI classifies the whole email, then a valid premium
     // spreadsheet must parse before anything is posted to Primus.
     if (!isTai && attachments.length > 0) {
-      let emailClassification = {
-        intent: "unknown",
-        confidence: "low",
-        reasoning: "not classified",
-        spreadsheetFilename: null,
-        invoicePdfFilename: null,
-      };
       try {
         emailClassification = await classifyIncomingEmail(
             subject, from, emailBody, attachments,
@@ -5852,6 +5984,15 @@ async function processGmailMessage(
         await writeLog("warn", "ai", "Email classification failed", {
           messageId, subject, error: classifyErr.message,
         });
+      }
+
+      if (emailClassification.intent === "statement" &&
+          emailClassification.confidence !== "low") {
+        await handleStatementOnlyEmail({
+          gmail, messageId, subject, from, emailBody, tenant, headers,
+          emailClassification,
+        });
+        return;
       }
 
       if (emailClassification.intent === "insurance_premium") {
@@ -6177,8 +6318,11 @@ async function processGmailMessage(
             });
       }
       if (docType !== "INVOICE" && docType !== "POD") {
-        if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT" ||
-            (pageCount > 1 && looksLikeCarrierInvoiceEmail(subject, from))) {
+        if (shouldTreatStatementCoverAsInvoiceBundle({
+          preCheckLabel,
+          subject, from, filename: attachment.filename,
+          pageCount,
+        })) {
           docType = "INVOICE";
           await writeLog("info", "gmail",
               "Statement-cover PDF treated as invoice bundle", {
@@ -6187,6 +6331,15 @@ async function processGmailMessage(
                 preCheckLabel,
                 pageCount,
               });
+        } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
+          await writeLog("info", "gmail",
+              "Carrier statement ignored — not an invoice bundle", {
+                messageId,
+                filename: attachment.filename,
+                pageCount,
+              });
+          skippedDocTypes.push("STATEMENT");
+          continue;
         } else {
           await writeLog("info", "gmail",
               `Attachment is ${preCheckLabel}, skipping`, {
@@ -6274,10 +6427,15 @@ async function processGmailMessage(
                 });
           }
           if (docType !== "INVOICE" && docType !== "POD") {
-            if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT" ||
-                (pageCount > 1 &&
-                  looksLikeCarrierInvoiceEmail(subject, from))) {
+            if (shouldTreatStatementCoverAsInvoiceBundle({
+              preCheckLabel,
+              subject, from, filename: attachment.filename,
+              pageCount,
+            })) {
               docType = "INVOICE";
+            } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
+              skippedDocTypes.push("STATEMENT");
+              continue;
             } else {
               skippedDocTypes.push(preCheckLabel);
               continue;
@@ -6347,6 +6505,17 @@ async function processGmailMessage(
       }
       await writeLog("warn", "gmail", "No processable PDF invoices found",
           {messageId, subject});
+      const hasStatementOnly =
+        skippedDocTypes.some((t) => String(t).toUpperCase() === "STATEMENT") &&
+        invoicePdfCount === 0;
+      if (hasStatementOnly) {
+        await handleStatementOnlyEmail({
+          gmail, messageId, subject, from, emailBody, tenant, headers,
+          emailClassification,
+          reason: "Email contained a carrier statement but no freight invoice",
+        });
+        return;
+      }
       let noInvoiceReason =
           "Could not find a freight invoice in this email";
       if (skippedDocTypes.length > 0) {
@@ -6886,6 +7055,7 @@ async function processGmailMessage(
             charges: normalizedChargeData.unrecognizedCharges,
             category: chargeCategory,
             freightMismatch,
+            hasCertificate: !!aiResult.hasWeightInspectionCertificate,
             customerRate: customerRateFromBooking(bookingForCharges),
           });
           await saveOutboundEmail(
@@ -9429,20 +9599,28 @@ async function validateAmountWithPrimus(loadNumber, amount) {
         error: "No carrier cost on Primus record",
       };
     }
-    const diff = Math.abs(Number(amount) - primusAmount);
+    const submitted = Number(amount);
+    const diff = Math.abs(submitted - primusAmount);
     const tolerance = Math.max(0.50, primusAmount * 0.02);
-    const valid = diff <= tolerance;
+    // Accept when within tolerance, or when the carrier billed at/under the
+    // quoted cost — Jerry enters the carrier invoice amount, not the quote.
+    const valid = diff <= tolerance || submitted <= primusAmount + 0.01;
     return {
       ok: true,
       validAmount: valid,
       amount: primusAmount,
-      submittedAmount: Number(amount),
-      savedAmount: primusAmount,
+      primusQuotedAmount: primusAmount,
+      submittedAmount: submitted,
+      savedAmount: valid ? submitted : primusAmount,
+      enteredAmount: valid ? submitted : null,
       difference: diff,
       proNumber,
       reason: valid ?
-        "Amount matches" :
-        `Submitted $${amount} vs Primus $${primusAmount}` +
+        (submitted <= primusAmount + 0.01 && submitted < primusAmount - 0.01 ?
+          `Carrier billed $${submitted.toFixed(2)} — under Primus quote ` +
+          `$${primusAmount.toFixed(2)}; entering carrier amount` :
+          "Amount matches") :
+        `Submitted $${submitted} vs Primus $${primusAmount}` +
           ` (diff $${diff.toFixed(2)})`,
     };
   } catch (error) {

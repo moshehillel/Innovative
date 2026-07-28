@@ -51,7 +51,11 @@ const CHARGE_CATEGORY = Object.freeze({
 });
 
 const WNI_LABEL_PATTERN =
-  /re-?weigh|w\s*&\s*i\b|weight|inspect|re-?class|cubic|density|re-?dim/i;
+  /re-?weigh|w\s*&\s*i\b|weight\s*(?:&|and)\s*inspect|inspect(?:ion)?\s*(?:cert|fee|charge)|re-?class(?:ification)?|cubic|density|re-?dim/i;
+
+/** Accessorial / service fee labels (not weight/reclass). */
+const ACCESSORIAL_LABEL_PATTERN =
+  /school|notify|detention|delivery|liftgate|lumper|appointment|residential|inside|limited\s*access|accessorial|sort(?:ing)?|seg(?:regat)?|re-?deliver|notification|call\s*ahead|reschedule|storage|redelivery|hazmat|oversize|overlength|single\s*shipment|construction|military|farm|church|mine|prison|utility|airport|trade\s*show|exhibition|pallet|handling|chassis|drop|stop\s*off|driver\s*assist|tailgate|residential|non-?commercial/i;
 
 /** Dollars: Primus re-rate vs carrier invoice is a match within this. */
 const RATE_MATCH_TOLERANCE = 10;
@@ -129,12 +133,48 @@ function chargeLabel(charge) {
 }
 
 /**
+ * True when a charge label reads like an accessorial / service fee.
+ * @param {string} label Charge label from the invoice.
+ * @return {boolean}
+ */
+function isAccessorialLabel(label) {
+  return ACCESSORIAL_LABEL_PATTERN.test(String(label || ""));
+}
+
+/**
+ * @param {string} label Raw charge label/type from AI or carrier.
+ * @return {string} Human-readable label for emails.
+ */
+function displayChargeLabel(label) {
+  const raw = String(label || "").trim();
+  if (!raw) return "Additional charge";
+  const key = raw.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "");
+  const aliases = {
+    school_delivery: "School delivery fee",
+    notify_charge: "Notify charge",
+    notify_detention: "Notify detention",
+    notify_delivery: "Notify delivery",
+    notification_fee: "Notification fee",
+    detention: "Detention",
+    liftgate: "Liftgate",
+    lumper: "Lumper",
+  };
+  if (aliases[key]) return aliases[key];
+  if (/^[a-z0-9_]+$/i.test(raw)) {
+    return raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+  }
+  return raw;
+}
+
+/**
  * True when a charge label reads like a weight / inspection / reclass fee.
  * @param {string} label Charge label from the invoice.
  * @return {boolean}
  */
 function isWeightInspectionLabel(label) {
-  return WNI_LABEL_PATTERN.test(String(label || ""));
+  const text = String(label || "");
+  if (isAccessorialLabel(text)) return false;
+  return WNI_LABEL_PATTERN.test(text);
 }
 
 /**
@@ -335,13 +375,43 @@ function classifyAdditionalChargeReason(opts) {
   const charges = Array.isArray(opts.charges) ? opts.charges : [];
   const wniByLabel = charges.some(
       (c) => isWeightInspectionLabel(chargeLabel(c)));
+  const accessorialByLabel = charges.some(
+      (c) => isAccessorialLabel(chargeLabel(c)));
   const mismatch = opts.freightMismatch && opts.freightMismatch.mismatch;
+
+  // Itemized accessorials (school delivery, notify/detention, etc.) win
+  // over a stray W&I certificate flag or matching weight/class on the invoice.
+  if (accessorialByLabel && !wniByLabel && !mismatch) {
+    return CHARGE_CATEGORY.ACCESSORIAL;
+  }
+
   if (wniByLabel || opts.hasCertificate || mismatch) {
     return CHARGE_CATEGORY.WEIGHT_INSPECTION;
   }
   const hasLabeledCharge = charges.some((c) => chargeLabel(c).length > 0);
   if (hasLabeledCharge) return CHARGE_CATEGORY.ACCESSORIAL;
   return CHARGE_CATEGORY.RATE_INCREASE;
+}
+
+/**
+ * Picks the dispute/approval category from charge labels when the stored
+ * category would contradict the line items (e.g. accessorials labeled W&I).
+ * @param {object} opts charges, category, freightMismatch, hasCertificate.
+ * @return {string} CHARGE_CATEGORY value.
+ */
+function resolveEffectiveChargeCategory(opts) {
+  const charges = Array.isArray(opts.charges) ? opts.charges : [];
+  const stored = opts.category;
+  const fresh = classifyAdditionalChargeReason({
+    charges,
+    hasCertificate: opts.hasCertificate,
+    freightMismatch: opts.freightMismatch,
+  });
+  if (stored && stored !== fresh &&
+      fresh === CHARGE_CATEGORY.ACCESSORIAL) {
+    return fresh;
+  }
+  return stored || fresh;
 }
 
 /**
@@ -366,7 +436,7 @@ function categoryLabel(category) {
 function chargesHtml(charges) {
   const rows = (Array.isArray(charges) ? charges : [])
       .map((c) =>
-        `<li>${esc(chargeLabel(c) || "Additional charge")}: ` +
+        `<li>${esc(displayChargeLabel(chargeLabel(c)))}: ` +
         `<strong>${money(c && c.amount)}</strong></li>`)
       .join("");
   return rows ? `<ul style="margin:6px 0 6px 18px;padding:0">${rows}</ul>` :
@@ -464,6 +534,17 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `<tr><td style="padding:4px 16px 4px 0;font-weight:600;` +
     `white-space:nowrap">${esc(label)}</td><td>${value}</td></tr>`;
 
+  const accessorialConfirmHtml =
+    category === CHARGE_CATEGORY.ACCESSORIAL ?
+      `<p style="background:#eff6ff;border:1px solid #bfdbfe;` +
+      `padding:12px 14px;border-radius:6px;margin:14px 0">` +
+      `<strong>Dispatcher${dispatcherName ?
+        ` (${esc(dispatcherName)})` : ""} — please confirm:</strong> ` +
+      `Were the accessorial charge(s) below authorized on this load ` +
+      `(e.g. notify detention, school delivery, notify delivery)? ` +
+      `Reply to this thread or tell accounting before we bill the ` +
+      `customer or dispute the carrier.</p>` : "";
+
   const html =
     `<p>A carrier invoice came in <strong>higher than the quoted ` +
     `amount</strong> and needs your decision.</p>` +
@@ -480,6 +561,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
       row("W&amp;I certificate", "Attached / referenced on invoice") : "") +
     (dispatcherName ? row("Dispatcher", esc(dispatcherName)) : "") +
     `</table>` +
+    accessorialConfirmHtml +
     mismatchHtml +
     rateHtml +
     `<p><strong>Charges:</strong></p>` +
@@ -522,33 +604,54 @@ function buildDisputeEmailDraft(opts) {
   const {
     loadNumber, carrierName, proNumber, invoiceNumber,
     invoiceAmount, expectedAmount, charges, category, freightMismatch,
-    customerRate,
+    customerRate, hasCertificate,
   } = opts;
+
+  const effectiveCategory = resolveEffectiveChargeCategory({
+    charges,
+    category,
+    freightMismatch,
+    hasCertificate,
+  });
 
   const mm = freightMismatch || {};
   const mmDetails = mm.details || {};
   const diff = (Number(invoiceAmount) || 0) - (Number(expectedAmount) || 0);
 
   let basis;
-  if (category === CHARGE_CATEGORY.WEIGHT_INSPECTION) {
-    basis =
-      `The invoice reflects a reweigh/reclassification that does not ` +
-      `match our shipment records` +
-      (mmDetails.primusWeightLbs ?
-        ` (our records: ${mmDetails.primusWeightLbs} lbs` +
-        (mmDetails.primusClass ? `, class ${mmDetails.primusClass}` : "") +
-        `; invoice: ` +
-        (mmDetails.invoiceWeightLbs ?
-          `${mmDetails.invoiceWeightLbs} lbs` : "n/a") +
-        (mmDetails.invoiceClass ?
-          `, class ${mmDetails.invoiceClass}` : "") + `)` : "") +
-      `. Please provide the weight & inspection certificate supporting ` +
-      `this change or correct the invoice to the quoted rate.`;
-  } else if (category === CHARGE_CATEGORY.ACCESSORIAL) {
+  if (effectiveCategory === CHARGE_CATEGORY.WEIGHT_INSPECTION) {
+    if (mm.mismatch) {
+      basis =
+        `The invoice reflects a reweigh/reclassification that does not ` +
+        `match our shipment records` +
+        (mmDetails.primusWeightLbs ?
+          ` (our records: ${mmDetails.primusWeightLbs} lbs` +
+          (mmDetails.primusClass ? `, class ${mmDetails.primusClass}` : "") +
+          `; invoice: ` +
+          (mmDetails.invoiceWeightLbs ?
+            `${mmDetails.invoiceWeightLbs} lbs` : "n/a") +
+          (mmDetails.invoiceClass ?
+            `, class ${mmDetails.invoiceClass}` : "") + `)` : "") +
+        `. Please provide the weight & inspection certificate supporting ` +
+        `this change or correct the invoice to the quoted rate.`;
+    } else {
+      basis =
+        `The invoice includes a reweigh/reclassification or inspection ` +
+        `charge without documentation we can match to this shipment. ` +
+        `Please provide the weight & inspection certificate supporting ` +
+        `this change or correct the invoice to the quoted rate.`;
+    }
+  } else if (effectiveCategory === CHARGE_CATEGORY.ACCESSORIAL) {
+    const names = (Array.isArray(charges) ? charges : [])
+        .map((c) => displayChargeLabel(chargeLabel(c)))
+        .filter(Boolean);
+    const chargeList = names.length ?
+      names.join(", ") :
+      "the listed accessorial charge(s)";
     basis =
       `The invoice includes accessorial charge(s) that were not ` +
-      `authorized on this shipment. Please remove the unauthorized ` +
-      `charge(s) or provide documentation showing prior approval.`;
+      `authorized on this shipment (${chargeList}). Please remove the ` +
+      `unauthorized charge(s) or provide documentation showing prior approval.`;
   } else {
     basis =
       `The invoiced amount exceeds the rate quoted/agreed for this ` +
@@ -558,7 +661,7 @@ function buildDisputeEmailDraft(opts) {
   }
 
   const chargeLines = (Array.isArray(charges) ? charges : [])
-      .map((c) => `- ${chargeLabel(c) || "Additional charge"}: ` +
+      .map((c) => `- ${displayChargeLabel(chargeLabel(c))}: ` +
         `${money(c && c.amount)}`)
       .join("<br>");
 
@@ -735,12 +838,15 @@ module.exports = {
   applyAdditionalChargeEmailCc,
   formatCustomerRate,
   isWeightInspectionLabel,
+  isAccessorialLabel,
+  displayChargeLabel,
   sumCharges,
   detectFreightMismatch,
   buildRequoteFreightInfo,
   buildRateQueryFromBooking,
   evaluateRequoteMatch,
   classifyAdditionalChargeReason,
+  resolveEffectiveChargeCategory,
   categoryLabel,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,

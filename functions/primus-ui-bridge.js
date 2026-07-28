@@ -1982,7 +1982,11 @@ function resolveVendorBillRefs(args, vendor) {
   const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
   let proNumber = String(args.proNumber || vendor.PRO || "").trim();
   let vendorInvoiceNumber = String(
-      args.vendorInvoiceNumber || proNumber || "").trim();
+      args.vendorInvoiceNumber || args.carrierInvoiceNumber ||
+      args.invoiceNumber || "").trim();
+  if (!vendorInvoiceNumber) {
+    vendorInvoiceNumber = proNumber;
+  }
   let usedLoadFallback = false;
   if (!vendorInvoiceNumber && loadNumber) {
     vendorInvoiceNumber = loadNumber;
@@ -2021,6 +2025,42 @@ function roundMoney(amount) {
 }
 
 /**
+ * Scales vendor breakdown lines so their sum equals the carrier invoice total.
+ * @param {Array<object>} lines Breakdown rows with rate/total.
+ * @param {number} targetTotal Carrier invoice amount to enter.
+ * @return {Array<object>}
+ */
+function scaleBreakdownToTotal(lines, targetTotal) {
+  const target = roundMoney(targetTotal);
+  if (!Array.isArray(lines) || !lines.length || !(target > 0)) {
+    return lines;
+  }
+  const sum = roundMoney(
+      lines.reduce((s, line) => s + Number(line.total || line.rate || 0), 0));
+  if (!(sum > 0) || Math.abs(sum - target) <= 0.01) {
+    return lines.map((line) => ({
+      ...line,
+      rate: roundMoney(line.rate),
+      total: roundMoney(line.total || line.rate),
+    }));
+  }
+  const ratio = target / sum;
+  const scaled = lines.map((line, idx) => ({
+    ...line,
+    rate: roundMoney(Number(line.rate || 0) * ratio),
+    total: roundMoney(Number(line.total || line.rate || 0) * ratio),
+    ...(idx === 0 ? {first: true} : {}),
+  }));
+  const scaledSum = roundMoney(
+      scaled.reduce((s, line) => s + Number(line.total || 0), 0));
+  if (scaled.length && Math.abs(scaledSum - target) > 0.01) {
+    const last = scaled[scaled.length - 1];
+    last.total = roundMoney(last.total + (target - scaledSum));
+  }
+  return scaled;
+}
+
+/**
  * Builds vendor bill JSON for billsInfo from booking vendor + carrier invoice.
  * @param {object} vendor booking.vendor
  * @param {object} bill Carrier bill fields.
@@ -2028,31 +2068,36 @@ function roundMoney(amount) {
  * @return {object}
  */
 function buildBillsInfo(vendor, bill, termsId) {
-  const breakdown = Array.isArray(vendor.breakdown) && vendor.breakdown.length ?
-    vendor.breakdown.map((line, idx) => ({
+  const carrierTotal = roundMoney(bill.total);
+  let breakdown;
+  if (Array.isArray(vendor.breakdown) && vendor.breakdown.length) {
+    breakdown = vendor.breakdown.map((line, idx) => ({
       code: line.code || (idx === 0 ? "FRT" : ""),
       description: line.description || "FREIGHT CHARGE",
       qty: Number(line.qty || 1),
       rate: roundMoney(line.rate),
       total: roundMoney(line.total || line.rate),
       ...(idx === 0 ? {first: true} : {}),
-    })) :
-    [{
+    }));
+    if (carrierTotal > 0) {
+      breakdown = scaleBreakdownToTotal(breakdown, carrierTotal);
+    }
+  } else {
+    breakdown = [{
       code: "FRT",
       description: "FREIGHT CHARGE",
       qty: 1,
-      rate: roundMoney(bill.total),
-      total: roundMoney(bill.total),
+      rate: carrierTotal,
+      total: carrierTotal,
       first: true,
     }];
-  const total = breakdown.reduce(
-      (sum, line) => sum + Number(line.total || 0), 0);
+  }
   return {
     code: "FRT",
     vendorInvoiceNumber: String(bill.vendorInvoiceNumber),
     carrierId: String(vendor.id),
     carrierName: String(vendor.name || ""),
-    total: roundMoney(total || bill.total),
+    total: carrierTotal,
     breakdown,
     terms: termsId != null ? Number(termsId) : defaultTermsId(),
     PRO: String(bill.proNumber || bill.vendorInvoiceNumber),
