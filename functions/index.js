@@ -10705,6 +10705,10 @@ innovativePrimus.init({
   ensurePodMarkedOnPrimus: primusUiBridge.ensurePodMarkedOnPrimus,
   ensureCarrierBillUploadedToPrimus:
       primusUiBridge.ensureCarrierBillUploadedToPrimus,
+  resolveRestInvoiceIdForQuickBooks:
+      primusUiBridge.resolveRestInvoiceIdForQuickBooks,
+  rePushCarrierBillToQuickBooks:
+      primusUiBridge.rePushCarrierBillToQuickBooks,
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
 

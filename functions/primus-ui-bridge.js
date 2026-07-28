@@ -1687,6 +1687,30 @@ async function resolveIssuedInvoiceIdForLoad(loadNumber) {
 }
 
 /**
+ * REST invoice id for POST /quickbooks/billing — differs from manage.php id.
+ * @param {string|number} loadNumber BOL number.
+ * @param {string|number|null} uiInvoiceId manage.php customerInvoiceId.
+ * @return {Promise<string|null>}
+ */
+async function resolveRestInvoiceIdForQuickBooks(loadNumber, uiInvoiceId) {
+  const list = await fetchRestInvoicesByLoad(loadNumber);
+  if (!list.length) {
+    return uiInvoiceId != null ? String(uiInvoiceId) : null;
+  }
+  const issued = list.filter((inv) => inv.status && inv.status.generated);
+  const pool = issued.length ? issued : list;
+  if (uiInvoiceId != null) {
+    const uiStr = String(uiInvoiceId);
+    const direct = pool.find((inv) => String(inv.invoiceId) === uiStr);
+    if (direct) return uiStr;
+  }
+  const sorted = [...pool].sort(
+      (a, b) => Number(b.invoiceNumber || 0) - Number(a.invoiceNumber || 0));
+  return sorted[0] && sorted[0].invoiceId ?
+    String(sorted[0].invoiceId) : null;
+}
+
+/**
  * Picks an existing draft invoice id (UI docs, REST, or workflow state).
  * @param {object} args loadNumber, customerInvoiceId, bookingDocData
  * @return {Promise<object>} id and source
@@ -2417,6 +2441,7 @@ async function computeInvoiceMarginFromStore(invoiceId) {
 }
 exports.computeInvoiceMarginFromStore = computeInvoiceMarginFromStore;
 exports.resolveIssuedInvoiceIdForLoad = resolveIssuedInvoiceIdForLoad;
+exports.resolveRestInvoiceIdForQuickBooks = resolveRestInvoiceIdForQuickBooks;
 
 /**
  * @param {object} storeData getInvoiceStores response object.
@@ -2716,6 +2741,50 @@ async function resolveMasterVendorForBilling(bookingVendor, nameHint) {
         });
   }
   return bookingVendor;
+}
+
+/**
+ * Pushes carrier payable to QuickBooks Desktop via manage.php rePushToQB.
+ * Uses the UI invoice id (customerInvoiceId from billing), not the REST id.
+ * Payable must use master vendor id (resolveMasterVendorForBilling).
+ *
+ * @param {object} args
+ * @param {string|number} args.customerInvoiceId UI invoice id.
+ * @param {string|number} [args.invoiceNumber] Issued customer invoice #.
+ * @return {Promise<object>}
+ */
+async function rePushCarrierBillToQuickBooks(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, skipped: true, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  const uiInvoiceId = String(args.customerInvoiceId || args.invoiceId || "");
+  if (!uiInvoiceId) {
+    return {ok: false, error: "customerInvoiceId required"};
+  }
+  const invoiceNumber = String(args.invoiceNumber || "0");
+  const result = await managePhpPost({
+    action: "rePushToQB",
+    invoiceId: uiInvoiceId,
+    invoiceNumber,
+  });
+  const json = result.json;
+  if (isManageSuccess(json)) {
+    return {
+      ok: true,
+      synced: true,
+      message: (json && json.message) || "QuickBooks push succeeded",
+      raw: json,
+    };
+  }
+  const errMsg = (json && (json.message || json.error)) ||
+    (result.text || "").slice(0, 300) ||
+    "rePushToQB failed";
+  return {
+    ok: false,
+    synced: false,
+    error: errMsg,
+    raw: json || result.text,
+  };
 }
 
 /**
@@ -3362,6 +3431,7 @@ function isManagePhpEnabled() {
   return String(flag).toLowerCase() === "true";
 }
 exports.isManagePhpEnabled = isManagePhpEnabled;
+exports.rePushCarrierBillToQuickBooks = rePushCarrierBillToQuickBooks;
 
 /**
  * Full Primus UI billing flow captured from production DevTools:

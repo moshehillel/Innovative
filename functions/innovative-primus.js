@@ -50,6 +50,8 @@ let resolveCustomerAccountingEmails;
 let checkBookingHasPod;
 let ensurePodMarkedOnPrimus;
 let ensureCarrierBillUploadedToPrimus;
+let resolveRestInvoiceIdForQuickBooks;
+let rePushCarrierBillToQuickBooks;
 let notifyDispatcherRateIssue;
 let maybeNotifyLisaPodDiscrepancy;
 
@@ -77,11 +79,32 @@ function init(bundle) {
     resolveCustomerAccountingEmails, checkBookingHasPod,
     ensurePodMarkedOnPrimus,
     ensureCarrierBillUploadedToPrimus,
+    resolveRestInvoiceIdForQuickBooks,
+    rePushCarrierBillToQuickBooks,
     notifyDispatcherRateIssue,
     maybeNotifyLisaPodDiscrepancy,
   } = bundle);
 }
 exports.init = init;
+
+/**
+ * Normalizes Primus QuickBooks error payloads for alerts.
+ * @param {*} err Primus results.error value.
+ * @return {string|null}
+ */
+function formatPrimusQbError(err) {
+  if (err == null) return null;
+  if (typeof err === "string") return err;
+  if (typeof err === "object") {
+    const msg = err.message || err.error;
+    if (typeof msg === "string") return msg;
+    if (msg && typeof msg === "object") {
+      return msg.message || JSON.stringify(msg);
+    }
+    return JSON.stringify(err);
+  }
+  return String(err);
+}
 
 /**
  * @param {number|null|undefined} amount Money value.
@@ -229,7 +252,8 @@ async function sendWorkflowAlert(opts) {
  * @param {string} args.invoiceId Firestore invoice id.
  * @param {object} args.invoice Invoice data.
  * @param {object} args.primusSteps Mutable primusSteps map (updated in place).
- * @param {string|number} args.customerInvoiceId Primus customer invoice id.
+ * @param {string|number} args.customerInvoiceId Primus UI customer invoice id.
+ * @param {string|number} [args.invoiceNumber] Issued customer invoice number.
  * @return {Promise<object>} {synced, skipped, uploaded, failed, error}.
  */
 async function pushCarrierBillToQuickBooks(args) {
@@ -240,6 +264,7 @@ async function pushCarrierBillToQuickBooks(args) {
     invoice,
     primusSteps,
     customerInvoiceId,
+    invoiceNumber: invoiceNumberArg,
   } = args;
   if (!customerInvoiceId) {
     return {synced: false, skipped: true, reason: "no customerInvoiceId"};
@@ -248,83 +273,82 @@ async function pushCarrierBillToQuickBooks(args) {
     return {synced: true, skipped: true, reason: "already synced"};
   }
 
-  try {
-    const qbResult = await primusRequest(
-        "POST", "/quickbooks/billing",
-        {invoiceId: customerInvoiceId},
-    );
-    const qbResults = qbResult && qbResult.data && qbResult.data.results;
-    const qbBills = qbResults && qbResults.bills;
-    let primusQbError = null;
-    if (qbResults && qbResults.error != null) {
-      const err = qbResults.error;
-      if (typeof err === "string") {
-        primusQbError = err;
-      } else if (typeof err === "object") {
-        primusQbError = err.message || err.error ||
-          JSON.stringify(err);
-      } else {
-        primusQbError = String(err);
+  const uiInvoiceId = String(customerInvoiceId);
+  const invoiceNumber = String(
+      invoiceNumberArg ||
+      invoice.issuedInvoiceNumber ||
+      invoice.customerInvoiceNumber ||
+      "0",
+  );
+  const loadNumber = invoice.loadNumber ? String(invoice.loadNumber) : "";
+
+  /**
+   * @param {object} syncInfo Success metadata for logs.
+   * @return {Promise<object>}
+   */
+  async function markSynced(syncInfo) {
+    if (primusSteps) {
+      primusSteps.qbBillingSynced = true;
+      primusSteps.qbBillingSyncedAt = new Date().toISOString();
+      primusSteps.qbBillingMethod = syncInfo.method || "ui_rePushToQB";
+    }
+    const updatePayload = {
+      "primusSteps.qbBillingSynced": true,
+      "primusSteps.qbBillingSyncedAt":
+        admin.firestore.FieldValue.serverTimestamp(),
+      "primusSteps.qbBillingMethod": syncInfo.method || "ui_rePushToQB",
+      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    };
+    const invDateRaw = invoice.dueDate ? null :
+      (invoice.invoiceDate || invoice.receivedAt || null);
+    if (!invoice.dueDate && invDateRaw) {
+      const invDate = new Date(invDateRaw);
+      if (!isNaN(invDate.getTime())) {
+        invDate.setDate(invDate.getDate() + 30);
+        updatePayload.carrierBillDueDate =
+          invDate.toISOString().split("T")[0];
       }
     }
-    const uploaded = (qbBills && qbBills.uploadedBills &&
-        qbBills.uploadedBills.length) || 0;
-    const failed = (qbBills && qbBills.failedBills &&
-        qbBills.failedBills.length) || 0;
-    const rawSnippet = JSON.stringify(qbResult || {}).slice(0, 400);
-
-    if (uploaded > 0) {
-      if (primusSteps) {
-        primusSteps.qbBillingSynced = true;
-        primusSteps.qbBillingSyncedAt =
-          new Date().toISOString();
-      }
-      const updatePayload = {
-        "primusSteps.qbBillingSynced": true,
-        "primusSteps.qbBillingSyncedAt":
-          admin.firestore.FieldValue.serverTimestamp(),
-        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-      };
-      // Calculate and store Net 30 due date for reference when missing.
-      const invDateRaw = invoice.dueDate ? null :
-        (invoice.invoiceDate || invoice.receivedAt || null);
-      if (!invoice.dueDate && invDateRaw) {
-        const invDate = new Date(invDateRaw);
-        if (!isNaN(invDate.getTime())) {
-          invDate.setDate(invDate.getDate() + 30);
-          updatePayload.carrierBillDueDate =
-            invDate.toISOString().split("T")[0];
-        }
-      }
-      await invoiceDoc.ref.update(updatePayload);
-      await writeLog("info", "workflow",
-          "Carrier bill pushed to QuickBooks", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            customerInvoiceId,
-            uploadedBills: uploaded,
-          });
-      await logWorkflowStep({
-        invoiceId,
-        stepName: "qb_billing_sync",
-        stepStatus: "success",
-        output: {customerInvoiceId, uploadedBills: uploaded},
-      });
-      return {synced: true, uploaded, failed};
-    }
-
-    const failMsg = primusQbError ||
-        (failed > 0 ?
-          `${failed} bill(s) failed to upload to QuickBooks` :
-          "Primus returned no uploaded bills (QB may not be connected " +
-          "or the payable is not ready)");
-    await writeLog("error", "workflow",
-        "QB billing call returned no uploaded bills", {
+    await invoiceDoc.ref.update(updatePayload);
+    await writeLog("info", "workflow",
+        "Carrier bill pushed to QuickBooks", {
           invoiceId,
-          loadNumber: invoice.loadNumber,
-          customerInvoiceId,
-          failedBills: failed,
-          primusError: primusQbError,
+          loadNumber,
+          customerInvoiceId: uiInvoiceId,
+          invoiceNumber,
+          method: syncInfo.method,
+          ...syncInfo.extra,
+        });
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "qb_billing_sync",
+      stepStatus: "success",
+      output: {
+        customerInvoiceId: uiInvoiceId,
+        invoiceNumber,
+        method: syncInfo.method,
+        ...syncInfo.extra,
+      },
+    });
+    return {synced: true, method: syncInfo.method, ...syncInfo.extra};
+  }
+
+  /**
+   * @param {string} failMsg Human-readable failure.
+   * @param {object} detail Log/alert detail.
+   * @return {Promise<object>}
+   */
+  async function reportFailure(failMsg, detail) {
+    const rawSnippet = detail.raw ?
+      String(detail.raw).slice(0, 400) : "";
+    await writeLog("error", "workflow",
+        "QB billing sync failed — bill still in Primus", {
+          invoiceId,
+          loadNumber,
+          customerInvoiceId: uiInvoiceId,
+          invoiceNumber,
+          method: detail.method,
+          error: failMsg,
           raw: rawSnippet,
         });
     await logWorkflowStep({
@@ -334,9 +358,9 @@ async function pushCarrierBillToQuickBooks(args) {
       reason: failMsg,
       error: "QB_BILLING_FAILED",
       output: {
-        customerInvoiceId,
-        failedBills: failed,
-        primusError: primusQbError,
+        customerInvoiceId: uiInvoiceId,
+        invoiceNumber,
+        method: detail.method,
         raw: rawSnippet,
       },
     });
@@ -347,49 +371,91 @@ async function pushCarrierBillToQuickBooks(args) {
         invoiceId,
         type: "qb_billing_failed",
         context: {
-          loadNumber: invoice.loadNumber,
+          loadNumber,
           carrierName: invoice.carrierName,
-          customerInvoiceId,
+          customerInvoiceId: uiInvoiceId,
           errorMessage: failMsg,
           raw: rawSnippet,
         },
       });
     }
-    return {
-      synced: false,
-      uploaded: 0,
-      failed,
-      error: primusQbError || "no_uploaded_bills",
-    };
-  } catch (qbErr) {
-    await writeLog("error", "workflow",
-        "QB billing sync failed — bill still in Primus", {
-          invoiceId,
-          loadNumber: invoice.loadNumber,
-          customerInvoiceId,
-          error: qbErr.message,
+    return {synced: false, error: failMsg, method: detail.method};
+  }
+
+  // Primary path: QuickBooks Desktop via manage.php rePushToQB (UI invoice id).
+  if (isManagePhpEnabled && isManagePhpEnabled() &&
+      typeof rePushCarrierBillToQuickBooks === "function") {
+    try {
+      const uiResult = await rePushCarrierBillToQuickBooks({
+        customerInvoiceId: uiInvoiceId,
+        invoiceNumber,
+      });
+      if (uiResult.synced) {
+        return markSynced({
+          method: "ui_rePushToQB",
+          extra: {message: uiResult.message},
         });
-    await logWorkflowStep({
-      invoiceId,
-      stepName: "qb_billing_sync",
-      stepStatus: "failed",
-      error: qbErr.message,
-    });
-    if (req) {
-      await sendWorkflowAlert({
-        req,
-        code: "QB_BILLING_FAILED",
-        invoiceId,
-        type: "qb_billing_failed",
-        context: {
-          loadNumber: invoice.loadNumber,
-          carrierName: invoice.carrierName,
-          customerInvoiceId,
-          errorMessage: qbErr.message,
-        },
+      }
+      if (!uiResult.skipped) {
+        return reportFailure(
+            uiResult.error || "rePushToQB failed",
+            {method: "ui_rePushToQB", raw: uiResult.raw});
+      }
+    } catch (uiErr) {
+      return reportFailure(uiErr.message, {method: "ui_rePushToQB"});
+    }
+  }
+
+  // Optional REST fallback (QuickBooks Online API — usually off for IC).
+  if (process.env.PRIMUS_QB_USE_REST_API !== "true") {
+    return reportFailure(
+        "QuickBooks UI push is not available (manage.php off)",
+        {method: "none"});
+  }
+
+  let qbInvoiceId = uiInvoiceId;
+  if (loadNumber && typeof resolveRestInvoiceIdForQuickBooks === "function") {
+    try {
+      const resolved = await resolveRestInvoiceIdForQuickBooks(
+          loadNumber, customerInvoiceId);
+      if (resolved) qbInvoiceId = resolved;
+    } catch (_) {
+      // use UI id
+    }
+  }
+
+  try {
+    const qbResult = await primusRequest(
+        "POST", "/quickbooks/billing",
+        {invoiceId: qbInvoiceId},
+    );
+    const qbResults = qbResult && qbResult.data && qbResult.data.results;
+    const qbBills = qbResults && qbResults.bills;
+    const primusQbError = formatPrimusQbError(
+        qbResults && qbResults.error);
+    const uploaded = (qbBills && qbBills.uploadedBills &&
+        qbBills.uploadedBills.length) || 0;
+    const failed = (qbBills && qbBills.failedBills &&
+        qbBills.failedBills.length) || 0;
+    const rawSnippet = JSON.stringify(qbResult || {}).slice(0, 400);
+
+    if (uploaded > 0) {
+      return markSynced({
+        method: "rest_quickbooks_billing",
+        extra: {qbInvoiceId, uploadedBills: uploaded, failedBills: failed},
       });
     }
-    return {synced: false, error: qbErr.message};
+
+    const failMsg = primusQbError ||
+        (failed > 0 ?
+          `${failed} bill(s) failed to upload to QuickBooks` :
+          "Primus returned no uploaded bills");
+    return reportFailure(failMsg, {
+      method: "rest_quickbooks_billing",
+      raw: rawSnippet,
+    });
+  } catch (qbErr) {
+    return reportFailure(qbErr.message, {method: "rest_quickbooks_billing"});
   }
 }
 
@@ -2047,6 +2113,7 @@ exports.processPrimusWorkflow = onRequest(
               invoice,
               primusSteps,
               customerInvoiceId: invoice.customerInvoiceId,
+              invoiceNumber: invoice.issuedInvoiceNumber,
             });
           } else {
             let uiResult;
@@ -2183,6 +2250,8 @@ exports.processPrimusWorkflow = onRequest(
             await invoiceDoc.ref.update({
               primusSteps,
               customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+              issuedInvoiceNumber:
+                invoiceGenerationResult.invoiceNumber || null,
               updatedAt: admin.firestore.FieldValue.serverTimestamp(),
             });
 
@@ -2215,6 +2284,7 @@ exports.processPrimusWorkflow = onRequest(
               invoice,
               primusSteps,
               customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+              invoiceNumber: invoiceGenerationResult.invoiceNumber,
             });
           }
         } else if (invoice.customerInvoiceId) {
@@ -2246,6 +2316,7 @@ exports.processPrimusWorkflow = onRequest(
             invoice,
             primusSteps,
             customerInvoiceId: invoice.customerInvoiceId,
+            invoiceNumber: invoice.issuedInvoiceNumber,
           });
         } else {
           invoiceGenerationResult =
@@ -2315,6 +2386,7 @@ exports.processPrimusWorkflow = onRequest(
           await invoiceDoc.ref.update({
             primusSteps: primusSteps,
             customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+            issuedInvoiceNumber: invoiceGenerationResult.invoiceNumber || null,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
 
@@ -2342,6 +2414,7 @@ exports.processPrimusWorkflow = onRequest(
             invoice,
             primusSteps,
             customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+            invoiceNumber: invoiceGenerationResult.invoiceNumber,
           });
         }
 
@@ -2757,6 +2830,7 @@ exports.processPrimusWorkflow = onRequest(
             invoice,
             primusSteps,
             customerInvoiceId: finalCustomerInvoiceId,
+            invoiceNumber: issuedInvoiceNumber,
           });
         }
 

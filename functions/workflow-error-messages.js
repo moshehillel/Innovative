@@ -322,8 +322,9 @@ function buildWorkflowAlertEmail(opts) {
           `Primus invoice id: ${esc(ctx.customerInvoiceId)}. ` : "") +
         (ctx.raw ?
           `Primus response: ${esc(String(ctx.raw).slice(0, 200))}. ` : "") +
-        "Push the bill to QuickBooks from ShipPrimus, or retry after " +
-        "confirming the QB connection.";
+        "Push the bill to QuickBooks Desktop from ShipPrimus " +
+        "(Re-push to QB), or retry the workflow after confirming " +
+        "QuickBooks Desktop sync is running on the Primus workstation.";
       action = ACTION.NONE;
       break;
 
