@@ -2065,8 +2065,30 @@ function resolveTermsForCarrierBill(billDate, billDueDate, termsList) {
   }
 
   const days = diffCalendarDays(billDate, billDueDate);
+  const billDateOnly = toDateOnly(billDate);
+  const dueDateOnly = toDateOnly(billDueDate);
   if (!Number.isFinite(days) || days < 0) {
-    return {ok: false, error: "Invalid carrier bill date or due date"};
+    // AI often mis-reads dates on multi-invoice carrier PDFs (due before bill).
+    // Fall back to configured Net 30 rather than blocking billing.
+    if (fallback) {
+      return {
+        ok: true,
+        termsId: fallbackId,
+        source: "default_invalid_dates",
+        requestedDays: Number.isFinite(days) ? days : null,
+        days: fallback.days,
+        code: fallback.code,
+        description: fallback.description,
+        billDate: billDateOnly,
+        dueDate: dueDateOnly,
+      };
+    }
+    return {
+      ok: false,
+      error: "Invalid carrier bill date or due date",
+      billDate: billDateOnly,
+      dueDate: dueDateOnly,
+    };
   }
 
   const exact = termsList.find((t) => t.days === days);
@@ -2697,7 +2719,9 @@ function findMasterVendorByName(vendors, hint) {
  * different large assignment id Jerry must not send in billsInfo.carrierId.
  *
  * @param {object} bookingVendor booking.vendor from GET /book.
- * @param {string} [nameHint] Carrier name from invoice PDF/email.
+ * @param {string} [nameHint] Primus load vendor name (booking.vendor.name).
+ *   Do not pass the carrier name from the invoice PDF — it may differ from
+ *   the vendor assigned on the load and will break QuickBooks sync.
  * @return {Promise<object>} vendor-shaped object with master id + name.
  */
 async function resolveMasterVendorForBilling(bookingVendor, nameHint) {
@@ -3546,10 +3570,25 @@ async function runPrimusUiBillingFlow(args) {
   if (!vendor.id) {
     return {ok: false, error: "Booking missing vendor.id"};
   }
+  const primusVendorName = String(vendor.name || "").trim();
+  const extractedCarrierName = String(args.carrierName || "").trim();
+  if (extractedCarrierName && primusVendorName &&
+      extractedCarrierName.toLowerCase() !== primusVendorName.toLowerCase() &&
+      writeLog) {
+    await writeLog("warn", "primus",
+        "Invoice carrier name differs from Primus load vendor — using load vendor for billing/QB",
+        {
+          loadNumber,
+          extractedCarrierName,
+          primusVendorName,
+          bookingVendorId: vendor.id,
+        });
+  }
   try {
+    // Always bill against the vendor on the load — not the PDF/email carrier name.
     vendor = await resolveMasterVendorForBilling(
         vendor,
-        args.carrierName || vendor.name || "",
+        primusVendorName || extractedCarrierName || "",
     );
   } catch (vendorErr) {
     return {
@@ -3693,6 +3732,17 @@ async function runPrimusUiBillingFlow(args) {
           defaultDays: termsResolution.days,
           billDate: toDateOnly(billDate),
           dueDate: toDateOnly(carrierDueDate),
+        });
+  } else if (writeLog && termsResolution.source === "default_invalid_dates") {
+    await writeLog("warn", "primus",
+        "Invalid carrier bill dates — using default Net 30 term", {
+          loadNumber,
+          bookingId,
+          termsId,
+          billDate: termsResolution.billDate,
+          dueDate: termsResolution.dueDate,
+          requestedDays: termsResolution.requestedDays,
+          defaultDays: termsResolution.days,
         });
   }
 

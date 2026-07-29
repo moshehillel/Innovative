@@ -295,6 +295,34 @@ function isCarrierInvoicePastDue(item, asOf) {
 }
 
 /**
+ * Normalizes carrier PRO / invoice # for comparison (strip dashes/spaces).
+ * @param {string|null|undefined} value Raw reference.
+ * @return {string}
+ */
+function normalizeCarrierReference(value) {
+  return String(value || "").replace(/[\s-]/g, "").trim().toLowerCase();
+}
+
+/**
+ * True when AI flagged late-payment penalty line items on the invoice.
+ * @param {object} item AI invoice item.
+ * @return {boolean}
+ */
+function hasLateFeeLineItems(item) {
+  const rows = []
+      .concat(Array.isArray(item && item.unrecognizedCharges) ?
+        item.unrecognizedCharges : [])
+      .concat(Array.isArray(item && item.charges) ? item.charges : []);
+  return rows.some((row) => {
+    const label = String(row && (row.type || row.description || row.label) ||
+      "").toLowerCase();
+    return /\blate fee\b/.test(label) ||
+      /\blp\d+\b/.test(label) ||
+      /\blate payment\b/.test(label);
+  });
+}
+
+/**
  * True when the carrier bill for this load appears already entered in
  * Primus (vendor ref / PRO match, carrier-bill document, or REST invoice).
  * @param {object} item AI invoice item.
@@ -324,11 +352,35 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
     const bookingPro = String(
         (booking.vendor && booking.vendor.PRO) || "").trim();
 
-    if (carrierInvNum && carrierRef && carrierInvNum === carrierRef) {
+    if (carrierInvNum && carrierRef &&
+        normalizeCarrierReference(carrierInvNum) ===
+        normalizeCarrierReference(carrierRef)) {
       return true;
     }
-    if (proNumber && bookingPro && proNumber === bookingPro) {
+    if (proNumber && bookingPro &&
+        normalizeCarrierReference(proNumber) ===
+        normalizeCarrierReference(bookingPro)) {
       return true;
+    }
+
+    const invData = await primusRequest(
+        "GET",
+        `/invoice/bolnumber/${encodeURIComponent(loadNumber)}`);
+    const results = invData && invData.data && invData.data.results;
+    const list = Array.isArray(results) ?
+      results : (results ? [results] : []);
+    for (const inv of list) {
+      const vin = String(
+          inv.vendorInvoiceNumber || inv.carrierInvoiceNumber || "",
+      ).trim();
+      if (carrierInvNum && vin &&
+          normalizeCarrierReference(carrierInvNum) ===
+          normalizeCarrierReference(vin)) {
+        return true;
+      }
+      if (inv && inv.status && inv.status.generated) {
+        return true;
+      }
     }
 
     const vendorCost = Number(booking.vendor && booking.vendor.cost || 0);
@@ -366,19 +418,6 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
       } catch (_) {
         // UI lookup is best-effort.
       }
-    }
-
-    const invData = await primusRequest(
-        "GET",
-        `/invoice/bolnumber/${encodeURIComponent(loadNumber)}`);
-    const results = invData && invData.data && invData.data.results;
-    const list = Array.isArray(results) ?
-      results : (results ? [results] : []);
-    for (const inv of list) {
-      const vin = String(
-          inv.vendorInvoiceNumber || inv.carrierInvoiceNumber || "",
-      ).trim();
-      if (carrierInvNum && vin && carrierInvNum === vin) return true;
     }
 
     return false;
@@ -679,6 +718,18 @@ function checkSafeToSummarize(logs) {
     {pattern: /UNRECOGNIZED_CHARGES/i, reason: "Unrecognized charges"},
     {pattern: /waiting_manual/i, reason: "Waiting for manual review"},
     {pattern: /completed/i, reason: "Processing completed"},
+    {pattern: /insurance_processed/i, reason: "Insurance processed"},
+    {pattern: /insurance_failed/i, reason: "Insurance failed"},
+    {pattern: /queued for workflow/i, reason: "Queued for workflow"},
+    {pattern: /Invoice queued/i, reason: "Invoice queued"},
+    {pattern: /forwarded for review/i, reason: "Forwarded for review"},
+    {pattern: /human review/i, reason: "Human review"},
+    {pattern: /Email processing completed/i,
+      reason: "Email processing completed"},
+    {pattern: /Gmail inbox check completed/i, reason: "Inbox check completed"},
+    {pattern: /skipped/i, reason: "Skipped"},
+    {pattern: /no action/i, reason: "No action needed"},
+    {pattern: /pod_request|pod_delivery/i, reason: "POD handled"},
   ];
 
   // Check if any log indicates a terminal state
@@ -699,8 +750,8 @@ function checkSafeToSummarize(logs) {
     }
   }
 
-  // No terminal status found - check if idle long enough to assume done
-  if (minutesSinceLastLog < 15) {
+  // No terminal status found — summarize soon after activity stops.
+  if (minutesSinceLastLog < 1) {
     return {
       safe: false,
       reason: `Flow still running or too recent ` +
@@ -709,6 +760,38 @@ function checkSafeToSummarize(logs) {
   }
 
   return {safe: true, reason: `Idle for ${Math.round(minutesSinceLastLog)}m`};
+}
+
+/** Max characters stored/displayed for dashboard activity blurbs. */
+const AI_SUMMARY_MAX_CHARS = 200;
+
+/**
+ * @param {string|null|undefined} text Raw summary.
+ * @param {number} [maxLen] Character cap.
+ * @return {string|null}
+ */
+function truncateAiSummary(text, maxLen = AI_SUMMARY_MAX_CHARS) {
+  const s = String(text || "").trim();
+  if (!s) return null;
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen - 1).trimEnd() + "…";
+}
+
+/**
+ * @param {string} flowId Flow id.
+ * @param {string} [dataset] BigQuery dataset.
+ * @return {Promise<boolean>}
+ */
+async function flowAlreadySummarized(flowId, dataset = BQ_DATASET) {
+  const [rows] = await bigquery.query({
+    query: `
+      SELECT flowId FROM \`${dataset}.${BQ_SUMMARIES_TABLE}\`
+      WHERE flowId = @flowId
+      LIMIT 1
+    `,
+    params: {flowId: String(flowId)},
+  });
+  return rows.length > 0;
 }
 
 const normalizeLoadNumber = loadResolution.normalizeLoadNumber;
@@ -975,34 +1058,31 @@ async function summarizeSingleFlow(flowId, logs) {
   const messageId = lastLog.messageId || null;
   const invoiceId = lastLog.invoiceId || null;
 
+  const compactLogs = logs.slice(-60).map((log) => ({
+    t: log.timestamp || log.createdAt || null,
+    l: log.level || null,
+    m: String(log.message || "").slice(0, 180),
+  }));
+
   const prompt = {
     flowId: String(flowId),
     messageId: messageId,
     invoiceId: invoiceId,
-    logs: logs.slice(-200),
+    logs: compactLogs,
   };
 
   const aiRes = await client.messages.create({
     model: "claude-haiku-4-5",
-    max_tokens: 2048,
-    system: "You are a production workflow debugger and " +
-      "incident writer. " +
+    max_tokens: 220,
+    system: "You write one-line dashboard activity blurbs " +
+      "for freight billing ops. " +
       "Return ONLY valid JSON with keys: finalStatus, lastCompletedStep, " +
       "failureReason, recommendedFix, aiSummary. " +
-      "The aiSummary MUST be a clear, detailed, human narrative written " +
-      "in first-person past tense (e.g. 'I opened the email...'), and it " +
-      "MUST include both: (1) a short narrative paragraph and (2) a " +
-      "step-by-step timeline section. " +
-      "In the narrative, explicitly mention: email/message context, " +
-      "attachments found (count and filenames if available), " +
-      "what data was " +
-      "extracted (load/pro/invoice amount), " +
-      "what Primus checks were attempted " +
-      "and the outcome, what decision was made " +
-      "(approved / needs review / " +
-      "error), and why. " +
-      "If information is missing in the logs, say 'not present in logs' " +
-      "instead of guessing.",
+      "aiSummary MUST be exactly ONE short sentence " +
+      "(max 160 characters), past tense, outcome-focused — " +
+      "no bullet lists, no step timeline, no markdown. " +
+      "Include load/invoice when in logs. " +
+      "Say 'not in logs' for missing facts.",
     messages: [
       {
         role: "user",
@@ -1014,11 +1094,7 @@ async function summarizeSingleFlow(flowId, logs) {
               lastCompletedStep: "string|null",
               failureReason: "string|null",
               recommendedFix: "string|null",
-              aiSummary: "string",
-            },
-            aiSummaryTemplate: {
-              narrative: "1 short paragraph",
-              timeline: "Bullet list of major steps with timestamps if present",
+              aiSummary: "string (max 160 chars, one sentence)",
             },
           },
         }),
@@ -1051,8 +1127,8 @@ async function summarizeSingleFlow(flowId, logs) {
         finalStatus: aiJson.finalStatus || "unknown",
         lastStep: aiJson.lastCompletedStep || null,
         failureReason: aiJson.failureReason || null,
-        recommendedFix: aiJson.recommendedFix || null,
-        aiSummary: aiJson.aiSummary || null,
+        recommendedFix: truncateAiSummary(aiJson.recommendedFix, 200),
+        aiSummary: truncateAiSummary(aiJson.aiSummary),
       }]);
 
   return {
@@ -1119,74 +1195,11 @@ exports.summarizeFlowLogs = onRequest(async (req, res) => {
     }
 
     const {flowId} = req.body || {};
-
-    // Find unsummarized flow IDs by left-joining logs against summaries
-    let unsummarizedQuery;
-    let queryOptions;
-    if (flowId) {
-      unsummarizedQuery = `
-        SELECT DISTINCT l.flowId
-        FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\` l
-        LEFT JOIN \`${BQ_DATASET}.${BQ_SUMMARIES_TABLE}\` s
-          ON l.flowId = s.flowId
-        WHERE l.flowId = @flowId AND s.flowId IS NULL
-      `;
-      queryOptions = {
-        query: unsummarizedQuery,
-        params: {flowId: String(flowId)},
-      };
-    } else {
-      unsummarizedQuery = `
-        SELECT DISTINCT l.flowId
-        FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\` l
-        LEFT JOIN \`${BQ_DATASET}.${BQ_SUMMARIES_TABLE}\` s
-          ON l.flowId = s.flowId
-        WHERE s.flowId IS NULL AND l.flowId IS NOT NULL
-      `;
-      queryOptions = {query: unsummarizedQuery};
-    }
-
-    const [unsummarizedRows] = await bigquery.query(queryOptions);
-    const unsummarizedFlowIds = unsummarizedRows.map((r) => r.flowId);
-
-    const results = [];
-    for (const fid of unsummarizedFlowIds) {
-      const [logRows] = await bigquery.query({
-        query: `
-          SELECT * FROM \`${BQ_DATASET}.${BQ_LOGS_TABLE}\`
-          WHERE flowId = @flowId
-          ORDER BY timestamp ASC
-        `,
-        params: {flowId: fid},
-      });
-
-      const safeCheck = checkSafeToSummarize(logRows);
-      if (!safeCheck.safe) {
-        results.push({flowId: fid, skipped: true, reason: safeCheck.reason});
-        continue;
-      }
-
-      try {
-        const summary = await summarizeSingleFlow(fid, logRows);
-        results.push({...summary, skipped: false});
-      } catch (error) {
-        console.error(`Failed to summarize flow ${fid}:`, error);
-        results.push({
-          flowId: fid,
-          skipped: true,
-          reason: "Summarization failed",
-          error: error.message,
-        });
-      }
-    }
-
-    return res.json({
-      ok: true,
-      totalFlows: unsummarizedFlowIds.length,
-      summarized: results.filter((r) => !r.skipped).length,
-      skipped: results.filter((r) => r.skipped).length,
-      results,
+    const result = await runFlowLogSummarization({
+      flowId: flowId ? String(flowId) : null,
+      maxFlows: Number(req.body && req.body.maxFlows) || 80,
     });
+    return res.json({ok: true, ...result});
   } catch (error) {
     console.error("summarizeFlowLogs error:", error);
     return res.status(500).json({
@@ -1196,6 +1209,132 @@ exports.summarizeFlowLogs = onRequest(async (req, res) => {
     });
   }
 });
+
+/** Every 5 minutes — summarize completed flows for the dashboard feed. */
+exports.summarizeFlowLogsScheduled = onSchedule({
+  schedule: "every 5 minutes",
+  timeZone: "America/New_York",
+}, async () => {
+  try {
+    const result = await runFlowLogSummarization({maxFlows: 80});
+    console.log("summarizeFlowLogsScheduled:", JSON.stringify({
+      totalFlows: result.totalFlows,
+      summarized: result.summarized,
+      skipped: result.skipped,
+    }));
+  } catch (error) {
+    console.error("summarizeFlowLogsScheduled error:", error.message);
+  }
+});
+
+/**
+ * Summarizes one flow after workflow completion (best-effort, non-blocking).
+ * @param {string} flowId Flow id.
+ * @param {string} [dataset] BigQuery dataset.
+ * @return {Promise<object|null>}
+ */
+async function scheduleFlowSummary(flowId, dataset = BQ_DATASET) {
+  if (!flowId) return null;
+  if (await flowAlreadySummarized(flowId, dataset)) return null;
+  const [logRows] = await bigquery.query({
+    query: `
+      SELECT * FROM \`${dataset}.${BQ_LOGS_TABLE}\`
+      WHERE flowId = @flowId
+      ORDER BY timestamp ASC
+    `,
+    params: {flowId: String(flowId)},
+  });
+  if (!logRows.length) return null;
+  const safeCheck = checkSafeToSummarize(logRows);
+  if (!safeCheck.safe) return null;
+  return summarizeSingleFlow(flowId, logRows);
+}
+
+/**
+ * Batch-summarizes flows that have logs but no summary row yet.
+ * @param {object} [opts]
+ * @param {string|null} [opts.flowId] Single flow only.
+ * @param {number} [opts.maxFlows] Cap per invocation.
+ * @param {string} [opts.dataset] BigQuery dataset.
+ * @return {Promise<object>}
+ */
+async function runFlowLogSummarization(opts = {}) {
+  const dataset = opts.dataset || BQ_DATASET;
+  const maxFlows = Math.min(Number(opts.maxFlows || 80), 150);
+  let unsummarizedQuery;
+  let queryOptions;
+  if (opts.flowId) {
+    unsummarizedQuery = `
+      SELECT DISTINCT l.flowId
+      FROM \`${dataset}.${BQ_LOGS_TABLE}\` l
+      LEFT JOIN \`${dataset}.${BQ_SUMMARIES_TABLE}\` s
+        ON l.flowId = s.flowId
+      WHERE l.flowId = @flowId AND s.flowId IS NULL
+    `;
+    queryOptions = {
+      query: unsummarizedQuery,
+      params: {flowId: String(opts.flowId)},
+    };
+  } else {
+    unsummarizedQuery = `
+      SELECT flowId FROM (
+        SELECT l.flowId, MAX(l.timestamp) AS lastTs
+        FROM \`${dataset}.${BQ_LOGS_TABLE}\` l
+        LEFT JOIN \`${dataset}.${BQ_SUMMARIES_TABLE}\` s
+          ON l.flowId = s.flowId
+        WHERE s.flowId IS NULL AND l.flowId IS NOT NULL
+        GROUP BY l.flowId
+        ORDER BY lastTs DESC
+        LIMIT @maxFlows
+      )
+    `;
+    queryOptions = {
+      query: unsummarizedQuery,
+      params: {maxFlows},
+    };
+  }
+
+  const [unsummarizedRows] = await bigquery.query(queryOptions);
+  const unsummarizedFlowIds = unsummarizedRows.map((r) => r.flowId);
+
+  const results = [];
+  for (const fid of unsummarizedFlowIds) {
+    const [logRows] = await bigquery.query({
+      query: `
+        SELECT * FROM \`${dataset}.${BQ_LOGS_TABLE}\`
+        WHERE flowId = @flowId
+        ORDER BY timestamp ASC
+      `,
+      params: {flowId: fid},
+    });
+
+    const safeCheck = checkSafeToSummarize(logRows);
+    if (!safeCheck.safe) {
+      results.push({flowId: fid, skipped: true, reason: safeCheck.reason});
+      continue;
+    }
+
+    try {
+      const summary = await summarizeSingleFlow(fid, logRows);
+      results.push({...summary, skipped: false});
+    } catch (error) {
+      console.error(`Failed to summarize flow ${fid}:`, error);
+      results.push({
+        flowId: fid,
+        skipped: true,
+        reason: "Summarization failed",
+        error: error.message,
+      });
+    }
+  }
+
+  return {
+    totalFlows: unsummarizedFlowIds.length,
+    summarized: results.filter((r) => !r.skipped).length,
+    skipped: results.filter((r) => r.skipped).length,
+    results,
+  };
+}
 
 /**
  * Reminds / escalates TL invoices waiting on a carrier POD (3bd / 10bd).
@@ -7064,8 +7203,8 @@ async function processGmailMessage(
     }
 
     // Carriers often re-send a packet of old unpaid invoices with a new one.
-    // Skip past-due lines only when that bill is already in Primus; otherwise
-    // still process (old unpaid invoices need entry too).
+    // Skip past-due lines when already billed in Primus, or when the PDF is a
+    // past-due restatement with late-fee penalties on an already-issued load.
     {
       const beforePastDue = invoiceItems.length;
       const pastDueDropped = [];
@@ -7078,13 +7217,26 @@ async function processGmailMessage(
           continue;
         }
         const alreadyInPrimus = await isCarrierBillAlreadyEnteredInPrimus(item);
+        const lateFeeResend = hasLateFeeLineItems(item);
         if (alreadyInPrimus) {
           pastDueDropped.push({
             loadNumber: item.loadNumber || null,
             invoiceNumber: item.invoiceNumber || null,
             dueDate: item.dueDate || null,
             invoiceAmount: item.invoiceAmount || null,
-            reason: "already_in_primus",
+            reason: lateFeeResend ?
+              "past_due_late_fee_already_in_primus" :
+              "already_in_primus",
+          });
+          continue;
+        }
+        if (lateFeeResend) {
+          pastDueDropped.push({
+            loadNumber: item.loadNumber || null,
+            invoiceNumber: item.invoiceNumber || null,
+            dueDate: item.dueDate || null,
+            invoiceAmount: item.invoiceAmount || null,
+            reason: "past_due_late_fee_statement",
           });
           continue;
         }
@@ -8230,6 +8382,10 @@ async function processGmailMessage(
       finalStatus: finalStatus,
     });
 
+    scheduleFlowSummary(messageId).catch((err) => {
+      console.warn("scheduleFlowSummary after gmail:", err.message);
+    });
+
     await updateGmailQueueStatus(messageId, "completed", null, {tenant});
   } catch (error) {
     await updateGmailQueueStatus(messageId, "failed", error.message, {tenant});
@@ -8847,22 +9003,81 @@ exports.getRecentLogs = onRequest(async (req, res) => {
     const tenant = await resolveDashboardTenant(req);
     const limit = Math.min(Number(req.query.limit || 40), 100);
     const dataset = tenant.bqDataset;
-    const [rows] = await bigquery.query({
-      query: `
-        SELECT timestamp, level, category, message
-        FROM \`${dataset}.${BQ_LOGS_TABLE}\`
-        ORDER BY timestamp DESC
-        LIMIT @limit
-      `,
-      params: {limit},
+    const loadNumber = req.query.loadNumber ?
+      String(req.query.loadNumber).trim() : null;
+    const invoiceId = req.query.invoiceId ?
+      String(req.query.invoiceId).trim() : null;
+    const includeDetails = req.query.includeDetails === "1" ||
+      req.query.includeDetails === "true";
+    const messageLike = req.query.messageLike ?
+      String(req.query.messageLike).trim() : null;
+    let rows;
+    if (loadNumber || invoiceId || messageLike) {
+      const hours = Math.min(Number(req.query.hours || 48), 168);
+      const filters = [
+        "timestamp >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @hours HOUR)",
+      ];
+      const params = {hours, limit};
+      if (loadNumber) {
+        filters.push(`(
+          JSON_VALUE(details, '$.loadNumber') = @loadNumber OR
+          JSON_VALUE(details, '$.details.loadNumber') = @loadNumber
+        )`);
+        params.loadNumber = loadNumber;
+      }
+      if (invoiceId) {
+        filters.push(`(
+          JSON_VALUE(details, '$.invoiceId') = @invoiceId OR
+          JSON_VALUE(details, '$.details.invoiceId') = @invoiceId
+        )`);
+        params.invoiceId = invoiceId;
+      }
+      if (messageLike) {
+        filters.push("LOWER(message) LIKE LOWER(@messageLike)");
+        params.messageLike = `%${messageLike}%`;
+      }
+      [rows] = await bigquery.query({
+        query: `
+          SELECT timestamp, level, category, message, details
+          FROM \`${dataset}.${BQ_LOGS_TABLE}\`
+          WHERE ${filters.join(" AND ")}
+          ORDER BY timestamp ASC
+          LIMIT @limit
+        `,
+        params,
+      });
+    } else {
+      [rows] = await bigquery.query({
+        query: `
+          SELECT timestamp, level, category, message
+          FROM \`${dataset}.${BQ_LOGS_TABLE}\`
+          ORDER BY timestamp DESC
+          LIMIT @limit
+        `,
+        params: {limit},
+      });
+    }
+    const logs = rows.map((row) => {
+      const entry = {
+        timestamp: row.timestamp && row.timestamp.value ?
+          row.timestamp.value : String(row.timestamp),
+        level: row.level,
+        category: row.category,
+        message: row.message,
+      };
+      if (includeDetails && row.details != null) {
+        let details = row.details;
+        if (typeof details === "string") {
+          try {
+            details = JSON.parse(details);
+          } catch (_) {
+            /* keep string */
+          }
+        }
+        entry.details = details;
+      }
+      return entry;
     });
-    const logs = rows.map((row) => ({
-      timestamp: row.timestamp && row.timestamp.value ?
-        row.timestamp.value : String(row.timestamp),
-      level: row.level,
-      category: row.category,
-      message: row.message,
-    }));
     return res.json({ok: true, tenantId: tenant.tenantId, logs});
   } catch (error) {
     console.error("getRecentLogs error:", error);
@@ -8880,7 +9095,7 @@ exports.getRecentSummaries = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
     const tenant = await resolveDashboardTenant(req);
-    const limit = Math.min(Number(req.query.limit || 20), 100);
+    const limit = Math.min(Number(req.query.limit || 30), 100);
     const offset = Math.max(Number(req.query.offset || 0), 0);
     const dataset = tenant.bqDataset;
     const [rows] = await bigquery.query({
@@ -9132,6 +9347,45 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
     });
   }
 });
+
+/**
+ * To + Cc for customer-email approve/reject gate emails.
+ * Primary: CUSTOMER_EMAIL_APPROVER_EMAIL or ALERT_EMAIL.
+ * Cc: CUSTOMER_EMAIL_APPROVER_CC or LOW_PROFIT_CC_EMAIL (Lisa by default).
+ * @return {object} to and cc recipient strings.
+ */
+function resolveCustomerEmailApproverRecipients() {
+  const primaryRaw = process.env.CUSTOMER_EMAIL_APPROVER_EMAIL ||
+    process.env.ALERT_EMAIL || "mshglck@gmail.com";
+  const ccRaw = process.env.CUSTOMER_EMAIL_APPROVER_CC ||
+    process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+  const primary = [];
+  const cc = [];
+  const seen = new Set();
+  const addPrimary = (addr) => {
+    const a = String(addr || "").trim();
+    if (!a) return;
+    const key = a.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    primary.push(a);
+  };
+  const addCc = (addr) => {
+    const a = String(addr || "").trim();
+    if (!a) return;
+    const key = a.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    cc.push(a);
+  };
+  primaryRaw.split(/[,;]/).forEach(addPrimary);
+  ccRaw.split(/[,;]/).forEach(addCc);
+  if (!primary.length) addPrimary("mshglck@gmail.com");
+  return {
+    to: primary.join(", "),
+    cc: cc.length ? cc.join(", ") : null,
+  };
+}
 
 /**
  * Recipients for support-chat issue reports (comma-separated env + Lisa CC).
@@ -10202,7 +10456,7 @@ function parsePrimusAmount(raw) {
  * @return {Promise<object>} Validation result.
  */
 async function validateAmountWithPrimus(loadNumber, amount) {
-  try {
+  const runOnce = async () => {
     const booking = await fetchPrimusBooking(loadNumber);
     if (!booking) {
       return {
@@ -10246,6 +10500,23 @@ async function validateAmountWithPrimus(loadNumber, amount) {
         `Submitted $${submitted} vs Primus $${primusAmount}` +
           ` (diff $${diff.toFixed(2)})`,
     };
+  };
+
+  try {
+    let result = await runOnce();
+    const transient = !result.ok && result.error &&
+      /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i.test(result.error);
+    if (transient) {
+      await writeLog("warn", "primus",
+          "Amount validation fetch failed — retrying once", {
+            loadNumber,
+            amount,
+            error: result.error,
+          });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      result = await runOnce();
+    }
+    return result;
   } catch (error) {
     await writeLog("error", "primus", "Failed to validate amount with Primus", {
       loadNumber,
@@ -10697,6 +10968,8 @@ const primusBundle = {
   getGmailOAuthClient,
   notifyDispatcherRateIssue,
   maybeNotifyLisaPodDiscrepancy,
+  resolveCustomerEmailApproverRecipients,
+  isCarrierBillAlreadyEnteredInPrimus,
 };
 const primusUiBridge = require("./primus-ui-bridge");
 primusUiBridge.init({db, writeLog});
@@ -10733,6 +11006,11 @@ innovativePrimus.init({
       primusUiBridge.resolveRestInvoiceIdForQuickBooks,
   rePushCarrierBillToQuickBooks:
       primusUiBridge.rePushCarrierBillToQuickBooks,
+  scheduleFlowSummary: (flowId) => {
+    scheduleFlowSummary(flowId).catch((err) => {
+      console.warn("scheduleFlowSummary failed:", err.message);
+    });
+  },
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
 
