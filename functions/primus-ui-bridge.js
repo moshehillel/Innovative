@@ -3576,7 +3576,8 @@ async function runPrimusUiBillingFlow(args) {
       extractedCarrierName.toLowerCase() !== primusVendorName.toLowerCase() &&
       writeLog) {
     await writeLog("warn", "primus",
-        "Invoice carrier name differs from Primus load vendor — using load vendor for billing/QB",
+        "Invoice carrier name differs from Primus load vendor — " +
+        "using load vendor for billing/QB",
         {
           loadNumber,
           extractedCarrierName,
@@ -3585,7 +3586,7 @@ async function runPrimusUiBillingFlow(args) {
         });
   }
   try {
-    // Always bill against the vendor on the load — not the PDF/email carrier name.
+    // Bill against the load vendor — not the PDF/email carrier name.
     vendor = await resolveMasterVendorForBilling(
         vendor,
         primusVendorName || extractedCarrierName || "",
