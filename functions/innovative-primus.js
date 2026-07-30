@@ -94,6 +94,34 @@ function init(bundle) {
 exports.init = init;
 
 /**
+ * Runs UI billing once; retries once on transient ShipPrimus network errors.
+ * @param {object} flowArgs runPrimusUiBillingFlow arguments.
+ * @param {object} logContext invoiceId, loadNumber.
+ * @return {Promise<object>}
+ */
+async function runUiBillingFlowWithRetry(flowArgs, logContext) {
+  const runOnce = async () => {
+    try {
+      return await runPrimusUiBillingFlow(flowArgs);
+    } catch (uiErr) {
+      return {ok: false, error: uiErr.message};
+    }
+  };
+  let uiResult = await runOnce();
+  if (!uiResult.ok && workflowErrors.isTransientNetworkError(uiResult.error)) {
+    await writeLog("warn", "workflow",
+        "UI billing network error — retrying once", {
+          ...logContext,
+          error: uiResult.error,
+        });
+    await new Promise((resolve) => setTimeout(resolve,
+        workflowErrors.TRANSIENT_NETWORK_RETRY_MS));
+    uiResult = await runOnce();
+  }
+  return uiResult;
+}
+
+/**
  * True when Firestore shows carrier bill entered and customer invoice issued.
  * @param {object} invoice Invoice document.
  * @param {object} primusSteps Completed-step flags.
@@ -168,8 +196,7 @@ async function resolveBillingSkipAction(invoice, primusSteps, resumeFrom) {
     return {action: "continue"};
   }
 
-  const needsEmailSend = resumeFrom === "send_customer_email" ||
-    invoice.customerEmailApproval === "approved";
+  const needsEmailSend = invoice.customerEmailApproval === "approved";
   if (needsEmailSend) {
     return {
       action: "customer_email_only",
@@ -686,6 +713,13 @@ function buildCustomerEmailApprovalHtml(opts) {
     row("Invoice generated via", escapeHtml(genVia)) +
     `</table>` +
 
+    (!customerEmail ?
+      `<p style="background:#fef3c7;border:1px solid #f59e0b;` +
+      `padding:12px 14px;border-radius:8px;font-size:14px;color:#92400e">` +
+      `<strong>No customer accounting email found in Primus.</strong> ` +
+      `Add the accounting contact on the shipment before approving — ` +
+      `nothing will be sent until you approve after the email is fixed.</p>` :
+      "") +
     `<h3 style="margin:18px 0 8px;font-size:15px">` +
     `Outgoing customer email</h3>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
@@ -2117,7 +2151,33 @@ exports.processPrimusWorkflow = onRequest(
               },
             });
 
-            const customerRateResult = customerForCheckResult;
+            const manualRate = Number(invoice.customerRate || 0);
+            const manualCustomerName = String(
+                invoice.customerName || "",
+            ).trim();
+            let customerRateResult = customerForCheckResult;
+
+            // setCustomerRate saves to Firestore before resume; Primus may
+            // still report no rate — honor the manual entry instead of pausing.
+            if (!customerRateResult.ok && manualRate > 0) {
+              customerRateResult = {
+                ok: true,
+                customerName: manualCustomerName ||
+                  customerNameForCheck ||
+                  (customerForCheckResult &&
+                    customerForCheckResult.customerName) ||
+                  null,
+                customerRate: manualRate,
+                rateSource: "manual",
+              };
+              await writeLog("info", "workflow",
+                  "Using manually set customer rate", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerRate: manualRate,
+                    customerName: customerRateResult.customerName,
+                  });
+            }
 
             if (!customerRateResult.ok) {
               await logWorkflowStep({
@@ -2168,11 +2228,11 @@ exports.processPrimusWorkflow = onRequest(
               });
             }
 
-            customerName = customerRateResult.customerName;
-            // A rate manually entered via setCustomerRate takes priority over
-            // whatever Primus currently reports (which can be stale/doubled).
-            const manualRate = Number(invoice.customerRate || 0);
-            const primusRate = Number(customerRateResult.customerRate || 0);
+            customerName = customerRateResult.customerName ||
+              manualCustomerName || customerNameForCheck || "";
+            // Manual rate from setCustomerRate wins over Primus.
+            const primusRate = customerRateResult.rateSource === "manual" ?
+              0 : Number(customerRateResult.customerRate || 0);
             customerRate = manualRate || primusRate;
             // Carrier cost for profit: use the amount Jerry enters (carrier
             // invoice), not the Primus quoted cost on the booking.
@@ -2290,6 +2350,45 @@ exports.processPrimusWorkflow = onRequest(
                 bookingForInvoice = null;
               }
             }
+
+            // Broker 10% swap before billing — load must still be editable.
+            const vendorCostForBroker = bookingCarrierCost -
+              approvedChargesTotal;
+            const brokerProfitPct = vendorCostForBroker > 0 ?
+              Math.round((profit / vendorCostForBroker) * 10000) / 100 : 0;
+            if (brokerProfitPct < 10 && invoice.loadNumber) {
+              let brokerNameForSwap = "";
+              const contact = bookingForInvoice &&
+                bookingForInvoice.contactInformation;
+              if (contact) {
+                brokerNameForSwap = contact.salesRepName ||
+                  (contact.salesRep && contact.salesRep.name) || "";
+              }
+              try {
+                const brokerCommission = require("./broker-commission");
+                await brokerCommission.adjustBrokerCommissionForLowMargin({
+                  loadNumber: invoice.loadNumber,
+                  margin: brokerProfitPct,
+                  profit,
+                  brokerName: brokerNameForSwap,
+                  carrierName: invoice.carrierName,
+                  customerRate,
+                  carrierCost: vendorCostForBroker,
+                  vendorCost: vendorCostForBroker,
+                  invoiceAmount: invoice.invoiceAmount,
+                  booking: bookingForInvoice,
+                  trigger: "pre_billing",
+                });
+              } catch (brokerErr) {
+                await writeLog("warn", "workflow",
+                    "Pre-billing broker commission check failed", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      error: brokerErr.message,
+                    });
+              }
+            }
+
             const isPowerOnlyForInvoice = bookingForInvoice &&
           isPowerOnlyShipment && isPowerOnlyShipment(bookingForInvoice);
             if (isPowerOnlyForInvoice && readBillToReferenceNumber) {
@@ -2416,48 +2515,43 @@ exports.processPrimusWorkflow = onRequest(
                   invoiceNumber: invoice.issuedInvoiceNumber,
                 });
               } else {
-                let uiResult;
-                try {
-                  const bk = await fetchPrimusBooking(invoice.loadNumber);
-                  const podPath =
+                const bk = await fetchPrimusBooking(invoice.loadNumber);
+                const podPath =
                 (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
                 (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
                 null;
-                  let carrierBillPdf = null;
-                  let podPdf = null;
-                  carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
-                  if (podPath) {
-                    const podB64 = await downloadStorageFileBase64(podPath);
-                    if (podB64) {
-                      podPdf = {
-                        buffer: Buffer.from(podB64, "base64"),
-                        filename: `pod-${invoice.loadNumber}.pdf`,
-                      };
-                    }
+                let carrierBillPdf = null;
+                let podPdf = null;
+                carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
+                if (podPath) {
+                  const podB64 = await downloadStorageFileBase64(podPath);
+                  if (podB64) {
+                    podPdf = {
+                      buffer: Buffer.from(podB64, "base64"),
+                      filename: `pod-${invoice.loadNumber}.pdf`,
+                    };
                   }
-                  uiResult = await runPrimusUiBillingFlow({
-                    booking: bk,
-                    loadNumber: invoice.loadNumber,
-                    customerRate,
-                    carrierInvoiceAmount: invoice.invoiceAmount,
-                    carrierName: invoice.carrierName || null,
-                    proNumber: workingProNumber || invoice.proNumber,
-                    vendorInvoiceNumber: invoice.invoiceNumber ||
+                }
+                const uiResult = await runUiBillingFlowWithRetry({
+                  booking: bk,
+                  loadNumber: invoice.loadNumber,
+                  customerRate,
+                  carrierInvoiceAmount: invoice.invoiceAmount,
+                  carrierName: invoice.carrierName || null,
+                  proNumber: workingProNumber || invoice.proNumber,
+                  vendorInvoiceNumber: invoice.invoiceNumber ||
                   invoice.carrierInvoiceNumber ||
                   workingProNumber || invoice.proNumber,
-                    billDate: invoice.invoiceDate || invoice.receivedAt,
-                    billDueDate: invoice.dueDate,
-                    customerInvoiceId: invoice.customerInvoiceId || null,
-                    generated: false,
-                    carrierBillPdf,
-                    podPdf,
-                    billToReferenceNumber: billToReferenceNumber || null,
-                    skipCarrierBillUpload: primusSteps.carrierBillUploaded,
-                    skipPodUpload: primusSteps.podUploaded,
-                  });
-                } catch (uiErr) {
-                  uiResult = {ok: false, error: uiErr.message};
-                }
+                  billDate: invoice.invoiceDate || invoice.receivedAt,
+                  billDueDate: invoice.dueDate,
+                  customerInvoiceId: invoice.customerInvoiceId || null,
+                  generated: false,
+                  carrierBillPdf,
+                  podPdf,
+                  billToReferenceNumber: billToReferenceNumber || null,
+                  skipCarrierBillUpload: primusSteps.carrierBillUploaded,
+                  skipPodUpload: primusSteps.podUploaded,
+                }, {invoiceId, loadNumber: invoice.loadNumber});
 
                 const uiOk = uiResult.ok ||
               (uiResult.skipped && uiResult.reason === "already issued");
@@ -2816,7 +2910,7 @@ exports.processPrimusWorkflow = onRequest(
           // explicit "approved" lets the send proceed. "rejected" completes the
           // "rejected" completes without emailing; else pause for review.
           const emailApproval = invoice.customerEmailApproval || null;
-          if (customerEmail && emailApproval !== "approved") {
+          if (emailApproval !== "approved") {
             if (emailApproval === "rejected") {
               await logWorkflowStep({
                 invoiceId,

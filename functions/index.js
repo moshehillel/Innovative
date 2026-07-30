@@ -2,7 +2,6 @@ const {onRequest} = require("firebase-functions/v2/https");
 const {onSchedule} = require("firebase-functions/v2/scheduler");
 
 const admin = require("firebase-admin");
-const {google} = require("googleapis");
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
@@ -31,11 +30,14 @@ const undeliveredReport = require("./undelivered-shipment-report");
 const additionalCharges = require("./additional-charges");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
+const xpoImaging = require("./xpo-imaging");
 const loadResolution = require("./invoice-load-resolution");
 const apexCapitalIntake = require("./apex-capital-intake");
+const dailyActivityReport = require("./daily-activity-report");
 const podRequestIntake = require("./pod-request-intake");
 const administrativeEmailIntake = require("./administrative-email-intake");
 const dashboardTasks = require("./dashboard-tasks");
+const mailProvider = require("./mail-provider");
 const crypto = require("crypto");
 const {AsyncLocalStorage} = require("async_hooks");
 
@@ -71,6 +73,7 @@ const BQ_SUMMARIES_SCHEMA = [
 ];
 
 const db = admin.firestore();
+mailProvider.init({db});
 let _bucket = null;
 /**
  * Returns the default Storage bucket, lazily initialized.
@@ -96,13 +99,14 @@ function getDeleteAt(days) {
 // ── Multi-tenant support ─────────────────────────────────────────────────────
 // Each client (e.g. the Primus client, the TAI client) is a "tenant". A tenant
 // decides which TMS workflow runs for its invoices, which Firestore collections
-// and BigQuery dataset its data lives in, and which Gmail account its invoices
+// and BigQuery dataset its data lives in, and which mail inbox its invoices
 // arrive on. There is one shared deployment; tenants are namespaced by a
 // collection prefix rather than by separate Firebase projects.
 //
 // DEFAULT_TENANT reproduces the ORIGINAL single-tenant Primus behavior exactly:
 // empty collection prefix (so collection names are unchanged), the original
-// BigQuery dataset, and the legacy `settings/gmail` token doc. This guarantees
+// BigQuery dataset, and the legacy `settings/outlook` token doc when
+// MAIL_PROVIDER=outlook (or `settings/gmail` for Gmail). This guarantees
 // that existing data and the live Primus pipeline keep working with zero config
 // — only newly-added tenants get namespaced collections/datasets/inboxes.
 const DEFAULT_TENANT = Object.freeze({
@@ -112,6 +116,7 @@ const DEFAULT_TENANT = Object.freeze({
   collectionPrefix: "",
   bqDataset: BQ_DATASET,
   gmailDocId: "gmail",
+  outlookDocId: "outlook",
   alertEmail: process.env.ALERT_EMAIL || null,
   active: true,
 });
@@ -135,6 +140,7 @@ function normalizeTenant(tenantId, data) {
     collectionPrefix: String(d.collectionPrefix || tenantId).trim(),
     bqDataset: d.bqDataset || `${BQ_DATASET}_${tenantId}`,
     gmailDocId: d.gmailDocId || `gmail_${tenantId}`,
+    outlookDocId: d.outlookDocId || `outlook_${tenantId}`,
     alertEmail: d.alertEmail || process.env.ALERT_EMAIL || null,
     active: d.active !== false,
   };
@@ -174,6 +180,7 @@ function unconfiguredTenant(tenantId) {
     collectionPrefix: id,
     bqDataset: `${BQ_DATASET}_${id}`,
     gmailDocId: `gmail_${id}`,
+    outlookDocId: `outlook_${id}`,
     alertEmail: process.env.ALERT_EMAIL || null,
     active: false,
   };
@@ -243,34 +250,17 @@ function tcol(tenant, name) {
  * @return {string} Settings doc id.
  */
 function tenantGmailDocId(tenant) {
-  return (tenant && tenant.gmailDocId) || "gmail";
+  return mailProvider.tenantMailDocId(tenant);
 }
 
 /**
- * Loads a tenant's stored Gmail OAuth tokens, or null if not connected.
- * @param {object} tenant Tenant config.
- * @return {Promise<object|null>} OAuth tokens or null.
- */
-async function getTenantGmailTokens(tenant) {
-  const snap = await db.collection("settings")
-      .doc(tenantGmailDocId(tenant)).get();
-  if (!snap.exists) return null;
-  const data = snap.data() || {};
-  return data.tokens || data;
-}
-
-/**
- * Builds an authenticated Gmail API client for a tenant, or null if the
+ * Builds an authenticated mail API client for a tenant, or null if the
  * tenant's inbox is not connected.
  * @param {object} tenant Tenant config.
- * @return {Promise<object|null>} Gmail client or null.
+ * @return {Promise<object|null>} Mail client or null.
  */
 async function getTenantGmailClient(tenant) {
-  const tokens = await getTenantGmailTokens(tenant);
-  if (!tokens) return null;
-  const oauth2Client = getGmailOAuthClient();
-  oauth2Client.setCredentials(tokens);
-  return google.gmail({version: "v1", auth: oauth2Client});
+  return mailProvider.getTenantMailClient(tenant);
 }
 
 /**
@@ -726,7 +716,7 @@ function checkSafeToSummarize(logs) {
     {pattern: /human review/i, reason: "Human review"},
     {pattern: /Email processing completed/i,
       reason: "Email processing completed"},
-    {pattern: /Gmail inbox check completed/i, reason: "Inbox check completed"},
+    {pattern: /inbox check completed/i, reason: "Inbox check completed"},
     {pattern: /skipped/i, reason: "Skipped"},
     {pattern: /no action/i, reason: "No action needed"},
     {pattern: /pod_request|pod_delivery/i, reason: "POD handled"},
@@ -762,6 +752,9 @@ function checkSafeToSummarize(logs) {
   return {safe: true, reason: `Idle for ${Math.round(minutesSinceLastLog)}m`};
 }
 
+/** Per-flow dashboard activity feed disabled — use daily email digest. */
+const DASHBOARD_ACTIVITY_FEED_ENABLED = false;
+
 /** Max characters stored/displayed for dashboard activity blurbs. */
 const AI_SUMMARY_MAX_CHARS = 200;
 
@@ -775,23 +768,6 @@ function truncateAiSummary(text, maxLen = AI_SUMMARY_MAX_CHARS) {
   if (!s) return null;
   if (s.length <= maxLen) return s;
   return s.slice(0, maxLen - 1).trimEnd() + "…";
-}
-
-/**
- * @param {string} flowId Flow id.
- * @param {string} [dataset] BigQuery dataset.
- * @return {Promise<boolean>}
- */
-async function flowAlreadySummarized(flowId, dataset = BQ_DATASET) {
-  const [rows] = await bigquery.query({
-    query: `
-      SELECT flowId FROM \`${dataset}.${BQ_SUMMARIES_TABLE}\`
-      WHERE flowId = @flowId
-      LIMIT 1
-    `,
-    params: {flowId: String(flowId)},
-  });
-  return rows.length > 0;
 }
 
 const normalizeLoadNumber = loadResolution.normalizeLoadNumber;
@@ -1045,6 +1021,236 @@ async function getLastKnownLoadNumber(tenant = DEFAULT_TENANT) {
   }
 }
 
+/** Default OpenAI model for dashboard flow-log summaries. */
+const FLOW_SUMMARY_DEFAULT_MODEL = "gpt-4o-mini";
+const FLOW_SUMMARY_CLAUDE_MODEL = "claude-haiku-4-5";
+
+/**
+ * @param {*} raw details column from BigQuery.
+ * @return {object}
+ */
+function parseLogDetailsField(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  try {
+    return JSON.parse(String(raw));
+  } catch (_) {
+    return {};
+  }
+}
+
+/**
+ * Pulls a field from log details (supports nested details.*).
+ * @param {object} details Parsed details object.
+ * @param {string} key Field name.
+ * @return {*}
+ */
+function detailField(details, key) {
+  if (!details || typeof details !== "object") return null;
+  if (details[key] != null && details[key] !== "") return details[key];
+  const nested = details.details;
+  if (nested && nested[key] != null && nested[key] !== "") return nested[key];
+  return null;
+}
+
+/**
+ * Builds compact log rows for summarization with load/carrier context.
+ * @param {Array<object>} logs Flow logs sorted ascending.
+ * @return {Array<object>}
+ */
+function compactLogsForSummary(logs) {
+  return logs.slice(-60).map((log) => {
+    const d = parseLogDetailsField(log.details);
+    const entry = {
+      t: log.timestamp || log.createdAt || null,
+      l: log.level || null,
+      m: String(log.message || "").slice(0, 220),
+    };
+    const load = detailField(d, "loadNumber");
+    const carrier = detailField(d, "carrierName");
+    const amount = detailField(d, "invoiceAmount") ??
+      detailField(d, "submittedAmount");
+    const err = detailField(d, "error") ||
+      (d.result && d.result.error) ||
+      detailField(d, "failureReason");
+    const invNum = detailField(d, "invoiceNumber") ||
+      detailField(d, "issuedInvoiceNumber");
+    const wf = detailField(d, "workflowStatus") ||
+      detailField(d, "finalWorkflowStatus");
+    if (load) entry.load = load;
+    if (carrier) entry.carrier = carrier;
+    if (amount != null) entry.amount = amount;
+    if (err) entry.error = String(err).slice(0, 140);
+    if (invNum) entry.invoiceNum = invNum;
+    if (wf) entry.status = wf;
+    return entry;
+  });
+}
+
+/**
+ * Deterministic facts extracted from raw logs (ground truth for the model).
+ * @param {Array<object>} logs Flow logs sorted ascending.
+ * @return {object}
+ */
+function extractFlowFacts(logs) {
+  const facts = {
+    loadNumber: null,
+    carrierName: null,
+    customerName: null,
+    invoiceAmount: null,
+    issuedInvoiceNumber: null,
+    lastError: null,
+    lastMessage: null,
+    outcomeHint: null,
+  };
+  for (const log of logs) {
+    const d = parseLogDetailsField(log.details);
+    facts.loadNumber = detailField(d, "loadNumber") || facts.loadNumber;
+    facts.carrierName = detailField(d, "carrierName") || facts.carrierName;
+    facts.customerName = detailField(d, "customerName") || facts.customerName;
+    facts.invoiceAmount = detailField(d, "invoiceAmount") ??
+      detailField(d, "submittedAmount") ?? facts.invoiceAmount;
+    facts.issuedInvoiceNumber = detailField(d, "invoiceNumber") ||
+      detailField(d, "issuedInvoiceNumber") || facts.issuedInvoiceNumber;
+    const err = detailField(d, "error") ||
+      (d.result && d.result.error);
+    if (err && (log.level === "error" || log.level === "warn")) {
+      facts.lastError = String(err).slice(0, 180);
+    }
+    facts.lastMessage = String(log.message || facts.lastMessage || "");
+    const msg = String(log.message || "").toLowerCase();
+    const message = log.message || "";
+    if (/workflow completed|invoice approved|emailed to customer|/i
+        .test(message) ||
+        /issued via manage/i.test(message)) {
+      facts.outcomeHint = "completed";
+    } else if (/held for reviewer approval|awaiting.*approval/i.test(message)) {
+      facts.outcomeHint = "awaiting_email_approval";
+    } else if (/ui billing flow failed|workflow failed|/i.test(message) ||
+        /invoice_generation_failed/i.test(message)) {
+      facts.outcomeHint = "billing_failed";
+    } else if (/forwarded for review|no invoice|human review/i.test(message)) {
+      facts.outcomeHint = "needs_review";
+    } else if (/paused|missing customer rate|needs_customer/i.test(msg)) {
+      facts.outcomeHint = "paused";
+    }
+  }
+  return facts;
+}
+
+/**
+ * @param {string} raw Raw model output.
+ * @return {object}
+ */
+function parseFlowSummaryJson(raw) {
+  let text = String(raw || "").trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) text = fenced[1].trim();
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start >= 0 && end > start) text = text.slice(start, end + 1);
+  return JSON.parse(text);
+}
+
+/**
+ * Rule-based summary when the model output is weak or unparsable.
+ * @param {object} facts extractFlowFacts output.
+ * @param {string|null} failureReason Optional failure text.
+ * @return {string}
+ */
+function buildFallbackFlowSummary(facts, failureReason) {
+  const load = facts.loadNumber ? `Load ${facts.loadNumber}` : "Email intake";
+  const carrier = facts.carrierName ? ` (${facts.carrierName})` : "";
+  const amt = facts.invoiceAmount != null ?
+    ` $${Number(facts.invoiceAmount).toFixed(2)}` : "";
+  if (facts.outcomeHint === "completed") {
+    const inv = facts.issuedInvoiceNumber ?
+      ` — Primus #${facts.issuedInvoiceNumber}` : "";
+    return `${load}${carrier}${amt} billed and completed${inv}.`;
+  }
+  if (facts.outcomeHint === "awaiting_email_approval") {
+    return `${load}${carrier}${amt} billed — awaiting customer email approval.`;
+  }
+  if (facts.outcomeHint === "paused") {
+    return `${load}${carrier}${amt} paused — needs dispatcher action.`;
+  }
+  if (facts.outcomeHint === "billing_failed" || failureReason) {
+    const why = failureReason || facts.lastError || "billing failed";
+    return `${load}${carrier}${amt} failed: ${why}.`;
+  }
+  if (facts.outcomeHint === "needs_review") {
+    return `${load}${carrier} forwarded — no invoice auto-processed.`;
+  }
+  return `${load}${carrier}${amt} — ` +
+    `${facts.lastMessage || "processing finished"}.`;
+}
+
+/**
+ * OpenAI key for flow summaries (same env as support chat).
+ * @return {string|undefined}
+ */
+function getFlowSummaryOpenAiKey() {
+  return process.env.SUPPORT_CHAT_OPENAI_API_KEY ||
+    process.env.OPENAI_API_KEY;
+}
+
+/**
+ * Calls Claude or OpenAI for flow summary JSON.
+ * @param {object} prompt User prompt object.
+ * @return {Promise<string>} Raw JSON text from the model.
+ */
+async function callFlowSummaryModel(prompt) {
+  const systemPrompt =
+    "You summarize freight billing automation runs for a dashboard. " +
+    "Return ONLY a JSON object with keys: finalStatus, lastCompletedStep, " +
+    "failureReason, recommendedFix, aiSummary. " +
+    "aiSummary rules: ONE sentence, max 180 characters, past tense, plain " +
+    "English. ALWAYS lead with 'Load ####' when loadNumber is in facts/logs " +
+    "(never use internal invoiceId strings). Include carrier name and dollar " +
+    "amount when known. State outcome: billed, paused, failed (brief why), " +
+    "forwarded for review, or awaiting email approval. " +
+    "Do not contradict the facts block. No markdown, bullets, or timelines.";
+
+  const userContent = JSON.stringify(prompt);
+
+  if (process.env.ANTHROPIC_API_KEY) {
+    const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
+    const aiRes = await client.messages.create({
+      model: FLOW_SUMMARY_CLAUDE_MODEL,
+      max_tokens: 280,
+      system: systemPrompt,
+      messages: [{role: "user", content: userContent}],
+      temperature: 0.1,
+    });
+    return String(aiRes.content[0] && aiRes.content[0].text || "").trim();
+  }
+
+  const apiKey = getFlowSummaryOpenAiKey();
+  if (!apiKey) {
+    throw new Error(
+        "ANTHROPIC_API_KEY or SUPPORT_CHAT_OPENAI_API_KEY required",
+    );
+  }
+  const client = new OpenAI({apiKey});
+  const model = process.env.FLOW_SUMMARY_MODEL || FLOW_SUMMARY_DEFAULT_MODEL;
+  const completion = await client.chat.completions.create({
+    model,
+    max_tokens: 280,
+    temperature: 0.1,
+    response_format: {type: "json_object"},
+    messages: [
+      {role: "system", content: systemPrompt},
+      {role: "user", content: userContent},
+    ],
+  });
+  return String(
+      completion.choices &&
+      completion.choices[0] &&
+      completion.choices[0].message &&
+      completion.choices[0].message.content || "",
+  ).trim();
+}
+
 /**
  * Summarizes a single flow using OpenAI and writes to BigQuery.
  * @param {string} flowId Flow ID.
@@ -1052,68 +1258,57 @@ async function getLastKnownLoadNumber(tenant = DEFAULT_TENANT) {
  * @return {Promise<object>} Summary result.
  */
 async function summarizeSingleFlow(flowId, logs) {
-  const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
-
   const lastLog = logs.length > 0 ? logs[logs.length - 1] : {};
   const messageId = lastLog.messageId || null;
   const invoiceId = lastLog.invoiceId || null;
-
-  const compactLogs = logs.slice(-60).map((log) => ({
-    t: log.timestamp || log.createdAt || null,
-    l: log.level || null,
-    m: String(log.message || "").slice(0, 180),
-  }));
+  const facts = extractFlowFacts(logs);
+  const compactLogs = compactLogsForSummary(logs);
 
   const prompt = {
     flowId: String(flowId),
-    messageId: messageId,
-    invoiceId: invoiceId,
+    messageId,
+    invoiceId,
+    facts,
     logs: compactLogs,
-  };
-
-  const aiRes = await client.messages.create({
-    model: "claude-haiku-4-5",
-    max_tokens: 220,
-    system: "You write one-line dashboard activity blurbs " +
-      "for freight billing ops. " +
-      "Return ONLY valid JSON with keys: finalStatus, lastCompletedStep, " +
-      "failureReason, recommendedFix, aiSummary. " +
-      "aiSummary MUST be exactly ONE short sentence " +
-      "(max 160 characters), past tense, outcome-focused — " +
-      "no bullet lists, no step timeline, no markdown. " +
-      "Include load/invoice when in logs. " +
-      "Say 'not in logs' for missing facts.",
-    messages: [
-      {
-        role: "user",
-        content: JSON.stringify({
-          ...prompt,
-          instructions: {
-            outputFormat: {
-              finalStatus: "string",
-              lastCompletedStep: "string|null",
-              failureReason: "string|null",
-              recommendedFix: "string|null",
-              aiSummary: "string (max 160 chars, one sentence)",
-            },
-          },
-        }),
+    instructions: {
+      outputFormat: {
+        finalStatus: "string",
+        lastCompletedStep: "string|null",
+        failureReason: "string|null",
+        recommendedFix: "string|null",
+        aiSummary: "string (max 180 chars, one sentence, start with Load #)",
       },
-    ],
-    temperature: 0.2,
-  });
+    },
+  };
 
   let aiJson = null;
   try {
-    aiJson = JSON.parse(aiRes.content[0].text);
+    const rawText = await callFlowSummaryModel(prompt);
+    aiJson = parseFlowSummaryJson(rawText);
   } catch (e) {
     aiJson = {
       finalStatus: "unknown",
       lastCompletedStep: null,
-      failureReason: "AI_RETURNED_NON_JSON",
-      recommendedFix: "Check summarizeFlowLogs parsing",
-      aiSummary: aiRes.content[0].text,
+      failureReason: "AI_SUMMARY_FAILED",
+      recommendedFix: "Check summarizeFlowLogs",
+      aiSummary: buildFallbackFlowSummary(facts, null),
     };
+  }
+
+  const summaryText = String(aiJson.aiSummary || "").trim();
+  const looksBad = !summaryText ||
+    summaryText.startsWith("```") ||
+    /invoiceId|invoice [a-zA-Z0-9]{16,}/i.test(summaryText) ||
+    summaryText.length > 260;
+  if (looksBad) {
+    aiJson.aiSummary = buildFallbackFlowSummary(
+        facts, aiJson.failureReason || facts.lastError);
+  } else if (facts.loadNumber) {
+    const loadStr = String(facts.loadNumber).toLowerCase();
+    if (!summaryText.toLowerCase().includes(loadStr)) {
+      aiJson.aiSummary = buildFallbackFlowSummary(
+          facts, aiJson.failureReason || facts.lastError);
+    }
   }
 
   await bigquery
@@ -1210,44 +1405,90 @@ exports.summarizeFlowLogs = onRequest(async (req, res) => {
   }
 });
 
-/** Every 5 minutes — summarize completed flows for the dashboard feed. */
+/** Daily 6 PM ET — Jerry activity email (replaces per-flow summaries). */
 exports.summarizeFlowLogsScheduled = onSchedule({
-  schedule: "every 5 minutes",
+  schedule: "0 18 * * *",
   timeZone: "America/New_York",
+  timeoutSeconds: 540,
+  memory: "1GiB",
 }, async () => {
   try {
-    const result = await runFlowLogSummarization({maxFlows: 80});
-    console.log("summarizeFlowLogsScheduled:", JSON.stringify({
-      totalFlows: result.totalFlows,
-      summarized: result.summarized,
-      skipped: result.skipped,
-    }));
+    const tenants = await getActiveTenants();
+    for (const tenant of tenants) {
+      await runWithTenant(tenant, async () => {
+        const result = await dailyActivityReport.runDailyActivityReport({
+          tenant,
+          hours: 24,
+        });
+        console.log("dailyActivityReport:", JSON.stringify({
+          tenantId: tenant.tenantId,
+          bulletCount: result.bulletCount,
+          logCount: result.logCount,
+        }));
+        const swapResult = await dailyActivityReport.runDailyBrokerSwapReport({
+          tenant,
+          hours: 24,
+        });
+        console.log("dailyBrokerSwapReport:", JSON.stringify({
+          tenantId: tenant.tenantId,
+          swapCount: swapResult.swapCount,
+          logCount: swapResult.logCount,
+        }));
+      });
+    }
   } catch (error) {
-    console.error("summarizeFlowLogsScheduled error:", error.message);
+    console.error("summarizeFlowLogsScheduled (daily digest) error:",
+        error.message);
   }
 });
 
+exports.sendDailyActivityReport = onRequest(
+    {timeoutSeconds: 540, memory: "1GiB"},
+    async (req, res) => {
+      try {
+        const tenant = req.query.tenantId ?
+      await getTenant(String(req.query.tenantId)) :
+      DEFAULT_TENANT;
+        const hours = Number(req.query.hours || 24);
+        const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true";
+        const reportOnly = String(req.query.report || "").trim();
+        const runActivity = !reportOnly || reportOnly === "activity";
+        const runSwaps = !reportOnly || reportOnly === "swaps";
+
+        const activityResult = runActivity ?
+          await runWithTenant(tenant, () =>
+            dailyActivityReport.runDailyActivityReport({tenant, hours, dryRun}),
+          ) : null;
+        const swapResult = runSwaps ?
+          await runWithTenant(tenant, () =>
+            dailyActivityReport.runDailyBrokerSwapReport({tenant, hours, dryRun}),
+          ) : null;
+
+        return res.json({
+          ok: true,
+          tenantId: tenant.tenantId,
+          activity: activityResult,
+          brokerSwaps: swapResult,
+        });
+      } catch (error) {
+        console.error("sendDailyActivityReport error:", error);
+        return res.status(500).json({
+          ok: false,
+          error: error.message,
+        });
+      }
+    });
+
 /**
- * Summarizes one flow after workflow completion (best-effort, non-blocking).
+ * Per-flow summaries disabled — daily email digest replaces dashboard feed.
  * @param {string} flowId Flow id.
  * @param {string} [dataset] BigQuery dataset.
- * @return {Promise<object|null>}
+ * @return {Promise<null>}
  */
 async function scheduleFlowSummary(flowId, dataset = BQ_DATASET) {
-  if (!flowId) return null;
-  if (await flowAlreadySummarized(flowId, dataset)) return null;
-  const [logRows] = await bigquery.query({
-    query: `
-      SELECT * FROM \`${dataset}.${BQ_LOGS_TABLE}\`
-      WHERE flowId = @flowId
-      ORDER BY timestamp ASC
-    `,
-    params: {flowId: String(flowId)},
-  });
-  if (!logRows.length) return null;
-  const safeCheck = checkSafeToSummarize(logRows);
-  if (!safeCheck.safe) return null;
-  return summarizeSingleFlow(flowId, logRows);
+  void flowId;
+  void dataset;
+  return null;
 }
 
 /**
@@ -1383,6 +1624,54 @@ async function handleReportUndeliveredShipments(req, res) {
     });
   }
 }
+
+/**
+ * Smoke-test XPO weight cert pull from Cloud Functions.
+ * GET ?pro=123456789&format=json — returns PDF or JSON error.
+ */
+exports.testXpoWeightCert = onRequest(
+    {invoker: "public", timeoutSeconds: 60},
+    async (req, res) => {
+      try {
+        const bodyPro = req.body && (req.body.pro || req.body.proNumber);
+        const pro = String(
+            req.query.pro || bodyPro || req.get("X-Pro-Number") || "",
+        ).replace(/\D/g, "").slice(0, 9);
+        if (!pro) {
+          return res.status(400).json({
+            ok: false,
+            error: "Missing pro query parameter",
+          });
+        }
+        const asJson = req.query.format === "json" ||
+          (req.body && req.body.format === "json");
+        const result = await xpoImaging.fetchXpoWeightCertPdf(pro);
+        if (!result.ok || !result.pdfBuffer) {
+          return res.status(502).json({
+            ok: false,
+            proNumber: pro,
+            error: result.error || "Weight cert fetch failed",
+            attempts: result.attempts || null,
+          });
+        }
+        if (asJson) {
+          return res.json({
+            ok: true,
+            proNumber: pro,
+            imageType: result.imageType || null,
+            bytes: result.pdfBuffer.length,
+            pdfBase64: result.pdfBuffer.toString("base64"),
+          });
+        }
+        res.set("Content-Type", "application/pdf");
+        res.set("Content-Disposition",
+            `inline; filename="xpo-wi-${pro}.pdf"`);
+        return res.send(result.pdfBuffer);
+      } catch (error) {
+        console.error("testXpoWeightCert error:", error);
+        return res.status(500).json({ok: false, error: error.message});
+      }
+    });
 
 /**
  * Smoke-test FedEx Freight POD pull from Cloud Functions (bypasses NetFree).
@@ -1852,6 +2141,16 @@ exports.continueWorkflow = onRequest(async (req, res) => {
 
     const invoice = snap.data();
     const paused = invoice.workflowPausedAtStep;
+
+    if (paused === "send_customer_email" &&
+        invoice.decisionStage === "awaiting_customer_email_approval" &&
+        invoice.customerEmailApproval !== "approved") {
+      return res.status(400).json({
+        ok: false,
+        error: "Customer email is awaiting reviewer approval. " +
+          "Use the Approve link in the approval email.",
+      });
+    }
 
     await invoiceRef.update({
       workflowPausedAtStep: null,
@@ -3084,11 +3383,7 @@ exports.checkInvoiceAgainstPrimus = onRequest(async (req, res) => {
  * @return {google.auth.OAuth2} Gmail OAuth client.
  */
 function getGmailOAuthClient() {
-  return new google.auth.OAuth2(
-      process.env.GMAIL_CLIENT_ID,
-      process.env.GMAIL_CLIENT_SECRET,
-      process.env.GMAIL_REDIRECT_URI,
-  );
+  return mailProvider.getGmailOAuthClient();
 }
 
 /**
@@ -3105,6 +3400,55 @@ function isPdfMagicBytes(fileBuffer) {
     fileBuffer[3] === 0x46;
 }
 
+/** Filters logos/tiny stubs; compact carrier invoices can be ~5–8 KB. */
+const MIN_PDF_ATTACHMENT_BYTES = 5000;
+/** INV*.pdf-style names (e.g. Forward Air) may be smaller but valid. */
+const MIN_INVOICE_LIKE_PDF_BYTES = 3000;
+
+/**
+ * True when the filename suggests a carrier invoice PDF.
+ * @param {string} filename Attachment filename.
+ * @return {boolean}
+ */
+function looksLikeInvoicePdfFilename(filename) {
+  const base = String(filename || "").replace(/\.[^.]+$/, "");
+  const name = base.toLowerCase();
+  return /^(inv|invoice)[\d_.-]/i.test(base) ||
+    /invoice|inv[\d_-]|carrier.?bill|freight.?inv/i.test(name);
+}
+
+/**
+ * Minimum PDF byte size for intake, keyed off filename heuristics.
+ * @param {object} attachment Attachment metadata.
+ * @return {number}
+ */
+function minPdfBytesForAttachment(attachment) {
+  if (looksLikeInvoicePdfFilename(attachment && attachment.filename)) {
+    return MIN_INVOICE_LIKE_PDF_BYTES;
+  }
+  return MIN_PDF_ATTACHMENT_BYTES;
+}
+
+/**
+ * @param {object} attachment Attachment metadata.
+ * @param {Buffer} fileBuffer File bytes.
+ * @return {boolean}
+ */
+function isPdfAttachment(attachment, fileBuffer) {
+  const mime = String(attachment && attachment.mimeType || "").toLowerCase();
+  return mime === "application/pdf" || isPdfMagicBytes(fileBuffer);
+}
+
+/**
+ * @param {object} attachment Attachment metadata.
+ * @param {Buffer} fileBuffer File bytes.
+ * @return {boolean}
+ */
+function isPdfTooSmallForIntake(attachment, fileBuffer) {
+  if (!isPdfAttachment(attachment, fileBuffer)) return false;
+  return fileBuffer.length < minPdfBytesForAttachment(attachment);
+}
+
 /**
  * Returns true if an attachment should be processed (PDF, not too small).
  * @param {object} attachment - Attachment metadata.
@@ -3118,11 +3462,8 @@ function shouldProcessAttachment(attachment, fileBuffer) {
   if (mime.includes("message/rfc822") || name.endsWith(".eml")) {
     return false;
   }
-  const isPdf = mime === "application/pdf" ||
-    // Some clients send PDFs as octet-stream (or wrong mime); detect %PDF.
-    isPdfMagicBytes(fileBuffer);
-  if (!isPdf) return false;
-  if (fileBuffer.length < 10000) return false;
+  if (!isPdfAttachment(attachment, fileBuffer)) return false;
+  if (isPdfTooSmallForIntake(attachment, fileBuffer)) return false;
   return true;
 }
 
@@ -3691,13 +4032,11 @@ async function forwardToHumanReview(
 async function sendViaGmail(
     to, subject, html, attachments = [], tenant = null, opts = {},
 ) {
-  const docId = tenantGmailDocId(tenant || DEFAULT_TENANT);
-  const gmailDoc = await db.collection("settings").doc(docId).get();
-  if (!gmailDoc.exists) throw new Error("Gmail not connected");
-  const tokens = gmailDoc.data().tokens || gmailDoc.data();
-  const oauth2Client = getGmailOAuthClient();
-  oauth2Client.setCredentials(tokens);
-  const gmail = google.gmail({version: "v1", auth: oauth2Client});
+  const tenantCfg = tenant || DEFAULT_TENANT;
+  const mail = await mailProvider.getTenantMailClient(tenantCfg);
+  if (!mail) {
+    throw new Error(`${mailProvider.providerLabel()} not connected`);
+  }
 
   const boundary = `msg_${crypto.randomBytes(16).toString("hex")}`;
   const safeTo = String(to || "").replace(/[\r\n]/g, "");
@@ -3737,7 +4076,7 @@ async function sendViaGmail(
   lines.push(`--${boundary}--`);
 
   const raw = Buffer.from(lines.join("")).toString("base64url");
-  await gmail.users.messages.send({userId: "me", requestBody: {raw}});
+  await mail.users.messages.send({userId: "me", requestBody: {raw}});
 }
 
 /**
@@ -4802,6 +5141,96 @@ async function pauseWorkflow(
 }
 
 /**
+ * Saves weight & inspection certificate PDF bytes to Storage.
+ * @param {string} invoiceId Invoice id.
+ * @param {string} filename File name under weightCert/{invoiceId}/.
+ * @param {Uint8Array} pdfBytes PDF bytes.
+ * @return {Promise<string>} Storage path.
+ */
+async function saveWeightCertPdfBytes(invoiceId, filename, pdfBytes) {
+  const storagePath = `weightCert/${invoiceId}/${filename}`;
+  await getBucket().file(storagePath).save(Buffer.from(pdfBytes), {
+    metadata: {contentType: "application/pdf"},
+  });
+  return storagePath;
+}
+
+/**
+ * Pulls XPO weight & inspection certificate from the Imaging API when the
+ * invoice email did not include one.
+ * @param {string} messageId Gmail message id (logging).
+ * @param {object} aiResult Classified invoice fields (mutated on success).
+ * @return {Promise<object|null>} Saved cert info or null.
+ */
+async function maybeFetchXpoWeightCert(messageId, aiResult) {
+  if (!aiResult || aiResult.hasWeightInspectionCertificate) {
+    return null;
+  }
+  if (!xpoImaging.isXpoCarrier(aiResult.carrierName)) {
+    return null;
+  }
+  const proNumber = xpoImaging.resolveXpoPro({
+    proNumber: aiResult.proNumber,
+    invoiceNumber: aiResult.invoiceNumber,
+  });
+  if (!proNumber) {
+    await writeLog("info", "workflow",
+        "XPO invoice — no PRO for weight cert fetch", {
+          messageId,
+          loadNumber: aiResult.loadNumber,
+          carrierName: aiResult.carrierName,
+        });
+    return null;
+  }
+
+  let result;
+  try {
+    result = await xpoImaging.fetchXpoWeightCertPdf(proNumber);
+  } catch (err) {
+    await writeLog("warn", "workflow", "XPO weight cert fetch failed", {
+      messageId,
+      loadNumber: aiResult.loadNumber,
+      proNumber,
+      error: err.message,
+    });
+    return null;
+  }
+
+  if (!result.ok || !result.pdfBuffer) {
+    await writeLog("info", "workflow", "XPO weight cert not available", {
+      messageId,
+      loadNumber: aiResult.loadNumber,
+      proNumber,
+      error: result.error || "unknown",
+      attempts: result.attempts || null,
+    });
+    return null;
+  }
+
+  const filename = `xpo-wi-${proNumber}.pdf`;
+  const storagePath = await saveWeightCertPdfBytes(
+      messageId, filename, result.pdfBuffer);
+  aiResult.hasWeightInspectionCertificate = true;
+  await writeLog("info", "workflow",
+      "XPO weight & inspection certificate downloaded", {
+        messageId,
+        loadNumber: aiResult.loadNumber,
+        proNumber,
+        imageType: result.imageType || null,
+        storagePath,
+      });
+  return {
+    storagePath,
+    filename,
+    source: "xpo_imaging_api",
+    proNumber,
+    imageType: result.imageType || null,
+    mimeType: "application/pdf",
+    docType: "WEIGHT_INSPECTION_CERT",
+  };
+}
+
+/**
  * Pulls FedEx Freight POD from the public tracking API when missing locally.
  * @param {string} invoiceId Invoice id.
  * @param {object} invoice Invoice document.
@@ -5773,9 +6202,9 @@ async function handlePodOnlyDeliveryEmail(opts) {
     podStoragePath: storagePath,
   });
 
-  // Resume workflow so held customer email can proceed.
+  // Resume customer email only after reviewer approval.
   const workflowUrl = workflowUrlForTenant(tenant);
-  if (workflowUrl) {
+  if (workflowUrl && invoice.customerEmailApproval === "approved") {
     fetch(workflowUrl, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -5786,6 +6215,13 @@ async function handlePodOnlyDeliveryEmail(opts) {
       }),
     }).catch((e) =>
       console.error("pod-only resume failed", e.message));
+  } else if (workflowUrl) {
+    await writeLog("info", "gmail",
+        "POD applied — customer email still awaiting approval", {
+          messageId,
+          invoiceId,
+          loadNumber,
+        });
   }
 
   return {
@@ -6202,6 +6638,10 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "- statement: account summary or pay-online notice only — no freight",
       "  invoice PDF to extract (not a carrier Stmt packet of bills)",
       "- unknown: marketing, unrelated, or unclear",
+      "",
+      "NOT carrier_invoice (treat as unknown; inbox rules may ignore):",
+      "bank/Zelle/Venmo/PayPal payment alerts, wire/ACH deposit notices,",
+      "\"X sent you $Y\" / payment-received emails with no freight bill PDF.",
     ].join("\n"),
     messages: [{
       role: "user",
@@ -6383,6 +6823,19 @@ async function processGmailMessage(
         tenant,
         finalStatus: "emodal_broadcast_ignored",
         reason: "eModal / terminal broadcast — ignored",
+      });
+      return;
+    }
+
+    if (!isTai && administrativeEmailIntake.isPaymentNotificationEmail(
+        subject, from, emailBody)) {
+      await completeAdministrativeIgnore({
+        messageId,
+        subject,
+        from,
+        tenant,
+        finalStatus: "payment_notification_ignored",
+        reason: "Payment notification (Zelle/bank) — ignored",
       });
       return;
     }
@@ -6768,12 +7221,8 @@ async function processGmailMessage(
           mimeType: attachment.mimeType,
           fileSize: fileBuffer.length,
         });
-        const isPdfMime = attachment.mimeType === "application/pdf" ||
-          (attachment.mimeType === "application/octet-stream" &&
-            fileBuffer.length >= 4 &&
-            fileBuffer[0] === 0x25 && fileBuffer[1] === 0x50 &&
-            fileBuffer[2] === 0x44 && fileBuffer[3] === 0x46);
-        if (isPdfMime && fileBuffer.length < 10000) {
+        const isPdfMime = isPdfAttachment(attachment, fileBuffer);
+        if (isPdfMime && isPdfTooSmallForIntake(attachment, fileBuffer)) {
           // Small PDF — likely a real document but too short to be an invoice
           skippedDocTypes.push("small PDF");
         } else if (!isPdfMime && fileBuffer.length >= 10000) {
@@ -7092,6 +7541,19 @@ async function processGmailMessage(
           tenant,
           finalStatus: "rts_noa_ignored",
           reason: "RTS Notice of Assignment — no carrier invoice attached",
+          extra: {skippedAttachmentTypes: skippedDocTypes},
+        });
+        return;
+      }
+      if (administrativeEmailIntake.isPaymentNotificationEmail(
+          subject, from, emailBody) && invoicePdfCount === 0) {
+        await completeAdministrativeIgnore({
+          messageId,
+          subject,
+          from,
+          tenant,
+          finalStatus: "payment_notification_ignored",
+          reason: "Payment notification (Zelle/bank) — no freight invoice",
           extra: {skippedAttachmentTypes: skippedDocTypes},
         });
         return;
@@ -7545,6 +8007,13 @@ async function processGmailMessage(
       // Set when unrecognized charges need the 4-option approval email
       // (sent after the invoice doc is created so buttons have an id).
       let pendingAdditionalCharge = null;
+      let pendingXpoWeightCert = null;
+
+      // XPO Imaging API — pull W&I certificate when not attached to email.
+      if (!loadGateFailed && !aiResult.hasWeightInspectionCertificate) {
+        pendingXpoWeightCert = await maybeFetchXpoWeightCert(
+            messageId, aiResult);
+      }
 
       // Claude sometimes sets status=charges_no_proof / unrecognized_charges
       // without listing any real charge rows (FedEx 264172 → "includes
@@ -7880,12 +8349,6 @@ async function processGmailMessage(
         if (primusData.rate) {
           const profitCheck = checkProfitMargin(
               primusData.rate, primusValidationAmount);
-          const brokerProfitCheck =
-              await brokerCommission.resolveBrokerProfitCheck({
-                loadNumber: aiResult.loadNumber,
-                customerRate: primusData.rate,
-                vendorCost: primusValidationAmount,
-              });
           if (profitCheck.noRate || profitCheck.lowProfit) {
             const hasLumpers =
                 primusValidationAmount !== aiResult.invoiceAmount;
@@ -7934,30 +8397,6 @@ async function processGmailMessage(
               );
             }
             finalStatus = "no_rate";
-          } else if (brokerProfitCheck.lowMargin) {
-            let brokerName = "";
-            try {
-              const booking = await fetchPrimusBooking(aiResult.loadNumber);
-              const contact = booking && booking.contactInformation;
-              brokerName = (contact && (contact.salesRepName ||
-                (contact.salesRep && contact.salesRep.name))) || "";
-            } catch (_) {
-              // best-effort broker name for the notification email
-            }
-            await adjustBrokerCommission({
-              loadNumber: aiResult.loadNumber,
-              margin: brokerProfitCheck.margin,
-              profit: brokerProfitCheck.profit,
-              brokerName,
-              carrierName: aiResult.carrierName,
-            });
-            await writeLog("info", "primus",
-                "Low Profit % flagged for broker commission", {
-                  messageId, loadNumber: aiResult.loadNumber,
-                  profitPct: brokerProfitCheck.margin,
-                  profit: brokerProfitCheck.profit,
-                  source: brokerProfitCheck.source,
-                });
           }
         }
 
@@ -8117,6 +8556,14 @@ async function processGmailMessage(
             invoiceAttachments = preferred.concat(rest);
           }
         }
+        if (pendingXpoWeightCert && pendingXpoWeightCert.storagePath) {
+          invoiceAttachments.push({
+            filename: pendingXpoWeightCert.filename,
+            storagePath: pendingXpoWeightCert.storagePath,
+            mimeType: pendingXpoWeightCert.mimeType || "application/pdf",
+            docType: pendingXpoWeightCert.docType || "WEIGHT_INSPECTION_CERT",
+          });
+        }
 
         let decisionStage = isTai ?
           "pending_tai_check" : "pending_primus_check";
@@ -8179,6 +8626,13 @@ async function processGmailMessage(
           freightDetails: aiResult.freightDetails || null,
           hasWeightInspectionCertificate:
             !!aiResult.hasWeightInspectionCertificate,
+          weightInspectionCertificate: pendingXpoWeightCert ? {
+            source: pendingXpoWeightCert.source,
+            storagePath: pendingXpoWeightCert.storagePath,
+            filename: pendingXpoWeightCert.filename,
+            proNumber: pendingXpoWeightCert.proNumber || null,
+            imageType: pendingXpoWeightCert.imageType || null,
+          } : null,
           customerRate: isPendingChargeApproval && pendingAdditionalCharge ?
             (pendingAdditionalCharge.customerRate || null) : null,
           additionalCharge: isPendingChargeApproval ? {
@@ -8680,24 +9134,10 @@ async function extractPdfsFromRawMessage(gmail, messageId) {
   if (!raw) return [];
   return extractPdfAttachmentsFromMime(decodeGmailBase64(raw));
 }
-exports.gmailConnect = onRequest(async (req, res) => {
+exports.gmailConnect = onRequest({invoker: "public"}, async (req, res) => {
   try {
     const tenant = await resolveDashboardTenant(req);
-    const oauth2Client = getGmailOAuthClient();
-    const state = Buffer.from(JSON.stringify({
-      tenantId: tenant.tenantId,
-    })).toString("base64url");
-
-    const url = oauth2Client.generateAuthUrl({
-      access_type: "offline",
-      prompt: "consent",
-      scope: [
-        "https://www.googleapis.com/auth/gmail.modify",
-        "https://www.googleapis.com/auth/gmail.send",
-      ],
-      state,
-    });
-
+    const url = mailProvider.buildOAuthConnectUrl(tenant);
     return res.redirect(url);
   } catch (error) {
     console.error("gmailConnect error:", error);
@@ -8705,46 +9145,54 @@ exports.gmailConnect = onRequest(async (req, res) => {
   }
 });
 
-exports.gmailOAuthCallback = onRequest(async (req, res) => {
-  try {
-    const code = req.query.code;
+exports.mailConnect = exports.gmailConnect;
 
-    if (!code) {
-      return res.status(400).send("Missing code from Google.");
-    }
-
-    let tenantId = "default";
-    if (req.query.state) {
+exports.gmailOAuthCallback = onRequest(
+    {invoker: "public"},
+    async (req, res) => {
       try {
-        const parsed = JSON.parse(
-            Buffer.from(String(req.query.state), "base64url").toString("utf8"));
-        if (parsed && parsed.tenantId) {
-          tenantId = String(parsed.tenantId);
+        const code = req.query.code;
+        const providerLabel = mailProvider.providerLabel();
+
+        if (!code) {
+          return res.status(400).send(`Missing code from ${providerLabel}.`);
         }
-      } catch (_) {
-        // Legacy connect without state — fall back to default tenant.
+
+        let tenantId = "default";
+        if (req.query.state) {
+          try {
+            const parsed = JSON.parse(
+                Buffer.from(String(req.query.state), "base64url")
+                    .toString("utf8"));
+            if (parsed && parsed.tenantId) {
+              tenantId = String(parsed.tenantId);
+            }
+          } catch (_) {
+            // Legacy connect without state — fall back to default tenant.
+          }
+        }
+        const tenant = await getTenant(tenantId);
+
+        const tokens = await mailProvider.exchangeOAuthCode(code);
+
+        await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
+          tokens: tokens,
+          provider: mailProvider.getProvider(),
+          tenantId: tenant.tenantId,
+          connectedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        return res.send(
+            `${providerLabel} connected successfully for ` +
+        `${tenant.name || tenant.tenantId}. You can close this page.`);
+      } catch (error) {
+        console.error("gmailOAuthCallback error:", error);
+        return res.status(500).send(error.message);
       }
-    }
-    const tenant = await getTenant(tenantId);
-
-    const oauth2Client = getGmailOAuthClient();
-
-    const {tokens} = await oauth2Client.getToken(code);
-
-    await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
-      tokens: tokens,
-      tenantId: tenant.tenantId,
-      connectedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    return res.send(
-        `Gmail connected successfully for ${tenant.name || tenant.tenantId}. ` +
-        "You can close this page.");
-  } catch (error) {
-    console.error("gmailOAuthCallback error:", error);
-    return res.status(500).send(error.message);
-  }
-});
+exports.mailOAuthCallback = exports.gmailOAuthCallback;
+exports.outlookOAuthCallback = exports.gmailOAuthCallback;
 
 /**
  * Applies CORS headers so the static dashboard can call these endpoints
@@ -8765,6 +9213,71 @@ function applyDashboardCors(req, res) {
     return true;
   }
   return false;
+}
+
+/** Max rows returned by dashboard log CSV export (one calendar day). */
+const LOG_EXPORT_MAX_ROWS = 50000;
+const LOG_EXPORT_TZ = "America/New_York";
+
+/**
+ * Validates YYYY-MM-DD for log export.
+ * @param {string} raw Date string from query param.
+ * @return {string|null} Normalized date or null.
+ */
+function parseLogExportDate(raw) {
+  const s = String(raw || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const parts = s.split("-").map(Number);
+  const y = parts[0];
+  const m = parts[1];
+  const day = parts[2];
+  const check = new Date(Date.UTC(y, m - 1, day));
+  if (check.getUTCFullYear() !== y || check.getUTCMonth() + 1 !== m ||
+      check.getUTCDate() !== day) {
+    return null;
+  }
+  return s;
+}
+
+/**
+ * Escapes one CSV field.
+ * @param {*} value Cell value.
+ * @return {string}
+ */
+function csvEscapeCell(value) {
+  const s = value == null ? "" : String(value);
+  if (/[",\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, "\"\"")}"`;
+  }
+  return s;
+}
+
+/**
+ * @param {Array<object>} rows BigQuery log rows.
+ * @return {string} CSV text.
+ */
+function buildLogsCsv(rows) {
+  const header = [
+    "timestamp", "level", "category", "message", "flowId",
+    "messageId", "invoiceId", "currentStep", "details",
+  ];
+  const lines = [header.join(",")];
+  for (const row of rows) {
+    const ts = row.timestamp && row.timestamp.value ?
+      row.timestamp.value : String(row.timestamp || "");
+    lines.push([
+      csvEscapeCell(ts),
+      csvEscapeCell(row.level),
+      csvEscapeCell(row.category),
+      csvEscapeCell(row.message),
+      csvEscapeCell(row.flowId),
+      csvEscapeCell(row.messageId),
+      csvEscapeCell(row.invoiceId),
+      csvEscapeCell(row.currentStep),
+      csvEscapeCell(row.details),
+    ].join(","));
+  }
+  return lines.join("\r\n");
 }
 
 /**
@@ -8789,7 +9302,7 @@ const DASHBOARD_RANGES = {
   year: {days: 365, truncUnit: "MONTH"},
 };
 
-exports.getGmailStatus = onRequest(async (req, res) => {
+exports.getGmailStatus = onRequest({invoker: "public"}, async (req, res) => {
   if (applyDashboardCors(req, res)) {
     return;
   }
@@ -8802,6 +9315,7 @@ exports.getGmailStatus = onRequest(async (req, res) => {
       return res.json({
         ok: true,
         connected: false,
+        provider: mailProvider.getProvider(),
         tenantId: tenant.tenantId,
         tms: tenant.tms,
       });
@@ -8811,6 +9325,7 @@ exports.getGmailStatus = onRequest(async (req, res) => {
     return res.json({
       ok: true,
       connected: true,
+      provider: data.provider || mailProvider.getProvider(),
       tenantId: tenant.tenantId,
       tms: tenant.tms,
       tenantName: tenant.name,
@@ -8822,7 +9337,9 @@ exports.getGmailStatus = onRequest(async (req, res) => {
   }
 });
 
-exports.gmailDisconnect = onRequest(async (req, res) => {
+exports.getMailStatus = exports.getGmailStatus;
+
+exports.gmailDisconnect = onRequest({invoker: "public"}, async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Method not allowed."});
@@ -8836,6 +9353,8 @@ exports.gmailDisconnect = onRequest(async (req, res) => {
     return res.status(500).json({ok: false, error: error.message});
   }
 });
+
+exports.mailDisconnect = exports.gmailDisconnect;
 
 exports.setCustomerRate = onRequest(async (req, res) => {
   const invoiceId = req.query.invoiceId || (req.body && req.body.invoiceId);
@@ -8959,18 +9478,50 @@ exports.setCustomerRate = onRequest(async (req, res) => {
   const workflowUrl = workflowUrlForTenant(tenant);
 
   if (workflowUrl) {
-    fetch(workflowUrl, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({
+    try {
+      const response = await fetch(workflowUrl, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          invoiceId,
+          tenantId: tenant.tenantId,
+          resumeFrom: "get_rate",
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        await writeLog("error", "workflow",
+            "setCustomerRate: workflow resume failed", {
+              invoiceId,
+              tenantId: tenant.tenantId,
+              loadNumber: inv.loadNumber,
+              status: response.status,
+              error: payload.error || null,
+            });
+      } else {
+        await writeLog("info", "workflow",
+            "setCustomerRate: workflow resumed", {
+              invoiceId,
+              tenantId: tenant.tenantId,
+              loadNumber: inv.loadNumber,
+              workflowStatus: payload.workflowStatus || payload.ok || null,
+            });
+      }
+    } catch (e) {
+      await writeLog("error", "workflow", "setCustomerRate: resume failed", {
         invoiceId,
         tenantId: tenant.tenantId,
-        resumeFrom: "generate_invoice",
-      }),
-    }).catch((e) => console.error("setCustomerRate: resume failed", e.message));
+        loadNumber: inv.loadNumber,
+        error: e.message,
+      });
+    }
   } else {
-    console.error("setCustomerRate: no workflow URL for tenant",
-        tenant.tenantId);
+    await writeLog("error", "workflow",
+        "setCustomerRate: no workflow URL for tenant", {
+          invoiceId,
+          tenantId: tenant.tenantId,
+          loadNumber: inv.loadNumber,
+        });
   }
 
   return res.send(`<!DOCTYPE html>
@@ -9001,16 +9552,26 @@ exports.getRecentLogs = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
     const tenant = await resolveDashboardTenant(req);
-    const limit = Math.min(Number(req.query.limit || 40), 100);
-    const dataset = tenant.bqDataset;
     const loadNumber = req.query.loadNumber ?
       String(req.query.loadNumber).trim() : null;
     const invoiceId = req.query.invoiceId ?
       String(req.query.invoiceId).trim() : null;
-    const includeDetails = req.query.includeDetails === "1" ||
-      req.query.includeDetails === "true";
     const messageLike = req.query.messageLike ?
       String(req.query.messageLike).trim() : null;
+    const isFiltered = Boolean(loadNumber || invoiceId || messageLike);
+    if (!DASHBOARD_ACTIVITY_FEED_ENABLED && !isFiltered) {
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        logs: [],
+        activityFeedEnabled: false,
+        message: "Live log feed disabled. See daily Jerry activity email.",
+      });
+    }
+    const limit = Math.min(Number(req.query.limit || 40), 100);
+    const dataset = tenant.bqDataset;
+    const includeDetails = req.query.includeDetails === "1" ||
+      req.query.includeDetails === "true";
     let rows;
     if (loadNumber || invoiceId || messageLike) {
       const hours = Math.min(Number(req.query.hours || 48), 168);
@@ -9087,14 +9648,72 @@ exports.getRecentLogs = onRequest(async (req, res) => {
   }
 });
 
+exports.exportLogsCsv = onRequest(
+    {invoker: "public", timeoutSeconds: 120, memory: "512MiB"},
+    async (req, res) => {
+      if (applyDashboardCors(req, res)) return;
+      try {
+        const tenant = await resolveDashboardTenant(req);
+        const exportDate = parseLogExportDate(req.query.date);
+        if (!exportDate) {
+          return res.status(400).json({
+            ok: false,
+            error: "Missing or invalid date. Use ?date=YYYY-MM-DD",
+          });
+        }
+        const dataset = tenant.bqDataset;
+        const [rows] = await bigquery.query({
+          query: `
+            SELECT
+              timestamp, level, category, message, flowId, messageId,
+              invoiceId, currentStep, details
+            FROM \`${dataset}.${BQ_LOGS_TABLE}\`
+            WHERE DATE(timestamp, @tz) = @exportDate
+            ORDER BY timestamp ASC
+            LIMIT @maxRows
+          `,
+          params: {
+            tz: LOG_EXPORT_TZ,
+            exportDate,
+            maxRows: LOG_EXPORT_MAX_ROWS,
+          },
+        });
+        const csv = buildLogsCsv(rows);
+        const filename = `jerry-logs-${exportDate}.csv`;
+        res.set("Content-Type", "text/csv; charset=utf-8");
+        res.set("Content-Disposition", `attachment; filename="${filename}"`);
+        res.set("Access-Control-Expose-Headers", "Content-Disposition");
+        return res.status(200).send(`\uFEFF${csv}`);
+      } catch (error) {
+        console.error("exportLogsCsv error:", error);
+        return res.status(500).json({
+          ok: false,
+          error: "Failed to export logs.",
+          details: error.message,
+        });
+      }
+    },
+);
+
 /**
- * Returns AI-summarized flow logs for the dashboard activity feed.
- * Defaults to 20 summaries; use offset/limit for "Show more".
+ * Dashboard activity feed disabled — use daily email digest instead.
  */
 exports.getRecentSummaries = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
     const tenant = await resolveDashboardTenant(req);
+    if (!DASHBOARD_ACTIVITY_FEED_ENABLED) {
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        summaries: [],
+        activityFeedEnabled: false,
+        message: "Per-flow summaries disabled. Daily digest at 6 PM ET.",
+        limit: 0,
+        offset: 0,
+        hasMore: false,
+      });
+    }
     const limit = Math.min(Number(req.query.limit || 30), 100);
     const offset = Math.max(Number(req.query.offset || 0), 0);
     const dataset = tenant.bqDataset;
@@ -9453,22 +10072,24 @@ async function sendSupportIssueEmail({clientName, summary, transcript}) {
   const safeClientName = String(clientName || "").replace(/[\r\n]/g, " ");
   const subject = `[Support Chat] ${safeClientName} — issue reported`;
 
-  const gmailDoc = await db.collection("settings").doc("gmail").get();
-  if (!gmailDoc.exists) {
+  const mailDoc = await db.collection("settings")
+      .doc(tenantGmailDocId(DEFAULT_TENANT)).get();
+  if (!mailDoc.exists) {
     console.error(
-        "[sendSupportIssueEmail] Gmail not connected — issue report " +
+        "[sendSupportIssueEmail] Mail inbox not connected — issue report " +
         `dropped for ${safeClientName}`,
     );
     return;
   }
 
-  const gmailSettings = gmailDoc.data();
-  const tokens = gmailSettings.tokens || gmailSettings;
-
-  const oauth2Client = getGmailOAuthClient();
-  oauth2Client.setCredentials(tokens);
-
-  const gmail = google.gmail({version: "v1", auth: oauth2Client});
+  const mail = await mailProvider.getTenantMailClient(DEFAULT_TENANT);
+  if (!mail) {
+    console.error(
+        "[sendSupportIssueEmail] Mail client unavailable — issue report " +
+        `dropped for ${safeClientName}`,
+    );
+    return;
+  }
 
   const mimeBuffer = Buffer.from(
       `To: ${to}\r\n` +
@@ -9476,7 +10097,7 @@ async function sendSupportIssueEmail({clientName, summary, transcript}) {
       `Content-Type: text/html; charset="UTF-8"\r\n\r\n${html}`,
   );
 
-  await gmail.users.messages.send({
+  await mail.users.messages.send({
     userId: "me",
     requestBody: {raw: mimeBuffer.toString("base64url")},
   });
@@ -9494,17 +10115,18 @@ const SUPPORT_CHAT_PRODUCT_KNOWLEDGE =
   "PRODUCT KNOWLEDGE (answer how-it-works questions from this — " +
   "never mention source code, repos, or internal engineering): " +
   "This dashboard monitors automated carrier-invoice processing for " +
-  "the customer's TMS workflow. Gmail must stay connected so inbound " +
-  "invoice emails can be read. The stats chart (Day / Week / Month / Year) " +
+  "the customer's TMS workflow. Outlook must stay connected so inbound " +
+  "invoice emails can be read; Jerry checks the inbox automatically every " +
+  "20 minutes. The stats chart (Day / Week / Month / Year) " +
   "shows invoices processed, workflows completed, invoices with additional " +
   "charges, outbound reply emails sent, and emails forwarded for human " +
-  "review. The activity log shows AI-summarized processing events (not raw " +
-  "engine logs) with a Show more button. The task manager lists open items " +
+  "review. The task manager lists open items " +
   "for Lisa and ops (additional charges, human-review forwards, signed POD " +
   "requests) and each task can be dismissed when handled. " +
+  "A daily email digest (6 PM ET) is sent to Lisa only — it is not shown " +
+  "on the dashboard. " +
   "The recent-invoices table lists loads " +
   "with load #, pro #, carrier, customer, amount, and workflow status. " +
-  "The raw activity log (legacy) is replaced by summarized flow logs. " +
   "Typical flow: a carrier invoice email " +
   "arrives in Gmail → PDF is read → load/amount/POD pages are " +
   "extracted → the load is matched in the TMS → billing steps run. " +
@@ -9567,8 +10189,7 @@ function formatSupportChatDashboardContext(ctx) {
  * @return {string|undefined}
  */
 function getSupportChatOpenAiKey() {
-  return process.env.SUPPORT_CHAT_OPENAI_API_KEY ||
-    process.env.OPENAI_API_KEY;
+  return getFlowSummaryOpenAiKey();
 }
 
 /**
@@ -9755,24 +10376,33 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
  * via async-local context.
  * @param {object} tenant Tenant config.
  * @param {string} inboxFlowId Flow id for this inbox-check run.
+ * @param {object} [options] Per-run options.
+ * @param {boolean} [options.quietIfDisconnected] Skip warn log when OAuth
+ *   tokens are missing (scheduled runs).
  * @return {Promise<object>} {connected, processed}.
  */
-async function checkGmailInboxForTenant(tenant, inboxFlowId) {
+async function checkGmailInboxForTenant(tenant, inboxFlowId, options = {}) {
   return runWithTenant(tenant, async () => {
+    const mailLabel = mailProvider.providerLabel();
     const gmail = await getTenantGmailClient(tenant);
     if (!gmail) {
-      await writeLog("warn", "gmail",
-          `Gmail is not connected for tenant ${tenant.tenantId}`);
+      if (options.quietIfDisconnected) {
+        console.log(
+            `[${tenant.tenantId}] ${mailLabel} not connected — skipping`);
+      } else {
+        await writeLog("warn", "mail",
+            `${mailLabel} is not connected for tenant ${tenant.tenantId}`);
+      }
       return {connected: false, processed: 0};
     }
 
     await writeLog(
         "info",
-        "gmail",
-        "Fetching messages from Gmail",
+        "mail",
+        `Fetching messages from ${mailLabel}`,
         {
           flowId: inboxFlowId,
-          currentStep: "gmail_inbox_check",
+          currentStep: "mail_inbox_check",
           tenantId: tenant.tenantId,
         },
     );
@@ -9933,7 +10563,7 @@ async function checkGmailInboxForTenant(tenant, inboxFlowId) {
       }
     }
 
-    await writeLog("info", "gmail", "Gmail inbox check completed", {
+    await writeLog("info", "mail", mailProvider.inboxCheckCompletedMessage(), {
       processedMessages: messages.length,
       tenantId: tenant.tenantId,
     });
@@ -9968,49 +10598,77 @@ async function renewPrimusUiSessionIfDue() {
   console.error("renewPrimusUiSessionIfDue failed:", result.error);
 }
 
+/**
+ * Polls every active tenant inbox (or one tenant when tenantId is set).
+ * @param {object} [options] Run options.
+ * @param {string} [options.tenantId] Single-tenant poll.
+ * @param {boolean} [options.quietIfDisconnected] Skip warn logs when inbox
+ *   OAuth is not connected (for scheduled runs).
+ * @return {Promise<Array<object>>} Per-tenant {tenantId, connected, processed}.
+ */
+async function runMailInboxCheck(options = {}) {
+  await renewPrimusUiSessionIfDue();
+
+  await logWorkflowStep({
+    stepName: "gmail_email_found",
+    stepStatus: "started",
+  });
+
+  await writeLog("info", "mail", "Starting inbox check");
+
+  const inboxFlowId = crypto.randomUUID ?
+    crypto.randomUUID() :
+    `inbox-${Date.now()}`;
+
+  let tenants;
+  if (options.tenantId) {
+    tenants = [await getTenant(String(options.tenantId))];
+  } else {
+    tenants = await getActiveTenants();
+  }
+
+  const results = [];
+  for (const tenant of tenants) {
+    try {
+      const r = await checkGmailInboxForTenant(tenant, inboxFlowId, {
+        quietIfDisconnected: Boolean(options.quietIfDisconnected),
+      });
+      results.push({tenantId: tenant.tenantId, ...r});
+    } catch (tenantErr) {
+      console.error(
+          `runMailInboxCheck tenant ${tenant.tenantId} failed:`,
+          tenantErr);
+      results.push({
+        tenantId: tenant.tenantId,
+        error: tenantErr.message,
+      });
+    }
+  }
+  return results;
+}
+
+/** Every 20 minutes — poll Outlook/Gmail inboxes for new carrier invoices. */
+exports.checkMailInboxScheduled = onSchedule({
+  schedule: "every 20 minutes",
+  timeZone: "America/New_York",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+}, async () => {
+  try {
+    const results = await runMailInboxCheck({quietIfDisconnected: true});
+    console.log("checkMailInboxScheduled:", JSON.stringify(results));
+  } catch (error) {
+    console.error("checkMailInboxScheduled error:", error.message);
+  }
+});
+
 exports.checkGmailInbox = onRequest(
-    {timeoutSeconds: 540, memory: "1GiB"},
+    {invoker: "public", timeoutSeconds: 540, memory: "1GiB"},
     async (req, res) => {
       try {
-        await renewPrimusUiSessionIfDue();
-
-        await logWorkflowStep({
-          stepName: "gmail_email_found",
-          stepStatus: "started",
+        const results = await runMailInboxCheck({
+          tenantId: req.query.tenantId || null,
         });
-
-        await writeLog("info", "gmail", "Starting Gmail inbox check");
-
-        const inboxFlowId = crypto.randomUUID ?
-          crypto.randomUUID() :
-          `inbox-${Date.now()}`;
-
-        // Process every active tenant's inbox. A specific tenant can be polled
-        // in isolation with ?tenantId=. Tenants are processed sequentially so a
-        // flooded inbox can't starve the others within a single invocation.
-        let tenants;
-        if (req.query.tenantId) {
-          tenants = [await getTenant(String(req.query.tenantId))];
-        } else {
-          tenants = await getActiveTenants();
-        }
-
-        const results = [];
-        for (const tenant of tenants) {
-          try {
-            const r = await checkGmailInboxForTenant(tenant, inboxFlowId);
-            results.push({tenantId: tenant.tenantId, ...r});
-          } catch (tenantErr) {
-            console.error(
-                `checkGmailInbox tenant ${tenant.tenantId} failed:`,
-                tenantErr);
-            results.push({
-              tenantId: tenant.tenantId,
-              error: tenantErr.message,
-            });
-          }
-        }
-
         return res.json({ok: true, tenants: results});
       } catch (error) {
         console.error("checkGmailInbox error:", error);
@@ -10022,6 +10680,8 @@ exports.checkGmailInbox = onRequest(
       }
     },
 );
+
+exports.checkMailInbox = exports.checkGmailInbox;
 
 /**
  * Clears prior intake state so a Gmail message can be processed again.
@@ -10505,7 +11165,7 @@ async function validateAmountWithPrimus(loadNumber, amount) {
   try {
     let result = await runOnce();
     const transient = !result.ok && result.error &&
-      /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up/i.test(result.error);
+      workflowErrors.isTransientNetworkError(result.error);
     if (transient) {
       await writeLog("warn", "primus",
           "Amount validation fetch failed — retrying once", {
@@ -10513,7 +11173,8 @@ async function validateAmountWithPrimus(loadNumber, amount) {
             amount,
             error: result.error,
           });
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      await new Promise((resolve) => setTimeout(resolve,
+          workflowErrors.TRANSIENT_NETWORK_RETRY_MS));
       result = await runOnce();
     }
     return result;
@@ -10700,7 +11361,9 @@ function readBillToReferenceNumber(booking) {
   if (!party) return null;
   const ref = party.referenceNumber;
   const text = ref != null ? String(ref).trim() : "";
-  return text || null;
+  const bridge = require("./primus-ui-bridge");
+  const clean = bridge._internal.sanitizeBillToReferenceText(text);
+  return clean || null;
 }
 
 /**
@@ -10982,12 +11645,19 @@ brokerCommission.init({
   fetchPrimusBooking,
   checkProfitMargin,
   readCustomerRateFromAcct,
+  isCarrierBillAlreadyEnteredInPrimus,
 });
 
 undeliveredReport.init({
   writeLog,
   saveOutboundEmail,
   primusUiBridge,
+});
+
+dailyActivityReport.init({
+  bigquery,
+  writeLog,
+  saveOutboundEmail,
 });
 
 const innovativePrimus = require("./innovative-primus");
