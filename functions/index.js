@@ -1461,7 +1461,8 @@ exports.sendDailyActivityReport = onRequest(
           ) : null;
         const swapResult = runSwaps ?
           await runWithTenant(tenant, () =>
-            dailyActivityReport.runDailyBrokerSwapReport({tenant, hours, dryRun}),
+            dailyActivityReport.runDailyBrokerSwapReport(
+                {tenant, hours, dryRun}),
           ) : null;
 
         return res.json({
@@ -4583,26 +4584,6 @@ async function getPrimusShipment(loadNumber, proNumber) {
     });
     return {found: false, rate: null, customerEmail: null};
   }
-}
-
-/**
- * Adjusts broker commission in Primus for low-margin loads.
- * Karen Adams is exempt. Others swap to 10% when available; otherwise Lisa
- * is notified and invoicing continues.
- * @param {object} opts
- * @param {string} opts.loadNumber Load number.
- * @param {number} opts.margin Margin percentage.
- * @param {number} [opts.profit] Profit dollars.
- * @param {string} [opts.brokerName] Current sales rep / broker name.
- * @param {string} [opts.carrierName] Carrier name for the email.
- * @param {object} [opts.booking] Primus REST booking when already loaded.
- * @return {Promise<object>}
- */
-async function adjustBrokerCommission(opts) {
-  return brokerCommission.adjustBrokerCommissionForLowMargin({
-    ...(opts || {}),
-    trigger: "invoice_intake",
-  });
 }
 
 /**
