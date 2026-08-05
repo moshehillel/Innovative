@@ -21,7 +21,8 @@ check("Schneider order moved to carrierOrderNumber",
 check("Schneider BOL moved out of PRO",
     schneider.carrierBolNumber, "263645");
 check("Schneider PRO cleared", schneider.proNumber, "");
-check("Schneider broker load cleared", schneider.loadNumber, "");
+check("Schneider billing ref promoted to broker load",
+    schneider.loadNumber, "263645");
 
 // Explicit new-field extraction
 const explicit = lr.normalizeCarrierReferenceFields({
@@ -100,6 +101,44 @@ check("review shows BOL not PRO",
     review["Carrier PRO"], "none");
 check("review shows carrier BOL",
     review["Carrier BOL #"], "263645");
+
+const factorviewSubject = lr.extractLoadHintsFromEmailText(
+    "Invoice 23493 - Load 265708", "");
+check("FactorView subject extracts load 265708",
+    factorviewSubject.loadNumber, "265708");
+
+const emptyInvoice = lr.applyEmailLoadHintsToInvoice({
+  loadNumber: "",
+  proNumber: "",
+  carrierBolNumber: "",
+  carrierName: "KJH Carriers Corp",
+}, "Invoice 23493 - Load 265708", "");
+check("empty invoice gets subject load",
+    emptyInvoice.loadNumber, "265708");
+check("subject load source tagged",
+    emptyInvoice.loadNumberSource, "email_subject");
+
+const keepExisting = lr.applyEmailLoadHintsToInvoice({
+  loadNumber: "264200",
+}, "Invoice 23493 - Load 265708", "");
+check("existing broker load not overwritten",
+    keepExisting.loadNumber, "264200");
+
+const billingRef = lr.normalizeCarrierReferenceFields({
+  loadNumber: "",
+  carrierBolNumber: "265798",
+  carrierName: "KJH Carriers Corp",
+});
+check("billing reference promoted to broker load",
+    billingRef.loadNumber, "265798");
+
+const factorview798 = lr.applyEmailLoadHintsToInvoice({
+  loadNumber: "",
+  carrierBolNumber: "",
+  carrierName: "KJH Carriers Corp",
+}, "Invoice 23494 - Load 265798", "");
+check("FactorView 23494 subject load",
+    factorview798.loadNumber, "265798");
 
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

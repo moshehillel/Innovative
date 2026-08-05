@@ -97,6 +97,13 @@ function normalizeCarrierReferenceFields(aiResult) {
     out.shipmentReference = normalizeShipmentReference(out.carrierOrderNumber);
   }
 
+  // Factored invoices (FactorView, Chugh, Apex): billing reference is often
+  // the broker Primus load when no separate load # field is shown.
+  if (!isValidLoadNumber(out.loadNumber) &&
+      isValidLoadNumber(out.carrierBolNumber)) {
+    out.loadNumber = out.carrierBolNumber;
+  }
+
   return out;
 }
 
@@ -196,6 +203,60 @@ function pickTrackingSearchMatch(rows, hints = {}) {
 }
 
 /**
+ * Extracts a likely load/BOL or PRO from email subject/body text.
+ * @param {string} subject Subject line.
+ * @param {string} body Email body.
+ * @param {object} [hints] Optional AI hints (loadNumberHint, proNumberHint).
+ * @return {object} {loadNumber, proNumber}
+ */
+function extractLoadHintsFromEmailText(subject, body, hints) {
+  const hintLoad = hints && hints.loadNumberHint ?
+    String(hints.loadNumberHint).replace(/\D/g, "") : "";
+  const hintPro = hints && hints.proNumberHint ?
+    String(hints.proNumberHint).trim() : "";
+  if (hintLoad && hintLoad.length >= 5) {
+    return {loadNumber: hintLoad, proNumber: hintPro || null};
+  }
+  const text = `${subject || ""}\n${body || ""}`;
+  const labeled = text.match(
+      /(?:load|bol|b\/l|reference)\s*[#:]?\s*(\d{5,9})/i);
+  if (labeled) {
+    return {loadNumber: labeled[1], proNumber: hintPro || null};
+  }
+  const proLabeled = text.match(
+      /(?:pro|beyond\s*pro)\s*[#:]?\s*([A-Z0-9-]{5,})/i);
+  const digits = text.match(/\b(\d{5,9})\b/);
+  return {
+    loadNumber: digits ? digits[1] : null,
+    proNumber: hintPro || (proLabeled ? proLabeled[1] : null),
+  };
+}
+
+/**
+ * Applies subject/body load hints when PDF extraction left broker load empty.
+ * @param {object} aiResult AI classification row.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @param {object} [hints] Optional AI hints.
+ * @return {object} Copy with loadNumber / proNumber filled when applicable.
+ */
+function applyEmailLoadHintsToInvoice(aiResult, subject, body, hints) {
+  const out = {...(aiResult || {})};
+  const emailHints = extractLoadHintsFromEmailText(subject, body, hints);
+  const hasBrokerLoad = isValidLoadNumber(out.loadNumber);
+
+  if (!hasBrokerLoad && emailHints.loadNumber &&
+      isValidLoadNumber(emailHints.loadNumber)) {
+    out.loadNumber = normalizeLoadNumber(emailHints.loadNumber);
+    out.loadNumberSource = out.loadNumberSource || "email_subject";
+  }
+  if (!out.proNumber && emailHints.proNumber) {
+    out.proNumber = String(emailHints.proNumber).trim();
+  }
+  return out;
+}
+
+/**
  * Human-readable summary of reference fields for ops review emails.
  * @param {object} refs Sanitized reference fields.
  * @return {object} Label → value map.
@@ -220,5 +281,7 @@ module.exports = {
   evaluateLoadCandidate,
   buildPrimusLookupKeys,
   pickTrackingSearchMatch,
+  extractLoadHintsFromEmailText,
+  applyEmailLoadHintsToInvoice,
   carrierReferenceReviewFields,
 };
