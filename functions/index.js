@@ -5,6 +5,7 @@ const admin = require("firebase-admin");
 const {BigQuery} = require("@google-cloud/bigquery");
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
+const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const {PDFDocument, StandardFonts, rgb} = require("pdf-lib");
 const podUtils = require("./pod-utils");
 const {
@@ -1022,7 +1023,7 @@ async function getLastKnownLoadNumber(tenant = DEFAULT_TENANT) {
 }
 
 /** Default OpenAI model for dashboard flow-log summaries. */
-const FLOW_SUMMARY_DEFAULT_MODEL = "gpt-4o-mini";
+const FLOW_SUMMARY_DEFAULT_MODEL = DEFAULT_OPENAI_MODEL;
 const FLOW_SUMMARY_CLAUDE_MODEL = "claude-haiku-4-5";
 
 /**
@@ -4688,9 +4689,14 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Primus (often labeled Load #, Customer Ref, Broker Ref, Reference " +
         "#, Reference Number). It is usually 5–9 digits.",
         "carrierBolNumber is the carrier's Bill of Lading / BOL # when " +
-        "labeled Bill of Lading #, BOL#, Master Bill of Lading, or B/L #. " +
-        "Do NOT put carrier BOL in proNumber or loadNumber unless it is also " +
-        "clearly the broker's Primus load number.",
+        "labeled Bill of Lading #, BOL#, Master Bill of Lading, B/L #, " +
+        "Billing Reference Number, Billing Ref #, or Billing Reference. " +
+        "On factored invoices (FactorView, Chugh Capital, Apex, RTS, etc.) " +
+        "the billing reference is often the broker Primus load — if it is " +
+        "5–9 digits and no separate broker load field is shown, also set " +
+        "loadNumber to that value. " +
+        "Do NOT put carrier BOL in proNumber unless it is a true PRO / " +
+        "freight bill number.",
         "carrierOrderNumber is the carrier's order / shipment ID when " +
         "labeled Order Number, Order #, Shipment ID, or similar (any " +
         "length).",
@@ -4844,6 +4850,51 @@ function withAgentGreeting(html) {
   return `${agentGreetingHtml()}${body}`;
 }
 
+/** Default ops alert recipient when env vars are unset. */
+const LISA_EMAIL_DEFAULT = "Lisa@innovativecarriers.com";
+/** Default system-error inbox when SYSTEM_ERROR_EMAIL is unset. */
+const SYSTEM_ERROR_EMAIL_DEFAULT = "mshglck@gmail.com";
+/** Outbound types that always route to the system-error inbox. */
+const SYSTEM_ERROR_EMAIL_TYPES = new Set([
+  "workflow_failed",
+  "invoice_generation_failed",
+  "stuck_flow",
+]);
+
+/**
+ * Resolves the default ops alert inbox (Lisa / ALERT_EMAIL).
+ * @param {object} tenant Tenant config.
+ * @return {string}
+ */
+function resolveOpsAlertEmail(tenant) {
+  return (tenant && tenant.alertEmail) ||
+    process.env.ALERT_EMAIL ||
+    LISA_EMAIL_DEFAULT;
+}
+
+/**
+ * Resolves the system-error inbox (Advanced Automations).
+ * @return {string}
+ */
+function resolveSystemErrorEmail() {
+  return process.env.SYSTEM_ERROR_EMAIL || SYSTEM_ERROR_EMAIL_DEFAULT;
+}
+
+/**
+ * True when an outbound email should go to the system-error inbox only.
+ * @param {object} email Outbound email payload.
+ * @return {boolean}
+ */
+function isSystemErrorOutboundEmail(email) {
+  if (!email) return false;
+  if (email.systemError === true) return true;
+  if (email.alertCode &&
+    workflowErrors.isSystemAlertCode(email.alertCode, email.alertContext)) {
+    return true;
+  }
+  return SYSTEM_ERROR_EMAIL_TYPES.has(email.type);
+}
+
 /**
  * Persists and sends an outbound email.
  * @param {object} email - Email fields (type, subject, html, to, attachments).
@@ -4857,12 +4908,16 @@ async function saveOutboundEmail(email) {
   const tenant = (email && email.tenant) || currentTenant() || DEFAULT_TENANT;
   let sendResult = null;
   // Customer invoice emails go to the bill-to party; ops alerts use alertEmail.
+  // System errors (automation failures) go to SYSTEM_ERROR_EMAIL only.
   // `forceRecipient` pins delivery to an explicit address (e.g. a designated
   // reviewer for the customer-email approval gate) regardless of type.
+  const defaultRecipient = isSystemErrorOutboundEmail(email) ?
+    resolveSystemErrorEmail() :
+    resolveOpsAlertEmail(tenant);
   const to = ((email.type === "generated_bill" || email.forceRecipient) &&
     email.to) ?
     email.to :
-    (tenant.alertEmail || process.env.ALERT_EMAIL || email.to || "");
+    (defaultRecipient || email.to || "");
   const cc = email.cc || null;
 
   // Brand agent-authored notifications (errors, action-needed, forwards, etc.)
@@ -5751,26 +5806,7 @@ async function maybeBuildPodFromTrailerImages(invoiceId, invoice) {
  * @return {object} {loadNumber, proNumber}
  */
 function extractLoadHintsFromEmail(subject, body, hints) {
-  const hintLoad = hints && hints.loadNumberHint ?
-    String(hints.loadNumberHint).replace(/\D/g, "") : "";
-  const hintPro = hints && hints.proNumberHint ?
-    String(hints.proNumberHint).trim() : "";
-  if (hintLoad && hintLoad.length >= 5) {
-    return {loadNumber: hintLoad, proNumber: hintPro || null};
-  }
-  const text = `${subject || ""}\n${body || ""}`;
-  const labeled = text.match(
-      /(?:load|bol|b\/l|reference)\s*[#:]?\s*(\d{5,9})/i);
-  if (labeled) {
-    return {loadNumber: labeled[1], proNumber: hintPro || null};
-  }
-  const proLabeled = text.match(
-      /(?:pro|beyond\s*pro)\s*[#:]?\s*([A-Z0-9-]{5,})/i);
-  const digits = text.match(/\b(\d{5,9})\b/);
-  return {
-    loadNumber: digits ? digits[1] : null,
-    proNumber: hintPro || (proLabeled ? proLabeled[1] : null),
-  };
+  return loadResolution.extractLoadHintsFromEmailText(subject, body, hints);
 }
 
 /**
@@ -6549,6 +6585,7 @@ const INCOMING_EMAIL_INTENTS = new Set([
   "statement",
   "pod_delivery",
   "pod_request",
+  "quote_request",
   "unknown",
 ]);
 
@@ -6584,7 +6621,7 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "You classify inbound emails for a freight brokerage automation system.",
       "Return ONLY valid JSON with these keys:",
       "- intent: exactly one of carrier_invoice, insurance_premium,",
-      "  statement, pod_delivery, pod_request, unknown",
+      "  statement, pod_delivery, pod_request, quote_request, unknown",
       "- confidence: high, medium, or low",
       "- reasoning: one short sentence",
       "- spreadsheetFilename: if insurance_premium, the filename of the",
@@ -6616,6 +6653,12 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  proof of delivery for a load (usually no invoice PDF attached).",
       "  Examples: \"please send POD for load 264091\", \"need proof of",
       "  delivery for BOL 12345\".",
+      "- quote_request: customer or vendor asks for an LTL freight QUOTE /",
+      "  rate — usually NO carrier invoice PDF. Includes \"please quote\",",
+      "  \"provide quotation\", shipping from/to with weight/class/pallets,",
+      "  Menards PO tables, sales order shipment details, ready date.",
+      "  NOT carrier_invoice even if PDF attached unless it is clearly a",
+      "  freight bill to pay.",
       "- statement: account summary or pay-online notice only — no freight",
       "  invoice PDF to extract (not a carrier Stmt packet of bills)",
       "- unknown: marketing, unrelated, or unclear",
@@ -6672,6 +6715,16 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
 }
 
 /**
+ * Quote inbox automation is off until a dedicated quote mailbox is wired.
+ * Set QUOTE_INBOX_PROCESSING_ENABLED=true to re-enable in processGmailMessage.
+ * @return {boolean}
+ */
+function isQuoteInboxProcessingEnabled() {
+  return String(process.env.QUOTE_INBOX_PROCESSING_ENABLED || "")
+      .toLowerCase() === "true";
+}
+
+/**
  * Processes a Gmail message and ingests it into the invoice workflow.
  * @param {object} gmail - Gmail client instance.
  * @param {object} message - Message metadata.
@@ -6690,6 +6743,7 @@ async function processGmailMessage(
   const messageId = String(message.id || message.gmailMessageId || "");
   let subject = String(options.subject || "");
   let from = String(options.from || "");
+  let to = String(options.to || "");
   const tenant = options.tenant || currentTenant() || DEFAULT_TENANT;
   const isTai = tenant.tms === "tai";
 
@@ -6703,12 +6757,16 @@ async function processGmailMessage(
     const headers = payload.headers || [];
     const subjectHeader = headers.find((h) => h.name === "Subject");
     const fromHeader = headers.find((h) => h.name === "From");
+    const toHeader = headers.find((h) => h.name === "To");
 
     if (!subject) {
       subject = subjectHeader ? subjectHeader.value : "";
     }
     if (!from) {
       from = fromHeader ? fromHeader.value : "";
+    }
+    if (!to) {
+      to = toHeader ? toHeader.value : "";
     }
 
     const emailBody = extractEmailBody(payload);
@@ -6748,6 +6806,7 @@ async function processGmailMessage(
       messageId: messageId,
       subject: subject,
       from: from,
+      to: to,
     });
 
     const alreadyProcessed = await hasEmailBeenProcessed(messageId, tenant);
@@ -7022,6 +7081,51 @@ async function processGmailMessage(
       }
     }
 
+    if (!isTai && isQuoteInboxProcessingEnabled()) {
+      const quoteIntakeMod = require("./quote-intake");
+      if (quoteIntakeMod.looksLikeQuoteRequest(subject, emailBody) &&
+          emailClassification.intent === "unknown") {
+        try {
+          emailClassification = await classifyIncomingEmail(
+              subject, from, emailBody, attachments);
+        } catch (_) {
+          // heuristic fallback below
+        }
+      }
+    }
+
+    if (!isTai && isQuoteInboxProcessingEnabled()) {
+      const quoteAutomation = require("./quote-automation");
+      const quoteIntakeMod = require("./quote-intake");
+      const quoteLooks =
+        emailClassification.intent === "quote_request" ||
+        (emailClassification.intent === "unknown" &&
+          quoteIntakeMod.looksLikeQuoteRequest(subject, emailBody));
+      if (quoteLooks) {
+        try {
+          const quoteResult = await quoteAutomation.processQuoteEmail({
+            messageId,
+            subject,
+            from,
+            emailBody,
+            tenant,
+          });
+          if (quoteResult.handled) {
+            await updateGmailQueueStatus(messageId, "completed", null, {
+              tenant,
+            });
+            return;
+          }
+        } catch (quoteErr) {
+          await writeLog("error", "quote", "Quote request handler failed", {
+            messageId,
+            subject,
+            error: quoteErr.message,
+          });
+        }
+      }
+    }
+
     if (!isTai) {
       const podRequestCandidate = podRequestIntake.looksLikePodRequest(
           subject, emailBody);
@@ -7087,6 +7191,31 @@ async function processGmailMessage(
     }
 
     if (attachments.length === 0) {
+      const quoteIntakeMod = require("./quote-intake");
+      if (!isTai && isQuoteInboxProcessingEnabled() &&
+          quoteIntakeMod.looksLikeQuoteRequest(subject, emailBody)) {
+        try {
+          const quoteAutomation = require("./quote-automation");
+          const quoteResult = await quoteAutomation.processQuoteEmail({
+            messageId,
+            subject,
+            from,
+            emailBody,
+            tenant,
+          });
+          if (quoteResult.handled) {
+            await updateGmailQueueStatus(messageId, "completed", null, {
+              tenant,
+            });
+            return;
+          }
+        } catch (quoteErr) {
+          await writeLog("error", "quote",
+              "Quote handler failed (no attachment path)", {
+                messageId, error: quoteErr.message,
+              });
+        }
+      }
       await writeLog("warn", "gmail",
           "No attachments found, forwarding for review", {
             messageId, subject,
@@ -7892,6 +8021,9 @@ async function processGmailMessage(
       let loadResolvedFrom = null;
       let loadGateFailed = false;
       let loadGateReason = null;
+
+      aiResult = loadResolution.applyEmailLoadHintsToInvoice(
+          aiResult, subject, emailBody);
 
       if (!isTai) {
         const loadResolve = await resolveInvoiceLoadNumber(
@@ -9135,6 +9267,17 @@ exports.gmailOAuthCallback = onRequest(
         const code = req.query.code;
         const providerLabel = mailProvider.providerLabel();
 
+        if (req.query.admin_consent === "True") {
+          return res.send(
+              "<h2>Admin approval complete</h2>" +
+              "<p>Microsoft 365 admin consent was granted for Jerry " +
+              "mail access (read/send on the connected Outlook mailbox).</p>" +
+              "<p>You can close this page. On the Jerry dashboard, click " +
+              "<strong>Connect Outlook</strong> again using the accounting " +
+              "mailbox account — it should work without the admin approval " +
+              "prompt.</p>");
+        }
+
         if (!code) {
           return res.status(400).send(`Missing code from ${providerLabel}.`);
         }
@@ -9156,16 +9299,32 @@ exports.gmailOAuthCallback = onRequest(
 
         const tokens = await mailProvider.exchangeOAuthCode(code);
 
+        let connectedEmail = null;
+        let connectedDisplayName = null;
+        try {
+          const profile = await mailProvider.resolveMailboxProfileFromTokens(
+              tokens, tenant);
+          connectedEmail = profile.email;
+          connectedDisplayName = profile.displayName;
+        } catch (profileErr) {
+          console.warn(
+              "Could not resolve connected mailbox profile:",
+              profileErr.message);
+        }
+
         await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
           tokens: tokens,
           provider: mailProvider.getProvider(),
           tenantId: tenant.tenantId,
+          connectedEmail,
+          connectedDisplayName,
           connectedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
 
+        const mailboxLabel = connectedEmail || tenant.name || tenant.tenantId;
         return res.send(
             `${providerLabel} connected successfully for ` +
-        `${tenant.name || tenant.tenantId}. You can close this page.`);
+            `${mailboxLabel}. You can close this page.`);
       } catch (error) {
         console.error("gmailOAuthCallback error:", error);
         return res.status(500).send(error.message);
@@ -9188,7 +9347,7 @@ exports.outlookOAuthCallback = exports.gmailOAuthCallback;
 function applyDashboardCors(req, res) {
   res.set("Access-Control-Allow-Origin", process.env.DASHBOARD_ORIGIN || "*");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") {
     res.status(204).send("");
     return true;
@@ -9303,6 +9462,25 @@ exports.getGmailStatus = onRequest({invoker: "public"}, async (req, res) => {
     }
 
     const data = gmailDoc.data();
+    let connectedEmail = data.connectedEmail || null;
+    let connectedDisplayName = data.connectedDisplayName || null;
+    if (!connectedEmail && (data.tokens || data.access_token)) {
+      try {
+        const profile = await mailProvider.resolveMailboxProfileFromTokens(
+            data.tokens || data, tenant);
+        connectedEmail = profile.email;
+        connectedDisplayName = profile.displayName;
+        if (connectedEmail) {
+          await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
+            connectedEmail,
+            connectedDisplayName,
+          }, {merge: true});
+        }
+      } catch (profileErr) {
+        console.warn(
+            "getMailStatus profile lookup failed:", profileErr.message);
+      }
+    }
     return res.json({
       ok: true,
       connected: true,
@@ -9310,6 +9488,8 @@ exports.getGmailStatus = onRequest({invoker: "public"}, async (req, res) => {
       tenantId: tenant.tenantId,
       tms: tenant.tms,
       tenantName: tenant.name,
+      connectedEmail,
+      connectedDisplayName,
       connectedAt: data.connectedAt ? data.connectedAt.toDate() : null,
     });
   } catch (error) {
@@ -9950,15 +10130,14 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
 
 /**
  * To + Cc for customer-email approve/reject gate emails.
- * Primary: CUSTOMER_EMAIL_APPROVER_EMAIL or ALERT_EMAIL.
- * Cc: CUSTOMER_EMAIL_APPROVER_CC or LOW_PROFIT_CC_EMAIL (Lisa by default).
+ * Primary: CUSTOMER_EMAIL_APPROVER_EMAIL or ALERT_EMAIL (Lisa by default).
+ * Cc: CUSTOMER_EMAIL_APPROVER_CC only (optional extra recipients).
  * @return {object} to and cc recipient strings.
  */
 function resolveCustomerEmailApproverRecipients() {
   const primaryRaw = process.env.CUSTOMER_EMAIL_APPROVER_EMAIL ||
-    process.env.ALERT_EMAIL || "mshglck@gmail.com";
-  const ccRaw = process.env.CUSTOMER_EMAIL_APPROVER_CC ||
-    process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+    process.env.ALERT_EMAIL || LISA_EMAIL_DEFAULT;
+  const ccRaw = process.env.CUSTOMER_EMAIL_APPROVER_CC || "";
   const primary = [];
   const cc = [];
   const seen = new Set();
@@ -9980,7 +10159,7 @@ function resolveCustomerEmailApproverRecipients() {
   };
   primaryRaw.split(/[,;]/).forEach(addPrimary);
   ccRaw.split(/[,;]/).forEach(addCc);
-  if (!primary.length) addPrimary("mshglck@gmail.com");
+  if (!primary.length) addPrimary(LISA_EMAIL_DEFAULT);
   return {
     to: primary.join(", "),
     cc: cc.length ? cc.join(", ") : null,
@@ -9988,13 +10167,12 @@ function resolveCustomerEmailApproverRecipients() {
 }
 
 /**
- * Recipients for support-chat issue reports (comma-separated env + Lisa CC).
+ * Recipients for support-chat issue reports
+ * (SUPPORT_ISSUE_EMAIL, comma-separated — Advanced Automations only).
  * @return {string} Comma-separated To addresses for MIME.
  */
 function resolveSupportIssueRecipients() {
-  const raw = process.env.SUPPORT_ISSUE_EMAIL || "mshglck@gmail.com";
-  const also = process.env.SUPPORT_ISSUE_CC ||
-    process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+  const raw = process.env.SUPPORT_ISSUE_EMAIL || SYSTEM_ERROR_EMAIL_DEFAULT;
   const recipients = [];
   const seen = new Set();
   const add = (addr) => {
@@ -10006,8 +10184,7 @@ function resolveSupportIssueRecipients() {
     recipients.push(a);
   };
   raw.split(/[,;]/).forEach(add);
-  also.split(/[,;]/).forEach(add);
-  if (!recipients.length) add("mshglck@gmail.com");
+  if (!recipients.length) add(SYSTEM_ERROR_EMAIL_DEFAULT);
   return recipients.join(", ");
 }
 
@@ -10089,7 +10266,7 @@ async function sendSupportIssueEmail({clientName, summary, transcript}) {
 // that a confused user can't run up an unbounded bill.
 const SUPPORT_CHAT_MAX_TURNS = 24;
 const SUPPORT_CHAT_MAX_MESSAGE_LENGTH = 4000;
-const SUPPORT_CHAT_DEFAULT_MODEL = "gpt-4o-mini";
+const SUPPORT_CHAT_DEFAULT_MODEL = DEFAULT_OPENAI_MODEL;
 
 /** Product knowledge injected into the support-chat system prompt. */
 const SUPPORT_CHAT_PRODUCT_KNOWLEDGE =
@@ -10174,9 +10351,9 @@ function getSupportChatOpenAiKey() {
 }
 
 /**
- * Runs one dashboard support-chat turn via OpenAI (cheap model by default).
+ * Runs one dashboard support-chat turn via OpenAI (gpt-5.6-luna by default).
  * Set SUPPORT_CHAT_OPENAI_API_KEY in the functions environment. Optional
- * SUPPORT_CHAT_MODEL overrides the default gpt-4o-mini.
+ * SUPPORT_CHAT_MODEL overrides the default gpt-5.6-luna.
  *
  * @param {object} opts
  * @param {string} opts.clientName Dashboard client display name.
@@ -11694,5 +11871,79 @@ exports.processCtcTaiWorkflow = ctcTai.processCtcTaiWorkflow;
 exports.refreshPrimusUiSession = onSchedule("every 12 hours", async () => {
   if (!primusUiBridge.isManagePhpEnabled()) return;
   await primusUiBridge.renewUiSession();
+});
+
+// --- Quote automation (LTL RFQ → rate shop → dispatcher review) ---
+const quoteAutomation = require("./quote-automation");
+const quoteDashboard = require("./quote-dashboard");
+
+quoteAutomation.init({
+  db,
+  tcol,
+  writeLog,
+  saveOutboundEmail,
+  getPrimusToken,
+});
+
+quoteDashboard.init({
+  applyDashboardCors,
+  resolveDashboardTenant,
+  db,
+  tcol,
+});
+
+exports.getQuoteRules = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteRules);
+exports.applyQuoteRule = onRequest({invoker: "public"},
+    quoteDashboard.handleApplyQuoteRule);
+exports.testQuoteRules = onRequest({invoker: "public"},
+    quoteDashboard.handleTestQuoteRules);
+exports.quoteRulesChat = onRequest({invoker: "public"},
+    quoteDashboard.handleQuoteRulesChat);
+exports.getQuoteAdminConfig = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteAdminConfig);
+exports.getQuoteRequests = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteRequests);
+exports.getQuoteDispatcherData = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteDispatcherData);
+exports.saveQuoteSelection = onRequest({invoker: "public"},
+    quoteDashboard.handleSaveQuoteSelection);
+exports.getQuoteDispatcherProfile = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteDispatcherProfile);
+exports.getQuoteDispatcherInbox = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteDispatcherInbox);
+exports.getQuoteDispatchers = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteDispatchers);
+exports.quoteAdminPage = onRequest({invoker: "public"},
+    quoteDashboard.handleQuoteAdminPage);
+exports.quoteDispatcherPage = onRequest({invoker: "public"},
+    quoteDashboard.handleQuoteDispatcherPage);
+exports.quoteDispatcherHomePage = onRequest({invoker: "public"},
+    quoteDashboard.handleQuoteDispatcherHomePage);
+exports.getQuoteAuthConfig = onRequest({invoker: "public"},
+    quoteDashboard.handleGetQuoteAuthConfig);
+exports.quoteAuthClient = onRequest({invoker: "public"},
+    quoteDashboard.handleQuoteAuthClient);
+exports.processQuoteWorkflow = onRequest({
+  invoker: "public",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+}, async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const body = req.body || {};
+    const result = await quoteAutomation.processQuoteEmail({
+      messageId: body.messageId || `manual-${Date.now()}`,
+      subject: body.subject || "Manual quote",
+      from: body.from || "",
+      emailBody: body.emailBody || body.body || "",
+      tenant,
+    });
+    return res.json({ok: true, ...result});
+  } catch (err) {
+    console.error("processQuoteWorkflow:", err);
+    return res.status(500).json({ok: false, error: err.message});
+  }
 });
 

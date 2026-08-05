@@ -467,10 +467,33 @@ function buildWorkflowAlertEmail(opts) {
   return {subject, html, action};
 }
 
+/**
+ * True when a workflow alert should go to the system-error inbox only
+ * (Advanced Automations), not the ops alert inbox (Lisa).
+ * @param {string} code Catalog code passed to buildWorkflowAlertEmail.
+ * @param {object} [context] Alert context (errorMessage, step, etc.).
+ * @return {boolean}
+ */
+function isSystemAlertCode(code, context) {
+  const c = String(code || "").toUpperCase();
+  const ctx = context || {};
+  switch (c) {
+    case "INVOICE_GENERATION_FAILED":
+    case "WORKFLOW_FAILED":
+    case "STUCK_FLOW":
+      return true;
+    case "UI_BILLING_FAILED":
+      return looksLikeSystemError(ctx.errorMessage, ctx.step);
+    default:
+      return false;
+  }
+}
+
 module.exports = {
   ACTION,
   buildWorkflowAlertEmail,
   buildWorkflowActionButton,
   looksLikeSystemError,
+  isSystemAlertCode,
   isSystemUiBillingStep,
 };

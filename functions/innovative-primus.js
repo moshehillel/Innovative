@@ -387,9 +387,10 @@ async function sendWorkflowAlert(opts) {
   const {req, code, invoiceId, type, context} = opts;
   const baseUrl = `https://${req.get("host")}`;
   const tenantId = (req.body && req.body.tenantId) || null;
+  const alertContext = context || {};
   const alert = workflowErrors.buildWorkflowAlertEmail({
     code,
-    context: context || {},
+    context: alertContext,
     baseUrl,
     invoiceId,
     tenantId,
@@ -399,6 +400,9 @@ async function sendWorkflowAlert(opts) {
     invoiceId,
     subject: alert.subject,
     html: alert.html,
+    alertCode: code,
+    alertContext,
+    systemError: workflowErrors.isSystemAlertCode(code, alertContext),
   });
 }
 
