@@ -4350,16 +4350,37 @@ async function ensureCarrierBillUploadedToPrimus(args) {
 exports.ensureCarrierBillUploadedToPrimus = ensureCarrierBillUploadedToPrimus;
 
 /**
+ * Normalizes Bill To Reference# text (nbsp / mojibake / whitespace).
+ * @param {string|null|undefined} text Raw reference text.
+ * @return {string}
+ */
+function sanitizeBillToReferenceText(text) {
+  return String(text || "")
+      .replace(/\u00a0/g, " ")
+      .replace(/\u00c5/g, " ")
+      .replace(/\u00c2/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
  * True when issued invoice charge lines include the bill-to reference text.
  * @param {Array<object>} charges Invoice charge rows.
  * @param {string} billToReference Bill-to Reference# text.
  * @return {boolean}
  */
 function invoiceChargesIncludeReference(charges, billToReference) {
-  const ref = String(billToReference || "").trim().toLowerCase();
+  const ref = sanitizeBillToReferenceText(billToReference);
   if (!ref) return true;
-  return (Array.isArray(charges) ? charges : []).some((c) =>
-    String(c.description || "").toLowerCase().includes(ref));
+  const refNorm = ref.toLowerCase();
+  const tokens = ref.match(/[A-Z0-9]{6,}/gi) || [];
+  const serial = tokens.sort((a, b) => b.length - a.length)[0] || "";
+  return (Array.isArray(charges) ? charges : []).some((c) => {
+    const desc = sanitizeBillToReferenceText(c.description || "").toLowerCase();
+    if (desc.includes(refNorm)) return true;
+    if (serial && desc.includes(serial.toLowerCase())) return true;
+    return false;
+  });
 }
 
 exports._internal = {
@@ -4402,4 +4423,6 @@ exports._internal = {
   buildInsuranceBillsInfo,
   buildInsuranceActualCostLine,
   buildVendorRefExtraFieldsForBills,
+  sanitizeBillToReferenceText,
+  invoiceChargesIncludeReference,
 };

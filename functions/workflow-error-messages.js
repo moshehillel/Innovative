@@ -489,6 +489,22 @@ function isSystemAlertCode(code, context) {
   }
 }
 
+/** Delay before one retry on transient network errors (ms). */
+const TRANSIENT_NETWORK_RETRY_MS = 3000;
+
+/**
+ * True for timeouts / connection errors worth retrying once.
+ * @param {string|null|undefined} message Error message.
+ * @return {boolean}
+ */
+function isTransientNetworkError(message) {
+  const m = String(message || "").toLowerCase();
+  if (!m) return false;
+  return /timeout|timed out|econnreset|econnrefused|enetunreach|/ +
+    /fetch failed|network error|socket hang up|/ +
+    /status 502|status 503|status 504|aborted/.test(m);
+}
+
 module.exports = {
   ACTION,
   buildWorkflowAlertEmail,
@@ -496,4 +512,6 @@ module.exports = {
   looksLikeSystemError,
   isSystemAlertCode,
   isSystemUiBillingStep,
+  isTransientNetworkError,
+  TRANSIENT_NETWORK_RETRY_MS,
 };
