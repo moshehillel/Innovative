@@ -68,6 +68,9 @@ const ACCESSORIAL_LABEL_PATTERN = new RegExp(
 /** Dollars: Primus re-rate vs carrier invoice is a match within this. */
 const RATE_MATCH_TOLERANCE = 10;
 
+/** Charges at or below this amount are ignored for approval/dispute. */
+const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
+
 /**
  * @param {string} text Raw text.
  * @return {string}
@@ -195,6 +198,125 @@ function isWeightInspectionLabel(label) {
 function sumCharges(charges) {
   return (Array.isArray(charges) ? charges : [])
       .reduce((sum, c) => sum + (Number(c && c.amount) || 0), 0);
+}
+
+/**
+ * @param {string} text Raw label/description text.
+ * @return {string}
+ */
+function normalizeBreakdownText(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Keyword hints for matching invoice charge labels to Primus breakdown rows.
+ * @param {string} label Charge label from the invoice.
+ * @return {string[]}
+ */
+function chargeBreakdownKeywords(label) {
+  const n = normalizeBreakdownText(label);
+  const keys = [];
+  if (/compliance|csf/.test(n)) keys.push("compliance", "csf");
+  if (/reweigh|reclass|weight/.test(n)) {
+    keys.push("reweigh", "weight", "inspection");
+  }
+  if (/liftgate|lumper|detention|appointment/.test(n)) {
+    keys.push("liftgate", "lumper", "detention", "appointment");
+  }
+  return keys;
+}
+
+/**
+ * True when a charge row matches a Primus vendor cost breakdown entry
+ * (amount within 2%, description overlap, or keyword match).
+ * @param {object} charge Charge row {label|type, amount}.
+ * @param {Array<object>} breakdown booking.vendor.breakdown.
+ * @return {boolean}
+ */
+function isChargeInPrimusBreakdown(charge, breakdown) {
+  const rows = Array.isArray(breakdown) ? breakdown : [];
+  const cAmt = Math.abs(Number(charge && charge.amount || 0));
+  const cLabel = normalizeBreakdownText(
+      charge && (charge.label || charge.type));
+  const keywords = chargeBreakdownKeywords(
+      charge && (charge.label || charge.type));
+  return rows.some((b) => {
+    const bAmt = Math.abs(Number(b.total != null ? b.total : b.rate || 0));
+    const bDesc = normalizeBreakdownText(b.description || b.code);
+    const amtClose = cAmt > 0 &&
+      Math.abs(bAmt - cAmt) <= Math.max(0.50, cAmt * 0.02);
+    const descClose = cLabel && bDesc &&
+      (bDesc.includes(cLabel) || cLabel.includes(bDesc));
+    const keywordClose = keywords.length > 0 && keywords.some((kw) =>
+      bDesc.includes(kw));
+    return amtClose || descClose || keywordClose;
+  });
+}
+
+/**
+ * Drops charges at or below minAmount (default $5).
+ * @param {Array<object>} charges Charge rows.
+ * @param {number} [minAmount=5] Ignore charges at or below this amount.
+ * @return {{ignorable: Array<object>, remaining: Array<object>}}
+ */
+function filterIgnorableSmallCharges(charges, minAmount) {
+  const threshold = Number.isFinite(Number(minAmount)) ?
+    Number(minAmount) : MIN_IGNORABLE_CHARGE_AMOUNT;
+  const list = Array.isArray(charges) ? charges : [];
+  const ignorable = [];
+  const remaining = [];
+  for (const c of list) {
+    const amt = Math.abs(Number(c && c.amount || 0));
+    if (amt <= threshold) {
+      ignorable.push(c);
+    } else {
+      remaining.push(c);
+    }
+  }
+  return {ignorable, remaining};
+}
+
+/**
+ * Splits charges into those already on the Primus vendor breakdown vs net-new.
+ * @param {Array<object>} charges Charge rows (should already exclude small).
+ * @param {Array<object>} breakdown booking.vendor.breakdown.
+ * @return {{alreadyInPrimus: Array<object>, notInPrimus: Array<object>}}
+ */
+function partitionChargesByPrimus(charges, breakdown) {
+  const list = Array.isArray(charges) ? charges : [];
+  const alreadyInPrimus = [];
+  const notInPrimus = [];
+  for (const c of list) {
+    if (isChargeInPrimusBreakdown(c, breakdown)) {
+      alreadyInPrimus.push(c);
+    } else {
+      notInPrimus.push(c);
+    }
+  }
+  return {alreadyInPrimus, notInPrimus};
+}
+
+/**
+ * Filters charges for approval/dispute: drops small amounts, then partitions
+ * the remainder against the Primus vendor breakdown.
+ * @param {Array<object>} charges Raw charge rows.
+ * @param {Array<object>|null|undefined} breakdown booking.vendor.breakdown.
+ * @param {number} [minAmount=5] Ignore charges at or below this amount.
+ * @return {object} ignorableSmall, alreadyInPrimus, notInPrimus,
+ *   chargesForAction, skipApproval.
+ */
+function filterChargesForApproval(charges, breakdown, minAmount) {
+  const {ignorable, remaining} = filterIgnorableSmallCharges(
+      charges, minAmount);
+  const {alreadyInPrimus, notInPrimus} = partitionChargesByPrimus(
+      remaining, breakdown);
+  return {
+    ignorableSmall: ignorable,
+    alreadyInPrimus,
+    notInPrimus,
+    chargesForAction: notInPrimus,
+    skipApproval: notInPrimus.length === 0,
+  };
 }
 
 /**
@@ -458,7 +580,8 @@ function chargesHtml(charges) {
  * @param {object} opts baseUrl, invoiceId, tenantId, loadNumber, carrierName,
  *   customerName, invoiceAmount, primusAmount, charges, chargesTotal,
  *   category, freightMismatch, hasCertificate, dispatcherName,
- *   rateValidation (optional W&I re-rate result), customerRate.
+ *   rateValidation (optional W&I re-rate result), customerRate,
+ *   excludedInPrimusCount (optional — charges already on file).
  * @return {{subject: string, html: string}}
  */
 function buildAdditionalChargeApprovalEmail(opts) {
@@ -467,6 +590,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     invoiceAmount, primusAmount, charges, chargesTotal, category,
     freightMismatch, hasCertificate, dispatcherName, rateValidation,
     customerRate,
+    excludedInPrimusCount,
     actionUrl: actionUrlFn,
   } = opts;
 
@@ -576,6 +700,10 @@ function buildAdditionalChargeApprovalEmail(opts) {
     rateHtml +
     `<p><strong>Charges:</strong></p>` +
     chargesHtml(charges) +
+    (Number(excludedInPrimusCount) > 0 ?
+      `<p style="font-size:12px;color:#6b7280"><em>` +
+      `${esc(String(excludedInPrimusCount))} charge(s) already on file ` +
+      `in Primus were excluded from this list.</em></p>` : "") +
     `<hr style="border:none;border-top:1px solid #e5e7eb;margin:18px 0">` +
     `<p><strong>Choose one:</strong></p>` +
     btn("a", "#16a34a",
@@ -861,6 +989,7 @@ module.exports = {
   FOLLOW_UP_STATUS,
   CHARGE_CATEGORY,
   RATE_MATCH_TOLERANCE,
+  MIN_IGNORABLE_CHARGE_AMOUNT,
   LISA_EMAIL,
   mergeLisaOnCc,
   applyAdditionalChargeEmailCc,
@@ -869,6 +998,12 @@ module.exports = {
   isAccessorialLabel,
   displayChargeLabel,
   sumCharges,
+  normalizeBreakdownText,
+  chargeBreakdownKeywords,
+  isChargeInPrimusBreakdown,
+  filterIgnorableSmallCharges,
+  partitionChargesByPrimus,
+  filterChargesForApproval,
   detectFreightMismatch,
   buildRequoteFreightInfo,
   buildRateQueryFromBooking,

@@ -5,6 +5,7 @@
  */
 
 const OpenAI = require("openai");
+const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 
 let deps = {};
 
@@ -370,7 +371,7 @@ async function polishBulletsWithAi(agg, fallbackBullets) {
   const openaiKey = process.env.SUPPORT_CHAT_OPENAI_API_KEY ||
     process.env.OPENAI_API_KEY;
   const model = process.env.DAILY_ACTIVITY_REPORT_MODEL ||
-    process.env.FLOW_SUMMARY_MODEL || "gpt-4o-mini";
+    process.env.FLOW_SUMMARY_MODEL || DEFAULT_OPENAI_MODEL;
   const prompt = [
     "Write an end-of-day operations digest for Jerry (freight billing AI). ",
     "Return ONLY JSON: {\"lines\": [\"...\", ...]}. ",

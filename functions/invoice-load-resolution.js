@@ -14,13 +14,13 @@ function normalizeLoadNumber(loadNumber) {
 }
 
 /**
- * Validates a load number is 5–9 digits.
+ * Validates a load number is exactly 6 digits (Innovative Primus BOL).
  * @param {string|null|undefined} loadNumber Raw load number.
  * @return {boolean} True if valid.
  */
 function isValidLoadNumber(loadNumber) {
   const normalized = normalizeLoadNumber(loadNumber);
-  return /^\d{5,9}$/.test(normalized);
+  return /^\d{6}$/.test(normalized);
 }
 
 /**
@@ -104,6 +104,17 @@ function normalizeCarrierReferenceFields(aiResult) {
     out.loadNumber = out.carrierBolNumber;
   }
 
+  // LTL carriers (e.g. Central Transport) stamp a short account # on every
+  // invoice — not the broker Primus load. Prefer PRO lookup when present.
+  const proDigits = normalizeLoadNumber(out.proNumber);
+  if (out.loadNumber && proDigits.length >= 8 &&
+      /^\d{5}$/.test(out.loadNumber)) {
+    if (!out.carrierOrderNumber) {
+      out.carrierOrderNumber = out.loadNumber;
+    }
+    out.loadNumber = "";
+  }
+
   return out;
 }
 
@@ -124,12 +135,10 @@ function evaluateLoadCandidate(
     return {ok: false, reason: "same_as_pro"};
   }
   const loadNumberInt = Number(normalized);
-  const sameDigitLength = lastKnownLoadNumber === null ? true :
-    String(loadNumberInt).length === String(lastKnownLoadNumber).length;
-  const withinRange = lastKnownLoadNumber === null ? true :
-    (!sameDigitLength || (Number.isFinite(loadNumberInt) &&
-      Math.abs(loadNumberInt - lastKnownLoadNumber) <= 100000));
-  if (!withinRange) {
+  if (lastKnownLoadNumber !== null &&
+      Number.isFinite(lastKnownLoadNumber) &&
+      Number.isFinite(loadNumberInt) &&
+      Math.abs(loadNumberInt - lastKnownLoadNumber) > 100000) {
     return {ok: false, reason: "out_of_range"};
   }
   return {ok: true, loadNumber: normalized, loadNumberInt};
@@ -210,46 +219,29 @@ function pickTrackingSearchMatch(rows, hints = {}) {
  * @return {object} {loadNumber, proNumber}
  */
 function extractLoadHintsFromEmailText(subject, body, hints) {
-  const hintLoad = hints && hints.loadNumberHint ?
-    String(hints.loadNumberHint).replace(/\D/g, "") : "";
   const hintPro = hints && hints.proNumberHint ?
     String(hints.proNumberHint).trim() : "";
-  if (hintLoad && hintLoad.length >= 5) {
-    return {loadNumber: hintLoad, proNumber: hintPro || null};
-  }
   const text = `${subject || ""}\n${body || ""}`;
-  const labeled = text.match(
-      /(?:load|bol|b\/l|reference)\s*[#:]?\s*(\d{5,9})/i);
-  if (labeled) {
-    return {loadNumber: labeled[1], proNumber: hintPro || null};
-  }
   const proLabeled = text.match(
       /(?:pro|beyond\s*pro)\s*[#:]?\s*([A-Z0-9-]{5,})/i);
-  const digits = text.match(/\b(\d{5,9})\b/);
   return {
-    loadNumber: digits ? digits[1] : null,
+    loadNumber: null,
     proNumber: hintPro || (proLabeled ? proLabeled[1] : null),
   };
 }
 
 /**
- * Applies subject/body load hints when PDF extraction left broker load empty.
+ * Applies explicitly labeled PRO hints from email text when PDF left PRO empty.
+ * Never fills loadNumber from subject/body (batch numbers, unlabeled digits).
  * @param {object} aiResult AI classification row.
  * @param {string} subject Email subject.
  * @param {string} body Email body.
  * @param {object} [hints] Optional AI hints.
- * @return {object} Copy with loadNumber / proNumber filled when applicable.
+ * @return {object} Copy with proNumber filled when applicable.
  */
 function applyEmailLoadHintsToInvoice(aiResult, subject, body, hints) {
   const out = {...(aiResult || {})};
   const emailHints = extractLoadHintsFromEmailText(subject, body, hints);
-  const hasBrokerLoad = isValidLoadNumber(out.loadNumber);
-
-  if (!hasBrokerLoad && emailHints.loadNumber &&
-      isValidLoadNumber(emailHints.loadNumber)) {
-    out.loadNumber = normalizeLoadNumber(emailHints.loadNumber);
-    out.loadNumberSource = out.loadNumberSource || "email_subject";
-  }
   if (!out.proNumber && emailHints.proNumber) {
     out.proNumber = String(emailHints.proNumber).trim();
   }

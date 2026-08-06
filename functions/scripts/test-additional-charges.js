@@ -180,5 +180,53 @@ check("accessorial dispute names school delivery",
 check("accessorial dispute uses unauthorized wording",
     accessorialDispute.html.includes("not authorized"), true);
 
+// 5. Small-charge filter and Primus partition
+const breakdown = [
+  {description: "Liftgate Service", total: 75},
+  {description: "Detention", total: 50},
+];
+check("$5 charge ignored",
+    ac.filterIgnorableSmallCharges([{label: "Notify", amount: 5}])
+        .ignorable.length, 1);
+check("$5.01 charge kept",
+    ac.filterIgnorableSmallCharges([{label: "Notify", amount: 5.01}])
+        .remaining.length, 1);
+check("liftgate matched in Primus",
+    ac.isChargeInPrimusBreakdown({label: "Liftgate", amount: 75}, breakdown),
+    true);
+check("unknown charge not in Primus",
+    ac.isChargeInPrimusBreakdown({label: "School delivery", amount: 80},
+        breakdown), false);
+const mixed = ac.filterChargesForApproval([
+  {label: "Notify", amount: 3},
+  {label: "Liftgate", amount: 75},
+  {label: "School delivery", amount: 80},
+], breakdown);
+check("mixed: one small ignored", mixed.ignorableSmall.length, 1);
+check("mixed: one already in Primus", mixed.alreadyInPrimus.length, 1);
+check("mixed: one net-new", mixed.notInPrimus.length, 1);
+check("mixed: skipApproval false", mixed.skipApproval, false);
+const allDone = ac.filterChargesForApproval([
+  {label: "Notify", amount: 4},
+  {label: "Liftgate", amount: 75},
+], breakdown);
+check("all filtered: skip approval", allDone.skipApproval, true);
+check("all filtered: no net-new", allDone.chargesForAction.length, 0);
+
+const emailExcluded = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv123",
+  loadNumber: "264172",
+  carrierName: "Central",
+  invoiceAmount: 550,
+  primusAmount: 430,
+  charges: [{label: "School delivery", amount: 80}],
+  chargesTotal: 80,
+  category: ac.CHARGE_CATEGORY.ACCESSORIAL,
+  excludedInPrimusCount: 2,
+});
+check("email notes excluded Primus charges",
+    emailExcluded.html.includes("2 charge(s) already on file"), true);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

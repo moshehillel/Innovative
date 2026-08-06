@@ -30,11 +30,56 @@ check("RTS with invoice filename not ignored",
     ]));
 check("evaluate eModal",
     adm.evaluateAdministrativeIgnore("", "emodal@x.com", emodalBody, []).ignore);
-check("evaluate RTS NOA",
+check("evaluate RTS NOA with NOA filename",
     adm.evaluateAdministrativeIgnore(
         rtsSubject, "NOA@rtsinc.com", rtsBody,
         [{filename: "NOA.pdf", mimeType: "application/pdf"}]).status ===
-    "rts_noa_ignored");
+    "noa_ignored");
+
+const ithriveSubject =
+  "iThrive Funding - Notice of Assignment for First Family Trucking LLC " +
+  "(MC 1115353) - Please Confirm Receipt";
+const genericNoaPdf = [{filename: "1115.pdf", mimeType: "application/pdf"}];
+check("FactorView iThrive NOA content detected",
+    adm.isNoticeOfAssignmentEmail(
+        ithriveSubject,
+        "iThrive Funding <notification@factorview.com>",
+        "Please confirm receipt of Notice of Assignment"));
+check("generic PDF + NOA not ignored before classification",
+    !adm.evaluateAdministrativeIgnore(
+        ithriveSubject,
+        "notification@factorview.com",
+        "Notice of Assignment",
+        genericNoaPdf).ignore);
+check("generic PDF + NOA ignored after scan finds no invoice",
+    adm.shouldIgnoreNoaOnlyPackage(
+        ithriveSubject,
+        "Notice of Assignment",
+        genericNoaPdf,
+        0));
+check("FactorView invoice from same sender is NOT NOA",
+    !adm.isNoticeOfAssignmentEmail(
+        "Invoice 23493 - Load 265708",
+        "notification@factorview.com",
+        "Please see attached invoice"));
+check("FactorView invoice evaluate not ignored",
+    !adm.evaluateAdministrativeIgnore(
+        "Invoice 23494 - Load 265798",
+        "Chugh Capital, LLC <notification@factorview.com>",
+        "Invoice attached",
+        [{filename: "1116.pdf", mimeType: "application/pdf"}]).ignore);
+check("invoice PDF count blocks NOA ignore even with NOA subject",
+    !adm.shouldIgnoreNoaOnlyPackage(
+        ithriveSubject,
+        "Notice of Assignment",
+        genericNoaPdf,
+        1));
+check("invoice filename blocks NOA ignore",
+    !adm.shouldIgnoreNoaOnlyPackage(
+        ithriveSubject,
+        "Notice of Assignment",
+        [{filename: "carrier_invoice.pdf", mimeType: "application/pdf"}],
+        0));
 
 if (failures) {
   console.error(`\n${failures} test(s) failed`);

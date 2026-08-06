@@ -1679,49 +1679,79 @@ exports.processPrimusWorkflow = onRequest(
               label: c.type,
               amount: c.amount,
             }));
-            const proofTotal = approvedChargeProofFiles
-                .reduce((sum, c) => sum + (Number(c.amount) || 0), 0);
 
-            await logWorkflowStep({
-              invoiceId,
-              stepName: "extra_charges_held_for_review",
-              stepStatus: "failed",
-              reason: "Extra charges require A/B/C/D approval before invoicing",
-              input: {approvedChargeProofFiles, approvedChargesTotal},
-              error: "EXTRA_CHARGES_PENDING_REVIEW",
-            });
+            let bookingBreakdown = [];
+            try {
+              const bookingForProof =
+                await fetchPrimusBooking(invoice.loadNumber);
+              bookingBreakdown = bookingForProof &&
+                bookingForProof.vendor &&
+                Array.isArray(bookingForProof.vendor.breakdown) ?
+                bookingForProof.vendor.breakdown : [];
+            } catch (_) {
+              // Booking optional — treat all as net-new if unavailable.
+            }
+            const filteredProof =
+              additionalChargesMod.filterChargesForApproval(
+                  proofChargeRows, bookingBreakdown);
 
-            await invoiceDoc.ref.update({
-              additionalCharge: {
-                status: "pending_approval",
-                source: "proofed_charges",
-                category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
-                charges: proofChargeRows,
-                amount: proofTotal,
-                approved: false,
-                decision: null,
-              },
-              decisionStage: "additional_charge_pending_approval",
-              decisionReason:
+            if (filteredProof.skipApproval) {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "extra_charges_filtered",
+                stepStatus: "completed",
+                reason:
+                  "Proofed charges already in Primus or below $5 threshold",
+                input: {
+                  ignoredSmall: filteredProof.ignorableSmall,
+                  alreadyInPrimus: filteredProof.alreadyInPrimus,
+                },
+              });
+            } else {
+              const actionCharges = filteredProof.chargesForAction;
+              const proofTotal = additionalChargesMod.sumCharges(actionCharges);
+
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "extra_charges_held_for_review",
+                stepStatus: "failed",
+                reason: "Extra charges require A/B/C/D approval " +
+                  "before invoicing",
+                input: {approvedChargeProofFiles, approvedChargesTotal},
+                error: "EXTRA_CHARGES_PENDING_REVIEW",
+              });
+
+              await invoiceDoc.ref.update({
+                additionalCharge: {
+                  status: "pending_approval",
+                  source: "proofed_charges",
+                  category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
+                  charges: actionCharges,
+                  amount: proofTotal,
+                  approved: false,
+                  decision: null,
+                },
+                decisionStage: "additional_charge_pending_approval",
+                decisionReason:
                 "Extra charges verified — awaiting A/B/C/D decision",
-              processingLock: false,
-              finalWorkflowStatus: "additional_charge_pending_approval",
-              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
+                processingLock: false,
+                finalWorkflowStatus: "additional_charge_pending_approval",
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
 
-            const dispatcherForEmail = await (async () => {
-              try {
-                const bridge = require("./primus-ui-bridge");
-                return await bridge.resolveDispatcherEmail({
-                  loadNumber: invoice.loadNumber,
-                  fetchBooking: fetchPrimusBooking,
-                });
-              } catch (_) {
-                return {ok: false};
-              }
-            })();
+              const dispatcherForEmail = await (async () => {
+                try {
+                  const bridge = require("./primus-ui-bridge");
+                  return await bridge.resolveDispatcherEmail({
+                    loadNumber: invoice.loadNumber,
+                    fetchBooking: fetchPrimusBooking,
+                  });
+                } catch (_) {
+                  return {ok: false};
+                }
+              })();
 
-            const approvalEmail =
+              const approvalEmail =
             additionalChargesMod.buildAdditionalChargeApprovalEmail({
               baseUrl: `https://${req.get("host")}`,
               invoiceId,
@@ -1731,19 +1761,20 @@ exports.processPrimusWorkflow = onRequest(
               customerName: invoice.customerName || null,
               invoiceAmount: invoice.invoiceAmount,
               primusAmount: invoice.primusAmount || null,
-              charges: proofChargeRows,
+              charges: actionCharges,
               chargesTotal: proofTotal,
               category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
               dispatcherName: dispatcherForEmail.displayName ||
                 dispatcherForEmail.userName || null,
               customerRate: invoice.customerRate || null,
+              excludedInPrimusCount: filteredProof.alreadyInPrimus.length,
             });
 
-            const podFollowupMod = require("./pod-followup");
-            const approver =
+              const podFollowupMod = require("./pod-followup");
+              const approver =
             process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
             podFollowupMod.SARAH_EMAIL;
-            const approvalPayload =
+              const approvalPayload =
             additionalChargesMod.applyAdditionalChargeEmailCc({
               type: "additional_charge_approval",
               invoiceId,
@@ -1756,25 +1787,26 @@ exports.processPrimusWorkflow = onRequest(
                 approver.toLowerCase()) ?
                 dispatcherForEmail.email : undefined,
             });
-            await saveOutboundEmail(approvalPayload);
+              await saveOutboundEmail(approvalPayload);
 
-            await additionalChargesMod.createFollowUp(db, {
-              loadNumber: invoice.loadNumber,
-              carrierName: invoice.carrierName,
-              customerName: invoice.customerName || null,
-              invoiceId,
-              tenantId: (req.body && req.body.tenantId) || null,
-              category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
-              charges: proofChargeRows,
-              chargesTotal: proofTotal,
-              invoiceAmount: invoice.invoiceAmount,
-              status: additionalChargesMod.FOLLOW_UP_STATUS.PENDING_APPROVAL,
-            });
+              await additionalChargesMod.createFollowUp(db, {
+                loadNumber: invoice.loadNumber,
+                carrierName: invoice.carrierName,
+                customerName: invoice.customerName || null,
+                invoiceId,
+                tenantId: (req.body && req.body.tenantId) || null,
+                category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
+                charges: actionCharges,
+                chargesTotal: proofTotal,
+                invoiceAmount: invoice.invoiceAmount,
+                status: additionalChargesMod.FOLLOW_UP_STATUS.PENDING_APPROVAL,
+              });
 
-            return res.json({
-              ok: false,
-              error: "EXTRA_CHARGES_PENDING_REVIEW",
-            });
+              return res.json({
+                ok: false,
+                error: "EXTRA_CHARGES_PENDING_REVIEW",
+              });
+            }
           }
 
           // PRO Number Handling - use Primus response proNumber
