@@ -33,7 +33,7 @@ QUOTE_AUTH_ALLOWED_DOMAINS=innovativecarriers.com
 
 1. Firebase Auth user **created by admin** (no register on the dashboard)
 2. Email domain must match `QUOTE_AUTH_ALLOWED_DOMAINS` (default `@innovativecarriers.com`)
-3. Email must exist in Firestore **`quoteDispatchers`** roster (Izzy, Diego, QD seeded by default)
+3. Email must exist in Firestore **`quoteDispatchers`** roster (Leo, Barry, Izzy, Leah, Diego, QD seeded by default)
 
 The Firebase user email must match the dispatcher roster email.
 

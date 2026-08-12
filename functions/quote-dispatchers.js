@@ -8,12 +8,33 @@ const admin = require("firebase-admin");
 
 const DEFAULT_DISPATCHERS = [
   {
+    id: "leo",
+    name: "Leo",
+    email: "leo@innovativecarriers.com",
+    active: true,
+    signature: "Leo\nInnovative Carriers",
+  },
+  {
+    id: "barry",
+    name: "Barry",
+    email: "barry@innovativecarriers.com",
+    active: true,
+    signature: "Barry Schlesinger\nInnovative Carriers",
+  },
+  {
     id: "izzy",
     name: "Izzy",
-    email: "Izzy@innovativecarriers.com",
+    email: "izzy@innovativecarriers.com",
     phone: "718-218-7245 x211",
     active: true,
     signature: "Izzy\nQuotation Specialist\nT: 718-218-7245 x211",
+  },
+  {
+    id: "leah",
+    name: "Leah",
+    email: "leah@innovativecarriers.com",
+    active: true,
+    signature: "Leah\nInnovative Carriers",
   },
   {
     id: "diego",
