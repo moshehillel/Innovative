@@ -492,6 +492,9 @@ function isSystemAlertCode(code, context) {
 /** Delay before one retry on transient network errors (ms). */
 const TRANSIENT_NETWORK_RETRY_MS = 3000;
 
+/** Primus REST reads retried on transient 5xx / rate limits. */
+const PRIMUS_API_RETRY_ATTEMPTS = 3;
+
 /**
  * True for timeouts / connection errors worth retrying once.
  * @param {string|null|undefined} message Error message.
@@ -505,6 +508,23 @@ function isTransientNetworkError(message) {
     /status 502|status 503|status 504|aborted/.test(m);
 }
 
+/**
+ * True when a Primus REST response should be retried (transient server fault).
+ * @param {number} status HTTP status.
+ * @param {string|null|undefined} [message] Error body or message.
+ * @return {boolean}
+ */
+function isTransientPrimusApiError(status, message) {
+  const code = Number(status);
+  if (code === 429 || code === 500 || code === 502 || code === 503 ||
+      code === 504) {
+    return true;
+  }
+  const m = String(message || "").toLowerCase();
+  return /internal server error|service unavailable|bad gateway|/ +
+    /gateway timeout|too many requests/.test(m);
+}
+
 module.exports = {
   ACTION,
   buildWorkflowAlertEmail,
@@ -513,5 +533,7 @@ module.exports = {
   isSystemAlertCode,
   isSystemUiBillingStep,
   isTransientNetworkError,
+  isTransientPrimusApiError,
   TRANSIENT_NETWORK_RETRY_MS,
+  PRIMUS_API_RETRY_ATTEMPTS,
 };

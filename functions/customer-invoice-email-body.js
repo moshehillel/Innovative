@@ -1,5 +1,7 @@
 "use strict";
 
+const {innovativeCarriersLogoHtml} = require("./email-branding");
+
 const BRAND_BLUE = "#174a94";
 const BORDER = "#d1d5db";
 const ROW_ALT = "#f8fafc";
@@ -71,9 +73,9 @@ function customerInvoiceEmailSignatureHtml() {
         "https://secure.cardknox.com/innovativecarriers</a>",
     ) +
     "</table>" +
-    `<p style="margin:18px 0 0;font-size:15px;font-weight:700;` +
-    `color:${BRAND_BLUE};letter-spacing:.04em">` +
-    "WE&#39;LL GET IT THERE</p>" +
+    `<div style="margin:18px 0 0">` +
+    innovativeCarriersLogoHtml({mode: "data", maxWidth: 280}) +
+    "</div>" +
     "</div>"
   );
 }

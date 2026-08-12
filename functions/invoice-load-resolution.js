@@ -48,6 +48,29 @@ function normalizeShipmentReference(value) {
   return String(value || "").trim().replace(/\s+/g, " ");
 }
 
+/** PRO tokens that are label/status text, not carrier PRO numbers. */
+const PRO_GARBAGE_WORDS = new Set([
+  "vided", "provided", "provide", "none", "null", "na", "n/a",
+  "not", "available", "pending", "attached", "invoice", "number",
+  "ref", "reference", "see", "below", "tbd", "unknown",
+]);
+
+/**
+ * True when a value looks like a real carrier PRO / freight bill number.
+ * @param {string|null|undefined} value Raw PRO candidate.
+ * @return {boolean}
+ */
+function isPlausibleCarrierPro(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  const compact = raw.toLowerCase().replace(/[\s._-]/g, "");
+  if (PRO_GARBAGE_WORDS.has(compact)) return false;
+  if (/^(notprovided|notavailable|seebelow|na)$/i.test(compact)) return false;
+  const digits = raw.replace(/\D/g, "");
+  if (digits.length >= 4) return true;
+  return /^[A-Z0-9-]{5,}$/i.test(raw);
+}
+
 /**
  * Separates broker load, carrier BOL, order, PO, PRO, and shipment ref fields.
  * @param {object} aiResult AI classification row.
@@ -76,16 +99,33 @@ function normalizeCarrierReferenceFields(aiResult) {
     out.proNumber = "";
   }
 
-  // Alphanumeric shipment ref mis-placed as broker load (e.g. FBA19FXCCFZT).
-  if (out.loadNumber && !isValidLoadNumber(out.loadNumber)) {
-    if (looksLikeShipmentReference(out.loadNumber)) {
-      if (!out.shipmentReference) {
-        out.shipmentReference = normalizeShipmentReference(out.loadNumber);
-      }
-    } else if (!out.carrierOrderNumber) {
+  // LTL carriers (e.g. Central Transport) stamp a short account # on every
+  // invoice — not the broker Primus load. Prefer PRO lookup when present.
+  const proDigits = normalizeLoadNumber(out.proNumber);
+  if (out.loadNumber && proDigits.length >= 8 &&
+      /^\d{5}$/.test(out.loadNumber)) {
+    if (!out.carrierOrderNumber) {
       out.carrierOrderNumber = out.loadNumber;
     }
     out.loadNumber = "";
+  }
+
+  // Alphanumeric shipment ref mis-placed as broker load (e.g. FBA19FXCCFZT).
+  if (out.loadNumber && !isValidLoadNumber(out.loadNumber)) {
+    const expandedLoad = expandDroppedLeadingTwo(out.loadNumber);
+    if (expandedLoad) {
+      out.loadNumber = expandedLoad;
+    } else if (looksLikeShipmentReference(out.loadNumber)) {
+      if (!out.shipmentReference) {
+        out.shipmentReference = normalizeShipmentReference(out.loadNumber);
+      }
+      out.loadNumber = "";
+    } else {
+      if (!out.carrierOrderNumber) {
+        out.carrierOrderNumber = out.loadNumber;
+      }
+      out.loadNumber = "";
+    }
   } else if (out.carrierOrderNumber &&
       out.loadNumber === out.carrierOrderNumber) {
     out.loadNumber = "";
@@ -99,20 +139,17 @@ function normalizeCarrierReferenceFields(aiResult) {
 
   // Factored invoices (FactorView, Chugh, Apex): billing reference is often
   // the broker Primus load when no separate load # field is shown.
-  if (!isValidLoadNumber(out.loadNumber) &&
-      isValidLoadNumber(out.carrierBolNumber)) {
-    out.loadNumber = out.carrierBolNumber;
+  if (!isValidLoadNumber(out.loadNumber) && out.carrierBolNumber) {
+    const bolExpanded = expandDroppedLeadingTwo(out.carrierBolNumber);
+    if (isValidLoadNumber(out.carrierBolNumber)) {
+      out.loadNumber = out.carrierBolNumber;
+    } else if (bolExpanded) {
+      out.loadNumber = bolExpanded;
+    }
   }
 
-  // LTL carriers (e.g. Central Transport) stamp a short account # on every
-  // invoice — not the broker Primus load. Prefer PRO lookup when present.
-  const proDigits = normalizeLoadNumber(out.proNumber);
-  if (out.loadNumber && proDigits.length >= 8 &&
-      /^\d{5}$/.test(out.loadNumber)) {
-    if (!out.carrierOrderNumber) {
-      out.carrierOrderNumber = out.loadNumber;
-    }
-    out.loadNumber = "";
+  if (out.proNumber && !isPlausibleCarrierPro(out.proNumber)) {
+    out.proNumber = "";
   }
 
   return out;
@@ -123,10 +160,12 @@ function normalizeCarrierReferenceFields(aiResult) {
  * @param {string} candidate Normalized load digits.
  * @param {string} normalizedProNumber PRO digits (must differ from load).
  * @param {number|null} lastKnownLoadNumber Recent Primus load, if known.
+ * @param {object} [opts] Options.
+ * @param {boolean} [opts.skipRange] Skip lastKnown range gate (Primus hit).
  * @return {object} Result with ok flag and optional loadNumber.
  */
 function evaluateLoadCandidate(
-    candidate, normalizedProNumber, lastKnownLoadNumber) {
+    candidate, normalizedProNumber, lastKnownLoadNumber, opts) {
   const normalized = normalizeLoadNumber(candidate);
   if (!isValidLoadNumber(normalized)) {
     return {ok: false, reason: "invalid_format"};
@@ -135,13 +174,27 @@ function evaluateLoadCandidate(
     return {ok: false, reason: "same_as_pro"};
   }
   const loadNumberInt = Number(normalized);
-  if (lastKnownLoadNumber !== null &&
+  const skipRange = !!(opts && opts.skipRange);
+  if (!skipRange &&
+      lastKnownLoadNumber !== null &&
       Number.isFinite(lastKnownLoadNumber) &&
       Number.isFinite(loadNumberInt) &&
       Math.abs(loadNumberInt - lastKnownLoadNumber) > 100000) {
     return {ok: false, reason: "out_of_range"};
   }
   return {ok: true, loadNumber: normalized, loadNumberInt};
+}
+
+/**
+ * OCR/AI sometimes drops the leading "2" from 269xxx Innovative Primus loads.
+ * @param {string|null|undefined} value Raw reference digits.
+ * @return {string|null} Expanded 6-digit load, or null.
+ */
+function expandDroppedLeadingTwo(value) {
+  const digits = normalizeLoadNumber(value);
+  if (!/^\d{5}$/.test(digits)) return null;
+  const expanded = "2" + digits;
+  return isValidLoadNumber(expanded) ? expanded : null;
 }
 
 /**
@@ -163,8 +216,17 @@ function buildPrimusLookupKeys(refs) {
     if (keys.some((k) => k.ref === value)) return;
     keys.push({ref: value, label});
   };
+  const addLeadingTwoExpansion = (ref, label) => {
+    const expanded = expandDroppedLeadingTwo(ref);
+    if (!expanded) return;
+    addDigits(expanded, label);
+  };
+  addDigits(refs.loadNumber, "broker_load");
+  addLeadingTwoExpansion(refs.loadNumber, "broker_load_leading2");
   addDigits(refs.proNumber, "pro");
   addDigits(refs.carrierBolNumber, "carrier_bol");
+  addLeadingTwoExpansion(refs.carrierOrderNumber, "broker_load_leading2");
+  addLeadingTwoExpansion(refs.carrierBolNumber, "carrier_bol_leading2");
   addText(refs.shipmentReference, "shipment_ref");
   addText(refs.carrierOrderNumber, "carrier_order");
   addDigits(refs.poNumber, "po");
@@ -267,10 +329,12 @@ function carrierReferenceReviewFields(refs) {
 module.exports = {
   normalizeLoadNumber,
   isValidLoadNumber,
+  isPlausibleCarrierPro,
   looksLikeShipmentReference,
   normalizeShipmentReference,
   normalizeCarrierReferenceFields,
   evaluateLoadCandidate,
+  expandDroppedLeadingTwo,
   buildPrimusLookupKeys,
   pickTrackingSearchMatch,
   extractLoadHintsFromEmailText,

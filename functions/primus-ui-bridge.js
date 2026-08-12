@@ -34,22 +34,32 @@ const {
   defaultPrimusEmailDocsBody,
   appendCustomerInvoiceEmailSignature,
 } = require("./customer-invoice-email-body");
+const workflowErrors = require("./workflow-error-messages");
 
 const admin = require("firebase-admin");
 
 const SESSION_DOC = "system/primusUiSession";
 const DEFAULT_SESSION_TTL_HOURS = 24;
 const DEFAULT_RENEW_BEFORE_HOURS = 2;
+const MANAGE_POST_NETWORK_ATTEMPTS = 3;
 
 let db;
 let writeLog;
+let getPrimusToken;
 
 /**
- * @param {object} bundle { db, writeLog }
+ * @param {object} bundle { db, writeLog, getPrimusToken }
  * @return {void}
  */
 function init(bundle) {
-  ({db, writeLog} = bundle);
+  ({db, writeLog, getPrimusToken} = bundle);
+  if (getPrimusToken) {
+    try {
+      require("./quote-rate-shop").init({getPrimusToken});
+    } catch (_) {
+      // quote-rate-shop optional
+    }
+  }
 }
 exports.init = init;
 
@@ -296,7 +306,34 @@ async function managePhpPost(params, retryOnAuthFail = true) {
     return {ok: resp.ok, status: resp.status, text, json};
   };
 
-  let result = await doPost(cookie);
+  const postWithNetworkRetry = async (sessionCookie) => {
+    let lastErr;
+    for (let attempt = 1; attempt <= MANAGE_POST_NETWORK_ATTEMPTS; attempt++) {
+      try {
+        return await doPost(sessionCookie);
+      } catch (err) {
+        lastErr = err;
+        const msg = err && err.message ? err.message : String(err);
+        if (attempt >= MANAGE_POST_NETWORK_ATTEMPTS ||
+            !workflowErrors.isTransientNetworkError(msg)) {
+          throw err;
+        }
+        if (writeLog) {
+          await writeLog("warn", "primus",
+              "manage.php network error — retrying", {
+                action: params && params.action,
+                attempt,
+                error: msg,
+              });
+        }
+        await new Promise((resolve) => setTimeout(resolve,
+            workflowErrors.TRANSIENT_NETWORK_RETRY_MS));
+      }
+    }
+    throw lastErr;
+  };
+
+  let result = await postWithNetworkRetry(cookie);
   const looksLikeAuthFailure =
     result.status === 401 ||
     result.status === 403 ||
@@ -304,7 +341,7 @@ async function managePhpPost(params, retryOnAuthFail = true) {
 
   if (looksLikeAuthFailure && retryOnAuthFail) {
     cookie = await loginUi();
-    result = await doPost(cookie);
+    result = await postWithNetworkRetry(cookie);
   }
 
   return result;
@@ -859,11 +896,338 @@ async function getBookingSalesRep(recordId) {
 exports.getBookingSalesRep = getBookingSalesRep;
 
 /**
- * Swaps a load's sales rep to the broker's 10% variant via saveBookingSalesRep.
+ * @param {*} v Raw value.
+ * @return {string}
+ */
+function manageStr(v) {
+  if (v == null) return "";
+  return String(v);
+}
+
+/**
+ * @param {*} v Raw value.
+ * @param {number} [fallback=0]
+ * @return {number}
+ */
+function manageNum(v, fallback = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * @param {*} v Raw value.
+ * @return {boolean}
+ */
+function manageBool(v) {
+  return v === true || v === 1 || v === "1" || v === "true";
+}
+
+/**
+ * @param {*} v Raw value.
+ * @return {string}
+ */
+function manageNullableTime(v) {
+  return manageStr(v);
+}
+
+/**
+ * @param {*} v Raw value.
+ * @return {string}
+ */
+function manageUiBool(v) {
+  return manageBool(v) ? "true" : "false";
+}
+
+/**
+ * Formats a booking date for saveBooking (UI sends YYYY-MM-DD).
+ * @param {*} v Primary date from getBooking.
+ * @param {*} [fallback] Alternate source (e.g. dateSaved, dateDelivered).
+ * @return {string}
+ */
+function manageSaveDate(v, fallback) {
+  const candidates = [v, fallback];
+  for (const raw of candidates) {
+    const s = manageStr(raw).trim();
+    if (!s || s.startsWith("0000-00-00")) continue;
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
+    const us = s.match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
+    if (us) return `20${us[3]}-${us[1]}-${us[2]}`;
+    return s;
+  }
+  return "";
+}
+
+/**
+ * Rated/invoiced bookings carry quoteIdActual or totalActual on getBooking.
+ * @param {object} b bookingData from getBooking.
+ * @return {boolean}
+ */
+function bookingHasRatedActual(b) {
+  if (!b) return false;
+  const qid = b.quoteIdActual;
+  if (qid != null && String(qid).trim() !== "" && String(qid) !== "0") {
+    return true;
+  }
+  const total = b.totalActual;
+  return total != null && String(total).trim() !== "" && String(total) !== "0";
+}
+
+/**
+ * @param {object} b bookingData from getBooking.
+ * @return {object}
+ */
+function buildRatedActualFields(b) {
+  const src = b || {};
+  return {
+    linearFeet: manageStr(src.linearFeet),
+    totalDensityEstimated: manageStr(src.totalDensityEstimated),
+    UOMActual: manageStr(src.UOMActual || src.UOM || "US"),
+    piecesActual: manageStr(src.piecesActual),
+    totalWeightActual: manageStr(src.totalWeightActual),
+    totalDensityActual: manageStr(src.totalDensityActual),
+    accessorialsActual: manageStr(src.accessorialsActual || "[]"),
+    accessorialsLTLActual: manageStr(src.accessorialsLTLActual || "[]"),
+    carrierIdActual: manageStr(src.carrierIdActual),
+    carrierTypeIdActual: manageStr(src.carrierTypeIdActual),
+    quoteIdActual: manageStr(src.quoteIdActual),
+    carrierNameActual: manageStr(src.carrierNameActual),
+    providerCarrierActual: manageStr(src.providerCarrierActual),
+    carrierSCACActual: manageStr(src.carrierSCACActual),
+    quoteNumberActual: manageStr(src.quoteNumberActual),
+    extraInfoActual: manageStr(src.extraInfoActual),
+    serviceLevelActual: manageStr(src.serviceLevelActual),
+    serviceLevelCodeActual: manageStr(src.serviceLevelCodeActual),
+    transitDaysActual: manageStr(src.transitDaysActual),
+    totalActual: manageStr(src.totalActual),
+    carrierBOLNotesActual: manageStr(
+        src.carrierBOLNotesActual || src.BOLNotes || src.carrierBOLNotes),
+    warningsActual: manageStr(src.warningsActual ?? src.warnings),
+    quoteBillToActual: manageStr(src.quoteBillToActual || "[]"),
+    breakdownActual: manageStr(src.breakdownActual),
+    customAccessorialsBreakdownActual:
+      manageStr(src.customAccessorialsBreakdownActual || "[]"),
+    saveActualQuote: manageUiBool(src.saveActualQuote),
+  };
+}
+
+/**
+ * Fetches full booking form data from manage.php getBooking.
+ * @param {string|number} bookingId manage.php booking id.
+ * @return {Promise<object>}
+ */
+async function fetchManageBooking(bookingId) {
+  if (!bookingId) return {ok: false, error: "missing bookingId"};
+  const result = await managePhpPost({
+    action: "getBooking",
+    id: String(bookingId),
+  });
+  const booking = result.json && result.json.bookingData;
+  if (!isManageSuccess(result.json) || !booking) {
+    return {
+      ok: false,
+      error: (result.json && result.json.message) ||
+        result.text ||
+        "getBooking failed",
+      response: result.json || null,
+    };
+  }
+  return {ok: true, booking};
+}
+exports.fetchManageBooking = fetchManageBooking;
+
+/**
+ * Builds manage.php saveBooking params from getBooking data + sales rep.
+ * @param {object} booking bookingData from getBooking.
+ * @param {object} repRow Target corporate sales person row.
+ * @return {object}
+ */
+function buildSaveBookingParams(booking, repRow) {
+  const b = booking || {};
+  const repId = String(repRow.id || repRow.salesPersonId || "");
+  const repName = repRow.display ||
+    `${repRow.firstName || ""} ${repRow.lastName || ""}`.trim();
+  const rated = bookingHasRatedActual(b);
+  const customerSlId = b.billTo === "T" ?
+    manageStr(b.thirdPartyShippingLocationId) :
+    manageStr(b.thirdPartyShippingLocationId || b.customerId);
+
+  const params = {
+    origin: "BOLForm",
+    action: "saveBooking",
+    actionEnvironment: "Primus",
+    editedFrom: "Trackings Lookup Primus",
+    bookingId: manageStr(b.id),
+    vendorQuoteId: manageStr(b.vendorQuoteId || "0"),
+    shipperName: manageStr(b.shipperName),
+    shipperReferenceNumber: manageStr(b.shipperReferenceNumber),
+    shipperAddress1: manageStr(b.shipperAddress1),
+    shipperAddress2: manageStr(b.shipperAddress2),
+    shipperCountry: manageStr(b.shipperCountry),
+    shipperUNLOCode: manageStr(b.shipperUNLOCode),
+    shipperUNLOCodeCity: manageStr(b.shipperUNLOCodeCity),
+    shipperZipcode: manageStr(b.shipperZipcode),
+    shipperCity: manageStr(b.shipperCity),
+    shipperState: manageStr(b.shipperState),
+    shipperCityAlias: manageStr(b.shipperCityAlias),
+    shipperIATA: manageStr(b.shipperIATA),
+    shipperShippingLocationId: manageStr(b.shipperShippingLocationId),
+    shipperPhone: manageStr(b.shipperPhone),
+    shipperFax: manageStr(b.shipperFax),
+    shipperEmail: manageStr(b.shipperEmail),
+    shipperContact: manageStr(b.shipperContact),
+    shipperContactPhone: manageStr(b.shipperContactPhone),
+    consigneeName: manageStr(b.consigneeName),
+    consigneeReferenceNumber: manageStr(b.consigneeReferenceNumber),
+    consigneeAddress1: manageStr(b.consigneeAddress1),
+    consigneeAddress2: manageStr(b.consigneeAddress2),
+    consigneeCountry: manageStr(b.consigneeCountry),
+    consigneeUNLOCode: manageStr(b.consigneeUNLOCode),
+    consigneeUNLOCodeCity: manageStr(b.consigneeUNLOCodeCity),
+    consigneeZipcode: manageStr(b.consigneeZipcode),
+    consigneeCity: manageStr(b.consigneeCity),
+    consigneeState: manageStr(b.consigneeState),
+    consigneeCityAlias: manageStr(b.consigneeCityAlias),
+    consigneeIATA: manageStr(b.consigneeIATA),
+    consigneeShippingLocationId: manageStr(b.consigneeShippingLocationId),
+    consigneePhone: manageStr(b.consigneePhone),
+    consigneeFax: manageStr(b.consigneeFax),
+    consigneeEmail: manageStr(b.consigneeEmail),
+    consigneeContact: manageStr(b.consigneeContact),
+    consigneeContactPhone: manageStr(b.consigneeContactPhone),
+    thirdPartyName: manageStr(b.thirdPartyName),
+    thirdPartyReferenceNumber: manageStr(b.thirdPartyReferenceNumber),
+    thirdPartyAddress1: manageStr(b.thirdPartyAddress1),
+    thirdPartyAddress2: manageStr(b.thirdPartyAddress2),
+    thirdPartyCountry: manageStr(b.thirdPartyCountry),
+    thirdPartyZipcode: manageStr(b.thirdPartyZipcode),
+    thirdPartyCity: manageStr(b.thirdPartyCity),
+    thirdPartyState: manageStr(b.thirdPartyState),
+    thirdPartyCityAlias: manageStr(b.thirdPartyCityAlias),
+    thirdPartyShippingLocationId: manageStr(b.thirdPartyShippingLocationId),
+    thirdPartyPhone: manageStr(b.thirdPartyPhone),
+    thirdPartyFax: manageStr(b.thirdPartyFax),
+    thirdPartyEmail: manageStr(b.thirdPartyEmail),
+    thirdPartyContact: manageStr(b.thirdPartyContact),
+    thirdPartyContactPhone: manageStr(b.thirdPartyContactPhone),
+    billTo: manageStr(b.billTo || "T"),
+    pickupType: manageStr(b.pickupType),
+    pickupDate: rated ?
+      manageSaveDate(b.pickupDate, b.pickupDateRaw || b.dateSaved) :
+      manageStr(b.pickupDate),
+    pickupTimeFrom: manageNullableTime(b.pickupTimeFrom),
+    pickupTimeTo: manageNullableTime(b.pickupTimeTo),
+    pickupAptChecked: manageNum(b.pickupAptChecked),
+    pickupAptDate: manageStr(b.pickupAptDate),
+    pickupAptTime: manageStr(b.pickupAptTime),
+    pickupAptNumber: manageStr(b.pickupAptNumber),
+    pickupAptContact: manageStr(b.pickupAptContact),
+    pickupAptNotes: manageStr(b.pickupAptNotes),
+    deliveryType: manageStr(b.deliveryType),
+    deliveryDate: rated ?
+      manageSaveDate(b.deliveryDate, b.deliveryDateRaw || b.dateDelivered) :
+      manageStr(b.deliveryDate),
+    deliveryTimeFrom: manageNullableTime(b.deliveryTimeFrom),
+    deliveryTimeTo: manageNullableTime(b.deliveryTimeTo),
+    deliveryAptChecked: manageNum(b.deliveryAptChecked),
+    deliveryAptDate: manageStr(b.deliveryAptDate),
+    deliveryAptTime: manageStr(b.deliveryAptTime),
+    deliveryAptNumber: manageStr(b.deliveryAptNumber),
+    deliveryAptContact: manageStr(b.deliveryAptContact),
+    deliveryAptNotes: manageStr(b.deliveryAptNotes),
+    printOnBOL: rated ?
+      manageUiBool(b.printOnBOL) :
+      (manageBool(b.printOnBOL) ? 1 : 0),
+    brokerCompany: manageStr(b.brokerCompany),
+    brokerContact: manageStr(b.brokerContact),
+    brokerPhone: manageStr(b.brokerPhone),
+    brokerNotes: manageStr(b.brokerNotes),
+    BOLPredefined: manageStr(b.BOLPredefined),
+    BOLNotes: manageStr(b.BOLNotes),
+    notesInternal: manageStr(b.notesInternal),
+    notesExternal: manageStr(b.notesExternal),
+    UOM: manageStr(b.UOM || "US"),
+    pieces: manageStr(b.pieces),
+    totalWeight: manageNum(b.totalWeight),
+    totalPieces: manageNum(b.totalPieces),
+    customerQuoteId: manageStr(b.customerQuoteId || "0"),
+    accessorials: manageStr(b.accessorials || "[]"),
+    accessorialsLTL: manageStr(b.accessorialsLTL || "[]"),
+    carrierId: manageNum(b.carrierId),
+    carrierTypeId: manageNum(b.carrierTypeId),
+    carrierSCAC: manageStr(b.carrierSCAC),
+    quoteNumber: manageStr(b.quoteNumber),
+    extraInfo: manageStr(b.extraInfo),
+    quoteId: manageNum(b.quoteId),
+    transitDays: manageStr(b.transitDays) === "0" ?
+      "" : manageStr(b.transitDays),
+    total: manageNum(b.total),
+    customAccessorialsTotal: manageNum(b.customAccessorialsTotal),
+    breakdown: manageStr(b.breakdown || "{}"),
+    customAccessorialsBreakdown:
+      manageStr(b.customAccessorialsBreakdown || "[]"),
+    warnings: rated ? manageStr(b.warnings) : [],
+    quoteBillTo: rated ? manageStr(b.quoteBillTo || "[]") : "[]",
+    carrierBOLNotes: manageStr(b.carrierBOLNotes),
+    providerCarrier: manageStr(b.providerCarrier),
+    carrierName: manageStr(b.carrierName),
+    serviceLevel: manageStr(b.serviceLevel),
+    serviceLevelCode: manageStr(b.serviceLevelCode),
+    saveQuote: rated ? manageUiBool(b.saveQuote) : 0,
+    fromApplet: rated ?
+      manageUiBool(b.fromApplet) :
+      (manageBool(b.fromApplet) ? 1 : 0),
+    shipmentClassification: manageStr(b.shipmentClassification || "0"),
+    serviceType: rated ?
+      (manageStr(b.serviceType) === "0" ? "" : manageStr(b.serviceType)) :
+      manageNum(b.serviceType, 1),
+    stopsCount: manageNum(b.stopsCount),
+    equipmentIds: manageStr(b.equipmentIds || "[]"),
+    equipmentLength: manageNum(b.equipmentLength),
+    autoCalculatedLNFT: rated ?
+      manageUiBool(b.autoCalculatedLNFT !== false) :
+      1,
+    stopsInfo: "[]",
+    shipperShowName: manageStr(b.shipperShowName),
+    shipperVenueName: manageStr(b.shipperVenueName),
+    shipperBooth: manageStr(b.shipperBooth),
+    consigneeShowName: manageStr(b.consigneeShowName),
+    consigneeVenueName: manageStr(b.consigneeVenueName),
+    consigneeBooth: manageStr(b.consigneeBooth),
+    bookingSalesRepId: `[${repId}]`,
+    bookingSalesRepNames: repName,
+    officeId: manageNum(b.officeId),
+    bookingOfficeName: manageStr(b.bookingOfficeName || "ALL - Systemwide"),
+    billToData: b.billToData == null ? "null" : manageStr(b.billToData),
+    additionalInfo: manageStr(b.additionalInfo || "{}"),
+    laneDistance: manageStr(b.laneDistance),
+    controlledBy: manageNum(b.controlledBy),
+    addInsurance: rated ?
+      manageUiBool(b.addInsurance) :
+      (manageBool(b.addInsurance) ? 1 : 0),
+    insuranceAmount: manageStr(b.insuranceAmount || "0"),
+    controlledByName: manageStr(b.controlledByName),
+    modeName: manageStr(b.modeName || "LTL"),
+    copyBOLInvoicesCosts: rated ? manageUiBool(b.copyBOLInvoicesCosts) : 0,
+  };
+
+  if (rated) {
+    Object.assign(params, buildRatedActualFields(b));
+  } else {
+    params.bookingBOL = manageStr(b.BOL);
+    params.customerId = customerSlId;
+    params.dispatched = manageNum(b.dispatched);
+  }
+
+  return params;
+}
+exports.buildSaveBookingParams = buildSaveBookingParams;
+
+/**
+ * Swaps a load's sales rep via manage.php saveBooking (full booking save).
  * @param {object} args
  * @param {string|number} args.bookingId manage.php booking id.
- * @param {object} args.tenPctRow Row from getCorporateSalesPeople (10%).
- * @param {Array<object>} [args.removedReps] Current reps being replaced.
+ * @param {object} args.tenPctRow Row from getCorporateSalesPeople.
+ * @param {Array<object>} [args.removedReps] Ignored; call-site compat.
  * @return {Promise<object>}
  */
 async function swapBookingSalesRep(args) {
@@ -874,38 +1238,35 @@ async function swapBookingSalesRep(args) {
     return {ok: false, error: "missing bookingId or tenPctRow"};
   }
 
-  const salesReps = [{
-    salesPersonId: String(tenPctRow.id),
-    firstName: tenPctRow.firstName || "",
-    lastName: tenPctRow.lastName || "",
-    display: tenPctRow.display ||
-      `${tenPctRow.firstName || ""} ${tenPctRow.lastName || ""}`.trim(),
-  }];
-
-  const params = {
-    action: "saveBookingSalesRep",
-    recordId: bookingId,
-    salesReps,
-  };
-
-  const removedReps = args && args.removedReps;
-  if (Array.isArray(removedReps) && removedReps.length) {
-    params.removedSalesReps = removedReps.map((rep) => ({
-      salesPersonId: String(rep.salesPersonId || rep.id || ""),
-      firstName: rep.firstName || "",
-      lastName: rep.lastName || "",
-      display: rep.display || "",
-    }));
+  const fetchResult = await fetchManageBooking(bookingId);
+  if (!fetchResult.ok) {
+    return {
+      ok: false,
+      error: fetchResult.error,
+      response: fetchResult.response || null,
+    };
   }
 
+  const booking = fetchResult.booking;
+  const slId = booking.thirdPartyShippingLocationId || booking.customerId;
+  await managePhpPost({
+    action: "checkCustomerBOLLocked",
+    bookingId,
+    SLId: String(slId || ""),
+  });
+  await managePhpPost({action: "getBooking", id: bookingId});
+  await managePhpPost({action: "getBookingSalesRep", recordId: bookingId});
+
+  const params = buildSaveBookingParams(booking, tenPctRow);
   const result = await managePhpPost(params);
   if (!isManageSuccess(result.json)) {
     return {
       ok: false,
       error: (result.json && result.json.message) ||
         result.text ||
-        "saveBookingSalesRep failed",
+        "saveBooking failed",
       response: result.json || null,
+      rawText: result.text || null,
     };
   }
 
@@ -962,6 +1323,12 @@ async function fetchBookingsForTracking(opts) {
     let result = await managePhpPost(params);
     let rows = result.json && result.json.bookingsfortracking;
     let list = Array.isArray(rows) ? rows : [];
+    if (!list.length && page === 0) {
+      await loginUi();
+      result = await managePhpPost(params, false);
+      rows = result.json && result.json.bookingsfortracking;
+      list = Array.isArray(rows) ? rows : [];
+    }
     if (page > 0 && !list.length) {
       await loginUi();
       result = await managePhpPost(params, false);
@@ -1795,44 +2162,65 @@ function normalizeLookupText(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-/**
- * Maps REST bill-to party to manage.php shippingLocationId via name search.
- * @param {object} party thirdParty or shipper from booking.
- * @return {Promise<number|null>}
- */
-async function resolveManageShippingLocationId(party) {
-  if (!party || !party.name) return null;
-  const partyZip = String(party.zipCode || party.zipcode || "").trim();
-  const result = await managePhpPost({
-    action: "getShippingLocations",
-    item_id: "0",
-    excludeSLId: "0",
-    zipcode: partyZip,
-    fromStop: "false",
-    fromDrayage: "false",
-    fromBooking: "false",
-    fromInvoice: "false",
-    fromLTLQuote: "false",
-    fromFTLQuote: "false",
-    fromCustomerQuote: "false",
-    fromCopyCarriers: "false",
-    filterCountries: "false",
-    filterCountry: "",
-    page: "1",
-    query: String(party.name).trim(),
-    forcelimit: "",
-    fromApplet: "false",
-    onlyCustomers: "true",
-    start: "0",
-    limit: "25",
-    sort: JSON.stringify([{property: "name", direction: "ASC"}]),
-  });
-  const list = result.json && Array.isArray(result.json.shipping_locations) ?
-    result.json.shipping_locations : [];
-  if (!list.length) return null;
 
+/**
+ * @param {string|undefined} value
+ * @return {string}
+ */
+function normalizeCompanyName(value) {
+  return normalizeLookupText(value)
+      .replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, " ")
+      .replace(/\b(inc|llc|ltd|corp|corporation|co|company)\b\.?/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
+ * Strips Primus location suffixes (e.g. JB/KA) for bill-to match.
+ * @param {string} nameNorm Output of normalizeCompanyName.
+ * @return {string}
+ */
+function baseCompanyNameForMatch(nameNorm) {
+  return String(nameNorm || "")
+      .replace(/\s+[a-z]{1,4}$/, "")
+      .trim();
+}
+
+/**
+ * Search terms for manage.php / REST location lookup (strip Inc/LLC etc.).
+ * @param {string} partyName Raw bill-to party name from booking.
+ * @return {Array<string>}
+ */
+function buildShippingLocationSearchTerms(partyName) {
+  const raw = String(partyName || "").trim();
+  const terms = [];
+  const add = (t) => {
+    const q = String(t || "").trim();
+    if (!q) return;
+    if (!terms.some((x) => x.toLowerCase() === q.toLowerCase())) {
+      terms.push(q);
+    }
+  };
+  add(raw);
+  const normalized = normalizeCompanyName(raw);
+  if (normalized) add(normalized);
+  const base = baseCompanyNameForMatch(normalized);
+  if (base) add(base);
+  return terms;
+}
+
+/**
+ * @param {Array<object>} list manage.php shipping_locations rows.
+ * @param {object} party Bill-to party from booking.
+ * @return {number|null}
+ */
+function pickManageLocationFromList(list, party) {
+  if (!Array.isArray(list) || !list.length || !party) return null;
+  const partyZip = String(party.zipCode || party.zipcode || "").trim();
   const partyName = normalizeLookupText(party.name);
+  const partyBase = baseCompanyNameForMatch(normalizeCompanyName(party.name));
   const normZip = normalizeLookupText(partyZip);
+
   const exactName = list.filter((row) =>
     normalizeLookupText(row.name) === partyName);
   if (exactName.length === 1) return Number(exactName[0].id);
@@ -1842,6 +2230,24 @@ async function resolveManageShippingLocationId(party) {
     if (zipMatch) return Number(zipMatch.id);
     return Number(exactName[0].id);
   }
+
+  const baseMatches = list.filter((row) => {
+    const rowNorm = normalizeCompanyName(row.name);
+    const rowBase = baseCompanyNameForMatch(rowNorm);
+    const partyNameNorm = normalizeCompanyName(party.name);
+    if (rowNorm === partyNameNorm) return true;
+    if (partyNameNorm && rowNorm.startsWith(partyNameNorm + " ")) return true;
+    return rowBase === partyBase;
+  });
+  if (baseMatches.length === 1) return Number(baseMatches[0].id);
+  if (baseMatches.length > 1 && normZip) {
+    const zipMatch = baseMatches.find((row) =>
+      normalizeLookupText(row.zipcode) === normZip);
+    if (zipMatch) return Number(zipMatch.id);
+    return Number(baseMatches[0].id);
+  }
+  if (baseMatches.length > 1) return Number(baseMatches[0].id);
+
   if (list.length === 1) return Number(list[0].id);
   if (normZip) {
     const zipOnly = list.filter((row) =>
@@ -1849,6 +2255,167 @@ async function resolveManageShippingLocationId(party) {
     if (zipOnly.length === 1) return Number(zipOnly[0].id);
   }
   return null;
+}
+
+/**
+ * Matches bill-to party against booking.shippingLocations.
+ * @param {object} party Bill-to party.
+ * @param {object} booking Primus booking.
+ * @return {number|null}
+ */
+function resolveFromBookingShippingLocations(party, booking) {
+  const locs = booking && booking.shippingLocations;
+  if (!Array.isArray(locs) || !locs.length || !party) return null;
+  const partyId = party.id != null ? String(party.id) : null;
+  const partyNameNorm = normalizeCompanyName(party.name);
+  for (const loc of locs) {
+    if (partyId && loc.id != null && String(loc.id) === partyId) {
+      return Number(loc.id);
+    }
+    if (partyNameNorm && normalizeCompanyName(loc.name) === partyNameNorm) {
+      return Number(loc.id);
+    }
+  }
+  return null;
+}
+
+/**
+ * REST shipping-location search for one term and customer filter.
+ * @param {object} quoteRateShop quote-rate-shop module.
+ * @param {string} term Search query.
+ * @param {object} party Bill-to party.
+ * @param {boolean} customersOnly Restrict to customer locations.
+ * @return {Promise<number|null>}
+ */
+async function restShippingLocationSearchTerm(
+    quoteRateShop, term, party, customersOnly) {
+  const partyName = String(party.name || "").trim();
+  const partyEmail = String(party.email || "").trim();
+  const res = await quoteRateShop.searchShippingLocations({
+    name: term,
+    limit: 25,
+    active: true,
+    isCustomer: customersOnly,
+  });
+  const list = res.results || [];
+  const fromList = pickManageLocationFromList(list, party);
+  if (fromList) return fromList;
+  if (customersOnly) {
+    const best = quoteRateShop.pickBestCustomerMatch(list, {
+      from: partyEmail,
+      customerRef: partyName,
+    });
+    if (best && best.id &&
+        normalizeCompanyName(best.name) === normalizeCompanyName(partyName)) {
+      return Number(best.id);
+    }
+  }
+  return null;
+}
+
+/**
+ * REST shipping-location search fallback (quote-rate-shop helpers).
+ * @param {object} party Bill-to party.
+ * @return {Promise<number|null>}
+ */
+async function resolveManageShippingLocationIdViaRest(party) {
+  let quoteRateShop;
+  try {
+    quoteRateShop = require("./quote-rate-shop");
+  } catch (_) {
+    return null;
+  }
+  const partyName = String(party.name || "").trim();
+  const partyEmail = String(party.email || "").trim();
+  const searches = buildShippingLocationSearchTerms(partyName);
+  if (partyEmail.includes("@")) {
+    const domainStem = partyEmail.split("@")[1].split(".")[0];
+    if (domainStem.length > 2) searches.push(domainStem);
+  }
+  for (const q of searches) {
+    if (!q) continue;
+    try {
+      const fromCustomers = await restShippingLocationSearchTerm(
+          quoteRateShop, q, party, true);
+      if (fromCustomers) return fromCustomers;
+      const fromAll = await restShippingLocationSearchTerm(
+          quoteRateShop, q, party, false);
+      if (fromAll) return fromAll;
+    } catch (err) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "REST shipping location search failed", {
+              partyName,
+              term: q,
+              error: err.message,
+            }).catch(() => {});
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * manage.php getShippingLocations search with optional customer filter.
+ * @param {object} party Bill-to party.
+ * @param {boolean} customersOnly When true, onlyCustomers=true.
+ * @return {Promise<number|null>}
+ */
+async function searchManagePhpShippingLocation(party, customersOnly) {
+  const partyZip = String(party.zipCode || party.zipcode || "").trim();
+  for (const query of buildShippingLocationSearchTerms(party.name)) {
+    const result = await managePhpPost({
+      action: "getShippingLocations",
+      item_id: "0",
+      excludeSLId: "0",
+      zipcode: partyZip,
+      fromStop: "false",
+      fromDrayage: "false",
+      fromBooking: "false",
+      fromInvoice: "false",
+      fromLTLQuote: "false",
+      fromFTLQuote: "false",
+      fromCustomerQuote: "false",
+      fromCopyCarriers: "false",
+      filterCountries: "false",
+      filterCountry: "",
+      page: "1",
+      query,
+      forcelimit: "",
+      fromApplet: "false",
+      onlyCustomers: customersOnly ? "true" : "false",
+      start: "0",
+      limit: "25",
+      sort: JSON.stringify([{property: "name", direction: "ASC"}]),
+    });
+    const list = result.json &&
+      Array.isArray(result.json.shipping_locations) ?
+      result.json.shipping_locations : [];
+    const picked = pickManageLocationFromList(list, party);
+    if (picked) return picked;
+  }
+  return null;
+}
+
+/**
+ * Maps REST bill-to party to manage.php shippingLocationId via name search.
+ * @param {object} party thirdParty or shipper from booking.
+ * @param {object} [booking] Primus booking (shippingLocations fallback).
+ * @return {Promise<number|null>}
+ */
+async function resolveManageShippingLocationId(party, booking) {
+  if (!party || !party.name) return null;
+
+  const fromBookingLocs = resolveFromBookingShippingLocations(party, booking);
+  if (fromBookingLocs) return fromBookingLocs;
+
+  const fromCustomers = await searchManagePhpShippingLocation(party, true);
+  if (fromCustomers) return fromCustomers;
+
+  const fromAll = await searchManagePhpShippingLocation(party, false);
+  if (fromAll) return fromAll;
+
+  return resolveManageShippingLocationIdViaRest(party);
 }
 
 /**
@@ -1861,7 +2428,8 @@ async function resolveManageBilltoId(booking) {
   const party = resolveBillToParty(booking);
   const partyName = party && party.name ? String(party.name).trim() : null;
   if (party && party.name) {
-    const manageLocationId = await resolveManageShippingLocationId(party);
+    const manageLocationId =
+        await resolveManageShippingLocationId(party, booking);
     if (manageLocationId) {
       return {
         id: manageLocationId,
@@ -1870,19 +2438,23 @@ async function resolveManageBilltoId(booking) {
       };
     }
   }
-  const restId = resolveBilltoId(booking);
-  if (restId && writeLog) {
+  if (writeLog) {
     await writeLog("warn", "primus",
-        "Bill-to manage.php location lookup failed — using REST party id", {
+        "Bill-to manage.php location lookup failed — " +
+                "cannot use REST party id", {
           partyName,
-          restPartyId: restId,
+          restPartyId: resolveBilltoId(booking),
           billTo: booking && booking.billTo,
         }).catch(() => {});
   }
   return {
-    id: restId,
-    source: restId ? "rest_party_id" : null,
+    id: null,
+    source: "manage_location_not_found",
     partyName,
+    error: partyName ?
+      "Could not map bill-to party \"" + partyName +
+            "\" to manage.php shipping location" :
+      "Could not resolve bill-to party on booking",
   };
 }
 
@@ -1917,6 +2489,33 @@ async function getShippingLocationsContacts(shippingLocationId) {
 exports.getShippingLocationsContacts = getShippingLocationsContacts;
 
 /**
+ * @param {string|undefined} type Contact type label.
+ * @return {boolean}
+ */
+function isAccountingContactType(type) {
+  const t = normalizeLookupText(type);
+  if (!t) return false;
+  if (t === "accounting") return true;
+  if (t.includes("account") && t.includes("receivable")) return true;
+  if (t === "a/r" || t === "a r" || t === "ar") return true;
+  if (t === "billing" || t.includes("billing")) return true;
+  return false;
+}
+
+/**
+ * @param {string|undefined} email Email address.
+ * @return {boolean}
+ */
+function isAccountingStyleEmail(email) {
+  const e = normalizeLookupText(email);
+  if (!e || !e.includes("@")) return false;
+  const local = e.split("@")[0];
+  const acctLocal =
+      /^(ap|ar|accounting|accounts|billing|invoices?|receivable)/;
+  return acctLocal.test(local);
+}
+
+/**
  * @param {Array<object>} contacts
  * @return {string[]}
  */
@@ -1924,7 +2523,7 @@ function pickAccountingEmails(contacts) {
   const seen = new Set();
   const emails = [];
   for (const row of contacts || []) {
-    if (normalizeLookupText(row.type) !== "accounting") continue;
+    if (!isAccountingContactType(row.type)) continue;
     const email = String(row.email || "").trim();
     if (!email) continue;
     const key = email.toLowerCase();
@@ -1943,24 +2542,39 @@ function pickAccountingEmails(contacts) {
 async function resolveCustomerAccountingEmails(booking) {
   const party = resolveBillToParty(booking);
   if (!party) {
-    return {emails: [], source: null, manageLocationId: null};
-  }
-  if (!isManagePhpEnabled()) {
-    const fallback = String(party.email || "").trim();
     return {
-      emails: fallback ? [fallback] : [],
-      source: fallback ? "booking_party_email" : null,
+      emails: [],
+      source: "no_accounting_contacts",
       manageLocationId: null,
+      fallbackEmail: null,
+    };
+  }
+  const fallbackEmail = String(party.email || "").trim() || null;
+  if (!isManagePhpEnabled()) {
+    return {
+      emails: [],
+      source: "no_accounting_contacts",
+      manageLocationId: null,
+      fallbackEmail,
     };
   }
 
-  const manageLocationId = await resolveManageShippingLocationId(party);
+  const manageLocationId =
+      await resolveManageShippingLocationId(party, booking);
   if (!manageLocationId) {
-    const fallback = String(party.email || "").trim();
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "No manage.php shipping location for bill-to — " +
+                    "accounting email lookup skipped", {
+            partyName: party.name,
+            fallbackEmail,
+          }).catch(() => {});
+    }
     return {
-      emails: fallback ? [fallback] : [],
-      source: fallback ? "booking_party_email" : null,
+      emails: [],
+      source: "no_accounting_contacts",
       manageLocationId: null,
+      fallbackEmail,
     };
   }
 
@@ -1971,14 +2585,54 @@ async function resolveCustomerAccountingEmails(booking) {
       emails,
       source: "accounting_contacts",
       manageLocationId,
+      fallbackEmail,
     };
   }
 
-  const fallback = String(party.email || "").trim();
+  let quoteRateShop;
+  try {
+    quoteRateShop = require("./quote-rate-shop");
+  } catch (_) {
+    quoteRateShop = null;
+  }
+  if (quoteRateShop) {
+    try {
+      const restLoc = await quoteRateShop.getShippingLocationById(
+          manageLocationId);
+      const locEmail = restLoc && String(restLoc.email || "").trim();
+      if (locEmail && isAccountingStyleEmail(locEmail)) {
+        return {
+          emails: [locEmail],
+          source: "rest_location_email",
+          manageLocationId,
+          fallbackEmail,
+        };
+      }
+    } catch (err) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "REST location email lookup failed", {
+              manageLocationId,
+              error: err.message,
+            }).catch(() => {});
+      }
+    }
+  }
+
+  if (writeLog) {
+    await writeLog("warn", "primus",
+        "No accounting contacts on bill-to customer location", {
+          partyName: party.name,
+          manageLocationId,
+          fallbackEmail,
+          contactCount: (contactsResult.contacts || []).length,
+        }).catch(() => {});
+  }
   return {
-    emails: fallback ? [fallback] : [],
-    source: fallback ? "booking_party_email" : null,
+    emails: [],
+    source: "no_accounting_contacts",
     manageLocationId,
+    fallbackEmail,
   };
 }
 exports.resolveCustomerAccountingEmails = resolveCustomerAccountingEmails;
@@ -2011,25 +2665,45 @@ function parseTermsFromResponse(json) {
   })).filter((t) => t.id && Number.isFinite(t.days));
 }
 
+const GET_TERMS_ATTEMPTS = 3;
+
 /**
  * @return {Promise<Array<object>>}
  */
 async function fetchUiTerms() {
   const now = Date.now();
-  if (cachedTerms && now - cachedTermsAt < 60 * 60 * 1000) {
+  if (cachedTerms && cachedTerms.length > 0 &&
+      now - cachedTermsAt < 60 * 60 * 1000) {
     return cachedTerms;
   }
-  const result = await managePhpPost({
-    action: "getTerms",
-    active: "1",
-    page: "1",
-    start: "0",
-    limit: "25",
-    sort: JSON.stringify([{property: "description", direction: "ASC"}]),
-  });
-  cachedTerms = parseTermsFromResponse(result.json);
-  cachedTermsAt = now;
-  return cachedTerms;
+  for (let attempt = 1; attempt <= GET_TERMS_ATTEMPTS; attempt++) {
+    const result = await managePhpPost({
+      action: "getTerms",
+      active: "1",
+      page: "1",
+      start: "0",
+      limit: "25",
+      sort: JSON.stringify([{property: "description", direction: "ASC"}]),
+    });
+    const parsed = parseTermsFromResponse(result.json);
+    if (parsed.length > 0) {
+      cachedTerms = parsed;
+      cachedTermsAt = now;
+      return cachedTerms;
+    }
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "getTerms returned no terms — retrying", {
+            attempt,
+            responseKeys: result.json && typeof result.json === "object" ?
+              Object.keys(result.json) : null,
+          });
+    }
+    if (attempt < GET_TERMS_ATTEMPTS) {
+      await new Promise((r) => setTimeout(r, 500 * attempt));
+    }
+  }
+  return [];
 }
 
 /**
@@ -2052,6 +2726,20 @@ function diffCalendarDays(start, end) {
  */
 function resolveTermsForCarrierBill(billDate, billDueDate, termsList) {
   const fallbackId = defaultTermsId();
+  if (!termsList || termsList.length === 0) {
+    const days = billDueDate ?
+      diffCalendarDays(billDate, billDueDate) : null;
+    return {
+      ok: true,
+      termsId: fallbackId,
+      source: "default_empty_terms_list",
+      requestedDays: Number.isFinite(days) ? days : null,
+      days: 30,
+      description: "Net 30",
+      billDate: billDate ? toDateOnly(billDate) : null,
+      dueDate: billDueDate ? toDateOnly(billDueDate) : null,
+    };
+  }
   const fallback = termsList.find((t) => t.id === String(fallbackId));
 
   if (!billDueDate) {
@@ -2325,17 +3013,19 @@ function buildActualCosts(vendor, bill, withIds = null) {
 }
 
 /**
- * @param {number} customerRate Customer sell rate.
+ * @param {number} customerRate Base freight customer rate.
  * @param {string} [billToReference] Bill-to Reference# (e.g. Unit #256255).
+ * @param {Array<object>} [customerBillLines] Option B accessorial lines.
  * @return {Array<object>}
  */
-function buildCustomerCharges(customerRate, billToReference) {
+function buildCustomerCharges(
+    customerRate, billToReference, customerBillLines) {
   let description = "FREIGHT CHARGE";
-  const ref = String(billToReference || "").trim();
+  const ref = sanitizeBillToReferenceText(billToReference);
   if (ref) {
     description += ` - ${ref}`;
   }
-  return [{
+  const lines = [{
     id: 1,
     code: "",
     qty: 1,
@@ -2344,6 +3034,35 @@ function buildCustomerCharges(customerRate, billToReference) {
     total: roundMoney(customerRate).toFixed(2),
     chargeType: "",
   }];
+  (Array.isArray(customerBillLines) ? customerBillLines : []).forEach(
+      (line, idx) => {
+        const amount = roundMoney(line && line.amount);
+        if (!amount || amount <= 0) return;
+        const name = String(line && (line.name || line.label) || "ACCESSORIAL")
+            .trim().toUpperCase();
+        lines.push({
+          id: idx + 2,
+          code: "",
+          qty: 1,
+          description: name,
+          rate: amount,
+          total: amount.toFixed(2),
+          chargeType: "",
+        });
+      });
+  return lines;
+}
+
+/**
+ * @param {number} customerRate Base freight rate.
+ * @param {Array<object>} [customerBillLines] Option B accessorial lines.
+ * @return {number}
+ */
+function customerChargesTotal(customerRate, customerBillLines) {
+  const base = roundMoney(customerRate || 0);
+  const extra = (Array.isArray(customerBillLines) ? customerBillLines : [])
+      .reduce((sum, line) => sum + roundMoney(line && line.amount), 0);
+  return roundMoney(base + extra);
 }
 
 /**
@@ -2669,7 +3388,120 @@ function parseVendorsFromResponse(json) {
   return list.map((v) => ({
     id: String(v.id || v.carrierId || ""),
     name: String(v.name || v.carrierName || ""),
+    type: String(v.type || v.vendorType || v.carrierType || "").trim(),
+    vendorEmail: String(v.vendorEmail || v.email || "").trim(),
   })).filter((v) => v.id);
+}
+
+/**
+ * @param {string} value Email address or From header.
+ * @return {string} Lowercase domain or empty.
+ */
+function normalizeEmailDomain(value) {
+  const email = String(value || "").trim();
+  const addr = email.includes("@") ?
+    email.match(/[\w.+-]+@([\w.-]+\.\w+)/i) :
+    null;
+  const domain = addr ? addr[1] : "";
+  return domain.trim().toLowerCase();
+}
+
+/**
+ * @param {string} from From header.
+ * @return {string} Lowercase email address or empty.
+ */
+function extractEmailFromFromHeader(from) {
+  const hay = String(from || "").trim();
+  const bracket = hay.match(/<([^>]+@[^>]+)>/);
+  if (bracket && bracket[1]) return bracket[1].trim().toLowerCase();
+  const plain = hay.match(/([\w.+-]+@[\w.-]+\.\w+)/);
+  return plain ? plain[1].trim().toLowerCase() : "";
+}
+
+/**
+ * Picks a vendor row by invoice carrier name and/or sender email domain.
+ * @param {Array<object>} vendors Parsed getVendors list.
+ * @param {object} hints carrierName, emailDomain.
+ * @return {object|null}
+ */
+function findVendorByCarrierHint(vendors, hints = {}) {
+  const carrierName = String(hints.carrierName || "").trim();
+  const emailDomain = String(hints.emailDomain || "").trim().toLowerCase();
+  if (carrierName) {
+    const byName = findMasterVendorByName(vendors, carrierName);
+    if (byName) return byName;
+  }
+  if (emailDomain) {
+    const byEmail = vendors.find((v) => {
+      const domain = normalizeEmailDomain(v.vendorEmail || "");
+      return domain && domain === emailDomain;
+    });
+    if (byEmail) return byEmail;
+  }
+  return null;
+}
+
+/**
+ * Looks up a Primus master vendor by invoice carrier name and/or sender email.
+ * Used for drayage classification via vendor.type (e.g. DRAYAGE).
+ *
+ * @param {object} hints carrierName, fromEmail/from.
+ * @return {Promise<object|null>} {id, name, type, vendorEmail} or null.
+ */
+async function lookupVendorByCarrierHint(hints = {}) {
+  if (!isManagePhpEnabled()) return null;
+
+  const carrierName = String(hints.carrierName || "").trim();
+  const fromEmail = extractEmailFromFromHeader(
+      hints.fromEmail || hints.from || "",
+  );
+  const emailDomain = normalizeEmailDomain(fromEmail);
+  const nameQuery = carrierName.split(/[,\n/]/)[0].trim();
+  if (!nameQuery && !emailDomain) return null;
+
+  const seenIds = new Set();
+  const maxPages = 120;
+
+  const tryPage = async (start, query) => {
+    const params = {
+      action: "getVendors",
+      page: "1",
+      start: String(start),
+      limit: "25",
+    };
+    if (query) params.query = query;
+    const result = await managePhpPost(params);
+    const vendors = parseVendorsFromResponse(result.json);
+    if (!vendors.length) return null;
+    let anyNew = false;
+    for (const v of vendors) {
+      if (!seenIds.has(v.id)) {
+        seenIds.add(v.id);
+        anyNew = true;
+      }
+    }
+    if (!anyNew) return {done: true, match: null};
+    const match = findVendorByCarrierHint(vendors, {carrierName, emailDomain});
+    return {done: false, match: match || null};
+  };
+
+  if (nameQuery.length >= 3) {
+    for (let page = 0; page < 8; page++) {
+      const out = await tryPage(page * 25, nameQuery);
+      if (!out) break;
+      if (out.done) break;
+      if (out.match) return out.match;
+    }
+  }
+
+  for (let page = 0; page < maxPages; page++) {
+    const out = await tryPage(page * 25, null);
+    if (!out) break;
+    if (out.done) break;
+    if (out.match) return out.match;
+  }
+
+  return null;
 }
 
 let cachedRedkikVendor = null;
@@ -3446,6 +4278,7 @@ async function removeInsurancePremiumFromLoad(args) {
 exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
 exports.removeInsurancePremiumFromLoad = removeInsurancePremiumFromLoad;
 exports.resolveInsuranceVendor = resolveInsuranceVendor;
+exports.lookupVendorByCarrierHint = lookupVendorByCarrierHint;
 
 /**
  * @return {boolean}
@@ -3475,6 +4308,10 @@ async function runPrimusUiBillingFlow(args) {
   const booking = args.booking;
   if (!booking || !booking.BOLId) {
     return {ok: false, error: "Booking missing BOLId"};
+  }
+  if (args.billToReferenceNumber != null) {
+    args.billToReferenceNumber =
+        sanitizeBillToReferenceText(args.billToReferenceNumber) || null;
   }
 
   let uploadFileTypes;
@@ -3610,6 +4447,17 @@ async function runPrimusUiBillingFlow(args) {
   let billtoId = billtoResolution.id;
   let billtoSource = billtoResolution.source;
 
+  if (billtoSource === "manage_location_not_found" && !existingDraftId) {
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: billtoResolution.error ||
+        "Could not resolve manage.php bill-to shipping location",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName,
+    };
+  }
+
   if (existingDraftId) {
     const draftStores = await getInvoiceStores(existingDraftId);
     const storedBillto = draftStores.ok ?
@@ -3680,6 +4528,9 @@ async function runPrimusUiBillingFlow(args) {
   const carrierTotal = roundMoney(
       args.carrierInvoiceAmount || vendor.cost || 0);
   const customerRate = roundMoney(args.customerRate || 0);
+  const customerBillLines = Array.isArray(args.customerBillLines) ?
+    args.customerBillLines : [];
+  const customerTotal = customerChargesTotal(customerRate, customerBillLines);
   if (!carrierTotal || !customerRate) {
     return {ok: false, error: "Missing carrier or customer rate"};
   }
@@ -3754,10 +4605,10 @@ async function runPrimusUiBillingFlow(args) {
   const actualCostsFirst = buildActualCosts(vendor, bill);
   const totalActual = roundMoney(
       actualCostsFirst.reduce((s, l) => s + Number(l.total || 0), 0));
-  const profit = roundMoney(customerRate - totalActual);
+  const profit = roundMoney(customerTotal - totalActual);
   const profitPer = totalActual > 0 ?
     (profit / totalActual) * 100 : 0;
-  const gp = customerRate > 0 ? (profit / customerRate) * 100 : 0;
+  const gp = customerTotal > 0 ? (profit / customerTotal) * 100 : 0;
 
   const notes = {
     internalNotes: String(booking.internalNotes || ""),
@@ -3767,10 +4618,11 @@ async function runPrimusUiBillingFlow(args) {
   const phase1 = await managePhpPost({
     action: "saveInvoice",
     billsInfo,
-    charges: buildCustomerCharges(customerRate, args.billToReferenceNumber),
+    charges: buildCustomerCharges(
+        customerRate, args.billToReferenceNumber, customerBillLines),
     actualCosts: actualCostsFirst,
     estimatedCosts,
-    chargesTotal: customerRate,
+    chargesTotal: customerTotal,
     totalEstimatedCosts: totalEstimated,
     totalActualCosts: totalActual,
     billtoId: String(billtoId),
@@ -3815,7 +4667,8 @@ async function runPrimusUiBillingFlow(args) {
       vendor, bill, storedCosts || actualCostsFirst);
   const storedCharges = extractChargesFromStore(storeData);
   const phase2Charges = (storedCharges ||
-    buildCustomerCharges(customerRate, args.billToReferenceNumber))
+    buildCustomerCharges(
+        customerRate, args.billToReferenceNumber, customerBillLines))
       .map((c) => ({
         id: String(c.id != null ? c.id : 1),
         code: c.code || "",
@@ -3828,7 +4681,7 @@ async function runPrimusUiBillingFlow(args) {
       !invoiceChargesIncludeReference(
           phase2Charges, args.billToReferenceNumber)) {
     const withRef = buildCustomerCharges(
-        customerRate, args.billToReferenceNumber);
+        customerRate, args.billToReferenceNumber, customerBillLines);
     phase2Charges.splice(0, phase2Charges.length, ...withRef.map((c) => ({
       id: String(c.id),
       code: c.code || "",
@@ -3883,7 +4736,7 @@ async function runPrimusUiBillingFlow(args) {
     charges: phase2Charges,
     actualCosts: actualCostsWithIds,
     estimatedCosts: phase2Estimated,
-    chargesTotal: customerRate,
+    chargesTotal: customerTotal,
     totalEstimatedCosts: totalEstimated,
     totalActualCosts: totalActual,
     billtoId: String(billtoId),
@@ -3993,6 +4846,8 @@ async function runPrimusUiBillingFlow(args) {
     customerInvoiceId: Number(uiInvoiceId),
     invoiceNumber,
     billtoId,
+    billtoSource,
+    billtoPartyName: billtoResolution.partyName || null,
     reusedDraft: !!existingDraftId,
     draftSource: draftResolution.source,
     uploadFileTypes,
@@ -4079,8 +4934,39 @@ async function lookupPrimusUsers(query) {
 exports.lookupPrimusUsers = lookupPrimusUsers;
 
 /**
+ * Ordered Primus user hints for the load dispatcher (UI "Controlled by").
+ * Falls back to dispatchedByUser only when control fields are absent.
+ * @param {object} booking Primus booking.
+ * @return {string[]}
+ */
+function dispatcherQueriesFromBooking(booking) {
+  const queries = [];
+  const seen = new Set();
+  const add = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return;
+    const key = text.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    queries.push(text);
+  };
+
+  add(booking.userName);
+  const control = booking.contactInformation &&
+    booking.contactInformation.controlUser;
+  if (control && control.name) add(control.name);
+  add(booking.controlledByName);
+  const controlledBy = String(booking.controlledBy || "").trim();
+  if (controlledBy && !/^\d+$/.test(controlledBy)) add(controlledBy);
+  add(booking.dispatchedByUser);
+  add(booking.CreatedBy);
+
+  return queries;
+}
+
+/**
  * Resolves the load dispatcher contact (username + email) from a booking.
- * Uses booking.dispatchedByUser / userName, then getUsers by username.
+ * Uses Primus "Controlled by" (userName / controlUser) before dispatchedByUser.
  * @param {object} args Args.
  * @param {object} [args.booking] Primus booking (optional if loadNumber set).
  * @param {string|number} [args.loadNumber] BOL / load number.
@@ -4097,23 +4983,9 @@ async function resolveDispatcherEmail(args = {}) {
     return {ok: false, error: "missing booking"};
   }
 
-  const userName = String(
-      booking.dispatchedByUser || booking.userName || "",
-  ).trim();
-  const control = booking.contactInformation &&
-    booking.contactInformation.controlUser;
-  const controlName = control && control.name ?
-    String(control.name).trim() : "";
-
-  if (!userName && !controlName) {
+  const queries = dispatcherQueriesFromBooking(booking);
+  if (!queries.length) {
     return {ok: false, error: "no dispatcher username on booking"};
-  }
-
-  // Username query is the reliable match (verified with getUsers).
-  const queries = [];
-  if (userName) queries.push(userName);
-  if (controlName && controlName.toLowerCase() !== userName.toLowerCase()) {
-    queries.push(controlName);
   }
 
   for (const query of queries) {
@@ -4134,7 +5006,7 @@ async function resolveDispatcherEmail(args = {}) {
     if (!email || !email.includes("@")) {
       return {
         ok: false,
-        userName: matched.userName || userName,
+        userName: matched.userName || query,
         displayName: matched.displayName ||
           `${matched.firstName || ""} ${matched.lastName || ""}`.trim(),
         error: "dispatcher user found but has no email",
@@ -4143,10 +5015,10 @@ async function resolveDispatcherEmail(args = {}) {
     return {
       ok: true,
       email,
-      userName: matched.userName || userName,
+      userName: matched.userName || query,
       displayName: matched.displayName ||
         `${matched.firstName || ""} ${matched.lastName || ""}`.trim() ||
-        controlName || userName,
+        query,
       userId: matched.id || null,
       query,
     };
@@ -4154,8 +5026,8 @@ async function resolveDispatcherEmail(args = {}) {
 
   return {
     ok: false,
-    userName: userName || null,
-    displayName: controlName || null,
+    userName: queries[0] || null,
+    displayName: queries.find((q) => q.includes(" ")) || null,
     error: "getUsers did not return a matching dispatcher",
   };
 }
@@ -4355,12 +5227,15 @@ exports.ensureCarrierBillUploadedToPrimus = ensureCarrierBillUploadedToPrimus;
  * @return {string}
  */
 function sanitizeBillToReferenceText(text) {
-  return String(text || "")
+  const cleaned = String(text || "")
       .replace(/\u00a0/g, " ")
       .replace(/\u00c5/g, " ")
       .replace(/\u00c2/g, "")
       .replace(/\s+/g, " ")
       .trim();
+  const lower = cleaned.toLowerCase();
+  if (lower === "undefined" || lower === "null") return "";
+  return cleaned;
 }
 
 /**
@@ -4397,7 +5272,11 @@ exports._internal = {
   resolveBillToParty,
   resolveManageBilltoId,
   resolveManageShippingLocationId,
+  normalizeCompanyName,
+  pickManageLocationFromList,
   pickAccountingEmails,
+  isAccountingContactType,
+  isAccountingStyleEmail,
   listFileTypeDriveIds,
   listPodDriveFileIds,
   listCustomerDriveFileIds,

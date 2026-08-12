@@ -1,5 +1,7 @@
 "use strict";
 
+const additionalCharges = require("./additional-charges");
+
 /**
  * Weekly report: shipments with pickup > N days ago and no delivery date,
  * grouped by dispatcher and emailed to each dispatcher.
@@ -73,11 +75,26 @@ function readPickupDate(row) {
 
 /**
  * @param {object} row Tracking list row.
+ * @return {string}
+ */
+function readDispatcherUser(row) {
+  const dispatched = String(row.dispatchedByUser || "").trim();
+  const createdBy = String(row.CreatedBy || "").trim();
+  const controlledBy = String(row.controlledBy || "").trim();
+  if (dispatched && !/^\d+$/.test(dispatched)) return dispatched;
+  if (createdBy && !/^\d+$/.test(createdBy)) return createdBy;
+  if (controlledBy && !/^\d+$/.test(controlledBy)) return controlledBy;
+  return dispatched || createdBy || controlledBy;
+}
+
+/**
+ * @param {object} row Tracking list row.
  * @return {object}
  */
 function normalizeTrackingRow(row) {
   const pickupDate = readPickupDate(row);
   const bol = String(row.BOL || row.bol || "").trim();
+  const dispatcherUser = readDispatcherUser(row);
   return {
     loadNumber: bol,
     bookingId: row.id || null,
@@ -90,8 +107,10 @@ function normalizeTrackingRow(row) {
       "—",
     destination: [row.consigneeCity, row.consigneeState].filter(Boolean)
         .join(", ") || "—",
-    dispatcherUser: String(row.dispatchedByUser || row.controlledBy || "")
-        .trim(),
+    dispatcherUser,
+    controlledBy: row.controlledBy || null,
+    dispatchedByUser: row.dispatchedByUser || null,
+    createdBy: row.CreatedBy || null,
     statusName: row.status_name || row.status_code || "",
   };
 }
@@ -161,10 +180,12 @@ async function resolveDispatcherForRow(row, cache) {
   }
   const result = await bridge.resolveDispatcherEmail({
     booking: {
-      dispatchedByUser: userName,
-      userName,
+      userName: row.dispatcherUser,
+      dispatchedByUser: row.dispatchedByUser,
+      controlledBy: row.controlledBy,
+      CreatedBy: row.createdBy,
       contactInformation: {
-        controlUser: {name: userName},
+        controlUser: {name: row.dispatcherUser},
       },
     },
   });
@@ -321,6 +342,15 @@ async function runUndeliveredShipmentReport(opts) {
   dateFrom.setDate(dateFrom.getDate() - lookbackDays);
 
   const rawRows = await bridge.fetchBookingsForTracking({dateFrom, dateTo});
+  if (!Array.isArray(rawRows)) {
+    return {ok: false, error: "getBookingsForTracking returned invalid data"};
+  }
+  if (!rawRows.length) {
+    return {
+      ok: false,
+      error: "getBookingsForTracking returned no rows (Primus session or API)",
+    };
+  }
   const deduped = dedupeTrackingRows(rawRows);
   const stale = filterStaleUndelivered(deduped, minDays);
   const groups = await groupByDispatcherEmail(stale);
@@ -351,13 +381,13 @@ async function runUndeliveredShipmentReport(opts) {
     });
 
     if (!dryRun && typeof saveOutboundEmail === "function") {
-      await saveOutboundEmail({
+      await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc({
         type: "undelivered_shipment_report",
         subject: mail.subject,
         html: mail.html,
         forceRecipient: true,
         to: email,
-      });
+      }));
     }
 
     sent.push({

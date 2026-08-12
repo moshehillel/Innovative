@@ -34,7 +34,7 @@ function providerLabel() {
  * @return {string}
  */
 function inboxCheckCompletedMessage() {
-  return `${providerLabel()} inbox check completed`;
+  return "Inbox check completed";
 }
 
 /**

@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quote Dashboard</title>
+  <style>
+    :root {
+      --primary: #1f4fd8;
+      --primary-dark: #153a9e;
+      --primary-light: #eef2ff;
+      --bg: #f0f4fa;
+      --surface: #ffffff;
+      --surface-muted: #f8fafc;
+      --border: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text: #1f2937;
+      --text-secondary: #475569;
+      --muted: #64748b;
+      --success: #059669;
+      --success-bg: #ecfdf5;
+      --warning: #d97706;
+      --warning-bg: #fffbeb;
+      --error: #dc2626;
+      --error-bg: #fef2f2;
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+      --shadow: 0 4px 6px rgba(15, 23, 42, 0.04), 0 12px 24px rgba(15, 23, 42, 0.06);
+      --shadow-lg: 0 8px 16px rgba(15, 23, 42, 0.06), 0 24px 48px rgba(15, 23, 42, 0.08);
+      --radius: 12px;
+      --radius-lg: 16px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Login screen */
+    .login-page {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 20px;
+      background:
+        radial-gradient(ellipse 90% 70% at 50% -20%, rgba(31, 79, 216, 0.12), transparent),
+        var(--bg);
+    }
+    .login {
+      width: 100%;
+      max-width: 420px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 40px 36px 32px;
+      box-shadow: var(--shadow-lg);
+    }
+    .login-brand {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    .login-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 52px;
+      height: 52px;
+      border-radius: 14px;
+      background: linear-gradient(145deg, var(--primary) 0%, var(--primary-dark) 100%);
+      color: #fff;
+      font-size: 24px;
+      margin-bottom: 18px;
+      box-shadow: 0 8px 20px rgba(31, 79, 216, 0.25);
+    }
+    .login h2 {
+      margin: 0 0 8px;
+      font-size: 1.5rem;
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      color: var(--primary-dark);
+    }
+    .login .login-desc {
+      color: var(--muted);
+      font-size: 0.9375rem;
+      margin: 0;
+      line-height: 1.55;
+    }
+    .login-form {
+      margin-top: 28px;
+      display: grid;
+      gap: 20px;
+    }
+    .login-form label {
+      display: grid;
+      gap: 8px;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+    .login-form input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.9375rem;
+      font-family: inherit;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .login-form input:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(31, 79, 216, 0.15);
+    }
+    .login-form input::placeholder { color: #94a3b8; }
+    .btn-login {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 13px 20px;
+      border-radius: 10px;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      font-family: inherit;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 4px;
+      transition: background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
+      box-shadow: 0 2px 8px rgba(31, 79, 216, 0.25);
+    }
+    .btn-login:hover {
+      background: var(--primary-dark);
+      transform: translateY(-1px);
+    }
+    .btn-login:active { transform: translateY(0); }
+    .login-links {
+      margin: 18px 0 0;
+      text-align: center;
+    }
+    .link-btn {
+      background: none;
+      border: none;
+      color: var(--primary);
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-family: inherit;
+      padding: 6px 10px;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 500;
+      transition: color 0.15s ease, background 0.15s ease;
+    }
+    .link-btn:hover {
+      color: var(--primary-dark);
+      background: var(--primary-light);
+    }
+    .login-msg { margin-top: 14px; font-size: 0.875rem; text-align: center; }
+    .login-msg.ok { color: var(--success); background: var(--success-bg); padding: 10px 14px; border-radius: 8px; }
+    .login-footer {
+      margin-top: 28px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      font-size: 0.8125rem;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    /* Dashboard */
+    header {
+      background: var(--surface);
+      padding: 18px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      box-shadow: var(--shadow-sm);
+    }
+    header h1 {
+      font-size: 1.125rem;
+      margin: 0;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--primary-dark);
+    }
+    .sub { color: var(--muted); font-size: 0.875rem; margin-top: 2px; }
+    main { max-width: 1100px; margin: 0 auto; padding: 24px 24px 48px; }
+
+    .hidden { display: none !important; }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+    .stat {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      box-shadow: var(--shadow-sm);
+    }
+    .stat .num {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--primary-dark);
+      line-height: 1.1;
+    }
+    .stat .lbl { color: var(--muted); font-size: 0.8125rem; margin-top: 6px; font-weight: 500; }
+    button, .btn {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 10px;
+      cursor: pointer;
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+      display: inline-block;
+      font-family: inherit;
+      transition: background 0.15s ease, transform 0.15s ease;
+    }
+    button:hover, .btn:hover { background: var(--primary-dark); }
+    button.ghost, .btn.ghost {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      box-shadow: var(--shadow-sm);
+    }
+    button.ghost:hover, .btn.ghost:hover {
+      background: var(--primary-light);
+      border-color: #c7d2fe;
+      color: var(--primary-dark);
+    }
+    .filter-bar {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .table-wrap {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow-sm);
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      text-align: left;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      font-size: 0.875rem;
+      vertical-align: top;
+    }
+    th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      background: var(--surface-muted);
+    }
+    tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: var(--surface-muted); }
+    .badge {
+      display: inline-block;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--surface-muted);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }
+    .badge.pending {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border-color: #fcd34d;
+    }
+    .empty { color: var(--muted); padding: 48px 16px; text-align: center; font-size: 0.9375rem; }
+    .err {
+      color: var(--error);
+      background: var(--error-bg);
+      margin-top: 14px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+      text-align: center;
+    }
+    .quote-list { display: grid; gap: 12px; }
+    .quote-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+    }
+    .quote-card-head {
+      display: grid;
+      grid-template-columns: 20px 1fr auto;
+      gap: 12px;
+      align-items: start;
+      padding: 16px 18px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .quote-card-head:hover { background: var(--surface-muted); }
+    .quote-card .chevron {
+      color: var(--muted);
+      margin-top: 4px;
+      transition: transform 0.15s ease;
+      font-size: 0.75rem;
+    }
+    .quote-card.open .chevron { transform: rotate(90deg); }
+    .quote-card-title {
+      font-weight: 700;
+      font-size: 0.9375rem;
+      color: var(--primary-dark);
+    }
+    .quote-card-sub {
+      color: var(--muted);
+      font-size: 0.8125rem;
+      margin-top: 4px;
+      line-height: 1.45;
+    }
+    .quote-card-body {
+      display: none;
+      padding: 0 18px 18px;
+      border-top: 1px solid var(--border);
+    }
+    .quote-card.open .quote-card-body { display: block; padding-top: 14px; }
+    .lane-preview {
+      margin-top: 10px;
+      padding: 12px 14px;
+      background: var(--surface-muted);
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .lane-preview h4 {
+      margin: 0 0 8px;
+      font-size: 0.8125rem;
+      font-weight: 700;
+    }
+    .rate-line {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      padding: 3px 0;
+    }
+    .rate-line .sell { color: var(--success); font-weight: 600; }
+    .card-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+    .more-rates {
+      color: var(--muted);
+      font-size: 0.75rem;
+      margin-top: 4px;
+    }
+    .outlook-bar {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      margin-bottom: 24px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      align-items: center;
+      box-shadow: var(--shadow-sm);
+    }
+    .outlook-bar .status {
+      flex: 1;
+      min-width: 200px;
+      font-size: 0.875rem;
+      line-height: 1.5;
+      color: var(--text-secondary);
+    }
+    .outlook-bar .status.ok {
+      color: var(--success);
+      background: var(--success-bg);
+      padding: 10px 14px;
+      border-radius: 8px;
+    }
+    .outlook-bar .status.warn {
+      color: var(--warning);
+      background: var(--warning-bg);
+      padding: 10px 14px;
+      border-radius: 8px;
+    }
+
+    @media (max-width: 640px) {
+      .login { padding: 32px 24px 28px; }
+      header { padding: 16px; }
+      main { padding: 16px 16px 40px; }
+      .quote-card-head { grid-template-columns: 16px 1fr; }
+      .quote-card-head .badge { grid-column: 2; }
+    }
+  </style>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+</head>
+<body>
+  <div id="login-screen" class="login-page">
+    <section class="login">
+      <div class="login-brand">
+        <div class="login-icon" aria-hidden="true">&#9993;</div>
+        <h2>Quote Dashboard</h2>
+        <p class="login-desc">Sign in with your dispatcher account.<br>New users are added by admin only.</p>
+      </div>
+      <form id="login-form" class="login-form">
+        <label>Email
+          <input type="email" id="login-email" autocomplete="username" placeholder="you@innovativecarriers.com" required>
+        </label>
+        <label>Password
+          <input type="password" id="login-password" autocomplete="current-password" placeholder="Enter your password" required>
+        </label>
+        <button type="submit" class="btn-login">Sign in</button>
+      </form>
+      <p class="login-links">
+        <button type="button" class="link-btn" id="btn-forgot">Forgot password?</button>
+      </p>
+      <div class="login-msg ok hidden" id="login-success"></div>
+      <div class="err" id="login-error"></div>
+      <p class="login-footer">Each dispatcher only sees quotes assigned to their own email address.</p>
+    </section>
+  </div>
+
+  <div id="app" class="hidden">
+    <header>
+      <div>
+        <h1 id="title">Quote Dashboard</h1>
+        <div class="sub" id="subtitle"></div>
+      </div>
+      <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
+        <button type="button" class="ghost" id="btn-rules">Quote rules</button>
+        <button type="button" class="ghost" id="btn-signout">Sign out</button>
+        <button type="button" class="ghost" id="btn-refresh">Refresh</button>
+      </div>
+    </header>
+    <main>
+      <div class="outlook-bar">
+        <div class="status warn" id="outlook-status">
+          Connect your Outlook mailbox to receive quotes sent to your email.
+        </div>
+        <button type="button" class="ghost" id="btn-outlook-connect">Connect Outlook</button>
+        <button type="button" class="ghost hidden" id="btn-outlook-disconnect">Disconnect</button>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="num" id="stat-pending">—</div><div class="lbl">Pending</div></div>
+        <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Recent quotes</div></div>
+      </div>
+      <div class="filter-bar">
+        <button type="button" id="filter-pending" class="ghost">Pending only</button>
+        <button type="button" id="filter-all" class="ghost">All recent</button>
+      </div>
+      <div class="quote-list" id="rows">
+        <div class="empty">Loading…</div>
+      </div>
+    </main>
+  </div>
+
+  <script src="__API_BASE__/quoteAuthClient?v=__AUTH_CLIENT_VERSION__"></script>
+  <script>
+    const API = "__API_BASE__";
+    const TENANT_ID = "__TENANT_ID__";
+    let filterStatus = "";
+
+    async function apiFetch(path, opts) {
+      const headers = Object.assign(
+          {"Content-Type": "application/json"},
+          await QuoteAuth.authHeaders(),
+          (opts && opts.headers) || {});
+      return fetch(API + path, Object.assign({}, opts || {}, {headers}))
+          .then((r) => r.json());
+    }
+
+    async function loadProfile() {
+      const res = await apiFetch("/getQuoteDispatcherProfile?tenantId=" +
+        encodeURIComponent(TENANT_ID));
+      if (!res.ok) throw new Error(res.error || "Profile failed");
+      document.getElementById("title").textContent =
+        res.dispatcher.name + " — Quotes";
+      document.getElementById("subtitle").textContent =
+        res.dispatcher.email || "";
+      const outlook = res.outlook || {};
+      const statusEl = document.getElementById("outlook-status");
+      const connectBtn = document.getElementById("btn-outlook-connect");
+      const disconnectBtn = document.getElementById("btn-outlook-disconnect");
+      if (outlook.connected) {
+        statusEl.className = "status ok";
+        statusEl.textContent = "Outlook connected: " + (outlook.email || "");
+        connectBtn.classList.add("hidden");
+        disconnectBtn.classList.remove("hidden");
+      } else {
+        statusEl.className = "status warn";
+        statusEl.textContent =
+          "Connect your Outlook mailbox (" + (res.dispatcher.email || "") +
+          ") to pull in quote requests sent to you.";
+        connectBtn.classList.remove("hidden");
+        disconnectBtn.classList.add("hidden");
+      }
+    }
+
+    async function loadInbox() {
+      let path = "/getQuoteDispatcherInbox?tenantId=" +
+        encodeURIComponent(TENANT_ID) + "&limit=50";
+      // Always fetch recent; apply pending filter client-side so draft_ready stays visible
+      const res = await apiFetch(path);
+      const root = document.getElementById("rows");
+      if (!res.ok) {
+        root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
+        return;
+      }
+      let items = res.items || [];
+      if (filterStatus === "awaiting_dispatcher") {
+        items = items.filter((i) =>
+          i.status === "awaiting_dispatcher" || i.status === "draft_ready");
+      } else if (filterStatus) {
+        items = items.filter((i) => i.status === filterStatus);
+      }
+      document.getElementById("stat-total").textContent = items.length;
+      document.getElementById("stat-pending").textContent =
+        items.filter((i) =>
+          i.status === "awaiting_dispatcher" || i.status === "draft_ready"
+        ).length;
+      if (!items.length) {
+        root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
+        return;
+      }
+      root.innerHTML = items.map((item) => {
+        const pending = item.status === "awaiting_dispatcher" ||
+          item.status === "draft_ready";
+        const lanes = item.lanesPreview || [];
+        const lanesHtml = lanes.map((lane) => {
+          const opts = (lane.topOptions || []).map((o) =>
+            '<div class="rate-line"><span class="sell">$' +
+            num(o.sellRate) + "</span> · " + esc(o.name || o.SCAC || "Carrier") +
+            (o.transitDays ? " · " + o.transitDays + " days" : "") +
+            "</div>"
+          ).join("");
+          const more = (lane.optionCount || 0) > (lane.topOptions || []).length ?
+            '<div class="more-rates">+' +
+              ((lane.optionCount || 0) - (lane.topOptions || []).length) +
+              " more rates on full review</div>" : "";
+          const acc = (lane.accessorials || []).length ?
+            '<div class="more-rates">Accessorials: ' +
+              esc((lane.appliedRules || []).map((r) => r.name).join(", ") ||
+                lane.accessorials.join(", ")) + "</div>" : "";
+          return '<div class="lane-preview"><h4>' +
+            esc(lane.label || lane.laneKey) + "</h4>" +
+            (opts || '<div class="rate-line">No rates</div>') +
+            more + acc + "</div>";
+        }).join("");
+
+        return `<div class="quote-card" data-id="${esc(item.id)}">
+          <div class="quote-card-head">
+            <span class="chevron">▶</span>
+            <div>
+              <div class="quote-card-title">${esc(item.batchQuoteId || "—")}</div>
+              <div class="quote-card-sub">${esc(item.from || "")}<br>${esc(item.subject || "")}<br>${item.laneCount || 0} lane(s)</div>
+            </div>
+            <span class="badge ${pending ? "pending" : ""}">${esc(item.status || "")}</span>
+          </div>
+          <div class="quote-card-body">
+            ${lanesHtml || '<div class="empty" style="padding:12px">No lane preview</div>'}
+            <div class="card-actions">
+              <a class="btn" href="${esc(item.openUrl || "#")}">Open full review</a>
+              <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}">Dismiss</button>
+            </div>
+          </div>
+        </div>`;
+      }).join("");
+
+      root.querySelectorAll(".quote-card-head").forEach((el) => {
+        el.addEventListener("click", () => {
+          el.parentElement.classList.toggle("open");
+        });
+      });
+      root.querySelectorAll(".btn-dismiss-card").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!confirm("Dismiss this quote?")) return;
+          try {
+            const res2 = await apiFetch("/dismissQuote", {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: btn.dataset.id,
+              }),
+            });
+            if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
+            await loadInbox();
+          } catch (err) {
+            alert(err.message || "Dismiss failed");
+          }
+        });
+      });
+    }
+
+    function num(n) {
+      const v = Number(n);
+      return isFinite(v) ? v.toFixed(2) : "—";
+    }
+
+    function esc(s) {
+      return String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;");
+    }
+
+    function showApp(show) {
+      document.getElementById("login-screen").classList.toggle("hidden", show);
+      document.getElementById("app").classList.toggle("hidden", !show);
+    }
+
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      document.getElementById("login-error").textContent = "";
+      document.getElementById("login-success").classList.add("hidden");
+      try {
+        await QuoteAuth.signInWithEmailPassword(
+            document.getElementById("login-email").value,
+            document.getElementById("login-password").value);
+      } catch (err) {
+        document.getElementById("login-error").textContent =
+          err.message || "Sign-in failed";
+      }
+    });
+
+    document.getElementById("btn-forgot").addEventListener("click", async () => {
+      document.getElementById("login-error").textContent = "";
+      document.getElementById("login-success").classList.add("hidden");
+      const email = document.getElementById("login-email").value;
+      if (!email) {
+        document.getElementById("login-error").textContent =
+          "Enter your email above, then click Forgot password.";
+        document.getElementById("login-email").focus();
+        return;
+      }
+      try {
+        await QuoteAuth.sendPasswordResetEmail(email);
+        document.getElementById("login-success").textContent =
+          "Password reset email sent. Check your inbox.";
+        document.getElementById("login-success").classList.remove("hidden");
+      } catch (err) {
+        document.getElementById("login-error").textContent =
+          err.message || "Could not send reset email";
+      }
+    });
+
+    document.getElementById("btn-signout").addEventListener("click", () => QuoteAuth.signOut());
+    document.getElementById("btn-refresh").addEventListener("click", loadInbox);
+    document.getElementById("btn-outlook-connect").addEventListener("click", async () => {
+      try {
+        const res = await apiFetch("/getQuoteOutlookConnectUrl?tenantId=" +
+          encodeURIComponent(TENANT_ID));
+        if (!res.ok) throw new Error(res.error || "Connect failed");
+        window.open(res.url, "_blank", "noopener,noreferrer");
+      } catch (err) {
+        alert(err.message || "Could not start Outlook connect");
+      }
+    });
+    document.getElementById("btn-outlook-disconnect").addEventListener("click", async () => {
+      if (!confirm("Disconnect Outlook from this dashboard?")) return;
+      try {
+        const res = await apiFetch("/quoteOutlookDisconnect?tenantId=" +
+          encodeURIComponent(TENANT_ID), {method: "POST"});
+        if (!res.ok) throw new Error(res.error || "Disconnect failed");
+        await loadProfile();
+      } catch (err) {
+        alert(err.message || "Could not disconnect Outlook");
+      }
+    });
+    document.getElementById("filter-pending").addEventListener("click", () => {
+      filterStatus = "awaiting_dispatcher"; loadInbox();
+    });
+    document.getElementById("filter-all").addEventListener("click", () => {
+      filterStatus = ""; loadInbox();
+    });
+    document.getElementById("btn-rules").addEventListener("click", () => {
+      window.open(API + "/quoteAdminPage?tenantId=" + encodeURIComponent(TENANT_ID), "_blank");
+    });
+
+    (async () => {
+      try {
+        await QuoteAuth.init({apiBase: API, tenantId: TENANT_ID});
+        QuoteAuth.onAuth(async (user) => {
+          if (!user) { showApp(false); return; }
+          showApp(true);
+          try {
+            await loadProfile();
+            await loadInbox();
+          } catch (e) {
+            document.getElementById("login-error").textContent = e.message;
+            showApp(false);
+            await QuoteAuth.signOut();
+          }
+        });
+      } catch (e) {
+        document.getElementById("login-error").textContent = e.message;
+      }
+    })();
+  </script>
+</body>
+</html>

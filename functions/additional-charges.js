@@ -71,6 +71,32 @@ const RATE_MATCH_TOLERANCE = 10;
 /** Charges at or below this amount are ignored for approval/dispute. */
 const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
 
+/** Flat band for lumper base-freight pre-check vs Primus carrier cost. */
+const LUMPER_BASE_TOLERANCE = 5;
+
+/**
+ * Validates invoice amount by subtracting lumper charges before comparing
+ * to Primus carrier cost (booking.vendor.cost).
+ * @param {object} aiResult AI classification result.
+ * @param {number} primusCarrierCost Carrier cost from Primus booking.
+ * @return {object} Validation result.
+ */
+function validateLumperAmount(aiResult, primusCarrierCost) {
+  const lumperCharges = (aiResult.recognizedCharges || [])
+      .filter((c) => c && c.type === "lumper");
+  const totalLumper = lumperCharges.reduce(
+      (sum, c) => sum + (Number(c.amount) || 0), 0);
+  const baseAmount = Number(aiResult.invoiceAmount || 0) - totalLumper;
+  const difference = Math.abs(baseAmount - Number(primusCarrierCost || 0));
+  // Flat band — pre-check only; full validation uses validateAmountWithPrimus.
+  return {
+    valid: difference <= LUMPER_BASE_TOLERANCE,
+    baseAmount,
+    totalLumper,
+    difference,
+  };
+}
+
 /**
  * @param {string} text Raw text.
  * @return {string}
@@ -123,6 +149,20 @@ function applyAdditionalChargeEmailCc(payload) {
   return Object.assign({}, payload, {
     cc: mergeLisaOnCc(payload && payload.cc),
   });
+}
+
+/**
+ * Ensures Lisa is CC'd on emails sent directly to a load dispatcher.
+ * Skips duplicate CC when Lisa is already the primary recipient.
+ * @param {object} payload saveOutboundEmail fields.
+ * @return {object}
+ */
+function applyDispatcherEmailCc(payload) {
+  const out = Object.assign({}, payload || {});
+  const to = String(out.to || "").trim().toLowerCase();
+  if (to === LISA_EMAIL.toLowerCase()) return out;
+  out.cc = mergeLisaOnCc(out.cc);
+  return out;
 }
 
 /**
@@ -710,17 +750,18 @@ function buildAdditionalChargeApprovalEmail(opts) {
         "A — Approve: pay carrier + bill customer (auto-email customer)") +
     btn("b", "#0d9488",
         "B — Approve: pay carrier + bill customer " +
-        "(enter updated rate; dispatcher notifies customer)") +
+        "(itemize accessorials; dispatcher notifies customer)") +
     btn("c", "#2563eb",
         "C — Approve: pay carrier only (customer rate unchanged)") +
     btn("d", "#dc2626",
         "D — Not approved: dispute with carrier") +
     `<p style="font-size:12px;color:#6b7280">A: customer rate is auto-bumped ` +
-    `by the charge amount and the customer is emailed. B: you enter the ` +
-    `updated customer rate on the confirm page and the dispatcher notifies ` +
-    `the customer of that amount. C: the carrier bill is entered at the full ` +
-    `carrier amount and the customer rate stays the same (no itemization ` +
-    `needed). D: Jerry will draft the dispute wording for manual submission.` +
+    `by the charge amount and the customer is emailed. B: the base customer ` +
+    `rate stays the same — enter each accessorial and the amount to bill the ` +
+    `customer on separate lines; the dispatcher notifies the customer. C: ` +
+    `the carrier bill is entered at the full carrier amount and the customer ` +
+    `rate stays the same (no itemization needed). D: Jerry will draft the ` +
+    `wording for manual submission.` +
     `</p>`;
 
   return {
@@ -875,8 +916,26 @@ function buildCustomerChargeNotificationEmail(opts) {
 function buildDispatcherNotifyReminderEmail(opts) {
   const {
     dispatcherName, loadNumber, carrierName, customerName,
-    charges, chargesTotal, customerRate, originalCustomerRate,
+    charges, chargesTotal, customerRate, customerBillLines,
   } = opts;
+  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
+  const baseRate = Number(customerRate) || 0;
+  const accessorialTotal = sumCustomerBillLines(billLines);
+  const billingBlock = billLines.length ?
+    ((baseRate > 0 ?
+      `<p><strong>Base customer rate (unchanged): ` +
+      `${formatCustomerRate(baseRate)}</strong></p>` : "") +
+      `<p><strong>Accessorials to bill the customer:</strong></p>` +
+      customerBillLinesHtml(billLines) +
+      `<p><strong>Total to bill (base + accessorials): ` +
+      `${money(baseRate + accessorialTotal)}</strong></p>` +
+      `<p>Please notify the customer of the accessorial charge(s) above. ` +
+      `The base freight rate is not changed.</p>`) :
+    (chargesHtml(charges) +
+      `<p>Total additional: <strong>${money(chargesTotal)}</strong></p>` +
+      `<p><strong>Action needed:</strong> please email the customer about ` +
+      `this charge. This item stays on your task list (Additional Charges ` +
+      `Follow-Up) until done.</p>`);
   const html =
     `<p>Hi${dispatcherName ? ` ${esc(dispatcherName)}` : ""},</p>` +
     `<p>An additional carrier charge on load ` +
@@ -885,19 +944,7 @@ function buildDispatcherNotifyReminderEmail(opts) {
     `customer, and it was decided that <strong>you will notify the ` +
     `customer</strong>${customerName ? ` (${esc(customerName)})` : ""} ` +
     `about it yourself.</p>` +
-    (customerRate != null && Number(customerRate) > 0 ?
-      `<p><strong>Updated customer rate to bill: ` +
-      `${formatCustomerRate(customerRate)}</strong>` +
-      (originalCustomerRate != null && Number(originalCustomerRate) > 0 &&
-        Number(originalCustomerRate) !== Number(customerRate) ?
-        ` (was ${formatCustomerRate(originalCustomerRate)})` : "") +
-      `</p>` +
-      `<p>Please notify the customer of this updated amount.</p>` : "") +
-    chargesHtml(charges) +
-    `<p>Total additional: <strong>${money(chargesTotal)}</strong></p>` +
-    `<p><strong>Action needed:</strong> please email the customer about ` +
-    `this charge and the updated rate above. This item stays on your task ` +
-    `list (Additional Charges Follow-Up) until done.</p>`;
+    billingBlock;
   return {
     subject: `Task — notify customer of additional charge on ` +
       `Load ${loadNumber}`,
@@ -984,6 +1031,189 @@ async function updateFollowUp(db, opts) {
   await ref.update(update);
 }
 
+/**
+ * @param {Array<object>} lines Customer bill lines {name, amount}.
+ * @return {number}
+ */
+function sumCustomerBillLines(lines) {
+  return (Array.isArray(lines) ? lines : [])
+      .reduce((sum, line) => sum + (Number(line && line.amount) || 0), 0);
+}
+
+/**
+ * @param {Array<object>} lines Customer bill lines.
+ * @return {string}
+ */
+function customerBillLinesHtml(lines) {
+  const rows = (Array.isArray(lines) ? lines : [])
+      .map((line) =>
+        `<li>${esc(String(line.name || "Accessorial"))}: ` +
+        `<strong>${money(line.amount)}</strong></li>`)
+      .join("");
+  return rows ?
+    `<ul style="margin:6px 0 6px 18px;padding:0">${rows}</ul>` :
+    "";
+}
+
+/**
+ * @param {Array<object>} lines Raw line objects.
+ * @return {object} Normalized lines payload.
+ */
+function normalizeCustomerBillLines(lines) {
+  const out = [];
+  for (const line of (Array.isArray(lines) ? lines : [])) {
+    const name = String(line && (line.name || line.label) || "").trim();
+    const amount = Math.round(Number(line && line.amount) * 100) / 100;
+    if (!name) continue;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return {
+        ok: false,
+        error: `Invalid amount for accessorial "${name}"`,
+      };
+    }
+    out.push({name, amount});
+  }
+  if (!out.length) {
+    return {
+      ok: false,
+      error: "Enter at least one accessorial name and customer charge amount.",
+    };
+  }
+  return {ok: true, lines: out, total: sumCustomerBillLines(out)};
+}
+
+/**
+ * @param {object} body POST body from the confirm form.
+ * @return {object} Parsed customer bill lines payload.
+ */
+function parseCustomerBillLinesFromRequest(body) {
+  const raw = body && body.customerBillLinesJson;
+  if (!raw) {
+    return {ok: false, error: "Missing accessorial billing lines."};
+  }
+  try {
+    const parsed = JSON.parse(String(raw));
+    return normalizeCustomerBillLines(parsed);
+  } catch (_) {
+    return {ok: false, error: "Could not read accessorial billing lines."};
+  }
+}
+
+/**
+ * Seeds Option B rows from carrier-detected charge lines.
+ * @param {Array<object>} charges Carrier charge rows.
+ * @return {Array<object>}
+ */
+function seedCustomerBillLinesFromCharges(charges) {
+  const rows = (Array.isArray(charges) ? charges : []).map((charge) => ({
+    name: displayChargeLabel(chargeLabel(charge)),
+    amount: "",
+    carrierAmount: Number(charge && charge.amount) || 0,
+  }));
+  if (rows.length) return rows;
+  return [{name: "", amount: "", carrierAmount: 0}];
+}
+
+/**
+ * Option B confirm page — itemized customer accessorial billing.
+ * @param {object} opts form options.
+ * @return {string} HTML page.
+ */
+function buildOptionBAccessorialConfirmPage(opts) {
+  const fields = opts.fields || {};
+  const btnColor = opts.confirmColor || "#0d9488";
+  const formAction = `${opts.baseUrl}/${opts.actionPath}`;
+  const hidden = Object.entries(fields)
+      .map(([name, value]) =>
+        `<input type="hidden" name="${esc(name)}" ` +
+        `value="${esc(String(value ?? ""))}">`)
+      .join("");
+  const baseRate = Number(opts.baseCustomerRate) || 0;
+  const seedRows = seedCustomerBillLinesFromCharges(opts.carrierCharges);
+  const seedJson = JSON.stringify(seedRows)
+      .replace(/</g, "\\u003c")
+      .replace(/-->/g, "--\\u003e");
+  const baseRateHtml = baseRate > 0 ?
+    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+    `<strong>Base customer rate (unchanged):</strong> ` +
+    `${formatCustomerRate(baseRate)}</p>` :
+    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+    `The base customer freight rate will stay as-is in Primus. Enter each ` +
+    `accessorial and the amount to bill the customer below.</p>`;
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${esc(opts.title || "Confirm option B")}</title>` +
+    `<style>` +
+    `.bill-row{display:grid;grid-template-columns:1fr 140px 32px;gap:8px;` +
+    `align-items:start;margin-bottom:10px}` +
+    `.bill-row input{width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
+    `border-radius:8px;font-size:16px;box-sizing:border-box}` +
+    `.bill-hint{font-size:12px;color:#6b7280;margin-top:4px}` +
+    `.add-btn{background:#fff;color:#0d9488;border:1px solid #0d9488;` +
+    `padding:8px 12px;border-radius:8px;font-size:14px;cursor:pointer}` +
+    `.remove-btn{background:#fff;color:#dc2626;border:1px solid #fecaca;` +
+    `border-radius:8px;width:32px;height:42px;cursor:pointer}` +
+    `</style></head>` +
+    `<body style="font-family:Arial,sans-serif;max-width:560px;` +
+    `margin:48px auto;padding:0 16px;color:#111827">` +
+    `<h1 style="font-size:22px;margin-bottom:12px">` +
+    `${esc(opts.title || "Confirm option B")}</h1>` +
+    `<p style="font-size:16px;color:#374151;line-height:1.5">` +
+    `${opts.description || ""}</p>` +
+    baseRateHtml +
+    `<form method="POST" action="${esc(formAction)}" id="option-b-form" ` +
+    `style="margin-top:16px">` +
+    hidden +
+    `<input type="hidden" name="customerBillLinesJson" ` +
+    `id="customerBillLinesJson">` +
+    `<p style="font-size:14px;font-weight:600;color:#374151;` +
+    `margin-bottom:8px">` +
+    `Accessorials to bill the customer</p>` +
+    `<div id="bill-lines"></div>` +
+    `<button type="button" class="add-btn" id="add-bill-line">` +
+    `+ Add accessorial</button>` +
+    `<div style="margin-top:20px">` +
+    `<button type="submit" style="background:${btnColor};color:#fff;` +
+    `border:none;padding:12px 20px;border-radius:8px;font-size:16px;` +
+    `font-weight:600;cursor:pointer">` +
+    `${esc(opts.confirmLabel || "Confirm option B")}</button>` +
+    `</div></form>` +
+    `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
+    `If you did not request this, close this page — nothing has been ` +
+    `changed yet.</p>` +
+    `<script>` +
+    `const seedRows = ${seedJson};` +
+    `const container = document.getElementById("bill-lines");` +
+    `function escAttr(v){return String(v ?? "").replace(/&/g,"&amp;")` +
+    `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
+    `function addRow(row={}){` +
+    `const wrap=document.createElement("div");wrap.className="bill-row";` +
+    `const hint=row.carrierAmount?` +
+    `"<div class=\\"bill-hint\\">Carrier billed ` +
+    `"+row.carrierAmount.toFixed(2)+"</div>":"";` +
+    `wrap.innerHTML="<div><input type=\\"text\\" class=\\"bill-name\\" ` +
+    `placeholder=\\"Accessorial name\\" value=\\""+escAttr(row.name||"")+` +
+    `"\\" required>"+hint+"</div><div><input type=\\"number\\" ` +
+    `class=\\"bill-amount\\" min=\\"0.01\\" step=\\"0.01\\" ` +
+    `placeholder=\\"0.00\\" value=\\""+escAttr(row.amount||"")+` +
+    `"\\" required></div><button type=\\"button\\" class=\\"remove-btn\\" ` +
+    `title=\\"Remove\\">×</button>";` +
+    `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
+    `container.appendChild(wrap);}` +
+    `(seedRows.length?seedRows:[{name:"",amount:""}]).forEach(addRow);` +
+    `document.getElementById("add-bill-line").onclick=()=>addRow({});` +
+    `document.getElementById("option-b-form").onsubmit=()=>{` +
+    `const lines=[...container.querySelectorAll(".bill-row")].map((row)=>{` +
+    `return {name:row.querySelector(".bill-name").value.trim(),` +
+    `amount:Number(row.querySelector(".bill-amount").value)};` +
+    `}).filter((line)=>line.name&&line.amount>0);` +
+    `if(!lines.length){alert("Enter at least one accessorial and amount.");` +
+    `return false;}` +
+    `document.getElementById("customerBillLinesJson").value=` +
+    `JSON.stringify(lines);return true;};` +
+    `</script></body></html>`;
+}
+
 module.exports = {
   FOLLOW_UP_COLLECTION,
   FOLLOW_UP_STATUS,
@@ -993,6 +1223,7 @@ module.exports = {
   LISA_EMAIL,
   mergeLisaOnCc,
   applyAdditionalChargeEmailCc,
+  applyDispatcherEmailCc,
   formatCustomerRate,
   isWeightInspectionLabel,
   isAccessorialLabel,
@@ -1009,12 +1240,20 @@ module.exports = {
   buildRateQueryFromBooking,
   evaluateRequoteMatch,
   classifyAdditionalChargeReason,
+  validateLumperAmount,
+  LUMPER_BASE_TOLERANCE,
   resolveEffectiveChargeCategory,
   categoryLabel,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
   buildCustomerChargeNotificationEmail,
   buildDispatcherNotifyReminderEmail,
+  buildOptionBAccessorialConfirmPage,
+  customerBillLinesHtml,
+  sumCustomerBillLines,
+  normalizeCustomerBillLines,
+  parseCustomerBillLinesFromRequest,
+  seedCustomerBillLinesFromCharges,
   createFollowUp,
   updateFollowUp,
 };

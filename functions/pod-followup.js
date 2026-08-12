@@ -70,13 +70,19 @@ function businessDaysBetween(from, to) {
   return count;
 }
 
+/** Minimum bytes for a JPEG/PNG POD saved with an invoice email. */
+const MIN_POD_IMAGE_BYTES = 5000;
+
+/** Legacy floor for standalone trailer / POD-only image replies. */
+const MIN_TRAILER_IMAGE_BYTES = 50000;
+
 /**
  * @param {object} attachment Attachment meta {mimeType, filename}.
  * @param {Buffer} buffer File bytes.
- * @return {boolean} True for trailer-image candidates (size floor ~50KB).
+ * @return {boolean} True when bytes look like JPEG/PNG/WebP image data.
  */
-function isTrailerImageAttachment(attachment, buffer) {
-  if (!buffer || buffer.length < 50000) return false;
+function looksLikePodImageBytes(attachment, buffer) {
+  if (!buffer || !buffer.length) return false;
   const mime = String((attachment && attachment.mimeType) || "").toLowerCase();
   const name = String((attachment && attachment.filename) || "").toLowerCase();
   if (mime === "image/jpeg" || mime === "image/jpg" || mime === "image/png") {
@@ -84,7 +90,6 @@ function isTrailerImageAttachment(attachment, buffer) {
   }
   if (mime === "image/webp") return true;
   if (/\.(jpe?g|png|webp)$/i.test(name)) return true;
-  // Magic bytes: JPEG FF D8 FF, PNG 89 50 4E 47
   if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
     return true;
   }
@@ -93,6 +98,31 @@ function isTrailerImageAttachment(attachment, buffer) {
     return true;
   }
   return false;
+}
+
+/**
+ * @param {object} attachment Attachment meta {mimeType, filename}.
+ * @param {Buffer} buffer File bytes.
+ * @param {object} [opts] Options.
+ * @param {number} [opts.minBytes] Minimum file size (default 5KB).
+ * @return {boolean} True for JPEG/PNG POD image candidates.
+ */
+function isPodImageAttachment(attachment, buffer, opts) {
+  const minBytes = (opts && opts.minBytes != null) ?
+    Number(opts.minBytes) : MIN_POD_IMAGE_BYTES;
+  if (!buffer || buffer.length < minBytes) return false;
+  return looksLikePodImageBytes(attachment, buffer);
+}
+
+/**
+ * @param {object} attachment Attachment meta {mimeType, filename}.
+ * @param {Buffer} buffer File bytes.
+ * @return {boolean} True for trailer-image candidates (size floor ~50KB).
+ */
+function isTrailerImageAttachment(attachment, buffer) {
+  return isPodImageAttachment(attachment, buffer, {
+    minBytes: MIN_TRAILER_IMAGE_BYTES,
+  });
 }
 
 /**
@@ -284,7 +314,10 @@ module.exports = {
   LISA_EMAIL,
   SARAH_EMAIL,
   POD_FOLLOW_UP_STATUS,
+  MIN_POD_IMAGE_BYTES,
+  MIN_TRAILER_IMAGE_BYTES,
   businessDaysBetween,
+  isPodImageAttachment,
   isTrailerImageAttachment,
   detectImageMime,
   imagesToPodPdf,

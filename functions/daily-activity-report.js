@@ -6,6 +6,7 @@
 
 const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
+const mailIntakeQueue = require("./mail-intake-queue");
 
 let deps = {};
 
@@ -133,7 +134,8 @@ function aggregateDailyActivity(logs) {
         timestamp: log.timestamp || null,
       });
     }
-    if (msg === "Gmail inbox check completed" ||
+    if (msg === "Inbox check completed" ||
+        msg === "Gmail inbox check completed" ||
         msg === "Outlook inbox check completed") {
       agg.inboxChecks += 1;
     }
@@ -733,7 +735,407 @@ async function runDailyBrokerSwapReport(opts = {}) {
   };
 }
 
+/**
+ * Escapes HTML for email bodies.
+ * @param {*} str Value to escape.
+ * @return {string}
+ */
+function escapeHtml(str) {
+  return String(str == null ? "" : str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+}
+
+/**
+ * Formats a Firestore timestamp for display.
+ * @param {*} ts Firestore timestamp.
+ * @return {string}
+ */
+function fmtDiscoveredAt(ts) {
+  if (!ts || !ts.toDate) return "—";
+  return ts.toDate().toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/**
+ * Builds HTML for the daily inbox intake digest.
+ * @param {Array<object>} rows emailIntake rows.
+ * @param {object} meta Report metadata.
+ * @return {string}
+ */
+function buildInboxDigestHtml(rows, meta) {
+  const needsAttention = rows.filter((row) => {
+    const status = row.intakeStatus || row.status;
+    return status === "queued" || status === "processing" ||
+      status === "failed" || status === "waiting_children";
+  });
+  const completed = rows.filter((row) => {
+    const status = row.intakeStatus || row.status;
+    return status === "completed";
+  });
+
+  const rowHtml = (list) => list.map((row) => {
+    const status = row.intakeStatus || row.status || "unknown";
+    const summary = row.summary ||
+      mailIntakeQueue.buildIntakeSummary(row);
+    return `<tr>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(fmtDiscoveredAt(row.discoveredAt))}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(row.from || "—")}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(row.subject || "—")}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(status)}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(summary)}</td>` +
+      `</tr>`;
+  }).join("");
+
+  const table = (title, list) => {
+    if (!list.length) {
+      return `<h3 style="margin:18px 0 8px">${escapeHtml(title)}</h3>` +
+        `<p style="color:#6b7280">None.</p>`;
+    }
+    return `<h3 style="margin:18px 0 8px">${escapeHtml(title)} ` +
+      `(${list.length})</h3>` +
+      `<table style="border-collapse:collapse;width:100%;font-size:13px">` +
+      `<thead><tr style="background:#f9fafb">` +
+      `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+      `Discovered</th>` +
+      `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+      `From</th>` +
+      `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+      `Subject</th>` +
+      `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+      `Status</th>` +
+      `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+      `Summary</th>` +
+      `</tr></thead><tbody>${rowHtml(list)}</tbody></table>`;
+  };
+
+  return (
+    `<p style="color:#374151">Inbox intake for the last ${meta.hours} hours ` +
+    `(as of ${escapeHtml(meta.label)} ET).</p>` +
+    table("Needs attention", needsAttention) +
+    table("Completed", completed) +
+    `<p style="color:#6b7280;font-size:12px;margin-top:12px">` +
+    `${rows.length} email(s) discovered · automated inbox digest</p>`
+  );
+}
+
+/**
+ * @param {object} opts Options.
+ * @param {object} opts.tenant Tenant config.
+ * @param {number} [opts.hours=24] Lookback window.
+ * @param {boolean} [opts.dryRun=false] Skip email send.
+ * @return {Promise<object>}
+ */
+async function runDailyInboxDigestReport(opts = {}) {
+  const tenant = opts.tenant;
+  const hours = Math.min(Math.max(Number(opts.hours || 24), 1), 168);
+  const dryRun = Boolean(opts.dryRun);
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+  const rows = await mailIntakeQueue.listIntakeForDigest(tenant, since);
+
+  const now = new Date();
+  const label = now.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  const subjectDate = now.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  const html = buildInboxDigestHtml(rows, {hours, label});
+  const subject = `Jerry inbox digest — ${subjectDate}`;
+
+  const to = process.env.DAILY_ACTIVITY_REPORT_EMAIL ||
+    process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+  const cc = process.env.DAILY_ACTIVITY_REPORT_CC || null;
+
+  if (!dryRun && deps.saveOutboundEmail) {
+    await deps.saveOutboundEmail({
+      type: "daily_inbox_digest",
+      subject,
+      html,
+      to,
+      cc,
+      tenant,
+    });
+  }
+
+  const needsAttentionCount = rows.filter((row) => {
+    const status = row.intakeStatus || row.status;
+    return status === "queued" || status === "processing" ||
+      status === "failed" || status === "waiting_children";
+  }).length;
+
+  if (deps.writeLog) {
+    await deps.writeLog("info", "report", "Daily inbox digest generated", {
+      hours,
+      emailCount: rows.length,
+      needsAttentionCount,
+      dryRun,
+      to,
+      cc,
+      tenantId: tenant && tenant.tenantId,
+    }, null, tenant);
+  }
+
+  return {
+    ok: true,
+    hours,
+    emailCount: rows.length,
+    needsAttentionCount,
+    dryRun,
+    emailedTo: dryRun ? null : to,
+  };
+}
+
+/** Human-readable labels for ignore categories (by finalStatus). */
+const IGNORE_CATEGORY_LABELS = {
+  payment_notification_ignored: "Payment notification",
+  emodal_broadcast_ignored: "eModal / terminal broadcast",
+  noa_ignored: "Notice of assignment (NOA)",
+  already_processed: "Already processed",
+  statement_ignored_abe_cc: "Carrier statement (Abe on CC)",
+  past_due_only: "Past-due / already in Primus",
+  administrative_ignored: "Administrative",
+  payment_inquiry_ignored_abe_cc: "Payment inquiry (Abe on thread)",
+  insurance_duplicate: "Duplicate insurance intake",
+};
+
+/**
+ * @param {object} row emailIntake row.
+ * @return {string} Category key for grouping.
+ */
+function categorizeIgnoredEmail(row) {
+  const finalStatus = row.finalStatus || row.outcomeReason || "other";
+  return String(finalStatus);
+}
+
+/**
+ * @param {string} categoryKey finalStatus / outcomeReason key.
+ * @return {string} Display label for ignore category.
+ */
+function labelIgnoredCategory(categoryKey) {
+  if (IGNORE_CATEGORY_LABELS[categoryKey]) {
+    return IGNORE_CATEGORY_LABELS[categoryKey];
+  }
+  return String(categoryKey).replace(/_/g, " ");
+}
+
+/**
+ * @param {object} row emailIntake row.
+ * @return {string} Reason text for display.
+ */
+function describeIgnoredReason(row) {
+  if (row.ignoreReason) return String(row.ignoreReason);
+  if (row.summary) return String(row.summary);
+  const key = categorizeIgnoredEmail(row);
+  const labeled = labelIgnoredCategory(key);
+  return labeled !== "other" ? labeled : "Ignored";
+}
+
+/**
+ * @param {string|null|undefined} messageId Message id.
+ * @return {string}
+ */
+function fmtMessageIdTail(messageId) {
+  const id = String(messageId || "");
+  if (!id) return "—";
+  return id.length > 10 ? `…${id.slice(-10)}` : id;
+}
+
+/**
+ * @param {Array<object>} rows Ignored emailIntake rows.
+ * @return {Array<{categoryKey: string, label: string, rows: Array<object>}>}
+ */
+function groupIgnoredEmails(rows) {
+  const buckets = new Map();
+  for (const row of rows) {
+    const categoryKey = categorizeIgnoredEmail(row);
+    if (!buckets.has(categoryKey)) {
+      buckets.set(categoryKey, []);
+    }
+    buckets.get(categoryKey).push(row);
+  }
+  return Array.from(buckets.entries())
+      .map(([categoryKey, bucketRows]) => ({
+        categoryKey,
+        label: labelIgnoredCategory(categoryKey),
+        rows: bucketRows.sort((a, b) => {
+          const aMs = mailIntakeQueue.intakeFinishedMs(a) || 0;
+          const bMs = mailIntakeQueue.intakeFinishedMs(b) || 0;
+          return aMs - bMs;
+        }),
+      }))
+      .sort((a, b) => a.label.localeCompare(b.label));
+}
+
+/**
+ * Builds HTML for the daily ignored-emails digest.
+ * @param {Array<object>} groups groupIgnoredEmails output.
+ * @param {object} meta Report metadata.
+ * @return {string}
+ */
+function buildIgnoredEmailsReportHtml(groups, meta) {
+  const rowHtml = (list) => list.map((row) => {
+    const finished = row.finishedAt || row.discoveredAt;
+    const messageId = row.id || row.gmailMessageId || null;
+    return `<tr>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(fmtDiscoveredAt(finished))}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(row.from || "—")}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(row.subject || "—")}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(row.finalStatus || row.outcomeReason || "—")}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
+      `${escapeHtml(describeIgnoredReason(row))}</td>` +
+      `<td style="padding:6px 10px;border:1px solid #e5e7eb;` +
+      `font-family:monospace">` +
+      `${escapeHtml(fmtMessageIdTail(messageId))}</td>` +
+      `</tr>`;
+  }).join("");
+
+  const tableHead = (
+    `<thead><tr style="background:#f9fafb">` +
+    `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+    `Time (ET)</th>` +
+    `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+    `From</th>` +
+    `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+    `Subject</th>` +
+    `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+    `Status</th>` +
+    `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+    `Reason</th>` +
+    `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
+    `Msg ID</th>` +
+    `</tr></thead>`
+  );
+
+  const total = groups.reduce((n, g) => n + g.rows.length, 0);
+  if (!total) {
+    return (
+      `<p style="color:#374151">No ignored emails in the last ${meta.hours} ` +
+      `hours (as of ${escapeHtml(meta.label)} ET).</p>` +
+      `<p style="color:#6b7280;font-size:12px">` +
+      `automated daily ignored-email report</p>`
+    );
+  }
+
+  const sections = groups.map((group) => (
+    `<h3 style="margin:18px 0 8px">${escapeHtml(group.label)} ` +
+    `(${group.rows.length})</h3>` +
+    `<table style="border-collapse:collapse;width:100%;font-size:13px">` +
+    `${tableHead}<tbody>${rowHtml(group.rows)}</tbody></table>`
+  )).join("");
+
+  return (
+    `<p style="color:#374151">Ignored emails for the last ${meta.hours} ` +
+    `hours (as of ${escapeHtml(meta.label)} ET). Review for possible ` +
+    `mis-ignored invoices.</p>` +
+    sections +
+    `<p style="color:#6b7280;font-size:12px;margin-top:12px">` +
+    `${total} ignored email(s) · automated daily ignored-email report</p>`
+  );
+}
+
+/**
+ * @param {object} opts Options.
+ * @param {object} opts.tenant Tenant config.
+ * @param {number} [opts.hours=24] Lookback window.
+ * @param {boolean} [opts.dryRun=false] Skip email send.
+ * @return {Promise<object>}
+ */
+async function runDailyIgnoredEmailsReport(opts = {}) {
+  const tenant = opts.tenant;
+  const hours = Math.min(Math.max(Number(opts.hours || 24), 1), 168);
+  const dryRun = Boolean(opts.dryRun);
+  const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+  const rows = await mailIntakeQueue.listIgnoredIntakeForReport(tenant, since);
+  const groups = groupIgnoredEmails(rows);
+
+  const now = new Date();
+  const label = now.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  const subjectDate = now.toLocaleDateString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  const html = buildIgnoredEmailsReportHtml(groups, {hours, label});
+  const subject = `Jerry ignored emails — ${subjectDate}`;
+
+  const to = process.env.DAILY_ACTIVITY_REPORT_EMAIL ||
+    process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+  const cc = process.env.DAILY_ACTIVITY_REPORT_CC || null;
+
+  if (!dryRun && deps.saveOutboundEmail) {
+    await deps.saveOutboundEmail({
+      type: "daily_ignored_emails_report",
+      subject,
+      html,
+      to,
+      cc,
+      tenant,
+    });
+  }
+
+  if (deps.writeLog) {
+    await deps.writeLog("info", "report",
+        "Daily ignored emails report generated", {
+          hours,
+          ignoredCount: rows.length,
+          categoryCount: groups.length,
+          dryRun,
+          to,
+          cc,
+          tenantId: tenant && tenant.tenantId,
+        }, null, tenant);
+  }
+
+  return {
+    ok: true,
+    hours,
+    ignoredCount: rows.length,
+    categoryCount: groups.length,
+    groups: groups.map((g) => ({
+      categoryKey: g.categoryKey,
+      label: g.label,
+      count: g.rows.length,
+    })),
+    dryRun,
+    emailedTo: dryRun ? null : to,
+  };
+}
+
 exports.aggregateDailyActivity = aggregateDailyActivity;
 exports.buildDeterministicBullets = buildDeterministicBullets;
 exports.runDailyActivityReport = runDailyActivityReport;
 exports.runDailyBrokerSwapReport = runDailyBrokerSwapReport;
+exports.runDailyInboxDigestReport = runDailyInboxDigestReport;
+exports.runDailyIgnoredEmailsReport = runDailyIgnoredEmailsReport;
+exports.categorizeIgnoredEmail = categorizeIgnoredEmail;
+exports.labelIgnoredCategory = labelIgnoredCategory;
+exports.describeIgnoredReason = describeIgnoredReason;
+exports.groupIgnoredEmails = groupIgnoredEmails;
+exports.buildIgnoredEmailsReportHtml = buildIgnoredEmailsReportHtml;

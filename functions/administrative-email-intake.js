@@ -20,6 +20,9 @@ function isEmodalBroadcast(subject, from, body) {
   return /today'?s emodal broadcasts/i.test(hay);
 }
 
+/** Default accounting contact for carrier payment questions. */
+const PAYMENT_INQUIRY_EMAIL_DEFAULT = "abe@innovativecarriers.com";
+
 /**
  * Bank / Zelle payment alerts — not carrier freight invoices.
  * @param {string} subject Email subject.
@@ -51,24 +54,101 @@ function isPaymentNotificationEmail(subject, from, body) {
 }
 
 /**
+ * Carrier / factor follow-ups about payment timing, Quick Pay, or remittance
+ * — not a freight invoice to enter.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isPaymentInquiryEmail(subject, from, body) {
+  if (isPaymentNotificationEmail(subject, from, body)) return false;
+  const sub = String(subject || "").trim();
+  const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase();
+  if (!hay.trim()) return false;
+
+  const patterns = [
+    /\bquick\s*pay\b/,
+    /\bquickpay\b/,
+    /\bpayment\s+inquir(y|ies)\b/,
+    /\bpayment\s+request\b/,
+    /\bpayment\s+status\b/,
+    /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\bwhen\s+(?:will|can)\s+(?:we|i|our)\s+(?:get\s+)?paid\b/,
+    /\bwhen\s+will\s+.*\s+be\s+paid\b/,
+    /\bconfirm(?:ation)?\s+(?:that\s+)?(?:all\s+)?required\s+documents\b/,
+    /\bdocuments\s+have\s+been\s+received\b/,
+    /\bprocess(?:ing)?\s+(?:at\s+)?(?:the\s+)?\d+\s*%\b/,
+    /\bsame[- ]day\s+(?:pay|payment)\b/,
+    /\bfollow(?:ing)?\s+up\s+on\s+.*(?:quick\s*pay|payment)\b/,
+    /\brequesting\s+(?:confirmation|processing)\s+.*\bpayment\b/,
+    /\bremittance\s+(?:status|inquiry|request)\b/,
+    /\bhas\s+(?:this|the)\s+invoice\s+been\s+paid\b/,
+    /\bcheck\s+(?:on|regarding)\s+(?:my\s+)?payment\b/,
+  ];
+  if (patterns.some((re) => re.test(hay))) return true;
+  if (/quick\s*pay\s+invoice/i.test(sub)) return true;
+  if (/payment\s+inquir/i.test(sub)) return true;
+  return false;
+}
+
+/**
+ * Payment-inquiry handler applies only when there is no invoice PDF to process.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {number} [invoicePdfCount] Invoice PDFs after doc classification.
+ * @return {boolean}
+ */
+function shouldHandlePaymentInquiry(
+    subject, from, body, invoicePdfCount) {
+  if (Number(invoicePdfCount) > 0) return false;
+  if (!isPaymentInquiryEmail(subject, from, body)) return false;
+  return true;
+}
+
+/**
  * Subject/body looks like a factor carrier-invoice notification.
  * @param {string} subject Email subject.
  * @param {string} body Plain body.
  * @return {boolean}
  */
 function looksLikeInvoiceEmailContent(subject, body) {
+  const sub = String(subject || "").trim().toLowerCase();
   const content = `${subject || ""}\n${body || ""}`.toLowerCase();
-  if (/^invoice\s+#?\d+/.test(String(subject || "").trim().toLowerCase())) {
+  if (/^(?:fw:\s*)?invoice\s+#?\d+/.test(sub)) return true;
+  if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
+  if (/\binvoice\s+#?\d+[\s-]+(?:for\s+)?(?:bol|load)\s+#?\d{5,9}/i
+      .test(content)) {
     return true;
   }
   if (/\binvoice\s+#?\d+[\s-]+load\s+\d{5,9}/i.test(content)) {
     return true;
   }
   if (/\bfreight invoice\b/.test(content) &&
-      /\bload\s+#?\d{5,9}/i.test(content)) {
+      /\b(?:load|bol)\s+#?\d{5,9}/i.test(content)) {
     return true;
   }
   return false;
+}
+
+/**
+ * Ignore bank/Zelle alerts only when the email is not an invoice package.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function shouldIgnoreAsPaymentNotification(
+    subject, from, body, attachments) {
+  if (!isPaymentNotificationEmail(subject, from, body)) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -195,6 +275,42 @@ function shouldIgnoreNoaOnlyPackage(
 }
 
 /**
+ * Central guard: true when an email must not be auto-ignored as admin noise.
+ * @param {object} signals Veto inputs gathered at the call site.
+ * @param {string} [signals.subject] Email subject.
+ * @param {string} [signals.body] Plain email body.
+ * @param {Array<object>} [signals.attachments] Attachment metadata.
+ * @param {object} [signals.emailClassification] Incoming email classifier.
+ * @param {number} [signals.invoicePdfCount] Classified invoice PDF count.
+ * @return {boolean}
+ */
+function hasInvoiceVeto(signals = {}) {
+  const {
+    subject = "",
+    body = "",
+    attachments = [],
+    emailClassification = null,
+    invoicePdfCount,
+  } = signals;
+
+  if (looksLikeInvoiceEmailContent(subject, body)) return true;
+
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
+    return true;
+  }
+
+  if (emailClassification &&
+      emailClassification.intent === "carrier_invoice") {
+    return true;
+  }
+
+  if (Number(invoicePdfCount) > 0) return true;
+
+  return false;
+}
+
+/**
  * @param {string} subject Subject.
  * @param {string} from From.
  * @param {string} body Body.
@@ -223,8 +339,12 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
 }
 
 module.exports = {
+  PAYMENT_INQUIRY_EMAIL_DEFAULT,
   isEmodalBroadcast,
   isPaymentNotificationEmail,
+  shouldIgnoreAsPaymentNotification,
+  isPaymentInquiryEmail,
+  shouldHandlePaymentInquiry,
   looksLikeInvoiceEmailContent,
   looksLikeNoaEmailContent,
   isNoticeOfAssignmentEmail,
@@ -233,5 +353,6 @@ module.exports = {
   attachmentFilenameLooksLikeNoa,
   rtsNoaAttachmentsLookNoaOnly,
   shouldIgnoreNoaOnlyPackage,
+  hasInvoiceVeto,
   evaluateAdministrativeIgnore,
 };

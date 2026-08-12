@@ -14,6 +14,7 @@
 
 const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
+const loadResolution = require("./invoice-load-resolution");
 const workflowErrors = require("./workflow-error-messages");
 const emailActionTokens = require("./email-action-tokens");
 
@@ -633,7 +634,8 @@ function buildCustomerEmailApprovalHtml(opts) {
     invoice, customerName, customerRate, profit, marginPct,
     workingProNumber, amountValidation, baseAmount, approvedChargesTotal,
     finalCustomerInvoiceId, issuedInvoiceNumber, customerEmail,
-    customerEmailSource, podStoragePath, podOnPrimusAlready,
+    customerEmailSource, customerEmailFallback, billtoSource, billtoPartyName,
+    podStoragePath, podOnPrimusAlready,
     primusSteps, approveUrl, rejectUrl, invoiceGenerationResult,
   } = opts;
 
@@ -692,7 +694,7 @@ function buildCustomerEmailApprovalHtml(opts) {
     row("Carrier invoice #", escapeHtml(invoice.invoiceNumber || "—")) +
     row("Carrier bill date", escapeHtml(invoice.invoiceDate || "—")) +
     row("Carrier due date", escapeHtml(invoice.dueDate || "—")) +
-    row("Gmail subject", escapeHtml(invoice.gmailSubject || "—")) +
+    row("Email subject", escapeHtml(invoice.gmailSubject || "—")) +
     `</table>` +
 
     `<h3 style="margin:18px 0 8px;font-size:15px">Amount validation</h3>` +
@@ -715,14 +717,21 @@ function buildCustomerEmailApprovalHtml(opts) {
     row("Primus invoice ID", escapeHtml(
         String(finalCustomerInvoiceId || "—"))) +
     row("Invoice generated via", escapeHtml(genVia)) +
+    row("Bill-to resolved via", escapeHtml(billtoSource || "—")) +
+    (billtoPartyName ?
+      row("Bill-to party", escapeHtml(billtoPartyName)) : "") +
     `</table>` +
 
     (!customerEmail ?
       `<p style="background:#fef3c7;border:1px solid #f59e0b;` +
       `padding:12px 14px;border-radius:8px;font-size:14px;color:#92400e">` +
       `<strong>No customer accounting email found in Primus.</strong> ` +
-      `Add the accounting contact on the shipment before approving — ` +
-      `nothing will be sent until you approve after the email is fixed.</p>` :
+      (customerEmailFallback ?
+        `The booking party email (${escapeHtml(customerEmailFallback)}) ` +
+        `will <strong>NOT</strong> be used automatically. ` :
+        "") +
+      `Add the accounting contact on the customer location in Primus ` +
+      `before approving — fix the recipient manually if needed.</p>` :
       "") +
     `<h3 style="margin:18px 0 8px;font-size:15px">` +
     `Outgoing customer email</h3>` +
@@ -970,6 +979,15 @@ exports.processPrimusWorkflow = onRequest(
         const additionalApprovedExtra = (additionalChargeApproved &&
           additionalCharge.source === "unrecognized_charges") ?
           (Number(additionalCharge.amount) || 0) : 0;
+        const additionalChargesMod = require("./additional-charges");
+        const optionBCustomerBillLines = (additionalChargeApproved &&
+          additionalCharge &&
+          String(additionalCharge.decision || "").toUpperCase() === "B" &&
+          Array.isArray(additionalCharge.customerBillLines)) ?
+          additionalCharge.customerBillLines : [];
+        const customerBillAccessorialTotal = optionBCustomerBillLines.length ?
+          additionalChargesMod.sumCustomerBillLines(optionBCustomerBillLines) :
+          0;
 
         const approvedChargesTotal = approvedChargeProofFiles
             .reduce((sum, c) => sum + (Number(c.amount) || 0), 0) +
@@ -1030,8 +1048,10 @@ exports.processPrimusWorkflow = onRequest(
         let extractedPodOnlyFile = null;
         let bookingForMode = null;
 
-        // Drayage loads are not auto-processed — stop early before POD/AI work.
-        if (invoice.loadNumber && isDrayageShipment && readShipmentMode) {
+        // Drayage loads are not auto-processed — stop before POD/AI work.
+        // Leo-validated drayage returns include Primus entry instructions.
+        if (invoice.loadNumber && isDrayageShipment && readShipmentMode &&
+            !invoice.drayageLeoValidated) {
           bookingForMode = await fetchPrimusBooking(invoice.loadNumber);
           const shipmentMode = readShipmentMode(bookingForMode);
           if (isDrayageShipment(bookingForMode)) {
@@ -1811,7 +1831,17 @@ exports.processPrimusWorkflow = onRequest(
 
           // PRO Number Handling - use Primus response proNumber
           const primusProNumber = amountValidation.proNumber || "";
-          if (invoice.proNumber &&
+          const invoiceProPlausible =
+            loadResolution.isPlausibleCarrierPro(invoice.proNumber);
+          if (invoice.proNumber && !invoiceProPlausible) {
+            await writeLog("warn", "workflow",
+                "Ignoring implausible PRO from invoice intake", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  proNumberRaw: invoice.proNumber,
+                });
+          }
+          if (invoiceProPlausible &&
             invoice.proNumber.trim() !== "" && !primusProNumber) {
             await logWorkflowStep({
               invoiceId,
@@ -1876,8 +1906,18 @@ exports.processPrimusWorkflow = onRequest(
               await setWorkflowHeartbeat(invoiceDoc.ref, "pro_added");
             }
           } else {
-          // Use Primus proNumber if available, otherwise use workingProNumber
-            workingProNumber = primusProNumber || workingProNumber;
+          // Use Primus proNumber if available, otherwise plausible invoice PRO
+            workingProNumber = primusProNumber ||
+              (invoiceProPlausible ? invoice.proNumber : "") ||
+              workingProNumber;
+            if (primusProNumber &&
+              workingProNumber !== invoice.proNumber &&
+              invoice.proNumber && !invoiceProPlausible) {
+              await invoiceDoc.ref.update({
+                proNumber: workingProNumber,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            }
           }
         } // end !skipToCustomerEmail (validation + PRO)
 
@@ -2277,10 +2317,12 @@ exports.processPrimusWorkflow = onRequest(
             amountValidation.submittedAmount ||
             invoice.invoiceAmount || 0,
             );
-            profit = Number(customerRate || 0) -
+            const customerRevenue = Number(customerRate || 0) +
+              customerBillAccessorialTotal;
+            profit = customerRevenue -
           (bookingCarrierCost - approvedChargesTotal);
-            marginPctCalc = customerRate > 0 ?
-          Math.round((profit / customerRate) * 100) : 0;
+            marginPctCalc = customerRevenue > 0 ?
+          Math.round((profit / customerRevenue) * 100) : 0;
 
             await writeLog(
                 "info", "workflow", "Customer rate and profit check", {
@@ -2288,6 +2330,8 @@ exports.processPrimusWorkflow = onRequest(
                   loadNumber: invoice.loadNumber,
                   customerName,
                   customerRate,
+                  customerBillAccessorialTotal,
+                  customerRevenue,
                   carrierInvoiceAmount: invoice.invoiceAmount,
                   approvedChargesTotal,
                   profit,
@@ -2531,7 +2575,7 @@ exports.processPrimusWorkflow = onRequest(
                   customerInvoiceId: invoice.customerInvoiceId,
                   generated: true,
                   reused: true,
-                  invoiceTotal: customerRate,
+                  invoiceTotal: customerRate + customerBillAccessorialTotal,
                 };
                 primusSteps.customerInvoiceGenerated = true;
                 await invoiceDoc.ref.update({
@@ -2572,6 +2616,7 @@ exports.processPrimusWorkflow = onRequest(
                   booking: bk,
                   loadNumber: invoice.loadNumber,
                   customerRate,
+                  customerBillLines: optionBCustomerBillLines,
                   carrierInvoiceAmount: invoice.invoiceAmount,
                   carrierName: invoice.carrierName || null,
                   proNumber: workingProNumber || invoice.proNumber,
@@ -2611,12 +2656,14 @@ exports.processPrimusWorkflow = onRequest(
                   customerInvoiceId: uiResult.customerInvoiceId ||
                 invoice.customerInvoiceId,
                   invoiceNumber: uiResult.invoiceNumber || null,
-                  invoiceTotal: customerRate,
+                  invoiceTotal: customerRate + customerBillAccessorialTotal,
                   generated: !!(uiResult.issued || uiResult.generated),
                   reused: !!(uiResult.skipped &&
                 uiResult.reason === "already issued"),
                   error: uiResult.error || null,
                   step: uiResult.step || null,
+                  billtoSource: uiResult.billtoSource || null,
+                  billtoPartyName: uiResult.billtoPartyName || null,
                 };
 
                 if (!uiOk) {
@@ -2871,6 +2918,7 @@ exports.processPrimusWorkflow = onRequest(
 
           let customerEmail = null;
           let customerEmailSource = null;
+          let customerEmailFallback = null;
           let bookingForEmail = null;
           try {
             bookingForEmail = await fetchPrimusBooking(invoice.loadNumber);
@@ -2878,24 +2926,12 @@ exports.processPrimusWorkflow = onRequest(
               if (resolveCustomerAccountingEmails && managePhpActive) {
                 const resolved =
                   await resolveCustomerAccountingEmails(bookingForEmail);
+                customerEmailFallback = resolved.fallbackEmail || null;
                 if (resolved.emails && resolved.emails.length) {
                   customerEmail = resolved.emails.join(",");
                   customerEmailSource = resolved.source || null;
-                }
-              }
-              if (!customerEmail) {
-                const billTo = bookingForEmail.billTo || "";
-                if (billTo === "thirdparty" && bookingForEmail.thirdParty) {
-                  customerEmail = bookingForEmail.thirdParty.email || null;
-                  customerEmailSource = "booking_third_party_email";
-                }
-                if (!customerEmail && bookingForEmail.shipper) {
-                  customerEmail = bookingForEmail.shipper.email || null;
-                  customerEmailSource = "booking_shipper_email";
-                }
-                if (!customerEmail && bookingForEmail.consignee) {
-                  customerEmail = bookingForEmail.consignee.email || null;
-                  customerEmailSource = "booking_consignee_email";
+                } else if (resolved.source === "no_accounting_contacts") {
+                  customerEmailSource = "no_accounting_contacts";
                 }
               }
             }
@@ -2980,8 +3016,12 @@ exports.processPrimusWorkflow = onRequest(
             await pauseWorkflow(
                 invoiceDoc.ref,
                 "send_customer_email",
-                "awaiting_customer_email_approval",
-                "Awaiting reviewer approval before emailing the customer",
+                customerEmail ?
+                  "awaiting_customer_email_approval" :
+                  "missing_accounting_email",
+                customerEmail ?
+                  "Awaiting reviewer approval before emailing the customer" :
+                  "No accounting email found — reviewer must fix recipient",
             );
 
             const baseUrl = emailActionTokens.publicFunctionsBaseUrl();
@@ -3026,6 +3066,11 @@ exports.processPrimusWorkflow = onRequest(
                 issuedInvoiceNumber,
                 customerEmail,
                 customerEmailSource,
+                customerEmailFallback,
+                billtoSource: (invoiceGenerationResult &&
+                  invoiceGenerationResult.billtoSource) || null,
+                billtoPartyName: (invoiceGenerationResult &&
+                  invoiceGenerationResult.billtoPartyName) || null,
                 podStoragePath,
                 podOnPrimusAlready: Boolean(invoice.podOnPrimusAlready),
                 primusSteps,

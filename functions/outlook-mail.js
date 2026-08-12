@@ -253,6 +253,31 @@ function getMimeHeader(headers, name) {
 }
 
 /**
+ * @param {string} contentTypeHeader Content-Type header value.
+ * @return {string}
+ */
+function mimeCharset(contentTypeHeader) {
+  const m = String(contentTypeHeader || "")
+      .match(/charset="?([^";\s]+)"?/i);
+  return m ? m[1].toLowerCase() : "utf-8";
+}
+
+/**
+ * Reconstruct UTF-8 text from a latin1-preserved MIME byte string.
+ * @param {string} raw Latin1-preserved MIME bytes as a JS string.
+ * @param {string} [charset] Declared charset (default utf-8).
+ * @return {string}
+ */
+function decodeMimeUtf8Text(raw, charset) {
+  const buf = Buffer.from(String(raw || ""), "latin1");
+  const cs = String(charset || "utf-8").toLowerCase();
+  if (cs.includes("utf-8") || cs.includes("utf8")) {
+    return buf.toString("utf8");
+  }
+  return buf.toString("latin1");
+}
+
+/**
  * @param {string} partHeaders MIME part headers.
  * @param {string} partBody MIME part body.
  * @return {string} Decoded part text.
@@ -260,10 +285,11 @@ function getMimeHeader(headers, name) {
 function decodeMimePartBody(partHeaders, partBody) {
   const encoding = (getMimeHeader(partHeaders, "Content-Transfer-Encoding") ||
     "").toLowerCase();
+  const charset = mimeCharset(getMimeHeader(partHeaders, "Content-Type"));
   if (encoding === "base64") {
     return Buffer.from(partBody.replace(/\s/g, ""), "base64").toString("utf8");
   }
-  return partBody;
+  return decodeMimeUtf8Text(partBody, charset);
 }
 
 /**
@@ -278,7 +304,9 @@ function parseOutboundMimeForGraph(mimeBuffer) {
   const headerBlock = splitIdx >= 0 ? raw.slice(0, splitIdx) : raw;
   const bodyBlock = splitIdx >= 0 ? raw.slice(splitIdx + splitAt.length) : "";
 
-  const subject = getMimeHeader(headerBlock, "Subject") || "";
+  const subject = decodeMimeUtf8Text(
+      getMimeHeader(headerBlock, "Subject") || "",
+  );
   const toRecipients = parseGraphRecipients(getMimeHeader(headerBlock, "To"));
   const ccRecipients = parseGraphRecipients(getMimeHeader(headerBlock, "Cc"));
 
@@ -325,17 +353,26 @@ function parseOutboundMimeForGraph(mimeBuffer) {
         Buffer.from(partBody, "latin1").toString("base64");
       const mimeType =
         partType.split(";")[0].trim() || "application/octet-stream";
+      const contentIdRaw = getMimeHeader(partHeaders, "Content-ID") || "";
+      const contentId = contentIdRaw.replace(/^<|>$/g, "");
+      const isInline = disposition.toLowerCase().includes("inline") ||
+        Boolean(contentId);
       attachments.push({
         "@odata.type": "#microsoft.graph.fileAttachment",
         "name": filename,
         "contentType": mimeType,
         "contentBytes": contentBytes,
+        ...(isInline && contentId ? {
+          isInline: true,
+          contentId,
+        } : {}),
       });
     }
   } else if (contentType.includes("text/html")) {
-    html = bodyBlock.trim();
+    html = decodeMimePartBody(headerBlock, bodyBlock.trim());
   } else {
-    html = `<pre>${bodyBlock.trim().replace(/</g, "&lt;")}</pre>`;
+    const plain = decodeMimePartBody(headerBlock, bodyBlock.trim());
+    html = `<pre>${plain.replace(/</g, "&lt;")}</pre>`;
   }
 
   if (!toRecipients.length) {
@@ -384,6 +421,78 @@ async function sendOutboundMimeViaGraph(mimeBuffer, tokens, onTokenUpdate) {
 }
 
 /**
+ * Extracts bare email from "Name <email>" or raw address.
+ * @param {string} raw From/to string.
+ * @return {string|null}
+ */
+function extractEmailAddress(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  const angle = s.match(/<([^>]+)>/);
+  if (angle) return angle[1].trim();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s)) return s;
+  const loose = s.match(/[^\s<>"]+@[^\s<>"]+/);
+  return loose ? loose[0] : null;
+}
+
+/**
+ * Sends a simple Graph sendMail message (quote replies, etc.).
+ * @param {object} opts to, subject, bodyText, bodyHtml, cc, internetMessageId.
+ * @param {object} tokens OAuth tokens.
+ * @param {Function} onTokenUpdate Persist refreshed tokens.
+ * @return {Promise<object>}
+ */
+async function sendSimpleMail(opts, tokens, onTokenUpdate) {
+  const toList = [].concat(opts.to || [])
+      .map(extractEmailAddress)
+      .filter(Boolean);
+  if (!toList.length) {
+    throw new Error("No recipient email address for send");
+  }
+  const ccList = [].concat(opts.cc || [])
+      .map(extractEmailAddress)
+      .filter(Boolean);
+  const useHtml = !!(opts.bodyHtml && String(opts.bodyHtml).trim());
+  const message = {
+    subject: String(opts.subject || "(no subject)"),
+    body: {
+      contentType: useHtml ? "HTML" : "Text",
+      content: useHtml ?
+        String(opts.bodyHtml) :
+        String(opts.bodyText || ""),
+    },
+    toRecipients: toList.map((address) => ({
+      emailAddress: {address},
+    })),
+  };
+  if (ccList.length) {
+    message.ccRecipients = ccList.map((address) => ({
+      emailAddress: {address},
+    }));
+  }
+  if (opts.internetMessageId) {
+    message.internetMessageHeaders = [{
+      name: "In-Reply-To",
+      value: String(opts.internetMessageId),
+    }, {
+      name: "References",
+      value: String(opts.internetMessageId),
+    }];
+  }
+  console.log("Outlook sendSimpleMail:", {
+    subject: message.subject,
+    to: toList,
+    cc: ccList,
+  });
+  await graphFetch("/me/sendMail", tokens, onTokenUpdate, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({message, saveToSentItems: true}),
+  });
+  return {ok: true, to: toList, subject: message.subject};
+}
+
+/**
  * Builds a Gmail-compatible client backed by Microsoft Graph.
  * @param {object} tokens OAuth tokens.
  * @param {Function} onTokenUpdate Persist refreshed tokens.
@@ -393,21 +502,62 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
   const api = {
     users: {
       messages: {
-        list: async ({maxResults = 50, pageToken, q} = {}) => {
+        list: async ({
+          maxResults = 50,
+          pageToken,
+          q,
+          includeRead,
+          readAfter,
+          readBefore,
+          readMode,
+        } = {}) => {
           let url;
           if (pageToken) {
             url = pageToken;
           } else {
-            const after = parseGmailAfterDate(q);
-            let filter = "isRead eq false";
-            if (after) {
-              filter += ` and receivedDateTime ge ${after.toISOString()}`;
+            const readAfterDate = readAfter ?
+              (readAfter instanceof Date ? readAfter : new Date(readAfter)) :
+              null;
+            const readBeforeDate = readBefore ?
+              (readBefore instanceof Date ? readBefore : new Date(readBefore)) :
+              null;
+            const mode = String(readMode || "openedSince").toLowerCase();
+            let filter;
+            let orderBy;
+            if (readAfterDate && !isNaN(readAfterDate.getTime())) {
+              if (mode === "received") {
+                filter = "isRead eq true and receivedDateTime ge " +
+                  readAfterDate.toISOString();
+                if (readBeforeDate && !isNaN(readBeforeDate.getTime())) {
+                  filter += " and receivedDateTime le " +
+                    readBeforeDate.toISOString();
+                }
+                orderBy = "receivedDateTime desc";
+              } else {
+                // openedSince / modified: lastModified proxy for mark-as-read.
+                // Do not cap on server — until is applied client-side for
+                // modified mode only (avoids missing mail touched after until).
+                filter = "isRead eq true and lastModifiedDateTime ge " +
+                  readAfterDate.toISOString();
+                orderBy = "lastModifiedDateTime desc";
+              }
+            } else {
+              const after = parseGmailAfterDate(q);
+              filter = includeRead ? "" : "isRead eq false";
+              if (after) {
+                const dateClause = `receivedDateTime ge ${after.toISOString()}`;
+                filter = filter ? `${filter} and ${dateClause}` : dateClause;
+              }
+              if (!filter) {
+                filter = "receivedDateTime ge 1970-01-01T00:00:00Z";
+              }
+              orderBy = "receivedDateTime desc";
             }
             const params = new URLSearchParams({
               "$filter": filter,
               "$select": "id",
               "$top": String(maxResults),
-              "$orderby": "receivedDateTime desc",
+              "$orderby": orderBy,
             });
             url = `/me/mailFolders/inbox/messages?${params.toString()}`;
           }
@@ -420,7 +570,7 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
           };
         },
 
-        get: async ({id, format}) => {
+        get: async ({id, format, metadataHeaders}) => {
           if (format === "raw") {
             const rawMime = await graphFetch(
                 `/me/messages/${encodeURIComponent(id)}/$value`,
@@ -429,6 +579,42 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
                 {rawBinary: true},
             );
             return {data: {raw: toBase64Url(rawMime), id}};
+          }
+
+          if (format === "metadata") {
+            const msg = await graphFetch(
+                `/me/messages/${encodeURIComponent(id)}` +
+                "?$select=id,subject,from,receivedDateTime," +
+                "lastModifiedDateTime,isRead",
+                tokens,
+                onTokenUpdate,
+            );
+            const headers = [];
+            if (Array.isArray(metadataHeaders)) {
+              if (metadataHeaders.includes("Subject")) {
+                headers.push({name: "Subject", value: msg.subject || ""});
+              }
+              if (metadataHeaders.includes("From")) {
+                headers.push({
+                  name: "From",
+                  value: formatGraphAddress(msg.from),
+                });
+              }
+            }
+            const readMs = msg.lastModifiedDateTime ?
+              new Date(msg.lastModifiedDateTime).getTime() : 0;
+            const receivedMs = msg.receivedDateTime ?
+              new Date(msg.receivedDateTime).getTime() : 0;
+            return {
+              data: {
+                id: msg.id,
+                internalDate: String(readMs || receivedMs || 0),
+                readModifiedDateTime: msg.lastModifiedDateTime || null,
+                receivedDateTime: msg.receivedDateTime || null,
+                isRead: Boolean(msg.isRead),
+                payload: {headers},
+              },
+            };
           }
 
           const msg = await graphFetch(
@@ -561,15 +747,16 @@ function buildOutlookAdminConsentUrl() {
 
 /**
  * @param {string} code OAuth authorization code.
+ * @param {string} [redirectUri] Optional redirect URI override.
  * @return {Promise<object>} Token payload with expires_at.
  */
-async function exchangeOutlookCode(code) {
+async function exchangeOutlookCode(code, redirectUri) {
   const cfg = getOutlookOAuthConfig();
   const body = new URLSearchParams({
     client_id: cfg.clientId,
     client_secret: cfg.clientSecret,
     code,
-    redirect_uri: cfg.redirectUri,
+    redirect_uri: redirectUri || cfg.redirectUri,
     grant_type: "authorization_code",
     scope: SCOPES,
   });
@@ -616,4 +803,6 @@ module.exports = {
   createOutlookMailClient,
   fetchMailboxProfile,
   getOutlookOAuthConfig,
+  sendSimpleMail,
+  extractEmailAddress,
 };
