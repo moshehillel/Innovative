@@ -188,7 +188,7 @@
       background: var(--success-bg);
       box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.12);
     }
-    .opt input { margin-top: 4px; width: 16px; height: 16px; }
+    .opt input[type="checkbox"] { margin-top: 4px; width: 16px; height: 16px; }
     .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
     .tag {
       font-size: 0.6875rem;
@@ -694,11 +694,7 @@
         laneAccessorials[lane.laneKey] = (lane.accessorials || []).slice();
         const prices = {};
         (lane.options || []).forEach((opt) => {
-          const rateId = String(opt.rateId);
-          const existing = customerPrices[lane.laneKey] &&
-            customerPrices[lane.laneKey][rateId];
-          prices[rateId] = existing != null && existing !== "" ?
-            existing : defaultCustomerPrice(opt);
+          prices[String(opt.rateId)] = defaultCustomerPrice(opt);
         });
         customerPrices[lane.laneKey] = prices;
       });
@@ -828,7 +824,7 @@
         });
       });
 
-      root.querySelectorAll("input[data-rate]").forEach((input) => {
+      root.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
         input.addEventListener("change", () => {
           const laneKey = input.dataset.lane;
           const rateId = String(input.dataset.rate);
@@ -847,6 +843,27 @@
           }
           draftReady = false;
           document.getElementById("btn-approve").disabled = true;
+          persistSelections();
+        });
+      });
+
+      root.querySelectorAll("input[data-customer-rate]").forEach((input) => {
+        const sync = () => {
+          const laneKey = input.dataset.lane;
+          const rateId = String(input.dataset.rate);
+          if (!customerPrices[laneKey]) customerPrices[laneKey] = {};
+          customerPrices[laneKey][rateId] = input.value;
+          draftReady = false;
+          document.getElementById("btn-approve").disabled = true;
+        };
+        input.addEventListener("click", (e) => e.stopPropagation());
+        input.addEventListener("mousedown", (e) => e.stopPropagation());
+        input.addEventListener("change", () => {
+          sync();
+          persistSelections();
+        });
+        input.addEventListener("blur", () => {
+          sync();
           persistSelections();
         });
       });
@@ -912,6 +929,13 @@
         showMsg("Check at least one rate before generating the email.", false);
         return;
       }
+      const missing = validateCheckedCustomerRates();
+      if (missing.length) {
+        showMsg(
+            "Set a customer rate (> 0) for: " + missing.join(", "),
+            false);
+        return;
+      }
       try {
         const res = await apiFetch("/generateQuoteEmail", {
           method: "POST",
@@ -938,6 +962,13 @@
     });
 
     document.getElementById("btn-approve").addEventListener("click", async () => {
+      const missing = validateCheckedCustomerRates();
+      if (missing.length) {
+        showMsg(
+            "Set a customer rate (> 0) for: " + missing.join(", "),
+            false);
+        return;
+      }
       if (!confirm("Send this email to the customer via your connected Outlook?")) return;
       try {
         const res = await apiFetch("/approveQuoteEmail", {

@@ -170,12 +170,27 @@ function buildAccessorialsIncludedSection(lanes) {
 }
 
 /**
+ * Customer-facing sell amount: dispatcher override, else margin sellRate.
+ * @param {object} opt Rate option.
+ * @return {number|null}
+ */
+function effectiveCustomerRate(opt) {
+  if (!opt || typeof opt !== "object") return null;
+  if (opt.customerPrice != null && opt.customerPrice !== "") {
+    const override = Number(opt.customerPrice);
+    if (Number.isFinite(override)) return override;
+  }
+  const sell = Number(opt.sellRate);
+  return Number.isFinite(sell) ? sell : null;
+}
+
+/**
  * Formats one pricing line — bullet style (Coreforce / Diego pattern).
  * @param {object} opt Selected option.
  * @return {string}
  */
 function formatCustomerPricingLineBullet(opt) {
-  const price = money(opt.sellRate || opt.customerPrice);
+  const price = money(effectiveCustomerRate(opt));
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const days = opt.transitDays || "?";
@@ -194,7 +209,7 @@ function formatCustomerPricingLineBullet(opt) {
  * @return {string}
  */
 function formatCustomerPricingLineSimple(opt) {
-  const price = money(opt.sellRate || opt.customerPrice);
+  const price = money(effectiveCustomerRate(opt));
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "";
   const days = opt.transitDays || "?";
@@ -213,7 +228,7 @@ function formatCustomerPricingLineSimple(opt) {
  * @return {string}
  */
 function formatCustomerPricingLine(opt) {
-  const price = money(opt.sellRate || opt.customerPrice);
+  const price = money(effectiveCustomerRate(opt));
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const transit = opt.transitDays ? `${opt.transitDays}` : "?";
@@ -280,9 +295,11 @@ function buildCustomerEmailFromSelections(quote, opts = {}) {
       lines.push("[No rates selected for this lane]");
     } else {
       for (const opt of selected) {
+        const customerRate = effectiveCustomerRate(opt);
         lines.push(formatLine({
           ...opt,
-          sellRate: opt.sellRate,
+          customerPrice: customerRate,
+          sellRate: customerRate,
           warnings: opt.warnings || opt.rateRemarks,
         }));
       }
@@ -349,6 +366,11 @@ function buildCustomerDraftHtml(quote) {
  */
 function serializeForDispatcherPage(quote) {
   const storedEmail = quote.customerEmailText || null;
+  const shippingLocationId = quote.shippingLocationId != null &&
+    String(quote.shippingLocationId).trim() !== "" ?
+    String(quote.shippingLocationId) : null;
+  const shippingLocationName = quote.shippingLocationName ||
+    quote.matchedCustomerName || null;
   return {
     id: quote.id,
     batchQuoteId: quote.batchQuoteId,
@@ -356,6 +378,9 @@ function serializeForDispatcherPage(quote) {
     from: quote.from,
     customerRef: quote.customerRef,
     status: quote.status,
+    shippingLocationId,
+    shippingLocationName,
+    customerMatched: !!shippingLocationId,
     customerDraftText: storedEmail || buildCustomerDraftText(quote),
     customerEmailText: storedEmail,
     accessorialsIncludedText: buildAccessorialsIncludedSection(quote.lanes),
@@ -385,6 +410,8 @@ function serializeForDispatcherPage(quote) {
         SCAC: o.SCAC,
         cost: o.total,
         sellRate: o.sellRate,
+        customerPrice: o.customerPrice != null ?
+          Number(o.customerPrice) : null,
         transitDays: o.transitDays,
         quoteNumber: o.quoteNumber,
         tags: o.tags,
@@ -403,6 +430,7 @@ module.exports = {
   buildCustomerEmailFromSelections,
   textToEmailHtml,
   serializeForDispatcherPage,
+  effectiveCustomerRate,
   formatCustomerPricingLine,
   formatCustomerPricingLineBullet,
   formatCustomerPricingLineSimple,
@@ -410,5 +438,6 @@ module.exports = {
   buildLaneEnrichmentNote,
   buildAccessorialWhy,
   collectAppliedAccessorials,
+  resolveSelectedOptions,
   COMMON_ACCESSORIALS,
 };
