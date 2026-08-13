@@ -396,6 +396,33 @@ async function fetchCostQuote(costQuoteId) {
 }
 
 /**
+ * Parse Primus GET /accessorial JSON into flat accessorial rows.
+ * Live shape: `{ data: { results: { accessorials: [...] } } }`.
+ * Also supports legacy array-of-blocks results.
+ * @param {object} json Primus response.
+ * @return {Array<object>}
+ */
+function parseAccessorialCatalogResponse(json) {
+  const results = json && json.data && json.data.results;
+  if (!results) return [];
+  if (Array.isArray(results.accessorials)) {
+    return results.accessorials;
+  }
+  if (Array.isArray(results)) {
+    const out = [];
+    for (const block of results) {
+      if (Array.isArray(block && block.accessorials)) {
+        out.push(...block.accessorials);
+      } else if (block && block.code) {
+        out.push(block);
+      }
+    }
+    return out;
+  }
+  return [];
+}
+
+/**
  * GET /accessorial — full catalog.
  * @param {boolean} [customerDefault] Pass default=true for customer list.
  * @return {Promise<Array<object>>}
@@ -403,15 +430,118 @@ async function fetchCostQuote(costQuoteId) {
 async function fetchAccessorialCatalog(customerDefault = false) {
   const query = customerDefault ? {default: "true"} : {};
   const json = await primusFetch("/accessorial", {query});
-  const results = json && json.data && json.data.results;
-  if (!Array.isArray(results)) return [];
-  const out = [];
-  for (const block of results) {
-    if (Array.isArray(block.accessorials)) {
-      out.push(...block.accessorials);
-    }
+  return parseAccessorialCatalogResponse(json);
+}
+
+/**
+ * Raw GET /accessorial JSON (for catalog builders / caching).
+ * @param {boolean} [customerDefault] Pass default=true for customer list.
+ * @return {Promise<object>}
+ */
+async function fetchAccessorialCatalogRaw(customerDefault = false) {
+  const query = customerDefault ? {default: "true"} : {};
+  return primusFetch("/accessorial", {query});
+}
+
+/** Primus freightInfo.dimType allowed values. */
+const PRIMUS_DIM_TYPES = new Set([
+  "TRUCK LOAD", "PLT", "CTN", "CRT", "DRM", "CON", "BOX",
+  "BDL", "ENV", "CYL", "CAS", "OTH", "TOT",
+]);
+
+/**
+ * Normalize country to ISO 3166-1 alpha-2 for Primus rate APIs.
+ * Primus rejects "USA" — it wants "US".
+ * @param {*} value Raw country from AI/heuristics/booking.
+ * @return {string} Two-letter country code (default US).
+ */
+function normalizeIsoCountry(value) {
+  const raw = String(value == null ? "" : value).trim();
+  if (!raw) return "US";
+  const compact = raw.replace(/[^A-Za-z]/g, "").toUpperCase();
+  if (compact === "US" || compact === "USA" ||
+      compact === "UNITEDSTATES" || compact === "UNITEDSTATESOFAMERICA") {
+    return "US";
   }
-  return out;
+  if (compact === "CA" || compact === "CAN" || compact === "CANADA") {
+    return "CA";
+  }
+  if (compact === "MX" || compact === "MEX" || compact === "MEXICO") {
+    return "MX";
+  }
+  if (/^[A-Z]{2}$/.test(compact)) return compact;
+  return "US";
+}
+
+/**
+ * Normalize freight packaging type to a Primus dimType enum.
+ * @param {*} value Raw dimType (e.g. "pallet", "in", "PLT").
+ * @param {object} [row] Freight row — prefer PLT for LTL-looking freight.
+ * @return {string} Primus dimType.
+ */
+function normalizeDimType(value, row = {}) {
+  const raw = String(value == null ? "" : value).trim();
+  const upper = raw.toUpperCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
+  if (PRIMUS_DIM_TYPES.has(upper)) return upper;
+
+  const key = upper.replace(/\s+/g, "");
+  const aliases = {
+    PALLET: "PLT",
+    PALLETS: "PLT",
+    SKID: "PLT",
+    SKIDS: "PLT",
+    PLTS: "PLT",
+    // Heuristic/AI sometimes put dim UOM ("in") in dimType.
+    IN: "PLT",
+    INCH: "PLT",
+    INCHES: "PLT",
+    CARTON: "CTN",
+    CARTONS: "CTN",
+    CTNS: "CTN",
+    CRATE: "CRT",
+    CRATES: "CRT",
+    DRUM: "DRM",
+    DRUMS: "DRM",
+    CONTAINER: "CON",
+    CONTAINERS: "CON",
+    BOXES: "BOX",
+    BUNDLE: "BDL",
+    BUNDLES: "BDL",
+    ENVELOPE: "ENV",
+    ENVELOPES: "ENV",
+    CYLINDER: "CYL",
+    CYLINDERS: "CYL",
+    CASE: "CAS",
+    CASES: "CAS",
+    TRUCKLOAD: "TRUCK LOAD",
+    TL: "TRUCK LOAD",
+    FTL: "TRUCK LOAD",
+    OTHER: "OTH",
+    UNKNOWN: "OTH",
+    TOTAL: "TOT",
+  };
+  if (aliases[key]) return aliases[key];
+  if (aliases[upper]) return aliases[upper];
+
+  const looksLikePallet =
+    Number(row.qty) > 0 ||
+    (Number(row.length) > 0 && Number(row.width) > 0) ||
+    Number(row.weight) > 0;
+  return looksLikePallet ? "PLT" : "OTH";
+}
+
+/**
+ * Normalize freightInfo rows for Primus rate query.
+ * @param {Array<object>} freightInfo Raw freight lines.
+ * @return {Array<object>}
+ */
+function normalizeFreightInfoForRate(freightInfo) {
+  const rows = Array.isArray(freightInfo) ? freightInfo : [];
+  return rows.map((row) => {
+    const r = row && typeof row === "object" ? {...row} : {};
+    r.dimType = normalizeDimType(r.dimType, r);
+    return r;
+  });
 }
 
 /**
@@ -423,16 +553,16 @@ async function fetchAccessorialCatalog(customerDefault = false) {
 function buildRateMultipleQuery(lane, opts = {}) {
   const ship = lane.shipper || {};
   const cons = lane.consignee || {};
-  const freightInfo = lane.freightInfo || [];
+  const freightInfo = normalizeFreightInfoForRate(lane.freightInfo || []);
   const params = {
     originCity: String(ship.city || "").trim(),
     originState: String(ship.state || "").trim(),
     originZipcode: String(ship.zipCode || ship.zipcode || "").trim(),
-    originCountry: String(ship.country || "USA").trim() || "USA",
+    originCountry: normalizeIsoCountry(ship.country),
     destinationCity: String(cons.city || "").trim(),
     destinationState: String(cons.state || "").trim(),
     destinationZipcode: String(cons.zipCode || cons.zipcode || "").trim(),
-    destinationCountry: String(cons.country || "USA").trim() || "USA",
+    destinationCountry: normalizeIsoCountry(cons.country),
     UOM: String(opts.UOM || lane.UOM || "US").trim() || "US",
     freightInfo: JSON.stringify(freightInfo),
   };
@@ -601,6 +731,8 @@ module.exports = {
   searchCostQuotes,
   fetchCostQuote,
   fetchAccessorialCatalog,
+  fetchAccessorialCatalogRaw,
+  parseAccessorialCatalogResponse,
   buildRateMultipleQuery,
   computeSellRate,
   tagRateOptions,
@@ -608,4 +740,7 @@ module.exports = {
   pickTopOptions,
   normalizeRateRow,
   parseRatesFromResponse,
+  normalizeIsoCountry,
+  normalizeDimType,
+  normalizeFreightInfoForRate,
 };

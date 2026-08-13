@@ -15,6 +15,7 @@ const quoteDispatchers = require("./quote-dispatchers");
 const dispatcherAuth = require("./quote-dispatcher-auth");
 const quoteFirebaseAuth = require("./quote-firebase-auth");
 const quoteOutlook = require("./quote-outlook");
+const quoteAccCatalog = require("./quote-accessorial-catalog");
 
 /** Bumped when quote-auth-client.js API changes (cache-bust HTML). */
 const QUOTE_AUTH_CLIENT_VERSION = "2";
@@ -31,6 +32,7 @@ function init(d) {
   quoteDispatchers.init({tcol: d.tcol});
   quoteOutlook.init({tcol: d.tcol, writeLog: d.writeLog});
   addressEnrichment.init({tcol: d.tcol});
+  quoteAccCatalog.init({tcol: d.tcol});
 }
 
 /**
@@ -575,10 +577,45 @@ async function handleRerunQuoteRates(req, res) {
         auth.tenant, String(quoteId), {
           laneKey: body.laneKey || null,
           accessorials: body.accessorials,
+          accessorialsWithData: body.accessorialsWithData,
         });
     return res.json(result);
   } catch (err) {
     return res.status(500).json({ok: false, error: err.message});
+  }
+}
+
+/**
+ * GET Primus accessorial catalog for dispatcher re-rate UI
+ * (Origin / Destination / Other), with Firestore cache.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleGetQuoteAccessorialCatalog(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const user = await resolveDashboardUser(req);
+    if (!user.ok) {
+      return res.status(user.status || 401).json({
+        ok: false,
+        error: user.error,
+      });
+    }
+    const forceRefresh =
+      req.query.refresh === "1" || req.query.refresh === "true";
+    const catalog = await quoteAccCatalog.getQuoteAccessorialCatalog(
+        user.tenant, {forceRefresh});
+    return res.json(catalog);
+  } catch (err) {
+    console.error("getQuoteAccessorialCatalog:", err);
+    const fallback = quoteAccCatalog.buildStaticFallbackCatalog();
+    return res.json({
+      ok: true,
+      cached: false,
+      fetchError: err.message,
+      ...fallback,
+    });
   }
 }
 
@@ -634,10 +671,17 @@ async function handleGetQuoteDispatcherInbox(req, res) {
     const status = req.query.status ? String(req.query.status) : "";
     if (req.query.syncOutlook !== "0") {
       try {
+        const includeRead =
+          req.query.includeRead === "1" ||
+          req.query.includeRead === "true";
+        const forceReprocess =
+          req.query.forceReprocess === "1" ||
+          req.query.forceReprocess === "true";
         await quoteOutlook.syncDispatcherInbox(
             user.tenant,
             user.dispatcher,
-            quoteAutomation.processQuoteEmail);
+            quoteAutomation.processQuoteEmail,
+            {includeRead, forceReprocess});
       } catch (syncErr) {
         console.warn("quote outlook sync:", syncErr.message);
       }
@@ -773,6 +817,8 @@ async function handleQuoteOutlookOAuthCallback(req, res) {
         "<h2>Outlook connected</h2>" +
         "<p>Mailbox <strong>" + (result.email || "") + "</strong> is linked " +
         "for " + (result.dispatcherName || "dispatcher") + ".</p>" +
+        (result.upn && result.upn !== result.email ?
+          "<p>Sign-in UPN: <code>" + result.upn + "</code></p>" : "") +
         "<p>You can close this window and return to the quote dashboard.</p>");
   } catch (err) {
     console.error("quoteOutlookOAuthCallback:", err);
@@ -911,12 +957,20 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
   if (cors(req, res)) return;
   try {
     const tenant = await deps.resolveDashboardTenant(req);
+    const includeRead =
+      req.query.includeRead === "1" ||
+      req.query.includeRead === "true";
+    const forceReprocess =
+      req.query.forceReprocess === "1" ||
+      req.query.forceReprocess === "true";
+    const syncOpts = {includeRead, forceReprocess};
     const dispatchers = await quoteDispatchers.listActiveDispatchers(tenant);
     const perDispatcher = [];
     let synced = 0;
     let connected = 0;
     let skipped = 0;
     let errors = 0;
+    let scanned = 0;
 
     for (const dispatcher of dispatchers) {
       const status = await quoteOutlook.getOutlookStatus(
@@ -935,15 +989,22 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
         const result = await quoteOutlook.syncDispatcherInbox(
             tenant,
             dispatcher,
-            quoteAutomation.processQuoteEmail);
+            quoteAutomation.processQuoteEmail,
+            syncOpts);
         const count = Number(result && result.synced) || 0;
         synced += count;
+        scanned += Number(result && result.scanned) || 0;
         perDispatcher.push({
           dispatcherId: dispatcher.id,
           name: dispatcher.name || null,
           email: status.email || null,
           ok: true,
           synced: count,
+          scanned: result && result.scanned,
+          skippedExisting: result && result.skippedExisting,
+          skippedNotQuote: result && result.skippedNotQuote,
+          processErrors: result && result.processErrors,
+          includeRead: result && result.includeRead,
           skipped: result && result.skipped ? result.skipped : undefined,
         });
       } catch (syncErr) {
@@ -976,6 +1037,9 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
             connected,
             skipped,
             errors,
+            scanned,
+            includeRead,
+            forceReprocess,
             dispatcherCount: dispatchers.length,
           });
     }
@@ -987,6 +1051,9 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
       connected,
       skipped,
       errors,
+      scanned,
+      includeRead,
+      forceReprocess,
       perDispatcher,
     });
   } catch (err) {
@@ -1014,6 +1081,7 @@ module.exports = {
   handleApproveQuoteEmail,
   handleDismissQuote,
   handleRerunQuoteRates,
+  handleGetQuoteAccessorialCatalog,
   handleGetQuoteDispatcherProfile,
   handleGetQuoteDispatcherInbox,
   handleGetQuoteDispatchers,

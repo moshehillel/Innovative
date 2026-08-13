@@ -12,6 +12,7 @@ const rateShop = require("./quote-rate-shop");
 const quoteOutput = require("./quote-output");
 const quoteDispatchers = require("./quote-dispatchers");
 const quoteOutlook = require("./quote-outlook");
+const quoteAccCatalog = require("./quote-accessorial-catalog");
 
 let deps = {};
 
@@ -25,6 +26,7 @@ function init(d) {
   quoteRules.init({tcol: d.tcol});
   quoteDispatchers.init({tcol: d.tcol});
   addressEnrichment.init({tcol: d.tcol});
+  quoteAccCatalog.init({tcol: d.tcol});
 }
 
 /**
@@ -37,11 +39,11 @@ function col(tenant, name) {
 }
 
 /**
- * Resolves shipping location id from sender email domain / customer name.
+ * Resolves Primus customer match from sender email domain / customer name.
  * @param {object} opts from, customerRef.
- * @return {Promise<string|null>}
+ * @return {Promise<object>} `{id, name}` — id may be null.
  */
-async function resolveShippingLocationId(opts) {
+async function resolveCustomerMatch(opts) {
   const ref = String(opts.customerRef || "");
   const searchTerms = [];
   if (/menards/i.test(ref)) searchTerms.push("menards");
@@ -61,8 +63,71 @@ async function resolveShippingLocationId(opts) {
     customerRef: opts.customerRef,
     searchTerms,
   });
-  if (match && match.id) return match.id;
-  return process.env.QUOTE_DEFAULT_SHIPPING_LOCATION_ID || null;
+  if (match && match.id) {
+    return {
+      id: String(match.id),
+      name: match.name || null,
+    };
+  }
+  const fallback = process.env.QUOTE_DEFAULT_SHIPPING_LOCATION_ID || null;
+  return {id: fallback, name: null};
+}
+
+/**
+ * Resolves shipping location id from sender email domain / customer name.
+ * @param {object} opts from, customerRef.
+ * @return {Promise<string|null>}
+ */
+async function resolveShippingLocationId(opts) {
+  const match = await resolveCustomerMatch(opts);
+  return match.id || null;
+}
+
+/**
+ * Parses dispatcher customerPrices map from a selection payload.
+ * @param {object} sel Selection row.
+ * @return {Map<string, number>}
+ */
+function parseCustomerPrices(sel) {
+  const out = new Map();
+  if (!sel || typeof sel !== "object") return out;
+  const raw = sel.customerPrices || sel.customerRateOverrides || null;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [rateId, value] of Object.entries(raw)) {
+      const n = Number(value);
+      if (rateId && Number.isFinite(n)) out.set(String(rateId), n);
+    }
+  }
+  if (Array.isArray(sel.rates)) {
+    for (const row of sel.rates) {
+      if (!row || row.rateId == null) continue;
+      const n = Number(row.customerPrice != null ?
+        row.customerPrice : row.sellRate);
+      if (Number.isFinite(n)) out.set(String(row.rateId), n);
+    }
+  }
+  return out;
+}
+
+/**
+ * Ensures every checked rate has a customer rate &gt; 0.
+ * @param {Array<object>} lanes Quote lanes after selection save.
+ * @return {void}
+ */
+function assertSelectedCustomerRates(lanes) {
+  for (const lane of lanes || []) {
+    const selected = quoteOutput.resolveSelectedOptions(lane);
+    for (const opt of selected) {
+      const rate = quoteOutput.effectiveCustomerRate(opt);
+      if (!(Number(rate) > 0)) {
+        const name = opt.name || opt.SCAC || opt.id || "rate";
+        throw new Error(
+            `Customer rate required for ${name} ` +
+            `(lane ${lane.label || lane.laneKey}). ` +
+            "Set a customer rate greater than 0 before generating.");
+      }
+    }
+  }
 }
 
 /**
@@ -74,12 +139,14 @@ async function resolveShippingLocationId(opts) {
 async function rateLane(lane, ctx) {
   let rulesOut;
   if (Array.isArray(ctx.accessorialOverride)) {
-    const codes = [...new Set(
-        ctx.accessorialOverride.map(String).filter(Boolean),
-    )];
+    const codes = quoteAccCatalog.normalizeRerunAccessorialCodes(
+        ctx.accessorialOverride);
+    const withData = Array.isArray(ctx.accessorialsWithDataOverride) ?
+      ctx.accessorialsWithDataOverride :
+      codes.map((code) => ({code}));
     rulesOut = {
       accessorials: codes,
-      accessorialsWithData: codes.map((code) => ({code})),
+      accessorialsWithData: withData,
       appliedRules: [{
         ruleId: "manual_override",
         name: "Dispatcher override",
@@ -179,9 +246,11 @@ async function processQuoteEmail(opts) {
 
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
-  const shippingLocationId = await resolveShippingLocationId({
+  const customerMatch = await resolveCustomerMatch({
     from, customerRef: extracted.customerRef,
   });
+  const shippingLocationId = customerMatch.id || null;
+  const shippingLocationName = customerMatch.name || null;
   const rules = await quoteRules.loadActiveRules(tenant);
 
   const enrichLog = (level, category, message, data) =>
@@ -238,6 +307,7 @@ async function processQuoteEmail(opts) {
     shipper: extracted.shipper,
     specialInstructionsGlobal: extracted.specialInstructionsGlobal || "",
     shippingLocationId,
+    shippingLocationName,
     lanes: ratedLanes,
     customerDraftText: "",
     status: "awaiting_dispatcher",
@@ -379,10 +449,10 @@ async function saveLaneSelection(tenant, quoteId, laneKey, rateId) {
 }
 
 /**
- * Saves multi-select rate ids per lane.
+ * Saves multi-select rate ids per lane (and optional customer price overrides).
  * @param {object} tenant Tenant.
  * @param {string} quoteId Quote doc id.
- * @param {Array<object>} selections [{laneKey, rateIds: string[]}].
+ * @param {Array<object>} selections [{laneKey, rateIds, customerPrices?}].
  * @return {Promise<object>}
  */
 async function saveLaneSelections(tenant, quoteId, selections) {
@@ -396,16 +466,25 @@ async function saveLaneSelections(tenant, quoteId, selections) {
     const ids = Array.isArray(sel.rateIds) ?
       sel.rateIds.map(String).filter(Boolean) :
       (sel.rateId ? [String(sel.rateId)] : []);
-    byLane.set(String(sel.laneKey), [...new Set(ids)]);
+    byLane.set(String(sel.laneKey), {
+      rateIds: [...new Set(ids)],
+      customerPrices: parseCustomerPrices(sel),
+    });
   }
 
   const lanes = (data.lanes || []).map((lane) => {
     if (!byLane.has(lane.laneKey)) return lane;
-    const rateIds = byLane.get(lane.laneKey);
-    const selectedOptions = (lane.options || []).filter((o) =>
+    const {rateIds, customerPrices} = byLane.get(lane.laneKey);
+    const options = (lane.options || []).map((o) => {
+      const key = String(o.id);
+      if (!customerPrices.has(key)) return o;
+      return {...o, customerPrice: customerPrices.get(key)};
+    });
+    const selectedOptions = options.filter((o) =>
       rateIds.includes(String(o.id)));
     return {
       ...lane,
+      options,
       selectedRateIds: rateIds,
       selectedRateId: rateIds[0] || null,
       selectedOptions,
@@ -441,6 +520,8 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
     const fresh = await ref.get();
     Object.assign(quote, fresh.data());
   }
+
+  assertSelectedCustomerRates(quote.lanes);
 
   const style = opts.style || "bullet";
   const text = opts.bodyText != null ?
@@ -494,8 +575,12 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
   if (!snap.exists) throw new Error("Quote not found");
   const data = snap.data();
   const rules = await quoteRules.loadActiveRules(tenant);
-  const accessorialOverride = Array.isArray(opts.accessorials) ?
-    opts.accessorials.map(String) : null;
+  const accessorialOverride = opts.accessorials != null ?
+    quoteAccCatalog.normalizeRerunAccessorialCodes(opts.accessorials) :
+    null;
+  const accessorialsWithDataOverride =
+    Array.isArray(opts.accessorialsWithData) ?
+      opts.accessorialsWithData : null;
   const targetKey = opts.laneKey ? String(opts.laneKey) : null;
 
   const ratedLanes = [];
@@ -522,6 +607,9 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         customerPrefs: {},
         accessorialOverride: accessorialOverride != null ?
           accessorialOverride : undefined,
+        accessorialsWithDataOverride:
+          accessorialsWithDataOverride != null ?
+            accessorialsWithDataOverride : undefined,
       });
       ratedLanes.push(rated);
     } catch (err) {
@@ -592,6 +680,7 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
       rateId: o.id,
       name: o.name,
       sellRate: o.sellRate,
+      customerPrice: quoteOutput.effectiveCustomerRate(o),
       quoteNumber: o.quoteNumber,
       transitDays: o.transitDays,
     })),
@@ -656,5 +745,6 @@ module.exports = {
   getQuoteRequest,
   listQuotesForDispatcher,
   resolveShippingLocationId,
+  resolveCustomerMatch,
   rateLane,
 };

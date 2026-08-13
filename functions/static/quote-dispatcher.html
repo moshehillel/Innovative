@@ -98,6 +98,65 @@
       color: var(--primary-dark);
     }
     .why strong { display: block; margin-bottom: 4px; }
+    .acc-panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-muted);
+      padding: 12px 14px;
+      margin: 8px 0 14px;
+    }
+    .acc-search {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 0.8125rem;
+      margin-bottom: 10px;
+      background: var(--surface);
+    }
+    .acc-sections {
+      display: grid;
+      gap: 12px;
+    }
+    @media (min-width: 860px) {
+      .acc-sections { grid-template-columns: 1fr 1fr 1fr; }
+    }
+    .acc-section h4 {
+      margin: 0 0 6px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--primary-dark);
+    }
+    .acc-section .acc-list {
+      max-height: 220px;
+      overflow: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding-right: 4px;
+    }
+    .acc-section label {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      cursor: pointer;
+      line-height: 1.35;
+    }
+    .acc-section label.disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .acc-section label .code {
+      color: var(--muted);
+      font-size: 0.6875rem;
+      white-space: nowrap;
+    }
+    .acc-section label.hidden-acc { display: none; }
     .acc-toggles {
       display: flex;
       flex-wrap: wrap;
@@ -142,6 +201,62 @@
     }
     .price { font-size: 1rem; font-weight: 600; margin-top: 2px; }
     .sell { color: var(--success); }
+    .rate-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      margin-top: 8px;
+      font-size: 0.875rem;
+    }
+    .rate-cost {
+      font-weight: 700;
+      color: var(--text);
+    }
+    .customer-rate-field {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      color: var(--success);
+    }
+    .customer-rate-field input[type="number"] {
+      width: 104px;
+      margin: 0;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--surface);
+    }
+    .customer-rate-field input[type="number"]:focus {
+      outline: none;
+      border-color: var(--success);
+      box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.15);
+    }
+    .rate-meta { color: var(--muted); font-weight: 500; }
+    .suggested-sell {
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+    .customer-match {
+      margin: 0 0 14px;
+      font-size: 0.8125rem;
+    }
+    .badge.match {
+      background: var(--success-bg);
+      color: var(--success);
+      border-color: #6ee7b7;
+    }
+    .badge.nomatch {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border-color: #fcd34d;
+    }
     .warn {
       color: var(--warning);
       background: var(--warning-bg);
@@ -370,6 +485,7 @@
       <span id="meta">Loading…</span>
       <span id="status-badge" class="badge" style="margin-left:8px"></span>
     </div>
+    <div id="customer-match" class="customer-match hidden"></div>
     <div class="toolbar">
       <button type="button" id="btn-generate">Generate email</button>
       <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
@@ -397,9 +513,11 @@
     const API = "__API_BASE__";
     let quote = null;
     const selections = {};
+    const customerPrices = {};
     const laneAccessorials = {};
     let draftReady = false;
     const hasLegacyToken = DISPATCHER_ID && TOKEN;
+    let accessorialCatalog = null;
 
     async function apiFetch(path, opts) {
       const headers = Object.assign(
@@ -407,7 +525,9 @@
           await QuoteAuth.authHeaders(),
           (opts && opts.headers) || {});
       let url = API + path;
-      if (hasLegacyToken && path.indexOf("getQuoteDispatcherData") >= 0) {
+      if (hasLegacyToken &&
+          (path.indexOf("getQuoteDispatcherData") >= 0 ||
+           path.indexOf("getQuoteAccessorialCatalog") >= 0)) {
         url += (path.indexOf("?") >= 0 ? "&" : "?") +
           "dispatcherId=" + encodeURIComponent(DISPATCHER_ID) +
           "&token=" + encodeURIComponent(TOKEN);
@@ -422,11 +542,69 @@
       el.classList.remove("hidden");
     }
 
+    function defaultCustomerPrice(opt) {
+      if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
+        const override = Number(opt.customerPrice);
+        if (isFinite(override)) return override;
+      }
+      const sell = Number(opt && opt.sellRate);
+      return isFinite(sell) ? sell : "";
+    }
+
     function collectSelections() {
-      return (quote.lanes || []).map((lane) => ({
-        laneKey: lane.laneKey,
-        rateIds: selections[lane.laneKey] || [],
-      }));
+      return (quote.lanes || []).map((lane) => {
+        const laneKey = lane.laneKey;
+        const rateIds = selections[laneKey] || [];
+        const prices = {};
+        const byLane = customerPrices[laneKey] || {};
+        (lane.options || []).forEach((opt) => {
+          const rateId = String(opt.rateId);
+          const raw = byLane[rateId];
+          const n = raw != null && raw !== "" ? Number(raw) :
+            Number(defaultCustomerPrice(opt));
+          if (isFinite(n)) prices[rateId] = n;
+        });
+        return {
+          laneKey,
+          rateIds,
+          customerPrices: prices,
+        };
+      });
+    }
+
+    function validateCheckedCustomerRates() {
+      const missing = [];
+      (quote.lanes || []).forEach((lane) => {
+        const rateIds = selections[lane.laneKey] || [];
+        const byLane = customerPrices[lane.laneKey] || {};
+        rateIds.forEach((rateId) => {
+          const opt = (lane.options || [])
+              .find((o) => String(o.rateId) === String(rateId));
+          const raw = byLane[rateId];
+          const n = raw != null && raw !== "" ? Number(raw) :
+            Number(defaultCustomerPrice(opt));
+          if (!(n > 0)) {
+            missing.push((opt && (opt.name || opt.SCAC)) || rateId);
+          }
+        });
+      });
+      return missing;
+    }
+
+    function renderCustomerMatch(q) {
+      const el = document.getElementById("customer-match");
+      if (!el) return;
+      if (q.customerMatched && q.shippingLocationId) {
+        const name = q.shippingLocationName ?
+          esc(q.shippingLocationName) + " · " : "";
+        el.innerHTML = "<span class='badge match'>Primus customer: " +
+          name + "ID " + esc(q.shippingLocationId) + "</span>";
+        el.classList.remove("hidden");
+      } else {
+        el.innerHTML = "<span class='badge nomatch'>" +
+          "No customer match — set customer rates manually</span>";
+        el.classList.remove("hidden");
+      }
     }
 
     async function persistSelections() {
@@ -444,10 +622,43 @@
       } catch (_) { /* non-fatal */ }
     }
 
+    async function loadAccessorialCatalog() {
+      try {
+        const res = await apiFetch("/getQuoteAccessorialCatalog?tenantId=" +
+          encodeURIComponent(TENANT_ID));
+        if (res && res.ok !== false &&
+            (res.origin || res.destination || res.other)) {
+          accessorialCatalog = res;
+          return;
+        }
+      } catch (_) { /* use fallback below */ }
+      accessorialCatalog = {
+        origin: [
+          {label: "Liftgate at Origin", code: "LFO", selectable: true},
+          {label: "Appointment at Origin", code: "APO", selectable: true},
+          {label: "Limited Access Pickup", code: "LAO", selectable: true},
+          {label: "Residential Pickup", code: "RSO", selectable: true},
+        ],
+        destination: [
+          {label: "Liftgate at Destination", code: "LFD", selectable: true},
+          {label: "Appointment at Destination", code: "APD", selectable: true},
+          {label: "Limited Access Delivery", code: "LAD", selectable: true},
+          {label: "Residential Delivery", code: "RSD", selectable: true},
+          {label: "Nursing Home Delivery", code: "NUD", selectable: true},
+          {label: "Hotel Delivery", code: "HOD", selectable: true},
+        ],
+        other: [],
+        source: "client-fallback",
+      };
+    }
+
     async function load() {
       const url = "/getQuoteDispatcherData?id=" +
         encodeURIComponent(QUOTE_ID) + "&tenantId=" + encodeURIComponent(TENANT_ID);
-      const res = await apiFetch(url);
+      const [res] = await Promise.all([
+        apiFetch(url),
+        loadAccessorialCatalog(),
+      ]);
       if (!res.ok) {
         document.getElementById("meta").textContent = res.error || "Failed to load";
         return;
@@ -461,6 +672,7 @@
       document.getElementById("title").textContent = quote.batchQuoteId || "Quote";
       document.getElementById("meta").textContent =
         (quote.from || "") + " — " + (quote.subject || "");
+      renderCustomerMatch(quote);
       const badge = document.getElementById("status-badge");
       badge.textContent = quote.status || "";
       badge.className = "badge " + (quote.status || "");
@@ -480,22 +692,45 @@
       (quote.lanes || []).forEach((lane) => {
         selections[lane.laneKey] = (lane.selectedRateIds || []).slice();
         laneAccessorials[lane.laneKey] = (lane.accessorials || []).slice();
+        const prices = {};
+        (lane.options || []).forEach((opt) => {
+          const rateId = String(opt.rateId);
+          const existing = customerPrices[lane.laneKey] &&
+            customerPrices[lane.laneKey][rateId];
+          prices[rateId] = existing != null && existing !== "" ?
+            existing : defaultCustomerPrice(opt);
+        });
+        customerPrices[lane.laneKey] = prices;
       });
       renderLanes();
+    }
+
+    function renderAccSection(sectionKey, title, items, accSet, laneKey) {
+      let html = "<div class='acc-section' data-section='" + sectionKey + "'>";
+      html += "<h4>" + esc(title) + "</h4><div class='acc-list'>";
+      (items || []).forEach((a) => {
+        const code = a.code || "";
+        const label = a.label || a.name || code;
+        const selectable = a.selectable !== false && !!code;
+        const checked = code && accSet.has(code) ? " checked" : "";
+        const disabled = selectable ? "" : " disabled";
+        const cls = selectable ? "" : " disabled";
+        const search = (label + " " + code).toLowerCase();
+        html += "<label class='" + cls + "' data-search='" + esc(search) + "'>" +
+          "<input type='checkbox' data-acc='" + esc(code) +
+          "' data-lane='" + esc(laneKey) + "'" + checked + disabled + "> " +
+          "<span>" + esc(label) +
+          (code ? " <span class='code'>(" + esc(code) + ")</span>" : "") +
+          "</span></label>";
+      });
+      html += "</div></div>";
+      return html;
     }
 
     function renderLanes() {
       const root = document.getElementById("lanes");
       root.innerHTML = "";
-      const common = quote.commonAccessorials || [
-        {code: "LFO", label: "Liftgate pickup"},
-        {code: "LFD", label: "Liftgate delivery"},
-        {code: "APD", label: "Appointment delivery"},
-        {code: "LAD", label: "Limited access"},
-        {code: "RSD", label: "Residential delivery"},
-        {code: "NUD", label: "Nursing home delivery"},
-        {code: "HOD", label: "Hotel delivery"},
-      ];
+      const cat = accessorialCatalog || {origin: [], destination: [], other: []};
 
       (quote.lanes || []).forEach((lane, idx) => {
         const div = document.createElement("div");
@@ -519,16 +754,17 @@
           whyHtml += "</div>";
         }
 
-        let toggles = "<div class='acc-toggles'>";
-        common.forEach((a) => {
-          const checked = accSet.has(a.code) ? " checked" : "";
-          toggles += "<label><input type='checkbox' data-acc='" + esc(a.code) +
-            "' data-lane='" + esc(lane.laneKey) + "'" + checked + "> " +
-            esc(a.label) + "</label>";
-        });
+        let toggles = "<div class='acc-panel' data-lane-acc='" + esc(lane.laneKey) + "'>";
+        toggles += "<input type='search' class='acc-search' placeholder='Search accessorials…' " +
+          "data-lane='" + esc(lane.laneKey) + "'>";
+        toggles += "<div class='acc-sections'>";
+        toggles += renderAccSection("origin", "Origin (pickup)", cat.origin, accSet, lane.laneKey);
+        toggles += renderAccSection("destination", "Destination (delivery)", cat.destination, accSet, lane.laneKey);
+        toggles += renderAccSection("other", "Other", cat.other, accSet, lane.laneKey);
         toggles += "</div>";
         toggles += "<button type='button' class='ghost btn-rerun' data-lane='" +
           esc(lane.laneKey) + "'>Rerun quote with these accessorials</button>";
+        toggles += "</div>";
 
         let optsHtml = "";
         if (lane.rateError) {
@@ -536,15 +772,34 @@
         }
         (lane.options || []).forEach((opt) => {
           const isChecked = selected.has(String(opt.rateId));
-          optsHtml += `<label class="opt${isChecked ? " checked" : ""}">
+          const rateId = String(opt.rateId);
+          const custVal = customerPrices[lane.laneKey] &&
+            customerPrices[lane.laneKey][rateId] != null ?
+            customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
+          const custStr = custVal === "" || custVal == null ? "" : num(custVal);
+          const sellHint = Number(opt.sellRate);
+          const showSuggested = isFinite(sellHint) &&
+            Number(custVal) !== sellHint;
+          optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
             <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(opt.rateId)}"${isChecked ? " checked" : ""}>
             <div>
               <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
               <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
-              <div class="price">Cost $${num(opt.cost)} · <span class="sell">Sell $${num(opt.sellRate)}</span> · ${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}</div>
+              <div class="rate-row">
+                <span class="rate-cost">Cost $${num(opt.cost)}</span>
+                <label class="customer-rate-field">Customer rate $
+                  <input type="number" min="0.01" step="0.01"
+                    data-customer-rate="1"
+                    data-lane="${esc(lane.laneKey)}"
+                    data-rate="${esc(opt.rateId)}"
+                    value="${esc(custStr)}">
+                </label>
+                ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
+                <span class="rate-meta">${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}</span>
+              </div>
               ${opt.warnings ? '<div class="warn">'+esc(String(opt.warnings).slice(0,160))+'</div>' : ""}
             </div>
-          </label>`;
+          </div>`;
         });
         if (!(lane.options || []).length && !lane.rateError) {
           optsHtml = "<p style='color:var(--muted);font-size:0.875rem'>No rates returned.</p>";
@@ -596,10 +851,23 @@
         });
       });
 
+      root.querySelectorAll(".acc-search").forEach((input) => {
+        input.addEventListener("input", () => {
+          const q = String(input.value || "").trim().toLowerCase();
+          const panel = input.closest(".acc-panel");
+          if (!panel) return;
+          panel.querySelectorAll("label[data-search]").forEach((lab) => {
+            const hay = lab.getAttribute("data-search") || "";
+            lab.classList.toggle("hidden-acc", q && hay.indexOf(q) < 0);
+          });
+        });
+      });
+
       root.querySelectorAll("input[data-acc]").forEach((input) => {
         input.addEventListener("change", () => {
           const laneKey = input.dataset.lane;
           const code = input.dataset.acc;
+          if (!code) return;
           const set = new Set(laneAccessorials[laneKey] || []);
           if (input.checked) set.add(code);
           else set.delete(code);
@@ -613,13 +881,15 @@
           btn.disabled = true;
           btn.textContent = "Re-rating…";
           try {
+            const codes = laneAccessorials[laneKey] || [];
             const res = await apiFetch("/rerunQuoteRates", {
               method: "POST",
               body: JSON.stringify({
                 tenantId: TENANT_ID,
                 quoteId: QUOTE_ID,
                 laneKey,
-                accessorials: laneAccessorials[laneKey] || [],
+                accessorials: codes.map((code) => ({code})),
+                accessorialsWithData: codes.map((code) => ({code})),
                 dispatcherId: DISPATCHER_ID || undefined,
                 token: TOKEN || undefined,
               }),

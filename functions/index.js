@@ -7824,13 +7824,12 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
 }
 
 /**
- * Quote inbox automation is off until a dedicated quote mailbox is wired.
- * Set QUOTE_INBOX_PROCESSING_ENABLED=true to re-enable in processGmailMessage.
+ * Jerry (accounting) inbox never processes quotes — dispatcher Outlook only.
+ * Kept as a hard off-switch so processGmailMessage cannot route quote_request.
  * @return {boolean}
  */
 function isQuoteInboxProcessingEnabled() {
-  return String(process.env.QUOTE_INBOX_PROCESSING_ENABLED || "")
-      .toLowerCase() === "true";
+  return false;
 }
 
 /**
@@ -10766,6 +10765,23 @@ exports.gmailOAuthCallback = onRequest(
               "<strong>Connect Outlook</strong> again using the accounting " +
               "mailbox account — it should work without the admin approval " +
               "prompt.</p>");
+        }
+
+        // Quote dispatcher Outlook connect reuses this Azure redirect URI;
+        // route by OAuth state.flow instead of a separate callback function.
+        if (req.query.state) {
+          try {
+            const parsedState = JSON.parse(
+                Buffer.from(String(req.query.state), "base64url")
+                    .toString("utf8"));
+            if (parsedState && parsedState.flow === "quote_dispatcher") {
+              const quoteDashboardMod = require("./quote-dashboard");
+              return quoteDashboardMod.handleQuoteOutlookOAuthCallback(
+                  req, res);
+            }
+          } catch (_) {
+            // Fall through to Jerry mail token handling.
+          }
         }
 
         if (!code) {
@@ -14329,6 +14345,11 @@ exports.rerunQuoteRates = onRequest({
   timeoutSeconds: 540,
   memory: "1GiB",
 }, quoteDashboard.handleRerunQuoteRates);
+exports.getQuoteAccessorialCatalog = onRequest({
+  invoker: "public",
+  timeoutSeconds: 120,
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteAccessorialCatalog);
 exports.getQuoteDispatcherProfile = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteDispatcherProfile);
 exports.getQuoteDispatcherInbox = onRequest({invoker: "public"},
