@@ -612,6 +612,7 @@
     let draftReady = false;
     const hasLegacyToken = DISPATCHER_ID && TOKEN;
     let accessorialCatalog = null;
+    let accessorialCatalogPromise = null;
 
     async function apiFetch(path, opts) {
       const headers = Object.assign(
@@ -716,17 +717,8 @@
       } catch (_) { /* non-fatal */ }
     }
 
-    async function loadAccessorialCatalog() {
-      try {
-        const res = await apiFetch("/getQuoteAccessorialCatalog?tenantId=" +
-          encodeURIComponent(TENANT_ID));
-        if (res && res.ok !== false &&
-            (res.origin || res.destination || res.other)) {
-          accessorialCatalog = res;
-          return;
-        }
-      } catch (_) { /* use fallback below */ }
-      accessorialCatalog = {
+    function fallbackAccessorialCatalog() {
+      return {
         origin: [
           {label: "Liftgate at Origin", code: "LFO", selectable: true},
           {label: "Appointment at Origin", code: "APO", selectable: true},
@@ -746,13 +738,40 @@
       };
     }
 
+    async function loadAccessorialCatalog() {
+      try {
+        const res = await apiFetch("/getQuoteAccessorialCatalog?tenantId=" +
+          encodeURIComponent(TENANT_ID));
+        if (res && res.ok !== false &&
+            (res.origin || res.destination || res.other)) {
+          accessorialCatalog = res;
+          return accessorialCatalog;
+        }
+      } catch (_) { /* use fallback below */ }
+      accessorialCatalog = fallbackAccessorialCatalog();
+      return accessorialCatalog;
+    }
+
+    function ensureAccessorialCatalog() {
+      if (accessorialCatalog) return Promise.resolve(accessorialCatalog);
+      if (!accessorialCatalogPromise) {
+        accessorialCatalogPromise = loadAccessorialCatalog()
+            .catch(() => {
+              accessorialCatalog = fallbackAccessorialCatalog();
+              return accessorialCatalog;
+            })
+            .finally(() => {
+              accessorialCatalogPromise = null;
+            });
+      }
+      return accessorialCatalogPromise;
+    }
+
     async function load() {
       const url = "/getQuoteDispatcherData?id=" +
         encodeURIComponent(QUOTE_ID) + "&tenantId=" + encodeURIComponent(TENANT_ID);
-      const [res] = await Promise.all([
-        apiFetch(url),
-        loadAccessorialCatalog(),
-      ]);
+      // Do not await Primus accessorial catalog — it blocks first paint.
+      const res = await apiFetch(url);
       if (!res.ok) {
         document.getElementById("meta").textContent = res.error || "Failed to load";
         return;
@@ -897,19 +916,8 @@
       return n;
     }
 
-    function renderAccSection(sectionKey, title, items, accSet, laneKey) {
-      const checkedCount = countCheckedInItems(items, accSet);
-      const countLabel = checkedCount ?
-        checkedCount + " selected" :
-        (items || []).length + " options";
-      let html = "<div class='acc-section' data-section='" + sectionKey + "'>";
-      html += "<button type='button' class='acc-section-toggle' " +
-        "aria-expanded='false' data-acc-toggle='1'>" +
-        "<span class='acc-chevron'>▶</span>" +
-        "<h4>" + esc(title) + "</h4>" +
-        "<span class='acc-count'>" + esc(countLabel) + "</span>" +
-        "</button>";
-      html += "<div class='acc-list'>";
+    function renderAccOptionsHtml(items, accSet, laneKey) {
+      let html = "";
       (items || []).forEach((a) => {
         const code = a.code || "";
         const label = a.label || a.name || code;
@@ -925,14 +933,160 @@
           (code ? " <span class='code'>(" + esc(code) + ")</span>" : "") +
           "</span></label>";
       });
+      return html;
+    }
+
+    function renderAccSection(sectionKey, title, items, accSet, laneKey, opts) {
+      const loaded = !!(opts && opts.loaded);
+      const loading = !!(opts && opts.loading);
+      const checkedCount = loaded ?
+        countCheckedInItems(items, accSet) :
+        (accSet && accSet.size) || 0;
+      let countLabel;
+      if (loading) countLabel = "Loading…";
+      else if (!loaded) countLabel = checkedCount ?
+        checkedCount + " selected · expand to edit" :
+        "Expand to load";
+      else if (checkedCount) countLabel = checkedCount + " selected";
+      else countLabel = (items || []).length + " options";
+
+      let html = "<div class='acc-section' data-section='" + sectionKey + "'>";
+      html += "<button type='button' class='acc-section-toggle' " +
+        "aria-expanded='false' data-acc-toggle='1'>" +
+        "<span class='acc-chevron'>▶</span>" +
+        "<h4>" + esc(title) + "</h4>" +
+        "<span class='acc-count'>" + esc(countLabel) + "</span>" +
+        "</button>";
+      html += "<div class='acc-list' data-acc-list='1'>";
+      if (loading) {
+        html += "<div class='empty' style='padding:8px'>Loading accessorials…</div>";
+      } else if (loaded) {
+        html += renderAccOptionsHtml(items, accSet, laneKey);
+      }
       html += "</div></div>";
       return html;
+    }
+
+    function bindAccCheckboxHandlers(root) {
+      (root || document).querySelectorAll("input[data-acc]").forEach((input) => {
+        if (input.dataset.boundAcc === "1") return;
+        input.dataset.boundAcc = "1";
+        input.addEventListener("change", () => {
+          const laneKey = input.dataset.lane;
+          const code = input.dataset.acc;
+          if (!code) return;
+          const set = new Set(laneAccessorials[laneKey] || []);
+          if (input.checked) set.add(code);
+          else set.delete(code);
+          laneAccessorials[laneKey] = [...set];
+        });
+      });
+    }
+
+    function fillAccPanel(panel, cat) {
+      if (!panel || !cat) return;
+      const laneKey = panel.getAttribute("data-lane-acc");
+      const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey) || {};
+      const accSet = new Set(laneAccessorials[laneKey] || lane.accessorials || []);
+      const openSections = {};
+      panel.querySelectorAll(".acc-section").forEach((section) => {
+        openSections[section.getAttribute("data-section")] =
+          section.classList.contains("open");
+      });
+      const searchEl = panel.querySelector(".acc-search");
+      const searchVal = searchEl ? searchEl.value : "";
+
+      const sectionsHost = panel.querySelector(".acc-sections");
+      if (!sectionsHost) return;
+      sectionsHost.innerHTML =
+        renderAccSection("origin", "Origin (pickup)", cat.origin, accSet, laneKey,
+            {loaded: true}) +
+        renderAccSection("destination", "Destination (delivery)", cat.destination,
+            accSet, laneKey, {loaded: true}) +
+        renderAccSection("other", "Other", cat.other, accSet, laneKey,
+            {loaded: true});
+
+      sectionsHost.querySelectorAll(".acc-section").forEach((section) => {
+        const key = section.getAttribute("data-section");
+        if (openSections[key]) {
+          section.classList.add("open");
+          const btn = section.querySelector("[data-acc-toggle]");
+          if (btn) btn.setAttribute("aria-expanded", "true");
+        }
+      });
+      bindAccSectionToggles(panel);
+      bindAccCheckboxHandlers(panel);
+      if (searchEl && searchVal) {
+        searchEl.value = searchVal;
+        searchEl.dispatchEvent(new Event("input"));
+      }
+    }
+
+    async function ensureCatalogForPanel(panel, openSection) {
+      if (!panel) return;
+      const sectionKey = openSection && openSection.getAttribute ?
+        openSection.getAttribute("data-section") : null;
+
+      function openByKey(key) {
+        if (!key) return;
+        const fresh = panel.querySelector(
+            '.acc-section[data-section="' + key + '"]');
+        if (!fresh) return;
+        fresh.classList.add("open");
+        const btn = fresh.querySelector("[data-acc-toggle]");
+        if (btn) btn.setAttribute("aria-expanded", "true");
+      }
+
+      if (accessorialCatalog) {
+        if (!panel.dataset.accFilled) {
+          fillAccPanel(panel, accessorialCatalog);
+          panel.dataset.accFilled = "1";
+        }
+        openByKey(sectionKey);
+        return;
+      }
+      panel.querySelectorAll(".acc-section").forEach((section) => {
+        const list = section.querySelector("[data-acc-list]");
+        const count = section.querySelector(".acc-count");
+        if (list) {
+          list.innerHTML =
+            "<div class='empty' style='padding:8px'>Loading accessorials…</div>";
+        }
+        if (count) count.textContent = "Loading…";
+      });
+      openByKey(sectionKey);
+      const cat = await ensureAccessorialCatalog();
+      fillAccPanel(panel, cat);
+      panel.dataset.accFilled = "1";
+      openByKey(sectionKey);
+    }
+
+    function bindAccSectionToggles(root) {
+      (root || document).querySelectorAll("[data-acc-toggle]").forEach((btn) => {
+        if (btn.dataset.boundToggle === "1") return;
+        btn.dataset.boundToggle = "1";
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const section = btn.closest(".acc-section");
+          const panel = btn.closest(".acc-panel");
+          if (!section || !panel) return;
+          const willOpen = !section.classList.contains("open");
+          if (willOpen) {
+            await ensureCatalogForPanel(panel, section);
+          } else {
+            section.classList.remove("open");
+            btn.setAttribute("aria-expanded", "false");
+          }
+        });
+      });
     }
 
     function renderLanes() {
       const root = document.getElementById("lanes");
       root.innerHTML = "";
-      const cat = accessorialCatalog || {origin: [], destination: [], other: []};
+      const cat = accessorialCatalog;
+      const loaded = !!cat;
 
       (quote.lanes || []).forEach((lane, idx) => {
         const div = document.createElement("div");
@@ -956,13 +1110,17 @@
           whyHtml += "</div>";
         }
 
-        let toggles = "<div class='acc-panel' data-lane-acc='" + esc(lane.laneKey) + "'>";
+        let toggles = "<div class='acc-panel' data-lane-acc='" + esc(lane.laneKey) + "'" +
+          (loaded ? " data-acc-filled='1'" : "") + ">";
         toggles += "<input type='search' class='acc-search' placeholder='Search accessorials…' " +
           "data-lane='" + esc(lane.laneKey) + "'>";
         toggles += "<div class='acc-sections'>";
-        toggles += renderAccSection("origin", "Origin (pickup)", cat.origin, accSet, lane.laneKey);
-        toggles += renderAccSection("destination", "Destination (delivery)", cat.destination, accSet, lane.laneKey);
-        toggles += renderAccSection("other", "Other", cat.other, accSet, lane.laneKey);
+        toggles += renderAccSection("origin", "Origin (pickup)",
+            loaded ? cat.origin : [], accSet, lane.laneKey, {loaded});
+        toggles += renderAccSection("destination", "Destination (delivery)",
+            loaded ? cat.destination : [], accSet, lane.laneKey, {loaded});
+        toggles += renderAccSection("other", "Other",
+            loaded ? cat.other : [], accSet, lane.laneKey, {loaded});
         toggles += "</div>";
         toggles += "<button type='button' class='ghost btn-rerun' data-lane='" +
           esc(lane.laneKey) + "'>Rerun quote with these accessorials</button>";
@@ -1035,16 +1193,8 @@
         });
       });
 
-      root.querySelectorAll("[data-acc-toggle]").forEach((btn) => {
-        btn.addEventListener("click", (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const section = btn.closest(".acc-section");
-          if (!section) return;
-          const open = section.classList.toggle("open");
-          btn.setAttribute("aria-expanded", open ? "true" : "false");
-        });
-      });
+      bindAccSectionToggles(root);
+      bindAccCheckboxHandlers(root);
 
       root.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
         input.addEventListener("change", () => {
@@ -1091,10 +1241,17 @@
       });
 
       root.querySelectorAll(".acc-search").forEach((input) => {
-        input.addEventListener("input", () => {
-          const q = String(input.value || "").trim().toLowerCase();
+        input.addEventListener("focus", () => {
+          const panel = input.closest(".acc-panel");
+          ensureCatalogForPanel(panel, null);
+        });
+        input.addEventListener("input", async () => {
           const panel = input.closest(".acc-panel");
           if (!panel) return;
+          if (!accessorialCatalog) {
+            await ensureCatalogForPanel(panel, null);
+          }
+          const q = String(input.value || "").trim().toLowerCase();
           panel.querySelectorAll("label[data-search]").forEach((lab) => {
             const hay = lab.getAttribute("data-search") || "";
             lab.classList.toggle("hidden-acc", q && hay.indexOf(q) < 0);
@@ -1113,18 +1270,6 @@
             section.classList.toggle("open", open);
             if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
           });
-        });
-      });
-
-      root.querySelectorAll("input[data-acc]").forEach((input) => {
-        input.addEventListener("change", () => {
-          const laneKey = input.dataset.lane;
-          const code = input.dataset.acc;
-          if (!code) return;
-          const set = new Set(laneAccessorials[laneKey] || []);
-          if (input.checked) set.add(code);
-          else set.delete(code);
-          laneAccessorials[laneKey] = [...set];
         });
       });
 

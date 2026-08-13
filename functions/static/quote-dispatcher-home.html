@@ -446,7 +446,6 @@
       <div style="margin-left:auto;display:flex;gap:8px;flex-wrap:wrap">
         <button type="button" class="ghost" id="btn-rules">Quote rules</button>
         <button type="button" class="ghost" id="btn-signout">Sign out</button>
-        <button type="button" class="ghost" id="btn-refresh">Refresh</button>
       </div>
     </header>
     <main>
@@ -454,6 +453,9 @@
         <div class="status warn" id="outlook-status">
           Connect your Outlook mailbox to receive quotes sent to your email.
         </div>
+        <button type="button" class="ghost" id="btn-outlook-sync" disabled>
+          Sync Outlook
+        </button>
         <button type="button" class="ghost" id="btn-outlook-connect">Connect Outlook</button>
         <button type="button" class="ghost hidden" id="btn-outlook-disconnect">Disconnect</button>
       </div>
@@ -475,7 +477,11 @@
   <script>
     const API = "__API_BASE__";
     const TENANT_ID = "__TENANT_ID__";
+    const SYNC_THROTTLE_MS = 5 * 60 * 1000;
+    const SYNC_KEY = "quoteOutlookLastSync:" + TENANT_ID;
     let filterStatus = "";
+    let outlookConnected = false;
+    let syncInFlight = null;
 
     async function apiFetch(path, opts) {
       const headers = Object.assign(
@@ -484,6 +490,13 @@
           (opts && opts.headers) || {});
       return fetch(API + path, Object.assign({}, opts || {}, {headers}))
           .then((r) => r.json());
+    }
+
+    function setSyncButtonBusy(busy, label) {
+      const btn = document.getElementById("btn-outlook-sync");
+      if (!btn) return;
+      btn.disabled = busy || !outlookConnected;
+      btn.textContent = label || (busy ? "Syncing…" : "Sync Outlook");
     }
 
     async function loadProfile() {
@@ -495,6 +508,7 @@
       document.getElementById("subtitle").textContent =
         res.dispatcher.email || "";
       const outlook = res.outlook || {};
+      outlookConnected = !!outlook.connected;
       const statusEl = document.getElementById("outlook-status");
       const connectBtn = document.getElementById("btn-outlook-connect");
       const disconnectBtn = document.getElementById("btn-outlook-disconnect");
@@ -511,11 +525,15 @@
         connectBtn.classList.remove("hidden");
         disconnectBtn.classList.add("hidden");
       }
+      setSyncButtonBusy(!!syncInFlight);
+      return res;
     }
 
-    async function loadInbox() {
+    async function loadInbox(opts) {
+      const sync = !!(opts && opts.sync);
       let path = "/getQuoteDispatcherInbox?tenantId=" +
-        encodeURIComponent(TENANT_ID) + "&limit=50";
+        encodeURIComponent(TENANT_ID) + "&limit=50&syncOutlook=" +
+        (sync ? "1" : "0");
       // Always fetch recent; apply pending filter client-side so draft_ready stays visible
       const res = await apiFetch(path);
       const root = document.getElementById("rows");
@@ -601,12 +619,59 @@
               }),
             });
             if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
-            await loadInbox();
+            await loadInbox({sync: false});
           } catch (err) {
             alert(err.message || "Dismiss failed");
           }
         });
       });
+    }
+
+    function lastSyncAt() {
+      const n = Number(sessionStorage.getItem(SYNC_KEY) || 0);
+      return isFinite(n) ? n : 0;
+    }
+
+    function markSynced() {
+      try {
+        sessionStorage.setItem(SYNC_KEY, String(Date.now()));
+      } catch (_) { /* ignore */ }
+    }
+
+    /**
+     * Opt-in Outlook sync. Does not block initial paint.
+     * When done, quietly reloads the Firestore inbox list.
+     * @param {object} [opts] force=true bypasses throttle.
+     * @return {Promise<void>}
+     */
+    function syncOutlookInBackground(opts) {
+      const force = !!(opts && opts.force);
+      if (!outlookConnected) return Promise.resolve();
+      if (syncInFlight) return syncInFlight;
+      if (!force && (Date.now() - lastSyncAt()) < SYNC_THROTTLE_MS) {
+        return Promise.resolve();
+      }
+      setSyncButtonBusy(true);
+      syncInFlight = (async () => {
+        try {
+          await loadInbox({sync: true});
+          markSynced();
+        } catch (_) {
+          // Non-fatal: scheduler still syncs ~every 20 min.
+        } finally {
+          syncInFlight = null;
+          setSyncButtonBusy(false);
+        }
+      })();
+      return syncInFlight;
+    }
+
+    function maybeDeferredSync() {
+      if (!outlookConnected) return;
+      // Let the Firestore list paint first, then soft-sync if stale.
+      setTimeout(() => {
+        syncOutlookInBackground({force: false});
+      }, 0);
     }
 
     function num(n) {
@@ -659,7 +724,9 @@
     });
 
     document.getElementById("btn-signout").addEventListener("click", () => QuoteAuth.signOut());
-    document.getElementById("btn-refresh").addEventListener("click", loadInbox);
+    document.getElementById("btn-outlook-sync").addEventListener("click", () => {
+      syncOutlookInBackground({force: true});
+    });
     document.getElementById("btn-outlook-connect").addEventListener("click", async () => {
       try {
         const res = await apiFetch("/getQuoteOutlookConnectUrl?tenantId=" +
@@ -682,10 +749,10 @@
       }
     });
     document.getElementById("filter-pending").addEventListener("click", () => {
-      filterStatus = "awaiting_dispatcher"; loadInbox();
+      filterStatus = "awaiting_dispatcher"; loadInbox({sync: false});
     });
     document.getElementById("filter-all").addEventListener("click", () => {
-      filterStatus = ""; loadInbox();
+      filterStatus = ""; loadInbox({sync: false});
     });
     document.getElementById("btn-rules").addEventListener("click", () => {
       window.open(API + "/quoteAdminPage?tenantId=" + encodeURIComponent(TENANT_ID), "_blank");
@@ -698,8 +765,12 @@
           if (!user) { showApp(false); return; }
           showApp(true);
           try {
-            await loadProfile();
-            await loadInbox();
+            // Fast path: profile + Firestore inbox in parallel (no Outlook wait).
+            await Promise.all([
+              loadProfile(),
+              loadInbox({sync: false}),
+            ]);
+            maybeDeferredSync();
           } catch (e) {
             document.getElementById("login-error").textContent = e.message;
             showApp(false);

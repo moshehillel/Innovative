@@ -14352,8 +14352,12 @@ exports.getQuoteAccessorialCatalog = onRequest({
 }, quoteDashboard.handleGetQuoteAccessorialCatalog);
 exports.getQuoteDispatcherProfile = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteDispatcherProfile);
-exports.getQuoteDispatcherInbox = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteDispatcherInbox);
+exports.getQuoteDispatcherInbox = onRequest({
+  invoker: "public",
+  // Sync Outlook path can scan/process mail; fast path returns Firestore only.
+  timeoutSeconds: 300,
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteDispatcherInbox);
 exports.getQuoteDispatchers = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteDispatchers);
 exports.quoteAdminPage = onRequest({invoker: "public"},

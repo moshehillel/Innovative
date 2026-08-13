@@ -669,7 +669,12 @@ async function handleGetQuoteDispatcherInbox(req, res) {
       });
     }
     const status = req.query.status ? String(req.query.status) : "";
-    if (req.query.syncOutlook !== "0") {
+    // Opt-in only: page loads must stay fast (Firestore list). Outlook sync
+    // runs on scheduler + explicit Sync Outlook / syncOutlook=1.
+    const wantSync =
+      req.query.syncOutlook === "1" ||
+      req.query.syncOutlook === "true";
+    if (wantSync) {
       try {
         const includeRead =
           req.query.includeRead === "1" ||
@@ -948,7 +953,7 @@ function handleQuoteAuthClient(req, res) {
 /**
  * Scheduled sync: every connected dispatcher Outlook inbox.
  * Mirror of Jerry checkMailInbox — Cloud Scheduler hits this every 20 min.
- * Dashboard getQuoteDispatcherInbox sync is unchanged.
+ * Dashboard inbox loads use syncOutlook=0 by default; syncOutlook=1 is opt-in.
  * @param {object} req Request.
  * @param {object} res Response.
  * @return {Promise<void>}
