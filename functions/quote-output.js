@@ -464,7 +464,7 @@ function serializeForDispatcherPage(quote) {
     shippingLocationId,
     shippingLocationName,
     customerMatched: !!shippingLocationId,
-    // Text draft only — HTML + unused catalog/meta omitted to keep payload lean.
+    // Text draft only — omit unused HTML/catalog fields for leaner payload.
     customerDraftText: storedEmail || buildCustomerDraftText(quote),
     customerEmailText: storedEmail,
     customerRequest: quote.extracted &&
