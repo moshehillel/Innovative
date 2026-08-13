@@ -39,13 +39,63 @@ function normalizeEmail(email) {
 }
 
 /**
+ * @param {string} email Email address.
+ * @return {string} Domain part or empty string.
+ */
+function emailDomain(email) {
+  const normalized = normalizeEmail(email);
+  const at = normalized.lastIndexOf("@");
+  if (at < 0) return "";
+  return normalized.slice(at + 1);
+}
+
+/**
+ * Domains allowed for quote Outlook connect (same as auth allowlist).
+ * @return {string[]}
+ */
+function getAllowedOutlookDomains() {
+  const raw = process.env.QUOTE_AUTH_ALLOWED_DOMAINS ||
+    "innovativecarriers.com,advancedautomations.net";
+  return raw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+}
+
+/**
+ * @param {string} email Email address.
+ * @return {boolean}
+ */
+function isAllowedOutlookDomain(email) {
+  const domain = emailDomain(email);
+  if (!domain) return false;
+  return getAllowedOutlookDomains().some(
+      (d) => domain === d || domain.endsWith("." + d));
+}
+
+/**
+ * Developer / AA testers may connect any allowlisted company mailbox
+ * (e.g. moshe@advancedautomations.net → leo@innovativecarriers.com inbox).
+ * Real dispatchers still require an exact roster email match.
+ * @param {object} dispatcher Dispatcher row.
+ * @return {boolean}
+ */
+function canRelaxOutlookEmailMatch(dispatcher) {
+  if (!dispatcher) return false;
+  if (String(dispatcher.id || "") === "developer") return true;
+  if (process.env.QUOTE_OUTLOOK_ALLOW_MISMATCH === "true") return true;
+  return emailDomain(dispatcher.email) === "advancedautomations.net";
+}
+
+/**
+ * Same Azure-registered redirect as Jerry mail (OUTLOOK_REDIRECT_URI /
+ * outlookOAuthCallback). Quote flow is distinguished via OAuth state.flow.
  * @return {string}
  */
 function getRedirectUri() {
+  if (process.env.OUTLOOK_REDIRECT_URI) {
+    return process.env.OUTLOOK_REDIRECT_URI;
+  }
   const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
     "https://us-central1-tai-invoice-automation.cloudfunctions.net";
-  return process.env.QUOTE_OUTLOOK_REDIRECT_URI ||
-    `${base}/quoteOutlookOAuthCallback`;
+  return `${base}/outlookOAuthCallback`;
 }
 
 /**
@@ -190,12 +240,19 @@ async function handleOAuthCallback(parsed, code, getTenant, getDispatcher) {
   const rosterEmail = normalizeEmail(dispatcher.email);
   const connectedEmail = normalizeEmail(profile.email);
   if (rosterEmail && connectedEmail && rosterEmail !== connectedEmail) {
-    return {
-      ok: false,
-      error:
-        "Connect the Outlook mailbox that matches your dispatcher email (" +
-        dispatcher.email + ")",
-    };
+    const relaxed = canRelaxOutlookEmailMatch(dispatcher);
+    if (!relaxed || !isAllowedOutlookDomain(connectedEmail)) {
+      return {
+        ok: false,
+        error:
+          "Connect the Outlook mailbox that matches your dispatcher email (" +
+          dispatcher.email + ")",
+      };
+    }
+    console.warn(
+        "[quote-outlook] Allowing mailbox mismatch for " +
+        String(dispatcher.id) + ": roster=" + rosterEmail +
+        " connected=" + connectedEmail);
   }
 
   await saveDispatcherTokens(tenant, dispatcher.id, tokens, {
@@ -430,6 +487,9 @@ async function sendQuoteReply(tenant, dispatcher, opts = {}) {
 module.exports = {
   init,
   normalizeEmail,
+  emailDomain,
+  isAllowedOutlookDomain,
+  canRelaxOutlookEmailMatch,
   buildConnectUrl,
   getRedirectUri,
   getOutlookStatus,
