@@ -899,6 +899,106 @@ function handleQuoteAuthClient(req, res) {
   }
 }
 
+/**
+ * Scheduled sync: every connected dispatcher Outlook inbox.
+ * Mirror of Jerry checkMailInbox — Cloud Scheduler hits this every 20 min.
+ * Dashboard getQuoteDispatcherInbox sync is unchanged.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleSyncQuoteOutlookInboxes(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const tenant = await deps.resolveDashboardTenant(req);
+    const dispatchers = await quoteDispatchers.listActiveDispatchers(tenant);
+    const perDispatcher = [];
+    let synced = 0;
+    let connected = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const dispatcher of dispatchers) {
+      const status = await quoteOutlook.getOutlookStatus(
+          tenant, dispatcher.id);
+      if (!status.connected) {
+        skipped += 1;
+        perDispatcher.push({
+          dispatcherId: dispatcher.id,
+          name: dispatcher.name || null,
+          skipped: "not_connected",
+        });
+        continue;
+      }
+      connected += 1;
+      try {
+        const result = await quoteOutlook.syncDispatcherInbox(
+            tenant,
+            dispatcher,
+            quoteAutomation.processQuoteEmail);
+        const count = Number(result && result.synced) || 0;
+        synced += count;
+        perDispatcher.push({
+          dispatcherId: dispatcher.id,
+          name: dispatcher.name || null,
+          email: status.email || null,
+          ok: true,
+          synced: count,
+          skipped: result && result.skipped ? result.skipped : undefined,
+        });
+      } catch (syncErr) {
+        errors += 1;
+        console.error(
+            `syncQuoteOutlookInboxes ${dispatcher.id}:`,
+            syncErr);
+        if (deps.writeLog) {
+          deps.writeLog("error", "quote",
+              "Scheduled Outlook sync failed for dispatcher", {
+                tenantId: tenant.tenantId,
+                dispatcherId: dispatcher.id,
+                error: syncErr.message,
+              });
+        }
+        perDispatcher.push({
+          dispatcherId: dispatcher.id,
+          name: dispatcher.name || null,
+          ok: false,
+          error: syncErr.message,
+        });
+      }
+    }
+
+    if (deps.writeLog) {
+      deps.writeLog("info", "quote",
+          "Scheduled quote Outlook inbox sync complete", {
+            tenantId: tenant.tenantId,
+            synced,
+            connected,
+            skipped,
+            errors,
+            dispatcherCount: dispatchers.length,
+          });
+    }
+
+    return res.json({
+      ok: true,
+      tenantId: tenant.tenantId,
+      synced,
+      connected,
+      skipped,
+      errors,
+      perDispatcher,
+    });
+  } catch (err) {
+    console.error("syncQuoteOutlookInboxes:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Internal server error",
+      details: err.message,
+    });
+  }
+}
+
 module.exports = {
   init,
   handleGetQuoteRules,
@@ -925,4 +1025,5 @@ module.exports = {
   handleQuoteDispatcherPage,
   handleQuoteDispatcherHomePage,
   handleQuoteAuthClient,
+  handleSyncQuoteOutlookInboxes,
 };

@@ -14351,6 +14351,14 @@ exports.quoteOutlookOAuthCallback = onRequest({invoker: "public"},
     quoteDashboard.handleQuoteOutlookOAuthCallback);
 exports.quoteAuthClient = onRequest({invoker: "public"},
     quoteDashboard.handleQuoteAuthClient);
+// Cloud Scheduler every 20 min (see setup-quote-outlook-http-scheduler.ps1).
+// Public like checkMailInbox — no shared-secret pattern on that job either.
+exports.syncQuoteOutlookInboxes = onRequest({
+  invoker: "public",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+}, quoteDashboard.handleSyncQuoteOutlookInboxes);
+exports.checkQuoteMailInbox = exports.syncQuoteOutlookInboxes;
 exports.processQuoteWorkflow = onRequest({
   invoker: "public",
   timeoutSeconds: 540,
