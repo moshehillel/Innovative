@@ -539,17 +539,139 @@
     }
     .home-link:hover { text-decoration: underline; }
 
+    /* Thinking / working wait — first paint before JS */
+    .page-thinking {
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      min-height: 42vh;
+      padding: 8px 0 24px;
+    }
+    .page-thinking.hidden { display: none !important; }
+    .thinking-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 28px 26px 24px;
+      box-shadow: var(--shadow-sm);
+      max-width: 520px;
+    }
+    .thinking-eyebrow {
+      margin: 0 0 10px;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--primary);
+    }
+    .thinking-status {
+      margin: 0;
+      font-size: 1.125rem;
+      font-weight: 650;
+      letter-spacing: -0.015em;
+      color: var(--primary-dark);
+      display: flex;
+      align-items: baseline;
+      gap: 2px;
+    }
+    .thinking-dots span {
+      display: inline-block;
+      width: 0.35em;
+      opacity: 0.25;
+      animation: thinking-dot 1.2s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes thinking-dot {
+      0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+      40% { opacity: 1; transform: translateY(-1px); }
+    }
+    .thinking-sub {
+      margin: 8px 0 0;
+      font-size: 0.875rem;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+    .thinking-pulse {
+      margin-top: 18px;
+      height: 3px;
+      border-radius: 999px;
+      background: #e8eefc;
+      overflow: hidden;
+      position: relative;
+    }
+    .thinking-pulse::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 42%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, transparent, var(--primary), transparent);
+      opacity: 0.85;
+      animation: thinking-bar 1.45s ease-in-out infinite;
+    }
+    @keyframes thinking-bar {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(280%); }
+    }
+    .thinking-skel {
+      display: grid;
+      gap: 12px;
+    }
+    .skel {
+      background: linear-gradient(
+        90deg,
+        #e8eef8 0%,
+        #f4f7fc 45%,
+        #e8eef8 90%
+      );
+      background-size: 200% 100%;
+      animation: skel-shimmer 1.35s ease-in-out infinite;
+      border-radius: 10px;
+    }
+    @keyframes skel-shimmer {
+      0% { background-position: 100% 0; }
+      100% { background-position: -100% 0; }
+    }
+    .skel-title { height: 22px; width: 42%; }
+    .skel-meta { height: 14px; width: 68%; }
+    .skel-lane {
+      height: 64px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background:
+        linear-gradient(90deg, #eef2f8 0%, #f8fafc 50%, #eef2f8 100%);
+      background-size: 200% 100%;
+      animation: skel-shimmer 1.5s ease-in-out infinite;
+      box-shadow: var(--shadow-sm);
+    }
+    .skel-lane:nth-child(3) { animation-delay: 0.12s; }
+    .skel-lane:nth-child(4) { animation-delay: 0.24s; }
+    .quote-ready {
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.28s ease, transform 0.28s ease;
+      pointer-events: none;
+    }
+    .quote-ready.is-visible {
+      opacity: 1;
+      transform: none;
+      pointer-events: auto;
+    }
+    .quote-ready.hidden { display: none !important; }
+
     @media (max-width: 640px) {
       body { padding: 16px 16px 40px; }
       .login { padding: 32px 24px 28px; }
       .login-page { margin: -16px; }
+      .thinking-panel { padding: 22px 18px 20px; }
     }
   </style>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
 </head>
 <body>
-  <section id="login-screen" class="login-page">
+  <section id="login-screen" class="login-page hidden">
     <div class="login">
       <h2>Sign in to review quote</h2>
       <p class="login-desc">Use your dispatcher email and password.</p>
@@ -570,31 +692,51 @@
     </div>
   </section>
 
-  <div id="app" class="hidden">
-    <div style="margin-bottom:12px">
-      <a class="home-link" id="home-link" href="#">← Back to dashboard</a>
+  <!-- Visible on first paint so "Open full review" never lands on a blank page -->
+  <div id="app">
+    <div id="page-thinking" class="page-thinking" aria-live="polite" aria-busy="true">
+      <div class="thinking-panel">
+        <p class="thinking-eyebrow">Quote review</p>
+        <p class="thinking-status" id="thinking-status">
+          Reviewing quote<span class="thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+        </p>
+        <p class="thinking-sub" id="thinking-sub">Pulling lane details and carrier options for this request.</p>
+        <div class="thinking-pulse" aria-hidden="true"></div>
+      </div>
+      <div class="thinking-skel" aria-hidden="true">
+        <div class="skel skel-title"></div>
+        <div class="skel skel-meta"></div>
+        <div class="skel-lane"></div>
+        <div class="skel-lane"></div>
+      </div>
     </div>
-    <h1 id="title">Quote review</h1>
-    <div class="meta">
-      <span id="meta">Loading…</span>
-      <span id="status-badge" class="badge" style="margin-left:8px"></span>
-    </div>
-    <div id="customer-match" class="customer-match hidden"></div>
-    <div class="toolbar">
-      <button type="button" id="btn-generate">Generate email</button>
-      <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
-      <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
-      <span style="flex:1"></span>
-      <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
-    </div>
-    <div id="action-msg" class="msg hidden"></div>
-    <div id="lanes"></div>
-    <div class="draft">
-      <h3>Customer email draft</h3>
-      <p style="color:var(--muted);font-size:0.875rem;margin:0 0 12px">
-        Check rates above, click Generate email, edit if needed, then Approve to send via your Outlook.
-      </p>
-      <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
+
+    <div id="quote-ready" class="quote-ready hidden">
+      <div style="margin-bottom:12px">
+        <a class="home-link" id="home-link" href="#">← Back to dashboard</a>
+      </div>
+      <h1 id="title">Quote review</h1>
+      <div class="meta">
+        <span id="meta"></span>
+        <span id="status-badge" class="badge" style="margin-left:8px"></span>
+      </div>
+      <div id="customer-match" class="customer-match hidden"></div>
+      <div class="toolbar">
+        <button type="button" id="btn-generate">Generate email</button>
+        <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
+        <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
+        <span style="flex:1"></span>
+        <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
+      </div>
+      <div id="action-msg" class="msg hidden"></div>
+      <div id="lanes"></div>
+      <div class="draft">
+        <h3>Customer email draft</h3>
+        <p style="color:var(--muted);font-size:0.875rem;margin:0 0 12px">
+          Check rates above, click Generate email, edit if needed, then Approve to send via your Outlook.
+        </p>
+        <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
+      </div>
     </div>
   </div>
 
@@ -613,6 +755,68 @@
     const hasLegacyToken = DISPATCHER_ID && TOKEN;
     let accessorialCatalog = null;
     let accessorialCatalogPromise = null;
+    let thinkingTimer = null;
+    let thinkingStep = 0;
+    const THINKING_STEPS = [
+      {
+        status: "Reviewing quote",
+        sub: "Pulling lane details and carrier options for this request.",
+      },
+      {
+        status: "Checking rates",
+        sub: "Comparing sell prices, transit, and selected carriers.",
+      },
+      {
+        status: "Preparing review",
+        sub: "Organizing lanes so you can confirm and email the customer.",
+      },
+    ];
+
+    function setThinkingCopy(step) {
+      const item = THINKING_STEPS[step % THINKING_STEPS.length];
+      const statusEl = document.getElementById("thinking-status");
+      const subEl = document.getElementById("thinking-sub");
+      if (statusEl) {
+        statusEl.textContent = "";
+        statusEl.appendChild(document.createTextNode(item.status));
+        const dots = document.createElement("span");
+        dots.className = "thinking-dots";
+        dots.setAttribute("aria-hidden", "true");
+        dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
+        statusEl.appendChild(dots);
+      }
+      if (subEl) subEl.textContent = item.sub;
+    }
+
+    function showThinking(active) {
+      const panel = document.getElementById("page-thinking");
+      const ready = document.getElementById("quote-ready");
+      if (!panel || !ready) return;
+      if (active) {
+        ready.classList.add("hidden");
+        ready.classList.remove("is-visible");
+        panel.classList.remove("hidden");
+        panel.setAttribute("aria-busy", "true");
+        thinkingStep = 0;
+        setThinkingCopy(0);
+        if (thinkingTimer) clearInterval(thinkingTimer);
+        thinkingTimer = setInterval(() => {
+          thinkingStep += 1;
+          setThinkingCopy(thinkingStep);
+        }, 2200);
+      } else {
+        if (thinkingTimer) {
+          clearInterval(thinkingTimer);
+          thinkingTimer = null;
+        }
+        panel.classList.add("hidden");
+        panel.setAttribute("aria-busy", "false");
+        ready.classList.remove("hidden");
+        // Force reflow so fade-in runs after unhiding.
+        void ready.offsetWidth;
+        ready.classList.add("is-visible");
+      }
+    }
 
     async function apiFetch(path, opts) {
       const headers = Object.assign(
@@ -768,16 +972,20 @@
     }
 
     async function load() {
+      showThinking(true);
       const url = "/getQuoteDispatcherData?id=" +
         encodeURIComponent(QUOTE_ID) + "&tenantId=" + encodeURIComponent(TENANT_ID);
-      // Do not await Primus accessorial catalog — it blocks first paint.
+      // Kick catalog in parallel — never block first paint on Primus catalog.
+      ensureAccessorialCatalog();
       const res = await apiFetch(url);
       if (!res.ok) {
+        showThinking(false);
         document.getElementById("meta").textContent = res.error || "Failed to load";
         return;
       }
       quote = res.quote;
       applyQuote(quote);
+      showThinking(false);
     }
 
     function applyQuote(q) {
@@ -812,6 +1020,23 @@
         customerPrices[lane.laneKey] = prices;
       });
       renderLanes();
+      // If catalog finished while we rendered, fill panels without a second trip.
+      if (accessorialCatalog) {
+        document.querySelectorAll(".acc-panel").forEach((panel) => {
+          if (!panel.dataset.accFilled) {
+            fillAccPanel(panel, accessorialCatalog);
+            panel.dataset.accFilled = "1";
+          }
+        });
+      } else {
+        ensureAccessorialCatalog().then((cat) => {
+          document.querySelectorAll(".acc-panel").forEach((panel) => {
+            if (panel.dataset.accFilled) return;
+            fillAccPanel(panel, cat);
+            panel.dataset.accFilled = "1";
+          });
+        });
+      }
     }
 
     function formatAddressBlock(party) {
@@ -1435,6 +1660,7 @@
     function showApp(show) {
       document.getElementById("login-screen").classList.toggle("hidden", show);
       document.getElementById("app").classList.toggle("hidden", !show);
+      if (show) showThinking(true);
     }
 
     document.getElementById("login-form").addEventListener("submit", async (e) => {
@@ -1478,18 +1704,33 @@
     });
 
     if (!QUOTE_ID) {
+      showThinking(false);
       document.getElementById("meta").textContent = "Missing quote id";
     } else if (hasLegacyToken) {
       showApp(true);
       load();
     } else {
+      // Keep thinking motion alive while Firebase auth resolves.
+      showThinking(true);
       QuoteAuth.init({apiBase: API, tenantId: TENANT_ID}).then(() => {
         QuoteAuth.onAuth((user) => {
-          if (!user) { showApp(false); return; }
+          if (!user) {
+            if (thinkingTimer) {
+              clearInterval(thinkingTimer);
+              thinkingTimer = null;
+            }
+            showApp(false);
+            return;
+          }
           showApp(true);
           load();
         });
       }).catch((e) => {
+        if (thinkingTimer) {
+          clearInterval(thinkingTimer);
+          thinkingTimer = null;
+        }
+        showApp(false);
         const errEl = document.getElementById("login-error");
         errEl.textContent = e.message;
         errEl.classList.remove("hidden");

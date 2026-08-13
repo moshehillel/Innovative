@@ -464,15 +464,11 @@ function serializeForDispatcherPage(quote) {
     shippingLocationId,
     shippingLocationName,
     customerMatched: !!shippingLocationId,
+    // Text draft only — HTML + unused catalog/meta omitted to keep payload lean.
     customerDraftText: storedEmail || buildCustomerDraftText(quote),
     customerEmailText: storedEmail,
-    accessorialsIncludedText: buildAccessorialsIncludedSection(quote.lanes),
     customerRequest: quote.extracted &&
       quote.extracted.customerRequest || null,
-    customerDraftHtml: storedEmail ?
-      textToEmailHtml(storedEmail) :
-      buildCustomerDraftHtml(quote),
-    commonAccessorials: COMMON_ACCESSORIALS,
     lanes: (quote.lanes || []).map((lane) => ({
       laneKey: lane.laneKey,
       label: lane.label,
@@ -480,7 +476,6 @@ function serializeForDispatcherPage(quote) {
       consignee: lane.consignee,
       freightInfo: Array.isArray(lane.freightInfo) ? lane.freightInfo : [],
       siteType: lane.siteType || null,
-      enrichmentMeta: lane.enrichmentMeta || null,
       accessorials: lane.accessorials || [],
       accessorialLabels: quoteRules.formatAccessorialLabels(
           lane.accessorials || []),
@@ -491,6 +486,9 @@ function serializeForDispatcherPage(quote) {
       rateError: lane.rateError || null,
       options: (lane.options || []).map((o) => {
         const warningText = cleanCarrierNote(o.warnings || o.rateRemarks);
+        // UI truncates notes to ~200 chars; trim payload for multi-rate lanes.
+        const warnings = warningText ?
+          warningText.slice(0, 240) : null;
         return {
           rateId: o.id,
           name: o.name,
@@ -502,9 +500,8 @@ function serializeForDispatcherPage(quote) {
           transitDays: o.transitDays,
           quoteNumber: o.quoteNumber,
           tags: o.tags,
-          warnings: warningText || null,
+          warnings,
           guaranteed: o.guaranteed,
-          rateBreakdown: o.rateBreakdown,
         };
       }),
     })),
