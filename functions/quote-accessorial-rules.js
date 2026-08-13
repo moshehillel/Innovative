@@ -123,6 +123,23 @@ const DEFAULT_RULES = [
     autoApply: true,
     requiresConfirm: false,
   },
+  {
+    id: "appointment_delivery_text",
+    active: true,
+    priority: 65,
+    name: "Appointment delivery — email request",
+    identifyVia: "address_text",
+    match: {
+      instructionsContains: [
+        "appointment", "appt required", "must call",
+        "schedule delivery", "delivery appointment",
+      ],
+    },
+    addAccessorials: ["APD"],
+    notes: "Special instructions mention appointment delivery.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
 ];
 
 let tcolFn = null;
@@ -166,9 +183,40 @@ async function loadActiveRules(tenant) {
   if (!rules.length) {
     await seedDefaultRules(tenant);
     rules = DEFAULT_RULES.map((r) => ({...r}));
+  } else {
+    // Upsert any newly added DEFAULT_RULES ids without overwriting edits.
+    await ensureDefaultRulesPresent(tenant);
+    const again = await col(tenant, "quoteRules")
+        .where("active", "==", true)
+        .get();
+    rules = again.docs.map((d) => ({id: d.id, ...d.data()}));
   }
   return rules.sort((a, b) =>
     (Number(a.priority) || 999) - (Number(b.priority) || 999));
+}
+
+/**
+ * Creates missing DEFAULT_RULES docs (merge: false create-only).
+ * @param {object} tenant Tenant.
+ * @return {Promise<void>}
+ */
+async function ensureDefaultRulesPresent(tenant) {
+  const ref = col(tenant, "quoteRules");
+  const existing = await ref.get();
+  const have = new Set(existing.docs.map((d) => d.id));
+  const missing = DEFAULT_RULES.filter((r) => !have.has(r.id));
+  if (!missing.length) return;
+  const batch = admin.firestore().batch();
+  for (const rule of missing) {
+    const {id, ...rest} = rule;
+    batch.set(ref.doc(id), {
+      ...rest,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: "system-seed-missing",
+    });
+  }
+  await batch.commit();
 }
 
 /**

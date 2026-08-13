@@ -19,6 +19,67 @@ const COMMON_ACCESSORIALS = [
 ];
 
 /**
+ * Strips HTML / Word junk / entities from carrier notes for UI + email.
+ * Never use raw carrier HTML as email styling.
+ * @param {string|Array|null|undefined} input Raw note(s).
+ * @return {string} Plain text, or "" if empty after clean.
+ */
+function cleanCarrierNote(input) {
+  let text;
+  if (Array.isArray(input)) {
+    text = input.map((part) => String(part == null ? "" : part)).join(" ");
+  } else {
+    text = String(input == null ? "" : input);
+  }
+  if (!text.trim()) return "";
+
+  text = text
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<\/?(?:o:p|xml|w:[^>\s]+)[^>]*>/gi, " ")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<\/(?:p|div|tr|li|h[1-6])>/gi, "\n")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&#160;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;/gi, "\"")
+      .replace(/&#39;/gi, "'")
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+        const n = parseInt(h, 16);
+        return Number.isFinite(n) ? String.fromCharCode(n) : " ";
+      })
+      .replace(/&#(\d+);/g, (_, n) => {
+        const code = Number(n);
+        return Number.isFinite(code) ? String.fromCharCode(code) : " ";
+      })
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200b-\u200d\ufeff]/g, "");
+
+  text = text
+      .replace(/\r/g, "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{2,}/g, "\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\n/g, " ")
+      .replace(/ {2,}/g, " ")
+      .trim();
+
+  // Drop leftover Word class crumbs that sometimes survive strip.
+  text = text
+      .replace(/\bMsoNormal\b/gi, " ")
+      .replace(/\bMso[A-Za-z0-9]+\b/gi, " ")
+      .replace(/ {2,}/g, " ")
+      .trim();
+
+  if (!text || /^[\s.,;:/\-_|]+$/.test(text)) return "";
+  return text;
+}
+
+/**
  * Generates next batch quote id like Q#D3478.
  * @param {string} [prefix] Single letter prefix.
  * @return {string}
@@ -128,9 +189,8 @@ function buildCustomerDraftText(quote) {
     lines.push(
         "[Dispatcher fills: $___ — Carrier | Q# _____ | ___-day transit]",
     );
-    if (lane.notesForCustomer) {
-      lines.push(lane.notesForCustomer);
-    }
+    const laneNote = cleanCarrierNote(lane.notesForCustomer);
+    if (laneNote) lines.push(laneNote);
     lines.push("");
   }
 
@@ -185,7 +245,18 @@ function effectiveCustomerRate(opt) {
 }
 
 /**
+ * Plain carrier note for customer email (stripped; empty if junk-only).
+ * @param {object} opt Rate option.
+ * @return {string}
+ */
+function customerNoteFromOption(opt) {
+  if (!opt || typeof opt !== "object") return "";
+  return cleanCarrierNote(opt.warnings || opt.rateRemarks);
+}
+
+/**
  * Formats one pricing line — bullet style (Coreforce / Diego pattern).
+ * Note text is appended by the email builder on its own line.
  * @param {object} opt Selected option.
  * @return {string}
  */
@@ -195,12 +266,7 @@ function formatCustomerPricingLineBullet(opt) {
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const days = opt.transitDays || "?";
   const svc = opt.guaranteed ? "guaranteed" : "estimated";
-  let line =
-    `• $${price} – ${days}-day transit (${svc}) – ${carrier} Q# ${q}`;
-  if (opt.warnings) {
-    line += ` (${String(opt.warnings).slice(0, 120)})`;
-  }
-  return line;
+  return `• $${price} – ${days}-day transit (${svc}) – ${carrier} · Q# ${q}`;
 }
 
 /**
@@ -214,11 +280,8 @@ function formatCustomerPricingLineSimple(opt) {
   const q = opt.quoteNumber || opt.savedQuoteNumber || "";
   const days = opt.transitDays || "?";
   let line =
-    `$${price} ${carrier} ${days} days transit estimated.`;
-  if (q) line += `  ${q}`;
-  if (opt.warnings) {
-    line += `, ${String(opt.warnings).slice(0, 200)}`;
-  }
+    `$${price} · ${carrier} · ${days}-day transit (estimated)`;
+  if (q) line += ` · Q# ${q}`;
   return line;
 }
 
@@ -232,13 +295,10 @@ function formatCustomerPricingLine(opt) {
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const transit = opt.transitDays ? `${opt.transitDays}` : "?";
-  let line =
-    `$${price} transit is estimated ${transit} standard business days ` +
-    `${carrier} Q ${q}`;
-  if (opt.warnings) {
-    line += ` - ${String(opt.warnings).slice(0, 200)}`;
-  }
-  return line;
+  return (
+    `$${price} · ${transit} standard business days (estimated) · ` +
+    `${carrier} · Q# ${q}`
+  );
 }
 
 /**
@@ -296,15 +356,18 @@ function buildCustomerEmailFromSelections(quote, opts = {}) {
     } else {
       for (const opt of selected) {
         const customerRate = effectiveCustomerRate(opt);
-        lines.push(formatLine({
+        const priced = {
           ...opt,
           customerPrice: customerRate,
           sellRate: customerRate,
-          warnings: opt.warnings || opt.rateRemarks,
-        }));
+        };
+        lines.push(formatLine(priced));
+        const note = customerNoteFromOption(opt);
+        if (note) lines.push(`  Note: ${note}`);
       }
     }
-    if (lane.notesForCustomer) lines.push(lane.notesForCustomer);
+    const laneNote = cleanCarrierNote(lane.notesForCustomer);
+    if (laneNote) lines.push(laneNote);
     lines.push("");
   }
 
@@ -339,14 +402,31 @@ function escapeHtml(s) {
 }
 
 /**
- * Plain text → simple HTML paragraphs for Outlook.
+ * Plain text → light HTML paragraphs for Outlook (never carrier HTML).
  * @param {string} text Plain text.
  * @return {string}
  */
 function textToEmailHtml(text) {
+  const base =
+    "margin:0 0 8px;font-family:Calibri,Arial,sans-serif;font-size:14px;" +
+    "line-height:1.4;color:#222;";
   return String(text || "")
       .split("\n")
-      .map((line) => line ? `<p>${escapeHtml(line)}</p>` : "<p><br></p>")
+      .map((line) => {
+        if (!line) return `<p style="${base}"><br></p>`;
+        const trimmed = line.trimStart();
+        let style = base;
+        if (trimmed.startsWith("• ")) {
+          style =
+            "margin:0 0 4px;font-family:Calibri,Arial,sans-serif;" +
+            "font-size:14px;line-height:1.45;color:#222;";
+        } else if (/^Note:/i.test(trimmed)) {
+          style =
+            "margin:0 0 12px 12px;font-family:Calibri,Arial,sans-serif;" +
+            "font-size:13px;line-height:1.4;color:#444;";
+        }
+        return `<p style="${style}">${escapeHtml(line)}</p>`;
+      })
       .join("\n");
 }
 
@@ -371,6 +451,8 @@ function serializeForDispatcherPage(quote) {
     String(quote.shippingLocationId) : null;
   const shippingLocationName = quote.shippingLocationName ||
     quote.matchedCustomerName || null;
+  const quoteShipper = quote.shipper ||
+    (quote.extracted && quote.extracted.shipper) || null;
   return {
     id: quote.id,
     batchQuoteId: quote.batchQuoteId,
@@ -378,6 +460,7 @@ function serializeForDispatcherPage(quote) {
     from: quote.from,
     customerRef: quote.customerRef,
     status: quote.status,
+    shipper: quoteShipper,
     shippingLocationId,
     shippingLocationName,
     customerMatched: !!shippingLocationId,
@@ -393,7 +476,9 @@ function serializeForDispatcherPage(quote) {
     lanes: (quote.lanes || []).map((lane) => ({
       laneKey: lane.laneKey,
       label: lane.label,
+      shipper: lane.shipper || quoteShipper || null,
       consignee: lane.consignee,
+      freightInfo: Array.isArray(lane.freightInfo) ? lane.freightInfo : [],
       siteType: lane.siteType || null,
       enrichmentMeta: lane.enrichmentMeta || null,
       accessorials: lane.accessorials || [],
@@ -404,33 +489,38 @@ function serializeForDispatcherPage(quote) {
       selectedRateIds: lane.selectedRateIds ||
         (lane.selectedRateId ? [lane.selectedRateId] : []),
       rateError: lane.rateError || null,
-      options: (lane.options || []).map((o) => ({
-        rateId: o.id,
-        name: o.name,
-        SCAC: o.SCAC,
-        cost: o.total,
-        sellRate: o.sellRate,
-        customerPrice: o.customerPrice != null ?
-          Number(o.customerPrice) : null,
-        transitDays: o.transitDays,
-        quoteNumber: o.quoteNumber,
-        tags: o.tags,
-        warnings: o.warnings || o.rateRemarks,
-        guaranteed: o.guaranteed,
-        rateBreakdown: o.rateBreakdown,
-      })),
+      options: (lane.options || []).map((o) => {
+        const warningText = cleanCarrierNote(o.warnings || o.rateRemarks);
+        return {
+          rateId: o.id,
+          name: o.name,
+          SCAC: o.SCAC,
+          cost: o.total,
+          sellRate: o.sellRate,
+          customerPrice: o.customerPrice != null ?
+            Number(o.customerPrice) : null,
+          transitDays: o.transitDays,
+          quoteNumber: o.quoteNumber,
+          tags: o.tags,
+          warnings: warningText || null,
+          guaranteed: o.guaranteed,
+          rateBreakdown: o.rateBreakdown,
+        };
+      }),
     })),
   };
 }
 
 module.exports = {
   generateBatchQuoteId,
+  cleanCarrierNote,
   buildCustomerDraftText,
   buildCustomerDraftHtml,
   buildCustomerEmailFromSelections,
   textToEmailHtml,
   serializeForDispatcherPage,
   effectiveCustomerRate,
+  customerNoteFromOption,
   formatCustomerPricingLine,
   formatCustomerPricingLineBullet,
   formatCustomerPricingLineSimple,
