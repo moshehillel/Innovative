@@ -573,7 +573,10 @@
       display: flex;
       align-items: baseline;
       gap: 2px;
+      min-height: 1.5em;
+      transition: opacity 0.22s ease;
     }
+    .thinking-status.is-fading { opacity: 0; }
     .thinking-dots span {
       display: inline-block;
       width: 0.35em;
@@ -585,12 +588,6 @@
     @keyframes thinking-dot {
       0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
       40% { opacity: 1; transform: translateY(-1px); }
-    }
-    .thinking-sub {
-      margin: 8px 0 0;
-      font-size: 0.875rem;
-      color: var(--muted);
-      line-height: 1.45;
     }
     .thinking-pulse {
       margin-top: 18px;
@@ -698,9 +695,8 @@
       <div class="thinking-panel">
         <p class="thinking-eyebrow">Quote review</p>
         <p class="thinking-status" id="thinking-status">
-          Reviewing quote<span class="thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+          Searching out all carriers for you<span class="thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
         </p>
-        <p class="thinking-sub" id="thinking-sub">Pulling lane details and carrier options for this request.</p>
         <div class="thinking-pulse" aria-hidden="true"></div>
       </div>
       <div class="thinking-skel" aria-hidden="true">
@@ -756,36 +752,78 @@
     let accessorialCatalog = null;
     let accessorialCatalogPromise = null;
     let thinkingTimer = null;
+    let thinkingFadeTimer = null;
     let thinkingStep = 0;
-    const THINKING_STEPS = [
-      {
-        status: "Reviewing quote",
-        sub: "Pulling lane details and carrier options for this request.",
-      },
-      {
-        status: "Checking rates",
-        sub: "Comparing sell prices, transit, and selected carriers.",
-      },
-      {
-        status: "Preparing review",
-        sub: "Organizing lanes so you can confirm and email the customer.",
-      },
+    // Visual-only rotation. Never delays API calls.
+    const THINKING_ROTATE_MS = 1500;
+    const THINKING_FADE_MS = 220;
+    const THINKING_PHRASES = [
+      "Searching out all carriers for you",
+      "Looking over data",
+      "Processing",
+      "Thinking",
+      "Reviewing quote details",
+      "Checking rates and transit",
+      "Matching the best options",
+      "Preparing your results",
     ];
 
-    function setThinkingCopy(step) {
-      const item = THINKING_STEPS[step % THINKING_STEPS.length];
+    function thinkingDotsEl() {
+      const dots = document.createElement("span");
+      dots.className = "thinking-dots";
+      dots.setAttribute("aria-hidden", "true");
+      dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
+      return dots;
+    }
+
+    function applyThinkingPhrase(phrase) {
       const statusEl = document.getElementById("thinking-status");
-      const subEl = document.getElementById("thinking-sub");
-      if (statusEl) {
-        statusEl.textContent = "";
-        statusEl.appendChild(document.createTextNode(item.status));
-        const dots = document.createElement("span");
-        dots.className = "thinking-dots";
-        dots.setAttribute("aria-hidden", "true");
-        dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
-        statusEl.appendChild(dots);
+      if (!statusEl) return;
+      statusEl.textContent = "";
+      statusEl.appendChild(document.createTextNode(phrase));
+      statusEl.appendChild(thinkingDotsEl());
+    }
+
+    function setThinkingCopy(step, withFade) {
+      const phrase = THINKING_PHRASES[step % THINKING_PHRASES.length];
+      const statusEl = document.getElementById("thinking-status");
+      if (!statusEl) return;
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
       }
-      if (subEl) subEl.textContent = item.sub;
+      if (!withFade) {
+        statusEl.classList.remove("is-fading");
+        applyThinkingPhrase(phrase);
+        return;
+      }
+      statusEl.classList.add("is-fading");
+      thinkingFadeTimer = setTimeout(() => {
+        applyThinkingPhrase(phrase);
+        statusEl.classList.remove("is-fading");
+        thinkingFadeTimer = null;
+      }, THINKING_FADE_MS);
+    }
+
+    function stopThinkingRotation() {
+      if (thinkingTimer) {
+        clearInterval(thinkingTimer);
+        thinkingTimer = null;
+      }
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+    }
+
+    function startThinkingRotation() {
+      thinkingStep = 0;
+      setThinkingCopy(0, false);
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      thinkingTimer = setInterval(() => {
+        thinkingStep += 1;
+        setThinkingCopy(thinkingStep, true);
+      }, THINKING_ROTATE_MS);
     }
 
     function showThinking(active) {
@@ -797,18 +835,9 @@
         ready.classList.remove("is-visible");
         panel.classList.remove("hidden");
         panel.setAttribute("aria-busy", "true");
-        thinkingStep = 0;
-        setThinkingCopy(0);
-        if (thinkingTimer) clearInterval(thinkingTimer);
-        thinkingTimer = setInterval(() => {
-          thinkingStep += 1;
-          setThinkingCopy(thinkingStep);
-        }, 2200);
+        startThinkingRotation();
       } else {
-        if (thinkingTimer) {
-          clearInterval(thinkingTimer);
-          thinkingTimer = null;
-        }
+        stopThinkingRotation();
         panel.classList.add("hidden");
         panel.setAttribute("aria-busy", "false");
         ready.classList.remove("hidden");
@@ -1715,10 +1744,7 @@
       QuoteAuth.init({apiBase: API, tenantId: TENANT_ID}).then(() => {
         QuoteAuth.onAuth((user) => {
           if (!user) {
-            if (thinkingTimer) {
-              clearInterval(thinkingTimer);
-              thinkingTimer = null;
-            }
+            stopThinkingRotation();
             showApp(false);
             return;
           }
@@ -1726,10 +1752,7 @@
           load();
         });
       }).catch((e) => {
-        if (thinkingTimer) {
-          clearInterval(thinkingTimer);
-          thinkingTimer = null;
-        }
+        stopThinkingRotation();
         showApp(false);
         const errEl = document.getElementById("login-error");
         errEl.textContent = e.message;
