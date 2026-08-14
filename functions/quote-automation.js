@@ -397,7 +397,11 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
       dispatcherEmail) {
       continue;
     }
-    if (opts.status && data.status !== opts.status) continue;
+    if (opts.status) {
+      if (data.status !== opts.status) continue;
+    } else if (data.status === "dismissed") {
+      continue;
+    }
     items.push({
       id: doc.id,
       batchQuoteId: data.batchQuoteId,
@@ -593,13 +597,6 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
       const rated = await rateLane({
         ...lane,
         shipper: lane.shipper || data.shipper,
-        // clear previous options/selection before re-rate
-        options: undefined,
-        selectedRateIds: undefined,
-        selectedOptions: undefined,
-        selectedRateId: undefined,
-        selectedOption: undefined,
-        rateError: undefined,
       }, {
         rules,
         shippingLocationId: data.shippingLocationId,
@@ -611,7 +608,16 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
           accessorialsWithDataOverride != null ?
             accessorialsWithDataOverride : undefined,
       });
-      ratedLanes.push(rated);
+      ratedLanes.push({
+        ...rated,
+        options: rated.options || [],
+        rateError: rated.rateError || null,
+        // Clear prior dispatcher picks after a fresh rate pull.
+        selectedRateIds: [],
+        selectedOptions: [],
+        selectedRateId: null,
+        selectedOption: null,
+      });
     } catch (err) {
       ratedLanes.push({
         ...lane,
@@ -619,6 +625,8 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         rateError: err.message,
         selectedRateIds: [],
         selectedOptions: [],
+        selectedRateId: null,
+        selectedOption: null,
       });
     }
   }

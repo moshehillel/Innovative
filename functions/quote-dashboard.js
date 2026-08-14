@@ -525,8 +525,16 @@ async function handleDismissQuote(req, res) {
     return res.status(405).json({ok: false, error: "Use POST"});
   }
   try {
-    const body = req.body || {};
-    const quoteId = body.quoteId;
+    let body = req.body || {};
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body || "{}");
+      } catch (_) {
+        body = {};
+      }
+    }
+    const quoteId = body.quoteId || body.id ||
+      (req.query && (req.query.quoteId || req.query.id));
     if (!quoteId) {
       return res.status(400).json({ok: false, error: "quoteId required"});
     }

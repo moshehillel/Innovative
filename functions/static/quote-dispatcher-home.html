@@ -408,12 +408,17 @@
     }
     .quote-card-head {
       display: grid;
-      grid-template-columns: 20px 1fr auto;
+      grid-template-columns: 20px 1fr auto auto;
       gap: 12px;
       align-items: start;
       padding: 16px 18px;
       cursor: pointer;
       user-select: none;
+    }
+    .quote-card-head .btn-dismiss-card {
+      padding: 8px 12px;
+      font-size: 0.8125rem;
+      align-self: start;
     }
     .quote-card-head:hover { background: var(--surface-muted); }
     .quote-card .chevron {
@@ -505,8 +510,9 @@
       .login { padding: 32px 24px 28px; }
       header { padding: 16px; }
       main { padding: 16px 16px 40px; }
-      .quote-card-head { grid-template-columns: 16px 1fr; }
+      .quote-card-head { grid-template-columns: 16px 1fr auto; }
       .quote-card-head .badge { grid-column: 2; }
+      .quote-card-head .btn-dismiss-card { grid-column: 3; grid-row: 1; }
     }
   </style>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
@@ -688,12 +694,41 @@
     }
 
     async function apiFetch(path, opts) {
+      let authHeaders = {};
+      try {
+        authHeaders = await QuoteAuth.authHeaders();
+      } catch (_) { /* legacy / unsigned */ }
       const headers = Object.assign(
           {"Content-Type": "application/json"},
-          await QuoteAuth.authHeaders(),
+          authHeaders,
           (opts && opts.headers) || {});
-      return fetch(API + path, Object.assign({}, opts || {}, {headers}))
-          .then((r) => r.json());
+      const res = await fetch(API + path, Object.assign({}, opts || {}, {headers}));
+      const text = await res.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (_) {
+        throw new Error(res.status === 200 ?
+          "Invalid response" : ("Request failed (" + res.status + ")"));
+      }
+      return data;
+    }
+
+    async function dismissQuoteById(quoteId) {
+      const id = String(quoteId || "").trim();
+      if (!id) throw new Error("Missing quote id");
+      const res2 = await apiFetch(
+          "/dismissQuote?tenantId=" + encodeURIComponent(TENANT_ID) +
+          "&quoteId=" + encodeURIComponent(id), {
+            method: "POST",
+            body: JSON.stringify({
+              tenantId: TENANT_ID,
+              quoteId: id,
+              id: id,
+            }),
+          });
+      if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
+      return res2;
     }
 
     function setSyncButtonBusy(busy, label) {
@@ -746,7 +781,7 @@
         root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
         return;
       }
-      let items = res.items || [];
+      let items = (res.items || []).filter((i) => i.status !== "dismissed");
       if (filterStatus === "awaiting_dispatcher") {
         items = items.filter((i) =>
           i.status === "awaiting_dispatcher" || i.status === "draft_ready");
@@ -795,37 +830,50 @@
               <div class="quote-card-sub">${esc(item.from || "")}<br>${esc(item.subject || "")}<br>${item.laneCount || 0} lane(s)</div>
             </div>
             <span class="badge ${pending ? "pending" : ""}">${esc(item.status || "")}</span>
+            <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}">Dismiss</button>
           </div>
           <div class="quote-card-body">
             ${lanesHtml || '<div class="empty" style="padding:12px">No lane preview</div>'}
             <div class="card-actions">
               <a class="btn" href="${esc(item.openUrl || "#")}">Open full review</a>
-              <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}">Dismiss</button>
             </div>
           </div>
         </div>`;
       }).join("");
 
       root.querySelectorAll(".quote-card-head").forEach((el) => {
-        el.addEventListener("click", () => {
+        el.addEventListener("click", (e) => {
+          if (e.target.closest(".btn-dismiss-card")) return;
           el.parentElement.classList.toggle("open");
         });
       });
       root.querySelectorAll(".btn-dismiss-card").forEach((btn) => {
         btn.addEventListener("click", async (e) => {
+          e.preventDefault();
           e.stopPropagation();
-          if (!confirm("Dismiss this quote?")) return;
+          if (btn.getAttribute("data-confirm") !== "1") {
+            btn.setAttribute("data-confirm", "1");
+            btn.textContent = "Confirm?";
+            setTimeout(() => {
+              if (btn.getAttribute("data-confirm") === "1") {
+                btn.removeAttribute("data-confirm");
+                btn.textContent = "Dismiss";
+              }
+            }, 4000);
+            return;
+          }
+          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+          const card = btn.closest(".quote-card");
+          btn.disabled = true;
+          btn.textContent = "Dismissing…";
           try {
-            const res2 = await apiFetch("/dismissQuote", {
-              method: "POST",
-              body: JSON.stringify({
-                tenantId: TENANT_ID,
-                quoteId: btn.dataset.id,
-              }),
-            });
-            if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
+            await dismissQuoteById(quoteId);
+            if (card) card.remove();
             await loadInbox({sync: false});
           } catch (err) {
+            btn.disabled = false;
+            btn.removeAttribute("data-confirm");
+            btn.textContent = "Dismiss";
             alert(err.message || "Dismiss failed");
           }
         });
