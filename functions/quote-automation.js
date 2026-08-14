@@ -373,11 +373,96 @@ async function processQuoteEmail(opts) {
 }
 
 /**
+ * @param {string|null|undefined} status Quote status.
+ * @return {string}
+ */
+function normalizeQuoteStatus(status) {
+  return String(status || "").toLowerCase().trim();
+}
+
+/**
+ * Dismissed quotes must never appear as pending work.
+ * @param {object} row Quote doc or inbox item.
+ * @return {boolean}
+ */
+function isDismissedQuote(row) {
+  if (!row) return false;
+  if (normalizeQuoteStatus(row.status) === "dismissed") return true;
+  return !!row.dismissedAt;
+}
+
+/**
+ * Pending = still needs dispatcher action. Never includes dismissed.
+ * @param {object} row Quote doc or inbox item.
+ * @return {boolean}
+ */
+function isPendingQuote(row) {
+  if (isDismissedQuote(row)) return false;
+  const status = normalizeQuoteStatus(row && row.status);
+  return status === "awaiting_dispatcher" || status === "draft_ready";
+}
+
+/**
+ * @param {object} row Quote doc.
+ * @param {string} [statusFilter] pending | dismissed | exact status.
+ * @return {boolean}
+ */
+function matchesInboxStatus(row, statusFilter) {
+  const want = normalizeQuoteStatus(statusFilter);
+  if (!want) return !isDismissedQuote(row);
+  if (want === "dismissed") return isDismissedQuote(row);
+  if (want === "pending") return isPendingQuote(row);
+  if (isDismissedQuote(row)) return false;
+  return normalizeQuoteStatus(row.status) === want;
+}
+
+/**
+ * @param {object} doc Quote firestore doc.
+ * @param {object} data Quote fields.
+ * @return {object}
+ */
+function serializeInboxQuote(doc, data) {
+  return {
+    id: doc.id,
+    batchQuoteId: data.batchQuoteId,
+    subject: data.subject,
+    from: data.from,
+    status: data.status,
+    dismissedAt: data.dismissedAt || null,
+    laneCount: (data.lanes || []).length,
+    createdAt: data.createdAt,
+    assignedDispatcherEmail: data.assignedDispatcherEmail,
+    receivedMailboxEmail: data.receivedMailboxEmail,
+    dispatcherQuoteUrl: data.dispatcherQuoteUrl,
+    lanesPreview: (data.lanes || []).map((lane) => ({
+      laneKey: lane.laneKey,
+      label: lane.label,
+      accessorials: lane.accessorials || [],
+      appliedRules: (lane.appliedRules || []).map((r) => ({
+        name: r.name,
+        notes: r.notes || null,
+      })),
+      topOptions: (lane.options || []).slice(0, 5).map((o) => ({
+        rateId: o.id,
+        name: o.name,
+        SCAC: o.SCAC,
+        sellRate: o.sellRate,
+        transitDays: o.transitDays,
+      })),
+      optionCount: (lane.options || []).length,
+      rateError: lane.rateError || null,
+    })),
+  };
+}
+
+/**
  * Lists quotes for one dispatcher inbox (matched by id + email).
+ * Dismissed quotes are excluded unless status=dismissed. Pending means
+ * awaiting_dispatcher or draft_ready — never dismissed.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row (id + email).
- * @param {object} [opts] limit, status.
- * @return {Promise<Array<object>>}
+ * @param {object} [opts] limit, status (pending|dismissed|exact).
+ * @return {Promise<{items: Array<object>, counts: object}>}
  */
 async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
   const limit = Math.min(Number(opts.limit) || 50, 100);
@@ -389,6 +474,8 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
       .limit(limit * 5)
       .get();
   const items = [];
+  let pendingCount = 0;
+  let totalCount = 0;
   for (const doc of snap.docs) {
     const data = doc.data();
     if (data.assignedDispatcherId !== dispatcherId) continue;
@@ -397,44 +484,18 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
       dispatcherEmail) {
       continue;
     }
-    if (opts.status) {
-      if (data.status !== opts.status) continue;
-    } else if (data.status === "dismissed") {
-      continue;
+    if (!isDismissedQuote(data)) {
+      totalCount += 1;
+      if (isPendingQuote(data)) pendingCount += 1;
     }
-    items.push({
-      id: doc.id,
-      batchQuoteId: data.batchQuoteId,
-      subject: data.subject,
-      from: data.from,
-      status: data.status,
-      laneCount: (data.lanes || []).length,
-      createdAt: data.createdAt,
-      assignedDispatcherEmail: data.assignedDispatcherEmail,
-      receivedMailboxEmail: data.receivedMailboxEmail,
-      dispatcherQuoteUrl: data.dispatcherQuoteUrl,
-      lanesPreview: (data.lanes || []).map((lane) => ({
-        laneKey: lane.laneKey,
-        label: lane.label,
-        accessorials: lane.accessorials || [],
-        appliedRules: (lane.appliedRules || []).map((r) => ({
-          name: r.name,
-          notes: r.notes || null,
-        })),
-        topOptions: (lane.options || []).slice(0, 5).map((o) => ({
-          rateId: o.id,
-          name: o.name,
-          SCAC: o.SCAC,
-          sellRate: o.sellRate,
-          transitDays: o.transitDays,
-        })),
-        optionCount: (lane.options || []).length,
-        rateError: lane.rateError || null,
-      })),
-    });
-    if (items.length >= limit) break;
+    if (!matchesInboxStatus(data, opts.status)) continue;
+    if (items.length >= limit) continue;
+    items.push(serializeInboxQuote(doc, data));
   }
-  return items;
+  return {
+    items,
+    counts: {pending: pendingCount, total: totalCount},
+  };
 }
 
 /**
@@ -518,6 +579,9 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const quote = {id: snap.id, ...snap.data()};
+  if (isDismissedQuote(quote)) {
+    throw new Error("Quote was dismissed");
+  }
 
   if (Array.isArray(opts.selections) && opts.selections.length) {
     await saveLaneSelections(tenant, quoteId, opts.selections);
@@ -578,6 +642,9 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const data = snap.data();
+  if (isDismissedQuote(data)) {
+    throw new Error("Quote was dismissed");
+  }
   const rules = await quoteRules.loadActiveRules(tenant);
   const accessorialOverride = opts.accessorials != null ?
     quoteAccCatalog.normalizeRerunAccessorialCodes(opts.accessorials) :
@@ -662,6 +729,9 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const quote = {id: snap.id, ...snap.data()};
+  if (isDismissedQuote(quote)) {
+    throw new Error("Quote was dismissed");
+  }
   const dispatcher = opts.dispatcher;
   if (!dispatcher || !dispatcher.id) {
     throw new Error("Dispatcher required to send email");
@@ -752,6 +822,8 @@ module.exports = {
   rerunQuoteRates,
   getQuoteRequest,
   listQuotesForDispatcher,
+  isDismissedQuote,
+  isPendingQuote,
   resolveShippingLocationId,
   resolveCustomerMatch,
   rateLane,

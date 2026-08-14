@@ -1677,7 +1677,11 @@
         document.getElementById("btn-generate").disabled = true;
         btn.disabled = true;
         btn.textContent = "Dismissed";
-        showMsg("Quote dismissed.", true);
+        showMsg("Quote dismissed. Returning to inbox…", true);
+        setTimeout(() => {
+          window.location.href = API + "/quoteDispatcherHomePage?tenantId=" +
+            encodeURIComponent(TENANT_ID);
+        }, 700);
       } catch (err) {
         btn.disabled = false;
         btn.removeAttribute("data-confirm");

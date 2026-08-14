@@ -714,6 +714,39 @@
       return data;
     }
 
+    function quoteStatusOf(item) {
+      return String((item && item.status) || "").toLowerCase().trim();
+    }
+
+    function isDismissedItem(item) {
+      if (!item) return false;
+      if (quoteStatusOf(item) === "dismissed") return true;
+      return !!item.dismissedAt;
+    }
+
+    function isPendingItem(item) {
+      if (isDismissedItem(item)) return false;
+      const status = quoteStatusOf(item);
+      return status === "awaiting_dispatcher" || status === "draft_ready";
+    }
+
+    function writeStat(id, value) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = String(Math.max(0, value));
+    }
+
+    function readStat(id) {
+      const n = Number(document.getElementById(id).textContent);
+      return isFinite(n) ? n : 0;
+    }
+
+    function applyLocalDismissStats(status) {
+      writeStat("stat-total", readStat("stat-total") - 1);
+      if (isPendingItem({status: status})) {
+        writeStat("stat-pending", readStat("stat-pending") - 1);
+      }
+    }
+
     async function dismissQuoteById(quoteId) {
       const id = String(quoteId || "").trim();
       if (!id) throw new Error("Missing quote id");
@@ -773,7 +806,9 @@
       let path = "/getQuoteDispatcherInbox?tenantId=" +
         encodeURIComponent(TENANT_ID) + "&limit=50&syncOutlook=" +
         (sync ? "1" : "0");
-      // Always fetch recent; apply pending filter client-side so draft_ready stays visible
+      const pendingView = filterStatus === "pending" ||
+        filterStatus === "awaiting_dispatcher";
+      if (pendingView) path += "&status=pending";
       try {
       const res = await apiFetch(path);
       const root = document.getElementById("rows");
@@ -781,25 +816,21 @@
         root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
         return;
       }
-      let items = (res.items || []).filter((i) => i.status !== "dismissed");
-      if (filterStatus === "awaiting_dispatcher") {
-        items = items.filter((i) =>
-          i.status === "awaiting_dispatcher" || i.status === "draft_ready");
-      } else if (filterStatus) {
-        items = items.filter((i) => i.status === filterStatus);
-      }
-      document.getElementById("stat-total").textContent = items.length;
-      document.getElementById("stat-pending").textContent =
-        items.filter((i) =>
-          i.status === "awaiting_dispatcher" || i.status === "draft_ready"
-        ).length;
+      const visible = (res.items || []).filter((i) => !isDismissedItem(i));
+      const pendingItems = visible.filter(isPendingItem);
+      const counts = res.counts || {
+        total: visible.length,
+        pending: pendingItems.length,
+      };
+      writeStat("stat-total", Number(counts.total) || 0);
+      writeStat("stat-pending", Number(counts.pending) || 0);
+      let items = pendingView ? pendingItems : visible;
       if (!items.length) {
         root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
         return;
       }
       root.innerHTML = items.map((item) => {
-        const pending = item.status === "awaiting_dispatcher" ||
-          item.status === "draft_ready";
+        const pending = isPendingItem(item);
         const lanes = item.lanesPreview || [];
         const lanesHtml = lanes.map((lane) => {
           const opts = (lane.topOptions || []).map((o) =>
@@ -822,7 +853,7 @@
             more + acc + "</div>";
         }).join("");
 
-        return `<div class="quote-card" data-id="${esc(item.id)}">
+        return `<div class="quote-card" data-id="${esc(item.id)}" data-status="${esc(item.status || "")}">
           <div class="quote-card-head">
             <span class="chevron">▶</span>
             <div>
@@ -868,7 +899,13 @@
           btn.textContent = "Dismissing…";
           try {
             await dismissQuoteById(quoteId);
+            const status = (card && card.getAttribute("data-status")) || "";
             if (card) card.remove();
+            applyLocalDismissStats(status);
+            if (!document.querySelector("#rows .quote-card")) {
+              document.getElementById("rows").innerHTML =
+                '<div class="empty">No quotes assigned to you.</div>';
+            }
             await loadInbox({sync: false});
           } catch (err) {
             btn.disabled = false;
@@ -1007,7 +1044,7 @@
       }
     });
     document.getElementById("filter-pending").addEventListener("click", () => {
-      filterStatus = "awaiting_dispatcher"; loadInbox({sync: false});
+      filterStatus = "pending"; loadInbox({sync: false});
     });
     document.getElementById("filter-all").addEventListener("click", () => {
       filterStatus = ""; loadInbox({sync: false});

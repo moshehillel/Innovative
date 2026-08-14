@@ -699,11 +699,17 @@ async function handleGetQuoteDispatcherInbox(req, res) {
         console.warn("quote outlook sync:", syncErr.message);
       }
     }
-    const items = await quoteAutomation.listQuotesForDispatcher(
+    const listed = await quoteAutomation.listQuotesForDispatcher(
         user.tenant, user.dispatcher, {
           limit: Number(req.query.limit) || 50,
           status: status || undefined,
         });
+    const items = Array.isArray(listed) ? listed : (listed.items || []);
+    const counts = listed.counts || {
+      pending: items.filter(quoteAutomation.isPendingQuote).length,
+      total: items.filter((row) =>
+        !quoteAutomation.isDismissedQuote(row)).length,
+    };
     const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
       "https://us-central1-tai-invoice-automation.cloudfunctions.net";
     const enriched = items.map((item) => {
@@ -712,7 +718,7 @@ async function handleGetQuoteDispatcherInbox(req, res) {
         `&tenantId=${encodeURIComponent(user.tenant.tenantId)}`;
       return {...item, openUrl};
     });
-    return res.json({ok: true, items: enriched});
+    return res.json({ok: true, items: enriched, counts});
   } catch (err) {
     return res.status(500).json({ok: false, error: err.message});
   }
