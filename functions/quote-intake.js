@@ -84,8 +84,8 @@ async function callQuoteExtractionModel(client, payload) {
       "    consignee: {name, address1, city, state, zipCode, country, phone},",
       "    siteType: menards_dc | amazon_fc | aafes_military |",
       "      nursing_home | hotel | residential | other,",
-      "    freightInfo: [{qty, weight, class, length, width, height,",
-      "      dimType}],",
+      "    freightInfo: [{qty, weight, weightType, class, length, width,",
+      "      height, dimType}],",
       "    referenceNumbers: [PO numbers],",
       "    specialInstructions: string,",
       "    flags: {missingClass, suspiciousPalletCount, residentialDelivery}",
@@ -133,6 +133,12 @@ async function callQuoteExtractionModel(client, payload) {
       "  in the quote email, set wantsLimitedAccessInQuote true.",
       "- Always return at least one lane when pickup + delivery addresses",
       "  are present, even if freight dims/class/weight are missing.",
+      "- Sole address → consignee (destination / Ship To): when the email",
+      "  contains only ONE physical address (street/city/state/zip), put",
+      "  it on lanes[].consignee. Leave shipper null/empty (or name-only",
+      "  from a known customer profile) — do NOT put the sole address on",
+      "  shipper by default. Multi-address emails (Ship From + Ship To,",
+      "  or clear origin + destination) still map normally.",
     ].join("\n"),
     messages: [{
       role: "user",
@@ -315,6 +321,143 @@ function heuristicExtractQuote(opts) {
 }
 
 /**
+ * True when a party has enough location fields to count as a physical
+ * address (not name/phone alone).
+ * @param {object|null|undefined} party Address party.
+ * @return {boolean}
+ */
+function partyHasPhysicalAddress(party) {
+  if (!party || typeof party !== "object") return false;
+  const zip = String(
+      party.zipCode || party.zipcode || party.zip || "").trim();
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim();
+  const address1 = String(party.address1 || "").trim();
+  return Boolean(zip || (city && state) || address1);
+}
+
+/**
+ * Compact key for comparing two address blocks.
+ * @param {object|null|undefined} party Address party.
+ * @return {string}
+ */
+function physicalAddressKey(party) {
+  if (!partyHasPhysicalAddress(party)) return "";
+  const zip = String(
+      party.zipCode || party.zipcode || party.zip || "")
+      .trim()
+      .toLowerCase();
+  const city = String(party.city || "").trim().toLowerCase();
+  const state = String(party.state || "").trim().toLowerCase();
+  const address1 = String(party.address1 || "").trim().toLowerCase();
+  return [address1, city, state, zip].filter(Boolean).join("|");
+}
+
+/**
+ * Keep name/phone; clear street/city/state/zip/country.
+ * @param {object|null|undefined} party Address party.
+ * @return {object|null}
+ */
+function clearPhysicalAddressFields(party) {
+  if (!party || typeof party !== "object") return null;
+  const name = String(party.name || "").trim();
+  const phone = String(party.phone || "").trim();
+  if (!name && !phone) return null;
+  return {
+    name: name || "",
+    address1: "",
+    address2: "",
+    city: "",
+    state: "",
+    zipCode: "",
+    country: "",
+    phone: phone || "",
+  };
+}
+
+/**
+ * Copy location fields onto a consignee, preserving an existing name.
+ * @param {object} fromParty Source address (often mis-labeled shipper).
+ * @param {object|null|undefined} consignee Existing consignee.
+ * @return {object}
+ */
+function moveAddressOntoConsignee(fromParty, consignee) {
+  const base = consignee && typeof consignee === "object" ? consignee : {};
+  return {
+    name: String(base.name || fromParty.name || "").trim(),
+    address1: String(fromParty.address1 || "").trim(),
+    address2: String(fromParty.address2 || "").trim(),
+    city: String(fromParty.city || "").trim(),
+    state: String(fromParty.state || "").trim(),
+    zipCode: String(
+        fromParty.zipCode || fromParty.zipcode || fromParty.zip || "")
+        .trim(),
+    country: String(fromParty.country || "US").trim() || "US",
+    phone: String(base.phone || fromParty.phone || "").trim() || null,
+  };
+}
+
+/**
+ * Default: a sole physical address in an RFQ is the destination
+ * (consignee / Ship To), not the shipper pickup.
+ * Future sender-specific rules may override this to treat the sole
+ * address as pickup for some mailboxes.
+ * Does not alter true multi-address extracts (distinct Ship From + Ship To).
+ * @param {object} extracted Parsed quote request.
+ * @return {object} Same object, normalized in place.
+ */
+function normalizeSoleAddressToConsignee(extracted) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes)) extracted.lanes = [];
+  const shipper = extracted.shipper;
+  const shipperHas = partyHasPhysicalAddress(shipper);
+  const shipperKey = physicalAddressKey(shipper);
+
+  const laneConsignees = extracted.lanes.map((lane) =>
+    lane && lane.consignee ? lane.consignee : null);
+  const consigneesWithAddr = laneConsignees.filter(partyHasPhysicalAddress);
+  const uniqueConsigneeKeys = [...new Set(
+      consigneesWithAddr.map(physicalAddressKey).filter(Boolean))];
+
+  // Distinct shipper + consignee(s) → leave multi-address extracts alone.
+  if (shipperHas && uniqueConsigneeKeys.length) {
+    const onlySameAsShipper = uniqueConsigneeKeys.length === 1 &&
+      uniqueConsigneeKeys[0] === shipperKey;
+    if (!onlySameAsShipper) return extracted;
+    // Same sole block on both sides → keep consignee, clear shipper addr.
+    extracted.shipper = clearPhysicalAddressFields(shipper);
+    return extracted;
+  }
+
+  // Sole address on shipper, all consignees empty → move to destination.
+  if (shipperHas && !consigneesWithAddr.length) {
+    if (!extracted.lanes.length) {
+      extracted.lanes = [{
+        laneKey: "DEST",
+        label: "TO destination",
+        consignee: moveAddressOntoConsignee(shipper, null),
+        freightInfo: [],
+        flags: {},
+      }];
+    } else {
+      for (const lane of extracted.lanes) {
+        if (!lane || typeof lane !== "object") continue;
+        lane.consignee = moveAddressOntoConsignee(shipper, lane.consignee);
+        if (!lane.label && lane.consignee.city) {
+          lane.label = `TO ${lane.consignee.city}` +
+            (lane.consignee.state ? `, ${lane.consignee.state}` : "");
+        }
+      }
+    }
+    extracted.shipper = clearPhysicalAddressFields(shipper);
+    return extracted;
+  }
+
+  // Consignee(s) already hold the only address — nothing to do.
+  return extracted;
+}
+
+/**
  * @param {object} opts subject, from, body.
  * @return {Promise<object>} Parsed quote request.
  */
@@ -335,7 +478,7 @@ async function extractQuoteRequest(opts) {
 
   if (!process.env.ANTHROPIC_API_KEY) {
     const heuristic = heuristicExtractQuote({subject, from, body});
-    if (heuristic) return heuristic;
+    if (heuristic) return normalizeSoleAddressToConsignee(heuristic);
     fallback.error = "ANTHROPIC_API_KEY not configured";
     return fallback;
   }
@@ -354,7 +497,9 @@ async function extractQuoteRequest(opts) {
       const parsed = JSON.parse(jsonText);
       if (!Array.isArray(parsed.lanes)) parsed.lanes = [];
       if (!parsed.flags) parsed.flags = {};
-      if (parsed.lanes.length) return parsed;
+      if (parsed.lanes.length) {
+        return normalizeSoleAddressToConsignee(parsed);
+      }
       lastErr = new Error("model returned zero lanes");
     } catch (err) {
       lastErr = err;
@@ -362,7 +507,7 @@ async function extractQuoteRequest(opts) {
   }
 
   const heuristic = heuristicExtractQuote({subject, from, body});
-  if (heuristic) return heuristic;
+  if (heuristic) return normalizeSoleAddressToConsignee(heuristic);
 
   fallback.error = `Parse failed: ${(lastErr && lastErr.message) || "unknown"}`;
   fallback.raw = raw.slice(0, 500);
@@ -381,6 +526,7 @@ function looksLikeQuoteRequest(subject, body) {
     "please quote", "provide quote", "need quote", "quotation",
     "rate quote", "quote request", "freight quote", "shipping rate",
     "let us know the shipping rate", "get a freight quote",
+    "\\bquote\\b", "rfq",
   ].join("|"));
   if (quotePhrases.test(text)) {
     return true;
@@ -391,6 +537,16 @@ function looksLikeQuoteRequest(subject, body) {
   ].join("|"));
   const hasDest = /shipping to|ship to|consignee|deliver to|ship to:/;
   if (hasOrigin.test(text) && hasDest.test(text)) {
+    return true;
+  }
+  // PO/ref-only subjects (e.g. "0444524") with freight dims in body.
+  const hasFreightDims =
+    /\b\d+\s*x\s*\d+(\s*x\s*\d+)?\b/.test(text) &&
+    /\b(pallet|pallets|plt|skid|lbs?|pounds|class\s*\d+)\b/.test(text);
+  const hasOdHints =
+    /\b[A-Z]{2}\s+\d{5}\b/i.test(`${subject}\n${body}`) ||
+    /\b(ca|ny|nj|tx|fl|il|oh|pa|ga|nc|md)\b.*\b\d{5}\b/i.test(text);
+  if (hasFreightDims && hasOdHints) {
     return true;
   }
   return false;
@@ -432,10 +588,11 @@ async function classifyIsQuoteRequest(opts) {
   try {
     const client = new OpenAI({apiKey});
     const model = process.env.QUOTE_CLASSIFY_MODEL || DEFAULT_OPENAI_MODEL;
+    // gpt-5.6-luna rejects temperature (only default 1). Omit it.
     const completion = await client.chat.completions.create({
       model,
-      temperature: 0,
       max_completion_tokens: 200,
+      response_format: {type: "json_object"},
       messages: [
         {
           role: "system",
@@ -445,9 +602,14 @@ async function classifyIsQuoteRequest(opts) {
             "{\"isQuote\":boolean,\"confidence\":\"high|medium|low\",",
             "\"reasoning\":\"one short sentence\"}",
             "",
-            "isQuote=true ONLY when the sender is asking for a NEW LTL",
+            "isQuote=true when the sender is asking for a NEW LTL",
             "freight rate/quote (origins, destinations, pallets, weight,",
             "class, ready date, PO/SO tables, ship from/to blocks).",
+            "Subjects that are only a PO/ref number can still be quotes",
+            "when the body has ship-from/to and freight details.",
+            "Also isQuote=true for incomplete RFQ pastes that include",
+            "a shipper/pickup block plus pallet/weight/dims even if the",
+            "destination is missing — dispatchers complete those.",
             "",
             "isQuote=false for: carrier invoices, PODs, booking/accepting",
             "a prior quote, questions about rates already sent, thank-yous,",
@@ -491,4 +653,6 @@ module.exports = {
   looksLikeQuoteRequest,
   classifyIsQuoteRequest,
   toPlainText,
+  normalizeSoleAddressToConsignee,
+  partyHasPhysicalAddress,
 };

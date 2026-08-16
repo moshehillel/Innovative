@@ -13,6 +13,12 @@ const admin = require("firebase-admin");
 const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both"];
 const DEFAULT_IDENTIFY_VIA = "both";
 
+/**
+ * Default rule ids whose addAccessorials / name / notes are force-synced
+ * from DEFAULT_RULES on load (overrides stale Firestore seed values).
+ */
+const MANAGED_DEFAULT_RULE_IDS = new Set(["amazon_fc"]);
+
 const DEFAULT_RULES = [
   {
     id: "liftgate_no_dock",
@@ -102,7 +108,7 @@ const DEFAULT_RULES = [
     id: "amazon_fc",
     active: true,
     priority: 50,
-    name: "Amazon FC — appointment + limited access",
+    name: "Amazon FC — appointment delivery",
     identifyVia: "both",
     match: {
       consigneeNameContains: [
@@ -110,8 +116,9 @@ const DEFAULT_RULES = [
       ],
       siteType: "amazon_fc",
     },
-    addAccessorials: ["APD", "LAD"],
-    notes: "Amazon fulfillment center delivery.",
+    // Amazon FCs need appointment (APD) only — not Limited Access (LAD).
+    addAccessorials: ["APD"],
+    notes: "Amazon fulfillment center — appointment delivery only (no LAD).",
     autoApply: true,
     requiresConfirm: true,
   },
@@ -201,6 +208,7 @@ async function loadActiveRules(tenant) {
 
 /**
  * Creates missing DEFAULT_RULES docs (merge: false create-only).
+ * Also force-syncs managed default fields (e.g. amazon_fc accessorials).
  * @param {object} tenant Tenant.
  * @return {Promise<void>}
  */
@@ -209,8 +217,8 @@ async function ensureDefaultRulesPresent(tenant) {
   const existing = await ref.get();
   const have = new Set(existing.docs.map((d) => d.id));
   const missing = DEFAULT_RULES.filter((r) => !have.has(r.id));
-  if (!missing.length) return;
   const batch = admin.firestore().batch();
+  let writes = 0;
   for (const rule of missing) {
     const {id, ...rest} = rule;
     batch.set(ref.doc(id), {
@@ -219,8 +227,47 @@ async function ensureDefaultRulesPresent(tenant) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: "system-seed-missing",
     });
+    writes++;
   }
+  writes += queueManagedDefaultSync(batch, ref, existing);
+  if (!writes) return;
   await batch.commit();
+}
+
+/**
+ * Queue force-sync of managed DEFAULT_RULES fields onto existing docs.
+ * @param {FirebaseFirestore.WriteBatch} batch Batch.
+ * @param {FirebaseFirestore.CollectionReference} ref Rules collection.
+ * @param {FirebaseFirestore.QuerySnapshot} existing Existing rules snap.
+ * @return {number} Number of writes queued.
+ */
+function queueManagedDefaultSync(batch, ref, existing) {
+  const byId = new Map(existing.docs.map((d) => [d.id, d]));
+  let writes = 0;
+  for (const rule of DEFAULT_RULES) {
+    if (!MANAGED_DEFAULT_RULE_IDS.has(rule.id)) continue;
+    const doc = byId.get(rule.id);
+    if (!doc) continue;
+    const data = doc.data() || {};
+    const wantCodes = (rule.addAccessorials || []).map(String);
+    const haveCodes = (data.addAccessorials || []).map(String);
+    const codesSame = wantCodes.length === haveCodes.length &&
+      wantCodes.every((c, i) => c === haveCodes[i]);
+    if (codesSame &&
+        data.name === rule.name &&
+        data.notes === rule.notes) {
+      continue;
+    }
+    batch.set(ref.doc(rule.id), {
+      addAccessorials: wantCodes,
+      name: rule.name,
+      notes: rule.notes || "",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedBy: "system-sync-managed-defaults",
+    }, {merge: true});
+    writes++;
+  }
+  return writes;
 }
 
 /**
@@ -475,7 +522,9 @@ async function listAllRules(tenant) {
     await seedDefaultRules(tenant);
     return DEFAULT_RULES.map((r) => ({...r}));
   }
-  return snap.docs.map((d) => ({id: d.id, ...d.data()}));
+  await ensureDefaultRulesPresent(tenant);
+  const again = await col(tenant, "quoteRules").orderBy("priority").get();
+  return again.docs.map((d) => ({id: d.id, ...d.data()}));
 }
 
 /**
@@ -540,8 +589,10 @@ module.exports = {
   DEFAULT_RULES,
   IDENTIFY_VIA_VALUES,
   DEFAULT_IDENTIFY_VIA,
+  MANAGED_DEFAULT_RULE_IDS,
   loadActiveRules,
   seedDefaultRules,
+  ensureDefaultRulesPresent,
   applyRulesToLane,
   listAllRules,
   upsertRule,
