@@ -7,6 +7,7 @@
 const admin = require("firebase-admin");
 const quoteIntake = require("./quote-intake");
 const quoteRules = require("./quote-accessorial-rules");
+const freightRules = require("./quote-freight-rules");
 const addressEnrichment = require("./quote-address-enrichment");
 const rateShop = require("./quote-rate-shop");
 const quoteOutput = require("./quote-output");
@@ -209,8 +210,12 @@ async function rateLane(lane, ctx) {
     mode: "cheapest",
   });
 
+  const freightApplied = Array.isArray(lane.freightRulesApplied) ?
+    lane.freightRulesApplied : [];
+
   return {
     ...mergedLane,
+    appliedRules: [...freightApplied, ...(mergedLane.appliedRules || [])],
     options,
     rateError: null,
   };
@@ -232,7 +237,7 @@ async function processQuoteEmail(opts) {
     messageId, subject, from,
   });
 
-  const extracted = await quoteIntake.extractQuoteRequest({
+  let extracted = await quoteIntake.extractQuoteRequest({
     subject, from, body: emailBody,
   });
 
@@ -243,6 +248,9 @@ async function processQuoteEmail(opts) {
       reason: extracted.error || "No lanes extracted",
     };
   }
+
+  // Built-in freight rules: combine same-OD ≤26 PLT, then split >26 PLT.
+  extracted = freightRules.applyFreightRules(extracted);
 
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
@@ -289,7 +297,8 @@ async function processQuoteEmail(opts) {
         shipper: lane.shipper || shipper,
         options: [],
         rateError: err.message,
-        appliedRules: [],
+        appliedRules: Array.isArray(lane.freightRulesApplied) ?
+          lane.freightRulesApplied : [],
       });
     }
   }
@@ -827,4 +836,5 @@ module.exports = {
   resolveShippingLocationId,
   resolveCustomerMatch,
   rateLane,
+  freightRules,
 };

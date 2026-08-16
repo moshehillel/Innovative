@@ -1,5 +1,9 @@
 /**
  * Quote accessorial rules — Firestore-backed, applied before rate shop.
+ *
+ * Pallet trailer capacity (combine same-OD / split oversize) is a separate
+ * always-on built-in in quote-freight-rules.js (MAX 26 PLT/trailer), applied
+ * after extractQuoteRequest and before accessorial rules / rateLane.
  */
 
 "use strict";
