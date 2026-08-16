@@ -212,8 +212,33 @@ async function handleApplyQuoteRule(req, res) {
       await quoteRules.deleteRule(tenant, validated.ruleId);
       return res.json({ok: true, deleted: validated.ruleId});
     }
+    let patch = validated.patch;
+    // Preserve existing name/match (and other fields) when chat sends a
+    // partial update like { addAccessorials: ["APD"] }.
+    const existingRules = await quoteRules.listAllRules(tenant);
+    const existing = existingRules.find((r) => r.id === validated.ruleId);
+    if (existing) {
+      patch = {
+        active: existing.active,
+        priority: existing.priority,
+        name: existing.name,
+        match: existing.match || {},
+        addAccessorials: existing.addAccessorials || [],
+        filterCarrierWarnings: existing.filterCarrierWarnings || [],
+        notes: existing.notes || "",
+        autoApply: existing.autoApply,
+        requiresConfirm: existing.requiresConfirm,
+        identifyVia: existing.identifyVia,
+        ...patch,
+      };
+      if (Array.isArray(existing.addAccessorialsWithData) &&
+          !Object.prototype.hasOwnProperty.call(
+              validated.patch, "addAccessorialsWithData")) {
+        patch.addAccessorialsWithData = existing.addAccessorialsWithData;
+      }
+    }
     const rule = await quoteRules.upsertRule(
-        tenant, validated.ruleId, validated.patch, updatedBy);
+        tenant, validated.ruleId, patch, updatedBy);
     return res.json({ok: true, rule});
   } catch (err) {
     console.error("applyQuoteRule:", err);
@@ -291,6 +316,24 @@ async function handleQuoteRulesChat(req, res) {
       messages,
       existingRules,
     });
+    // Backfill name/match on update proposals so Confirm never fails
+    // with "Proposal needs name or match criteria".
+    if (result && result.action === "propose_update_rule" &&
+        result.proposal && result.proposal.ruleId) {
+      const existing = existingRules.find(
+          (r) => r.id === result.proposal.ruleId);
+      if (existing) {
+        const patch = result.proposal.patch &&
+          typeof result.proposal.patch === "object" ?
+          {...result.proposal.patch} : {};
+        if (!patch.name) patch.name = existing.name;
+        if (!patch.match) patch.match = existing.match || {};
+        if (!patch.identifyVia) {
+          patch.identifyVia = existing.identifyVia || "both";
+        }
+        result.proposal = {...result.proposal, patch};
+      }
+    }
     return res.json({ok: true, ...result});
   } catch (err) {
     console.error("quoteRulesChat:", err);
