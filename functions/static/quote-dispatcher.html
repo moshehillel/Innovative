@@ -333,6 +333,53 @@
       padding: 0 10px 10px;
     }
     .acc-section.open .acc-list { display: flex; }
+    .rates-section {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden;
+      margin-top: 14px;
+    }
+    .rates-section-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      margin: 0;
+      padding: 10px 12px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+      color: var(--primary-dark);
+    }
+    .rates-section-toggle:hover { background: var(--primary-light); }
+    .rates-section-toggle .rates-chevron {
+      color: var(--muted);
+      font-size: 0.75rem;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+    }
+    .rates-section.open .rates-chevron { transform: rotate(90deg); }
+    .rates-section-toggle h4 {
+      margin: 0;
+      font-size: 0.8125rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+      flex: 1;
+    }
+    .rates-section-toggle .rates-count {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .rates-section .rates-list {
+      display: none;
+      padding: 0 12px 12px;
+    }
+    .rates-section.open .rates-list { display: block; }
     .acc-section label {
       display: flex;
       align-items: flex-start;
@@ -468,11 +515,26 @@
       margin-top: 24px;
       box-shadow: var(--shadow-sm);
     }
+    .draft-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
     .draft h3 {
-      margin: 0 0 8px;
+      margin: 0;
       font-size: 1rem;
       font-weight: 700;
       color: var(--primary-dark);
+      flex: 1;
+      min-width: 140px;
+    }
+    .draft-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
     }
     .draft textarea {
       width: 100%;
@@ -820,7 +882,6 @@
       <div id="customer-match" class="customer-match hidden"></div>
       <div class="toolbar">
         <button type="button" id="btn-generate">Save rate and generate draft email</button>
-        <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
         <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
         <span style="flex:1"></span>
         <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
@@ -829,10 +890,15 @@
       <div id="quote-details" class="details-panel"></div>
       <div id="lanes"></div>
       <div class="draft">
-        <h3>Customer email draft</h3>
+        <div class="draft-head">
+          <h3>Customer email draft</h3>
+          <div class="draft-actions">
+            <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
+          </div>
+        </div>
         <p style="color:var(--muted);font-size:0.875rem;margin:0 0 12px">
-          Check rates above, click Save rate and generate draft email
-          (saves to Primus first), edit if needed, then Approve to send via your Outlook.
+          Check rates above (collapse the rates list anytime), click Save rate and generate draft email
+          (saves to Primus first), edit if needed, then Approve here to send via your Outlook.
           Dispatcher notes stay on this page only and are not emailed.
         </p>
         <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
@@ -1175,6 +1241,7 @@
       });
       renderQuoteDetails(quote);
       renderLanes();
+      if (draftReady) collapseRatesSections();
       // If catalog finished while we rendered, fill panels without a second trip.
       if (accessorialCatalog) {
         document.querySelectorAll(".acc-panel").forEach((panel) => {
@@ -1630,6 +1697,51 @@
       });
     }
 
+    function ratesSectionCountLabel(rateCount, selectedCount) {
+      if (!rateCount) return "No rates";
+      if (selectedCount) {
+        return selectedCount + " selected · check to include in email";
+      }
+      return rateCount + " options · check to include in email";
+    }
+
+    function updateRatesSectionCount(laneEl, selectedCount) {
+      if (!laneEl) return;
+      const countEl = laneEl.querySelector(".rates-section .rates-count");
+      if (!countEl) return;
+      const laneKey = laneEl.getAttribute("data-lane-key");
+      const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+      const rateCount = ((lane && lane.options) || []).length;
+      countEl.textContent = ratesSectionCountLabel(rateCount, selectedCount);
+    }
+
+    function setRatesSectionOpen(section, open) {
+      if (!section) return;
+      section.classList.toggle("open", !!open);
+      const btn = section.querySelector("[data-rates-toggle]");
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    function collapseRatesSections(root) {
+      (root || document).querySelectorAll(".rates-section").forEach((section) => {
+        setRatesSectionOpen(section, false);
+      });
+    }
+
+    function bindRatesSectionToggles(root) {
+      (root || document).querySelectorAll("[data-rates-toggle]").forEach((btn) => {
+        if (btn.dataset.boundRatesToggle === "1") return;
+        btn.dataset.boundRatesToggle = "1";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const section = btn.closest(".rates-section");
+          if (!section) return;
+          setRatesSectionOpen(section, !section.classList.contains("open"));
+        });
+      });
+    }
+
     function renderLanes() {
       const root = document.getElementById("lanes");
       root.innerHTML = "";
@@ -1717,6 +1829,19 @@
           optsHtml = "<p style='color:var(--muted);font-size:0.875rem'>No rates returned.</p>";
         }
 
+        const ratesCountLabel = ratesSectionCountLabel(
+            (lane.options || []).length, selected.size);
+        const ratesSectionHtml =
+          "<div class='rates-section open' data-rates-section='1'>" +
+            "<button type='button' class='rates-section-toggle' " +
+              "aria-expanded='true' data-rates-toggle='1'>" +
+              "<span class='rates-chevron'>▶</span>" +
+              "<h4>Cheapest rates</h4>" +
+              "<span class='rates-count'>" + esc(ratesCountLabel) + "</span>" +
+            "</button>" +
+            "<div class='rates-list'>" + optsHtml + "</div>" +
+          "</div>";
+
         div.innerHTML =
           "<div class='lane-head'>" +
             "<span class='chevron'>▶</span>" +
@@ -1730,8 +1855,7 @@
             whyHtml +
             "<p style='margin:0 0 4px;font-size:0.8125rem;font-weight:600;color:var(--text-secondary)'>Accessorials for re-rate</p>" +
             toggles +
-            "<p style='margin:18px 0 4px;font-size:0.8125rem;font-weight:600;color:var(--text-secondary)'>Cheapest rates (check to include in email)</p>" +
-            optsHtml +
+            ratesSectionHtml +
           "</div>";
         root.appendChild(div);
       });
@@ -1742,6 +1866,7 @@
         });
       });
 
+      bindRatesSectionToggles(root);
       bindAccSectionToggles(root);
       bindAccCheckboxHandlers(root);
 
@@ -1762,6 +1887,7 @@
               ((lane && lane.options) || []).length + " rates · " +
               set.size + " selected";
           }
+          updateRatesSectionCount(laneEl, set.size);
           draftReady = false;
           document.getElementById("btn-approve").disabled = true;
           persistSelections();
@@ -1923,6 +2049,11 @@
         document.getElementById("btn-copy").disabled = false;
         document.getElementById("status-badge").textContent = "draft_ready";
         document.getElementById("status-badge").className = "badge draft_ready";
+        collapseRatesSections();
+        const draftEl = document.querySelector(".draft");
+        if (draftEl && draftEl.scrollIntoView) {
+          draftEl.scrollIntoView({behavior: "smooth", block: "nearest"});
+        }
         const failed = (res.saveResults || []).filter((r) => !r.ok);
         if (res.partial || failed.length) {
           const names = failed.map((r) => r.name || r.rateId).join(", ");
