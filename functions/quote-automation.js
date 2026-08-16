@@ -132,6 +132,294 @@ function assertSelectedCustomerRates(lanes) {
 }
 
 /**
+ * Normalizes an address party from dispatcher edits.
+ * @param {object|null|undefined} party Raw party.
+ * @return {object|null}
+ */
+function normalizeAddressParty(party) {
+  if (!party || typeof party !== "object") return null;
+  const zip = party.zipCode != null ? party.zipCode :
+    (party.zip != null ? party.zip : party.zipcode);
+  const out = {
+    name: party.name != null ? String(party.name).trim() : "",
+    address1: party.address1 != null ? String(party.address1).trim() : "",
+    address2: party.address2 != null ? String(party.address2).trim() : "",
+    city: party.city != null ? String(party.city).trim() : "",
+    state: party.state != null ? String(party.state).trim() : "",
+    zipCode: zip != null ? String(zip).trim() : "",
+    country: party.country != null ? String(party.country).trim() : "",
+    phone: party.phone != null ? String(party.phone).trim() : "",
+  };
+  const hasAny = Object.values(out).some((v) => v);
+  return hasAny ? out : null;
+}
+
+/**
+ * Normalizes freight rows from dispatcher edits.
+ * @param {Array<object>|null|undefined} rows Freight lines.
+ * @return {Array<object>}
+ */
+function normalizeFreightRows(rows) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    const r = row && typeof row === "object" ? row : {};
+    const numOrNull = (v) => {
+      if (v == null || v === "") return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    };
+    const weightTypeRaw = String(r.weightType || "").trim().toLowerCase();
+    const weightType =
+      (weightTypeRaw === "each" || weightTypeRaw === "perpiece" ||
+        weightTypeRaw === "per-piece") ? "each" : "total";
+    return {
+      qty: numOrNull(r.qty),
+      weight: numOrNull(r.weight),
+      weightType,
+      class: r.class != null && r.class !== "" ?
+        (Number(r.class) || r.class) : null,
+      length: numOrNull(r.length),
+      width: numOrNull(r.width),
+      height: numOrNull(r.height),
+      dimType: r.dimType != null && String(r.dimType).trim() ?
+        String(r.dimType).trim() : "PLT",
+    };
+  }).filter((r) =>
+    r.qty != null || r.weight != null || r.length != null ||
+    r.width != null || r.height != null || r.class != null);
+}
+
+/**
+ * Updates quote shipper/consignee/freight/customer fields (dispatcher edit).
+ * @param {object} tenant Tenant.
+ * @param {string} quoteId Quote doc id.
+ * @param {object} details Patch payload.
+ * @return {Promise<object>}
+ */
+async function updateQuoteDetails(tenant, quoteId, details = {}) {
+  const ref = col(tenant, "quoteRequests").doc(quoteId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Quote not found");
+  const data = snap.data();
+  if (isDismissedQuote(data)) {
+    throw new Error("Quote was dismissed");
+  }
+
+  const patch = {
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (details.customerRef != null) {
+    patch.customerRef = String(details.customerRef).trim();
+  }
+  if (details.readyDate !== undefined) {
+    patch.readyDate = details.readyDate ?
+      String(details.readyDate).trim() : null;
+  }
+  if (details.specialInstructionsGlobal !== undefined) {
+    patch.specialInstructionsGlobal =
+      String(details.specialInstructionsGlobal || "");
+  }
+  if (details.shippingLocationName != null ||
+      details.matchedCustomerName != null) {
+    patch.shippingLocationName = String(
+        details.shippingLocationName != null ?
+          details.shippingLocationName :
+          details.matchedCustomerName || "").trim() || null;
+  }
+  if (details.shipper !== undefined) {
+    patch.shipper = normalizeAddressParty(details.shipper);
+  }
+
+  const lanePatches = Array.isArray(details.lanes) ? details.lanes : [];
+  const byLane = new Map();
+  for (const row of lanePatches) {
+    if (!row || !row.laneKey) continue;
+    byLane.set(String(row.laneKey), row);
+  }
+
+  let lanes = data.lanes || [];
+  if (byLane.size || details.shipper !== undefined) {
+    lanes = lanes.map((lane) => {
+      const row = byLane.get(String(lane.laneKey));
+      let next = {...lane};
+      if (details.shipper !== undefined && !row) {
+        // Quote-level shipper applies to lanes without an explicit override.
+        next.shipper = patch.shipper || lane.shipper;
+      }
+      if (!row) return next;
+      if (row.shipper !== undefined) {
+        next = {...next, shipper: normalizeAddressParty(row.shipper)};
+      } else if (details.shipper !== undefined) {
+        next = {...next, shipper: patch.shipper || next.shipper};
+      }
+      if (row.consignee !== undefined) {
+        next = {...next, consignee: normalizeAddressParty(row.consignee)};
+      }
+      if (row.freightInfo !== undefined) {
+        next = {...next, freightInfo: normalizeFreightRows(row.freightInfo)};
+      }
+      if (row.specialInstructions !== undefined) {
+        next = {
+          ...next,
+          specialInstructions: String(row.specialInstructions || ""),
+        };
+      }
+      if (row.label != null && String(row.label).trim()) {
+        next = {...next, label: String(row.label).trim()};
+      }
+      return next;
+    });
+    patch.lanes = lanes;
+  }
+
+  // Clear stale draft so dispatcher re-generates after detail edits.
+  patch.customerEmailText = admin.firestore.FieldValue.delete();
+  patch.customerEmailHtml = admin.firestore.FieldValue.delete();
+  if (data.status === "draft_ready") {
+    patch.status = "awaiting_dispatcher";
+  }
+
+  await ref.update(patch);
+
+  const fresh = await ref.get();
+  const quote = {id: fresh.id, ...fresh.data()};
+  return {
+    ok: true,
+    quote: quoteOutput.serializeForDispatcherPage(quote),
+  };
+}
+
+/**
+ * Parses Primus /rate/save result row into persisted fields.
+ * @param {object|null} row Save result.
+ * @return {object}
+ */
+function parsePrimusSaveResult(row) {
+  if (!row || typeof row !== "object") {
+    return {quoteNumber: null, costQuoteId: null, url: null};
+  }
+  const quoteNumber = row.quoteNumber || row.quote_number ||
+    row.number || null;
+  const costQuoteId = row.costQuoteId || row.cost_quote_id ||
+    row.costQuoteID || row.id || row.quoteId || null;
+  const url = row.url || row.link || row.quoteUrl || row.QuoteUrl || null;
+  return {
+    quoteNumber: quoteNumber != null ? String(quoteNumber) : null,
+    costQuoteId: costQuoteId != null ? String(costQuoteId) : null,
+    url: url != null ? String(url) : null,
+  };
+}
+
+/**
+ * Saves checked rates to Primus and persists quote numbers on options.
+ * @param {object} tenant Tenant.
+ * @param {string} quoteId Quote id.
+ * @param {object} quote Quote data (mutated lanes in place).
+ * @return {Promise<object>} {ok, saveResults, lanes, failedCount, savedCount}
+ */
+async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
+  const saveResults = [];
+  let savedCount = 0;
+  let failedCount = 0;
+  const lanes = (quote.lanes || []).map((lane) => {
+    const selectedIds = new Set(
+        (lane.selectedRateIds || []).map(String));
+    if (!selectedIds.size && lane.selectedRateId) {
+      selectedIds.add(String(lane.selectedRateId));
+    }
+    const options = (lane.options || []).map((opt) => ({...opt}));
+    return {...lane, options, selectedRateIds: [...selectedIds]};
+  });
+
+  for (const lane of lanes) {
+    for (const opt of lane.options) {
+      const rateId = String(opt.id);
+      if (!(lane.selectedRateIds || []).includes(rateId)) continue;
+
+      // Reuse prior successful Primus save when present.
+      if (opt.costQuoteId && (opt.quoteNumber || opt.savedQuoteNumber)) {
+        saveResults.push({
+          laneKey: lane.laneKey,
+          rateId,
+          name: opt.name || opt.SCAC || rateId,
+          ok: true,
+          reused: true,
+          quoteNumber: opt.quoteNumber || opt.savedQuoteNumber,
+          costQuoteId: opt.costQuoteId,
+          url: opt.quoteUrl || opt.url || null,
+        });
+        savedCount += 1;
+        continue;
+      }
+
+      try {
+        const saved = await rateShop.saveRate(rateId, {
+          laneDistance: lane.laneDistance != null ?
+            lane.laneDistance : undefined,
+        });
+        const parsed = parsePrimusSaveResult(saved && saved.results);
+        if (!parsed.quoteNumber && !parsed.costQuoteId) {
+          throw new Error("Primus save returned no quote number");
+        }
+        opt.quoteNumber = parsed.quoteNumber || opt.quoteNumber || null;
+        opt.savedQuoteNumber = opt.quoteNumber;
+        opt.costQuoteId = parsed.costQuoteId;
+        opt.quoteUrl = parsed.url;
+        opt.url = parsed.url;
+        opt.savedAt = new Date().toISOString();
+        saveResults.push({
+          laneKey: lane.laneKey,
+          rateId,
+          name: opt.name || opt.SCAC || rateId,
+          ok: true,
+          reused: false,
+          quoteNumber: opt.quoteNumber,
+          costQuoteId: opt.costQuoteId,
+          url: opt.quoteUrl,
+        });
+        savedCount += 1;
+      } catch (err) {
+        failedCount += 1;
+        saveResults.push({
+          laneKey: lane.laneKey,
+          rateId,
+          name: opt.name || opt.SCAC || rateId,
+          ok: false,
+          error: err && err.message ? err.message : String(err),
+        });
+      }
+    }
+    const okIds = new Set(
+        saveResults
+            .filter((r) => r.laneKey === lane.laneKey && r.ok)
+            .map((r) => String(r.rateId)));
+    // Only successfully saved rates stay selected for the customer email.
+    lane.selectedRateIds = (lane.selectedRateIds || [])
+        .filter((id) => okIds.has(String(id)));
+    lane.selectedRateId = lane.selectedRateIds[0] || null;
+    lane.selectedOptions = lane.options.filter((o) =>
+      lane.selectedRateIds.includes(String(o.id)));
+    lane.selectedOption = lane.selectedOptions[0] || null;
+  }
+
+  await col(tenant, "quoteRequests").doc(quoteId).update({
+    lanes,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  quote.lanes = lanes;
+
+  return {
+    ok: failedCount === 0,
+    partial: failedCount > 0 && savedCount > 0,
+    savedCount,
+    failedCount,
+    saveResults,
+    lanes,
+  };
+}
+
+/**
  * Rates one lane and returns top options with sell rates.
  * @param {object} lane Lane with shipper, consignee, freightInfo.
  * @param {object} ctx Context with rules, shippingLocationId, margin opts.
@@ -578,9 +866,11 @@ async function saveLaneSelections(tenant, quoteId, selections) {
 
 /**
  * Builds and stores customer email draft from checked rates.
+ * Saves each checked rate to Primus (/rate/save) first so the draft
+ * includes real quote numbers.
  * @param {object} tenant Tenant.
  * @param {string} quoteId Quote id.
- * @param {object} [opts] style, bodyText override.
+ * @param {object} [opts] style, bodyText override, selections.
  * @return {Promise<object>}
  */
 async function generateQuoteEmail(tenant, quoteId, opts = {}) {
@@ -600,6 +890,21 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
 
   assertSelectedCustomerRates(quote.lanes);
 
+  const saveOutcome = await saveSelectedRatesToPrimus(
+      tenant, quoteId, quote);
+
+  if (!saveOutcome.savedCount) {
+    const firstErr = (saveOutcome.saveResults || [])
+        .find((r) => !r.ok);
+    throw new Error(
+        (firstErr && firstErr.error) ||
+        "Failed to save rates to Primus — no draft generated.");
+  }
+
+  // Reload after save so selectedOptions / quote numbers are current.
+  const afterSave = await ref.get();
+  Object.assign(quote, afterSave.data());
+
   const style = opts.style || "bullet";
   const text = opts.bodyText != null ?
     String(opts.bodyText) :
@@ -612,10 +917,27 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
     customerDraftText: text,
     emailStyle: style,
     status: "draft_ready",
+    lastRateSaveResults: saveOutcome.saveResults,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  return {ok: true, text, html, status: "draft_ready"};
+  return {
+    ok: true,
+    partial: !!saveOutcome.partial,
+    text,
+    html,
+    status: "draft_ready",
+    savedCount: saveOutcome.savedCount,
+    failedCount: saveOutcome.failedCount,
+    saveResults: saveOutcome.saveResults,
+    quote: quoteOutput.serializeForDispatcherPage({
+      id: quoteId,
+      ...quote,
+      customerEmailText: text,
+      customerDraftText: text,
+      status: "draft_ready",
+    }),
+  };
 }
 
 /**
@@ -825,6 +1147,7 @@ module.exports = {
   processQuoteEmail,
   saveLaneSelection,
   saveLaneSelections,
+  updateQuoteDetails,
   generateQuoteEmail,
   approveQuoteEmail,
   dismissQuote,

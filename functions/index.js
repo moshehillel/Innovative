@@ -14334,8 +14334,13 @@ exports.saveQuoteSelection = onRequest({invoker: "public"},
     quoteDashboard.handleSaveQuoteSelection);
 exports.saveQuoteSelections = onRequest({invoker: "public"},
     quoteDashboard.handleSaveQuoteSelections);
-exports.generateQuoteEmail = onRequest({invoker: "public"},
-    quoteDashboard.handleGenerateQuoteEmail);
+exports.updateQuoteDetails = onRequest({invoker: "public"},
+    quoteDashboard.handleUpdateQuoteDetails);
+exports.generateQuoteEmail = onRequest({
+  invoker: "public",
+  timeoutSeconds: 300,
+  memory: "512MiB",
+}, quoteDashboard.handleGenerateQuoteEmail);
 exports.approveQuoteEmail = onRequest({invoker: "public"},
     quoteDashboard.handleApproveQuoteEmail);
 exports.dismissQuote = onRequest({invoker: "public"},

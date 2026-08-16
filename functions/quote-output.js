@@ -189,8 +189,7 @@ function buildCustomerDraftText(quote) {
     lines.push(
         "[Dispatcher fills: $___ — Carrier | Q# _____ | ___-day transit]",
     );
-    const laneNote = cleanCarrierNote(lane.notesForCustomer);
-    if (laneNote) lines.push(laneNote);
+    // Dispatcher notes (notesForCustomer / enrichment / why) stay UI-only.
     lines.push("");
   }
 
@@ -362,12 +361,9 @@ function buildCustomerEmailFromSelections(quote, opts = {}) {
           sellRate: customerRate,
         };
         lines.push(formatLine(priced));
-        const note = customerNoteFromOption(opt);
-        if (note) lines.push(`  Note: ${note}`);
+        // Carrier / dispatcher notes are UI-only — never in customer email.
       }
     }
-    const laneNote = cleanCarrierNote(lane.notesForCustomer);
-    if (laneNote) lines.push(laneNote);
     lines.push("");
   }
 
@@ -459,6 +455,8 @@ function serializeForDispatcherPage(quote) {
     subject: quote.subject,
     from: quote.from,
     customerRef: quote.customerRef,
+    readyDate: quote.readyDate || null,
+    specialInstructionsGlobal: quote.specialInstructionsGlobal || "",
     status: quote.status,
     shipper: quoteShipper,
     shippingLocationId,
@@ -475,6 +473,8 @@ function serializeForDispatcherPage(quote) {
       shipper: lane.shipper || quoteShipper || null,
       consignee: lane.consignee,
       freightInfo: Array.isArray(lane.freightInfo) ? lane.freightInfo : [],
+      specialInstructions: lane.specialInstructions || "",
+      notesForCustomer: lane.notesForCustomer || null,
       siteType: lane.siteType || null,
       accessorials: lane.accessorials || [],
       accessorialLabels: quoteRules.formatAccessorialLabels(
@@ -489,6 +489,7 @@ function serializeForDispatcherPage(quote) {
         // UI truncates notes to ~200 chars; trim payload for multi-rate lanes.
         const warnings = warningText ?
           warningText.slice(0, 240) : null;
+        const quoteNumber = o.quoteNumber || o.savedQuoteNumber || null;
         return {
           rateId: o.id,
           name: o.name,
@@ -498,7 +499,9 @@ function serializeForDispatcherPage(quote) {
           customerPrice: o.customerPrice != null ?
             Number(o.customerPrice) : null,
           transitDays: o.transitDays,
-          quoteNumber: o.quoteNumber,
+          quoteNumber,
+          costQuoteId: o.costQuoteId || null,
+          quoteUrl: o.quoteUrl || o.url || null,
           tags: o.tags,
           warnings,
           guaranteed: o.guaranteed,

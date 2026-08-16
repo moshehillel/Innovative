@@ -442,6 +442,38 @@ async function handleSaveQuoteSelections(req, res) {
 }
 
 /**
+ * POST update quote shipper/consignee/freight/customer details.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleUpdateQuoteDetails(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST"});
+  }
+  try {
+    const body = req.body || {};
+    const quoteId = body.quoteId;
+    if (!quoteId) {
+      return res.status(400).json({ok: false, error: "quoteId required"});
+    }
+    const auth = await authorizeQuoteAccess(req, String(quoteId));
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({
+        ok: false,
+        error: auth.error,
+      });
+    }
+    const result = await quoteAutomation.updateQuoteDetails(
+        auth.tenant, String(quoteId), body.details || body);
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ok: false, error: err.message});
+  }
+}
+
+/**
  * POST generate customer email draft from checked rates.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -678,7 +710,7 @@ async function handleGetQuoteDispatcherInbox(req, res) {
     }
     const status = req.query.status ? String(req.query.status) : "";
     // Opt-in only: page loads must stay fast (Firestore list). Outlook sync
-    // runs on scheduler + explicit Sync Outlook / syncOutlook=1.
+    // runs on the 20-min scheduler + optional quiet background syncOutlook=1.
     const wantSync =
       req.query.syncOutlook === "1" ||
       req.query.syncOutlook === "true";
@@ -1096,6 +1128,7 @@ module.exports = {
   handleGetQuoteDispatcherData,
   handleSaveQuoteSelection,
   handleSaveQuoteSelections,
+  handleUpdateQuoteDetails,
   handleGenerateQuoteEmail,
   handleApproveQuoteEmail,
   handleDismissQuote,

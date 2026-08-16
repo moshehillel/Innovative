@@ -175,6 +175,107 @@
       vertical-align: top;
     }
     .freight-table tr:last-child td { border-bottom: none; }
+    .details-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 16px 18px 18px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow-sm);
+    }
+    .details-panel h3 {
+      margin: 0 0 12px;
+      font-size: 0.9375rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+    }
+    .details-grid {
+      display: grid;
+      gap: 10px 14px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 720px) {
+      .details-grid { grid-template-columns: 1fr 1fr; }
+      .details-grid .span-2 { grid-column: 1 / -1; }
+    }
+    .field-label {
+      display: block;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .field-input,
+    .field-textarea,
+    .freight-edit input,
+    .freight-edit select,
+    .addr-edit input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 0.8125rem;
+      background: var(--surface);
+      color: var(--text);
+    }
+    .field-textarea { min-height: 64px; resize: vertical; }
+    .addr-edit {
+      display: grid;
+      gap: 8px;
+    }
+    .addr-edit .addr-row {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 560px) {
+      .addr-edit .addr-row.cols-2 { grid-template-columns: 1fr 1fr; }
+      .addr-edit .addr-row.cols-3 { grid-template-columns: 2fr 1fr 1fr; }
+    }
+    .freight-edit {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.75rem;
+    }
+    .freight-edit th {
+      text-align: left;
+      font-size: 0.625rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 4px 4px 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .freight-edit td {
+      padding: 4px 4px 4px 0;
+      vertical-align: middle;
+    }
+    .freight-edit input,
+    .freight-edit select {
+      padding: 6px 6px;
+      min-width: 0;
+    }
+    .details-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+      align-items: center;
+    }
+    .dispatcher-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #fff7ed;
+      border: 1px solid #fed7aa;
+      font-size: 0.8125rem;
+      color: #9a3412;
+    }
+    .dispatcher-note strong { display: block; margin-bottom: 2px; }
     .acc-sections {
       display: grid;
       gap: 8px;
@@ -718,18 +819,21 @@
       </div>
       <div id="customer-match" class="customer-match hidden"></div>
       <div class="toolbar">
-        <button type="button" id="btn-generate">Generate email</button>
+        <button type="button" id="btn-generate">Save rate and generate draft email</button>
         <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
         <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
         <span style="flex:1"></span>
         <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
       </div>
       <div id="action-msg" class="msg hidden"></div>
+      <div id="quote-details" class="details-panel"></div>
       <div id="lanes"></div>
       <div class="draft">
         <h3>Customer email draft</h3>
         <p style="color:var(--muted);font-size:0.875rem;margin:0 0 12px">
-          Check rates above, click Generate email, edit if needed, then Approve to send via your Outlook.
+          Check rates above, click Save rate and generate draft email
+          (saves to Primus first), edit if needed, then Approve to send via your Outlook.
+          Dispatcher notes stay on this page only and are not emailed.
         </p>
         <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
       </div>
@@ -1059,6 +1163,7 @@
         });
         customerPrices[lane.laneKey] = prices;
       });
+      renderQuoteDetails(quote);
       renderLanes();
       // If catalog finished while we rendered, fill panels without a second trip.
       if (accessorialCatalog) {
@@ -1079,96 +1184,247 @@
       }
     }
 
-    function formatAddressBlock(party) {
-      if (!party || typeof party !== "object") {
-        return {name: "", lines: "", missing: true};
+    function partyField(party, field) {
+      const p = party && typeof party === "object" ? party : {};
+      if (field === "zipCode") {
+        return p.zipCode || p.zip || p.zipcode || "";
       }
-      const name = String(party.name || "").trim();
-      const street = [party.address1, party.address2]
-          .map((x) => String(x || "").trim())
-          .filter(Boolean)
-          .join(", ");
-      const cityLine = [
-        [party.city, party.state].filter(Boolean).join(", "),
-        party.zipCode || party.zip || "",
-        party.country || "",
-      ].map((x) => String(x || "").trim()).filter(Boolean).join(" ");
-      const phone = String(party.phone || "").trim();
-      const lines = [street, cityLine, phone ? "Tel: " + phone : ""]
-          .filter(Boolean)
-          .join("\n");
-      return {
-        name,
-        lines,
-        missing: !name && !lines,
-      };
+      return p[field] != null ? p[field] : "";
     }
 
-    function formatDims(f) {
-      const L = f.length != null && f.length !== "" ? f.length : null;
-      const W = f.width != null && f.width !== "" ? f.width : null;
-      const H = f.height != null && f.height !== "" ? f.height : null;
-      if (L == null && W == null && H == null) return "—";
-      return [L != null ? L : "?", W != null ? W : "?", H != null ? H : "?"]
-          .join("×");
-    }
-
-    function renderFreightTable(freightInfo) {
-      const rows = Array.isArray(freightInfo) ? freightInfo : [];
-      if (!rows.length) {
-        return "<p class='freight-missing'>No freight details extracted.</p>";
-      }
-      let html = "<table class='freight-table'><thead><tr>" +
-        "<th>Qty</th><th>Weight</th><th>Class</th>" +
-        "<th>L×W×H</th><th>Type</th></tr></thead><tbody>";
-      rows.forEach((f) => {
-        const qty = f.qty != null && f.qty !== "" ? f.qty : "—";
-        const weight = f.weight != null && f.weight !== "" ? f.weight : "—";
-        const cls = f.class != null && f.class !== "" ? f.class : "—";
-        const dimType = f.dimType || f.packaging || "—";
-        html += "<tr>" +
-          "<td>" + esc(qty) + "</td>" +
-          "<td>" + esc(weight) + "</td>" +
-          "<td>" + esc(cls) + "</td>" +
-          "<td>" + esc(formatDims(f)) + "</td>" +
-          "<td>" + esc(dimType) + "</td>" +
-          "</tr>";
-      });
-      html += "</tbody></table>";
+    function renderAddressEditor(prefix, party, title) {
+      const p = party || {};
+      let html = "<div class='addr-block addr-edit' data-addr='" + esc(prefix) + "'>";
+      html += "<h3>" + esc(title) + "</h3>";
+      html += "<label class='field-label'>Name</label>" +
+        "<input class='field-input' data-f='name' value='" +
+        esc(partyField(p, "name")) + "'>";
+      html += "<label class='field-label'>Address 1</label>" +
+        "<input class='field-input' data-f='address1' value='" +
+        esc(partyField(p, "address1")) + "'>";
+      html += "<label class='field-label'>Address 2</label>" +
+        "<input class='field-input' data-f='address2' value='" +
+        esc(partyField(p, "address2")) + "'>";
+      html += "<div class='addr-row cols-3'>";
+      html += "<div><label class='field-label'>City</label>" +
+        "<input class='field-input' data-f='city' value='" +
+        esc(partyField(p, "city")) + "'></div>";
+      html += "<div><label class='field-label'>State</label>" +
+        "<input class='field-input' data-f='state' value='" +
+        esc(partyField(p, "state")) + "'></div>";
+      html += "<div><label class='field-label'>Zip</label>" +
+        "<input class='field-input' data-f='zipCode' value='" +
+        esc(partyField(p, "zipCode")) + "'></div>";
+      html += "</div>";
+      html += "<div class='addr-row cols-2'>";
+      html += "<div><label class='field-label'>Country</label>" +
+        "<input class='field-input' data-f='country' value='" +
+        esc(partyField(p, "country") || "US") + "'></div>";
+      html += "<div><label class='field-label'>Phone</label>" +
+        "<input class='field-input' data-f='phone' value='" +
+        esc(partyField(p, "phone")) + "'></div>";
+      html += "</div></div>";
       return html;
     }
 
+    function renderFreightEditor(laneKey, freightInfo) {
+      const rows = Array.isArray(freightInfo) && freightInfo.length ?
+        freightInfo.slice() : [{
+          qty: "", weight: "", weightType: "total", class: "",
+          length: "", width: "", height: "", dimType: "PLT",
+        }];
+      let html = "<div class='freight-block' data-freight-lane='" +
+        esc(laneKey) + "'>";
+      html += "<h3>Freight / dimensions</h3>";
+      html += "<table class='freight-edit'><thead><tr>" +
+        "<th>Qty</th><th>Weight</th><th>Wt type</th><th>Class</th>" +
+        "<th>L</th><th>W</th><th>H</th><th>Dim type</th><th></th>" +
+        "</tr></thead><tbody>";
+      rows.forEach((f, i) => {
+        const wt = f.weightType === "each" ? "each" : "total";
+        html += "<tr data-freight-row='" + i + "'>";
+        ["qty", "weight"].forEach((k) => {
+          html += "<td><input data-f='" + k + "' value='" +
+            esc(f[k] != null ? f[k] : "") + "'></td>";
+        });
+        html += "<td><select data-f='weightType'>" +
+          "<option value='total'" + (wt === "total" ? " selected" : "") +
+          ">total</option>" +
+          "<option value='each'" + (wt === "each" ? " selected" : "") +
+          ">each</option></select></td>";
+        html += "<td><input data-f='class' value='" +
+          esc(f.class != null ? f.class : "") + "'></td>";
+        ["length", "width", "height"].forEach((k) => {
+          html += "<td><input data-f='" + k + "' value='" +
+            esc(f[k] != null ? f[k] : "") + "'></td>";
+        });
+        html += "<td><input data-f='dimType' value='" +
+          esc(f.dimType || f.packaging || "PLT") + "'></td>";
+        html += "<td><button type='button' class='ghost btn-rm-freight' " +
+          "title='Remove line'>×</button></td>";
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      html += "<button type='button' class='ghost btn-add-freight' " +
+        "data-lane='" + esc(laneKey) +
+        "' style='margin-top:8px'>Add freight line</button>";
+      html += "</div>";
+      return html;
+    }
+
+    function readAddressBlock(root, selector) {
+      const block = root.querySelector(selector);
+      if (!block) return null;
+      const out = {};
+      block.querySelectorAll("[data-f]").forEach((el) => {
+        out[el.getAttribute("data-f")] = el.value;
+      });
+      return out;
+    }
+
+    function readFreightBlock(root, laneKey) {
+      const block = root.querySelector(
+          '[data-freight-lane="' + laneKey + '"]');
+      if (!block) return [];
+      const rows = [];
+      block.querySelectorAll("tbody tr").forEach((tr) => {
+        const row = {};
+        tr.querySelectorAll("[data-f]").forEach((el) => {
+          row[el.getAttribute("data-f")] = el.value;
+        });
+        rows.push(row);
+      });
+      return rows;
+    }
+
+    function collectQuoteDetailsPayload() {
+      const detailsRoot = document.getElementById("quote-details");
+      const payload = {
+        customerRef: detailsRoot.querySelector("[data-q='customerRef']").value,
+        shippingLocationName:
+          detailsRoot.querySelector("[data-q='customerName']").value,
+        readyDate: detailsRoot.querySelector("[data-q='readyDate']").value,
+        specialInstructionsGlobal:
+          detailsRoot.querySelector("[data-q='specialGlobal']").value,
+        shipper: readAddressBlock(detailsRoot, "[data-addr='quote-shipper']"),
+        lanes: [],
+      };
+      document.querySelectorAll(".lane[data-lane-key]").forEach((laneEl) => {
+        const laneKey = laneEl.getAttribute("data-lane-key");
+        payload.lanes.push({
+          laneKey,
+          shipper: readAddressBlock(laneEl, "[data-addr='shipper']"),
+          consignee: readAddressBlock(laneEl, "[data-addr='consignee']"),
+          freightInfo: readFreightBlock(laneEl, laneKey),
+          specialInstructions: (laneEl.querySelector("[data-lane-special]") ||
+            {value: ""}).value,
+        });
+      });
+      return payload;
+    }
+
+    function renderQuoteDetails(q) {
+      const el = document.getElementById("quote-details");
+      if (!el) return;
+      let html = "<h3>Quote details</h3><div class='details-grid'>";
+      html += "<div><label class='field-label'>Customer name</label>" +
+        "<input class='field-input' data-q='customerName' value='" +
+        esc(q.shippingLocationName || "") + "'></div>";
+      html += "<div><label class='field-label'>Customer ref</label>" +
+        "<input class='field-input' data-q='customerRef' value='" +
+        esc(q.customerRef || "") + "'></div>";
+      html += "<div><label class='field-label'>Ready date</label>" +
+        "<input class='field-input' data-q='readyDate' type='date' value='" +
+        esc((q.readyDate || "").toString().slice(0, 10)) + "'></div>";
+      html += "<div class='span-2'><label class='field-label'>" +
+        "Special instructions (global)</label>" +
+        "<textarea class='field-textarea' data-q='specialGlobal'>" +
+        esc(q.specialInstructionsGlobal || "") + "</textarea></div>";
+      html += "</div>";
+      html += renderAddressEditor(
+          "quote-shipper", q.shipper, "Default from (shipper)");
+      html += "<div class='details-actions'>" +
+        "<button type='button' id='btn-save-details'>Save details</button>" +
+        "<button type='button' class='ghost' id='btn-save-rerate'>" +
+        "Save details &amp; rerun rates</button>" +
+        "</div>";
+      el.innerHTML = html;
+
+      const save = async (rerun) => {
+        const btn = document.getElementById(
+            rerun ? "btn-save-rerate" : "btn-save-details");
+        const other = document.getElementById(
+            rerun ? "btn-save-details" : "btn-save-rerate");
+        btn.disabled = true;
+        other.disabled = true;
+        const prev = btn.textContent;
+        btn.textContent = rerun ? "Saving & re-rating…" : "Saving…";
+        try {
+          const details = collectQuoteDetailsPayload();
+          const res = await apiFetch("/updateQuoteDetails", {
+            method: "POST",
+            body: JSON.stringify({
+              tenantId: TENANT_ID,
+              quoteId: QUOTE_ID,
+              details,
+              dispatcherId: DISPATCHER_ID || undefined,
+              token: TOKEN || undefined,
+            }),
+          });
+          if (!res.ok) throw new Error(res.error || "Save details failed");
+          if (rerun) {
+            const rateRes = await apiFetch("/rerunQuoteRates", {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: QUOTE_ID,
+                dispatcherId: DISPATCHER_ID || undefined,
+                token: TOKEN || undefined,
+              }),
+            });
+            if (!rateRes.ok) {
+              throw new Error(rateRes.error || "Rerun rates failed");
+            }
+            applyQuote(rateRes.quote);
+            showMsg("Details saved and rates refreshed.", true);
+          } else {
+            applyQuote(res.quote);
+            showMsg(
+                "Details saved. Rerun rates to refresh carrier options.",
+                true);
+          }
+        } catch (err) {
+          showMsg(err.message || "Save details failed", false);
+        } finally {
+          btn.disabled = false;
+          other.disabled = false;
+          btn.textContent = prev;
+        }
+      };
+      document.getElementById("btn-save-details")
+          .addEventListener("click", () => save(false));
+      document.getElementById("btn-save-rerate")
+          .addEventListener("click", () => save(true));
+    }
+
     function renderLaneSummary(lane) {
-      const from = formatAddressBlock(
-          lane.shipper || (quote && quote.shipper) || null);
-      const to = formatAddressBlock(lane.consignee || null);
       let html = "<div class='lane-summary'>";
-      html += "<div class='addr-block'><h3>From (shipper)</h3>";
-      if (from.missing) {
-        html += "<p class='addr-missing'>No shipper address on file.</p>";
-      } else {
-        if (from.name) {
-          html += "<div class='addr-name'>" + esc(from.name) + "</div>";
-        }
-        if (from.lines) {
-          html += "<div class='addr-lines'>" + esc(from.lines) + "</div>";
-        }
+      html += renderAddressEditor(
+          "shipper",
+          lane.shipper || (quote && quote.shipper) || null,
+          "From (shipper)");
+      html += renderAddressEditor(
+          "consignee", lane.consignee || null, "To (consignee)");
+      html += renderFreightEditor(lane.laneKey, lane.freightInfo);
+      html += "<div class='span-2' style='grid-column:1/-1'>" +
+        "<label class='field-label'>Special instructions (lane)</label>" +
+        "<textarea class='field-textarea' data-lane-special>" +
+        esc(lane.specialInstructions || "") + "</textarea></div>";
+      if (lane.notesForCustomer) {
+        html += "<div class='dispatcher-note span-2' style='grid-column:1/-1'>" +
+          "<strong>Dispatcher note (not emailed)</strong>" +
+          esc(lane.notesForCustomer) + "</div>";
       }
-      html += "</div>";
-      html += "<div class='addr-block'><h3>To (consignee)</h3>";
-      if (to.missing) {
-        html += "<p class='addr-missing'>No consignee address on file.</p>";
-      } else {
-        if (to.name) {
-          html += "<div class='addr-name'>" + esc(to.name) + "</div>";
-        }
-        if (to.lines) {
-          html += "<div class='addr-lines'>" + esc(to.lines) + "</div>";
-        }
-      }
-      html += "</div>";
-      html += "<div class='freight-block'><h3>Freight / dimensions</h3>" +
-        renderFreightTable(lane.freightInfo) + "</div>";
       html += "</div>";
       return html;
     }
@@ -1356,6 +1612,7 @@
       (quote.lanes || []).forEach((lane, idx) => {
         const div = document.createElement("div");
         div.className = "lane" + (idx === 0 ? " open" : "");
+        div.setAttribute("data-lane-key", lane.laneKey);
         const selected = new Set(selections[lane.laneKey] || []);
         const accSet = new Set(laneAccessorials[lane.laneKey] || lane.accessorials || []);
 
@@ -1420,7 +1677,7 @@
                     value="${esc(custStr)}">
                 </label>
                 ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
-                <span class="rate-meta">${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}</span>
+                <span class="rate-meta">${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}${opt.costQuoteId ? " · saved" : ""}</span>
               </div>
               ${(() => {
                 const note = cleanNote(opt.warnings);
@@ -1567,6 +1824,39 @@
           }
         });
       });
+
+      root.querySelectorAll(".btn-add-freight").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const block = btn.closest("[data-freight-lane]");
+          if (!block) return;
+          const tbody = block.querySelector("tbody");
+          if (!tbody) return;
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            "<td><input data-f='qty' value=''></td>" +
+            "<td><input data-f='weight' value=''></td>" +
+            "<td><select data-f='weightType'>" +
+            "<option value='total' selected>total</option>" +
+            "<option value='each'>each</option></select></td>" +
+            "<td><input data-f='class' value=''></td>" +
+            "<td><input data-f='length' value=''></td>" +
+            "<td><input data-f='width' value=''></td>" +
+            "<td><input data-f='height' value=''></td>" +
+            "<td><input data-f='dimType' value='PLT'></td>" +
+            "<td><button type='button' class='ghost btn-rm-freight' " +
+            "title='Remove line'>×</button></td>";
+          tbody.appendChild(tr);
+          tr.querySelector(".btn-rm-freight").addEventListener("click", () => {
+            tr.remove();
+          });
+        });
+      });
+      root.querySelectorAll(".btn-rm-freight").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const tr = btn.closest("tr");
+          if (tr) tr.remove();
+        });
+      });
     }
 
     document.getElementById("btn-generate").addEventListener("click", async () => {
@@ -1582,6 +1872,10 @@
             false);
         return;
       }
+      const btn = document.getElementById("btn-generate");
+      btn.disabled = true;
+      const prevLabel = btn.textContent;
+      btn.textContent = "Saving rates…";
       try {
         const res = await apiFetch("/generateQuoteEmail", {
           method: "POST",
@@ -1595,15 +1889,33 @@
           }),
         });
         if (!res.ok) throw new Error(res.error || "Generate failed");
+        if (res.quote) applyQuote(res.quote);
         document.getElementById("draft-text").value = res.text || "";
         draftReady = true;
         document.getElementById("btn-approve").disabled = false;
         document.getElementById("btn-copy").disabled = false;
         document.getElementById("status-badge").textContent = "draft_ready";
         document.getElementById("status-badge").className = "badge draft_ready";
-        showMsg("Email draft generated. Review, then Approve to send.", true);
+        const failed = (res.saveResults || []).filter((r) => !r.ok);
+        if (res.partial || failed.length) {
+          const names = failed.map((r) => r.name || r.rateId).join(", ");
+          showMsg(
+              "Draft generated for " + (res.savedCount || 0) +
+              " saved rate(s). Failed to save: " + names +
+              ". Failed rates were left out of the email.",
+              false);
+        } else {
+          showMsg(
+              "Rates saved to Primus and email draft generated. " +
+              "Review, then Approve to send.",
+              true);
+        }
       } catch (err) {
         showMsg(err.message || "Generate failed", false);
+      } finally {
+        btn.disabled = quote &&
+          (quote.status === "sent" || quote.status === "dismissed");
+        btn.textContent = prevLabel;
       }
     });
 
