@@ -41,37 +41,97 @@ function col(tenant, name) {
 
 /**
  * Resolves Primus customer match from sender email domain / customer name.
- * @param {object} opts from, customerRef.
- * @return {Promise<object>} `{id, name}` — id may be null.
+ * @param {object} opts from, customerRef, customerName, allowDefault?.
+ * @return {Promise<object>} `{id, name, code?, searchTerm?}` — id may be null.
  */
 async function resolveCustomerMatch(opts) {
   const ref = String(opts.customerRef || "");
+  const customerName = String(
+      opts.customerName || opts.shippingLocationName || "").trim();
+  const hay = `${ref} ${customerName} ${opts.from || ""}`;
   const searchTerms = [];
-  if (/menards/i.test(ref)) searchTerms.push("menards");
-  if (/sleeptone|sanders/i.test(ref + opts.from)) {
+  if (customerName) searchTerms.push(customerName);
+  if (/menards/i.test(hay)) searchTerms.push("menards");
+  if (/sleeptone|sanders/i.test(hay)) {
     searchTerms.push("sanders", "sleeptone");
   }
-  if (/ruelily/i.test(ref + opts.from)) searchTerms.push("ruelily");
-  if (/ctadigital|petra/i.test(ref + opts.from)) {
+  if (/ruelily/i.test(hay)) searchTerms.push("ruelily");
+  if (/ctadigital|petra/i.test(hay)) {
     searchTerms.push("ctadigital", "petra");
   }
-  if (/coreforce|isnetusa|lifeworks/i.test(ref + opts.from)) {
+  if (/coreforce|isnetusa|lifeworks/i.test(hay)) {
     searchTerms.push("coreforce", "lifeworks");
   }
 
   const match = await rateShop.resolveCustomerForQuote({
     from: opts.from,
     customerRef: opts.customerRef,
+    customerName,
     searchTerms,
   });
   if (match && match.id) {
     return {
       id: String(match.id),
       name: match.name || null,
+      code: match.code || null,
+      searchTerm: match.searchTerm || null,
     };
+  }
+  if (opts.allowDefault === false) {
+    return {id: null, name: null};
   }
   const fallback = process.env.QUOTE_DEFAULT_SHIPPING_LOCATION_ID || null;
   return {id: fallback, name: null};
+}
+
+/**
+ * Looks up Primus customer for dispatcher-edited quote details.
+ * Keeps prior shippingLocationId when search fails.
+ * @param {object} data Existing quote doc.
+ * @param {object} patch Pending update patch (mutated).
+ * @param {object} [opts] forceLookup?.
+ * @return {Promise<object>} `{customerMatch, customerMatchMessage}`.
+ */
+async function applyCustomerLookupToPatch(data, patch, opts = {}) {
+  const customerName = String(
+      patch.shippingLocationName != null ?
+        patch.shippingLocationName :
+        (data.shippingLocationName || "")).trim();
+  const customerRef = String(
+      patch.customerRef != null ? patch.customerRef :
+        (data.customerRef || "")).trim();
+  const hasLookupSignal = !!(customerName || customerRef);
+  if (!hasLookupSignal) {
+    return {customerMatch: null, customerMatchMessage: null};
+  }
+
+  const match = await resolveCustomerMatch({
+    from: data.from || "",
+    customerRef,
+    customerName,
+    allowDefault: false,
+  });
+
+  if (match && match.id) {
+    patch.shippingLocationId = String(match.id);
+    if (match.name) patch.shippingLocationName = match.name;
+    patch.customerLookupStatus = "matched";
+    patch.customerLookupQuery = customerName || customerRef || null;
+    const customerMatch = {
+      id: String(match.id),
+      name: match.name || null,
+      code: match.code || null,
+    };
+    return {customerMatch, customerMatchMessage: null};
+  }
+
+  // Keep previous shippingLocationId; surface failed name lookup.
+  patch.customerLookupStatus = "no_match";
+  patch.customerLookupQuery = customerName || customerRef || null;
+  return {
+    customerMatch: null,
+    customerMatchMessage: "No Primus match for name",
+  };
 }
 
 /**
@@ -280,6 +340,25 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
     patch.status = "awaiting_dispatcher";
   }
 
+  const nameOrRefTouched = details.customerRef != null ||
+    details.shippingLocationName != null ||
+    details.matchedCustomerName != null ||
+    details.customerName != null;
+  let customerMatch = null;
+  let customerMatchMessage = null;
+  if (nameOrRefTouched) {
+    // Prefer explicit customerName from UI if present.
+    if (details.customerName != null &&
+        details.shippingLocationName == null &&
+        details.matchedCustomerName == null) {
+      patch.shippingLocationName =
+        String(details.customerName).trim() || null;
+    }
+    const lookup = await applyCustomerLookupToPatch(data, patch);
+    customerMatch = lookup.customerMatch;
+    customerMatchMessage = lookup.customerMatchMessage;
+  }
+
   await ref.update(patch);
 
   const fresh = await ref.get();
@@ -287,6 +366,8 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
   return {
     ok: true,
     quote: quoteOutput.serializeForDispatcherPage(quote),
+    customerMatch,
+    customerMatchMessage,
   };
 }
 
@@ -985,6 +1066,16 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
       opts.accessorialsWithData : null;
   const targetKey = opts.laneKey ? String(opts.laneKey) : null;
 
+  // Re-resolve Primus customer from name/ref before rate shop.
+  const customerPatch = {};
+  const lookup = await applyCustomerLookupToPatch(data, customerPatch, {
+    forceLookup: true,
+  });
+  const shippingLocationId = customerPatch.shippingLocationId != null ?
+    customerPatch.shippingLocationId : data.shippingLocationId;
+  const shippingLocationName = customerPatch.shippingLocationName != null ?
+    customerPatch.shippingLocationName : data.shippingLocationName;
+
   const ratedLanes = [];
   for (const lane of data.lanes || []) {
     if (targetKey && lane.laneKey !== targetKey) {
@@ -997,7 +1088,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         shipper: lane.shipper || data.shipper,
       }, {
         rules,
-        shippingLocationId: data.shippingLocationId,
+        shippingLocationId,
         extracted: data.extracted || {},
         customerPrefs: {},
         accessorialOverride: accessorialOverride != null ?
@@ -1030,6 +1121,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
   }
 
   const patch = {
+    ...customerPatch,
     lanes: ratedLanes,
     status: "awaiting_dispatcher",
     customerEmailText: admin.firestore.FieldValue.delete(),
@@ -1041,10 +1133,19 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
   }
   await ref.update(patch);
 
-  const quote = {id: quoteId, ...data, lanes: ratedLanes};
+  const quote = {
+    id: quoteId,
+    ...data,
+    ...customerPatch,
+    shippingLocationId,
+    shippingLocationName,
+    lanes: ratedLanes,
+  };
   return {
     ok: true,
     quote: quoteOutput.serializeForDispatcherPage(quote),
+    customerMatch: lookup.customerMatch,
+    customerMatchMessage: lookup.customerMatchMessage,
   };
 }
 

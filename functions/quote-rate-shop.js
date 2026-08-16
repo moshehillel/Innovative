@@ -5,6 +5,8 @@
 
 "use strict";
 
+const quoteOutput = require("./quote-output");
+
 let getPrimusToken = null;
 
 /** @type {"list"|"json"} How accessorial codes are sent on rate calls. */
@@ -94,8 +96,10 @@ async function primusFetch(path, opts = {}) {
  */
 function normalizeRateRow(r) {
   const remarks = Array.isArray(r.rateRemarks) ?
-    r.rateRemarks.join(" ") : "";
-  const warnings = r.warnings || remarks || "";
+    r.rateRemarks.join(" ") :
+    (r.rateRemarks || "");
+  const rawWarnings = r.warnings || remarks || "";
+  const warnings = quoteOutput.cleanCarrierNote(rawWarnings);
   const guaranteed =
     r.guaranteed === true ||
     String(r.rateType || "").toUpperCase() === "GUARANTEED";
@@ -255,15 +259,43 @@ async function getShippingLocationById(id) {
 }
 
 /**
+ * Loose company-name normalize for Primus customer matching.
+ * @param {string} value Raw name.
+ * @return {string}
+ */
+function normalizeCustomerName(value) {
+  return String(value || "")
+      .toLowerCase()
+      .replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, " ")
+      .replace(/\b(inc|llc|ltd|corp|corporation|co|company)\b\.?/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
  * Picks best customer match from search results.
  * @param {Array<object>} results Shipping locations.
- * @param {object} opts from email, customerRef.
+ * @param {object} opts from email, customerRef, customerName.
  * @return {object|null}
  */
 function pickBestCustomerMatch(results, opts = {}) {
   if (!Array.isArray(results) || !results.length) return null;
   const from = String(opts.from || "").toLowerCase();
   const ref = String(opts.customerRef || "").toLowerCase();
+  const wantName = normalizeCustomerName(
+      opts.customerName || opts.name || "");
+
+  if (wantName) {
+    for (const row of results) {
+      if (normalizeCustomerName(row.name) === wantName) return row;
+    }
+    for (const row of results) {
+      const name = normalizeCustomerName(row.name);
+      if (name && (name.includes(wantName) || wantName.includes(name))) {
+        return row;
+      }
+    }
+  }
 
   for (const row of results) {
     const email = String(row.email || "").toLowerCase();
@@ -276,12 +308,14 @@ function pickBestCustomerMatch(results, opts = {}) {
     const name = String(row.name || "").toLowerCase();
     if (name && (from.includes(name) || ref.includes(name))) return row;
   }
+  // Name-driven search: avoid picking an unrelated first hit.
+  if (wantName) return null;
   return results[0];
 }
 
 /**
  * Resolves Primus customer id (shipping location) for rate shop.
- * @param {object} opts from, customerRef, searchTerms[].
+ * @param {object} opts from, customerRef, customerName, searchTerms[].
  * @return {Promise<object|null>} {id, name, code, customer}
  */
 async function resolveCustomerForQuote(opts = {}) {
@@ -289,24 +323,40 @@ async function resolveCustomerForQuote(opts = {}) {
   const emailMatch = from.match(/<([^>]+@[^>]+)>|([\w.+-]+@[\w.-]+)/);
   const email = emailMatch ? (emailMatch[1] || emailMatch[2]) : "";
   const searches = [];
+  const addSearch = (term) => {
+    const t = String(term || "").trim();
+    if (t.length < 2) return;
+    if (!searches.some((s) => s.toLowerCase() === t.toLowerCase())) {
+      searches.push(t);
+    }
+  };
+
+  // Dispatcher-entered customer name is the strongest signal.
+  addSearch(opts.customerName || opts.name || "");
 
   if (email.includes("@")) {
     const local = email.split("@")[0];
     const domain = email.split("@")[1];
     const domainStem = domain.split(".")[0];
-    if (domainStem.length > 2) searches.push(domainStem);
-    if (local.length > 2) searches.push(local);
+    if (domainStem.length > 2) addSearch(domainStem);
+    if (local.length > 2) addSearch(local);
   }
 
   const domainMatch = from.match(/@([\w.-]+)/);
   if (domainMatch) {
     const stem = domainMatch[1].split(".")[0];
-    if (stem.length > 2 && !searches.includes(stem)) searches.push(stem);
+    if (stem.length > 2) addSearch(stem);
   }
 
   for (const term of opts.searchTerms || []) {
-    if (term && !searches.includes(term)) searches.push(String(term));
+    addSearch(term);
   }
+
+  const matchOpts = {
+    from: opts.from,
+    customerRef: opts.customerRef,
+    customerName: opts.customerName || opts.name || "",
+  };
 
   for (const term of searches) {
     try {
@@ -316,7 +366,7 @@ async function resolveCustomerForQuote(opts = {}) {
         active: true,
         isCustomer: true,
       });
-      const best = pickBestCustomerMatch(res.results, opts);
+      const best = pickBestCustomerMatch(res.results, matchOpts);
       if (best && best.id) {
         return {
           id: String(best.id),
@@ -324,6 +374,7 @@ async function resolveCustomerForQuote(opts = {}) {
           code: best.code || null,
           customer: best.customer === true,
           email: best.email || null,
+          searchTerm: term,
         };
       }
     } catch (_) {
@@ -495,6 +546,9 @@ function normalizeDimType(value, row = {}) {
     IN: "PLT",
     INCH: "PLT",
     INCHES: "PLT",
+    // AI sometimes writes unit word as packaging type.
+    CM: "PLT",
+    CMS: "PLT",
     CARTON: "CTN",
     CARTONS: "CTN",
     CTNS: "CTN",
@@ -540,6 +594,10 @@ function normalizeFreightInfoForRate(freightInfo) {
   return rows.map((row) => {
     const r = row && typeof row === "object" ? {...row} : {};
     r.dimType = normalizeDimType(r.dimType, r);
+    // Primus requires weightType; AI extract often omits it.
+    const wt = String(r.weightType || "").trim().toLowerCase();
+    r.weightType = (wt === "each" || wt === "perpiece" || wt === "per-piece") ?
+      "each" : "total";
     return r;
   });
 }

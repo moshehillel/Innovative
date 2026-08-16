@@ -447,6 +447,14 @@ function serializeForDispatcherPage(quote) {
     String(quote.shippingLocationId) : null;
   const shippingLocationName = quote.shippingLocationName ||
     quote.matchedCustomerName || null;
+  const customerLookupStatus = quote.customerLookupStatus || null;
+  const customerMatch = shippingLocationId &&
+    customerLookupStatus !== "no_match" ? {
+      id: shippingLocationId,
+      name: shippingLocationName,
+    } : null;
+  const customerMatchMessage = customerLookupStatus === "no_match" ?
+    "No Primus match for name" : null;
   const quoteShipper = quote.shipper ||
     (quote.extracted && quote.extracted.shipper) || null;
   return {
@@ -461,7 +469,11 @@ function serializeForDispatcherPage(quote) {
     shipper: quoteShipper,
     shippingLocationId,
     shippingLocationName,
-    customerMatched: !!shippingLocationId,
+    customerMatched: !!(customerMatch && shippingLocationId),
+    customerMatch,
+    customerMatchMessage,
+    customerLookupStatus,
+    customerLookupQuery: quote.customerLookupQuery || null,
     // Text draft only — omit unused HTML/catalog fields for leaner payload.
     customerDraftText: storedEmail || buildCustomerDraftText(quote),
     customerEmailText: storedEmail,

@@ -1037,6 +1037,16 @@
     function renderCustomerMatch(q) {
       const el = document.getElementById("customer-match");
       if (!el) return;
+      if (q.customerLookupStatus === "no_match" ||
+          q.customerMatchMessage === "No Primus match for name") {
+        const qName = q.customerLookupQuery || q.shippingLocationName || "";
+        el.innerHTML = "<span class='badge nomatch'>" +
+          "No Primus match for name" +
+          (qName ? " (“" + esc(qName) + "”)" : "") +
+          "</span>";
+        el.classList.remove("hidden");
+        return;
+      }
       if (q.customerMatched && q.shippingLocationId) {
         const name = q.shippingLocationName ?
           esc(q.shippingLocationName) + " · " : "";
@@ -1386,12 +1396,29 @@
               throw new Error(rateRes.error || "Rerun rates failed");
             }
             applyQuote(rateRes.quote);
-            showMsg("Details saved and rates refreshed.", true);
+            if (rateRes.customerMatchMessage) {
+              showMsg(rateRes.customerMatchMessage +
+                " — rates used prior customer id if any.", true);
+            } else if (rateRes.customerMatch && rateRes.customerMatch.id) {
+              showMsg("Details saved, Primus customer matched (" +
+                (rateRes.customerMatch.name || rateRes.customerMatch.id) +
+                "), rates refreshed.", true);
+            } else {
+              showMsg("Details saved and rates refreshed.", true);
+            }
           } else {
             applyQuote(res.quote);
-            showMsg(
-                "Details saved. Rerun rates to refresh carrier options.",
-                true);
+            if (res.customerMatchMessage) {
+              showMsg(res.customerMatchMessage, true);
+            } else if (res.customerMatch && res.customerMatch.id) {
+              showMsg("Details saved. Primus customer: " +
+                (res.customerMatch.name || res.customerMatch.id) +
+                ". Rerun rates to refresh carrier options.", true);
+            } else {
+              showMsg(
+                  "Details saved. Rerun rates to refresh carrier options.",
+                  true);
+            }
           }
         } catch (err) {
           showMsg(err.message || "Save details failed", false);
