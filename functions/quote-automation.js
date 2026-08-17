@@ -501,12 +501,54 @@ async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
 }
 
 /**
+ * Checks lane has enough origin/destination/freight for Primus rating.
+ * @param {object} lane Lane.
+ * @return {{ok: boolean, reason: string|null}}
+ */
+function validateLaneForRating(lane) {
+  const ship = lane.shipper || {};
+  const cons = lane.consignee || {};
+  const originZip = ship.zipCode || ship.zipcode || ship.zip;
+  const destZip = cons.zipCode || cons.zipcode || cons.zip;
+  const missing = [];
+  if (!String(ship.city || "").trim() || !String(ship.state || "").trim() ||
+      !String(originZip || "").trim()) {
+    missing.push("origin city/state/zip");
+  }
+  if (!String(cons.city || "").trim() || !String(cons.state || "").trim() ||
+      !String(destZip || "").trim()) {
+    missing.push("destination city/state/zip");
+  }
+  const freight = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+  const hasFreight = freight.some((r) =>
+    r && (r.weight != null || r.qty != null));
+  if (!hasFreight) missing.push("freight weight/qty");
+  if (!missing.length) return {ok: true, reason: null};
+  return {
+    ok: false,
+    reason: "Cannot rate — missing " + missing.join(" and ") +
+      ". Fill quote details and rerun.",
+  };
+}
+
+/**
  * Rates one lane and returns top options with sell rates.
  * @param {object} lane Lane with shipper, consignee, freightInfo.
  * @param {object} ctx Context with rules, shippingLocationId, margin opts.
  * @return {Promise<object>}
  */
 async function rateLane(lane, ctx) {
+  const odCheck = validateLaneForRating(lane);
+  if (!odCheck.ok) {
+    return {
+      ...lane,
+      options: [],
+      rateError: odCheck.reason,
+      appliedRules: Array.isArray(lane.freightRulesApplied) ?
+        lane.freightRulesApplied : [],
+    };
+  }
+
   let rulesOut;
   if (Array.isArray(ctx.accessorialOverride)) {
     const codes = quoteAccCatalog.normalizeRerunAccessorialCodes(
@@ -554,7 +596,27 @@ async function rateLane(lane, ctx) {
     timeout: process.env.QUOTE_RATE_TIMEOUT || undefined,
   });
 
-  const {rates} = await rateShop.fetchMultipleRates(query);
+  let fetched = await rateShop.fetchMultipleRates(query);
+  let rates = fetched.rates || [];
+  let noRates = fetched.noRates || [];
+  let rateNote = null;
+
+  // Matched customers without carrier profiles (or missing class) often
+  // return empty rates. Keep the match on the quote, but fall back to
+  // market rates so the dispatcher still has options.
+  if (!rates.length && ctx.shippingLocationId &&
+      rateShop.shouldRetryRatesWithoutCustomer(noRates)) {
+    const fallbackQuery = {...query};
+    delete fallbackQuery.customerId;
+    fetched = await rateShop.fetchMultipleRates(fallbackQuery);
+    rates = fetched.rates || [];
+    noRates = fetched.noRates || [];
+    if (rates.length) {
+      rateNote = "Customer matched, but Primus had no customer-specific " +
+        "carrier profiles (or class was invalid). Showing market rates.";
+    }
+  }
+
   const filtered = rateShop.filterBlockedCarriers(
       rates, rulesOut.filterCarrierWarnings);
 
@@ -582,11 +644,21 @@ async function rateLane(lane, ctx) {
   const freightApplied = Array.isArray(lane.freightRulesApplied) ?
     lane.freightRulesApplied : [];
 
+  let rateError = null;
+  let rateWarning = null;
+  if (!options.length) {
+    rateError = rateShop.summarizeNoRateErrors(noRates) ||
+      "No rates returned from Primus.";
+  } else if (rateNote) {
+    rateWarning = rateNote;
+  }
+
   return {
     ...mergedLane,
     appliedRules: [...freightApplied, ...(mergedLane.appliedRules || [])],
     options,
-    rateError: null,
+    rateError,
+    rateWarning,
   };
 }
 
@@ -666,6 +738,7 @@ async function processQuoteEmail(opts) {
         shipper: lane.shipper || shipper,
         options: [],
         rateError: err.message,
+        rateWarning: null,
         appliedRules: Array.isArray(lane.freightRulesApplied) ?
           lane.freightRulesApplied : [],
       });
@@ -1101,6 +1174,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         ...rated,
         options: rated.options || [],
         rateError: rated.rateError || null,
+        rateWarning: rated.rateWarning || null,
         // Clear prior dispatcher picks after a fresh rate pull.
         selectedRateIds: [],
         selectedOptions: [],
@@ -1112,6 +1186,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         ...lane,
         options: [],
         rateError: err.message,
+        rateWarning: null,
         selectedRateIds: [],
         selectedOptions: [],
         selectedRateId: null,

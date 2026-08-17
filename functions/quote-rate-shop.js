@@ -128,13 +128,72 @@ function parseRatesFromResponse(json) {
 }
 
 /**
+ * Parses noRates carrier failures from /rate/multiple response.
+ * @param {object} json API JSON body.
+ * @return {Array<object>}
+ */
+function parseNoRatesFromResponse(json) {
+  const results = json && json.data && json.data.results;
+  if (!results || typeof results !== "object") return [];
+  return Array.isArray(results.noRates) ? results.noRates : [];
+}
+
+/**
+ * Summarizes Primus noRates errors for dispatcher UI.
+ * @param {Array<object>} noRates Carrier failure rows.
+ * @return {string|null}
+ */
+function summarizeNoRateErrors(noRates) {
+  const rows = Array.isArray(noRates) ? noRates : [];
+  if (!rows.length) return null;
+  const tallies = new Map();
+  for (const row of rows) {
+    const err = String((row && row.error) || "Unknown carrier error").trim();
+    if (!err) continue;
+    tallies.set(err, (tallies.get(err) || 0) + 1);
+  }
+  if (!tallies.size) return "No rates returned from Primus.";
+  const ranked = [...tallies.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([err, n]) => `${err} (${n})`);
+  return `Primus returned no rates: ${ranked.join("; ")}`;
+}
+
+/**
+ * True when empty rates are mostly customer-profile / class failures
+ * that often clear if we rate without a customerId.
+ * @param {Array<object>} noRates Carrier failure rows.
+ * @return {boolean}
+ */
+function shouldRetryRatesWithoutCustomer(noRates) {
+  const rows = Array.isArray(noRates) ? noRates : [];
+  if (!rows.length) return false;
+  let hits = 0;
+  for (const row of rows) {
+    const err = String((row && row.error) || "").toLowerCase();
+    if (err.includes("customer profile") ||
+        err.includes("class invalid") ||
+        err.includes("invalid class")) {
+      hits += 1;
+    }
+  }
+  return hits >= Math.max(1, Math.ceil(rows.length * 0.5));
+}
+
+/**
  * @param {object} params Flat + array query params for /rate/multiple.
- * @return {Promise<object>} {ok, rates, raw}
+ * @return {Promise<object>} {ok, rates, noRates, raw}
  */
 async function fetchMultipleRates(params) {
   const {query, queryArrays} = splitRateQueryParams(params);
   const json = await primusFetch("/rate/multiple", {query, queryArrays});
-  return {ok: true, rates: parseRatesFromResponse(json), raw: json};
+  return {
+    ok: true,
+    rates: parseRatesFromResponse(json),
+    noRates: parseNoRatesFromResponse(json),
+    raw: json,
+  };
 }
 
 /**
@@ -145,7 +204,12 @@ async function fetchMultipleRates(params) {
 async function fetchSingleRate(params) {
   const {query, queryArrays} = splitRateQueryParams(params);
   const json = await primusFetch("/rate", {query, queryArrays});
-  return {ok: true, rates: parseRatesFromResponse(json), raw: json};
+  return {
+    ok: true,
+    rates: parseRatesFromResponse(json),
+    noRates: parseNoRatesFromResponse(json),
+    raw: json,
+  };
 }
 
 /**
@@ -598,6 +662,9 @@ function normalizeFreightInfoForRate(freightInfo) {
     const wt = String(r.weightType || "").trim().toLowerCase();
     r.weightType = (wt === "each" || wt === "perpiece" || wt === "per-piece") ?
       "each" : "total";
+    // Null/blank class makes customer-profile rating fail with "Class invalid".
+    // Omit so Primus can density-calculate when possible.
+    if (r.class == null || r.class === "") delete r.class;
     return r;
   });
 }
@@ -798,6 +865,9 @@ module.exports = {
   pickTopOptions,
   normalizeRateRow,
   parseRatesFromResponse,
+  parseNoRatesFromResponse,
+  summarizeNoRateErrors,
+  shouldRetryRatesWithoutCustomer,
   normalizeIsoCountry,
   normalizeDimType,
   normalizeFreightInfoForRate,

@@ -496,6 +496,7 @@ function serializeForDispatcherPage(quote) {
       selectedRateIds: lane.selectedRateIds ||
         (lane.selectedRateId ? [lane.selectedRateId] : []),
       rateError: lane.rateError || null,
+      rateWarning: lane.rateWarning || null,
       options: (lane.options || []).map((o) => {
         const warningText = cleanCarrierNote(o.warnings || o.rateRemarks);
         // UI truncates notes to ~200 chars; trim payload for multi-rate lanes.

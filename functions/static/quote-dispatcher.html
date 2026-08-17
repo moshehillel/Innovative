@@ -1463,13 +1463,20 @@
               throw new Error(rateRes.error || "Rerun rates failed");
             }
             applyQuote(rateRes.quote);
-            if (rateRes.customerMatchMessage) {
+            const emptyLane = (rateRes.quote && rateRes.quote.lanes || [])
+                .find((l) => !(l.options || []).length);
+            if (emptyLane && emptyLane.rateError) {
+              showMsg(emptyLane.rateError, false);
+            } else if (rateRes.customerMatchMessage) {
               showMsg(rateRes.customerMatchMessage +
                 " — rates used prior customer id if any.", true);
             } else if (rateRes.customerMatch && rateRes.customerMatch.id) {
+              const warn = (rateRes.quote.lanes || [])
+                  .map((l) => l.rateWarning).find(Boolean);
               showMsg("Details saved, Primus customer matched (" +
                 (rateRes.customerMatch.name || rateRes.customerMatch.id) +
-                "), rates refreshed.", true);
+                "), rates refreshed." +
+                (warn ? " " + warn : ""), true);
             } else {
               showMsg("Details saved and rates refreshed.", true);
             }
@@ -1790,6 +1797,8 @@
         let optsHtml = "";
         if (lane.rateError) {
           optsHtml = "<div class='warn'>Rate error: " + esc(lane.rateError) + "</div>";
+        } else if (lane.rateWarning) {
+          optsHtml = "<div class='warn'>" + esc(lane.rateWarning) + "</div>";
         }
         (lane.options || []).forEach((opt) => {
           const isChecked = selected.has(String(opt.rateId));
