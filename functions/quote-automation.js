@@ -549,6 +549,30 @@ async function rateLane(lane, ctx) {
     };
   }
 
+  // Fill missing/invalid NMFC class from weight + dims (Primus density table).
+  const classFix = rateShop.ensureFreightClasses(lane.freightInfo || [], {
+    UOM: "US",
+  });
+  const freightWithClass = classFix.freightInfo;
+  const hasRateableClass = freightWithClass.some((r) =>
+    rateShop.isValidFreightClass(r && r.class));
+  if (!hasRateableClass && classFix.unresolved.length) {
+    const why = classFix.unresolved
+        .map((u) => `line ${u.index + 1}: ${u.reason}`)
+        .join("; ");
+    return {
+      ...lane,
+      freightInfo: freightWithClass,
+      options: [],
+      rateError: "Cannot rate — freight class missing and weight/dims are " +
+        "insufficient to derive NMFC class from density (" + why + ").",
+      appliedRules: Array.isArray(lane.freightRulesApplied) ?
+        lane.freightRulesApplied : [],
+    };
+  }
+
+  const laneForRate = {...lane, freightInfo: freightWithClass};
+
   let rulesOut;
   if (Array.isArray(ctx.accessorialOverride)) {
     const codes = quoteAccCatalog.normalizeRerunAccessorialCodes(
@@ -570,10 +594,10 @@ async function rateLane(lane, ctx) {
     };
   } else {
     rulesOut = quoteRules.applyRulesToLane(
-        lane, ctx.rules, ctx.extracted || {});
+        laneForRate, ctx.rules, ctx.extracted || {});
   }
   const mergedLane = {
-    ...lane,
+    ...laneForRate,
     accessorials: rulesOut.accessorials,
     accessorialsWithData: rulesOut.accessorialsWithData,
     appliedRules: rulesOut.appliedRules,
@@ -613,7 +637,7 @@ async function rateLane(lane, ctx) {
     noRates = fetched.noRates || [];
     if (rates.length) {
       rateNote = "Customer matched, but Primus had no customer-specific " +
-        "carrier profiles (or class was invalid). Showing market rates.";
+        "carrier profiles. Showing market rates.";
     }
   }
 

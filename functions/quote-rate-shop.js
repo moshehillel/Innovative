@@ -564,6 +564,38 @@ const PRIMUS_DIM_TYPES = new Set([
   "BDL", "ENV", "CYL", "CAS", "OTH", "TOT",
 ]);
 
+/** Valid NMFC freight classes Primus accepts on LTL rate calls. */
+const VALID_NMFC_CLASSES = new Set([
+  50, 55, 60, 65, 70, 77.5, 85, 92.5, 100, 110, 125, 150, 175,
+  200, 250, 300, 400, 500,
+]);
+
+/**
+ * Primus-compatible NMFC density → class table (pcf / lbs per cu ft).
+ * Matches Primus booking samples (density + class on pieces).
+ * Tenant /tools/densityrules is empty, so we use this local table.
+ */
+const DENSITY_CLASS_TABLE = [
+  {minPcf: 50, freightClass: 50},
+  {minPcf: 35, freightClass: 55},
+  {minPcf: 30, freightClass: 60},
+  {minPcf: 22.5, freightClass: 65},
+  {minPcf: 15, freightClass: 70},
+  {minPcf: 13.5, freightClass: 77.5},
+  {minPcf: 12, freightClass: 85},
+  {minPcf: 10.5, freightClass: 92.5},
+  {minPcf: 9, freightClass: 100},
+  {minPcf: 8, freightClass: 110},
+  {minPcf: 7, freightClass: 125},
+  {minPcf: 6, freightClass: 150},
+  {minPcf: 5, freightClass: 175},
+  {minPcf: 4, freightClass: 200},
+  {minPcf: 3, freightClass: 250},
+  {minPcf: 2, freightClass: 300},
+  {minPcf: 1, freightClass: 400},
+  {minPcf: 0, freightClass: 500},
+];
+
 /**
  * Normalize country to ISO 3166-1 alpha-2 for Primus rate APIs.
  * Primus rejects "USA" — it wants "US".
@@ -649,22 +681,139 @@ function normalizeDimType(value, row = {}) {
 }
 
 /**
+ * True when value is a Primus-accepted NMFC freight class.
+ * @param {*} value Raw class from extract / dispatcher.
+ * @return {boolean}
+ */
+function isValidFreightClass(value) {
+  if (value == null || value === "") return false;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  return VALID_NMFC_CLASSES.has(n);
+}
+
+/**
+ * Map density (lbs per cubic foot) to NMFC class.
+ * @param {number} densityPcf Pounds per cubic foot.
+ * @return {number|null}
+ */
+function classFromDensity(densityPcf) {
+  const d = Number(densityPcf);
+  if (!Number.isFinite(d) || d < 0) return null;
+  for (const row of DENSITY_CLASS_TABLE) {
+    if (d >= row.minPcf) return row.freightClass;
+  }
+  return 500;
+}
+
+/**
+ * Cubic feet for one piece from L×W×H.
+ * @param {object} row Freight line.
+ * @param {string} [uom] "US" (inches) or metric (cm).
+ * @return {number|null}
+ */
+function cubicFeetPerPiece(row, uom = "US") {
+  const length = Number(row && row.length);
+  const width = Number(row && row.width);
+  const height = Number(row && row.height);
+  if (!(length > 0 && width > 0 && height > 0)) return null;
+  const vol = length * width * height;
+  const isUs = String(uom || "US").toUpperCase() === "US";
+  // US dims are inches → /1728. Metric dims are cm → /28316.846592.
+  const cft = isUs ? (vol / 1728) : (vol / 28316.846592);
+  return cft > 0 ? cft : null;
+}
+
+/**
+ * Density (pcf) for a freight line from weight + dims.
+ * @param {object} row Freight line.
+ * @param {string} [uom] UOM for dim units.
+ * @return {{density: number, totalWeight: number, cubicFeet: number}|null}
+ */
+function densityFromFreightRow(row, uom = "US") {
+  if (!row || typeof row !== "object") return null;
+  const weight = Number(row.weight);
+  if (!(weight > 0)) return null;
+  const cftEach = cubicFeetPerPiece(row, uom);
+  if (!(cftEach > 0)) return null;
+  const qty = Number(row.qty);
+  const pieces = qty > 0 ? qty : 1;
+  const wt = String(row.weightType || "").trim().toLowerCase();
+  const weightIsEach =
+    wt === "each" || wt === "perpiece" || wt === "per-piece";
+  const totalWeight = weightIsEach ? weight * pieces : weight;
+  const totalCft = cftEach * pieces;
+  if (!(totalWeight > 0 && totalCft > 0)) return null;
+  return {
+    density: totalWeight / totalCft,
+    totalWeight,
+    cubicFeet: totalCft,
+  };
+}
+
+/**
+ * Derive NMFC class from weight + dims when class is missing/invalid.
+ * Primus /tools/densityrules is empty for this tenant; table matches
+ * Primus booking density/class pairs.
+ * @param {Array<object>} freightInfo Freight lines.
+ * @param {object} [opts] UOM.
+ * @return {{freightInfo: Array<object>, filled: number,
+ *   unresolved: Array<object>}}
+ */
+function ensureFreightClasses(freightInfo, opts = {}) {
+  const uom = opts.UOM || opts.uom || "US";
+  const rows = Array.isArray(freightInfo) ? freightInfo : [];
+  const unresolved = [];
+  let filled = 0;
+  const next = rows.map((row, idx) => {
+    const r = row && typeof row === "object" ? {...row} : {};
+    if (isValidFreightClass(r.class)) {
+      r.class = Number(r.class);
+      return r;
+    }
+    const dens = densityFromFreightRow(r, uom);
+    const cls = dens ? classFromDensity(dens.density) : null;
+    if (cls != null) {
+      r.class = cls;
+      if (dens.density > 0) {
+        r.density = Math.round(dens.density * 1000) / 1000;
+      }
+      filled += 1;
+      return r;
+    }
+    if (r.class == null || r.class === "") delete r.class;
+    else r.class = null;
+    unresolved.push({
+      index: idx,
+      reason: !(Number(r.weight) > 0) ?
+        "missing weight" :
+        "missing or invalid length/width/height",
+    });
+    return r;
+  });
+  return {freightInfo: next, filled, unresolved};
+}
+
+/**
  * Normalize freightInfo rows for Primus rate query.
  * @param {Array<object>} freightInfo Raw freight lines.
+ * @param {object} [opts] UOM for density class fill.
  * @return {Array<object>}
  */
-function normalizeFreightInfoForRate(freightInfo) {
-  const rows = Array.isArray(freightInfo) ? freightInfo : [];
-  return rows.map((row) => {
+function normalizeFreightInfoForRate(freightInfo, opts = {}) {
+  const ensured = ensureFreightClasses(freightInfo, opts);
+  return ensured.freightInfo.map((row) => {
     const r = row && typeof row === "object" ? {...row} : {};
     r.dimType = normalizeDimType(r.dimType, r);
     // Primus requires weightType; AI extract often omits it.
     const wt = String(r.weightType || "").trim().toLowerCase();
     r.weightType = (wt === "each" || wt === "perpiece" || wt === "per-piece") ?
       "each" : "total";
-    // Null/blank class makes customer-profile rating fail with "Class invalid".
-    // Omit so Primus can density-calculate when possible.
-    if (r.class == null || r.class === "") delete r.class;
+    // Drop density helper field from rate payload (UI may keep it on quote).
+    delete r.density;
+    // Still omit blank/invalid class so market rating can density-calc.
+    if (!isValidFreightClass(r.class)) delete r.class;
+    else r.class = Number(r.class);
     return r;
   });
 }
@@ -678,7 +827,10 @@ function normalizeFreightInfoForRate(freightInfo) {
 function buildRateMultipleQuery(lane, opts = {}) {
   const ship = lane.shipper || {};
   const cons = lane.consignee || {};
-  const freightInfo = normalizeFreightInfoForRate(lane.freightInfo || []);
+  const uom = String(opts.UOM || lane.UOM || "US").trim() || "US";
+  const freightInfo = normalizeFreightInfoForRate(lane.freightInfo || [], {
+    UOM: uom,
+  });
   const params = {
     originCity: String(ship.city || "").trim(),
     originState: String(ship.state || "").trim(),
@@ -688,7 +840,7 @@ function buildRateMultipleQuery(lane, opts = {}) {
     destinationState: String(cons.state || "").trim(),
     destinationZipcode: String(cons.zipCode || cons.zipcode || "").trim(),
     destinationCountry: normalizeIsoCountry(cons.country),
-    UOM: String(opts.UOM || lane.UOM || "US").trim() || "US",
+    UOM: uom,
     freightInfo: JSON.stringify(freightInfo),
   };
 
@@ -871,4 +1023,11 @@ module.exports = {
   normalizeIsoCountry,
   normalizeDimType,
   normalizeFreightInfoForRate,
+  isValidFreightClass,
+  classFromDensity,
+  cubicFeetPerPiece,
+  densityFromFreightRow,
+  ensureFreightClasses,
+  VALID_NMFC_CLASSES,
+  DENSITY_CLASS_TABLE,
 };
