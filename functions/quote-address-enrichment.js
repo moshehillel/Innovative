@@ -189,6 +189,47 @@ function consigneeSearchText(consignee, extraName) {
 }
 
 /**
+ * True when name/address looks like a US military installation.
+ * Avoids city names such as Fort Lauderdale / Fort Worth.
+ * @param {string} text Searchable text.
+ * @return {boolean}
+ */
+function isMilitarySiteText(text) {
+  const t = String(text || "").toLowerCase();
+  if (/aafes|military exchange|army (and )?air force/.test(t)) return true;
+  if (/\bmilitary(\s+(base|bases|post|installation|facility)s?)?\b/.test(t)) {
+    return true;
+  }
+  if (/\bair force base\b|\bafb\b|\bair force station\b/.test(t)) return true;
+  if (/\b(naval (air )?station|naval base|navy (base|yard)|navy exchange)\b/
+      .test(t)) {
+    return true;
+  }
+  if (/\b(marine corps (base|air station|recruit|depot)|\bmcas\b|\bmcb\b)/
+      .test(t)) {
+    return true;
+  }
+  if (/\bjoint base\b/.test(t)) return true;
+  if (/\b(army (base|post|depot|airfield|installation)|us army)\b/.test(t)) {
+    return true;
+  }
+  if (/\b(the )?pentagon\b/.test(t)) return true;
+  if (/\bcamp (lejeune|pendleton|hansen|schwab|foster|zama|humphreys|casey)\b/
+      .test(t)) {
+    return true;
+  }
+  if (/\bfort\s+(bragg|liberty|hood|cavazos|campbell|benning|moore)\b/
+      .test(t) ||
+    /\bfort\s+(stewart|drum|riley|sill|bliss|knox|irwin|meade)\b/.test(t) ||
+    /\bfort\s+(belvoir|wainwright|huachuca|eustis|jackson|novosel)\b/
+        .test(t) ||
+    /\bfort\s+(gregg|johnson|leonard wood|carson)\b/.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Fast site-type from consignee / facility name (no API).
  * @param {object} consignee Consignee.
  * @param {string} [extraName] Optional Google place name.
@@ -203,8 +244,12 @@ function classifyFromNameHeuristics(consignee, extraName) {
   if (/menards/.test(text)) {
     return heuristicResult("menards_dc", name || "Menards", 0.9);
   }
-  if (/aafes|military exchange|army air force/.test(text)) {
-    return heuristicResult("aafes_military", name || "AAFES", 0.9);
+  if (isMilitarySiteText(text) || isMilitarySiteText(name)) {
+    return heuristicResult(
+        "aafes_military",
+        (consignee && consignee.name) || extraName || "Military base",
+        0.9,
+    );
   }
   if (/\bamazon\b|\bfba\b|fulfillment|amzl?\b/.test(text) ||
     /\b[a-z]{3}\d\b/.test(name)) {
@@ -297,7 +342,7 @@ function mapGoogleTypesToSiteType(types, placeName) {
   const name = String(placeName || "").toLowerCase();
 
   if (/menards/.test(name)) return "menards_dc";
-  if (/aafes|military exchange|army air force/.test(name)) {
+  if (t.has("military_base") || isMilitarySiteText(name)) {
     return "aafes_military";
   }
   if (/amazon|fba|fulfillment|amz/.test(name) ||
@@ -463,6 +508,8 @@ async function classifyWithLuna(consignee) {
     "shipper explicitly says residential.",
     "Nursing homes, hospitals, rehab, schools, hotels, warehouses,",
     "DCs, stores are NOT residential.",
+    "Military bases, forts, AFB, naval/Marine stations, AAFES/exchanges",
+    "→ siteType aafes_military.",
     "If the only input is street+city with no facility name and no",
     "unit, prefer siteType other, residentialDelivery false,",
     "confidence <= 0.55.",
@@ -533,6 +580,8 @@ async function classifyWithWebSearch(consignee) {
     "residentialDelivery=true ONLY with strong dwelling signals.",
     "Nursing homes, hospitals, rehab, assisted living → nursing_home.",
     "Hotels/inns/suites → hotel. Warehouses/DCs/stores → other.",
+    "Military bases, forts, AFB, naval/Marine stations, AAFES/exchanges",
+    "→ siteType aafes_military.",
     "If web search finds a named facility, set placeName and siteType.",
     "If search finds nothing useful, siteType other, confidence <= 0.55,",
     "residentialDelivery false.",
@@ -918,6 +967,7 @@ module.exports = {
   saveCachedClassification,
   deleteCachedClassification,
   classifyFromNameHeuristics,
+  isMilitarySiteText,
   classifyWithGooglePlaces,
   classifyWithLuna,
   classifyWithWebSearch,

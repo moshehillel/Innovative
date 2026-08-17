@@ -335,6 +335,7 @@ function flagFromEmail(lane, flag) {
  */
 function ruleMatchViaText(lane, context, rule) {
   const match = rule.match || {};
+  if (!Object.keys(match).length) return null;
   const cons = lane.consignee || {};
   const name = cons.name || "";
   const addr = [cons.address1, cons.address2, cons.city].join(" ");
@@ -377,6 +378,7 @@ function ruleMatchViaText(lane, context, rule) {
  */
 function ruleMatchViaAi(lane, context, rule) {
   const match = rule.match || {};
+  if (!Object.keys(match).length) return null;
   const meta = lane.enrichmentMeta;
   if (!meta) return null;
 

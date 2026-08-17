@@ -10,6 +10,7 @@ const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const {
   IDENTIFY_VIA_VALUES,
   DEFAULT_IDENTIFY_VIA,
+  ACCESSORIAL_LABELS,
 } = require("./quote-accessorial-rules");
 
 const DEFAULT_MODEL = DEFAULT_OPENAI_MODEL;
@@ -195,23 +196,61 @@ function parseAccessorialsAnswer(text) {
 }
 
 /**
+ * User-only blob for topic inference. Assistant turns are ignored because
+ * the identify questionnaire always mentions aafes_military as an example.
+ * @param {Array<object>} messages Chat turns.
+ * @return {string}
+ */
+function userTopicBlob(messages) {
+  return (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n")
+      .toLowerCase();
+}
+
+/**
+ * Military / AAFES phrasing, including common typos (militery, millitary).
+ * @param {string} blob Lowercased user text.
+ * @return {boolean}
+ */
+function isMilitaryTopicBlob(blob) {
+  const t = String(blob || "");
+  return /\baafes\b/.test(t) ||
+    /\bmil+i?t+[ae]r+y\b/.test(t) ||
+    /\b(army|navy|air\s*force|marine)\s+(base|bases|post|installation)s?\b/
+        .test(t) ||
+    /\bjoint\s+bases?\b/.test(t);
+}
+
+/**
+ * Human rule name: "Military bases — limited access".
+ * @param {object} topic Topic from inferCreateTopic.
+ * @param {Array<string>} codes Accessorial codes.
+ * @return {string}
+ */
+function formatCreateRuleName(topic, codes) {
+  const labels = (codes || []).map((c) => {
+    const label = ACCESSORIAL_LABELS[String(c)];
+    return label ? String(label).toLowerCase() : String(c);
+  });
+  const base = (topic && topic.name) || "Site rule";
+  return labels.length ? `${base} — ${labels.join(", ")}` : base;
+}
+
+/**
  * Infer site-type / rule id from create-flow chat history.
  * @param {Array<object>} messages Chat turns.
  * @return {object} ruleId, name, siteType?, flags?, notes
  */
 function inferCreateTopic(messages) {
-  const blob = (messages || [])
-      .filter((m) => m && m.role !== "assistant")
-      .map((m) => String(m.content || ""))
-      .join("\n")
-      .toLowerCase();
-  if (/\baafes\b|\bmilitary(\s+(base|bases|exchange|installation)s?)?\b/
-      .test(blob)) {
+  const blob = userTopicBlob(messages);
+  if (isMilitaryTopicBlob(blob)) {
     return {
       ruleId: "aafes_military",
-      name: "Military bases / AAFES",
+      name: "Military bases",
       siteType: "aafes_military",
-      notes: "AI-classified military / AAFES delivery location.",
+      notes: "AI-classified military base / AAFES delivery location.",
     };
   }
   if (/\bnursing(\s+home)?s?\b/.test(blob)) {
@@ -326,13 +365,23 @@ function buildAddressOnlyCreateProposal(messages, accessorials) {
   if (Array.isArray(topic.flags) && topic.flags.length) {
     match.flags = topic.flags.slice();
   }
-  const name = codes.length ?
-    `${topic.name} — ${codes.join("/")}` :
-    topic.name;
-  const labels = codes.join(", ");
+  if (!Object.keys(match).length) {
+    return {
+      reply: "I need a site type to match before I can propose that rule. " +
+        "Known types: aafes_military (military bases / AAFES), " +
+        "nursing_home, hotel, amazon_fc, menards_dc, residential. " +
+        "Which site should this apply to?",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+  const name = formatCreateRuleName(topic, codes);
+  const labels = codes.map((c) => ACCESSORIAL_LABELS[c] || c).join(", ");
   return {
     reply: `Here's a proposed rule for ${topic.name} that adds ` +
-      `${labels} (identified via AI site classification). ` +
+      `${labels} (identified via AI site classification, ` +
+      `match.siteType ${match.siteType || "flags"}). ` +
       `Click Confirm to apply it.`,
     action: "propose_create_rule",
     proposal: {
@@ -361,55 +410,11 @@ function buildAddressOnlyCreateProposal(messages, accessorials) {
  * @return {object}
  */
 function finalizeAddressOnlyCreate(out, messages, extras) {
+  void out;
+  // Always use the deterministic proposal. Merging the model patch allowed
+  // empty match {} / custom_site_rule when the LLM missed siteType.
   const built = buildAddressOnlyCreateProposal(
       messages, extras.accessorials || []);
-  const reask = new RegExp(
-      "could not process|try rephrasing|which accessorials|" +
-      "please choose one",
-      "i",
-  );
-  if (out.action === "propose_create_rule" && out.proposal &&
-      typeof out.proposal === "object") {
-    const patch = out.proposal.patch &&
-      typeof out.proposal.patch === "object" ?
-      {...out.proposal.patch} : {};
-    patch.identifyVia = "ai";
-    const match = patch.match && typeof patch.match === "object" ?
-      {...patch.match} : {};
-    delete match.consigneeNameContains;
-    delete match.consigneeAddressContains;
-    delete match.instructionsContains;
-    delete match.referenceContains;
-    if (!match.siteType && extras.siteType) {
-      match.siteType = extras.siteType;
-    }
-    if (!Object.keys(match).length && built.proposal.patch.match) {
-      Object.assign(match, built.proposal.patch.match);
-    }
-    patch.match = match;
-    const existing = Array.isArray(patch.addAccessorials) ?
-      patch.addAccessorials.map(String) : [];
-    const have = new Set(existing.map((c) => c.toUpperCase()));
-    const merged = existing.slice();
-    for (const code of extras.accessorials || []) {
-      if (!have.has(code)) merged.push(code);
-    }
-    patch.addAccessorials = merged.length ?
-      merged : (extras.accessorials || []).slice();
-    if (!patch.name) patch.name = built.proposal.patch.name;
-    if (!patch.notes) patch.notes = built.proposal.patch.notes;
-    out.proposal = {
-      ...out.proposal,
-      ruleId: out.proposal.ruleId || built.proposal.ruleId,
-      patch,
-    };
-    if (!out.reply || reask.test(String(out.reply))) {
-      out.reply = built.reply;
-    }
-    out.quickReplies = [];
-    out.createIdentify = extras;
-    return out;
-  }
   built.createIdentify = extras;
   return built;
 }
@@ -528,6 +533,7 @@ function looksLikeCreateRuleIntent(messages) {
   );
   return /\b(add|create|new|make|set up|setup)\b.{0,40}\brule\b/.test(t) ||
     /\brule\b.{0,40}\b(add|create|new)\b/.test(t) ||
+    /\b(add|create|new).{0,80}\b(mil+i?t+[ae]r+y|limited\s*ac+ess)\b/.test(t) ||
     createAccessorialRe.test(t);
 }
 
@@ -800,6 +806,7 @@ async function runQuoteRulesChatTurn(opts) {
     "  aafes_military (military bases / AAFES / military exchange),",
     "  residential, other.",
     "  For military bases / AAFES use match.siteType \"aafes_military\".",
+    "  NEVER propose match: {} — an empty match does not target a site.",
     "  If accessorials were already stated, propose_create_rule immediately.",
     "  If not, ask which codes to add — never say you could not process.",
     "  After they answer, propose_create_rule. Do NOT re-ask identify or",
@@ -835,7 +842,9 @@ async function runQuoteRulesChatTurn(opts) {
     "  - patch may be partial (only changed fields), e.g. addAccessorials.",
     "  - Always copy name and match from the current rule into patch",
     "    so the proposal is self-contained even for partial edits.",
-    "For propose_create_rule: patch MUST include name and match.",
+    "For propose_create_rule: patch MUST include name and a NON-EMPTY",
+    "match (siteType and/or flags for address-only; text needles for email).",
+    "Never use match: {}.",
     "",
     "Never claim you saved, updated, or deleted a rule.",
     "Never say \"Confirmed\", \"rule removed\", \"deleted\", or \"it's gone\".",
@@ -1064,6 +1073,13 @@ function validateRuleProposal(proposal) {
     return {ok: false, error: "Proposal needs name or match criteria"};
   }
 
+  if (Object.prototype.hasOwnProperty.call(normalized, "match")) {
+    const match = normalized.match;
+    if (!match || typeof match !== "object" || !Object.keys(match).length) {
+      return {ok: false, error: "Rule match cannot be empty"};
+    }
+  }
+
   return {
     ok: true,
     action: "upsert",
@@ -1080,6 +1096,7 @@ module.exports = {
   enforceCreateIdentifyGate,
   parseIdentifyChoiceAnswer,
   parseAccessorialsAnswer,
+  inferCreateTopic,
   IDENTIFY_QUICK_REPLIES,
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,
