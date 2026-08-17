@@ -69,12 +69,18 @@ Only `@innovativecarriers.com` emails are allowed unless you extend `QUOTE_AUTH_
 
 ## Address classification (optional)
 
-Quote automation can look up delivery addresses to classify site type (nursing home, hotel, Amazon FC, residential, etc.) and apply accessorial rules even when the customer email does not say so.
+Quote automation classifies delivery site type for accessorials:
+
+1. **Name heuristics first** (e.g. nursing/rehab in the consignee name) — no AI call.
+2. **Google Places** strong facility types only — never bare `premise`/`street_address` → residential.
+3. **OpenAI Responses + `web_search`** for ambiguous / address-only cases (ChatGPT-like lookup). Plain JSON completions without tools cannot identify facilities from street+city alone.
+4. No-tools OpenAI only for leftover residential-vs-commercial judgment; otherwise `other` / no RSD.
 
 | Variable | Purpose |
 |----------|---------|
-| `GOOGLE_PLACES_API_KEY` or `GOOGLE_MAPS_API_KEY` | Google Places lookup (preferred when set) |
-| `ANTHROPIC_API_KEY` | AI fallback when Google key is missing |
-| `OPENAI_API_KEY` | Second AI fallback if Anthropic is not configured |
+| `GOOGLE_PLACES_API_KEY` or `GOOGLE_MAPS_API_KEY` | Strong facility types / place name (not bare geocode → RSD) |
+| `SUPPORT_CHAT_OPENAI_API_KEY` / `OPENAI_API_KEY` | Web-search + optional no-tools classify |
+| `QUOTE_ADDRESS_WEB_MODEL` | Model for Responses + web_search (default: Luna) |
+| `QUOTE_ADDRESS_AI_MODEL` | Override no-tools classify model |
 
 Classifications are cached in Firestore `{tenant}_quoteAddressClassifications` by normalized street + city + state + zip so repeat deliveries skip external lookup.
