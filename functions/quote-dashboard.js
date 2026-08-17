@@ -336,7 +336,7 @@ async function handleQuoteRulesChat(req, res) {
     }
     // Normalize delete proposals so UI Confirm always has ruleId.
     if (result && result.action === "propose_delete_rule") {
-      let proposal = result.proposal && typeof result.proposal === "object" ?
+      const proposal = result.proposal && typeof result.proposal === "object" ?
         {...result.proposal} :
         {};
       const id = proposal.deleteRuleId || proposal.ruleId ||
