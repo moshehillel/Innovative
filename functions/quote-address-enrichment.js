@@ -3,25 +3,28 @@
  *
  * Fallback chain (prefer false negatives over false RSD on institutions):
  * 1. Name/address heuristics (nursing, hospital, school, hotel, warehouse…)
- * 2. Luna (OpenAI gpt-5.6-luna) structured site-type classify
- * 3. If Luna fails (error/empty/parse/low confidence): Anthropic AI, then
- *    Google Places **strong** types only (nursing_home, lodging, hospital,
+ *    — primary for facility keywords; AI is NOT called when these match.
+ * 2. Google Places **strong** types only (nursing_home, lodging, hospital,
  *    explicit residential) — NEVER bare street_address/premise → residential
  *    (false RSD on sites like 40 Heyward St / Bedford nursing rehab)
- * 4. Final: siteType other / no auto RSD
+ * 3. Ambiguous / address-only: OpenAI Responses API + web_search tool
+ *    (ChatGPT-like lookup). Plain chat.completions without tools cannot
+ *    identify facilities from street+city alone; with web_search, Luna/sol/
+ *    gpt-4o correctly find Bedford at 40 Heyward → nursing_home.
+ * 4. No-tools OpenAI JSON classify for leftover residential-vs-commercial
+ *    judgment when web search is unavailable or returns nothing useful.
+ * 5. Final: siteType other / no auto RSD
  * USPS RDI (Smarty/Melissa) not in repo — recommended later for hard RSD.
  *
  * Env: SUPPORT_CHAT_OPENAI_API_KEY / QUOTE_CLASSIFY_OPENAI_API_KEY /
- * OPENAI_API_KEY for Luna; optional ANTHROPIC_API_KEY; optional
- * GOOGLE_PLACES_API_KEY for strong facility types / place name.
+ * OPENAI_API_KEY for OpenAI; optional GOOGLE_PLACES_API_KEY for strong
+ * facility types / place name. QUOTE_ADDRESS_AI_MODEL / QUOTE_ADDRESS_WEB_MODEL
+ * override models.
  */
 
 "use strict";
 
 const admin = require("firebase-admin");
-// Anthropic fallback scaffold (wired by Luna enrichment work-in-progress).
-const Anthropic = require("@anthropic-ai/sdk");
-void Anthropic;
 const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 
@@ -425,8 +428,10 @@ async function classifyWithGooglePlaces(consignee) {
 }
 
 /**
- * Classify site type with Luna (OpenAI gpt-5.6-luna).
+ * Classify site type with OpenAI (default gpt-5.6-luna).
  * Prefer unknown/other over false residential when confidence is low.
+ * Not marketed as address-only facility detection — LLMs return other
+ * without a facility name; keep for ambiguous res/commercial cues.
  * @param {object} consignee Consignee.
  * @return {Promise<object|null>}
  */
@@ -487,6 +492,131 @@ async function classifyWithLuna(consignee) {
       completion.choices[0].message.content || "",
   ).trim();
   return parseAiClassification(raw, "luna");
+}
+
+/**
+ * Address-only / ambiguous facility lookup via OpenAI Responses + web_search.
+ * Mirrors ChatGPT browsing: model can look up what sits at a street address.
+ * Plain chat.completions (no tools) cannot do this — that was the Luna gap.
+ * @param {object} consignee Consignee.
+ * @return {Promise<object|null>}
+ */
+async function classifyWithWebSearch(consignee) {
+  const apiKey = getLunaOpenAiKey();
+  if (!apiKey) return null;
+
+  const c = consignee || {};
+  const addressLine = [
+    c.address1, c.address2, c.city, c.state, c.zipCode,
+  ].filter(Boolean).join(", ");
+  if (!addressLine.trim()) return null;
+
+  const payload = {
+    name: c.name || "",
+    address1: c.address1 || "",
+    address2: c.address2 || "",
+    city: c.city || "",
+    state: c.state || "",
+    zipCode: c.zipCode || "",
+  };
+
+  const system = [
+    "You classify LTL freight delivery locations for accessorials.",
+    "Use web search to identify the business/facility at the address",
+    "when no clear facility name is provided.",
+    "Return ONLY valid JSON (no markdown fences):",
+    "{ \"siteType\": string, \"residentialDelivery\": boolean,",
+    "  \"confidence\": number, \"placeName\": string, \"reason\": string }",
+    `siteType must be one of: ${SITE_TYPES.join(", ")}.`,
+    "CRITICAL: A bare street address is NOT enough for residential.",
+    "Do NOT assume apartment/residential from neighborhood alone.",
+    "residentialDelivery=true ONLY with strong dwelling signals.",
+    "Nursing homes, hospitals, rehab, assisted living → nursing_home.",
+    "Hotels/inns/suites → hotel. Warehouses/DCs/stores → other.",
+    "If web search finds a named facility, set placeName and siteType.",
+    "If search finds nothing useful, siteType other, confidence <= 0.55,",
+    "residentialDelivery false.",
+    "reason: one short sentence.",
+  ].join("\n");
+
+  const client = new OpenAI({apiKey});
+  const model = process.env.QUOTE_ADDRESS_WEB_MODEL ||
+    process.env.QUOTE_ADDRESS_AI_MODEL ||
+    process.env.QUOTE_CLASSIFY_MODEL ||
+    DEFAULT_OPENAI_MODEL;
+
+  const resp = await client.responses.create({
+    model,
+    tools: [{type: "web_search"}],
+    input: [
+      {role: "system", content: system},
+      {
+        role: "user",
+        content: [
+          "Classify this delivery address. Search the web if needed.",
+          "JSON only.",
+          JSON.stringify(payload),
+        ].join("\n"),
+      },
+    ],
+  });
+
+  const raw = extractJsonText(String(resp.output_text || "").trim());
+  const parsed = parseAiClassification(raw, "openai_web_search");
+  if (!parsed) return null;
+
+  // Prefer facility keywords from discovered place name over weak "other".
+  if (parsed.placeName) {
+    const fromName = classifyFromNameHeuristics(
+        consignee, parsed.placeName);
+    if (fromName && fromName.siteType !== "other") {
+      return {
+        ...fromName,
+        placeName: parsed.placeName || fromName.placeName,
+        source: "openai_web_search",
+        confidence: Math.max(fromName.confidence, parsed.confidence || 0),
+        reason: parsed.reason || fromName.reason,
+        residentialDelivery: false,
+      };
+    }
+  }
+  return parsed;
+}
+
+/**
+ * Pull a JSON object string out of model output that may include prose.
+ * @param {string} text Raw model text.
+ * @return {string}
+ */
+function extractJsonText(text) {
+  const s = String(text || "").trim();
+  if (!s) return "";
+  if (s.startsWith("{")) return s;
+  const start = s.indexOf("{");
+  const end = s.lastIndexOf("}");
+  if (start >= 0 && end > start) return s.slice(start, end + 1);
+  return s;
+}
+
+/**
+ * True when consignee name is missing or too generic to classify facilities.
+ * @param {object} consignee Consignee.
+ * @return {boolean}
+ */
+function isAddressOnlyOrWeakName(consignee) {
+  const name = String((consignee && consignee.name) || "").trim();
+  if (!name) return true;
+  if (/^(consignee|customer|receiver|ship\s*to|deliver(y)?\s*to)$/i
+      .test(name)) {
+    return true;
+  }
+  // Has facility keywords → heuristics already handled; treat as named.
+  if (/nursing|rehab|hospital|hotel|amazon|warehouse|school/i.test(name)) {
+    return false;
+  }
+  // Short generic tokens only.
+  if (name.length <= 3) return true;
+  return !/[a-z]/i.test(name);
 }
 
 /**
@@ -586,7 +716,8 @@ function mergeClassificationOntoLane(lane, classification, opts = {}) {
 }
 
 /**
- * Resolve site type: heuristics → Luna when ambiguous → Google facility types.
+ * Resolve site type: heuristics → Google strong types → web_search →
+ * no-tools AI → other (never bare premise → residential).
  * @param {object} consignee Consignee.
  * @param {Function} [log] Logger.
  * @return {Promise<object|null>}
@@ -619,7 +750,24 @@ async function resolveClassification(consignee, log = () => {}) {
     return google;
   }
 
-  // Ambiguous / bare geocode → Luna (not Google residential).
+  // Ambiguous / bare geocode → web search (ChatGPT-like facility lookup).
+  let web = null;
+  try {
+    web = await classifyWithWebSearch(consignee);
+  } catch (err) {
+    log("warn", "quote", "Web-search address classification failed", {
+      error: err.message,
+    });
+  }
+  if (web && google && google.placeTypes) {
+    web.placeTypes = google.placeTypes;
+  }
+  // Accept facility / residential hits from web search.
+  if (web && (web.siteType !== "other" || web.residentialDelivery === true)) {
+    return web;
+  }
+
+  // No-tools OpenAI for leftover residential-vs-commercial cues.
   let luna = null;
   try {
     luna = await classifyWithLuna(consignee);
@@ -628,7 +776,11 @@ async function resolveClassification(consignee, log = () => {}) {
       error: err.message,
     });
   }
-  if (luna) {
+  if (luna && (luna.siteType !== "other" || luna.residentialDelivery === true ||
+    (luna.confidence || 0) >= AI_ACCEPT_MIN_CONFIDENCE)) {
+    if (web && web.placeName && !luna.placeName) {
+      luna.placeName = web.placeName;
+    }
     if (google && google.placeName && !luna.placeName) {
       luna.placeName = google.placeName;
     }
@@ -636,6 +788,16 @@ async function resolveClassification(consignee, log = () => {}) {
       luna.placeTypes = google.placeTypes;
     }
     return luna;
+  }
+
+  // Prefer web "other" (no RSD) over inventing residential.
+  if (web) {
+    return {
+      ...web,
+      siteType: "other",
+      residentialDelivery: false,
+      confidence: Math.min(web.confidence || 0.4, 0.55),
+    };
   }
 
   // Default: commercial/other — do NOT invent RSD.
@@ -758,10 +920,12 @@ module.exports = {
   classifyFromNameHeuristics,
   classifyWithGooglePlaces,
   classifyWithLuna,
+  classifyWithWebSearch,
   classifyWithAi,
   resolveClassification,
   enrichLaneConsignee,
   mergeClassificationOntoLane,
   mapGoogleTypesToSiteType,
   isBareStreetGeocode,
+  isAddressOnlyOrWeakName,
 };
