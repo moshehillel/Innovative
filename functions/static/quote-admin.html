@@ -988,6 +988,20 @@
             "Cannot be — address / site classification only",
           ];
         }
+        // Prefer server-provided identify quick replies (canonical payloads).
+        if (res.action === "ask_identify_source" &&
+            Array.isArray(res.quickReplies) && res.quickReplies.length >= 2) {
+          const canon = [
+            "Can be identified from the email",
+            "Cannot be — address / site classification only",
+          ];
+          // Keep exact server strings when present; else force canon labels
+          // the identify parser accepts (1/2 and full button text).
+          res.quickReplies = res.quickReplies.map((label, i) => {
+            const s = String(label || "").trim();
+            return s || canon[i] || s;
+          });
+        }
         if (Array.isArray(res.quickReplies) && res.quickReplies.length) {
           renderQuickReplies(res.quickReplies);
         }

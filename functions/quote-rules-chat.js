@@ -39,6 +39,84 @@ const IDENTIFY_QUICK_REPLIES = [
 ];
 
 /**
+ * Normalize identify-choice text for robust matching.
+ * @param {string} text Raw user (or button) text.
+ * @return {string}
+ */
+function normalizeIdentifyAnswerText(text) {
+  return String(text || "")
+      .trim()
+      // Strip markdown wrappers on short answers (**2**, *can*).
+      .replace(/^\*{1,3}\s*/, "")
+      .replace(/\s*\*{1,3}$/, "")
+      .replace(/^`+|`+$/g, "")
+      .toLowerCase()
+      .replace(/[\u2010-\u2015\u2212]/g, "-") // hyphens / dashes
+      .replace(/\s+/g, " ");
+}
+
+/**
+ * Parse Can be / Cannot be questionnaire answers.
+ * Accepts: 1/2, A/B, can/cannot, can be/cannot be, full button labels,
+ * and pasted option text with trailing punctuation or em-dash clauses.
+ * @param {string} text User message.
+ * @return {"email"|"address_only"|null}
+ */
+function parseIdentifyChoiceAnswer(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const norm = normalizeIdentifyAnswerText(raw);
+
+  // Exact quick-reply payloads (any dash variant).
+  const cannotLabel = normalizeIdentifyAnswerText(QUICK_REPLY_CANNOT_BE);
+  const canLabel = normalizeIdentifyAnswerText(QUICK_REPLY_CAN_BE);
+  if (norm === cannotLabel || norm.startsWith(cannotLabel)) {
+    return "address_only";
+  }
+  if (norm === canLabel || norm.startsWith(canLabel)) {
+    return "email";
+  }
+
+  // Numbered / lettered options (optionally with trailing punctuation).
+  if (/^(2|b)([.)]|$)/.test(norm) ||
+      /^option\s*(2|b)\b/.test(norm)) {
+    return "address_only";
+  }
+  if (/^(1|a)([.)]|$)/.test(norm) ||
+      /^option\s*(1|a)\b/.test(norm)) {
+    return "email";
+  }
+
+  // Short / partial answers — cannot before can.
+  if (/^(cannot|can't)(\b|$)/.test(norm) ||
+      /^cannot be\b/.test(norm) ||
+      /\baddress\s*\/?\s*site classification\b/.test(norm) ||
+      /\baddress[- ]only\b/.test(norm) ||
+      /\bsite classification only\b/.test(norm) ||
+      /\bonly via (ai|address)\b/.test(norm) ||
+      /\bnot from (the )?email\b/.test(norm) ||
+      /\bcan't be identified\b/.test(norm) ||
+      /\bcannot be identified\b/.test(norm)) {
+    return "address_only";
+  }
+
+  if (/^can be\b/.test(norm) ||
+      /^can(\b|$)/.test(norm) ||
+      /\bcan be identified from the email\b/.test(norm) ||
+      /\balso from (the )?email\b/.test(norm) ||
+      /\bfrom (the )?email (as well|too|instead)\b/.test(norm) ||
+      /\bemail (body|subject|sender)\b/.test(norm)) {
+    // Guard: "can…" that is actually cannot (already handled above).
+    if (/^cannot\b/.test(norm) || /\bcannot be\b/.test(norm)) {
+      return "address_only";
+    }
+    return "email";
+  }
+
+  return null;
+}
+
+/**
  * Detect create-rule identify questionnaire progress from chat history.
  * @param {Array<object>} messages Chat turns with role/content.
  * @return {object} Gate status, source, and emailSignalsListed.
@@ -56,6 +134,8 @@ function detectCreateIdentifyGate(messages) {
 
   const askedChoiceRe = new RegExp(
       "how can (this|it) be identified|" +
+      "before i propose that rule|" +
+      "please choose one|" +
       "identified from the (quote )?email|" +
       "can be identified from the email|" +
       "address\\/?\\s*site classification|address only|cannot be",
@@ -67,24 +147,9 @@ function detectCreateIdentifyGate(messages) {
       "ways .+ from the email",
       "i",
   );
-  const cannotBeRe = new RegExp(
-      "cannot be|address[-\\s]?only|site classification only|" +
-      "only via (ai|address)|not from (the )?email|" +
-      "can't be identified from|cannot be identified",
-      "i",
-  );
-  const canBeRe = new RegExp(
-      "can be identified from the email|" +
-      "identified from the (quote )?email|" +
-      "also from (the )?email|" +
-      "from (the )?email (as well|too|instead)|" +
-      "email (body|subject|sender)|option a\\b|^a\\)",
-      "i",
-  );
 
   for (const turn of turns) {
     const text = turn.content;
-    const lower = text.toLowerCase();
 
     if (turn.role === "assistant") {
       if (askedChoiceRe.test(text)) {
@@ -96,20 +161,15 @@ function detectCreateIdentifyGate(messages) {
       continue;
     }
 
-    // User turns
-    if (cannotBeRe.test(lower) ||
-        text.trim() === QUICK_REPLY_CANNOT_BE) {
+    // User turns — prefer explicit identify answers when choice was offered
+    // or the message itself is clearly a Can be / Cannot be reply.
+    const choice = parseIdentifyChoiceAnswer(text);
+    if (choice === "address_only") {
       source = "address_only";
       continue;
     }
-    if (canBeRe.test(lower) ||
-        text.trim() === QUICK_REPLY_CAN_BE ||
-        /^can be\b/i.test(text.trim())) {
-      if (/cannot be/.test(lower)) {
-        source = "address_only";
-      } else {
-        source = "email";
-      }
+    if (choice === "email") {
+      source = "email";
       continue;
     }
 
@@ -177,15 +237,15 @@ function enforceCreateIdentifyGate(result, messages) {
   };
   const action = out.action || "none";
   const gate = detectCreateIdentifyGate(messages);
-  const midIdentify = gate.status === "awaiting_choice" ||
+  // Keep create-flow active through ready: the latest user turn is often
+  // just "2" / "Cannot be…", which is NOT create-intent by itself.
+  const inIdentifyFlow = gate.status === "awaiting_choice" ||
     gate.status === "awaiting_email_signals" ||
-    gate.status === "needed";
+    gate.status === "ready" ||
+    (gate.status === "needed" && looksLikeCreateRuleIntent(messages));
   const creating = action === "propose_create_rule" ||
     looksLikeCreateRuleIntent(messages) ||
-    // Stay in the questionnaire once it has started (user answered Can be /
-    // Cannot be, or assistant already asked).
-    (midIdentify && gate.status !== "needed") ||
-    (gate.status === "needed" && looksLikeCreateRuleIntent(messages));
+    inIdentifyFlow;
 
   if (action === "propose_update_rule" || action === "propose_delete_rule") {
     return out;
@@ -231,10 +291,47 @@ function enforceCreateIdentifyGate(result, messages) {
       }
     }
     out.createIdentify = gate;
-    if (out.action === "ask_identify_source" ||
+
+    // Choice is done — never re-ask identify, and never surface the generic
+    // parse-failure reply for a valid Can/Cannot answer.
+    if (out.action === "ask_identify_source") {
+      out.action = gate.source === "email" ?
+        "ask_email_signals" : "none";
+      if (gate.source === "email") {
+        out.proposal = null;
+        out.quickReplies = [];
+        if (!out.reply ||
+            /could not process|try rephrasing|please choose one/i
+                .test(String(out.reply))) {
+          out.reply = "Got it — this can be spotted in the quote email. " +
+            "Please list all ways you think we can get that signal " +
+            "(keywords in the body, sender domains, subject patterns, " +
+            "attachment text, consignee name phrases, etc.). " +
+            "I will only use what you list.";
+        }
+        return out;
+      }
+    }
+    if (gate.source === "address_only" &&
         out.action === "ask_email_signals") {
-      // Model stayed in ask mode after gate ready — leave as-is.
-      return out;
+      out.action = "none";
+      out.proposal = null;
+      out.quickReplies = [];
+    }
+    const badReply = !out.reply ||
+      /could not process|try rephrasing/i.test(String(out.reply));
+    if (badReply && out.action !== "propose_create_rule") {
+      out.reply = gate.source === "address_only" ?
+        ("Got it — address / site classification only " +
+          "(AI enrichment). I'll match via siteType / flags " +
+          "(e.g. aafes_military for military bases / AAFES). " +
+          "Which accessorials should this rule add " +
+          "(e.g. LAD, LFD, APD)?") :
+        ("Got it. Tell me any missing details " +
+          "(accessorials, site type, name) and I'll propose the rule.");
+      out.action = "none";
+      out.proposal = null;
+      out.quickReplies = [];
     }
     return out;
   }
@@ -340,6 +437,9 @@ async function runQuoteRulesChatTurn(opts) {
     "  \"" + QUICK_REPLY_CAN_BE + "\"",
     "  \"" + QUICK_REPLY_CANNOT_BE + "\"",
     "Wait for the user's choice. Do not invent a proposal yet.",
+    "User may answer with: 1, 2, A, B, can, cannot, can be, cannot be,",
+    "or the full quickReply button text (ignore em-dash / trailing clauses).",
+    "Those short answers are definitive — do not re-ask Step 1.",
     "",
     "Step 2a — If they choose CAN BE (email):",
     "  action: ask_email_signals. Ask them to list ALL ways they think we",
@@ -356,6 +456,12 @@ async function runQuoteRulesChatTurn(opts) {
     "  Proceed with address / siteType / flags classification matching only.",
     "  Set identifyVia to \"ai\". Do NOT invent email-text match keywords.",
     "  Use match.siteType and/or match.flags as appropriate.",
+    "  Known siteType values: nursing_home, hotel, amazon_fc, menards_dc,",
+    "  aafes_military (military bases / AAFES / military exchange),",
+    "  residential, other.",
+    "  For military bases / AAFES use match.siteType \"aafes_military\".",
+    "  If accessorials were already stated, propose_create_rule immediately.",
+    "  If not, ask which codes to add — never say you could not process.",
     "",
     "Current questionnaire state from chat history (authoritative):",
     `  status=${gateHint.status}; source=${gateHint.source || "null"};`,
@@ -364,6 +470,8 @@ async function runQuoteRulesChatTurn(opts) {
     "ask_identify_source (not propose_create_rule).",
     "If status is awaiting_email_signals: action MUST be ask_email_signals.",
     "Only when status is ready may you use propose_create_rule.",
+    "When status is ready after cannot-be (source=address_only), do NOT",
+    "re-ask identify and do NOT reply that you could not process the answer.",
     "",
     "identifyVia values:",
     "  address_text — match from email/text fields only.",
@@ -620,6 +728,7 @@ module.exports = {
   extractPatch,
   detectCreateIdentifyGate,
   enforceCreateIdentifyGate,
+  parseIdentifyChoiceAnswer,
   IDENTIFY_QUICK_REPLIES,
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,
