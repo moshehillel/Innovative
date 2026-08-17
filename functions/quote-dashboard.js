@@ -348,25 +348,49 @@ async function handleQuoteRulesChat(req, res) {
         proposal.deleteRuleId = proposal.deleteRuleId || id;
         result.proposal = proposal;
       }
-      // Never let the model claim deletion before Confirm.
-      const reply = String(result.reply || "");
-      const claimedDone =
-        /rule removed|already (deleted|removed)|successfully deleted/i
-            .test(reply) ||
-        /it's gone|it is gone/i.test(reply);
-      if (claimedDone) {
-        result.reply = id ?
-          ("I can remove the \"" + id +
-            "\" rule. Please click Confirm to apply this deletion.") :
-          ("I can remove that rule. Please click Confirm " +
-            "to apply this deletion.");
-      }
     }
-    return res.json({ok: true, ...result});
+    // Strip invented success claims from ANY model reply. Only the Confirm
+    // button path (applyQuoteRule) may announce an applied change.
+    if (result && typeof result.reply === "string") {
+      result.reply = scrubFalseApplyClaims(result.reply, result.action);
+    }
+    return res.json({
+      ok: true,
+      ...result,
+      // Fresh ids so the UI can answer status without another round-trip.
+      activeRuleIds: existingRules.map((r) => r.id),
+    });
   } catch (err) {
     console.error("quoteRulesChat:", err);
     return res.status(500).json({ok: false, error: err.message});
   }
+}
+
+/**
+ * Replace model replies that falsely claim a Confirm/apply already happened.
+ * @param {string} reply Model reply.
+ * @param {string} action Proposed action.
+ * @return {string}
+ */
+function scrubFalseApplyClaims(reply, action) {
+  const text = String(reply || "");
+  const claimed =
+    /confirmed\b|rule removed|successfully (deleted|removed|saved)/i
+        .test(text) ||
+    /already (deleted|removed)|it's gone|it is gone/i.test(text) ||
+    /deletion (was|has been) (processed|confirmed)/i.test(text);
+  if (!claimed) return text;
+  if (action === "propose_delete_rule") {
+    return "Please click the Confirm button to apply this deletion. " +
+      "I cannot remove a rule from chat text alone.";
+  }
+  if (action === "propose_create_rule" || action === "propose_update_rule") {
+    return "Please click the Confirm button to apply this change. " +
+      "I cannot save a rule from chat text alone.";
+  }
+  return "No change was applied yet. Click the Confirm button on the " +
+    "proposed change, or ask me to propose one. Chat text like " +
+    "\"Confirmed\" does not delete or save rules.";
 }
 
 /**

@@ -19,6 +19,16 @@ const DEFAULT_IDENTIFY_VIA = "both";
  */
 const MANAGED_DEFAULT_RULE_IDS = new Set(["amazon_fc"]);
 
+/**
+ * Former product defaults that must never be re-seeded after delete,
+ * even though they are no longer listed in DEFAULT_RULES.
+ */
+const RETIRED_DEFAULT_RULE_IDS = new Set([
+  "aafes_military",
+  "nursing_home",
+  "hotel",
+]);
+
 const DEFAULT_RULES = [
   {
     id: "liftgate_no_dock",
@@ -37,9 +47,8 @@ const DEFAULT_RULES = [
     autoApply: true,
     requiresConfirm: false,
   },
-  // aafes_military intentionally omitted — product removed this default.
-  // Deletes of other defaults are tombstoned in quoteRulesRemoved so
-  // ensureDefaultRulesPresent does not recreate them.
+  // Retired defaults (kept out of seed; tombstoned on delete):
+  // aafes_military, nursing_home, hotel
   {
     id: "menards_dc",
     active: true,
@@ -55,40 +64,6 @@ const DEFAULT_RULES = [
     notes: "Exclude carriers whose warnings block Menards delivery.",
     autoApply: true,
     requiresConfirm: false,
-  },
-  {
-    id: "nursing_home",
-    active: true,
-    priority: 30,
-    name: "Nursing home delivery",
-    identifyVia: "both",
-    match: {
-      consigneeNameContains: [
-        "nursing", "nursing home", "rehab", "care center", "skilled nursing",
-      ],
-      siteType: "nursing_home",
-    },
-    addAccessorials: ["NUD"],
-    notes: "Nursing home / rehab facility.",
-    autoApply: true,
-    requiresConfirm: true,
-  },
-  {
-    id: "hotel",
-    active: true,
-    priority: 40,
-    name: "Hotel delivery",
-    identifyVia: "both",
-    match: {
-      consigneeNameContains: [
-        "hotel", "marriott", "hilton", "hyatt", "inn", "suites",
-      ],
-      siteType: "hotel",
-    },
-    addAccessorials: ["HOD"],
-    notes: "Hotel consignee.",
-    autoApply: true,
-    requiresConfirm: true,
   },
   {
     id: "amazon_fc",
@@ -586,9 +561,9 @@ async function deleteRule(tenant, ruleId, removedBy) {
   const id = String(ruleId);
   const isDefault = DEFAULT_RULES.some((r) => r.id === id);
   await col(tenant, "quoteRules").doc(id).delete();
-  // Always tombstone known former defaults (e.g. aafes_military) and
-  // current DEFAULT_RULES ids so deletes survive reseed.
-  if (isDefault || id === "aafes_military") {
+  // Tombstone current defaults and retired product defaults so reseeds
+  // cannot resurrect intentional deletes.
+  if (isDefault || RETIRED_DEFAULT_RULE_IDS.has(id)) {
     await markDefaultRuleRemoved(tenant, id, removedBy);
   }
 }
@@ -620,6 +595,7 @@ module.exports = {
   IDENTIFY_VIA_VALUES,
   DEFAULT_IDENTIFY_VIA,
   MANAGED_DEFAULT_RULE_IDS,
+  RETIRED_DEFAULT_RULE_IDS,
   loadActiveRules,
   seedDefaultRules,
   ensureDefaultRulesPresent,

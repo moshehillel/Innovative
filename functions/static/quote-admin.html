@@ -817,11 +817,85 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    function isTypedConfirm(text) {
+      return /^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
+        .test(String(text || "").trim());
+    }
+
+    async function applyPendingProposal() {
+      if (!pendingProposal) return;
+      const confirmBtn = document.getElementById("confirm-proposal");
+      const wasDelete = isDeleteAction(pendingProposal.action);
+      const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
+      if (wasDelete && !ruleId) {
+        appendChat("assistant", "Failed: missing rule id to delete. Ask the assistant to propose the delete again.");
+        return;
+      }
+      const body = {
+        tenantId: TENANT_ID,
+        action: pendingProposal.action,
+        ruleId,
+        patch: pendingProposal.patch || {},
+        deleteRuleId: pendingProposal.deleteRuleId || ruleId,
+        updatedBy: "quote-admin-ui",
+      };
+      if (confirmBtn) confirmBtn.disabled = true;
+      try {
+        const res = await api("/applyQuoteRule", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        if (!res || !res.ok) {
+          const errMsg = "Failed: " + ((res && res.error) || "applyQuoteRule did not succeed");
+          appendChat("assistant", errMsg);
+          chatMessages.push({ role: "assistant", content: errMsg });
+          return;
+        }
+        // Ground-truth for later turns — only after applyQuoteRule ok.
+        const applied = wasDelete
+          ? `[APPLIED] Deleted rule "${ruleId}" via Confirm (applyQuoteRule ok).`
+          : `[APPLIED] Saved rule "${ruleId}" via Confirm (applyQuoteRule ok).`;
+        const okMsg = wasDelete
+          ? `Applied: removed "${ruleId}". It stays gone on refresh.`
+          : `Applied: saved "${ruleId}". Refresh the Rules list to see the update.`;
+        appendChat("assistant", okMsg);
+        chatMessages.push({ role: "assistant", content: applied });
+        document.getElementById("proposal-box").classList.add("hidden");
+        pendingProposal = null;
+        await loadRules();
+      } catch (e) {
+        const errMsg = "Failed: " + e.message;
+        appendChat("assistant", errMsg);
+        chatMessages.push({ role: "assistant", content: errMsg });
+      } finally {
+        if (confirmBtn) confirmBtn.disabled = false;
+      }
+    }
+
     async function sendChatMessage() {
       const input = document.getElementById("chat-input");
       const sendBtn = document.getElementById("chat-send");
       const text = input.value.trim();
       if (!text || sendBtn.disabled) return;
+
+      // Typing Confirm with a pending proposal uses applyQuoteRule — never the model.
+      if (pendingProposal && isTypedConfirm(text)) {
+        input.value = "";
+        chatMessages.push({ role: "user", content: text });
+        appendChat("user", text);
+        await applyPendingProposal();
+        return;
+      }
+      if (!pendingProposal && isTypedConfirm(text)) {
+        input.value = "";
+        chatMessages.push({ role: "user", content: text });
+        appendChat("user", text);
+        const tip = "There is no pending proposal. Ask me to remove or change a rule first, then click the Confirm button (typing Confirm alone does nothing).";
+        chatMessages.push({ role: "assistant", content: tip });
+        appendChat("assistant", tip);
+        return;
+      }
+
       chatMessages.push({ role: "user", content: text });
       appendChat("user", text);
       input.value = "";
@@ -853,6 +927,9 @@
           document.getElementById("proposal-box").classList.remove("hidden");
           document.getElementById("proposal-box").scrollIntoView({ behavior: "smooth", block: "nearest" });
         }
+        if (Array.isArray(res.activeRuleIds)) {
+          await loadRules();
+        }
       } catch (e) {
         appendChat("assistant", "Error: " + e.message);
       }
@@ -872,42 +949,7 @@
     });
 
     document.getElementById("confirm-proposal").addEventListener("click", async () => {
-      if (!pendingProposal) return;
-      const confirmBtn = document.getElementById("confirm-proposal");
-      const wasDelete = isDeleteAction(pendingProposal.action);
-      const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
-      if (wasDelete && !ruleId) {
-        appendChat("assistant", "Failed: missing rule id to delete. Ask the assistant to propose the delete again.");
-        return;
-      }
-      const body = {
-        tenantId: TENANT_ID,
-        action: pendingProposal.action,
-        ruleId,
-        patch: pendingProposal.patch || {},
-        deleteRuleId: pendingProposal.deleteRuleId || ruleId,
-        updatedBy: "quote-admin-ui",
-      };
-      confirmBtn.disabled = true;
-      try {
-        const res = await api("/applyQuoteRule", { method: "POST", body: JSON.stringify(body) });
-        if (!res || !res.ok) {
-          appendChat("assistant", "Failed: " + ((res && res.error) || "applyQuoteRule did not succeed"));
-          return;
-        }
-        const okMsg = wasDelete
-          ? "Confirmed — rule removed. It will not come back on refresh."
-          : "Confirmed — rule saved. Refresh the Rules list tab to see the update.";
-        appendChat("assistant", okMsg);
-        chatMessages.push({ role: "assistant", content: okMsg });
-        document.getElementById("proposal-box").classList.add("hidden");
-        pendingProposal = null;
-        await loadRules();
-      } catch (e) {
-        appendChat("assistant", "Failed: " + e.message);
-      } finally {
-        confirmBtn.disabled = false;
-      }
+      await applyPendingProposal();
     });
 
     document.getElementById("dismiss-proposal").addEventListener("click", () => {
