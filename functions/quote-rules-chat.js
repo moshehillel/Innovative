@@ -40,8 +40,8 @@ const IDENTIFY_QUICK_REPLIES = [
 
 /**
  * Detect create-rule identify questionnaire progress from chat history.
- * @param {Array<{role:string,content:string}>} messages Chat turns.
- * @return {{status:string, source:string|null, emailSignalsListed:boolean}}
+ * @param {Array<object>} messages Chat turns with role/content.
+ * @return {object} Gate status, source, and emailSignalsListed.
  */
 function detectCreateIdentifyGate(messages) {
   const turns = (messages || []).map((m) => ({
@@ -54,31 +54,55 @@ function detectCreateIdentifyGate(messages) {
   let askedEmailSignals = false;
   let emailSignalsListed = false;
 
+  const askedChoiceRe = new RegExp(
+      "how can (this|it) be identified|" +
+      "identified from the (quote )?email|" +
+      "can be identified from the email|" +
+      "address\\/?\\s*site classification|address only|cannot be",
+      "i",
+  );
+  const askedSignalsRe = new RegExp(
+      "list all ways|keywords|sender domains|subject patterns|" +
+      "attachment text|consignee name phrases|signal from the email|" +
+      "ways .+ from the email",
+      "i",
+  );
+  const cannotBeRe = new RegExp(
+      "cannot be|address[-\\s]?only|site classification only|" +
+      "only via (ai|address)|not from (the )?email|" +
+      "can't be identified from|cannot be identified",
+      "i",
+  );
+  const canBeRe = new RegExp(
+      "can be identified from the email|" +
+      "identified from the (quote )?email|" +
+      "also from (the )?email|" +
+      "from (the )?email (as well|too|instead)|" +
+      "email (body|subject|sender)|option a\\b|^a\\)",
+      "i",
+  );
+
   for (const turn of turns) {
     const text = turn.content;
     const lower = text.toLowerCase();
 
     if (turn.role === "assistant") {
-      if (/how can (this|it) be identified|identified from the (quote )?email|can be identified from the email|address\/?\s*site classification|address only|cannot be/i
-          .test(text)) {
+      if (askedChoiceRe.test(text)) {
         askedChoice = true;
       }
-      if (/list all ways|keywords|sender domains|subject patterns|attachment text|consignee name phrases|signal from the email|ways .+ from the email/i
-          .test(text)) {
+      if (askedSignalsRe.test(text)) {
         askedEmailSignals = true;
       }
       continue;
     }
 
     // User turns
-    if (/cannot be|address[-\s]?only|site classification only|only via (ai|address)|not from (the )?email|can't be identified from|cannot be identified/i
-        .test(lower) ||
+    if (cannotBeRe.test(lower) ||
         text.trim() === QUICK_REPLY_CANNOT_BE) {
       source = "address_only";
       continue;
     }
-    if (/can be identified from the email|identified from the (quote )?email|also from (the )?email|from (the )?email (as well|too|instead)|email (body|subject|sender)|option a\b|^a\)/i
-        .test(lower) ||
+    if (canBeRe.test(lower) ||
         text.trim() === QUICK_REPLY_CAN_BE ||
         /^can be\b/i.test(text.trim())) {
       if (/cannot be/.test(lower)) {
@@ -120,7 +144,7 @@ function detectCreateIdentifyGate(messages) {
 
 /**
  * True when the latest user message looks like a create/add rule request.
- * @param {Array<{role:string,content:string}>} messages Chat turns.
+ * @param {Array<object>} messages Chat turns.
  * @return {boolean}
  */
 function looksLikeCreateRuleIntent(messages) {
@@ -128,10 +152,15 @@ function looksLikeCreateRuleIntent(messages) {
       .find((m) => m.role !== "assistant");
   if (!lastUser) return false;
   const t = String(lastUser.content || "").toLowerCase();
+  const createAccessorialRe = new RegExp(
+      "\\b(whenever|when|for)\\b.{0,80}\\b(add|include|require)\\b" +
+      ".{0,40}\\b(accessorial|liftgate|appointment|nursing|hotel|" +
+      "residential|school)",
+      "i",
+  );
   return /\b(add|create|new|make|set up|setup)\b.{0,40}\brule\b/.test(t) ||
     /\brule\b.{0,40}\b(add|create|new)\b/.test(t) ||
-    /\b(whenever|when|for)\b.{0,80}\b(add|include|require)\b.{0,40}\b(accessorial|liftgate|appointment|nursing|hotel|residential|school)/i
-        .test(t);
+    createAccessorialRe.test(t);
 }
 
 /**
@@ -308,8 +337,8 @@ async function runQuoteRulesChatTurn(opts) {
     "     attachments/consignee name text) — as well as or instead of address.",
     "  B) Cannot be — address-only / site classification only (AI enrichment).",
     "Set quickReplies to those two option strings exactly:",
-    `  \"${QUICK_REPLY_CAN_BE}\"`,
-    `  \"${QUICK_REPLY_CANNOT_BE}\"`,
+    "  \"" + QUICK_REPLY_CAN_BE + "\"",
+    "  \"" + QUICK_REPLY_CANNOT_BE + "\"",
     "Wait for the user's choice. Do not invent a proposal yet.",
     "",
     "Step 2a — If they choose CAN BE (email):",

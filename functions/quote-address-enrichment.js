@@ -1,15 +1,27 @@
 /**
- * Quote address enrichment — classify delivery locations via Google Places
- * or AI. Results are cached in Firestore to skip repeat lookups.
+ * Quote address enrichment — classify delivery locations for accessorials.
  *
- * Env (optional): GOOGLE_PLACES_API_KEY or GOOGLE_MAPS_API_KEY
- * AI fallback: ANTHROPIC_API_KEY, else OPENAI_API_KEY
+ * Fallback chain (prefer false negatives over false RSD on institutions):
+ * 1. Name/address heuristics (nursing, hospital, school, hotel, warehouse…)
+ * 2. Luna (OpenAI gpt-5.6-luna) structured site-type classify
+ * 3. If Luna fails (error/empty/parse/low confidence): Anthropic AI, then
+ *    Google Places **strong** types only (nursing_home, lodging, hospital,
+ *    explicit residential) — NEVER bare street_address/premise → residential
+ *    (false RSD on sites like 40 Heyward St / Bedford nursing rehab)
+ * 4. Final: siteType other / no auto RSD
+ * USPS RDI (Smarty/Melissa) not in repo — recommended later for hard RSD.
+ *
+ * Env: SUPPORT_CHAT_OPENAI_API_KEY / QUOTE_CLASSIFY_OPENAI_API_KEY /
+ * OPENAI_API_KEY for Luna; optional ANTHROPIC_API_KEY; optional
+ * GOOGLE_PLACES_API_KEY for strong facility types / place name.
  */
 
 "use strict";
 
 const admin = require("firebase-admin");
+// Anthropic fallback scaffold (wired by Luna enrichment work-in-progress).
 const Anthropic = require("@anthropic-ai/sdk");
+void Anthropic;
 const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 
@@ -27,6 +39,12 @@ const SITE_TYPE_LABELS = {
   residential: "residential",
   other: "commercial / other",
 };
+
+/** Minimum confidence to accept residential / RSD from AI. */
+const RESIDENTIAL_MIN_CONFIDENCE = 0.75;
+/** Below this, treat AI result as failed and try the next fallback. */
+const AI_ACCEPT_MIN_CONFIDENCE = 0.55;
+void AI_ACCEPT_MIN_CONFIDENCE;
 
 let tcolFn = null;
 
@@ -119,6 +137,22 @@ async function saveCachedClassification(tenant, addressKey, data) {
 }
 
 /**
+ * Deletes a cached classification (e.g. after fixing false RSD).
+ * @param {object} tenant Tenant.
+ * @param {string} addressKey Normalized key.
+ * @return {Promise<boolean>} True if a doc was deleted.
+ */
+async function deleteCachedClassification(tenant, addressKey) {
+  if (!addressKey) return false;
+  const docId = addressKeyToDocId(addressKey);
+  const ref = col(tenant, "quoteAddressClassifications").doc(docId);
+  const snap = await ref.get();
+  if (!snap.exists) return false;
+  await ref.delete();
+  return true;
+}
+
+/**
  * @return {string|null}
  */
 function getGoogleApiKey() {
@@ -128,7 +162,129 @@ function getGoogleApiKey() {
 }
 
 /**
+ * Same key chain as quote-intake Luna classify.
+ * @return {string|null}
+ */
+function getLunaOpenAiKey() {
+  return process.env.QUOTE_CLASSIFY_OPENAI_API_KEY ||
+    process.env.SUPPORT_CHAT_OPENAI_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    null;
+}
+
+/**
+ * Combined searchable text from consignee fields.
+ * @param {object} consignee Consignee.
+ * @param {string} [extraName] Optional place name from Google.
+ * @return {string}
+ */
+function consigneeSearchText(consignee, extraName) {
+  const c = consignee || {};
+  return [
+    c.name, c.address1, c.address2, c.city, c.state, c.zipCode, extraName,
+  ].filter(Boolean).join(" ").toLowerCase();
+}
+
+/**
+ * Fast site-type from consignee / facility name (no API).
+ * @param {object} consignee Consignee.
+ * @param {string} [extraName] Optional Google place name.
+ * @return {object|null} Classification or null if ambiguous.
+ */
+function classifyFromNameHeuristics(consignee, extraName) {
+  const text = consigneeSearchText(consignee, extraName);
+  const name = String(
+      (consignee && consignee.name) || extraName || "",
+  ).toLowerCase();
+
+  if (/menards/.test(text)) {
+    return heuristicResult("menards_dc", name || "Menards", 0.9);
+  }
+  if (/aafes|military exchange|army air force/.test(text)) {
+    return heuristicResult("aafes_military", name || "AAFES", 0.9);
+  }
+  if (/\bamazon\b|\bfba\b|fulfillment|amzl?\b/.test(text) ||
+    /\b[a-z]{3}\d\b/.test(name)) {
+    return heuristicResult("amazon_fc", name || "Amazon FC", 0.85);
+  }
+  // Facility keywords — must win over any street geocode.
+  if (/nursing|rehab|skilled nursing|care center|assisted living|convalescent/
+      .test(text) ||
+    /\bhospital\b|\bmedical center\b|\bclinic\b/.test(text)) {
+    return heuristicResult(
+        "nursing_home",
+        (consignee && consignee.name) || extraName || "Nursing / care facility",
+        0.92,
+    );
+  }
+  if (/\b(school|university|college|academy|elementary|high school)\b/
+      .test(text)) {
+    return heuristicResult(
+        "other",
+        (consignee && consignee.name) || extraName || "School",
+        0.88,
+        {residentialDelivery: false},
+    );
+  }
+  if (/\bhotel\b|\bmarriott\b|\bhilton\b|\bhyatt\b|\binn\b|\bsuites\b/
+      .test(text) || /\blodging\b/.test(text)) {
+    return heuristicResult(
+        "hotel",
+        (consignee && consignee.name) || extraName || "Hotel",
+        0.9,
+    );
+  }
+  if (/\b(warehouse|distribution center|\bdc\b|fulfillment center)\b/
+      .test(text)) {
+    return heuristicResult(
+        "other",
+        (consignee && consignee.name) || extraName || "Warehouse / DC",
+        0.8,
+        {residentialDelivery: false},
+    );
+  }
+  // Strong residential-only signals (not bare street).
+  const residentialCue =
+    /\b(residential|private residence|residence)\b/.test(text) ||
+    /\b(apartment|apartments|\bapt\.?\b|condo|condominium)\b/.test(text) ||
+    /\b(trailer park|mobile home)\b/.test(text);
+  if (residentialCue) {
+    return heuristicResult(
+        "residential",
+        (consignee && consignee.name) || extraName || "",
+        0.85,
+        {residentialDelivery: true},
+    );
+  }
+
+  return null;
+}
+
+/**
+ * @param {string} siteType Site type.
+ * @param {string} placeName Display name.
+ * @param {number} confidence 0-1.
+ * @param {object} [extra] Extra fields.
+ * @return {object}
+ */
+function heuristicResult(siteType, placeName, confidence, extra = {}) {
+  return {
+    siteType,
+    placeTypes: [],
+    placeName: String(placeName || "").slice(0, 200),
+    source: "name_heuristic",
+    confidence,
+    residentialDelivery: extra.residentialDelivery != null ?
+      !!extra.residentialDelivery :
+      siteType === "residential",
+    reason: "Matched facility / residential keywords on name or address",
+  };
+}
+
+/**
  * Maps Google place types + name to internal siteType.
+ * Never treats bare street_address / premise / subpremise as residential —
+ * that caused false RSD on institutional sites (e.g. 40 Heyward St).
  * @param {Array<string>} types Google types.
  * @param {string} placeName Place display name.
  * @return {string}
@@ -145,8 +301,8 @@ function mapGoogleTypesToSiteType(types, placeName) {
     /\b[a-z]{3}\d\b/.test(name)) {
     return "amazon_fc";
   }
-  if (t.has("nursing_home") ||
-    /nursing|rehab|skilled nursing|care center/.test(name)) {
+  if (t.has("nursing_home") || t.has("hospital") ||
+    /nursing|rehab|skilled nursing|care center|assisted living/.test(name)) {
     return "nursing_home";
   }
   if (t.has("lodging") || t.has("hotel") ||
@@ -158,18 +314,30 @@ function mapGoogleTypesToSiteType(types, placeName) {
     return "amazon_fc";
   }
 
-  const commercial = [
-    "store", "shopping_mall", "supermarket", "department_store",
-    "hardware_store", "home_goods_store", "establishment",
-    "point_of_interest", "lodging", "hospital", "doctor",
-  ];
-  const isCommercial = commercial.some((c) => t.has(c));
-  if ((t.has("street_address") || t.has("premise") || t.has("subpremise")) &&
-    !isCommercial) {
-    return "residential";
-  }
+  // Explicit Google residential type only — not street/premise geocodes.
+  if (t.has("residential")) return "residential";
 
   return "other";
+}
+
+/**
+ * True when Google result is only a bare street/premise geocode.
+ * @param {Array<string>} types Google types.
+ * @return {boolean}
+ */
+function isBareStreetGeocode(types) {
+  const t = new Set((types || []).map((x) => String(x).toLowerCase()));
+  const geoOnly = ["street_address", "premise", "subpremise", "geocode",
+    "route", "political", "locality", "neighborhood", "postal_code",
+    "postal_code_suffix", "administrative_area_level_1",
+    "administrative_area_level_2", "administrative_area_level_3",
+    "country", "plus_code"];
+  if (!t.size) return true;
+  for (const x of t) {
+    if (!geoOnly.includes(x)) return false;
+  }
+  return t.has("street_address") || t.has("premise") ||
+    t.has("subpremise") || t.has("geocode") || t.size > 0;
 }
 
 /**
@@ -184,7 +352,8 @@ function buildAddressQuery(consignee) {
 }
 
 /**
- * Classify via Google Places Find Place + Place Details.
+ * Optional Google Places lookup for place name / facility types only.
+ * Does not assign residential from bare geocode.
  * @param {object} consignee Consignee.
  * @return {Promise<object|null>}
  */
@@ -229,6 +398,20 @@ async function classifyWithGooglePlaces(consignee) {
     }
   }
 
+  // Bare street geocode → metadata only; caller should use Luna / heuristics.
+  if (isBareStreetGeocode(types)) {
+    return {
+      siteType: "other",
+      placeTypes: types,
+      placeName,
+      source: "google_places",
+      confidence: 0.35,
+      residentialDelivery: false,
+      bareGeocode: true,
+      reason: "Google returned street/premise geocode only — not used for RSD",
+    };
+  }
+
   const siteType = mapGoogleTypesToSiteType(types, placeName);
   return {
     siteType,
@@ -236,92 +419,124 @@ async function classifyWithGooglePlaces(consignee) {
     placeName,
     source: "google_places",
     confidence: siteType === "other" ? 0.5 : 0.85,
+    residentialDelivery: siteType === "residential",
+    bareGeocode: false,
   };
 }
 
 /**
+ * Classify site type with Luna (OpenAI gpt-5.6-luna).
+ * Prefer unknown/other over false residential when confidence is low.
  * @param {object} consignee Consignee.
  * @return {Promise<object|null>}
  */
-async function classifyWithAi(consignee) {
+async function classifyWithLuna(consignee) {
+  const apiKey = getLunaOpenAiKey();
+  if (!apiKey) return null;
+
   const c = consignee || {};
   const payload = {
     name: c.name || "",
     address1: c.address1 || "",
+    address2: c.address2 || "",
     city: c.city || "",
     state: c.state || "",
     zipCode: c.zipCode || "",
   };
 
   const system = [
-    "You classify LTL freight delivery locations.",
+    "You classify LTL freight delivery locations for accessorials.",
     "Return ONLY valid JSON:",
-    "{ siteType, placeName, confidence }",
+    "{ \"siteType\": string, \"residentialDelivery\": boolean,",
+    "  \"confidence\": number, \"placeName\": string, \"reason\": string }",
     `siteType must be one of: ${SITE_TYPES.join(", ")}.`,
-    "Use placeName for the best public name of the location.",
-    "confidence is 0-1.",
+    "CRITICAL: A bare street address is NOT enough for residential.",
+    "Do NOT assume apartment/residential from neighborhood",
+    "(e.g. Brooklyn/Williamsburg) or street number alone.",
+    "residentialDelivery=true ONLY with strong signals: unit/apt",
+    "implying a dwelling, or name says residence/apartment, or",
+    "shipper explicitly says residential.",
+    "Nursing homes, hospitals, rehab, schools, hotels, warehouses,",
+    "DCs, stores are NOT residential.",
+    "If the only input is street+city with no facility name and no",
+    "unit, prefer siteType other, residentialDelivery false,",
+    "confidence <= 0.55.",
+    "If you recognize a well-known facility at that exact address,",
+    "you may name it and set the matching siteType.",
+    "reason: one short sentence.",
   ].join("\n");
 
-  if (process.env.ANTHROPIC_API_KEY) {
-    const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
-    const res = await client.messages.create({
-      model: "claude-sonnet-5",
-      max_tokens: 300,
-      system,
-      messages: [{
-        role: "user",
-        content: JSON.stringify(payload),
-      }],
-    });
-    const raw = String(
-        res.content && res.content[0] && res.content[0].text || "",
-    ).trim();
-    return parseAiClassification(raw);
-  }
+  const client = new OpenAI({apiKey});
+  const model = process.env.QUOTE_ADDRESS_AI_MODEL ||
+    process.env.QUOTE_CLASSIFY_MODEL ||
+    DEFAULT_OPENAI_MODEL;
+  // gpt-5.6-luna rejects temperature (only default 1). Omit it.
+  const completion = await client.chat.completions.create({
+    model,
+    max_completion_tokens: 300,
+    response_format: {type: "json_object"},
+    messages: [
+      {role: "system", content: system},
+      {role: "user", content: JSON.stringify(payload)},
+    ],
+  });
+  const raw = String(
+      completion.choices &&
+      completion.choices[0] &&
+      completion.choices[0].message &&
+      completion.choices[0].message.content || "",
+  ).trim();
+  return parseAiClassification(raw, "luna");
+}
 
-  const openAiKey = process.env.OPENAI_API_KEY;
-  if (openAiKey) {
-    const client = new OpenAI({apiKey: openAiKey});
-    const completion = await client.chat.completions.create({
-      model: process.env.QUOTE_ADDRESS_AI_MODEL || DEFAULT_OPENAI_MODEL,
-      max_completion_tokens: 300,
-      response_format: {type: "json_object"},
-      messages: [
-        {role: "system", content: system},
-        {role: "user", content: JSON.stringify(payload)},
-      ],
-    });
-    const raw = String(
-        completion.choices &&
-        completion.choices[0] &&
-        completion.choices[0].message &&
-        completion.choices[0].message.content || "",
-    ).trim();
-    return parseAiClassification(raw);
-  }
-
-  return null;
+/**
+ * @deprecated Use classifyWithLuna — kept as alias for callers/tests.
+ * @param {object} consignee Consignee address fields.
+ * @return {Promise<object|null>}
+ */
+async function classifyWithAi(consignee) {
+  return classifyWithLuna(consignee);
 }
 
 /**
  * @param {string} raw JSON text from model.
+ * @param {string} [source] Classification source label.
  * @return {object|null}
  */
-function parseAiClassification(raw) {
+function parseAiClassification(raw, source = "ai") {
   const jsonText = raw
       .replace(/^```(?:json)?\s*/i, "")
       .replace(/\s*```$/i, "")
       .trim();
   try {
     const parsed = JSON.parse(jsonText);
-    const siteType = SITE_TYPES.includes(parsed.siteType) ?
+    let siteType = SITE_TYPES.includes(parsed.siteType) ?
       parsed.siteType : "other";
+    const confidence = Math.min(
+        1, Math.max(0, Number(parsed.confidence) || 0.5),
+    );
+    let residentialDelivery = parsed.residentialDelivery === true ||
+      siteType === "residential";
+
+    // Prefer false negatives: low-confidence residential → other / no RSD.
+    if (siteType === "residential" &&
+      confidence < RESIDENTIAL_MIN_CONFIDENCE) {
+      siteType = "other";
+      residentialDelivery = false;
+    }
+    if (residentialDelivery && confidence < RESIDENTIAL_MIN_CONFIDENCE) {
+      residentialDelivery = false;
+      if (siteType === "residential") siteType = "other";
+    }
+
     return {
       siteType,
       placeTypes: [],
       placeName: String(parsed.placeName || "").slice(0, 200),
-      source: "ai",
-      confidence: Math.min(1, Math.max(0, Number(parsed.confidence) || 0.6)),
+      source,
+      confidence,
+      residentialDelivery,
+      reason: String(parsed.reason || "").slice(0, 300),
     };
   } catch (_) {
     return null;
@@ -345,8 +560,10 @@ function mergeClassificationOntoLane(lane, classification, opts = {}) {
     lane.siteType = classification.siteType;
   }
 
-  if (classification.siteType === "residential" ||
-    (lane.siteType === "residential")) {
+  const wantRsd = classification.residentialDelivery === true ||
+    classification.siteType === "residential" ||
+    lane.siteType === "residential";
+  if (wantRsd) {
     lane.flags = {...(lane.flags || {}), residentialDelivery: true};
   }
 
@@ -357,6 +574,7 @@ function mergeClassificationOntoLane(lane, classification, opts = {}) {
     placeTypes: classification.placeTypes || [],
     classifiedAs: classification.siteType,
     confidence: classification.confidence,
+    reason: classification.reason || null,
     addressKey: classification.addressKey,
     enrichedAt: classification.enrichedAt ||
       new Date().toISOString(),
@@ -365,6 +583,80 @@ function mergeClassificationOntoLane(lane, classification, opts = {}) {
   };
 
   return lane;
+}
+
+/**
+ * Resolve site type: heuristics → Luna when ambiguous → Google facility types.
+ * @param {object} consignee Consignee.
+ * @param {Function} [log] Logger.
+ * @return {Promise<object|null>}
+ */
+async function resolveClassification(consignee, log = () => {}) {
+  const heuristic = classifyFromNameHeuristics(consignee);
+  if (heuristic && heuristic.siteType !== "other") {
+    return heuristic;
+  }
+  if (heuristic && heuristic.siteType === "residential") {
+    return heuristic;
+  }
+
+  let google = null;
+  try {
+    google = await classifyWithGooglePlaces(consignee);
+  } catch (err) {
+    log("warn", "quote", "Google Places classification failed", {
+      error: err.message,
+    });
+  }
+
+  // Facility types from Google (nursing_home, hotel, etc.) are usable.
+  if (google && !google.bareGeocode &&
+    google.siteType && google.siteType !== "other") {
+    // Re-check name heuristics with Google place name.
+    const withName = classifyFromNameHeuristics(
+        consignee, google.placeName);
+    if (withName) return withName;
+    return google;
+  }
+
+  // Ambiguous / bare geocode → Luna (not Google residential).
+  let luna = null;
+  try {
+    luna = await classifyWithLuna(consignee);
+  } catch (err) {
+    log("warn", "quote", "Luna address classification failed", {
+      error: err.message,
+    });
+  }
+  if (luna) {
+    if (google && google.placeName && !luna.placeName) {
+      luna.placeName = google.placeName;
+    }
+    if (google && google.placeTypes) {
+      luna.placeTypes = google.placeTypes;
+    }
+    return luna;
+  }
+
+  // Default: commercial/other — do NOT invent RSD.
+  if (google) {
+    return {
+      ...google,
+      siteType: "other",
+      residentialDelivery: false,
+      confidence: Math.min(google.confidence || 0.4, 0.5),
+    };
+  }
+
+  return heuristic || {
+    siteType: "other",
+    placeTypes: [],
+    placeName: "",
+    source: "default",
+    confidence: 0.3,
+    residentialDelivery: false,
+    reason: "No classifier result — default commercial/other (no RSD)",
+  };
 }
 
 /**
@@ -400,21 +692,11 @@ async function enrichLaneConsignee(lane, tenant, opts = {}) {
 
   let classification = null;
   try {
-    classification = await classifyWithGooglePlaces(consignee);
+    classification = await resolveClassification(consignee, log);
   } catch (err) {
-    log("warn", "quote", "Google Places classification failed", {
+    log("warn", "quote", "Address classification failed", {
       addressKey, error: err.message,
     });
-  }
-
-  if (!classification) {
-    try {
-      classification = await classifyWithAi(consignee);
-    } catch (err) {
-      log("warn", "quote", "AI address classification failed", {
-        addressKey, error: err.message,
-      });
-    }
   }
 
   if (!classification) {
@@ -443,6 +725,8 @@ async function enrichLaneConsignee(lane, tenant, opts = {}) {
       placeName: classification.placeName || null,
       source: classification.source,
       confidence: classification.confidence,
+      residentialDelivery: !!classification.residentialDelivery,
+      reason: classification.reason || null,
     });
   } catch (err) {
     log("warn", "quote", "Failed to cache address classification", {
@@ -454,6 +738,7 @@ async function enrichLaneConsignee(lane, tenant, opts = {}) {
     addressKey,
     siteType: classification.siteType,
     source: classification.source,
+    residentialDelivery: !!classification.residentialDelivery,
   });
 
   return lane;
@@ -463,13 +748,20 @@ module.exports = {
   init,
   SITE_TYPES,
   SITE_TYPE_LABELS,
+  RESIDENTIAL_MIN_CONFIDENCE,
   normalizeAddressKey,
   normalizePart,
+  addressKeyToDocId,
   getCachedClassification,
   saveCachedClassification,
+  deleteCachedClassification,
+  classifyFromNameHeuristics,
   classifyWithGooglePlaces,
+  classifyWithLuna,
   classifyWithAi,
+  resolveClassification,
   enrichLaneConsignee,
   mergeClassificationOntoLane,
   mapGoogleTypesToSiteType,
+  isBareStreetGeocode,
 };
