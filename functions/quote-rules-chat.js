@@ -516,13 +516,25 @@ function detectCreateIdentifyGate(messages) {
 }
 
 /**
+ * Latest non-assistant turn.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object|null}
+ */
+function lastUserTurn(messages) {
+  return [...(messages || [])].reverse()
+      .find((m) => m && m.role !== "assistant") || null;
+}
+
+/**
  * True when the latest user message looks like a create/add rule request.
+ * Delete/remove phrasing is never treated as create (including "delete all
+ * rules for militery bases").
  * @param {Array<object>} messages Chat turns.
  * @return {boolean}
  */
 function looksLikeCreateRuleIntent(messages) {
-  const lastUser = [...(messages || [])].reverse()
-      .find((m) => m.role !== "assistant");
+  if (looksLikeDeleteRuleIntent(messages)) return false;
+  const lastUser = lastUserTurn(messages);
   if (!lastUser) return false;
   const t = String(lastUser.content || "").toLowerCase();
   const createAccessorialRe = new RegExp(
@@ -538,6 +550,141 @@ function looksLikeCreateRuleIntent(messages) {
 }
 
 /**
+ * True when the latest user message is a delete/remove request.
+ * Accepts typos (militery, millitary) and short forms ("remove military",
+ * "delete aafes").
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function looksLikeDeleteRuleIntent(messages) {
+  const lastUser = lastUserTurn(messages);
+  if (!lastUser) return false;
+  const t = String(lastUser.content || "").toLowerCase().trim();
+  if (!t || /^\[applied\]/.test(t)) return false;
+  const hasVerb = /\b(delete|remove|drop|clear|erase|uninstall)\b/.test(t) ||
+    /\bget rid of\b/.test(t);
+  if (!hasVerb) return false;
+  return /\brules?\b/.test(t) ||
+    /\baafes\b/.test(t) ||
+    isMilitaryTopicBlob(t) ||
+    /\b(nursing(\s+home)?s?|hotels?|amazon|menards?|residential)\b/.test(t);
+}
+
+/**
+ * Whether a live rule is a military / AAFES rule.
+ * @param {object} rule Rule doc.
+ * @return {boolean}
+ */
+function ruleLooksMilitary(rule) {
+  if (!rule) return false;
+  const id = String(rule.id || "").toLowerCase();
+  const name = String(rule.name || "").toLowerCase();
+  const notes = String(rule.notes || "").toLowerCase();
+  const siteType = String((rule.match && rule.match.siteType) || "")
+      .toLowerCase();
+  if (id === "aafes_military" || siteType === "aafes_military") return true;
+  return isMilitaryTopicBlob(`${id} ${name} ${notes} ${siteType}`) ||
+    /\baafes\b/.test(`${id} ${name} ${notes}`);
+}
+
+/**
+ * Live rules that match the user's delete topic.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {string} text Latest user text.
+ * @return {Array<object>}
+ */
+function findRulesForDeleteTopic(existingRules, text) {
+  const t = String(text || "").toLowerCase();
+  const live = (existingRules || []).filter((r) => r && r.active !== false);
+  if (isMilitaryTopicBlob(t) || /\baafes\b/.test(t)) {
+    return live.filter(ruleLooksMilitary);
+  }
+  if (/\bnursing(\s+home)?s?\b/.test(t)) {
+    return live.filter((r) => {
+      const id = String(r.id || "");
+      const site = String((r.match && r.match.siteType) || "");
+      return id === "nursing_home" || site === "nursing_home" ||
+        /\bnursing/.test(String(r.name || "").toLowerCase());
+    });
+  }
+  if (/\bhotels?\b/.test(t)) {
+    return live.filter((r) => {
+      const id = String(r.id || "");
+      const site = String((r.match && r.match.siteType) || "");
+      return id === "hotel" || site === "hotel" ||
+        /\bhotel/.test(String(r.name || "").toLowerCase());
+    });
+  }
+  if (/\bamazon\b/.test(t)) {
+    return live.filter((r) => String(r.id || "") === "amazon_fc" ||
+      String((r.match && r.match.siteType) || "") === "amazon_fc");
+  }
+  if (/\bmenards?\b/.test(t)) {
+    return live.filter((r) => String(r.id || "") === "menards_dc" ||
+      String((r.match && r.match.siteType) || "") === "menards_dc");
+  }
+  if (/\bresidential\b/.test(t)) {
+    return live.filter((r) => String(r.id || "") === "residential_delivery");
+  }
+  const idHit = live.filter((r) => {
+    const id = String(r.id || "").toLowerCase();
+    return id && (t.includes(id) || t.includes(id.replace(/_/g, " ")));
+  });
+  return idHit;
+}
+
+/**
+ * Deterministic delete proposal so we never fall through to the create
+ * identify gate or the generic "could not process" LLM fallback.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {object|null}
+ */
+function buildDeleteRuleProposal(messages, existingRules) {
+  if (!looksLikeDeleteRuleIntent(messages)) return null;
+  const lastUser = lastUserTurn(messages);
+  const text = lastUser ? String(lastUser.content || "") : "";
+  const matches = findRulesForDeleteTopic(existingRules, text);
+  if (!matches.length) {
+    const t = text.toLowerCase();
+    if (isMilitaryTopicBlob(t) || /\baafes\b/.test(t)) {
+      return {
+        reply: "There are no live military / AAFES rules to delete.",
+        action: "none",
+        proposal: null,
+        quickReplies: [],
+      };
+    }
+    return {
+      reply: "I couldn't find a matching live rule to delete. " +
+        "Name the rule id or site (for example aafes_military, " +
+        "military bases, Amazon).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+  const ids = [...new Set(matches.map((r) => String(r.id)))];
+  const primary = matches.find((r) => r.id === "aafes_military") || matches[0];
+  const labels = matches.map((r) =>
+    `"${r.name || r.id}" (${r.id})`).join(", ");
+  const reply = ids.length === 1 ?
+    `I'll delete the rule ${labels}. Click Confirm to apply the deletion.` :
+    `I'll delete all ${ids.length} matching rules: ${labels}. ` +
+      "Click Confirm to apply the deletion.";
+  return {
+    reply,
+    action: "propose_delete_rule",
+    proposal: {
+      ruleId: String(primary.id),
+      deleteRuleId: String(primary.id),
+      deleteRuleIds: ids,
+    },
+    quickReplies: [],
+  };
+}
+
+/**
  * Enforce identify questionnaire before create proposals.
  * @param {object} result Model JSON result.
  * @param {Array} messages Chat history including latest user turn.
@@ -550,6 +697,21 @@ function enforceCreateIdentifyGate(result, messages) {
     proposal: null,
   };
   const action = out.action || "none";
+  // Delete/remove never belongs in the create identify questionnaire.
+  // A leftover ready/address_only gate from an earlier add must not
+  // swallow "delete all rules for militery bases".
+  if (looksLikeDeleteRuleIntent(messages)) {
+    if (action === "propose_delete_rule") return out;
+    if (/could not process|try rephrasing/i.test(String(out.reply || ""))) {
+      out.reply = "Tell me which rule to delete (id or site, " +
+        "e.g. military bases / AAFES). I will propose a deletion " +
+        "for you to Confirm.";
+      out.action = "none";
+      out.proposal = null;
+      out.quickReplies = [];
+    }
+    return out;
+  }
   const gate = detectCreateIdentifyGate(messages);
   const extras = collectCreateFlowExtras(messages);
   const lastUser = [...(messages || [])].reverse()
@@ -713,6 +875,13 @@ function enforceCreateIdentifyGate(result, messages) {
  */
 async function runQuoteRulesChatTurn(opts) {
   const chatTurns = opts.messages || [];
+  const existingRules = opts.existingRules || [];
+  // Deterministic delete before OpenAI and before the create-identify gate.
+  // Otherwise a leftover Cannot-be flow (or empty model JSON) replies
+  // "I could not process that. Try rephrasing."
+  const deleteOut = buildDeleteRuleProposal(chatTurns, existingRules);
+  if (deleteOut) return deleteOut;
+
   const gateHint = detectCreateIdentifyGate(chatTurns);
   // After Cannot-be, accessorials are a structured answer — don't send
   // "LAD" / "limited access" through the model (that caused the re-ask loop).
@@ -773,6 +942,12 @@ async function runQuoteRulesChatTurn(opts) {
     "When the user wants to ADD or CREATE a new rule, you MUST NOT propose",
     "the rule (action must NOT be propose_create_rule) until this finishes.",
     "Updates and deletes skip this questionnaire unless it comes up naturally.",
+    "If the user asks to delete/remove/drop a rule (including typos like",
+    "militery / millitary, and short forms",
+    "\"remove military\", \"delete aafes\",",
+    "\"delete all rules for military bases\"): action MUST be",
+    "propose_delete_rule. Do NOT ask identify. Do NOT say you could not",
+    "process that. Ask them to click Confirm; do not claim the rule is gone.",
     "",
     "Step 1 — Always stop and ask (action: ask_identify_source):",
     "\"How can this condition be identified?\" Present exactly two options:",
@@ -1029,16 +1204,21 @@ function validateRuleProposal(proposal) {
   }
   const action = proposal.action || proposal.type;
   if (action === "propose_delete_rule" || action === "delete") {
-    const id = proposal.deleteRuleId ||
-      proposal.ruleId ||
-      (proposal.proposal && (
-        proposal.proposal.deleteRuleId || proposal.proposal.ruleId
-      )) ||
-      (proposal.patch && (
-        proposal.patch.deleteRuleId || proposal.patch.ruleId
-      ));
-    if (!id) return {ok: false, error: "Missing rule id to delete"};
-    return {ok: true, action: "delete", ruleId: String(id)};
+    const nested = proposal.proposal && typeof proposal.proposal === "object" ?
+      proposal.proposal : {};
+    const listed = []
+        .concat(proposal.deleteRuleIds || [])
+        .concat(nested.deleteRuleIds || [])
+        .concat(proposal.deleteRuleId || [])
+        .concat(proposal.ruleId || [])
+        .concat(nested.deleteRuleId || [])
+        .concat(nested.ruleId || [])
+        .concat(proposal.patch && proposal.patch.deleteRuleId || [])
+        .concat(proposal.patch && proposal.patch.ruleId || []);
+    const ids = [...new Set(listed.map((x) => String(x || "").trim())
+        .filter(Boolean))];
+    if (!ids.length) return {ok: false, error: "Missing rule id to delete"};
+    return {ok: true, action: "delete", ruleId: ids[0], ruleIds: ids};
   }
 
   const patch = extractPatch(proposal);
@@ -1097,6 +1277,10 @@ module.exports = {
   parseIdentifyChoiceAnswer,
   parseAccessorialsAnswer,
   inferCreateTopic,
+  looksLikeDeleteRuleIntent,
+  looksLikeCreateRuleIntent,
+  buildDeleteRuleProposal,
+  isMilitaryTopicBlob,
   IDENTIFY_QUICK_REPLIES,
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,

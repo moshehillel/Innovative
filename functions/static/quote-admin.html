@@ -845,7 +845,10 @@
       const ruleLabel = p.ruleId || p.deleteRuleId || patch.id || "unknown";
 
       if (isDeleteAction(action)) {
-        parts.push(`<strong>Delete</strong> the rule "${esc(ruleLabel)}".`);
+        const ids = Array.isArray(p.deleteRuleIds) && p.deleteRuleIds.length
+          ? p.deleteRuleIds
+          : [ruleLabel];
+        parts.push(`<strong>Delete</strong> ${ids.length === 1 ? "the rule" : ids.length + " rules"}: ${ids.map((id) => `"${esc(id)}"`).join(", ")}.`);
         return parts.join("<br>");
       } else if (isCreateAction(action)) {
         parts.push(`<strong>Create a new rule:</strong> "${esc(patch.name || p.ruleId || "new rule")}".`);
@@ -1021,16 +1024,21 @@
       const confirmBtn = document.getElementById("confirm-proposal");
       const wasDelete = isDeleteAction(pendingProposal.action);
       const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
-      if (wasDelete && !ruleId) {
+      const deleteRuleIds = Array.isArray(pendingProposal.deleteRuleIds) &&
+        pendingProposal.deleteRuleIds.length
+        ? pendingProposal.deleteRuleIds
+        : (ruleId ? [ruleId] : []);
+      if (wasDelete && !ruleId && !deleteRuleIds.length) {
         appendChat("assistant", "Failed: missing rule id to delete. Ask the assistant to propose the delete again.");
         return;
       }
       const body = {
         tenantId: TENANT_ID,
         action: pendingProposal.action,
-        ruleId,
+        ruleId: ruleId || deleteRuleIds[0],
         patch: pendingProposal.patch || {},
-        deleteRuleId: pendingProposal.deleteRuleId || ruleId,
+        deleteRuleId: pendingProposal.deleteRuleId || ruleId || deleteRuleIds[0],
+        deleteRuleIds,
         updatedBy: "quote-admin-ui",
       };
       if (confirmBtn) confirmBtn.disabled = true;
@@ -1150,6 +1158,9 @@
             action: res.action,
             ruleId,
             deleteRuleId: proposal.deleteRuleId || ruleId,
+            deleteRuleIds: Array.isArray(proposal.deleteRuleIds)
+              ? proposal.deleteRuleIds
+              : (ruleId ? [ruleId] : []),
             patch,
           };
           document.getElementById("proposal-summary").innerHTML = summarizeProposal(res);

@@ -209,8 +209,16 @@ async function handleApplyQuoteRule(req, res) {
     }
     const updatedBy = String(body.updatedBy || "quote-admin");
     if (validated.action === "delete") {
-      await quoteRules.deleteRule(tenant, validated.ruleId, updatedBy);
-      return res.json({ok: true, deleted: validated.ruleId});
+      const ids = Array.isArray(validated.ruleIds) && validated.ruleIds.length ?
+        validated.ruleIds : [validated.ruleId];
+      for (const id of ids) {
+        await quoteRules.deleteRule(tenant, id, updatedBy);
+      }
+      return res.json({
+        ok: true,
+        deleted: ids.length === 1 ? ids[0] : ids,
+        deletedIds: ids,
+      });
     }
     let patch = validated.patch;
     // Preserve existing name/match (and other fields) when chat sends a
@@ -341,11 +349,15 @@ async function handleQuoteRulesChat(req, res) {
       const proposal = result.proposal && typeof result.proposal === "object" ?
         {...result.proposal} :
         {};
+      const extraIds = Array.isArray(proposal.deleteRuleIds) ?
+        proposal.deleteRuleIds : [];
       const id = proposal.deleteRuleId || proposal.ruleId ||
-        result.deleteRuleId || result.ruleId;
-      if (id) {
-        proposal.ruleId = proposal.ruleId || id;
-        proposal.deleteRuleId = proposal.deleteRuleId || id;
+        result.deleteRuleId || result.ruleId || extraIds[0];
+      if (id || extraIds.length) {
+        proposal.ruleId = proposal.ruleId || id || extraIds[0];
+        proposal.deleteRuleId = proposal.deleteRuleId || id || extraIds[0];
+        proposal.deleteRuleIds = [...new Set(
+            [proposal.deleteRuleId, ...extraIds].filter(Boolean).map(String))];
         result.proposal = proposal;
       }
     }
