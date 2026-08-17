@@ -14,6 +14,7 @@ const quoteOutput = require("./quote-output");
 const quoteDispatchers = require("./quote-dispatchers");
 const quoteOutlook = require("./quote-outlook");
 const quoteAccCatalog = require("./quote-accessorial-catalog");
+const quoteEmailAcc = require("./quote-email-accessorials");
 
 let deps = {};
 
@@ -238,6 +239,10 @@ function normalizeFreightRows(rows) {
       weightType,
       class: r.class != null && r.class !== "" ?
         (Number(r.class) || r.class) : null,
+      classSource: r.classSource || null,
+      emailClass: r.emailClass != null && r.emailClass !== "" ?
+        (Number(r.emailClass) || r.emailClass) : null,
+      density: numOrNull(r.density),
       length: numOrNull(r.length),
       width: numOrNull(r.width),
       height: numOrNull(r.height),
@@ -549,7 +554,8 @@ async function rateLane(lane, ctx) {
     };
   }
 
-  // Fill missing/invalid NMFC class from weight + dims (Primus density table).
+  // Always overwrite email class with Primus density class when
+  // weight + L×W×H are present.
   const classFix = rateShop.ensureFreightClasses(lane.freightInfo || [], {
     UOM: "US",
   });
@@ -595,6 +601,14 @@ async function rateLane(lane, ctx) {
   } else {
     rulesOut = quoteRules.applyRulesToLane(
         laneForRate, ctx.rules, ctx.extracted || {});
+    const emailText = [
+      lane.specialInstructions,
+      ctx.extracted && ctx.extracted.specialInstructionsGlobal,
+    ].filter(Boolean).join("\n");
+    const requested = quoteEmailAcc.resolveRequestedAccessorials(
+        ctx.extracted || {}, {body: emailText});
+    rulesOut = quoteEmailAcc.applyEmailRequestedAccessorials(
+        rulesOut, requested, quoteRules.formatAccessorialLabels);
   }
   const mergedLane = {
     ...laneForRate,

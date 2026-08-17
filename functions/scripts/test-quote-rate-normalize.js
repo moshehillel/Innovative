@@ -72,12 +72,29 @@ const ruelily = rateShop.ensureFreightClasses([{
 check("ruelily filled class 110", ruelily.freightInfo[0].class, 110);
 check("ruelily filled count", ruelily.filled, 1);
 check("ruelily unresolved", ruelily.unresolved.length, 0);
+check("ruelily classSource density", ruelily.freightInfo[0].classSource,
+    "density");
 
 const noDims = rateShop.ensureFreightClasses([{
   qty: 1, weight: 500, dimType: "PLT", class: null,
 }]);
 check("no dims unresolved", noDims.unresolved.length, 1);
 check("no dims filled", noDims.filled, 0);
+
+const emailClass = rateShop.ensureFreightClasses([{
+  qty: 2, weight: 1205, weightType: "total",
+  length: 48, width: 40, height: 65, dimType: "PLT", class: 70,
+}]);
+check("email class overwritten to 110", emailClass.freightInfo[0].class, 110);
+check("email class preserved", emailClass.freightInfo[0].emailClass, 70);
+check("email class overwritten count", emailClass.overwritten, 1);
+
+const keepEmail = rateShop.ensureFreightClasses([{
+  qty: 1, weight: 500, dimType: "PLT", class: 70,
+}]);
+check("keep email class without dims", keepEmail.freightInfo[0].class, 70);
+check("keep email classSource", keepEmail.freightInfo[0].classSource, "email");
+check("keep email unresolved", keepEmail.unresolved.length, 0);
 
 const qFilled = rateShop.buildRateMultipleQuery({
   shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},

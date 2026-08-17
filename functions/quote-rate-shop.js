@@ -752,33 +752,44 @@ function densityFromFreightRow(row, uom = "US") {
 }
 
 /**
- * Derive NMFC class from weight + dims when class is missing/invalid.
+ * Always prefer Primus density class (weight + L×W×H) over email class.
+ * When dims/weight are insufficient, keep a valid previous class.
  * Primus /tools/densityrules is empty for this tenant; table matches
  * Primus booking density/class pairs.
  * @param {Array<object>} freightInfo Freight lines.
  * @param {object} [opts] UOM.
  * @return {{freightInfo: Array<object>, filled: number,
- *   unresolved: Array<object>}}
+ *   overwritten: number, unresolved: Array<object>}}
  */
 function ensureFreightClasses(freightInfo, opts = {}) {
   const uom = opts.UOM || opts.uom || "US";
   const rows = Array.isArray(freightInfo) ? freightInfo : [];
   const unresolved = [];
   let filled = 0;
+  let overwritten = 0;
   const next = rows.map((row, idx) => {
     const r = row && typeof row === "object" ? {...row} : {};
-    if (isValidFreightClass(r.class)) {
-      r.class = Number(r.class);
-      return r;
-    }
+    const prevClass = isValidFreightClass(r.class) ? Number(r.class) : null;
     const dens = densityFromFreightRow(r, uom);
     const cls = dens ? classFromDensity(dens.density) : null;
     if (cls != null) {
+      if (prevClass != null && prevClass !== cls) {
+        r.emailClass = prevClass;
+        overwritten += 1;
+      } else if (prevClass == null && r.class != null && r.class !== "") {
+        r.emailClass = r.class;
+      }
       r.class = cls;
+      r.classSource = "density";
       if (dens.density > 0) {
         r.density = Math.round(dens.density * 1000) / 1000;
       }
       filled += 1;
+      return r;
+    }
+    if (prevClass != null) {
+      r.class = prevClass;
+      if (!r.classSource) r.classSource = "email";
       return r;
     }
     if (r.class == null || r.class === "") delete r.class;
@@ -791,7 +802,7 @@ function ensureFreightClasses(freightInfo, opts = {}) {
     });
     return r;
   });
-  return {freightInfo: next, filled, unresolved};
+  return {freightInfo: next, filled, overwritten, unresolved};
 }
 
 /**
@@ -809,8 +820,10 @@ function normalizeFreightInfoForRate(freightInfo, opts = {}) {
     const wt = String(r.weightType || "").trim().toLowerCase();
     r.weightType = (wt === "each" || wt === "perpiece" || wt === "per-piece") ?
       "each" : "total";
-    // Drop density helper field from rate payload (UI may keep it on quote).
+    // Drop density helper fields from rate payload (UI may keep on quote).
     delete r.density;
+    delete r.classSource;
+    delete r.emailClass;
     // Still omit blank/invalid class so market rating can density-calc.
     if (!isValidFreightClass(r.class)) delete r.class;
     else r.class = Number(r.class);

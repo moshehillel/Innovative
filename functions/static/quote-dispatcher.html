@@ -98,6 +98,11 @@
       color: var(--primary-dark);
     }
     .why strong { display: block; margin-bottom: 4px; }
+    .class-hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin: 6px 0 0;
+    }
     .acc-panel {
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -1330,7 +1335,10 @@
           "<option value='each'" + (wt === "each" ? " selected" : "") +
           ">each</option></select></td>";
         html += "<td><input data-f='class' value='" +
-          esc(f.class != null ? f.class : "") + "'></td>";
+          esc(f.class != null ? f.class : "") + "'" +
+          (f.classSource === "density" ?
+            " title='Primus density class from weight and L×W×H'" : "") +
+          "></td>";
         ["length", "width", "height"].forEach((k) => {
           html += "<td><input data-f='" + k + "' value='" +
             esc(f[k] != null ? f[k] : "") + "'></td>";
@@ -1342,6 +1350,18 @@
         html += "</tr>";
       });
       html += "</tbody></table>";
+      const densityRows = rows.filter((f) => f.classSource === "density");
+      if (densityRows.length) {
+        const bits = densityRows.map((f) => {
+          if (f.emailClass != null && Number(f.emailClass) !== Number(f.class)) {
+            return "email class " + f.emailClass + " → Primus " + f.class;
+          }
+          return "Primus class " + f.class;
+        });
+        html += "<p class='class-hint'>Class from Primus density " +
+          "(weight × L×W×H; email class ignored): " +
+          esc(bits.join("; ")) + ".</p>";
+      }
       html += "<button type='button' class='ghost btn-add-freight' " +
         "data-lane='" + esc(laneKey) +
         "' style='margin-top:8px'>Add freight line</button>";

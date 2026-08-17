@@ -7,6 +7,7 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
+const emailAccessorials = require("./quote-email-accessorials");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
 
@@ -40,6 +41,20 @@ function toPlainText(input) {
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]{2,}/g, " ")
       .trim();
+}
+
+/**
+ * Normalize sole-address + stamp email-requested accessorial codes.
+ * @param {object} extracted Intake payload.
+ * @param {object} opts subject, body.
+ * @return {object}
+ */
+function finishExtract(extracted, opts) {
+  const next = normalizeSoleAddressToConsignee(extracted);
+  return emailAccessorials.attachRequestedAccessorials(next, {
+    subject: opts && opts.subject,
+    body: opts && opts.body,
+  });
 }
 
 /**
@@ -94,7 +109,9 @@ async function callQuoteExtractionModel(client, payload) {
       "- customerRequest: {",
       "    wantsGuaranteedOptions: boolean,",
       "    wantsCarrierExpiration: boolean,",
-      "    wantsLimitedAccessInQuote: boolean",
+      "    wantsLimitedAccessInQuote: boolean,",
+      "    requestedAccessorials: string[]  // Primus codes, e.g.",
+      "      [\"LAD\",\"LFD\",\"APD\",\"RSD\",\"IND\"]",
       "  }",
       "- flags: {needsDispatcherReview: boolean}",
       "",
@@ -120,9 +137,15 @@ async function callQuoteExtractionModel(client, payload) {
       "- If pallet count seems wrong (>20), suspiciousPalletCount true.",
       "- Detect liftgate / no dock in global or lane instructions.",
       "- If email mentions accessorials (liftgate, residential,",
-      "  appointment, limited access, inside delivery, etc.), copy",
-      "  those phrases into specialInstructions /",
-      "  specialInstructionsGlobal so quote rules can apply them.",
+      "  appointment, limited access, inside delivery, insurance,",
+      "  etc.), copy those phrases into specialInstructions /",
+      "  specialInstructionsGlobal AND map them to Primus codes in",
+      "  customerRequest.requestedAccessorials:",
+      "  liftgate pickup/origin → LFO; liftgate delivery or bare",
+      "  liftgate/no dock → LFD (+ LFO if unspecified); appointment",
+      "  → APD (APO if pickup); residential → RSD; limited/restricted",
+      "  access → LAD (LAO if pickup); inside delivery → IND;",
+      "  inside pickup → INO; insurance → INS; hazmat → HAZ.",
       "- Set flags.residentialDelivery true when residential/",
       "  home delivery is requested.",
       "- Military bases, forts, AFB, naval/Marine stations, AAFES",
@@ -132,7 +155,8 @@ async function callQuoteExtractionModel(client, payload) {
       "- If customer asks for carrier expiration days,",
       "  set customerRequest.wantsCarrierExpiration true.",
       "- If customer asks for limited/restricted delivery charges",
-      "  in the quote email, set wantsLimitedAccessInQuote true.",
+      "  in the quote email, set wantsLimitedAccessInQuote true",
+      "  and include LAD in requestedAccessorials.",
       "- Always return at least one lane when pickup + delivery addresses",
       "  are present, even if freight dims/class/weight are missing.",
       "- Sole address → consignee (destination / Ship To): when the email",
@@ -316,7 +340,9 @@ function heuristicExtractQuote(opts) {
     customerRequest: {
       wantsGuaranteedOptions: false,
       wantsCarrierExpiration: false,
-      wantsLimitedAccessInQuote: false,
+      wantsLimitedAccessInQuote: /limited\s*access|restricted\s*access/i
+          .test(body),
+      requestedAccessorials: [],
     },
     extractionSource: "heuristic_fallback",
   };
@@ -480,7 +506,7 @@ async function extractQuoteRequest(opts) {
 
   if (!process.env.ANTHROPIC_API_KEY) {
     const heuristic = heuristicExtractQuote({subject, from, body});
-    if (heuristic) return normalizeSoleAddressToConsignee(heuristic);
+    if (heuristic) return finishExtract(heuristic, {subject, body});
     fallback.error = "ANTHROPIC_API_KEY not configured";
     return fallback;
   }
@@ -500,7 +526,7 @@ async function extractQuoteRequest(opts) {
       if (!Array.isArray(parsed.lanes)) parsed.lanes = [];
       if (!parsed.flags) parsed.flags = {};
       if (parsed.lanes.length) {
-        return normalizeSoleAddressToConsignee(parsed);
+        return finishExtract(parsed, {subject, body});
       }
       lastErr = new Error("model returned zero lanes");
     } catch (err) {
@@ -509,7 +535,7 @@ async function extractQuoteRequest(opts) {
   }
 
   const heuristic = heuristicExtractQuote({subject, from, body});
-  if (heuristic) return normalizeSoleAddressToConsignee(heuristic);
+  if (heuristic) return finishExtract(heuristic, {subject, body});
 
   fallback.error = `Parse failed: ${(lastErr && lastErr.message) || "unknown"}`;
   fallback.raw = raw.slice(0, 500);
@@ -657,4 +683,5 @@ module.exports = {
   toPlainText,
   normalizeSoleAddressToConsignee,
   partyHasPhysicalAddress,
+  finishExtract,
 };

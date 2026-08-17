@@ -446,13 +446,21 @@ function matchViaEnrichment(lane, via, rule) {
 const ACCESSORIAL_LABELS = {
   LFO: "Liftgate pickup",
   LFD: "Liftgate delivery",
+  APO: "Appointment pickup",
   APD: "Appointment delivery",
+  LAO: "Limited access pickup",
   LAD: "Limited access",
+  RSO: "Residential pickup",
+  RSD: "Residential delivery",
+  INO: "Inside pickup",
+  IND: "Inside delivery",
   NUD: "Nursing home delivery",
   HOD: "Hotel delivery",
-  RSD: "Residential delivery",
   SCD: "School delivery",
   INS: "Insurance",
+  HAZ: "Hazardous material",
+  PFF: "Protect from freezing",
+  NTD: "Notification delivery",
 };
 
 /**

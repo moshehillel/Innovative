@@ -14,6 +14,7 @@ const COMMON_ACCESSORIALS = [
   {code: "APD", label: "Appointment delivery"},
   {code: "LAD", label: "Limited access"},
   {code: "RSD", label: "Residential delivery"},
+  {code: "IND", label: "Inside delivery"},
   {code: "NUD", label: "Nursing home delivery"},
   {code: "HOD", label: "Hotel delivery"},
 ];
