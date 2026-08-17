@@ -130,15 +130,26 @@ function formatLocationLabel(consignee, placeName) {
  * @return {string} Empty if no note needed.
  */
 function buildLaneEnrichmentNote(lane) {
-  const meta = lane.enrichmentMeta;
+  const destMeta = lane.enrichmentMeta;
+  const originMeta = lane.originEnrichmentMeta;
   const codes = lane.accessorials || [];
-  if (!meta || !codes.length) return "";
+  if ((!destMeta && !originMeta) || !codes.length) return "";
 
   const labels = quoteRules.formatAccessorialLabels(codes);
-  const typeLabel = formatSiteTypeLabel(meta.classifiedAs || lane.siteType);
-  const location = formatLocationLabel(lane.consignee, meta.placeName);
-  return `Accessorials added: ${labels} — location classified as ` +
-    `${typeLabel} (${location}).`;
+  const parts = [];
+  if (originMeta) {
+    const typeLabel = formatSiteTypeLabel(
+        originMeta.classifiedAs || lane.originSiteType);
+    const location = formatLocationLabel(lane.shipper, originMeta.placeName);
+    parts.push(`From classified as ${typeLabel} (${location})`);
+  }
+  if (destMeta) {
+    const typeLabel = formatSiteTypeLabel(
+        destMeta.classifiedAs || lane.siteType);
+    const location = formatLocationLabel(lane.consignee, destMeta.placeName);
+    parts.push(`To classified as ${typeLabel} (${location})`);
+  }
+  return `Accessorials added: ${labels} — ${parts.join("; ")}.`;
 }
 
 /**
@@ -468,6 +479,12 @@ function serializeForDispatcherPage(quote) {
     specialInstructionsGlobal: quote.specialInstructionsGlobal || "",
     status: quote.status,
     shipper: quoteShipper,
+    originSiteType: quote.originSiteType ||
+      (quote.lanes && quote.lanes[0] && quote.lanes[0].originSiteType) ||
+      null,
+    originEnrichmentMeta: quote.originEnrichmentMeta ||
+      (quote.lanes && quote.lanes[0] &&
+        quote.lanes[0].originEnrichmentMeta) || null,
     shippingLocationId,
     shippingLocationName,
     customerMatched: !!(customerMatch && shippingLocationId),
@@ -489,6 +506,9 @@ function serializeForDispatcherPage(quote) {
       specialInstructions: lane.specialInstructions || "",
       notesForCustomer: lane.notesForCustomer || null,
       siteType: lane.siteType || null,
+      enrichmentMeta: lane.enrichmentMeta || null,
+      originSiteType: lane.originSiteType || null,
+      originEnrichmentMeta: lane.originEnrichmentMeta || null,
       accessorials: lane.accessorials || [],
       accessorialLabels: quoteRules.formatAccessorialLabels(
           lane.accessorials || []),

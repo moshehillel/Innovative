@@ -743,9 +743,15 @@ async function processQuoteEmail(opts) {
   const enrichLog = (level, category, message, data) =>
     deps.writeLog(level, category, message, data);
 
+  const shipper = extracted.shipper || {};
   for (const lane of extracted.lanes) {
+    if (!lane.shipper ||
+        !addressEnrichment.normalizeAddressKey(lane.shipper)) {
+      lane.shipper = lane.shipper && typeof lane.shipper === "object" ?
+        {...shipper, ...lane.shipper} : {...shipper};
+    }
     try {
-      await addressEnrichment.enrichLaneConsignee(lane, tenant, {
+      await addressEnrichment.enrichLaneAddresses(lane, tenant, {
         log: enrichLog,
       });
     } catch (err) {
@@ -755,8 +761,6 @@ async function processQuoteEmail(opts) {
       });
     }
   }
-
-  const shipper = extracted.shipper || {};
   const ratedLanes = [];
   for (const lane of extracted.lanes) {
     try {
@@ -794,6 +798,9 @@ async function processQuoteEmail(opts) {
     format: extracted.format,
     readyDate: extracted.readyDate,
     shipper: extracted.shipper,
+    originSiteType: (ratedLanes[0] && ratedLanes[0].originSiteType) || null,
+    originEnrichmentMeta:
+      (ratedLanes[0] && ratedLanes[0].originEnrichmentMeta) || null,
     specialInstructionsGlobal: extracted.specialInstructionsGlobal || "",
     shippingLocationId,
     shippingLocationName,
@@ -1194,10 +1201,23 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
       continue;
     }
     try {
-      const rated = await rateLane({
+      const laneForRate = {
         ...lane,
         shipper: lane.shipper || data.shipper,
-      }, {
+      };
+      try {
+        await addressEnrichment.enrichLaneAddresses(laneForRate, tenant, {
+          log: (level, category, message, logData) =>
+            deps.writeLog(level, category, message, logData),
+        });
+      } catch (enrichErr) {
+        await deps.writeLog("warn", "quote",
+            "Rerun address enrichment failed", {
+              laneKey: lane.laneKey,
+              error: enrichErr.message,
+            });
+      }
+      const rated = await rateLane(laneForRate, {
         rules,
         shippingLocationId,
         extracted: data.extracted || {},

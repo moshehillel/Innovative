@@ -1,7 +1,8 @@
 /**
- * Quote address enrichment — classify delivery locations for accessorials.
+ * Quote address enrichment — classify Ship From (origin) and Ship To
+ * (destination) locations for accessorials.
  *
- * Fallback chain (prefer false negatives over false RSD on institutions):
+ * Fallback chain (prefer false negatives over false RSD/RSO on institutions):
  * 1. Name/address heuristics (nursing, hospital, school, hotel, warehouse…)
  *    — primary for facility keywords; AI is NOT called when these match.
  * 2. Google Places **strong** types only (nursing_home, lodging, hospital,
@@ -13,7 +14,7 @@
  *    gpt-4o correctly find Bedford at 40 Heyward → nursing_home.
  * 4. No-tools OpenAI JSON classify for leftover residential-vs-commercial
  *    judgment when web search is unavailable or returns nothing useful.
- * 5. Final: siteType other / no auto RSD
+ * 5. Final: siteType other / no auto RSD or RSO
  * USPS RDI (Smarty/Melissa) not in repo — recommended later for hard RSD.
  *
  * Env: SUPPORT_CHAT_OPENAI_API_KEY / QUOTE_CLASSIFY_OPENAI_API_KEY /
@@ -473,14 +474,26 @@ async function classifyWithGooglePlaces(consignee) {
 }
 
 /**
+ * Pickup vs delivery wording for AI classifiers.
+ * @param {string} [side] origin | dest.
+ * @return {string}
+ */
+function locationKindLabel(side) {
+  return side === "origin" ?
+    "pickup (Ship From / origin)" :
+    "delivery (Ship To / destination)";
+}
+
+/**
  * Classify site type with OpenAI (default gpt-5.6-luna).
  * Prefer unknown/other over false residential when confidence is low.
  * Not marketed as address-only facility detection — LLMs return other
  * without a facility name; keep for ambiguous res/commercial cues.
- * @param {object} consignee Consignee.
+ * @param {object} consignee Consignee or shipper address fields.
+ * @param {object} [opts] side origin|dest.
  * @return {Promise<object|null>}
  */
-async function classifyWithLuna(consignee) {
+async function classifyWithLuna(consignee, opts = {}) {
   const apiKey = getLunaOpenAiKey();
   if (!apiKey) return null;
 
@@ -495,7 +508,8 @@ async function classifyWithLuna(consignee) {
   };
 
   const system = [
-    "You classify LTL freight delivery locations for accessorials.",
+    `You classify LTL freight ${locationKindLabel(opts.side)} ` +
+      "locations for accessorials.",
     "Return ONLY valid JSON:",
     "{ \"siteType\": string, \"residentialDelivery\": boolean,",
     "  \"confidence\": number, \"placeName\": string, \"reason\": string }",
@@ -505,7 +519,7 @@ async function classifyWithLuna(consignee) {
     "(e.g. Brooklyn/Williamsburg) or street number alone.",
     "residentialDelivery=true ONLY with strong signals: unit/apt",
     "implying a dwelling, or name says residence/apartment, or",
-    "shipper explicitly says residential.",
+    "the RFQ explicitly says residential pickup or delivery.",
     "Nursing homes, hospitals, rehab, schools, hotels, warehouses,",
     "DCs, stores are NOT residential.",
     "Military bases, forts, AFB, naval/Marine stations, AAFES/exchanges",
@@ -545,10 +559,11 @@ async function classifyWithLuna(consignee) {
  * Address-only / ambiguous facility lookup via OpenAI Responses + web_search.
  * Mirrors ChatGPT browsing: model can look up what sits at a street address.
  * Plain chat.completions (no tools) cannot do this — that was the Luna gap.
- * @param {object} consignee Consignee.
+ * @param {object} consignee Consignee or shipper address fields.
+ * @param {object} [opts] side origin|dest.
  * @return {Promise<object|null>}
  */
-async function classifyWithWebSearch(consignee) {
+async function classifyWithWebSearch(consignee, opts = {}) {
   const apiKey = getLunaOpenAiKey();
   if (!apiKey) return null;
 
@@ -568,7 +583,8 @@ async function classifyWithWebSearch(consignee) {
   };
 
   const system = [
-    "You classify LTL freight delivery locations for accessorials.",
+    `You classify LTL freight ${locationKindLabel(opts.side)} ` +
+      "locations for accessorials.",
     "Use web search to identify the business/facility at the address",
     "when no clear facility name is provided.",
     "Return ONLY valid JSON (no markdown fences):",
@@ -602,7 +618,8 @@ async function classifyWithWebSearch(consignee) {
       {
         role: "user",
         content: [
-          "Classify this delivery address. Search the web if needed.",
+          `Classify this ${locationKindLabel(opts.side)} address. ` +
+            "Search the web if needed.",
           "JSON only.",
           JSON.stringify(payload),
         ].join("\n"),
@@ -657,6 +674,9 @@ function isAddressOnlyOrWeakName(consignee) {
   if (!name) return true;
   if (/^(consignee|customer|receiver|ship\s*to|deliver(y)?\s*to)$/i
       .test(name)) {
+    return true;
+  }
+  if (/^(shipper|origin|pickup|ship\s*from)$/i.test(name)) {
     return true;
   }
   // Has facility keywords → heuristics already handled; treat as named.
@@ -724,29 +744,42 @@ function parseAiClassification(raw, source = "ai") {
 
 /**
  * Merges classification onto a lane without overwriting strong email hints.
+ * Dest writes siteType / enrichmentMeta / flags.residentialDelivery.
+ * Origin writes originSiteType / originEnrichmentMeta /
+ * flags.residentialPickup.
  * @param {object} lane Lane object (mutated).
  * @param {object} classification Cached or fresh classification.
- * @param {object} [opts] skipSiteTypeOverwrite.
+ * @param {object} [opts] skipSiteTypeOverwrite, side origin|dest.
  * @return {object} lane
  */
 function mergeClassificationOntoLane(lane, classification, opts = {}) {
-  const emailSiteType = lane.siteType;
+  const side = opts.side === "origin" ? "origin" : "dest";
+  const isOrigin = side === "origin";
+  const emailSiteType = isOrigin ? lane.originSiteType : lane.siteType;
   const emailHadSpecific = emailSiteType &&
     emailSiteType !== "other";
   const emailFlags = {...(lane.flags || {})};
 
   if (!opts.skipSiteTypeOverwrite || !emailHadSpecific) {
-    lane.siteType = classification.siteType;
+    if (isOrigin) {
+      lane.originSiteType = classification.siteType;
+    } else {
+      lane.siteType = classification.siteType;
+    }
   }
 
-  const wantRsd = classification.residentialDelivery === true ||
+  const classifiedType = isOrigin ?
+    lane.originSiteType : lane.siteType;
+  const wantResidential = classification.residentialDelivery === true ||
     classification.siteType === "residential" ||
-    lane.siteType === "residential";
-  if (wantRsd) {
-    lane.flags = {...(lane.flags || {}), residentialDelivery: true};
+    classifiedType === "residential";
+  if (wantResidential) {
+    lane.flags = isOrigin ?
+      {...(lane.flags || {}), residentialPickup: true} :
+      {...(lane.flags || {}), residentialDelivery: true};
   }
 
-  lane.enrichmentMeta = {
+  const meta = {
     source: classification.source,
     cacheHit: !!classification.cacheHit,
     placeName: classification.placeName || null,
@@ -759,7 +792,13 @@ function mergeClassificationOntoLane(lane, classification, opts = {}) {
       new Date().toISOString(),
     emailSiteType: emailHadSpecific ? emailSiteType : null,
     emailFlags,
+    side,
   };
+  if (isOrigin) {
+    lane.originEnrichmentMeta = meta;
+  } else {
+    lane.enrichmentMeta = meta;
+  }
 
   return lane;
 }
@@ -767,11 +806,12 @@ function mergeClassificationOntoLane(lane, classification, opts = {}) {
 /**
  * Resolve site type: heuristics → Google strong types → web_search →
  * no-tools AI → other (never bare premise → residential).
- * @param {object} consignee Consignee.
+ * @param {object} consignee Consignee or shipper.
  * @param {Function} [log] Logger.
+ * @param {object} [opts] side origin|dest.
  * @return {Promise<object|null>}
  */
-async function resolveClassification(consignee, log = () => {}) {
+async function resolveClassification(consignee, log = () => {}, opts = {}) {
   const heuristic = classifyFromNameHeuristics(consignee);
   if (heuristic && heuristic.siteType !== "other") {
     return heuristic;
@@ -802,7 +842,7 @@ async function resolveClassification(consignee, log = () => {}) {
   // Ambiguous / bare geocode → web search (ChatGPT-like facility lookup).
   let web = null;
   try {
-    web = await classifyWithWebSearch(consignee);
+    web = await classifyWithWebSearch(consignee, opts);
   } catch (err) {
     log("warn", "quote", "Web-search address classification failed", {
       error: err.message,
@@ -819,7 +859,7 @@ async function resolveClassification(consignee, log = () => {}) {
   // No-tools OpenAI for leftover residential-vs-commercial cues.
   let luna = null;
   try {
-    luna = await classifyWithLuna(consignee);
+    luna = await classifyWithLuna(consignee, opts);
   } catch (err) {
     log("warn", "quote", "Luna address classification failed", {
       error: err.message,
@@ -871,62 +911,69 @@ async function resolveClassification(consignee, log = () => {}) {
 }
 
 /**
- * Main entry — enrich lane consignee with site classification.
- * @param {object} lane Lane with consignee.
+ * Classify one address party (origin shipper or dest consignee) and
+ * merge onto the lane. Cache is address-keyed and shared across sides.
+ * @param {object} lane Lane (mutated).
  * @param {object} tenant Tenant config.
- * @param {object} [opts] log, forceRefresh.
+ * @param {object} [opts] log, forceRefresh, side origin|dest.
  * @return {Promise<object>} Enriched lane (same reference).
  */
-async function enrichLaneConsignee(lane, tenant, opts = {}) {
-  const consignee = lane.consignee || {};
-  const addressKey = normalizeAddressKey(consignee);
+async function enrichLaneParty(lane, tenant, opts = {}) {
+  const side = opts.side === "origin" ? "origin" : "dest";
+  const party = side === "origin" ?
+    (lane.shipper || {}) : (lane.consignee || {});
+  const addressKey = normalizeAddressKey(party);
   if (!addressKey) {
     return lane;
   }
 
   const log = opts.log || (() => {});
+  const sideLabel = side === "origin" ? "origin" : "dest";
 
   if (!opts.forceRefresh) {
     const cached = await getCachedClassification(tenant, addressKey);
     if (cached && cached.siteType) {
       log("info", "quote", "Address classification cache hit", {
-        addressKey, siteType: cached.siteType,
+        addressKey, siteType: cached.siteType, side: sideLabel,
       });
       mergeClassificationOntoLane(lane, {
         ...cached,
         cacheHit: true,
         addressKey,
-      });
+      }, {side, skipSiteTypeOverwrite: opts.skipSiteTypeOverwrite});
       return lane;
     }
   }
 
   let classification = null;
   try {
-    classification = await resolveClassification(consignee, log);
+    classification = await resolveClassification(party, log, {side});
   } catch (err) {
     log("warn", "quote", "Address classification failed", {
-      addressKey, error: err.message,
+      addressKey, side: sideLabel, error: err.message,
     });
   }
 
   if (!classification) {
     log("warn", "quote", "Address enrichment skipped — no classifier", {
-      addressKey,
+      addressKey, side: sideLabel,
     });
     return lane;
   }
 
   classification.addressKey = addressKey;
   classification.consignee = {
-    name: consignee.name || null,
-    address1: consignee.address1 || null,
-    city: consignee.city || null,
-    state: consignee.state || null,
-    zipCode: consignee.zipCode || null,
+    name: party.name || null,
+    address1: party.address1 || null,
+    city: party.city || null,
+    state: party.state || null,
+    zipCode: party.zipCode || null,
   };
 
-  mergeClassificationOntoLane(lane, classification);
+  mergeClassificationOntoLane(lane, classification, {
+    side,
+    skipSiteTypeOverwrite: opts.skipSiteTypeOverwrite,
+  });
 
   try {
     await saveCachedClassification(tenant, addressKey, {
@@ -941,17 +988,53 @@ async function enrichLaneConsignee(lane, tenant, opts = {}) {
     });
   } catch (err) {
     log("warn", "quote", "Failed to cache address classification", {
-      addressKey, error: err.message,
+      addressKey, side: sideLabel, error: err.message,
     });
   }
 
   log("info", "quote", "Address classified", {
     addressKey,
+    side: sideLabel,
     siteType: classification.siteType,
     source: classification.source,
     residentialDelivery: !!classification.residentialDelivery,
   });
 
+  return lane;
+}
+
+/**
+ * Main dest entry — enrich lane consignee with site classification.
+ * @param {object} lane Lane with consignee.
+ * @param {object} tenant Tenant config.
+ * @param {object} [opts] log, forceRefresh.
+ * @return {Promise<object>} Enriched lane (same reference).
+ */
+async function enrichLaneConsignee(lane, tenant, opts = {}) {
+  return enrichLaneParty(lane, tenant, {...opts, side: "dest"});
+}
+
+/**
+ * Enrich lane shipper / origin with the same classification pipeline.
+ * @param {object} lane Lane with shipper.
+ * @param {object} tenant Tenant config.
+ * @param {object} [opts] log, forceRefresh.
+ * @return {Promise<object>} Enriched lane (same reference).
+ */
+async function enrichLaneShipper(lane, tenant, opts = {}) {
+  return enrichLaneParty(lane, tenant, {...opts, side: "origin"});
+}
+
+/**
+ * Classify Ship From and Ship To on a lane.
+ * @param {object} lane Lane with shipper and consignee.
+ * @param {object} tenant Tenant config.
+ * @param {object} [opts] log, forceRefresh.
+ * @return {Promise<object>} Enriched lane (same reference).
+ */
+async function enrichLaneAddresses(lane, tenant, opts = {}) {
+  await enrichLaneShipper(lane, tenant, opts);
+  await enrichLaneConsignee(lane, tenant, opts);
   return lane;
 }
 
@@ -973,7 +1056,10 @@ module.exports = {
   classifyWithWebSearch,
   classifyWithAi,
   resolveClassification,
+  enrichLaneParty,
   enrichLaneConsignee,
+  enrichLaneShipper,
+  enrichLaneAddresses,
   mergeClassificationOntoLane,
   mapGoogleTypesToSiteType,
   isBareStreetGeocode,

@@ -240,6 +240,20 @@
       .addr-edit .addr-row.cols-2 { grid-template-columns: 1fr 1fr; }
       .addr-edit .addr-row.cols-3 { grid-template-columns: 2fr 1fr 1fr; }
     }
+    .site-type-chip {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.6875rem;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      text-transform: none;
+      background: var(--primary-light);
+      color: var(--primary-dark);
+      border: 1px solid #c7d2fe;
+      vertical-align: middle;
+    }
     .freight-edit {
       width: 100%;
       border-collapse: collapse;
@@ -1274,10 +1288,33 @@
       return p[field] != null ? p[field] : "";
     }
 
-    function renderAddressEditor(prefix, party, title) {
+    function siteTypeLabel(meta, fallback) {
+      const t = (meta && meta.classifiedAs) || fallback;
+      if (!t) return "";
+      const labels = {
+        nursing_home: "nursing home",
+        hotel: "hotel",
+        amazon_fc: "Amazon FC",
+        menards_dc: "Menards DC",
+        aafes_military: "AAFES / military",
+        residential: "residential",
+        other: "commercial / other",
+      };
+      return labels[t] || String(t).replace(/_/g, " ");
+    }
+
+    function renderAddressEditor(prefix, party, title, enrichment, fallbackType) {
       const p = party || {};
       let html = "<div class='addr-block addr-edit' data-addr='" + esc(prefix) + "'>";
-      html += "<h3>" + esc(title) + "</h3>";
+      html += "<h3>" + esc(title);
+      const typeLabel = siteTypeLabel(enrichment, fallbackType);
+      if (typeLabel) {
+        const place = enrichment && enrichment.placeName ?
+          " · " + enrichment.placeName : "";
+        html += "<span class='site-type-chip'>" + esc(typeLabel + place) +
+          "</span>";
+      }
+      html += "</h3>";
       html += "<label class='field-label'>Name</label>" +
         "<input class='field-input' data-f='name' value='" +
         esc(partyField(p, "name")) + "'>";
@@ -1439,7 +1476,8 @@
         esc(q.specialInstructionsGlobal || "") + "</textarea></div>";
       html += "</div>";
       html += renderAddressEditor(
-          "quote-shipper", q.shipper, "Default from (shipper)");
+          "quote-shipper", q.shipper, "Default from (shipper)",
+          q.originEnrichmentMeta, q.originSiteType);
       html += "<div class='details-actions'>" +
         "<button type='button' id='btn-save-details'>Save details</button>" +
         "<button type='button' class='ghost' id='btn-save-rerate'>" +
@@ -1533,9 +1571,12 @@
       html += renderAddressEditor(
           "shipper",
           lane.shipper || (quote && quote.shipper) || null,
-          "From (shipper)");
+          "From (shipper)",
+          lane.originEnrichmentMeta,
+          lane.originSiteType);
       html += renderAddressEditor(
-          "consignee", lane.consignee || null, "To (consignee)");
+          "consignee", lane.consignee || null, "To (consignee)",
+          lane.enrichmentMeta, lane.siteType);
       html += renderFreightEditor(lane.laneKey, lane.freightInfo);
       html += "<div class='span-2' style='grid-column:1/-1'>" +
         "<label class='field-label'>Special instructions (lane)</label>" +

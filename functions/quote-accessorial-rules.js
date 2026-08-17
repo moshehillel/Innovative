@@ -12,6 +12,20 @@ const admin = require("firebase-admin");
 
 const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both"];
 const DEFAULT_IDENTIFY_VIA = "both";
+const APPLY_TO_VALUES = ["dest", "origin", "both"];
+const DEFAULT_APPLY_TO = "dest";
+
+/** Dest accessorial → pickup equivalent when a rule applies to origin. */
+const DEST_TO_ORIGIN_ACCESSORIAL = {
+  RSD: "RSO",
+  LAD: "LAO",
+  LFD: "LFO",
+  APD: "APO",
+  IND: "INO",
+  NUD: "NUP",
+  HOD: "HOO",
+  SCD: "SCO",
+};
 
 /**
  * Default rule ids whose addAccessorials / name / notes are force-synced
@@ -42,6 +56,7 @@ const DEFAULT_RULES = [
       ],
     },
     addAccessorials: ["LFO", "LFD"],
+    applyTo: "dest",
     notes: "Special instructions mention liftgate or no dock.",
     autoApply: true,
     requiresConfirm: false,
@@ -56,8 +71,9 @@ const DEFAULT_RULES = [
       siteType: "aafes_military",
     },
     addAccessorials: ["LAD", "APD"],
+    applyTo: "dest",
     notes: "AI-classified military base / AAFES — " +
-      "limited access and appointment delivery.",
+      "limited access and appointment delivery (destination only).",
     autoApply: true,
     requiresConfirm: false,
   },
@@ -74,6 +90,7 @@ const DEFAULT_RULES = [
       siteType: "menards_dc",
     },
     addAccessorials: [],
+    applyTo: "dest",
     filterCarrierWarnings: ["menards"],
     notes: "Exclude carriers whose warnings block Menards delivery.",
     autoApply: true,
@@ -93,6 +110,7 @@ const DEFAULT_RULES = [
     },
     // Amazon FCs need appointment (APD) only — not Limited Access (LAD).
     addAccessorials: ["APD"],
+    applyTo: "dest",
     notes: "Amazon fulfillment center — appointment delivery only (no LAD).",
     autoApply: true,
     requiresConfirm: true,
@@ -105,6 +123,7 @@ const DEFAULT_RULES = [
     identifyVia: "both",
     match: {flags: ["residentialDelivery"]},
     addAccessorials: ["RSD"],
+    applyTo: "dest",
     notes: "AI or heuristic flagged residential delivery.",
     autoApply: true,
     requiresConfirm: false,
@@ -122,7 +141,37 @@ const DEFAULT_RULES = [
       ],
     },
     addAccessorials: ["APD"],
+    applyTo: "dest",
     notes: "Special instructions mention appointment delivery.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
+  {
+    id: "residential_pickup",
+    active: true,
+    priority: 61,
+    name: "Residential pickup flag",
+    identifyVia: "both",
+    applyTo: "origin",
+    match: {flags: ["residentialPickup"]},
+    addAccessorials: ["RSO"],
+    notes: "AI or heuristic flagged residential pickup (origin).",
+    autoApply: true,
+    requiresConfirm: false,
+  },
+  {
+    id: "aafes_military_pickup",
+    active: true,
+    priority: 26,
+    name: "Military bases — limited access pickup",
+    identifyVia: "ai",
+    applyTo: "origin",
+    match: {
+      siteType: "aafes_military",
+    },
+    addAccessorials: ["LAO"],
+    notes: "AI-classified military origin — limited access pickup only " +
+      "(not dest LAD/APD).",
     autoApply: true,
     requiresConfirm: false,
   },
@@ -146,6 +195,44 @@ function init(deps) {
 function col(tenant, name) {
   if (!tcolFn) throw new Error("quote-accessorial-rules not initialized");
   return tcolFn(tenant, name);
+}
+
+/**
+ * @param {object} rule Rule document.
+ * @return {"dest"|"origin"|"both"}
+ */
+function normalizeApplyTo(rule) {
+  const v = rule && rule.applyTo;
+  return APPLY_TO_VALUES.includes(v) ? v : DEFAULT_APPLY_TO;
+}
+
+/**
+ * Map dest accessorials to pickup codes when applying a rule to origin.
+ * Dest-only rules never call this — they stay dest-scoped via applyTo.
+ * @param {Array<string>} codes Rule accessorials.
+ * @param {"dest"|"origin"} side Lane side.
+ * @return {Array<string>}
+ */
+function accessorialsForSide(codes, side) {
+  const list = (codes || []).map(String);
+  if (side !== "origin") return [...new Set(list)];
+  const out = [];
+  for (const c of list) {
+    out.push(DEST_TO_ORIGIN_ACCESSORIAL[c] || c);
+  }
+  return [...new Set(out)];
+}
+
+/**
+ * Sides a rule should evaluate against.
+ * @param {object} rule Rule document.
+ * @return {Array<"dest"|"origin">}
+ */
+function ruleSides(rule) {
+  const applyTo = normalizeApplyTo(rule);
+  if (applyTo === "both") return ["dest", "origin"];
+  if (applyTo === "origin") return ["origin"];
+  return ["dest"];
 }
 
 /**
@@ -322,14 +409,16 @@ function containsAny(haystack, needles) {
 /**
  * Email-extracted siteType (not enrichment-only).
  * @param {object} lane Lane object.
+ * @param {"dest"|"origin"} [side] Address side.
  * @return {string|null}
  */
-function getEmailSiteType(lane) {
-  const meta = lane.enrichmentMeta;
+function getEmailSiteType(lane, side = "dest") {
+  const meta = side === "origin" ?
+    lane.originEnrichmentMeta : lane.enrichmentMeta;
   if (meta) {
     return meta.emailSiteType || null;
   }
-  const siteType = lane.siteType;
+  const siteType = side === "origin" ? lane.originSiteType : lane.siteType;
   return siteType && siteType !== "other" ? siteType : null;
 }
 
@@ -337,17 +426,25 @@ function getEmailSiteType(lane) {
  * Whether a flag was set from email extraction (not enrichment-only).
  * @param {object} lane Lane object.
  * @param {string} flag Flag key.
+ * @param {"dest"|"origin"} [side] Address side.
  * @return {boolean}
  */
-function flagFromEmail(lane, flag) {
+function flagFromEmail(lane, flag, side = "dest") {
+  const resolved = side === "origin" && flag === "residentialDelivery" ?
+    "residentialPickup" : flag;
   const flags = lane.flags || {};
-  if (!flags[flag]) return false;
-  const meta = lane.enrichmentMeta;
+  if (!flags[resolved] && !flags[flag]) return false;
+  const meta = side === "origin" ?
+    lane.originEnrichmentMeta : lane.enrichmentMeta;
   if (!meta) return true;
-  if (flag === "residentialDelivery") {
+  if (resolved === "residentialPickup" || flag === "residentialDelivery") {
+    if (side === "origin") {
+      return !!meta.emailFlags && !!meta.emailFlags.residentialPickup;
+    }
     return !!meta.emailFlags && !!meta.emailFlags.residentialDelivery;
   }
-  return !!(meta.emailFlags && meta.emailFlags[flag]);
+  return !!(meta.emailFlags && (meta.emailFlags[resolved] ||
+    meta.emailFlags[flag]));
 }
 
 /**
@@ -355,26 +452,43 @@ function flagFromEmail(lane, flag) {
  * @param {object} lane Lane with consignee, flags, specialInstructions.
  * @param {object} context Global context (specialInstructionsGlobal).
  * @param {object} rule Rule document.
+ * @param {"dest"|"origin"} [side] Address side.
  * @return {string|null} Match dimension or null.
  */
-function ruleMatchViaText(lane, context, rule) {
+function ruleMatchViaText(lane, context, rule, side = "dest") {
   const match = rule.match || {};
   if (!Object.keys(match).length) return null;
-  const cons = lane.consignee || {};
-  const name = cons.name || "";
-  const addr = [cons.address1, cons.address2, cons.city].join(" ");
+  const party = side === "origin" ?
+    (lane.shipper || {}) : (lane.consignee || {});
+  const name = party.name || "";
+  const addr = [party.address1, party.address2, party.city].join(" ");
   const instr = [
     lane.specialInstructions,
     context.specialInstructionsGlobal,
   ].join(" ");
 
-  if (match.consigneeNameContains &&
-    containsAny(name, match.consigneeNameContains)) {
-    return "consigneeName";
-  }
-  if (match.consigneeAddressContains &&
-    containsAny(addr, match.consigneeAddressContains)) {
-    return "consigneeAddress";
+  if (side === "origin") {
+    if (match.shipperNameContains &&
+      containsAny(name, match.shipperNameContains)) {
+      return "shipperName";
+    }
+    if (match.consigneeNameContains &&
+      containsAny(name, match.consigneeNameContains)) {
+      return "shipperName";
+    }
+    if (match.consigneeAddressContains &&
+      containsAny(addr, match.consigneeAddressContains)) {
+      return "shipperAddress";
+    }
+  } else {
+    if (match.consigneeNameContains &&
+      containsAny(name, match.consigneeNameContains)) {
+      return "consigneeName";
+    }
+    if (match.consigneeAddressContains &&
+      containsAny(addr, match.consigneeAddressContains)) {
+      return "consigneeAddress";
+    }
   }
   if (match.instructionsContains &&
     containsAny(instr, match.instructionsContains)) {
@@ -385,9 +499,9 @@ function ruleMatchViaText(lane, context, rule) {
     if (containsAny(refs, match.referenceContains)) return "reference";
   }
   if (match.flags && Array.isArray(match.flags)) {
-    if (match.flags.some((f) => flagFromEmail(lane, f))) return "flags";
+    if (match.flags.some((f) => flagFromEmail(lane, f, side))) return "flags";
   }
-  if (match.siteType && getEmailSiteType(lane) === match.siteType) {
+  if (match.siteType && getEmailSiteType(lane, side) === match.siteType) {
     return "siteType";
   }
   return null;
@@ -398,12 +512,14 @@ function ruleMatchViaText(lane, context, rule) {
  * @param {object} lane Lane with enrichmentMeta.
  * @param {object} context Global context (unused).
  * @param {object} rule Rule document.
+ * @param {"dest"|"origin"} [side] Address side.
  * @return {string|null} Match dimension or null.
  */
-function ruleMatchViaAi(lane, context, rule) {
+function ruleMatchViaAi(lane, context, rule, side = "dest") {
   const match = rule.match || {};
   if (!Object.keys(match).length) return null;
-  const meta = lane.enrichmentMeta;
+  const meta = side === "origin" ?
+    lane.originEnrichmentMeta : lane.enrichmentMeta;
   if (!meta) return null;
 
   if (match.siteType && meta.classifiedAs === match.siteType) {
@@ -411,8 +527,11 @@ function ruleMatchViaAi(lane, context, rule) {
   }
   if (match.flags && Array.isArray(match.flags)) {
     const flags = lane.flags || {};
-    if (match.flags.includes("residentialDelivery") &&
-      flags.residentialDelivery &&
+    const wantsResidential = match.flags.includes("residentialDelivery") ||
+      match.flags.includes("residentialPickup");
+    const hasResidential = side === "origin" ?
+      !!flags.residentialPickup : !!flags.residentialDelivery;
+    if (wantsResidential && hasResidential &&
       meta.classifiedAs === "residential") {
       return "flags";
     }
@@ -424,12 +543,13 @@ function ruleMatchViaAi(lane, context, rule) {
  * @param {object} lane Lane with consignee, flags, specialInstructions.
  * @param {object} context Global context (specialInstructionsGlobal).
  * @param {object} rule Rule document.
+ * @param {"dest"|"origin"} [side] Address side.
  * @return {string|null} Match dimension or null.
  */
-function ruleMatchVia(lane, context, rule) {
+function ruleMatchVia(lane, context, rule, side = "dest") {
   const identifyVia = normalizeIdentifyVia(rule);
-  const textVia = ruleMatchViaText(lane, context, rule);
-  const aiVia = ruleMatchViaAi(lane, context, rule);
+  const textVia = ruleMatchViaText(lane, context, rule, side);
+  const aiVia = ruleMatchViaAi(lane, context, rule, side);
 
   if (identifyVia === "address_text") return textVia;
   if (identifyVia === "ai") return aiVia;
@@ -443,25 +563,30 @@ function ruleMatchVia(lane, context, rule) {
  * @return {boolean}
  */
 function ruleMatches(lane, context, rule) {
-  return !!ruleMatchVia(lane, context, rule);
+  return ruleSides(rule).some((side) =>
+    !!ruleMatchVia(lane, context, rule, side));
 }
 
 /**
  * @param {object} lane Lane.
  * @param {string} via Match dimension from ruleMatchVia.
  * @param {object} rule Rule document.
+ * @param {"dest"|"origin"} [side] Address side.
  * @return {boolean}
  */
-function matchViaEnrichment(lane, via, rule) {
-  const meta = lane.enrichmentMeta;
+function matchViaEnrichment(lane, via, rule, side = "dest") {
+  const meta = side === "origin" ?
+    lane.originEnrichmentMeta : lane.enrichmentMeta;
   if (!meta) return false;
   const match = rule.match || {};
   if (via === "siteType") {
     return meta.classifiedAs === match.siteType;
   }
   if (via === "flags") {
-    return !!(match.flags && match.flags.includes("residentialDelivery") &&
-      meta.classifiedAs === "residential");
+    const wantsResidential = !!(match.flags &&
+      (match.flags.includes("residentialDelivery") ||
+        match.flags.includes("residentialPickup")));
+    return wantsResidential && meta.classifiedAs === "residential";
   }
   return false;
 }
@@ -514,22 +639,26 @@ function applyRulesToLane(lane, rules, context = {}) {
 
   for (const rule of rules) {
     if (!rule.active) continue;
-    const via = ruleMatchVia(lane, context, rule);
-    if (!via) continue;
-    applied.push({
-      ruleId: rule.id,
-      name: rule.name,
-      notes: rule.notes || null,
-      matchVia: via,
-      identifyVia: normalizeIdentifyVia(rule),
-      fromEnrichment: matchViaEnrichment(lane, via, rule),
-    });
-    if (rule.requiresConfirm) requiresConfirm = true;
-    (rule.addAccessorials || []).forEach((c) => codes.add(String(c)));
-    (rule.filterCarrierWarnings || []).forEach((w) =>
-      filterWarnings.push(String(w)));
-    if (Array.isArray(rule.addAccessorialsWithData)) {
-      withData.push(...rule.addAccessorialsWithData);
+    for (const side of ruleSides(rule)) {
+      const via = ruleMatchVia(lane, context, rule, side);
+      if (!via) continue;
+      applied.push({
+        ruleId: rule.id,
+        name: rule.name,
+        notes: rule.notes || null,
+        matchVia: via,
+        identifyVia: normalizeIdentifyVia(rule),
+        applyTo: side,
+        fromEnrichment: matchViaEnrichment(lane, via, rule, side),
+      });
+      if (rule.requiresConfirm) requiresConfirm = true;
+      accessorialsForSide(rule.addAccessorials || [], side)
+          .forEach((c) => codes.add(String(c)));
+      (rule.filterCarrierWarnings || []).forEach((w) =>
+        filterWarnings.push(String(w)));
+      if (Array.isArray(rule.addAccessorialsWithData)) {
+        withData.push(...rule.addAccessorialsWithData);
+      }
     }
   }
 
@@ -605,19 +734,22 @@ async function deleteRule(tenant, ruleId, removedBy) {
 }
 
 /**
- * Test which rules match a sample consignee.
+ * Test which rules match a sample shipper / consignee.
  * @param {object} tenant Tenant.
- * @param {object} sample {consignee, specialInstructions, flags}.
+ * @param {object} sample {consignee, shipper, specialInstructions, flags}.
  * @return {Promise<object>}
  */
 async function testAddress(tenant, sample) {
   const rules = await loadActiveRules(tenant);
   const lane = {
     consignee: sample.consignee || {},
+    shipper: sample.shipper || {},
     specialInstructions: sample.specialInstructions || "",
     flags: sample.flags || {},
     siteType: sample.siteType || null,
+    originSiteType: sample.originSiteType || null,
     enrichmentMeta: sample.enrichmentMeta || null,
+    originEnrichmentMeta: sample.originEnrichmentMeta || null,
     referenceNumbers: sample.referenceNumbers || [],
   };
   return applyRulesToLane(lane, rules, {
@@ -630,6 +762,9 @@ module.exports = {
   DEFAULT_RULES,
   IDENTIFY_VIA_VALUES,
   DEFAULT_IDENTIFY_VIA,
+  APPLY_TO_VALUES,
+  DEFAULT_APPLY_TO,
+  DEST_TO_ORIGIN_ACCESSORIAL,
   MANAGED_DEFAULT_RULE_IDS,
   RETIRED_DEFAULT_RULE_IDS,
   loadActiveRules,
@@ -648,6 +783,8 @@ module.exports = {
   ruleMatchViaText,
   ruleMatchViaAi,
   normalizeIdentifyVia,
+  normalizeApplyTo,
+  accessorialsForSide,
   formatAccessorialLabels,
   ACCESSORIAL_LABELS,
 };

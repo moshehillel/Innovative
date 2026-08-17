@@ -272,19 +272,23 @@ async function handleTestQuoteRules(req, res) {
     const classifyAddress = !!body.classifyAddress;
     const lane = {
       consignee: (sample && sample.consignee) || {},
+      shipper: (sample && sample.shipper) || {},
       specialInstructions: (sample && sample.specialInstructions) || "",
       flags: (sample && sample.flags) || {},
       siteType: (sample && sample.siteType) || null,
+      originSiteType: (sample && sample.originSiteType) || null,
     };
 
     let enrichment = null;
+    let originEnrichment = null;
     if (classifyAddress) {
       try {
-        await addressEnrichment.enrichLaneConsignee(lane, tenant, {
+        await addressEnrichment.enrichLaneAddresses(lane, tenant, {
           log: (level, cat, msg, data) =>
             console.log(level, cat, msg, data),
         });
         enrichment = lane.enrichmentMeta || null;
+        originEnrichment = lane.originEnrichmentMeta || null;
       } catch (err) {
         enrichment = {error: err.message};
       }
@@ -295,7 +299,9 @@ async function handleTestQuoteRules(req, res) {
       ok: true,
       result,
       enrichment,
+      originEnrichment,
       addressKey: addressEnrichment.normalizeAddressKey(lane.consignee),
+      originAddressKey: addressEnrichment.normalizeAddressKey(lane.shipper),
     });
   } catch (err) {
     return res.status(500).json({ok: false, error: err.message});

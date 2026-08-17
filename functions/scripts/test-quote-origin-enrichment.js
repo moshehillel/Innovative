@@ -1,0 +1,252 @@
+/* eslint-disable no-console */
+"use strict";
+
+const quoteRules = require("../quote-accessorial-rules");
+const addressEnrichment = require("../quote-address-enrichment");
+
+let failures = 0;
+
+/**
+ * @param {string} name Check name.
+ * @param {*} got Actual.
+ * @param {*} exp Expected.
+ * @return {void}
+ */
+function check(name, got, exp) {
+  const pass = JSON.stringify(got) === JSON.stringify(exp);
+  if (!pass) failures++;
+  console.log(`${pass ? "PASS" : "FAIL"} ${name}`);
+  if (!pass) {
+    console.log(`  got: ${JSON.stringify(got)}`);
+    console.log(`  exp: ${JSON.stringify(exp)}`);
+  }
+}
+
+/**
+ * @param {string} name Check name.
+ * @param {Array<string>} arr Codes.
+ * @param {string} code Expected code.
+ * @return {void}
+ */
+function checkHas(name, arr, code) {
+  const pass = Array.isArray(arr) && arr.includes(code);
+  if (!pass) failures++;
+  console.log(`${pass ? "PASS" : "FAIL"} ${name}`);
+  if (!pass) console.log(`  missing ${code} in ${JSON.stringify(arr)}`);
+}
+
+/**
+ * @param {string} name Check name.
+ * @param {Array<string>} arr Codes.
+ * @param {string} code Forbidden code.
+ * @return {void}
+ */
+function checkNotHas(name, arr, code) {
+  const pass = Array.isArray(arr) && !arr.includes(code);
+  if (!pass) failures++;
+  console.log(`${pass ? "PASS" : "FAIL"} ${name}`);
+  if (!pass) {
+    console.log(`  unexpectedly has ${code} in ${JSON.stringify(arr)}`);
+  }
+}
+
+const rules = quoteRules.DEFAULT_RULES.map((r) => ({...r, active: true}));
+
+const d8986 = {
+  shipper: {
+    name: "Weida Freight System",
+    address1: "9050 Hermosa Ave",
+    city: "Rancho Cucamonga",
+    state: "CA",
+    zipCode: "91730",
+  },
+  consignee: {
+    name: "AAFES DDDC Newport News",
+    address1: "123 Warehouse Rd",
+    city: "Newport News",
+    state: "VA",
+    zipCode: "23602",
+  },
+  flags: {},
+  siteType: "aafes_military",
+  originSiteType: "other",
+  enrichmentMeta: {
+    classifiedAs: "aafes_military",
+    source: "name_heuristic",
+    side: "dest",
+  },
+  originEnrichmentMeta: {
+    classifiedAs: "other",
+    source: "name_heuristic",
+    side: "origin",
+    placeName: "Weida warehouse",
+  },
+};
+
+const outD8986 = quoteRules.applyRulesToLane(d8986, rules, {});
+checkHas("D8986 dest military → LAD", outD8986.accessorials, "LAD");
+checkHas("D8986 dest military → APD", outD8986.accessorials, "APD");
+checkNotHas("D8986 warehouse origin not LAO", outD8986.accessorials, "LAO");
+checkNotHas("D8986 warehouse origin not RSO", outD8986.accessorials, "RSO");
+checkNotHas("D8986 dest military not remapped to APO",
+    outD8986.accessorials, "APO");
+const destMilitary = (outD8986.appliedRules || [])
+    .filter((r) => r.ruleId === "aafes_military");
+check("D8986 military rule dest-only",
+    destMilitary.every((r) => r.applyTo === "dest"), true);
+check("D8986 no origin military pickup rule",
+    (outD8986.appliedRules || [])
+        .some((r) => r.ruleId === "aafes_military_pickup"),
+    false);
+
+const originMilitary = {
+  shipper: {name: "Fort Liberty AAFES", city: "Fort Liberty", state: "NC"},
+  consignee: {name: "Acme Warehouse", city: "Dallas", state: "TX"},
+  flags: {},
+  originSiteType: "aafes_military",
+  siteType: "other",
+  originEnrichmentMeta: {
+    classifiedAs: "aafes_military",
+    source: "name_heuristic",
+    side: "origin",
+  },
+  enrichmentMeta: {
+    classifiedAs: "other",
+    source: "default",
+    side: "dest",
+  },
+};
+const outOriginMil = quoteRules.applyRulesToLane(originMilitary, rules, {});
+checkHas("origin military → LAO", outOriginMil.accessorials, "LAO");
+checkNotHas("origin military not LAD", outOriginMil.accessorials, "LAD");
+checkNotHas("origin military not APD", outOriginMil.accessorials, "APD");
+
+const destAmazon = {
+  shipper: {name: "Weida warehouse", city: "Rancho Cucamonga", state: "CA"},
+  consignee: {name: "Amazon FBA HGR6", city: "Hagerstown", state: "MD"},
+  flags: {},
+  siteType: "amazon_fc",
+  originSiteType: "other",
+  enrichmentMeta: {classifiedAs: "amazon_fc", source: "name_heuristic"},
+  originEnrichmentMeta: {classifiedAs: "other", source: "name_heuristic"},
+};
+const outAmz = quoteRules.applyRulesToLane(destAmazon, rules, {});
+checkHas("dest Amazon → APD", outAmz.accessorials, "APD");
+checkNotHas("dest Amazon origin warehouse not APO",
+    outAmz.accessorials, "APO");
+
+const originAmazon = {
+  shipper: {name: "Amazon FC", city: "Phoenix", state: "AZ"},
+  consignee: {name: "Retail Store", city: "Dallas", state: "TX"},
+  flags: {},
+  originSiteType: "amazon_fc",
+  siteType: "other",
+  originEnrichmentMeta: {classifiedAs: "amazon_fc", source: "name_heuristic"},
+  enrichmentMeta: {classifiedAs: "other", source: "default"},
+};
+const outOriginAmz = quoteRules.applyRulesToLane(originAmazon, rules, {});
+checkNotHas("origin Amazon does not get dest APD",
+    outOriginAmz.accessorials, "APD");
+checkNotHas("origin Amazon does not auto APO",
+    outOriginAmz.accessorials, "APO");
+
+const destRes = {
+  consignee: {name: "Jane Doe", city: "Austin", state: "TX"},
+  shipper: {name: "Weida warehouse", city: "Rancho Cucamonga", state: "CA"},
+  flags: {residentialDelivery: true},
+  siteType: "residential",
+  originSiteType: "other",
+  enrichmentMeta: {classifiedAs: "residential", source: "name_heuristic"},
+  originEnrichmentMeta: {classifiedAs: "other", source: "name_heuristic"},
+};
+const outDestRes = quoteRules.applyRulesToLane(destRes, rules, {});
+checkHas("dest residential → RSD", outDestRes.accessorials, "RSD");
+checkNotHas("dest residential not RSO", outDestRes.accessorials, "RSO");
+
+const originRes = {
+  shipper: {name: "Private residence", city: "Austin", state: "TX"},
+  consignee: {name: "Acme DC", city: "Dallas", state: "TX"},
+  flags: {residentialPickup: true},
+  originSiteType: "residential",
+  siteType: "other",
+  originEnrichmentMeta: {classifiedAs: "residential", source: "name_heuristic"},
+  enrichmentMeta: {classifiedAs: "other", source: "default"},
+};
+const outOriginRes = quoteRules.applyRulesToLane(originRes, rules, {});
+checkHas("origin residential → RSO", outOriginRes.accessorials, "RSO");
+checkNotHas("origin residential not RSD", outOriginRes.accessorials, "RSD");
+
+const bothRes = {
+  shipper: {name: "Private residence", city: "Austin", state: "TX"},
+  consignee: {name: "Home delivery", city: "Dallas", state: "TX"},
+  flags: {residentialPickup: true, residentialDelivery: true},
+  originSiteType: "residential",
+  siteType: "residential",
+  originEnrichmentMeta: {classifiedAs: "residential", source: "ai"},
+  enrichmentMeta: {classifiedAs: "residential", source: "ai"},
+};
+const outBoth = quoteRules.applyRulesToLane(bothRes, rules, {});
+checkHas("both residential → RSO", outBoth.accessorials, "RSO");
+checkHas("both residential → RSD", outBoth.accessorials, "RSD");
+
+check("remap RSD → RSO",
+    quoteRules.accessorialsForSide(["RSD", "LAD"], "origin").sort(),
+    ["LAO", "RSO"].sort());
+check("dest side keeps dest codes",
+    quoteRules.accessorialsForSide(["RSD", "LAD"], "dest").sort(),
+    ["LAD", "RSD"].sort());
+
+const destLane = {flags: {}, consignee: {name: "Home"}};
+addressEnrichment.mergeClassificationOntoLane(destLane, {
+  siteType: "residential",
+  residentialDelivery: true,
+  source: "name_heuristic",
+  confidence: 0.9,
+  placeName: "Residence",
+  addressKey: "1 main|austin|tx",
+});
+check("dest merge siteType", destLane.siteType, "residential");
+check("dest merge RSD flag", destLane.flags.residentialDelivery, true);
+check("dest merge not origin", destLane.originSiteType, undefined);
+
+const originLane = {flags: {}, shipper: {name: "Home"}};
+addressEnrichment.mergeClassificationOntoLane(originLane, {
+  siteType: "residential",
+  residentialDelivery: true,
+  source: "name_heuristic",
+  confidence: 0.9,
+  placeName: "Residence",
+  addressKey: "1 main|austin|tx",
+}, {side: "origin"});
+check("origin merge originSiteType", originLane.originSiteType, "residential");
+check("origin merge RSO flag", originLane.flags.residentialPickup, true);
+check("origin merge does not set dest siteType", originLane.siteType,
+    undefined);
+check("origin merge does not set dest RSD",
+    !!originLane.flags.residentialDelivery, false);
+check("origin meta side", originLane.originEnrichmentMeta.side, "origin");
+
+const weida = addressEnrichment.classifyFromNameHeuristics({
+  name: "Weida Freight System warehouse",
+  address1: "9050 Hermosa Ave",
+  city: "Rancho Cucamonga",
+  state: "CA",
+});
+check("Weida warehouse heuristic not residential",
+    weida && weida.residentialDelivery, false);
+check("Weida warehouse heuristic not military",
+    weida && weida.siteType !== "aafes_military", true);
+
+const aafes = addressEnrichment.classifyFromNameHeuristics({
+  name: "AAFES DDDC Newport News",
+  city: "Newport News",
+  state: "VA",
+});
+check("AAFES dest heuristic military", aafes && aafes.siteType,
+    "aafes_military");
+
+if (failures) {
+  console.log(`\n${failures} failed`);
+  process.exit(1);
+}
+console.log("\nAll origin/dest enrichment rule checks passed");

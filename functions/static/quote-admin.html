@@ -503,12 +503,18 @@
     <section class="panel hidden" id="panel-test">
       <h2>Try an address</h2>
       <p class="panel-intro">
-        Enter a sample consignee and special instructions to see which rules would apply and what accessorials
+        Enter Ship From and/or Ship To addresses to see which rules would apply and what accessorials
         would be added — without sending a real quote.
       </p>
       <div class="test-form">
+        <label for="test-from-name">Who is shipping the freight?</label>
+        <p class="hint">Shipper / pickup location name (Ship From)</p>
+        <input id="test-from-name" placeholder="Weida Freight System">
+        <label for="test-from-address">Pickup address</label>
+        <p class="hint">Street, city, and state</p>
+        <input id="test-from-address" placeholder="9050 Hermosa Ave, Rancho Cucamonga CA">
         <label for="test-name">Who is receiving the freight?</label>
-        <p class="hint">Consignee / delivery location name</p>
+        <p class="hint">Consignee / delivery location name (Ship To)</p>
         <input id="test-name" placeholder="Sunrise Nursing Home">
         <label for="test-address">Delivery address</label>
         <p class="hint">Street, city, and state</p>
@@ -518,7 +524,7 @@
         <textarea id="test-instructions" rows="3" placeholder="No loading dock — liftgate required"></textarea>
         <label class="checkbox-row">
           <input type="checkbox" id="test-classify">
-          Classify address (Google Places or AI lookup + cache)
+          Classify From + To (Google Places or AI lookup + cache)
         </label>
         <button type="button" class="primary" id="run-test">Check which rules apply</button>
         <div id="test-result" class="test-result hidden"></div>
@@ -547,9 +553,13 @@
 
     const ACCESSORIAL_LABELS = {
       LFO: "Liftgate at pickup",
+      LFO: "Liftgate at pickup",
       LFD: "Liftgate at delivery",
+      APO: "Appointment pickup",
       APD: "Appointment required",
+      LAO: "Limited access pickup",
       LAD: "Limited access delivery",
+      RSO: "Residential pickup",
       NUD: "Nursing home delivery",
       HOD: "Hotel delivery",
       RSD: "Residential delivery",
@@ -569,6 +579,7 @@
 
     const FLAG_LABELS = {
       residentialDelivery: "Residential delivery",
+      residentialPickup: "Residential pickup",
     };
 
     const IDENTIFY_VIA_LABELS = {
@@ -610,17 +621,25 @@
       return label ? `${label} (${code})` : code;
     }
 
-    function describeMatch(match) {
+    function describeMatch(match, applyTo) {
       const lines = [];
       if (!match || typeof match !== "object") {
         lines.push("Always applies (no specific trigger configured).");
         return lines;
+      }
+      if (applyTo === "origin") {
+        lines.push("Applies to pickup / Ship From only");
+      } else if (applyTo === "both") {
+        lines.push("Applies to pickup and delivery (origin vs dest codes)");
       }
       if (match.consigneeNameContains && match.consigneeNameContains.length) {
         lines.push(`Consignee name includes ${quoteList(match.consigneeNameContains)}`);
       }
       if (match.consigneeAddressContains && match.consigneeAddressContains.length) {
         lines.push(`Delivery address includes ${quoteList(match.consigneeAddressContains)}`);
+      }
+      if (match.shipperNameContains && match.shipperNameContains.length) {
+        lines.push(`Shipper name includes ${quoteList(match.shipperNameContains)}`);
       }
       if (match.instructionsContains && match.instructionsContains.length) {
         lines.push(`Special instructions mention ${quoteList(match.instructionsContains)}`);
@@ -634,7 +653,9 @@
         });
       }
       if (match.siteType) {
-        lines.push(`Delivery site is identified as ${SITE_TYPE_LABELS[match.siteType] || match.siteType.replace(/_/g, " ")}`);
+        const kind = applyTo === "origin" ? "Pickup site" :
+          applyTo === "both" ? "Pickup or delivery site" : "Delivery site";
+        lines.push(`${kind} is identified as ${SITE_TYPE_LABELS[match.siteType] || match.siteType.replace(/_/g, " ")}`);
       }
       if (!lines.length) {
         lines.push("Custom match conditions (see Advanced for details).");
@@ -675,7 +696,7 @@
       const card = document.createElement("article");
       card.className = "rule-card" + (rule.active === false ? " inactive" : "");
 
-      const whenLines = describeMatch(rule.match);
+      const whenLines = describeMatch(rule.match, rule.applyTo);
       const thenLines = describeActions(rule);
 
       const badges = [];
@@ -705,7 +726,7 @@
         ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
         <details class="rule-advanced">
           <summary>Advanced (rule ID &amp; technical data)</summary>
-          <pre>${esc(JSON.stringify({ id: rule.id, identifyVia: rule.identifyVia || "both", match: rule.match, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
+          <pre>${esc(JSON.stringify({ id: rule.id, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
         </details>
       `;
       return card;
@@ -738,43 +759,62 @@
       }
     }
 
-    function formatTestResult(result, enrichment, addressKey) {
+    function formatClassificationBlock(title, enrichment, addressKey) {
+      let html = `<h3>${esc(title)}</h3>`;
+      if (!enrichment) {
+        html += '<p class="none">Not classified.</p>';
+        return html;
+      }
+      if (enrichment.error) {
+        html += `<p class="none">Classification failed: ${esc(enrichment.error)}</p>`;
+        return html;
+      }
+      const cache = enrichment.cacheHit ? "cache hit" : "cache miss (saved)";
+      const type = SITE_TYPE_LABELS[enrichment.classifiedAs] || enrichment.classifiedAs;
+      html += "<ul>";
+      html += `<li><strong>Site type:</strong> ${esc(type || "unknown")}</li>`;
+      if (enrichment.placeName) {
+        html += `<li><strong>Place name:</strong> ${esc(enrichment.placeName)}</li>`;
+      }
+      html += `<li><strong>Source:</strong> ${esc(enrichment.source || "unknown")} (${cache})</li>`;
+      if (addressKey) {
+        html += `<li><strong>Cache key:</strong> <code>${esc(addressKey)}</code></li>`;
+      }
+      html += "</ul>";
+      return html;
+    }
+
+    function formatTestResult(result, enrichment, addressKey, originEnrichment, originAddressKey) {
       if (!result) return '<p class="none">No result returned.</p>';
       const applied = result.appliedRules || [];
       const acc = result.accessorials || [];
       const filters = result.filterCarrierWarnings || [];
       let html = "";
 
-      if (enrichment) {
-        html += "<h3>Address classification</h3>";
-        if (enrichment.error) {
-          html += `<p class="none">Classification failed: ${esc(enrichment.error)}</p>`;
-        } else {
-          const cache = enrichment.cacheHit ? "cache hit" : "cache miss (saved)";
-          const type = SITE_TYPE_LABELS[enrichment.classifiedAs] || enrichment.classifiedAs;
-          html += "<ul>";
-          html += `<li><strong>Site type:</strong> ${esc(type || "unknown")}</li>`;
-          if (enrichment.placeName) {
-            html += `<li><strong>Place name:</strong> ${esc(enrichment.placeName)}</li>`;
-          }
-          html += `<li><strong>Source:</strong> ${esc(enrichment.source || "unknown")} (${cache})</li>`;
-          if (addressKey) {
-            html += `<li><strong>Cache key:</strong> <code>${esc(addressKey)}</code></li>`;
-          }
-          html += "</ul>";
+      if (originEnrichment || enrichment) {
+        if (originEnrichment) {
+          html += formatClassificationBlock(
+              "From (origin) classification", originEnrichment, originAddressKey);
+        }
+        if (enrichment) {
+          html += formatClassificationBlock(
+              "To (destination) classification", enrichment, addressKey);
         }
       }
 
       html += "<h3>Rules that matched</h3>";
       if (applied.length) {
         html += "<ul>" + applied.map(r => {
+          const sideLabel = r.applyTo === "origin" ? " (pickup)" :
+            r.applyTo === "dest" ? " (delivery)" : "";
           const viaLabel = r.fromEnrichment ?
             " (via AI classification)" :
             (r.matchVia === "consigneeName" ? " (via consignee name in email)" :
+              r.matchVia === "shipperName" ? " (via shipper name)" :
               r.matchVia === "instructions" ? " (via special instructions)" :
                 r.matchVia === "siteType" && r.identifyVia === "address_text" ?
                   " (via site type in email)" : "");
-          return `<li><strong>${esc(r.name)}</strong>${viaLabel}${r.notes ? " — " + esc(r.notes) : ""}</li>`;
+          return `<li><strong>${esc(r.name)}</strong>${sideLabel}${viaLabel}${r.notes ? " — " + esc(r.notes) : ""}</li>`;
         }).join("") + "</ul>";
       } else {
         html += '<p class="none">No rules matched this address.</p>';
@@ -859,7 +899,7 @@
 
       if (patch.name) parts.push(`Name: ${esc(patch.name)}`);
       if (patch.match) {
-        const when = describeMatch(patch.match);
+        const when = describeMatch(patch.match, patch.applyTo);
         parts.push(`When: ${when.map(esc).join("; ")}`);
       }
       if (patch.identifyVia) {
@@ -1207,6 +1247,10 @@
       resultEl.classList.remove("hidden");
       resultEl.innerHTML = "<p class=\"none\">Checking rules…</p>";
       const sample = {
+        shipper: {
+          name: document.getElementById("test-from-name").value,
+          address1: document.getElementById("test-from-address").value,
+        },
         consignee: {
           name: document.getElementById("test-name").value,
           address1: document.getElementById("test-address").value,
@@ -1219,7 +1263,9 @@
           method: "POST",
           body: JSON.stringify({ tenantId: TENANT_ID, sample, classifyAddress }),
         });
-        resultEl.innerHTML = formatTestResult(res.result, res.enrichment, res.addressKey);
+        resultEl.innerHTML = formatTestResult(
+            res.result, res.enrichment, res.addressKey,
+            res.originEnrichment, res.originAddressKey);
       } catch (e) {
         resultEl.innerHTML = `<p class="none">Error: ${esc(e.message)}</p>`;
       }
