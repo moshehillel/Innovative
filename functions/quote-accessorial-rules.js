@@ -24,7 +24,6 @@ const MANAGED_DEFAULT_RULE_IDS = new Set(["amazon_fc"]);
  * even though they are no longer listed in DEFAULT_RULES.
  */
 const RETIRED_DEFAULT_RULE_IDS = new Set([
-  "aafes_military",
   "nursing_home",
   "hotel",
 ]);
@@ -47,8 +46,23 @@ const DEFAULT_RULES = [
     autoApply: true,
     requiresConfirm: false,
   },
+  {
+    id: "aafes_military",
+    active: true,
+    priority: 25,
+    name: "Military bases — limited access, appointment delivery",
+    identifyVia: "ai",
+    match: {
+      siteType: "aafes_military",
+    },
+    addAccessorials: ["LAD", "APD"],
+    notes: "AI-classified military base / AAFES — " +
+      "limited access and appointment delivery.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
   // Retired defaults (kept out of seed; tombstoned on delete):
-  // aafes_military, nursing_home, hotel
+  // nursing_home, hotel
   {
     id: "menards_dc",
     active: true,
@@ -192,6 +206,16 @@ async function markDefaultRuleRemoved(tenant, ruleId, removedBy) {
     removedAt: admin.firestore.FieldValue.serverTimestamp(),
     removedBy: removedBy || "dashboard",
   }, {merge: true});
+}
+
+/**
+ * Drop a delete-tombstone so a previously removed default can be recreated.
+ * @param {object} tenant Tenant.
+ * @param {string} ruleId Rule id.
+ * @return {Promise<void>}
+ */
+async function clearRemovedDefaultRule(tenant, ruleId) {
+  await col(tenant, "quoteRulesRemoved").doc(String(ruleId)).delete();
 }
 
 /**
@@ -540,7 +564,9 @@ async function listAllRules(tenant) {
  * @return {Promise<object>}
  */
 async function upsertRule(tenant, ruleId, patch, updatedBy) {
-  const ref = col(tenant, "quoteRules").doc(String(ruleId));
+  const id = String(ruleId);
+  await clearRemovedDefaultRule(tenant, id);
+  const ref = col(tenant, "quoteRules").doc(id);
   const before = await ref.get();
   const data = {
     ...patch,
@@ -614,6 +640,7 @@ module.exports = {
   upsertRule,
   deleteRule,
   markDefaultRuleRemoved,
+  clearRemovedDefaultRule,
   loadRemovedDefaultRuleIds,
   testAddress,
   ruleMatches,

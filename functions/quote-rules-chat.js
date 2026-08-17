@@ -6,14 +6,14 @@
 "use strict";
 
 const OpenAI = require("openai");
-const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const {
   IDENTIFY_VIA_VALUES,
   DEFAULT_IDENTIFY_VIA,
   ACCESSORIAL_LABELS,
 } = require("./quote-accessorial-rules");
 
-const DEFAULT_MODEL = DEFAULT_OPENAI_MODEL;
+// Stronger than gpt-5.6-luna for freeform rule chat. Override via env.
+const RULES_CHAT_MODEL = process.env.QUOTE_RULES_CHAT_MODEL || "gpt-5.6-sol";
 
 const PATCH_FIELDS = [
   "active",
@@ -101,13 +101,23 @@ function parseIdentifyChoiceAnswer(text) {
     return "address_only";
   }
 
-  if (/^can be\b/.test(norm) ||
-      /^can(\b|$)/.test(norm) ||
-      /\bcan be identified from the email\b/.test(norm) ||
+  // Explicit email-identify phrases (not "can you add …").
+  if (/\bcan be identified from the email\b/.test(norm) ||
       /\balso from (the )?email\b/.test(norm) ||
       /\bfrom (the )?email (as well|too|instead)\b/.test(norm) ||
       /\bemail (body|subject|sender)\b/.test(norm)) {
-    // Guard: "can…" that is actually cannot (already handled above).
+    if (/^cannot\b/.test(norm) || /\bcannot be\b/.test(norm)) {
+      return "address_only";
+    }
+    return "email";
+  }
+
+  // Bare "can" / "can be" answers only — never "can you add for military".
+  if (/^can you\b/.test(norm)) return null;
+  const isShortIdentify = norm.length <= 48;
+  if (isShortIdentify &&
+      (/^can be\b/.test(norm) || /^can$/.test(norm) ||
+       /^can[.!]$/.test(norm))) {
     if (/^cannot\b/.test(norm) || /\bcannot be\b/.test(norm)) {
       return "address_only";
     }
@@ -139,7 +149,10 @@ const ACCESSORIAL_NAME_PATTERNS = [
   },
   {
     code: "APD",
-    re: /\bappointments?(\s+(delivery|dest|required))?\b/i,
+    re: new RegExp(
+        "\\b(apd|appointments?(\\s+(delivery|dest|required)?)?)\\b|" +
+        "\\b(delivery|dest(ination)?)\\s+appointments?\\b",
+        "i"),
   },
   {code: "RSD", re: /\bresidential(\s+delivery)?\b/i},
   {code: "NUD", re: /\bnursing(\s+home)?(\s+delivery)?\b/i},
@@ -221,6 +234,92 @@ function isMilitaryTopicBlob(blob) {
     /\b(army|navy|air\s*force|marine)\s+(base|bases|post|installation)s?\b/
         .test(t) ||
     /\bjoint\s+bases?\b/.test(t);
+}
+
+/**
+ * Site types identified from the delivery address / AI, not email
+ * keywords (military, nursing home, hotel).
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function isClearlySiteTypeTopic(messages) {
+  const blob = userTopicBlob(messages);
+  return isMilitaryTopicBlob(blob) ||
+    /\bnursing(\s+home)?s?\b/.test(blob) ||
+    /\bhotels?\b/.test(blob);
+}
+
+/**
+ * User explicitly asked to identify from the quote email.
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function userAskedForEmailIdentify(messages) {
+  const blob = userTopicBlob(messages);
+  return /\bidentified from the (quote )?email\b/.test(blob) ||
+    /\bfrom (the )?quote email\b/.test(blob) ||
+    /\bemail (keywords|signals|sender domains)\b/.test(blob);
+}
+
+/**
+ * Follow-up that is a complaint, not a new rule request.
+ * @param {string} text User text.
+ * @return {boolean}
+ */
+function isMetaFollowUpText(text) {
+  const t = String(text || "").toLowerCase().trim();
+  if (!t) return false;
+  return /\bi asked you\b/.test(t) ||
+    /\bthat'?s not what i (asked|meant|said)\b/.test(t) ||
+    /\byou (didn'?t|did not) (understand|answer)\b/.test(t);
+}
+
+/**
+ * Appointment / APD / LAD phrasing, including "delivery appointment".
+ * @param {string} blob Lowercased text.
+ * @return {boolean}
+ */
+function hasMilitaryAccessorialPhrasing(blob) {
+  const t = String(blob || "");
+  return /\b(apd|lad)\b/.test(t) ||
+    /\bappointments?\b/.test(t) ||
+    /\blimited\s*ac+ess\b/.test(t) ||
+    /\b(delivery|dest(ination)?)\s+appointments?\b/.test(t);
+}
+
+/**
+ * Military + appointment/LAD add or update. Typos: militery, aadd,
+ * fecileties.
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function looksLikeMilitaryAccessorialIntent(messages) {
+  if (looksLikeDeleteRuleIntent(messages)) return false;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "").toLowerCase() : "";
+  if (/^\[applied\]/.test(String(last && last.content || "").trim())) {
+    return false;
+  }
+  const blob = isMetaFollowUpText(lastText) ?
+    userTopicBlob(messages) : lastText;
+  if (!isMilitaryTopicBlob(blob)) return false;
+  return hasMilitaryAccessorialPhrasing(blob);
+}
+
+/**
+ * Fallback when JSON is empty or the model is unclear. Never the old
+ * "I could not process that" dead-end.
+ * @param {Array<object>} messages Chat turns.
+ * @return {string}
+ */
+function fallbackUnclearReply(messages) {
+  if (isMilitaryTopicBlob(userTopicBlob(messages))) {
+    return "I can add or update the military / AAFES site rule " +
+      "(limited access and appointment delivery). Tell me LAD, APD, " +
+      "or both and I'll propose it.";
+  }
+  return "Tell me the site (for example military bases) and which " +
+    "accessorials to add (LAD, APD, …). I'll propose a rule to Confirm.";
 }
 
 /**
@@ -480,10 +579,19 @@ function detectCreateIdentifyGate(messages) {
       // Any substantive follow-up after we asked for signals counts.
       if (text.trim().length >= 8 &&
           !/^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
-              .test(text.trim())) {
+              .test(text.trim()) &&
+          !looksLikeMilitaryAccessorialIntent(messages) &&
+          !isMetaFollowUpText(text)) {
         emailSignalsListed = true;
       }
     }
+  }
+
+  // Military / nursing / hotel are address+AI site types. Do not treat
+  // "can you add appointment for military" as an email-identify choice.
+  if (!source && isClearlySiteTypeTopic(messages) &&
+      !userAskedForEmailIdentify(messages)) {
+    source = "address_only";
   }
 
   if (source === "address_only") {
@@ -537,16 +645,21 @@ function looksLikeCreateRuleIntent(messages) {
   const lastUser = lastUserTurn(messages);
   if (!lastUser) return false;
   const t = String(lastUser.content || "").toLowerCase();
+  const addVerb = "\\b(a+dd|addd?|create|new|make|set\\s*up|setup|include)\\b";
   const createAccessorialRe = new RegExp(
-      "\\b(whenever|when|for)\\b.{0,80}\\b(add|include|require)\\b" +
+      "\\b(whenever|when|for)\\b.{0,80}" +
+      "\\b(a+dd|addd?|include|require|also)\\b" +
       ".{0,40}\\b(accessorial|liftgate|appointment|nursing|hotel|" +
       "residential|school)",
       "i",
   );
-  return /\b(add|create|new|make|set up|setup)\b.{0,40}\brule\b/.test(t) ||
+  return new RegExp(addVerb + ".{0,40}\\brule\\b", "i").test(t) ||
     /\brule\b.{0,40}\b(add|create|new)\b/.test(t) ||
-    /\b(add|create|new).{0,80}\b(mil+i?t+[ae]r+y|limited\s*ac+ess)\b/.test(t) ||
-    createAccessorialRe.test(t);
+    new RegExp(
+        addVerb + ".{0,80}\\b(mil+i?t+[ae]r+y|limited\\s*ac+ess)\\b",
+        "i").test(t) ||
+    createAccessorialRe.test(t) ||
+    looksLikeMilitaryAccessorialIntent(messages);
 }
 
 /**
@@ -685,14 +798,99 @@ function buildDeleteRuleProposal(messages, existingRules) {
 }
 
 /**
+ * Merge accessorial code lists, preserving order.
+ * @param {Array<string>} existing Existing codes.
+ * @param {Array<string>} extra Codes to add.
+ * @return {Array<string>}
+ */
+function mergeAccessorialCodes(existing, extra) {
+  const out = [];
+  const seen = new Set();
+  for (const c of [...(existing || []), ...(extra || [])]) {
+    const u = String(c || "").toUpperCase();
+    if (!u || seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out;
+}
+
+/**
+ * Codes implied by a military add/update request.
+ * @param {Array<object>} messages Chat turns.
+ * @return {Array<string>}
+ */
+function codesFromMilitaryIntent(messages) {
+  const extras = collectCreateAccessorials(messages);
+  const codes = extras.accessorials.slice();
+  const blob = userTopicBlob(messages);
+  const wantsApd = /\b(apd|appointments?)\b/.test(blob) ||
+    /\b(delivery|dest(ination)?)\s+appointments?\b/.test(blob);
+  const wantsLad = /\b(lad|limited\s*ac+ess)\b/.test(blob);
+  if (wantsApd && !codes.includes("APD")) codes.push("APD");
+  if (wantsLad && !codes.includes("LAD")) codes.push("LAD");
+  return codes;
+}
+
+/**
+ * Create or update the military site rule with APD/LAD. Skips the
+ * email-identify questionnaire — military is address/AI siteType.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {object|null}
+ */
+function buildMilitaryAccessorialProposal(messages, existingRules) {
+  if (!looksLikeMilitaryAccessorialIntent(messages)) return null;
+  let codes = codesFromMilitaryIntent(messages);
+  const live = (existingRules || []).find((r) =>
+    r && r.active !== false && ruleLooksMilitary(r));
+  if (live) {
+    if (!codes.length) codes = ["APD"];
+    const merged = mergeAccessorialCodes(live.addAccessorials, codes);
+    const topic = {name: "Military bases"};
+    const name = formatCreateRuleName(topic, merged);
+    const labels = merged.map((c) => ACCESSORIAL_LABELS[c] || c).join(", ");
+    const match = live.match && typeof live.match === "object" &&
+      Object.keys(live.match).length ?
+      live.match : {siteType: "aafes_military"};
+    return {
+      reply: `I'll update "${live.name}" (${live.id}) so it adds ` +
+        `${labels} (match.siteType aafes_military, identified via ` +
+        `AI / address). Click Confirm to apply it.`,
+      action: "propose_update_rule",
+      proposal: {
+        ruleId: String(live.id),
+        patch: {
+          active: true,
+          priority: live.priority || 25,
+          name,
+          identifyVia: live.identifyVia || "ai",
+          match,
+          addAccessorials: merged,
+          notes: "AI-classified military base / AAFES — " +
+            "limited access and appointment delivery.",
+          autoApply: live.autoApply !== false,
+          requiresConfirm: !!live.requiresConfirm,
+        },
+      },
+      quickReplies: [],
+    };
+  }
+  if (!codes.includes("LAD")) codes.unshift("LAD");
+  if (!codes.includes("APD")) codes.push("APD");
+  return buildAddressOnlyCreateProposal(messages, codes);
+}
+
+/**
  * Enforce identify questionnaire before create proposals.
  * @param {object} result Model JSON result.
  * @param {Array} messages Chat history including latest user turn.
+ * @param {Array<object>=} existingRules Live rules.
  * @return {object}
  */
-function enforceCreateIdentifyGate(result, messages) {
+function enforceCreateIdentifyGate(result, messages, existingRules) {
   const out = result && typeof result === "object" ? {...result} : {
-    reply: "I could not process that. Try rephrasing.",
+    reply: fallbackUnclearReply(messages),
     action: "none",
     proposal: null,
   };
@@ -712,19 +910,29 @@ function enforceCreateIdentifyGate(result, messages) {
     }
     return out;
   }
+  const militaryOut = buildMilitaryAccessorialProposal(
+      messages, existingRules || []);
+  if (militaryOut) return militaryOut;
+
   const gate = detectCreateIdentifyGate(messages);
   const extras = collectCreateFlowExtras(messages);
-  const lastUser = [...(messages || [])].reverse()
-      .find((m) => m && m.role !== "assistant");
+  const lastUser = lastUserTurn(messages);
+  const lastText = lastUser ? String(lastUser.content || "") : "";
   const lastIsAccessorials = !!(lastUser &&
       parseAccessorialsAnswer(lastUser.content).length);
-  // Keep create-flow active through ready: the latest user turn is often
-  // just "2" / "Cannot be…" / "LAD", which is NOT create-intent by itself.
-  const inIdentifyFlow = gate.status === "awaiting_choice" ||
-    gate.status === "awaiting_email_signals" ||
-    gate.status === "ready" ||
+  const lastIsIdentifyAnswer = !!parseIdentifyChoiceAnswer(lastText);
+  const lastIsMeta = isMetaFollowUpText(lastText);
+  // Only stay in the questionnaire for a real identify/accessorial
+  // answer — leftover "ready" must not steal "i asked you something".
+  const inIdentifyFlow =
+    (gate.status === "awaiting_choice" && lastIsIdentifyAnswer) ||
+    (gate.status === "awaiting_email_signals" &&
+      !looksLikeMilitaryAccessorialIntent(messages) && !lastIsMeta) ||
+    (gate.status === "ready" && gate.source === "address_only" &&
+      (lastIsAccessorials || lastIsIdentifyAnswer)) ||
     (extras.askedAccessorials && lastIsAccessorials) ||
-    (gate.status === "needed" && looksLikeCreateRuleIntent(messages));
+    (gate.status === "needed" && looksLikeCreateRuleIntent(messages) &&
+      !isClearlySiteTypeTopic(messages));
   const creating = action === "propose_create_rule" ||
     looksLikeCreateRuleIntent(messages) ||
     inIdentifyFlow;
@@ -733,10 +941,12 @@ function enforceCreateIdentifyGate(result, messages) {
   // update/delete skip the deterministic create proposal.
   const addressOnlyReady = gate.status === "ready" &&
     gate.source === "address_only";
-  if ((action === "propose_update_rule" ||
-      action === "propose_delete_rule") &&
-      !(addressOnlyReady && extras.accessorials.length)) {
-    return out;
+  if (action === "propose_update_rule" ||
+      action === "propose_delete_rule") {
+    if (!(addressOnlyReady && extras.accessorials.length &&
+        lastIsAccessorials)) {
+      return out;
+    }
   }
 
   if (!creating && action !== "ask_identify_source" &&
@@ -787,6 +997,10 @@ function enforceCreateIdentifyGate(result, messages) {
         return finalizeAddressOnlyCreate(
             {...out, createIdentify: gate}, messages, extras);
       }
+      if (action === "propose_create_rule" ||
+          action === "propose_update_rule") {
+        return out;
+      }
       out.action = "none";
       out.proposal = null;
       out.quickReplies = [];
@@ -825,8 +1039,7 @@ function enforceCreateIdentifyGate(result, messages) {
     const badReply = !out.reply ||
       /could not process|try rephrasing/i.test(String(out.reply));
     if (badReply && out.action !== "propose_create_rule") {
-      out.reply = "Got it. Tell me any missing details " +
-        "(accessorials, site type, name) and I'll propose the rule.";
+      out.reply = fallbackUnclearReply(messages);
       out.action = "none";
       out.proposal = null;
       out.quickReplies = [];
@@ -834,7 +1047,8 @@ function enforceCreateIdentifyGate(result, messages) {
     return out;
   }
 
-  if (gate.status === "awaiting_email_signals") {
+  if (gate.status === "awaiting_email_signals" &&
+      !looksLikeMilitaryAccessorialIntent(messages) && !lastIsMeta) {
     return {
       reply: out.action === "ask_email_signals" && out.reply ?
         out.reply :
@@ -876,21 +1090,28 @@ function enforceCreateIdentifyGate(result, messages) {
 async function runQuoteRulesChatTurn(opts) {
   const chatTurns = opts.messages || [];
   const existingRules = opts.existingRules || [];
-  // Deterministic delete before OpenAI and before the create-identify gate.
-  // Otherwise a leftover Cannot-be flow (or empty model JSON) replies
-  // "I could not process that. Try rephrasing."
+  // Obvious delete / military APD+LAD updates skip the model so a leftover
+  // identify gate cannot steal the turn.
   const deleteOut = buildDeleteRuleProposal(chatTurns, existingRules);
   if (deleteOut) return deleteOut;
+  const militaryOut = buildMilitaryAccessorialProposal(
+      chatTurns, existingRules);
+  if (militaryOut) return militaryOut;
 
   const gateHint = detectCreateIdentifyGate(chatTurns);
-  // After Cannot-be, accessorials are a structured answer — don't send
-  // "LAD" / "limited access" through the model (that caused the re-ask loop).
-  if (gateHint.status === "ready" && gateHint.source === "address_only") {
+  const last = lastUserTurn(chatTurns);
+  const lastText = last ? String(last.content || "") : "";
+  const lastIsAcc = parseAccessorialsAnswer(lastText).length > 0;
+  const lastIsChoice = !!parseIdentifyChoiceAnswer(lastText);
+  // After Cannot-be, only skip the model for a structured accessorial
+  // or identify answer. Follow-ups go to gpt-5.6-sol.
+  if (gateHint.status === "ready" && gateHint.source === "address_only" &&
+      (lastIsAcc || lastIsChoice)) {
     return enforceCreateIdentifyGate({
       reply: "",
       action: "none",
       proposal: null,
-    }, chatTurns);
+    }, chatTurns, existingRules);
   }
 
   const apiKey = process.env.QUOTE_RULES_CHAT_OPENAI_API_KEY ||
@@ -901,7 +1122,7 @@ async function runQuoteRulesChatTurn(opts) {
   }
 
   const client = new OpenAI({apiKey});
-  const model = process.env.QUOTE_RULES_CHAT_MODEL || DEFAULT_MODEL;
+  const model = RULES_CHAT_MODEL;
   const rulesJson = JSON.stringify(
       (opts.existingRules || []).slice(0, 40),
       null,
@@ -938,72 +1159,58 @@ async function runQuoteRulesChatTurn(opts) {
     "match may use: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType.",
     "",
-    "=== MANDATORY create-rule identify questionnaire ===",
-    "When the user wants to ADD or CREATE a new rule, you MUST NOT propose",
-    "the rule (action must NOT be propose_create_rule) until this finishes.",
-    "Updates and deletes skip this questionnaire unless it comes up naturally.",
-    "If the user asks to delete/remove/drop a rule (including typos like",
-    "militery / millitary, and short forms",
-    "\"remove military\", \"delete aafes\",",
-    "\"delete all rules for military bases\"): action MUST be",
-    "propose_delete_rule. Do NOT ask identify. Do NOT say you could not",
-    "process that. Ask them to click Confirm; do not claim the rule is gone.",
+    "=== Follow the user's LAST intent ===",
+    "Read the full conversation. Do not restart the identify",
+    "questionnaire if they already chose Cannot be, already named",
+    "accessorials, or asked to add APD/LAD for a known site type.",
+    "\"can you add …\" is a request, NOT the Can-be identify answer.",
+    "Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
+    "NEVER reply \"I could not process that\" or \"Try rephrasing\".",
+    "If unsure, ask one short question (action none) that advances",
+    "their last request — do not change the subject.",
     "",
-    "Step 1 — Always stop and ask (action: ask_identify_source):",
-    "\"How can this condition be identified?\" Present exactly two options:",
-    "  A) Can be identified from the quote email (body/subject/sender/",
-    "     attachments/consignee name text) — as well as or instead of address.",
-    "  B) Cannot be — address-only / site classification only (AI enrichment).",
-    "Set quickReplies to those two option strings exactly:",
+    "=== Military / AAFES / nursing home / hotel are site types ===",
+    "These are identified via AI address classification, not email.",
+    "Default identifyVia \"ai\" and match.siteType (aafes_military,",
+    "nursing_home, hotel). Do NOT ask email-signals for them.",
+    "\"add appointment delivery for military facilities\" (and typos)",
+    "→ update existing aafes_military or create it with LAD + APD.",
+    "Keep LAD if the prior military rule / intent already had it.",
+    "If aafes_military is missing from Current active rules JSON,",
+    "propose_create_rule to recreate it (tombstones must not block).",
+    "",
+    "=== Deletes ===",
+    "delete/remove/drop (typos militery / millitary, \"remove military\",",
+    "\"delete aafes\"): action MUST be propose_delete_rule. Do NOT ask",
+    "identify. Ask them to click Confirm; do not claim the rule is gone.",
+    "",
+    "=== Identify questionnaire (new rules only, unknown how-to-spot) ===",
+    "Ask identify ONLY when creating a NEW rule and it is NOT a known",
+    "site type (military / nursing / hotel) and they have not already",
+    "chosen Cannot be. Updates skip this.",
+    "Step 1 action ask_identify_source with exactly two quickReplies:",
     "  \"" + QUICK_REPLY_CAN_BE + "\"",
     "  \"" + QUICK_REPLY_CANNOT_BE + "\"",
-    "Wait for the user's choice. Do not invent a proposal yet.",
-    "User may answer with: 1, 2, A, B, can, cannot, can be, cannot be,",
-    "or the full quickReply button text (ignore em-dash / trailing clauses).",
-    "Those short answers are definitive — do not re-ask Step 1.",
+    "User may answer 1, 2, A, B, can, cannot, can be, cannot be, or the",
+    "button text. Those are definitive — do not re-ask.",
+    "CAN BE (email): ask_email_signals; only use signals they list;",
+    "identifyVia address_text or both.",
+    "CANNOT BE: identifyVia ai; match.siteType and/or flags; never",
+    "invent email keywords; never match: {}.",
+    "Known siteType: nursing_home, hotel, amazon_fc, menards_dc,",
+    "aafes_military, residential, other.",
+    "Codes: LAD LFD APD RSD NUD LTD LFO HOD SCD INS; \"limited access\";",
+    "LOAD = LAD; \"delivery appointment\" = APD.",
     "",
-    "Step 2a — If they choose CAN BE (email):",
-    "  action: ask_email_signals. Ask them to list ALL ways they think we",
-    "  can get the signal from the email (keywords, sender domains, subject",
-    "  patterns, attachment text, consignee name phrases, etc.).",
-    "  Wait for their list. Do NOT invent email match criteria yourself.",
-    "  Only after they list signals may you propose_create_rule, putting",
-    "  those signals into match (instructionsContains / consigneeNameContains",
-    "  / referenceContains / etc. as appropriate).",
-    "  Set identifyVia to \"address_text\" when matching email/text only,",
-    "  or \"both\" if address AI classification should also count.",
-    "",
-    "Step 2b — If they choose CANNOT BE (address-only):",
-    "  Proceed with address / siteType / flags classification matching only.",
-    "  Set identifyVia to \"ai\". Do NOT invent email-text match keywords.",
-    "  Use match.siteType and/or match.flags as appropriate.",
-    "  Known siteType values: nursing_home, hotel, amazon_fc, menards_dc,",
-    "  aafes_military (military bases / AAFES / military exchange),",
-    "  residential, other.",
-    "  For military bases / AAFES use match.siteType \"aafes_military\".",
-    "  NEVER propose match: {} — an empty match does not target a site.",
-    "  If accessorials were already stated, propose_create_rule immediately.",
-    "  If not, ask which codes to add — never say you could not process.",
-    "  After they answer, propose_create_rule. Do NOT re-ask identify or",
-    "  accessorials. Accept codes case-insensitively: LAD LFD APD RSD NUD",
-    "  LTD LFO HOD SCD INS, names like \"limited access\" /",
-    "  \"limited access delivery\", and LOAD as a typo for LAD.",
-    "",
-    "Current questionnaire state from chat history (authoritative):",
+    "Current questionnaire state from chat history:",
     `  status=${gateHint.status}; source=${gateHint.source || "null"};`,
     `  emailSignalsListed=${gateHint.emailSignalsListed};`,
     `  askedAccessorials=${!!gateHint.askedAccessorials};`,
     `  accessorials=${(gateHint.accessorials || []).join(",") || "none"};`,
     `  siteType=${gateHint.siteType || "null"}`,
-    "If status is needed or awaiting_choice: action MUST be",
-    "ask_identify_source (not propose_create_rule).",
-    "If status is awaiting_email_signals: action MUST be ask_email_signals.",
-    "Only when status is ready may you use propose_create_rule.",
-    "When status is ready after cannot-be (source=address_only), do NOT",
-    "re-ask identify and do NOT reply that you could not process the answer.",
-    "If accessorials are already listed in state, propose_create_rule now.",
-    "A short accessorial answer (LAD / lad / limited access / LOAD) is the",
-    "missing detail — propose the rule; never repeat the accessorials ask.",
+    "If they already chose cannot-be (source=address_only) or the",
+    "topic is a site type, do NOT ask identify or email-signals.",
+    "If accessorials are listed, propose now.",
     "",
     "identifyVia values:",
     "  address_text — match from email/text fields only.",
@@ -1030,13 +1237,12 @@ async function runQuoteRulesChatTurn(opts) {
     "When asked if a rule is gone: answer ONLY from Current active rules JSON",
     "above (fresh from Firestore this turn). Ignore prior chat claims.",
     "Messages starting with [APPLIED] are ground-truth UI Confirm results.",
-    "If unclear (and not mid identify questionnaire), ask one short",
-    "clarifying question with action none.",
+    "If unclear, ask one short clarifying question with action none.",
   ].join("\n");
 
   const messages = [
     {role: "system", content: systemPrompt},
-    ...(opts.messages || []).slice(-20).map((m) => ({
+    ...(opts.messages || []).slice(-30).map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
       content: String(m.content || "").slice(0, 4000),
     })),
@@ -1044,7 +1250,7 @@ async function runQuoteRulesChatTurn(opts) {
 
   const completion = await client.chat.completions.create({
     model,
-    max_completion_tokens: 900,
+    max_completion_tokens: 1600,
     response_format: {type: "json_object"},
     messages,
   });
@@ -1061,13 +1267,14 @@ async function runQuoteRulesChatTurn(opts) {
     parsed = JSON.parse(raw);
   } catch (_) {
     parsed = {
-      reply: raw || "I could not process that. Try rephrasing.",
+      reply: raw || fallbackUnclearReply(opts.messages || []),
       action: "none",
       proposal: null,
     };
   }
 
-  return enforceCreateIdentifyGate(parsed, opts.messages || []);
+  return enforceCreateIdentifyGate(
+      parsed, opts.messages || [], existingRules);
 }
 
 /**
@@ -1279,8 +1486,11 @@ module.exports = {
   inferCreateTopic,
   looksLikeDeleteRuleIntent,
   looksLikeCreateRuleIntent,
+  looksLikeMilitaryAccessorialIntent,
   buildDeleteRuleProposal,
+  buildMilitaryAccessorialProposal,
   isMilitaryTopicBlob,
+  RULES_CHAT_MODEL,
   IDENTIFY_QUICK_REPLIES,
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,

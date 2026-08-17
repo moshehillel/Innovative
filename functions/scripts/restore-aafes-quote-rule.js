@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * Permanently remove retired quote defaults (AAFES, nursing home, hotel)
- * and tombstone them so ensureDefaultRulesPresent cannot recreate them.
+ * Recreate aafes_military (LAD + APD, identifyVia ai) and drop its
+ * quoteRulesRemoved tombstone.
  *
  * Usage:
- *   node scripts/remove-retired-quote-rules.js
- *   node scripts/remove-retired-quote-rules.js --tenant-id default
+ *   node scripts/restore-aafes-quote-rule.js
+ *   node scripts/restore-aafes-quote-rule.js --tenant-id default
  */
 "use strict";
 
@@ -13,7 +13,7 @@ const admin = require("firebase-admin");
 const quoteRules = require("../quote-accessorial-rules");
 
 const PROJECT = "tai-invoice-automation";
-const RULE_IDS = ["nursing_home", "hotel"];
+const RULE_ID = "aafes_military";
 
 /**
  * @return {object}
@@ -53,30 +53,38 @@ async function main() {
   }
   quoteRules.init({tcol});
   const tenant = {tenantId: opts.tenantId};
-
-  for (const id of RULE_IDS) {
-    console.log("Deleting", id);
-    await quoteRules.deleteRule(tenant, id, "remove-retired-quote-rules");
-    await quoteRules.markDefaultRuleRemoved(
-        tenant, id, "remove-retired-quote-rules");
+  const seed = quoteRules.DEFAULT_RULES.find((r) => r.id === RULE_ID);
+  if (!seed) {
+    throw new Error("DEFAULT_RULES missing " + RULE_ID);
   }
+  const {id, ...patch} = seed;
 
-  await quoteRules.ensureDefaultRulesPresent(tenant);
-  const rules = await quoteRules.listAllRules(tenant);
+  console.log("Clearing tombstone and upserting", id);
+  await quoteRules.clearRemovedDefaultRule(tenant, id);
+  const rule = await quoteRules.upsertRule(
+      tenant, id, patch, "restore-aafes-quote-rule");
   const removed = await quoteRules.loadRemovedDefaultRuleIds(tenant);
-  const still = RULE_IDS.filter((id) => rules.some((r) => r.id === id));
 
   console.log("tenant:", opts.tenantId);
-  console.log("still present:", still.length ? still.join(",") : "(none)");
-  console.log("tombstoned:", RULE_IDS.map((id) =>
-    id + "=" + removed.has(id)).join(", "));
-  if (still.length) {
-    console.error("FAIL: rules still present after removal");
+  console.log("rule:", JSON.stringify({
+    id: rule.id,
+    name: rule.name,
+    identifyVia: rule.identifyVia,
+    match: rule.match,
+    addAccessorials: rule.addAccessorials,
+    notes: rule.notes,
+  }, null, 2));
+  console.log("tombstoned:", removed.has(id));
+  const codes = (rule.addAccessorials || []).map(String);
+  if (!codes.includes("LAD") || !codes.includes("APD")) {
+    console.error("FAIL: expected LAD+APD");
     process.exit(1);
   }
-  console.log("OK: retired rules gone and will not reseed");
-  console.log("active ids:", rules.filter((r) => r.active !== false)
-      .map((r) => r.id).join(", "));
+  if (removed.has(id)) {
+    console.error("FAIL: tombstone still present");
+    process.exit(1);
+  }
+  console.log("OK: military rule live with LAD+APD");
 }
 
 main().catch((err) => {
