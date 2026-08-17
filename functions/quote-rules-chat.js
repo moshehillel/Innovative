@@ -269,10 +269,15 @@ function validateRuleProposal(proposal) {
     return {ok: false, error: "Empty proposal"};
   }
   const action = proposal.action || proposal.type;
-  if (action === "propose_delete_rule") {
+  if (action === "propose_delete_rule" || action === "delete") {
     const id = proposal.deleteRuleId ||
-      (proposal.proposal && proposal.proposal.ruleId) ||
-      proposal.ruleId;
+      proposal.ruleId ||
+      (proposal.proposal && (
+        proposal.proposal.deleteRuleId || proposal.proposal.ruleId
+      )) ||
+      (proposal.patch && (
+        proposal.patch.deleteRuleId || proposal.patch.ruleId
+      ));
     if (!id) return {ok: false, error: "Missing rule id to delete"};
     return {ok: true, action: "delete", ruleId: String(id)};
   }

@@ -416,7 +416,8 @@
       <h2>Change rules in plain English</h2>
       <p class="panel-intro">
         Describe what you want changed — for example, add a rule for a new customer type or update accessorials
-        for nursing homes. The assistant will propose a change; review it before saving.
+        for nursing homes. The assistant will propose a change; click <strong>Confirm</strong> to apply it.
+        Press Enter to send (Shift+Enter for a new line).
       </p>
       <div class="chat-log" id="chat-log"></div>
       <div class="chat-input">
@@ -424,14 +425,14 @@
         <button type="button" class="primary" id="chat-send">Send</button>
       </div>
       <div id="proposal-box" class="proposal hidden">
-        <strong>Review before saving</strong>
+        <strong>Proposed rule change — click Confirm to apply</strong>
         <div id="proposal-summary" class="proposal-summary"></div>
         <details class="rule-advanced">
           <summary>Technical details (for IT)</summary>
           <pre id="proposal-json"></pre>
         </details>
         <div style="margin-top:12px;display:flex;gap:8px">
-          <button type="button" class="primary" id="confirm-proposal">Save this change</button>
+          <button type="button" class="primary" id="confirm-proposal">Confirm</button>
           <button type="button" class="ghost" id="dismiss-proposal">Cancel</button>
         </div>
       </div>
@@ -723,16 +724,56 @@
       return html;
     }
 
-    function summarizeProposal(res) {
-      if (!res || !res.proposal) return "The assistant proposed a rule change. Review the details below.";
-      const p = res.proposal;
-      const patch = p.patch || p;
-      const action = res.action || "update";
-      const parts = [];
+    function isDeleteAction(action) {
+      return action === "propose_delete_rule" || action === "delete";
+    }
 
-      if (action === "delete") {
-        parts.push(`<strong>Delete</strong> the rule "${esc(p.ruleId || patch.ruleId || "unknown")}".`);
-      } else if (action === "create") {
+    function isCreateAction(action) {
+      return action === "propose_create_rule" || action === "create";
+    }
+
+    function normalizeChatProposal(res) {
+      if (!res || typeof res !== "object") return res;
+      const action = res.action;
+      if (!action || action === "none") return res;
+      let proposal = res.proposal;
+      if (!proposal || typeof proposal !== "object") {
+        if (res.ruleId || res.patch || res.deleteRuleId) {
+          proposal = {
+            ruleId: res.ruleId || res.deleteRuleId || null,
+            patch: res.patch || null,
+            deleteRuleId: res.deleteRuleId || res.ruleId || null,
+          };
+        } else {
+          return res;
+        }
+      }
+      if (isDeleteAction(action)) {
+        const id = proposal.deleteRuleId || proposal.ruleId ||
+          (proposal.patch && (proposal.patch.deleteRuleId || proposal.patch.ruleId));
+        if (id) {
+          proposal = {
+            ...proposal,
+            ruleId: proposal.ruleId || id,
+            deleteRuleId: proposal.deleteRuleId || id,
+          };
+        }
+      }
+      return {...res, proposal};
+    }
+
+    function summarizeProposal(res) {
+      if (!res || !res.proposal) return "The assistant proposed a rule change. Click Confirm to apply it.";
+      const p = res.proposal;
+      const patch = (p.patch && typeof p.patch === "object") ? p.patch : {};
+      const action = res.action || "propose_update_rule";
+      const parts = [];
+      const ruleLabel = p.ruleId || p.deleteRuleId || patch.id || "unknown";
+
+      if (isDeleteAction(action)) {
+        parts.push(`<strong>Delete</strong> the rule "${esc(ruleLabel)}".`);
+        return parts.join("<br>");
+      } else if (isCreateAction(action)) {
         parts.push(`<strong>Create a new rule:</strong> "${esc(patch.name || p.ruleId || "new rule")}".`);
       } else {
         parts.push(`<strong>Update rule</strong> "${esc(p.ruleId || patch.id || "existing rule")}".`);
@@ -776,47 +817,76 @@
       log.scrollTop = log.scrollHeight;
     }
 
-    document.getElementById("chat-send").addEventListener("click", async () => {
+    async function sendChatMessage() {
       const input = document.getElementById("chat-input");
+      const sendBtn = document.getElementById("chat-send");
       const text = input.value.trim();
-      if (!text) return;
+      if (!text || sendBtn.disabled) return;
       chatMessages.push({ role: "user", content: text });
       appendChat("user", text);
       input.value = "";
-      document.getElementById("chat-send").disabled = true;
+      sendBtn.disabled = true;
       try {
-        const res = await api("/quoteRulesChat", {
+        let res = await api("/quoteRulesChat", {
           method: "POST",
           body: JSON.stringify({ tenantId: TENANT_ID, messages: chatMessages }),
         });
+        res = normalizeChatProposal(res) || res;
         if (res.reply) {
           chatMessages.push({ role: "assistant", content: res.reply });
           appendChat("assistant", res.reply);
         }
         if (res.action && res.action !== "none" && res.proposal) {
-          pendingProposal = { action: res.action, ...res.proposal, patch: res.proposal.patch || res.proposal };
+          const proposal = res.proposal;
+          const ruleId = proposal.ruleId || proposal.deleteRuleId || null;
+          const patch = (proposal.patch && typeof proposal.patch === "object")
+            ? proposal.patch
+            : (isDeleteAction(res.action) ? {} : proposal);
+          pendingProposal = {
+            action: res.action,
+            ruleId,
+            deleteRuleId: proposal.deleteRuleId || ruleId,
+            patch,
+          };
           document.getElementById("proposal-summary").innerHTML = summarizeProposal(res);
           document.getElementById("proposal-json").textContent = JSON.stringify(res, null, 2);
           document.getElementById("proposal-box").classList.remove("hidden");
+          document.getElementById("proposal-box").scrollIntoView({ behavior: "smooth", block: "nearest" });
         }
       } catch (e) {
         appendChat("assistant", "Error: " + e.message);
       }
-      document.getElementById("chat-send").disabled = false;
+      sendBtn.disabled = false;
+      input.focus();
+    }
+
+    document.getElementById("chat-send").addEventListener("click", () => {
+      sendChatMessage();
+    });
+
+    document.getElementById("chat-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
     });
 
     document.getElementById("confirm-proposal").addEventListener("click", async () => {
       if (!pendingProposal) return;
+      const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
       const body = {
         tenantId: TENANT_ID,
         action: pendingProposal.action,
-        ruleId: pendingProposal.ruleId,
-        patch: pendingProposal.patch,
-        deleteRuleId: pendingProposal.ruleId,
+        ruleId,
+        patch: pendingProposal.patch || {},
+        deleteRuleId: pendingProposal.deleteRuleId || ruleId,
         updatedBy: "quote-admin-ui",
       };
       const res = await api("/applyQuoteRule", { method: "POST", body: JSON.stringify(body) });
-      appendChat("assistant", res.ok ? "Rule saved. Refresh the Rules list tab to see the update." : ("Failed: " + (res.error || "")));
+      const okMsg = isDeleteAction(pendingProposal.action)
+        ? "Rule removed. Refresh the Rules list tab to see the update."
+        : "Rule saved. Refresh the Rules list tab to see the update.";
+      appendChat("assistant", res.ok ? okMsg : ("Failed: " + (res.error || "")));
       document.getElementById("proposal-box").classList.add("hidden");
       pendingProposal = null;
       loadRules();

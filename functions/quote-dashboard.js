@@ -334,6 +334,19 @@ async function handleQuoteRulesChat(req, res) {
         result.proposal = {...result.proposal, patch};
       }
     }
+    // Normalize delete proposals so UI Confirm always has ruleId.
+    if (result && result.action === "propose_delete_rule") {
+      let proposal = result.proposal && typeof result.proposal === "object" ?
+        {...result.proposal} :
+        {};
+      const id = proposal.deleteRuleId || proposal.ruleId ||
+        result.deleteRuleId || result.ruleId;
+      if (id) {
+        proposal.ruleId = proposal.ruleId || id;
+        proposal.deleteRuleId = proposal.deleteRuleId || id;
+        result.proposal = proposal;
+      }
+    }
     return res.json({ok: true, ...result});
   } catch (err) {
     console.error("quoteRulesChat:", err);
@@ -960,6 +973,7 @@ function handleQuoteAdminPage(req, res) {
     const tenantId = (req.query && req.query.tenantId) || "default";
     html = html.replace(/__TENANT_ID__/g, String(tenantId));
     res.set("Content-Type", "text/html; charset=utf-8");
+    res.set("Cache-Control", "no-cache");
     return res.status(200).send(html);
   } catch (err) {
     return res.status(500).send(`Admin page error: ${err.message}`);
