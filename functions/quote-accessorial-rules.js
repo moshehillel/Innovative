@@ -37,23 +37,9 @@ const DEFAULT_RULES = [
     autoApply: true,
     requiresConfirm: false,
   },
-  {
-    id: "aafes_military",
-    active: true,
-    priority: 25,
-    name: "AAFES / military DC — limited access + appointment",
-    identifyVia: "both",
-    match: {
-      consigneeNameContains: [
-        "aafes", "AAFES", "military exchange", "army air force",
-      ],
-      siteType: "aafes_military",
-    },
-    addAccessorials: ["LAD", "APD"],
-    notes: "Military exchange / AAFES — limited access delivery.",
-    autoApply: true,
-    requiresConfirm: true,
-  },
+  // aafes_military intentionally omitted — product removed this default.
+  // Deletes of other defaults are tombstoned in quoteRulesRemoved so
+  // ensureDefaultRulesPresent does not recreate them.
   {
     id: "menards_dc",
     active: true,
@@ -187,28 +173,56 @@ function normalizeIdentifyVia(rule) {
  * @return {Promise<Array<object>>}
  */
 async function loadActiveRules(tenant) {
+  await ensureDefaultRulesPresent(tenant);
   const snap = await col(tenant, "quoteRules")
       .where("active", "==", true)
       .get();
-  let rules = snap.docs.map((d) => ({id: d.id, ...d.data()}));
-  if (!rules.length) {
-    await seedDefaultRules(tenant);
-    rules = DEFAULT_RULES.map((r) => ({...r}));
-  } else {
-    // Upsert any newly added DEFAULT_RULES ids without overwriting edits.
-    await ensureDefaultRulesPresent(tenant);
-    const again = await col(tenant, "quoteRules")
-        .where("active", "==", true)
-        .get();
-    rules = again.docs.map((d) => ({id: d.id, ...d.data()}));
+  // Brand-new tenant: ensure may no-op if DEFAULT_RULES empty of
+  // non-tombstoned ids; seed fills remaining defaults once.
+  if (snap.empty) {
+    const any = await col(tenant, "quoteRules").limit(1).get();
+    if (any.empty) {
+      await seedDefaultRules(tenant);
+      const again = await col(tenant, "quoteRules")
+          .where("active", "==", true)
+          .get();
+      return again.docs.map((d) => ({id: d.id, ...d.data()})).sort((a, b) =>
+        (Number(a.priority) || 999) - (Number(b.priority) || 999));
+    }
   }
+  const rules = snap.docs.map((d) => ({id: d.id, ...d.data()}));
   return rules.sort((a, b) =>
     (Number(a.priority) || 999) - (Number(b.priority) || 999));
 }
 
 /**
+ * Ids the tenant intentionally deleted (do not re-seed from DEFAULT_RULES).
+ * @param {object} tenant Tenant.
+ * @return {Promise<Set<string>>}
+ */
+async function loadRemovedDefaultRuleIds(tenant) {
+  const snap = await col(tenant, "quoteRulesRemoved").get();
+  return new Set(snap.docs.map((d) => d.id));
+}
+
+/**
+ * @param {object} tenant Tenant.
+ * @param {string} ruleId Rule id.
+ * @param {string} [removedBy] Actor.
+ * @return {Promise<void>}
+ */
+async function markDefaultRuleRemoved(tenant, ruleId, removedBy) {
+  await col(tenant, "quoteRulesRemoved").doc(String(ruleId)).set({
+    ruleId: String(ruleId),
+    removedAt: admin.firestore.FieldValue.serverTimestamp(),
+    removedBy: removedBy || "dashboard",
+  }, {merge: true});
+}
+
+/**
  * Creates missing DEFAULT_RULES docs (merge: false create-only).
  * Also force-syncs managed default fields (e.g. amazon_fc accessorials).
+ * Skips ids tombstoned in quoteRulesRemoved.
  * @param {object} tenant Tenant.
  * @return {Promise<void>}
  */
@@ -216,7 +230,9 @@ async function ensureDefaultRulesPresent(tenant) {
   const ref = col(tenant, "quoteRules");
   const existing = await ref.get();
   const have = new Set(existing.docs.map((d) => d.id));
-  const missing = DEFAULT_RULES.filter((r) => !have.has(r.id));
+  const removed = await loadRemovedDefaultRuleIds(tenant);
+  const missing = DEFAULT_RULES.filter((r) =>
+    !have.has(r.id) && !removed.has(r.id));
   const batch = admin.firestore().batch();
   let writes = 0;
   for (const rule of missing) {
@@ -275,9 +291,12 @@ function queueManagedDefaultSync(batch, ref, existing) {
  * @return {Promise<void>}
  */
 async function seedDefaultRules(tenant) {
+  const removed = await loadRemovedDefaultRuleIds(tenant);
   const batch = admin.firestore().batch();
   const ref = col(tenant, "quoteRules");
+  let writes = 0;
   for (const rule of DEFAULT_RULES) {
+    if (removed.has(rule.id)) continue;
     const {id, ...rest} = rule;
     batch.set(ref.doc(id), {
       ...rest,
@@ -285,7 +304,9 @@ async function seedDefaultRules(tenant) {
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: "system-seed",
     }, {merge: true});
+    writes++;
   }
+  if (!writes) return;
   await batch.commit();
 }
 
@@ -517,14 +538,13 @@ function applyRulesToLane(lane, rules, context = {}) {
  * @return {Promise<Array<object>>}
  */
 async function listAllRules(tenant) {
-  const snap = await col(tenant, "quoteRules").orderBy("priority").get();
+  await ensureDefaultRulesPresent(tenant);
+  let snap = await col(tenant, "quoteRules").orderBy("priority").get();
   if (snap.empty) {
     await seedDefaultRules(tenant);
-    return DEFAULT_RULES.map((r) => ({...r}));
+    snap = await col(tenant, "quoteRules").orderBy("priority").get();
   }
-  await ensureDefaultRulesPresent(tenant);
-  const again = await col(tenant, "quoteRules").orderBy("priority").get();
-  return again.docs.map((d) => ({id: d.id, ...d.data()}));
+  return snap.docs.map((d) => ({id: d.id, ...d.data()}));
 }
 
 /**
@@ -555,12 +575,22 @@ async function upsertRule(tenant, ruleId, patch, updatedBy) {
 }
 
 /**
+ * Permanently remove a rule. Tombstones DEFAULT_RULES ids so getQuoteRules
+ * / loadActiveRules do not recreate them on the next ensureDefaultRulesPresent.
  * @param {object} tenant Tenant.
  * @param {string} ruleId Rule id.
+ * @param {string} [removedBy] Actor.
  * @return {Promise<void>}
  */
-async function deleteRule(tenant, ruleId) {
-  await col(tenant, "quoteRules").doc(String(ruleId)).delete();
+async function deleteRule(tenant, ruleId, removedBy) {
+  const id = String(ruleId);
+  const isDefault = DEFAULT_RULES.some((r) => r.id === id);
+  await col(tenant, "quoteRules").doc(id).delete();
+  // Always tombstone known former defaults (e.g. aafes_military) and
+  // current DEFAULT_RULES ids so deletes survive reseed.
+  if (isDefault || id === "aafes_military") {
+    await markDefaultRuleRemoved(tenant, id, removedBy);
+  }
 }
 
 /**
@@ -597,6 +627,8 @@ module.exports = {
   listAllRules,
   upsertRule,
   deleteRule,
+  markDefaultRuleRemoved,
+  loadRemovedDefaultRuleIds,
   testAddress,
   ruleMatches,
   ruleMatchVia,

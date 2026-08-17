@@ -99,7 +99,12 @@ async function runQuoteRulesChatTurn(opts) {
     "    so the proposal is self-contained even for partial edits.",
     "For propose_create_rule: patch MUST include name and match.",
     "",
-    "Never claim you saved a rule — user must click Confirm first.",
+    "Never claim you saved, updated, or deleted a rule.",
+    "The user must click the Confirm button first — only then is it applied.",
+    "For propose_delete_rule: reply must ask them to click Confirm;",
+    "never say \"Rule removed\", \"deleted\", or \"it's gone\" before Confirm.",
+    "If they ask whether a pending delete already happened, say no —",
+    "Confirm is still required (unless they already confirmed in UI).",
     "If unclear, ask one short clarifying question with action none.",
   ].join("\n");
 

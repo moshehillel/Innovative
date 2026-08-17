@@ -873,7 +873,13 @@
 
     document.getElementById("confirm-proposal").addEventListener("click", async () => {
       if (!pendingProposal) return;
+      const confirmBtn = document.getElementById("confirm-proposal");
+      const wasDelete = isDeleteAction(pendingProposal.action);
       const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
+      if (wasDelete && !ruleId) {
+        appendChat("assistant", "Failed: missing rule id to delete. Ask the assistant to propose the delete again.");
+        return;
+      }
       const body = {
         tenantId: TENANT_ID,
         action: pendingProposal.action,
@@ -882,14 +888,26 @@
         deleteRuleId: pendingProposal.deleteRuleId || ruleId,
         updatedBy: "quote-admin-ui",
       };
-      const res = await api("/applyQuoteRule", { method: "POST", body: JSON.stringify(body) });
-      const okMsg = isDeleteAction(pendingProposal.action)
-        ? "Rule removed. Refresh the Rules list tab to see the update."
-        : "Rule saved. Refresh the Rules list tab to see the update.";
-      appendChat("assistant", res.ok ? okMsg : ("Failed: " + (res.error || "")));
-      document.getElementById("proposal-box").classList.add("hidden");
-      pendingProposal = null;
-      loadRules();
+      confirmBtn.disabled = true;
+      try {
+        const res = await api("/applyQuoteRule", { method: "POST", body: JSON.stringify(body) });
+        if (!res || !res.ok) {
+          appendChat("assistant", "Failed: " + ((res && res.error) || "applyQuoteRule did not succeed"));
+          return;
+        }
+        const okMsg = wasDelete
+          ? "Confirmed — rule removed. It will not come back on refresh."
+          : "Confirmed — rule saved. Refresh the Rules list tab to see the update.";
+        appendChat("assistant", okMsg);
+        chatMessages.push({ role: "assistant", content: okMsg });
+        document.getElementById("proposal-box").classList.add("hidden");
+        pendingProposal = null;
+        await loadRules();
+      } catch (e) {
+        appendChat("assistant", "Failed: " + e.message);
+      } finally {
+        confirmBtn.disabled = false;
+      }
     });
 
     document.getElementById("dismiss-proposal").addEventListener("click", () => {

@@ -209,7 +209,7 @@ async function handleApplyQuoteRule(req, res) {
     }
     const updatedBy = String(body.updatedBy || "quote-admin");
     if (validated.action === "delete") {
-      await quoteRules.deleteRule(tenant, validated.ruleId);
+      await quoteRules.deleteRule(tenant, validated.ruleId, updatedBy);
       return res.json({ok: true, deleted: validated.ruleId});
     }
     let patch = validated.patch;
@@ -311,7 +311,9 @@ async function handleQuoteRulesChat(req, res) {
     if (!Array.isArray(messages) || !messages.length) {
       return res.status(400).json({ok: false, error: "messages required"});
     }
-    const existingRules = await quoteRules.listAllRules(tenant);
+    const allRules = await quoteRules.listAllRules(tenant);
+    // Chat only sees live rules — inactive / tombstoned-away defaults stay out.
+    const existingRules = allRules.filter((r) => r.active !== false);
     const result = await quoteRulesChat.runQuoteRulesChatTurn({
       messages,
       existingRules,
@@ -345,6 +347,19 @@ async function handleQuoteRulesChat(req, res) {
         proposal.ruleId = proposal.ruleId || id;
         proposal.deleteRuleId = proposal.deleteRuleId || id;
         result.proposal = proposal;
+      }
+      // Never let the model claim deletion before Confirm.
+      const reply = String(result.reply || "");
+      const claimedDone =
+        /rule removed|already (deleted|removed)|successfully deleted/i
+            .test(reply) ||
+        /it's gone|it is gone/i.test(reply);
+      if (claimedDone) {
+        result.reply = id ?
+          ("I can remove the \"" + id +
+            "\" rule. Please click Confirm to apply this deletion.") :
+          ("I can remove that rule. Please click Confirm " +
+            "to apply this deletion.");
       }
     }
     return res.json({ok: true, ...result});
