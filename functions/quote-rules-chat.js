@@ -116,6 +116,304 @@ function parseIdentifyChoiceAnswer(text) {
   return null;
 }
 
+const KNOWN_ACCESSORIAL_CODES = new Set([
+  "LFO", "LFD", "APD", "APO", "LAD", "LAO", "NUD", "NUP",
+  "HOD", "HOO", "RSD", "RSO", "SCD", "SCO", "INS", "LTD",
+  "IND", "INO", "NTO", "AF",
+]);
+
+const ACCESSORIAL_NAME_PATTERNS = [
+  {code: "LAO", re: /\blimited\s*access\s+(pickup|origin)\b/i},
+  {
+    code: "LAD",
+    re: /\blimited\s*access(\s+(delivery|dest(ination)?))?\b/i,
+  },
+  {
+    code: "LFO",
+    re: /\blift[\s-]*gates?\s+(at\s+)?(pickup|origin)\b/i,
+  },
+  {
+    code: "LFD",
+    re: /\blift[\s-]*gates?(\s+(at\s+)?(delivery|dest))?\b/i,
+  },
+  {
+    code: "APD",
+    re: /\bappointments?(\s+(delivery|dest|required))?\b/i,
+  },
+  {code: "RSD", re: /\bresidential(\s+delivery)?\b/i},
+  {code: "NUD", re: /\bnursing(\s+home)?(\s+delivery)?\b/i},
+  {code: "HOD", re: /\bhotel(\s+delivery)?\b/i},
+  {code: "SCD", re: /\bschool(\s+delivery)?\b/i},
+  {code: "INS", re: /\binsurance\b/i},
+];
+
+const ASKED_ACCESSORIALS_RE = new RegExp(
+    "which accessorials|accessorials should this rule add|" +
+    "which codes to add|what accessorials",
+    "i",
+);
+
+/**
+ * Parse accessorial codes / names from a user answer.
+ * Accepts case-insensitive codes (LAD, LFD, APD, …), names like
+ * "limited access", and the LOAD typo → LAD.
+ * @param {string} text User message.
+ * @return {Array<string>} Unique uppercase codes.
+ */
+function parseAccessorialsAnswer(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return [];
+  const codes = [];
+  const seen = new Set();
+  const add = (code) => {
+    let u = String(code || "").toUpperCase();
+    if (u === "LOAD") u = "LAD";
+    if (!/^[A-Z]{2,5}$/.test(u) || seen.has(u)) return;
+    seen.add(u);
+    codes.push(u);
+  };
+
+  const withLoadFix = raw.replace(/\bload\b/gi, "LAD");
+  for (const {code, re} of ACCESSORIAL_NAME_PATTERNS) {
+    if (re.test(withLoadFix)) add(code);
+  }
+
+  const words = withLoadFix.split(/[^a-z0-9]+/i).filter(Boolean);
+  const onlyCodes = words.length > 0 && words.every((w) => {
+    const u = w.toUpperCase();
+    return KNOWN_ACCESSORIAL_CODES.has(u) || /^[A-Z]{3,4}$/.test(u);
+  });
+  for (const w of words) {
+    const u = w.toUpperCase();
+    if (KNOWN_ACCESSORIAL_CODES.has(u)) {
+      add(u);
+    } else if (onlyCodes && /^[A-Z]{3,4}$/.test(u)) {
+      add(u);
+    }
+  }
+  return codes;
+}
+
+/**
+ * Infer site-type / rule id from create-flow chat history.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object} ruleId, name, siteType?, flags?, notes
+ */
+function inferCreateTopic(messages) {
+  const blob = (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n")
+      .toLowerCase();
+  if (/\baafes\b|\bmilitary(\s+(base|bases|exchange|installation)s?)?\b/
+      .test(blob)) {
+    return {
+      ruleId: "aafes_military",
+      name: "Military bases / AAFES",
+      siteType: "aafes_military",
+      notes: "AI-classified military / AAFES delivery location.",
+    };
+  }
+  if (/\bnursing(\s+home)?s?\b/.test(blob)) {
+    return {
+      ruleId: "nursing_home",
+      name: "Nursing home delivery",
+      siteType: "nursing_home",
+      notes: "AI-classified nursing home delivery location.",
+    };
+  }
+  if (/\bhotels?\b/.test(blob)) {
+    return {
+      ruleId: "hotel",
+      name: "Hotel delivery",
+      siteType: "hotel",
+      notes: "AI-classified hotel delivery location.",
+    };
+  }
+  if (/\bamazon\b|\bfulfillment centers?\b/.test(blob)) {
+    return {
+      ruleId: "amazon_fc",
+      name: "Amazon FC",
+      siteType: "amazon_fc",
+      notes: "Amazon fulfillment center.",
+    };
+  }
+  if (/\bmenards?\b/.test(blob)) {
+    return {
+      ruleId: "menards_dc",
+      name: "Menards DC",
+      siteType: "menards_dc",
+      notes: "Menards distribution center.",
+    };
+  }
+  if (/\bresidential\b/.test(blob)) {
+    return {
+      ruleId: "residential_delivery",
+      name: "Residential delivery",
+      flags: ["residentialDelivery"],
+      notes: "Residential delivery flag.",
+    };
+  }
+  return {
+    ruleId: "custom_site_rule",
+    name: "Custom site rule",
+    notes: "Created from quote rules chat.",
+  };
+}
+
+/**
+ * Collect accessorial answers from create-flow user turns.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object} askedAccessorials, accessorials[]
+ */
+function collectCreateAccessorials(messages) {
+  let askedAccessorials = false;
+  const codes = [];
+  const seen = new Set();
+  for (const turn of messages || []) {
+    const text = String(turn && turn.content || "");
+    if (turn && turn.role === "assistant") {
+      if (ASKED_ACCESSORIALS_RE.test(text)) askedAccessorials = true;
+      continue;
+    }
+    if (parseIdentifyChoiceAnswer(text)) continue;
+    for (const code of parseAccessorialsAnswer(text)) {
+      if (!seen.has(code)) {
+        seen.add(code);
+        codes.push(code);
+      }
+    }
+  }
+  return {askedAccessorials, accessorials: codes};
+}
+
+/**
+ * Extra create-flow fields persisted from chat history.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object}
+ */
+function collectCreateFlowExtras(messages) {
+  const acc = collectCreateAccessorials(messages);
+  const topic = inferCreateTopic(messages);
+  return {
+    askedAccessorials: acc.askedAccessorials,
+    accessorials: acc.accessorials,
+    siteType: topic.siteType || null,
+    topic,
+  };
+}
+
+/**
+ * @param {object} gate Identify-gate result.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object}
+ */
+function withCreateFlowExtras(gate, messages) {
+  return {...gate, ...collectCreateFlowExtras(messages)};
+}
+
+/**
+ * Deterministic address-only create proposal once accessorials are known.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<string>} accessorials Codes.
+ * @return {object}
+ */
+function buildAddressOnlyCreateProposal(messages, accessorials) {
+  const topic = inferCreateTopic(messages);
+  const codes = (accessorials || []).map(String);
+  const match = {};
+  if (topic.siteType) match.siteType = topic.siteType;
+  if (Array.isArray(topic.flags) && topic.flags.length) {
+    match.flags = topic.flags.slice();
+  }
+  const name = codes.length ?
+    `${topic.name} — ${codes.join("/")}` :
+    topic.name;
+  const labels = codes.join(", ");
+  return {
+    reply: `Here's a proposed rule for ${topic.name} that adds ` +
+      `${labels} (identified via AI site classification). ` +
+      `Click Confirm to apply it.`,
+    action: "propose_create_rule",
+    proposal: {
+      ruleId: topic.ruleId,
+      patch: {
+        active: true,
+        priority: 40,
+        name,
+        identifyVia: "ai",
+        match,
+        addAccessorials: codes,
+        notes: topic.notes,
+        autoApply: true,
+        requiresConfirm: false,
+      },
+    },
+    quickReplies: [],
+  };
+}
+
+/**
+ * Fill or replace a create proposal after Cannot-be + accessorials.
+ * @param {object} out Model result (mutated copy).
+ * @param {Array<object>} messages Chat turns.
+ * @param {object} extras create-flow extras.
+ * @return {object}
+ */
+function finalizeAddressOnlyCreate(out, messages, extras) {
+  const built = buildAddressOnlyCreateProposal(
+      messages, extras.accessorials || []);
+  const reask = new RegExp(
+      "could not process|try rephrasing|which accessorials|" +
+      "please choose one",
+      "i",
+  );
+  if (out.action === "propose_create_rule" && out.proposal &&
+      typeof out.proposal === "object") {
+    const patch = out.proposal.patch &&
+      typeof out.proposal.patch === "object" ?
+      {...out.proposal.patch} : {};
+    patch.identifyVia = "ai";
+    const match = patch.match && typeof patch.match === "object" ?
+      {...patch.match} : {};
+    delete match.consigneeNameContains;
+    delete match.consigneeAddressContains;
+    delete match.instructionsContains;
+    delete match.referenceContains;
+    if (!match.siteType && extras.siteType) {
+      match.siteType = extras.siteType;
+    }
+    if (!Object.keys(match).length && built.proposal.patch.match) {
+      Object.assign(match, built.proposal.patch.match);
+    }
+    patch.match = match;
+    const existing = Array.isArray(patch.addAccessorials) ?
+      patch.addAccessorials.map(String) : [];
+    const have = new Set(existing.map((c) => c.toUpperCase()));
+    const merged = existing.slice();
+    for (const code of extras.accessorials || []) {
+      if (!have.has(code)) merged.push(code);
+    }
+    patch.addAccessorials = merged.length ?
+      merged : (extras.accessorials || []).slice();
+    if (!patch.name) patch.name = built.proposal.patch.name;
+    if (!patch.notes) patch.notes = built.proposal.patch.notes;
+    out.proposal = {
+      ...out.proposal,
+      ruleId: out.proposal.ruleId || built.proposal.ruleId,
+      patch,
+    };
+    if (!out.reply || reask.test(String(out.reply))) {
+      out.reply = built.reply;
+    }
+    out.quickReplies = [];
+    out.createIdentify = extras;
+    return out;
+  }
+  built.createIdentify = extras;
+  return built;
+}
+
 /**
  * Detect create-rule identify questionnaire progress from chat history.
  * @param {Array<object>} messages Chat turns with role/content.
@@ -184,22 +482,32 @@ function detectCreateIdentifyGate(messages) {
   }
 
   if (source === "address_only") {
-    return {status: "ready", source, emailSignalsListed: false};
+    return withCreateFlowExtras(
+        {status: "ready", source, emailSignalsListed: false}, messages);
   }
   if (source === "email" && emailSignalsListed) {
-    return {status: "ready", source, emailSignalsListed: true};
+    return withCreateFlowExtras(
+        {status: "ready", source, emailSignalsListed: true}, messages);
   }
   if (source === "email") {
-    return {
+    return withCreateFlowExtras({
       status: "awaiting_email_signals",
       source,
       emailSignalsListed: false,
-    };
+    }, messages);
   }
   if (askedChoice) {
-    return {status: "awaiting_choice", source: null, emailSignalsListed: false};
+    return withCreateFlowExtras({
+      status: "awaiting_choice",
+      source: null,
+      emailSignalsListed: false,
+    }, messages);
   }
-  return {status: "needed", source: null, emailSignalsListed: false};
+  return withCreateFlowExtras({
+    status: "needed",
+    source: null,
+    emailSignalsListed: false,
+  }, messages);
 }
 
 /**
@@ -237,17 +545,29 @@ function enforceCreateIdentifyGate(result, messages) {
   };
   const action = out.action || "none";
   const gate = detectCreateIdentifyGate(messages);
+  const extras = collectCreateFlowExtras(messages);
+  const lastUser = [...(messages || [])].reverse()
+      .find((m) => m && m.role !== "assistant");
+  const lastIsAccessorials = !!(lastUser &&
+      parseAccessorialsAnswer(lastUser.content).length);
   // Keep create-flow active through ready: the latest user turn is often
-  // just "2" / "Cannot be…", which is NOT create-intent by itself.
+  // just "2" / "Cannot be…" / "LAD", which is NOT create-intent by itself.
   const inIdentifyFlow = gate.status === "awaiting_choice" ||
     gate.status === "awaiting_email_signals" ||
     gate.status === "ready" ||
+    (extras.askedAccessorials && lastIsAccessorials) ||
     (gate.status === "needed" && looksLikeCreateRuleIntent(messages));
   const creating = action === "propose_create_rule" ||
     looksLikeCreateRuleIntent(messages) ||
     inIdentifyFlow;
 
-  if (action === "propose_update_rule" || action === "propose_delete_rule") {
+  // Mid create-flow (Cannot-be + accessorials): don't let a mis-tagged
+  // update/delete skip the deterministic create proposal.
+  const addressOnlyReady = gate.status === "ready" &&
+    gate.source === "address_only";
+  if ((action === "propose_update_rule" ||
+      action === "propose_delete_rule") &&
+      !(addressOnlyReady && extras.accessorials.length)) {
     return out;
   }
 
@@ -292,43 +612,53 @@ function enforceCreateIdentifyGate(result, messages) {
     }
     out.createIdentify = gate;
 
-    // Choice is done — never re-ask identify, and never surface the generic
-    // parse-failure reply for a valid Can/Cannot answer.
-    if (out.action === "ask_identify_source") {
-      out.action = gate.source === "email" ?
-        "ask_email_signals" : "none";
-      if (gate.source === "email") {
-        out.proposal = null;
-        out.quickReplies = [];
-        if (!out.reply ||
-            /could not process|try rephrasing|please choose one/i
-                .test(String(out.reply))) {
-          out.reply = "Got it — this can be spotted in the quote email. " +
-            "Please list all ways you think we can get that signal " +
-            "(keywords in the body, sender domains, subject patterns, " +
-            "attachment text, consignee name phrases, etc.). " +
-            "I will only use what you list.";
-        }
-        return out;
+    // Address-only: persist accessorials and propose once they are known.
+    // Never re-ask identify, and never loop "Which accessorials…".
+    if (gate.source === "address_only") {
+      if (extras.accessorials.length) {
+        return finalizeAddressOnlyCreate(
+            {...out, createIdentify: gate}, messages, extras);
       }
-    }
-    if (gate.source === "address_only" &&
-        out.action === "ask_email_signals") {
       out.action = "none";
       out.proposal = null;
       out.quickReplies = [];
+      if (extras.askedAccessorials && lastIsAccessorials === false &&
+          lastUser && !parseIdentifyChoiceAnswer(lastUser.content)) {
+        out.reply = "I didn't catch an accessorial code. Send codes like " +
+          "LAD, LFD, APD (any case), or a name like \"limited access\". " +
+          "LOAD is treated as LAD.";
+      } else {
+        out.reply = "Got it — address / site classification only " +
+          "(AI enrichment). I'll match via siteType / flags " +
+          "(e.g. aafes_military for military bases / AAFES). " +
+          "Which accessorials should this rule add " +
+          "(e.g. LAD, LFD, APD — or names like limited access)?";
+      }
+      return out;
+    }
+
+    // Choice is done — never re-ask identify, and never surface the generic
+    // parse-failure reply for a valid Can/Cannot answer.
+    if (out.action === "ask_identify_source") {
+      out.action = "ask_email_signals";
+      out.proposal = null;
+      out.quickReplies = [];
+      if (!out.reply ||
+          /could not process|try rephrasing|please choose one/i
+              .test(String(out.reply))) {
+        out.reply = "Got it — this can be spotted in the quote email. " +
+          "Please list all ways you think we can get that signal " +
+          "(keywords in the body, sender domains, subject patterns, " +
+          "attachment text, consignee name phrases, etc.). " +
+          "I will only use what you list.";
+      }
+      return out;
     }
     const badReply = !out.reply ||
       /could not process|try rephrasing/i.test(String(out.reply));
     if (badReply && out.action !== "propose_create_rule") {
-      out.reply = gate.source === "address_only" ?
-        ("Got it — address / site classification only " +
-          "(AI enrichment). I'll match via siteType / flags " +
-          "(e.g. aafes_military for military bases / AAFES). " +
-          "Which accessorials should this rule add " +
-          "(e.g. LAD, LFD, APD)?") :
-        ("Got it. Tell me any missing details " +
-          "(accessorials, site type, name) and I'll propose the rule.");
+      out.reply = "Got it. Tell me any missing details " +
+        "(accessorials, site type, name) and I'll propose the rule.";
       out.action = "none";
       out.proposal = null;
       out.quickReplies = [];
@@ -376,6 +706,18 @@ function enforceCreateIdentifyGate(result, messages) {
  * @return {Promise<object>} {reply, action, proposal}
  */
 async function runQuoteRulesChatTurn(opts) {
+  const chatTurns = opts.messages || [];
+  const gateHint = detectCreateIdentifyGate(chatTurns);
+  // After Cannot-be, accessorials are a structured answer — don't send
+  // "LAD" / "limited access" through the model (that caused the re-ask loop).
+  if (gateHint.status === "ready" && gateHint.source === "address_only") {
+    return enforceCreateIdentifyGate({
+      reply: "",
+      action: "none",
+      proposal: null,
+    }, chatTurns);
+  }
+
   const apiKey = process.env.QUOTE_RULES_CHAT_OPENAI_API_KEY ||
     process.env.SUPPORT_CHAT_OPENAI_API_KEY ||
     process.env.OPENAI_API_KEY;
@@ -390,8 +732,6 @@ async function runQuoteRulesChatTurn(opts) {
       null,
       0,
   ).slice(0, 8000);
-
-  const gateHint = detectCreateIdentifyGate(opts.messages || []);
 
   const systemPrompt = [
     "You help freight dispatchers manage LTL quote accessorial rules.",
@@ -462,16 +802,26 @@ async function runQuoteRulesChatTurn(opts) {
     "  For military bases / AAFES use match.siteType \"aafes_military\".",
     "  If accessorials were already stated, propose_create_rule immediately.",
     "  If not, ask which codes to add — never say you could not process.",
+    "  After they answer, propose_create_rule. Do NOT re-ask identify or",
+    "  accessorials. Accept codes case-insensitively: LAD LFD APD RSD NUD",
+    "  LTD LFO HOD SCD INS, names like \"limited access\" /",
+    "  \"limited access delivery\", and LOAD as a typo for LAD.",
     "",
     "Current questionnaire state from chat history (authoritative):",
     `  status=${gateHint.status}; source=${gateHint.source || "null"};`,
-    `  emailSignalsListed=${gateHint.emailSignalsListed}`,
+    `  emailSignalsListed=${gateHint.emailSignalsListed};`,
+    `  askedAccessorials=${!!gateHint.askedAccessorials};`,
+    `  accessorials=${(gateHint.accessorials || []).join(",") || "none"};`,
+    `  siteType=${gateHint.siteType || "null"}`,
     "If status is needed or awaiting_choice: action MUST be",
     "ask_identify_source (not propose_create_rule).",
     "If status is awaiting_email_signals: action MUST be ask_email_signals.",
     "Only when status is ready may you use propose_create_rule.",
     "When status is ready after cannot-be (source=address_only), do NOT",
     "re-ask identify and do NOT reply that you could not process the answer.",
+    "If accessorials are already listed in state, propose_create_rule now.",
+    "A short accessorial answer (LAD / lad / limited access / LOAD) is the",
+    "missing detail — propose the rule; never repeat the accessorials ask.",
     "",
     "identifyVia values:",
     "  address_text — match from email/text fields only.",
@@ -729,6 +1079,7 @@ module.exports = {
   detectCreateIdentifyGate,
   enforceCreateIdentifyGate,
   parseIdentifyChoiceAnswer,
+  parseAccessorialsAnswer,
   IDENTIFY_QUICK_REPLIES,
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,

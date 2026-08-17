@@ -246,6 +246,36 @@
       color: #fff;
       border-bottom-right-radius: 4px;
     }
+    .msg.thinking .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--primary-dark);
+      font-weight: 650;
+      display: flex;
+      align-items: baseline;
+      gap: 2px;
+    }
+    .thinking-status {
+      margin: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 2px;
+      min-height: 1.4em;
+      transition: opacity 0.22s ease;
+    }
+    .thinking-status.is-fading { opacity: 0; }
+    .thinking-dots span {
+      display: inline-block;
+      width: 0.35em;
+      opacity: 0.25;
+      animation: thinking-dot 1.2s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes thinking-dot {
+      0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+      40% { opacity: 1; transform: translateY(-1px); }
+    }
     .chat-quick-replies {
       display: none;
       flex-wrap: wrap;
@@ -501,6 +531,18 @@
     let chatMessages = [];
     let pendingProposal = null;
     let pendingQuickReplies = [];
+    let thinkingTimer = null;
+    let thinkingFadeTimer = null;
+    let thinkingStep = 0;
+    const THINKING_ROTATE_MS = 1500;
+    const THINKING_FADE_MS = 220;
+    const THINKING_PHRASES = [
+      "Thinking",
+      "Looking over data",
+      "Processing",
+      "Reviewing your request",
+      "Preparing a proposal",
+    ];
 
     const ACCESSORIAL_LABELS = {
       LFO: "Liftgate at pickup",
@@ -884,6 +926,90 @@
       log.scrollTop = log.scrollHeight;
     }
 
+    function thinkingDotsEl() {
+      const dots = document.createElement("span");
+      dots.className = "thinking-dots";
+      dots.setAttribute("aria-hidden", "true");
+      dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
+      return dots;
+    }
+
+    function applyThinkingPhrase(phrase) {
+      const statusEl = document.getElementById("chat-thinking-status");
+      if (!statusEl) return;
+      statusEl.textContent = "";
+      statusEl.appendChild(document.createTextNode(phrase));
+      statusEl.appendChild(thinkingDotsEl());
+    }
+
+    function setThinkingCopy(step, withFade) {
+      const phrase = THINKING_PHRASES[step % THINKING_PHRASES.length];
+      const statusEl = document.getElementById("chat-thinking-status");
+      if (!statusEl) return;
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+      if (!withFade) {
+        statusEl.classList.remove("is-fading");
+        applyThinkingPhrase(phrase);
+        return;
+      }
+      statusEl.classList.add("is-fading");
+      thinkingFadeTimer = setTimeout(() => {
+        applyThinkingPhrase(phrase);
+        statusEl.classList.remove("is-fading");
+        thinkingFadeTimer = null;
+      }, THINKING_FADE_MS);
+    }
+
+    function stopThinkingRotation() {
+      if (thinkingTimer) {
+        clearInterval(thinkingTimer);
+        thinkingTimer = null;
+      }
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+    }
+
+    function startThinkingRotation() {
+      thinkingStep = 0;
+      setThinkingCopy(0, false);
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      thinkingTimer = setInterval(() => {
+        thinkingStep += 1;
+        setThinkingCopy(thinkingStep, true);
+      }, THINKING_ROTATE_MS);
+    }
+
+    function showChatThinking(active) {
+      const log = document.getElementById("chat-log");
+      if (!log) return;
+      let row = document.getElementById("chat-thinking");
+      if (active) {
+        if (!row) {
+          row = document.createElement("div");
+          row.id = "chat-thinking";
+          row.className = "msg assistant thinking";
+          row.setAttribute("aria-live", "polite");
+          row.innerHTML =
+            '<div class="bubble"><span class="thinking-status" id="chat-thinking-status"></span></div>';
+          log.appendChild(row);
+        } else {
+          log.appendChild(row);
+        }
+        row.classList.remove("hidden");
+        row.setAttribute("aria-busy", "true");
+        startThinkingRotation();
+        log.scrollTop = log.scrollHeight;
+      } else {
+        stopThinkingRotation();
+        if (row) row.remove();
+      }
+    }
+
     function isTypedConfirm(text) {
       return /^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
         .test(String(text || "").trim());
@@ -908,11 +1034,13 @@
         updatedBy: "quote-admin-ui",
       };
       if (confirmBtn) confirmBtn.disabled = true;
+      showChatThinking(true);
       try {
         const res = await api("/applyQuoteRule", {
           method: "POST",
           body: JSON.stringify(body),
         });
+        showChatThinking(false);
         if (!res || !res.ok) {
           const errMsg = "Failed: " + ((res && res.error) || "applyQuoteRule did not succeed");
           appendChat("assistant", errMsg);
@@ -932,10 +1060,12 @@
         pendingProposal = null;
         await loadRules();
       } catch (e) {
+        showChatThinking(false);
         const errMsg = "Failed: " + e.message;
         appendChat("assistant", errMsg);
         chatMessages.push({ role: "assistant", content: errMsg });
       } finally {
+        showChatThinking(false);
         if (confirmBtn) confirmBtn.disabled = false;
       }
     }
@@ -971,11 +1101,13 @@
       appendChat("user", text);
       input.value = "";
       sendBtn.disabled = true;
+      showChatThinking(true);
       try {
         let res = await api("/quoteRulesChat", {
           method: "POST",
           body: JSON.stringify({ tenantId: TENANT_ID, messages: chatMessages }),
         });
+        showChatThinking(false);
         res = normalizeChatProposal(res) || res;
         if (res.reply) {
           chatMessages.push({ role: "assistant", content: res.reply });
@@ -1029,8 +1161,10 @@
           await loadRules();
         }
       } catch (e) {
+        showChatThinking(false);
         appendChat("assistant", "Error: " + e.message);
       }
+      showChatThinking(false);
       sendBtn.disabled = false;
       input.focus();
     }
