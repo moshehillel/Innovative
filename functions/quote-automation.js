@@ -503,7 +503,7 @@ async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
 /**
  * Checks lane has enough origin/destination/freight for Primus rating.
  * @param {object} lane Lane.
- * @return {{ok: boolean, reason: string|null}}
+ * @return {object} `{ok, reason}` — reason set when not rateable.
  */
 function validateLaneForRating(lane) {
   const ship = lane.shipper || {};
