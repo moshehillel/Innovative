@@ -51,6 +51,7 @@ function toPlainText(input) {
  */
 function finishExtract(extracted, opts) {
   const next = normalizeSoleAddressToConsignee(extracted);
+  correctCartonVsPalletFreight(next, opts && opts.body);
   return emailAccessorials.attachRequestedAccessorials(next, {
     subject: opts && opts.subject,
     body: opts && opts.body,
@@ -133,6 +134,15 @@ async function callQuoteExtractionModel(client, payload) {
       "  PLT, CTN, CRT, DRM, CON, BOX, BDL, ENV, CYL, CAS, OTH, TOT,",
       "  or TRUCK LOAD. Use PLT for pallets/skids. Country codes ISO2",
       "  (US/CA/MX), never USA.",
+      "- Cartons are NOT pallets. qty on a PLT line is the pallet/skid",
+      "  COUNT, never carton/piece/box count. Carton totals are pieces,",
+      "  not trailer qty.",
+      "- If the email has both Total Cartons (N) and Number of Pallet(s)",
+      "  (M), freightInfo qty MUST be M with dimType PLT — not N.",
+      "  Example: Total Cartons 35, Number of Pallet 1, weight 137,",
+      "  Pallet dimensions 48*40*28 → [{qty:1, weight:137, length:48,",
+      "  width:40, height:28, dimType:\"PLT\"}]. Mention carton count",
+      "  in specialInstructions only.",
       "- If class missing, set flags.missingClass true on that lane.",
       "- If pallet count seems wrong (>20), suspiciousPalletCount true.",
       "- Detect liftgate / no dock in global or lane instructions.",
@@ -270,6 +280,157 @@ function extractPalletFreight(body) {
 }
 
 /**
+ * Parse a labeled integer/float after a heading (colon, dash, em dash).
+ * @param {string} text Body.
+ * @param {RegExp} re Pattern with one capture group.
+ * @return {number|null}
+ */
+function matchLabeledNumber(text, re) {
+  const m = String(text || "").match(re);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Parse Total Cartons / Number of Pallet(s) / weight / pallet dims.
+ * Carton count is pieces; pallet count is PLT qty.
+ * @param {string} body Plain text body.
+ * @return {object}
+ */
+function parseLabeledFreightTotals(body) {
+  const text = String(body || "");
+  let palletCount = matchLabeledNumber(text,
+      /Number\s+of\s+Pallets?\s*[-–—:=]?\s*(\d+)/i);
+  if (palletCount == null) {
+    palletCount = matchLabeledNumber(text,
+        /Pallet\s+Counts?\s*[-–—:=]?\s*(\d+)/i);
+  }
+  const cartonCount = matchLabeledNumber(text,
+      /Total\s+Cartons?\s*[-–—:=]?\s*(\d+)/i);
+  const weight = matchLabeledNumber(text,
+      /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d.]+)/i);
+  const dim = text.match(new RegExp(
+      "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*([\\d.]+)\\s*[x×*]\\s*" +
+      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
+      "i"));
+  return {
+    cartonCount,
+    palletCount,
+    weight,
+    length: dim ? Number(dim[1]) : null,
+    width: dim ? Number(dim[2]) : null,
+    height: dim ? Number(dim[3]) : null,
+  };
+}
+
+/**
+ * Fill missing weight/dims on a freight row from labeled totals.
+ * @param {object} row Freight row.
+ * @param {object} labeled Parsed labeled totals.
+ * @return {object}
+ */
+function fillLabeledFreightFields(row, labeled) {
+  const next = row && typeof row === "object" ? {...row} : {};
+  const lab = labeled || {};
+  if (next.weight == null && lab.weight != null) next.weight = lab.weight;
+  if (next.length == null && lab.length != null) next.length = lab.length;
+  if (next.width == null && lab.width != null) next.width = lab.width;
+  if (next.height == null && lab.height != null) next.height = lab.height;
+  return next;
+}
+
+/**
+ * When the RFQ lists carton count AND pallet count, qty is pallets.
+ * @param {Array<object>} freightInfo Existing freight lines.
+ * @param {object} labeled Parsed labeled totals.
+ * @return {Array<object>}
+ */
+function applyLabeledFreightTotals(freightInfo, labeled) {
+  const lab = labeled || {};
+  const src = Array.isArray(freightInfo) ? freightInfo : [];
+  const palletCount = lab.palletCount;
+  const cartonCount = lab.cartonCount;
+  const both = palletCount != null && cartonCount != null &&
+    palletCount !== cartonCount;
+
+  let rows = src.length ? src.map((r) => ({...r})) : [];
+  if (!rows.length) {
+    rows = [{
+      qty: palletCount != null ? palletCount : 1,
+      weight: lab.weight != null ? lab.weight : null,
+      class: null,
+      length: lab.length != null ? lab.length : null,
+      width: lab.width != null ? lab.width : null,
+      height: lab.height != null ? lab.height : null,
+      dimType: "PLT",
+    }];
+    return rows;
+  }
+
+  if (both) {
+    const totalQty = rows.reduce((sum, r) =>
+      sum + (Math.max(0, Number(r.qty) || 0)), 0);
+    const usedCartonsAsQty = totalQty === cartonCount ||
+      rows.some((r) => Number(r.qty) === cartonCount);
+    if (usedCartonsAsQty) {
+      const base = fillLabeledFreightFields(rows[0], lab);
+      const corrected = {
+        qty: palletCount,
+        weight: lab.weight != null ? lab.weight : (base.weight || null),
+        class: base.class != null ? base.class : null,
+        length: lab.length != null ? lab.length : (base.length || null),
+        width: lab.width != null ? lab.width : (base.width || null),
+        height: lab.height != null ? lab.height : (base.height || null),
+        dimType: "PLT",
+      };
+      if (base.weightType) corrected.weightType = base.weightType;
+      return [corrected];
+    }
+  }
+
+  if (palletCount != null && rows.length === 1) {
+    const row = fillLabeledFreightFields(rows[0], lab);
+    const dim = String(row.dimType || "").trim().toUpperCase();
+    const packagingIsPallet = !dim || dim === "PLT" || dim === "OTH";
+    if (packagingIsPallet) {
+      row.qty = palletCount;
+      row.dimType = "PLT";
+    }
+    return [row];
+  }
+
+  return rows.map((r) => fillLabeledFreightFields(r, lab));
+}
+
+/**
+ * Correct AI/heuristic PLT qty when the email labeled cartons vs pallets.
+ * Mutates extracted lanes in place.
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function correctCartonVsPalletFreight(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const labeled = parseLabeledFreightTotals(body);
+  if (labeled.palletCount == null && labeled.cartonCount == null &&
+      labeled.weight == null && labeled.length == null) {
+    return extracted;
+  }
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    lane.freightInfo = applyLabeledFreightTotals(
+        lane.freightInfo, labeled);
+    if (labeled.palletCount != null && labeled.cartonCount != null &&
+        labeled.cartonCount !== labeled.palletCount && lane.flags) {
+      lane.flags.suspiciousPalletCount = false;
+    }
+  }
+  return extracted;
+}
+
+/**
  * Deterministic fallback when AI returns empty/invalid JSON.
  * Handles Pickup Location + Shipping To quote emails.
  * @param {object} opts subject, from, body.
@@ -292,7 +453,13 @@ function heuristicExtractQuote(opts) {
     body.match(/Please quote\s+([A-Z0-9-]+)/i);
   const customerRef = (soMatch && soMatch[1]) || subject.slice(0, 120);
   let freightInfo = extractPalletFreight(body);
-  if (!freightInfo.length) {
+  const labeled = parseLabeledFreightTotals(body);
+  const hasLabeledFreight = labeled.palletCount != null ||
+    labeled.cartonCount != null || labeled.weight != null ||
+    labeled.length != null;
+  if (hasLabeledFreight) {
+    freightInfo = applyLabeledFreightTotals(freightInfo, labeled);
+  } else if (!freightInfo.length) {
     const pallets = body.match(/Number of Pallets:\s*(\d+)/i);
     freightInfo = [{
       qty: pallets ? Number(pallets[1]) : 1,
@@ -684,4 +851,8 @@ module.exports = {
   normalizeSoleAddressToConsignee,
   partyHasPhysicalAddress,
   finishExtract,
+  parseLabeledFreightTotals,
+  applyLabeledFreightTotals,
+  correctCartonVsPalletFreight,
+  heuristicExtractQuote,
 };
