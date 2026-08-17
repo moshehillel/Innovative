@@ -28,6 +28,223 @@ const PATCH_FIELDS = [
   "addAccessorialsWithData",
 ];
 
+const QUICK_REPLY_CAN_BE =
+  "Can be identified from the email";
+const QUICK_REPLY_CANNOT_BE =
+  "Cannot be — address / site classification only";
+
+const IDENTIFY_QUICK_REPLIES = [
+  QUICK_REPLY_CAN_BE,
+  QUICK_REPLY_CANNOT_BE,
+];
+
+/**
+ * Detect create-rule identify questionnaire progress from chat history.
+ * @param {Array<{role:string,content:string}>} messages Chat turns.
+ * @return {{status:string, source:string|null, emailSignalsListed:boolean}}
+ */
+function detectCreateIdentifyGate(messages) {
+  const turns = (messages || []).map((m) => ({
+    role: m.role === "assistant" ? "assistant" : "user",
+    content: String(m.content || ""),
+  }));
+
+  let askedChoice = false;
+  let source = null;
+  let askedEmailSignals = false;
+  let emailSignalsListed = false;
+
+  for (const turn of turns) {
+    const text = turn.content;
+    const lower = text.toLowerCase();
+
+    if (turn.role === "assistant") {
+      if (/how can (this|it) be identified|identified from the (quote )?email|can be identified from the email|address\/?\s*site classification|address only|cannot be/i
+          .test(text)) {
+        askedChoice = true;
+      }
+      if (/list all ways|keywords|sender domains|subject patterns|attachment text|consignee name phrases|signal from the email|ways .+ from the email/i
+          .test(text)) {
+        askedEmailSignals = true;
+      }
+      continue;
+    }
+
+    // User turns
+    if (/cannot be|address[-\s]?only|site classification only|only via (ai|address)|not from (the )?email|can't be identified from|cannot be identified/i
+        .test(lower) ||
+        text.trim() === QUICK_REPLY_CANNOT_BE) {
+      source = "address_only";
+      continue;
+    }
+    if (/can be identified from the email|identified from the (quote )?email|also from (the )?email|from (the )?email (as well|too|instead)|email (body|subject|sender)|option a\b|^a\)/i
+        .test(lower) ||
+        text.trim() === QUICK_REPLY_CAN_BE ||
+        /^can be\b/i.test(text.trim())) {
+      if (/cannot be/.test(lower)) {
+        source = "address_only";
+      } else {
+        source = "email";
+      }
+      continue;
+    }
+
+    if (source === "email" && askedEmailSignals) {
+      // Any substantive follow-up after we asked for signals counts.
+      if (text.trim().length >= 8 &&
+          !/^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
+              .test(text.trim())) {
+        emailSignalsListed = true;
+      }
+    }
+  }
+
+  if (source === "address_only") {
+    return {status: "ready", source, emailSignalsListed: false};
+  }
+  if (source === "email" && emailSignalsListed) {
+    return {status: "ready", source, emailSignalsListed: true};
+  }
+  if (source === "email") {
+    return {
+      status: "awaiting_email_signals",
+      source,
+      emailSignalsListed: false,
+    };
+  }
+  if (askedChoice) {
+    return {status: "awaiting_choice", source: null, emailSignalsListed: false};
+  }
+  return {status: "needed", source: null, emailSignalsListed: false};
+}
+
+/**
+ * True when the latest user message looks like a create/add rule request.
+ * @param {Array<{role:string,content:string}>} messages Chat turns.
+ * @return {boolean}
+ */
+function looksLikeCreateRuleIntent(messages) {
+  const lastUser = [...(messages || [])].reverse()
+      .find((m) => m.role !== "assistant");
+  if (!lastUser) return false;
+  const t = String(lastUser.content || "").toLowerCase();
+  return /\b(add|create|new|make|set up|setup)\b.{0,40}\brule\b/.test(t) ||
+    /\brule\b.{0,40}\b(add|create|new)\b/.test(t) ||
+    /\b(whenever|when|for)\b.{0,80}\b(add|include|require)\b.{0,40}\b(accessorial|liftgate|appointment|nursing|hotel|residential|school)/i
+        .test(t);
+}
+
+/**
+ * Enforce identify questionnaire before create proposals.
+ * @param {object} result Model JSON result.
+ * @param {Array} messages Chat history including latest user turn.
+ * @return {object}
+ */
+function enforceCreateIdentifyGate(result, messages) {
+  const out = result && typeof result === "object" ? {...result} : {
+    reply: "I could not process that. Try rephrasing.",
+    action: "none",
+    proposal: null,
+  };
+  const action = out.action || "none";
+  const gate = detectCreateIdentifyGate(messages);
+  const midIdentify = gate.status === "awaiting_choice" ||
+    gate.status === "awaiting_email_signals" ||
+    gate.status === "needed";
+  const creating = action === "propose_create_rule" ||
+    looksLikeCreateRuleIntent(messages) ||
+    // Stay in the questionnaire once it has started (user answered Can be /
+    // Cannot be, or assistant already asked).
+    (midIdentify && gate.status !== "needed") ||
+    (gate.status === "needed" && looksLikeCreateRuleIntent(messages));
+
+  if (action === "propose_update_rule" || action === "propose_delete_rule") {
+    return out;
+  }
+
+  if (!creating && action !== "ask_identify_source" &&
+      action !== "ask_email_signals") {
+    return out;
+  }
+
+  if (gate.status === "ready") {
+    // Strip premature create if model invented email match without signals.
+    if (action === "propose_create_rule" && gate.source === "email") {
+      const patch = out.proposal && out.proposal.patch;
+      if (!patch || !patch.match || typeof patch.match !== "object" ||
+          !Object.keys(patch.match).length) {
+        return {
+          reply: "Thanks — please list every way we can spot this in the " +
+            "quote email (keywords, sender domains, subject patterns, " +
+            "attachment text, consignee name phrases, etc.). I will use " +
+            "only what you list.",
+          action: "ask_email_signals",
+          proposal: null,
+          quickReplies: [],
+          createIdentify: gate,
+        };
+      }
+    }
+    if (action === "propose_create_rule" && gate.source === "address_only") {
+      // Force AI / site-classification path; drop invented email text matches.
+      if (out.proposal && out.proposal.patch) {
+        const patch = {...out.proposal.patch};
+        patch.identifyVia = "ai";
+        const match = patch.match && typeof patch.match === "object" ?
+          {...patch.match} : {};
+        delete match.consigneeNameContains;
+        delete match.consigneeAddressContains;
+        delete match.instructionsContains;
+        delete match.referenceContains;
+        // Keep siteType / flags for classification matching.
+        patch.match = match;
+        out.proposal = {...out.proposal, patch};
+      }
+    }
+    out.createIdentify = gate;
+    if (out.action === "ask_identify_source" ||
+        out.action === "ask_email_signals") {
+      // Model stayed in ask mode after gate ready — leave as-is.
+      return out;
+    }
+    return out;
+  }
+
+  if (gate.status === "awaiting_email_signals") {
+    return {
+      reply: out.action === "ask_email_signals" && out.reply ?
+        out.reply :
+        "Got it — this can be spotted in the quote email. Please list " +
+        "all ways you think we can get that signal (keywords in the " +
+        "body, sender domains, subject patterns, attachment text, " +
+        "consignee name phrases, etc.). I will only use what you list.",
+      action: "ask_email_signals",
+      proposal: null,
+      quickReplies: [],
+      createIdentify: gate,
+    };
+  }
+
+  // needed or awaiting_choice — stop and ask with two clear options.
+  const reply = (out.action === "ask_identify_source" && out.reply) ?
+    out.reply :
+    "Before I propose that rule: how can this condition be identified?\n\n" +
+    "1. **Can be** identified from the quote email " +
+    "(body / subject / sender / attachments / consignee name text) — " +
+    "as well as or instead of the address.\n" +
+    "2. **Cannot be** — address-only / site classification only " +
+    "(AI enrichment of the delivery address).\n\n" +
+    "Please choose one.";
+
+  return {
+    reply,
+    action: "ask_identify_source",
+    proposal: null,
+    quickReplies: IDENTIFY_QUICK_REPLIES.slice(),
+    createIdentify: gate,
+  };
+}
+
 /**
  * @param {object} opts messages[], existingRules[].
  * @return {Promise<object>} {reply, action, proposal}
@@ -48,6 +265,8 @@ async function runQuoteRulesChatTurn(opts) {
       0,
   ).slice(0, 8000);
 
+  const gateHint = detectCreateIdentifyGate(opts.messages || []);
+
   const systemPrompt = [
     "You help freight dispatchers manage LTL quote accessorial rules.",
     "Rules map site types or instructions to Primus accessorial codes.",
@@ -61,13 +280,16 @@ async function runQuoteRulesChatTurn(opts) {
     "When user asks to add, change, or remove a rule, respond JSON only:",
     "{",
     "  \"reply\": \"friendly confirmation message for the user\",",
-    "  \"action\": \"none\" | \"propose_create_rule\" |",
+    "  \"action\": \"none\" | \"ask_identify_source\" |",
+    "    \"ask_email_signals\" | \"propose_create_rule\" |",
     "    \"propose_update_rule\" | \"propose_delete_rule\",",
     "  \"proposal\": null | {",
     "    \"ruleId\": \"snake_case_id\",",
     "    \"patch\": { rule fields for create/update },",
     "    \"deleteRuleId\": \"id for delete\"",
-    "  }",
+    "  },",
+    "  \"quickReplies\": [] | [\"Can be identified from the email\",",
+    "    \"Cannot be — address / site classification only\"]",
     "}",
     "",
     "Rule patch fields: active, priority, name, match, addAccessorials,",
@@ -75,20 +297,49 @@ async function runQuoteRulesChatTurn(opts) {
     "match may use: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType.",
     "",
-    "identifyVia controls how the destination category is detected:",
-    "  address_text — match only from email text (consignee name, address,",
-    "    instructions, reference numbers, email-extracted siteType/flags).",
-    "  ai — match only from AI address classification (enriched siteType,",
-    "    residential flag from enrichment). Label this \"AI\" to users.",
-    "  both — match if either text OR AI signals hit (default).",
+    "=== MANDATORY create-rule identify questionnaire ===",
+    "When the user wants to ADD or CREATE a new rule, you MUST NOT propose",
+    "the rule (action must NOT be propose_create_rule) until this finishes.",
+    "Updates and deletes skip this questionnaire unless it comes up naturally.",
     "",
-    "When proposing a create or update rule, ask (or infer and confirm):",
-    "\"Can this destination type be identified from address text in the email",
-    "(consignee name, instructions, etc.), or only via AI address",
-    "classification?\" Set identifyVia accordingly:",
-    "  - Text-only triggers (e.g. liftgate in instructions) → address_text",
-    "  - Name in email OR AI can classify (hotels, Amazon FC) → both",
-    "  - Only AI/geocoding can tell (residential with no email hint) → ai",
+    "Step 1 — Always stop and ask (action: ask_identify_source):",
+    "\"How can this condition be identified?\" Present exactly two options:",
+    "  A) Can be identified from the quote email (body/subject/sender/",
+    "     attachments/consignee name text) — as well as or instead of address.",
+    "  B) Cannot be — address-only / site classification only (AI enrichment).",
+    "Set quickReplies to those two option strings exactly:",
+    `  \"${QUICK_REPLY_CAN_BE}\"`,
+    `  \"${QUICK_REPLY_CANNOT_BE}\"`,
+    "Wait for the user's choice. Do not invent a proposal yet.",
+    "",
+    "Step 2a — If they choose CAN BE (email):",
+    "  action: ask_email_signals. Ask them to list ALL ways they think we",
+    "  can get the signal from the email (keywords, sender domains, subject",
+    "  patterns, attachment text, consignee name phrases, etc.).",
+    "  Wait for their list. Do NOT invent email match criteria yourself.",
+    "  Only after they list signals may you propose_create_rule, putting",
+    "  those signals into match (instructionsContains / consigneeNameContains",
+    "  / referenceContains / etc. as appropriate).",
+    "  Set identifyVia to \"address_text\" when matching email/text only,",
+    "  or \"both\" if address AI classification should also count.",
+    "",
+    "Step 2b — If they choose CANNOT BE (address-only):",
+    "  Proceed with address / siteType / flags classification matching only.",
+    "  Set identifyVia to \"ai\". Do NOT invent email-text match keywords.",
+    "  Use match.siteType and/or match.flags as appropriate.",
+    "",
+    "Current questionnaire state from chat history (authoritative):",
+    `  status=${gateHint.status}; source=${gateHint.source || "null"};`,
+    `  emailSignalsListed=${gateHint.emailSignalsListed}`,
+    "If status is needed or awaiting_choice: action MUST be",
+    "ask_identify_source (not propose_create_rule).",
+    "If status is awaiting_email_signals: action MUST be ask_email_signals.",
+    "Only when status is ready may you use propose_create_rule.",
+    "",
+    "identifyVia values:",
+    "  address_text — match from email/text fields only.",
+    "  ai — match only from AI address classification.",
+    "  both — either text OR AI signals (default when both apply).",
     "",
     "Include identifyVia in every create/update proposal patch.",
     "",
@@ -108,7 +359,8 @@ async function runQuoteRulesChatTurn(opts) {
     "When asked if a rule is gone: answer ONLY from Current active rules JSON",
     "above (fresh from Firestore this turn). Ignore prior chat claims.",
     "Messages starting with [APPLIED] are ground-truth UI Confirm results.",
-    "If unclear, ask one short clarifying question with action none.",
+    "If unclear (and not mid identify questionnaire), ask one short",
+    "clarifying question with action none.",
   ].join("\n");
 
   const messages = [
@@ -130,18 +382,21 @@ async function runQuoteRulesChatTurn(opts) {
       completion.choices &&
       completion.choices[0] &&
       completion.choices[0].message &&
-      completion.choices[0].message.content || "",
+      completion.choices[0].content || "",
   ).trim();
 
+  let parsed;
   try {
-    return JSON.parse(raw);
+    parsed = JSON.parse(raw);
   } catch (_) {
-    return {
+    parsed = {
       reply: raw || "I could not process that. Try rephrasing.",
       action: "none",
       proposal: null,
     };
   }
+
+  return enforceCreateIdentifyGate(parsed, opts.messages || []);
 }
 
 /**
@@ -334,4 +589,9 @@ module.exports = {
   runQuoteRulesChatTurn,
   validateRuleProposal,
   extractPatch,
+  detectCreateIdentifyGate,
+  enforceCreateIdentifyGate,
+  IDENTIFY_QUICK_REPLIES,
+  QUICK_REPLY_CAN_BE,
+  QUICK_REPLY_CANNOT_BE,
 };

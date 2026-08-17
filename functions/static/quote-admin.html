@@ -246,6 +246,36 @@
       color: #fff;
       border-bottom-right-radius: 4px;
     }
+    .chat-quick-replies {
+      display: none;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 12px;
+    }
+    .chat-quick-replies.visible { display: flex; }
+    .chat-quick-replies button {
+      background: var(--surface);
+      border: 1px solid #c7d2fe;
+      color: var(--primary-dark);
+      padding: 8px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      line-height: 1.35;
+      text-align: left;
+      max-width: 100%;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .chat-quick-replies button:hover {
+      background: var(--primary-light);
+      border-color: var(--primary);
+    }
+    .chat-quick-replies button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
     .chat-input {
       display: flex;
       gap: 10px;
@@ -420,6 +450,7 @@
         Press Enter to send (Shift+Enter for a new line).
       </p>
       <div class="chat-log" id="chat-log"></div>
+      <div class="chat-quick-replies" id="chat-quick-replies" aria-label="Quick replies"></div>
       <div class="chat-input">
         <textarea id="chat-input" placeholder="Example: For nursing homes, add the nursing home delivery accessorial and ask for confirmation before quoting."></textarea>
         <button type="button" class="primary" id="chat-send">Send</button>
@@ -469,6 +500,7 @@
     const API = "https://us-central1-tai-invoice-automation.cloudfunctions.net";
     let chatMessages = [];
     let pendingProposal = null;
+    let pendingQuickReplies = [];
 
     const ACCESSORIAL_LABELS = {
       LFO: "Liftgate at pickup",
@@ -808,6 +840,41 @@
 
     document.getElementById("reload-rules").addEventListener("click", loadRules);
 
+    function clearQuickReplies() {
+      pendingQuickReplies = [];
+      const el = document.getElementById("chat-quick-replies");
+      if (!el) return;
+      el.innerHTML = "";
+      el.classList.remove("visible");
+    }
+
+    function renderQuickReplies(replies) {
+      const el = document.getElementById("chat-quick-replies");
+      if (!el) return;
+      const list = Array.isArray(replies) ?
+        replies.map((r) => String(r || "").trim()).filter(Boolean) : [];
+      pendingQuickReplies = list;
+      el.innerHTML = "";
+      if (!list.length) {
+        el.classList.remove("visible");
+        return;
+      }
+      list.forEach((label) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        btn.addEventListener("click", () => {
+          if (document.getElementById("chat-send").disabled) return;
+          const input = document.getElementById("chat-input");
+          input.value = label;
+          clearQuickReplies();
+          sendChatMessage();
+        });
+        el.appendChild(btn);
+      });
+      el.classList.add("visible");
+    }
+
     function appendChat(role, text) {
       const log = document.getElementById("chat-log");
       const div = document.createElement("div");
@@ -824,6 +891,7 @@
 
     async function applyPendingProposal() {
       if (!pendingProposal) return;
+      clearQuickReplies();
       const confirmBtn = document.getElementById("confirm-proposal");
       const wasDelete = isDeleteAction(pendingProposal.action);
       const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
@@ -881,6 +949,7 @@
       // Typing Confirm with a pending proposal uses applyQuoteRule — never the model.
       if (pendingProposal && isTypedConfirm(text)) {
         input.value = "";
+        clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
         appendChat("user", text);
         await applyPendingProposal();
@@ -888,6 +957,7 @@
       }
       if (!pendingProposal && isTypedConfirm(text)) {
         input.value = "";
+        clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
         appendChat("user", text);
         const tip = "There is no pending proposal. Ask me to remove or change a rule first, then click the Confirm button (typing Confirm alone does nothing).";
@@ -896,6 +966,7 @@
         return;
       }
 
+      clearQuickReplies();
       chatMessages.push({ role: "user", content: text });
       appendChat("user", text);
       input.value = "";
@@ -910,7 +981,20 @@
           chatMessages.push({ role: "assistant", content: res.reply });
           appendChat("assistant", res.reply);
         }
-        if (res.action && res.action !== "none" && res.proposal) {
+        if (res.action === "ask_identify_source" &&
+            (!Array.isArray(res.quickReplies) || !res.quickReplies.length)) {
+          res.quickReplies = [
+            "Can be identified from the email",
+            "Cannot be — address / site classification only",
+          ];
+        }
+        if (Array.isArray(res.quickReplies) && res.quickReplies.length) {
+          renderQuickReplies(res.quickReplies);
+        }
+        if (res.action && res.action !== "none" &&
+            res.action !== "ask_identify_source" &&
+            res.action !== "ask_email_signals" &&
+            res.proposal) {
           const proposal = res.proposal;
           const ruleId = proposal.ruleId || proposal.deleteRuleId || null;
           const patch = (proposal.patch && typeof proposal.patch === "object")
@@ -955,6 +1039,7 @@
     document.getElementById("dismiss-proposal").addEventListener("click", () => {
       document.getElementById("proposal-box").classList.add("hidden");
       pendingProposal = null;
+      clearQuickReplies();
     });
 
     document.getElementById("run-test").addEventListener("click", async () => {
