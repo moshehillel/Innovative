@@ -967,6 +967,7 @@ async function processQuoteEmail(opts) {
     customerLookupQueries: customerMatch.searchesTried || [],
     customerDeclinedAccessorials: extracted.customerDeclinedAccessorials ||
       [],
+    extractModel: extracted.extractModel || null,
     extractionWarnings: collectQuoteWarnings(extracted, ratedLanes),
     rateSource: quoteRateSource(ratedLanes, shippingLocationId),
     lanes: ratedLanes,

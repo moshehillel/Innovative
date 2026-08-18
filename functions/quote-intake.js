@@ -11,6 +11,9 @@ const emailAccessorials = require("./quote-email-accessorials");
 const freightDims = require("./quote-freight-dims");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
+// Live bake-off tied (Haiku / Sonnet 4.5 / Sonnet 5 / luna / sol / gpt-4o
+// all 17/17). Keep Haiku. Override with QUOTE_EXTRACT_MODEL (Claude or gpt-*).
+const DEFAULT_QUOTE_EXTRACT_MODEL = "claude-haiku-4-5";
 
 /**
  * Flatten HTML / MIME bodies into plain text for heuristics + AI.
@@ -150,125 +153,173 @@ function extractJsonObject(raw) {
 }
 
 /**
- * @param {object} client Anthropic client.
+ * Configured extract model (Claude or OpenAI slug).
+ * @return {string}
+ */
+function getQuoteExtractModel() {
+  return process.env.QUOTE_EXTRACT_MODEL || DEFAULT_QUOTE_EXTRACT_MODEL;
+}
+
+/**
+ * True for OpenAI chat-completions extract models.
+ * @param {string} model Model slug.
+ * @return {boolean}
+ */
+function isOpenAiExtractModel(model) {
+  const m = String(model || "").toLowerCase();
+  return m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") ||
+    m.startsWith("o4");
+}
+
+/**
+ * Shared RFQ extract system prompt (Claude + OpenAI).
+ * Understand English meaning; do not substring-match keywords.
+ * @return {string}
+ */
+function quoteExtractSystemPrompt() {
+  return [
+    "You extract LTL freight quote requests for a freight broker.",
+    "Return ONLY valid JSON (no markdown).",
+    "Understand English meaning (negation, packing type, totals).",
+    "Do NOT substring-match keywords. Read the whole phrase.",
+    "",
+    "Keys:",
+    "- format: multi_lane_table | single_shipment | unknown",
+    "- customerRef: PO / sales order / subject reference",
+    "- customerName: bill-to / account / company requesting the quote",
+    "- readyDate: YYYY-MM-DD or null",
+    "- shipper: {name, address1, city, state, zipCode, country, phone}",
+    "- lanes: array of {",
+    "    laneKey: stable id e.g. PIONEER_OH,",
+    "    label: e.g. TO PIONEER, OH,",
+    "    consignee: {name, address1, city, state, zipCode, country, phone},",
+    "    siteType: menards_dc | amazon_fc | aafes_military |",
+    "      nursing_home | hotel | residential | other,",
+    "    freightInfo: [{qty, weight, weightType, class, length, width,",
+    "      height, dimType}],",
+    "    referenceNumbers: [PO numbers],",
+    "    specialInstructions: string,",
+    "    flags: {missingClass, suspiciousPalletCount, residentialDelivery}",
+    "  }",
+    "- specialInstructionsGlobal: pickup/delivery notes for all lanes",
+    "- customerRequest: {",
+    "    wantsGuaranteedOptions: boolean,",
+    "    wantsCarrierExpiration: boolean,",
+    "    wantsLimitedAccessInQuote: boolean,",
+    "    requestedAccessorials: string[]  // Primus codes, e.g.",
+    "      [\"LAD\",\"LFD\",\"APD\",\"RSD\",\"IND\"]",
+    "  }",
+    "- customerDeclinedAccessorials: string[]  // e.g. [\"APD\"] when the",
+    "    customer said appointment is NOT needed",
+    "- flags: {needsDispatcherReview: boolean}",
+    "",
+    "WORKED EXAMPLES (follow these exactly):",
+    "1) \"No Appointment necessary\" / \"no appt needed\" /",
+    "   \"appointment not required\" → do NOT put APD or APO in",
+    "   requestedAccessorials. Put \"APD\" in",
+    "   customerDeclinedAccessorials. Copy the phrase into",
+    "   specialInstructions only. The word \"appointment\" is not a",
+    "   request when it is negated.",
+    "2) \"Delivery appointment required\" / \"must call to schedule\"",
+    "   → requestedAccessorials MUST include APD. Do not decline it.",
+    "3) Pallet 1 (40x48x70, 1822 lbs) and Pallet 2 (40x48x66, 1702 lbs)",
+    "   quoted to BOTH 90723 and 11216 (same freight, two dests) →",
+    "   two lanes; EACH lane has TWO freight lines (qty 1 each).",
+    "   Not 1 pallet. Do not split Pallet 1 to dest A and Pallet 2",
+    "   to dest B unless the email assigns them.",
+    "4) \"2 pallets\" → qty 2 (or two qty-1 PLT lines), never qty 1.",
+    "5) Total Cartons 35, Number of Pallet 1, weight 137,",
+    "   Pallet dimensions 48*40*28 → one freight line",
+    "   [{qty:1, weight:137, weightType:\"total\", length:40, width:48,",
+    "   height:28, dimType:\"PLT\"}]. Cartons ≠ pallets. Mention 35",
+    "   cartons in specialInstructions only.",
+    "6) \"Total weight – 8146.05\" (or 8146) on many pallets →",
+    "   weight 8146.05 (or 8146), weightType \"total\". Never per-pallet",
+    "   / each. Never strip the decimal (814605 is wrong).",
+    "7) Zip-only \"from 08701 to 22911\" → shipper.zipCode 08701 and",
+    "   consignee.zipCode 22911 even if city/state are blank.",
+    "",
+    "Real patterns to recognize:",
+    "- Ship From / Ship To blocks (Coreforce, warehouse quotes)",
+    "- Inline origin + destination (GPA Perris CA → HGR6 Hagerstown MD)",
+    "- Amazon FC codes: HGR6, FBA shipment ids in body",
+    "- AAFES / military bases / forts / AFB / naval stations / exchanges",
+    "- Multi-pallet lines: 1 pallet 40x48x65 @ 602.5 lbs",
+    "- Pickup address blocks without Ship From label (Petra / CTA Digital)",
+    "- Subject may be just \"Quote\" — still extract shipper/consignee",
+    "  from Pickup Location / Shipping To blocks in the body.",
+    "",
+    "Rules:",
+    "- Group table rows by destination city/state/zip into one lane each.",
+    "- Sum weight and pallets per lane when table groups freight blocks.",
+    "- weightType should be total unless clearly per-piece.",
+    "  If the email says Total weight / \"total weight – N\", weightType",
+    "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
+    "- Pallet L×W is always 40 x 48 (length 40, width 48), never 48x40.",
+    "  If the email says 48*40 or 48x40, store length:40, width:48.",
+    "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
+    "  and dimType PLT — do not invent dims over explicit values.",
+    "- dimType must be Primus packaging enum (not inch/cm):",
+    "  PLT, CTN, CRT, DRM, CON, BOX, BDL, ENV, CYL, CAS, OTH, TOT,",
+    "  or TRUCK LOAD. Use PLT for pallets/skids. Country codes ISO2",
+    "  (US/CA/MX), never USA.",
+    "- Cartons are NOT pallets. qty on a PLT line is the pallet/skid",
+    "  COUNT, never carton/piece/box count. Carton totals are pieces,",
+    "  not trailer qty.",
+    "- Pallet 1 / Pallet 2 / Pallet N blocks are separate freight",
+    "  lines (qty 1 each) with that line's dims and weight. Do not",
+    "  drop Pallet 2. Do not collapse to qty 1 unless the email",
+    "  explicitly says 1 pallet (Number of Pallet - 1).",
+    "- If class missing, set flags.missingClass true on that lane.",
+    "- If pallet count seems wrong (>20), suspiciousPalletCount true.",
+    "- Detect liftgate / no dock in global or lane instructions.",
+    "- If email mentions accessorials (liftgate, residential,",
+    "  appointment, limited access, inside delivery, insurance,",
+    "  etc.), copy those phrases into specialInstructions /",
+    "  specialInstructionsGlobal AND map them to Primus codes in",
+    "  customerRequest.requestedAccessorials:",
+    "  liftgate pickup/origin → LFO; liftgate delivery or bare",
+    "  liftgate/no dock → LFD (+ LFO if unspecified); appointment",
+    "  → APD (APO if pickup) UNLESS the email says no appointment",
+    "  / no appt needed / appointment not required;",
+    "  residential → RSD; limited/restricted",
+    "  access → LAD (LAO if pickup); inside delivery → IND;",
+    "  inside pickup → INO; insurance → INS; hazmat → HAZ.",
+    "- Set flags.residentialDelivery true when residential/",
+    "  home delivery is requested.",
+    "- Military bases, forts, AFB, naval/Marine stations, AAFES",
+    "  exchanges → siteType aafes_military.",
+    "- If customer asks for guaranteed + standard options,",
+    "  set customerRequest.wantsGuaranteedOptions true.",
+    "- If customer asks for carrier expiration days,",
+    "  set customerRequest.wantsCarrierExpiration true.",
+    "- If customer asks for limited/restricted delivery charges",
+    "  in the quote email, set wantsLimitedAccessInQuote true",
+    "  and include LAD in requestedAccessorials.",
+    "- Always return at least one lane when pickup + delivery addresses",
+    "  are present, even if freight dims/class/weight are missing.",
+    "- Zip-only origin/dest is valid: keep the 5-digit zipCode even",
+    "  when city and state are missing.",
+    "- Sole address → consignee (destination / Ship To): when the email",
+    "  contains only ONE physical address (street/city/state/zip), put",
+    "  it on lanes[].consignee. Leave shipper null/empty (or name-only",
+    "  from a known customer profile) — do NOT put the sole address on",
+    "  shipper by default. Multi-address emails (Ship From + Ship To,",
+    "  or clear origin + destination) still map normally.",
+  ].join("\n");
+}
+
+/**
  * @param {object} payload subject/from/body.
+ * @param {string} model Claude model slug.
  * @return {Promise<string>} Raw model text.
  */
-async function callQuoteExtractionModel(client, payload) {
+async function callClaudeQuoteExtraction(payload, model) {
+  const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
   const res = await client.messages.create({
-    model: process.env.QUOTE_EXTRACT_MODEL || "claude-haiku-4-5",
+    model,
     max_tokens: 4000,
-    system: [
-      "You extract LTL freight quote requests for a freight broker.",
-      "Return ONLY valid JSON (no markdown).",
-      "",
-      "Keys:",
-      "- format: multi_lane_table | single_shipment | unknown",
-      "- customerRef: PO / sales order / subject reference",
-      "- customerName: bill-to / account / company requesting the quote",
-      "- readyDate: YYYY-MM-DD or null",
-      "- shipper: {name, address1, city, state, zipCode, country, phone}",
-      "- lanes: array of {",
-      "    laneKey: stable id e.g. PIONEER_OH,",
-      "    label: e.g. TO PIONEER, OH,",
-      "    consignee: {name, address1, city, state, zipCode, country, phone},",
-      "    siteType: menards_dc | amazon_fc | aafes_military |",
-      "      nursing_home | hotel | residential | other,",
-      "    freightInfo: [{qty, weight, weightType, class, length, width,",
-      "      height, dimType}],",
-      "    referenceNumbers: [PO numbers],",
-      "    specialInstructions: string,",
-      "    flags: {missingClass, suspiciousPalletCount, residentialDelivery}",
-      "  }",
-      "- specialInstructionsGlobal: pickup/delivery notes for all lanes",
-      "- customerRequest: {",
-      "    wantsGuaranteedOptions: boolean,",
-      "    wantsCarrierExpiration: boolean,",
-      "    wantsLimitedAccessInQuote: boolean,",
-      "    requestedAccessorials: string[]  // Primus codes, e.g.",
-      "      [\"LAD\",\"LFD\",\"APD\",\"RSD\",\"IND\"]",
-      "  }",
-      "- flags: {needsDispatcherReview: boolean}",
-      "",
-      "Real patterns to recognize:",
-      "- Ship From / Ship To blocks (Coreforce, warehouse quotes)",
-      "- Inline origin + destination (GPA Perris CA → HGR6 Hagerstown MD)",
-      "- Amazon FC codes: HGR6, FBA shipment ids in body",
-      "- AAFES / military bases / forts / AFB / naval stations / exchanges",
-      "- Multi-pallet lines: 1 pallet 40x48x65 @ 602.5 lbs",
-      "- Pickup address blocks without Ship From label (Petra / CTA Digital)",
-      "- Subject may be just \"Quote\" — still extract shipper/consignee",
-      "  from Pickup Location / Shipping To blocks in the body.",
-      "",
-      "Rules:",
-      "- Group table rows by destination city/state/zip into one lane each.",
-      "- Sum weight and pallets per lane when table groups freight blocks.",
-      "- weightType should be total unless clearly per-piece.",
-      "  If the email says Total weight / \"total weight – N\", weightType",
-      "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
-      "- Pallet L×W is always 40 x 48 (length 40, width 48), never 48x40.",
-      "  If the email says 48*40 or 48x40, store length:40, width:48.",
-      "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
-      "  and dimType PLT — do not invent dims over explicit values.",
-      "- dimType must be Primus packaging enum (not inch/cm):",
-      "  PLT, CTN, CRT, DRM, CON, BOX, BDL, ENV, CYL, CAS, OTH, TOT,",
-      "  or TRUCK LOAD. Use PLT for pallets/skids. Country codes ISO2",
-      "  (US/CA/MX), never USA.",
-      "- Cartons are NOT pallets. qty on a PLT line is the pallet/skid",
-      "  COUNT, never carton/piece/box count. Carton totals are pieces,",
-      "  not trailer qty.",
-      "- If the email has both Total Cartons (N) and Number of Pallet(s)",
-      "  (M), freightInfo qty MUST be M with dimType PLT — not N.",
-      "  Example: Total Cartons 35, Number of Pallet 1, weight 137,",
-      "  Pallet dimensions 48*40*28 → [{qty:1, weight:137, length:40,",
-      "  width:48, height:28, dimType:\"PLT\"}]. Mention carton count",
-      "  in specialInstructions only.",
-      "- Pallet 1 / Pallet 2 / Pallet N blocks are separate freight",
-      "  lines (qty 1 each) with that line's dims and weight. Do not",
-      "  drop Pallet 2. Do not collapse to qty 1 unless the email",
-      "  explicitly says 1 pallet (Number of Pallet - 1).",
-      "- If the email asks to quote the SAME freight to multiple",
-      "  destinations (e.g. subject \"quote to 90723 and 11216\") and",
-      "  does not assign which pallet goes to which zip, copy ALL",
-      "  pallet lines onto EVERY lane. Do not split Pallet 1 to dest A",
-      "  and Pallet 2 to dest B unless the email assigns them.",
-      "- \"No appointment necessary / no appt needed / appointment not",
-      "  required\" is NOT a request for APD. Do not add APD.",
-      "- If class missing, set flags.missingClass true on that lane.",
-      "- If pallet count seems wrong (>20), suspiciousPalletCount true.",
-      "- Detect liftgate / no dock in global or lane instructions.",
-      "- If email mentions accessorials (liftgate, residential,",
-      "  appointment, limited access, inside delivery, insurance,",
-      "  etc.), copy those phrases into specialInstructions /",
-      "  specialInstructionsGlobal AND map them to Primus codes in",
-      "  customerRequest.requestedAccessorials:",
-      "  liftgate pickup/origin → LFO; liftgate delivery or bare",
-      "  liftgate/no dock → LFD (+ LFO if unspecified); appointment",
-      "  → APD (APO if pickup) UNLESS the email says no appointment",
-      "  / no appt needed / appointment not required;",
-      "  residential → RSD; limited/restricted",
-      "  access → LAD (LAO if pickup); inside delivery → IND;",
-      "  inside pickup → INO; insurance → INS; hazmat → HAZ.",
-      "- Set flags.residentialDelivery true when residential/",
-      "  home delivery is requested.",
-      "- Military bases, forts, AFB, naval/Marine stations, AAFES",
-      "  exchanges → siteType aafes_military.",
-      "- If customer asks for guaranteed + standard options,",
-      "  set customerRequest.wantsGuaranteedOptions true.",
-      "- If customer asks for carrier expiration days,",
-      "  set customerRequest.wantsCarrierExpiration true.",
-      "- If customer asks for limited/restricted delivery charges",
-      "  in the quote email, set wantsLimitedAccessInQuote true",
-      "  and include LAD in requestedAccessorials.",
-      "- Always return at least one lane when pickup + delivery addresses",
-      "  are present, even if freight dims/class/weight are missing.",
-      "- Sole address → consignee (destination / Ship To): when the email",
-      "  contains only ONE physical address (street/city/state/zip), put",
-      "  it on lanes[].consignee. Leave shipper null/empty (or name-only",
-      "  from a known customer profile) — do NOT put the sole address on",
-      "  shipper by default. Multi-address emails (Ship From + Ship To,",
-      "  or clear origin + destination) still map normally.",
-    ].join("\n"),
+    system: quoteExtractSystemPrompt(),
     messages: [{
       role: "user",
       content: JSON.stringify(payload),
@@ -279,6 +330,45 @@ async function callQuoteExtractionModel(client, payload) {
       .map((b) => b.text)
       .join("\n")
       .trim();
+}
+
+/**
+ * @param {object} payload subject/from/body.
+ * @param {string} model OpenAI model slug.
+ * @return {Promise<string>} Raw model text.
+ */
+async function callOpenAiQuoteExtraction(payload, model) {
+  const apiKey = getQuoteClassifyOpenAiKey();
+  if (!apiKey) throw new Error("OpenAI API key not configured");
+  const client = new OpenAI({apiKey});
+  const completion = await client.chat.completions.create({
+    model,
+    max_completion_tokens: 4000,
+    response_format: {type: "json_object"},
+    messages: [
+      {role: "system", content: quoteExtractSystemPrompt()},
+      {role: "user", content: JSON.stringify(payload)},
+    ],
+  });
+  return String(
+      completion.choices &&
+      completion.choices[0] &&
+      completion.choices[0].message &&
+      completion.choices[0].message.content || "",
+  ).trim();
+}
+
+/**
+ * @param {object} payload subject/from/body.
+ * @param {string} [model] Override model slug.
+ * @return {Promise<string>} Raw model text.
+ */
+async function callQuoteExtractionModel(payload, model) {
+  const slug = model || getQuoteExtractModel();
+  if (isOpenAiExtractModel(slug)) {
+    return callOpenAiQuoteExtraction(payload, slug);
+  }
+  return callClaudeQuoteExtraction(payload, slug);
 }
 
 /**
@@ -967,19 +1057,28 @@ async function extractQuoteRequest(opts) {
     error: null,
   };
 
-  if (!process.env.ANTHROPIC_API_KEY) {
+  const extractModel = getQuoteExtractModel();
+  const canCallModel = isOpenAiExtractModel(extractModel) ?
+    Boolean(getQuoteClassifyOpenAiKey()) :
+    Boolean(process.env.ANTHROPIC_API_KEY);
+  if (!canCallModel) {
     const heuristic = heuristicExtractQuote({subject, from, body});
-    if (heuristic) return finishExtract(heuristic, {subject, body});
-    fallback.error = "ANTHROPIC_API_KEY not configured";
+    if (heuristic) {
+      heuristic.extractModel = "heuristic";
+      return finishExtract(heuristic, {subject, body});
+    }
+    fallback.error = isOpenAiExtractModel(extractModel) ?
+      "OpenAI API key not configured" :
+      "ANTHROPIC_API_KEY not configured";
+    fallback.extractModel = extractModel;
     return fallback;
   }
 
-  const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
   let raw = "";
   let lastErr = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      raw = await callQuoteExtractionModel(client, {subject, from, body});
+      raw = await callQuoteExtractionModel({subject, from, body}, extractModel);
       const jsonText = extractJsonObject(raw);
       if (!jsonText) {
         lastErr = new Error("empty model response");
@@ -988,6 +1087,7 @@ async function extractQuoteRequest(opts) {
       const parsed = JSON.parse(jsonText);
       if (!Array.isArray(parsed.lanes)) parsed.lanes = [];
       if (!parsed.flags) parsed.flags = {};
+      parsed.extractModel = extractModel;
       if (parsed.lanes.length) {
         return finishExtract(parsed, {subject, body});
       }
@@ -998,10 +1098,14 @@ async function extractQuoteRequest(opts) {
   }
 
   const heuristic = heuristicExtractQuote({subject, from, body});
-  if (heuristic) return finishExtract(heuristic, {subject, body});
+  if (heuristic) {
+    heuristic.extractModel = "heuristic";
+    return finishExtract(heuristic, {subject, body});
+  }
 
   fallback.error = `Parse failed: ${(lastErr && lastErr.message) || "unknown"}`;
   fallback.raw = raw.slice(0, 500);
+  fallback.extractModel = extractModel;
   return fallback;
 }
 
@@ -1140,6 +1244,12 @@ async function classifyIsQuoteRequest(opts) {
 }
 
 module.exports = {
+  DEFAULT_QUOTE_EXTRACT_MODEL,
+  getQuoteExtractModel,
+  isOpenAiExtractModel,
+  quoteExtractSystemPrompt,
+  callQuoteExtractionModel,
+  extractJsonObject,
   extractQuoteRequest,
   looksLikeQuoteRequest,
   classifyIsQuoteRequest,
