@@ -8,6 +8,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const emailAccessorials = require("./quote-email-accessorials");
+const freightDims = require("./quote-freight-dims");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
 
@@ -52,6 +53,7 @@ function toPlainText(input) {
 function finishExtract(extracted, opts) {
   const next = normalizeSoleAddressToConsignee(extracted);
   correctCartonVsPalletFreight(next, opts && opts.body);
+  normalizeFreightOnExtract(next, opts && opts.body);
   return emailAccessorials.attachRequestedAccessorials(next, {
     subject: opts && opts.subject,
     body: opts && opts.body,
@@ -92,6 +94,7 @@ async function callQuoteExtractionModel(client, payload) {
       "Keys:",
       "- format: multi_lane_table | single_shipment | unknown",
       "- customerRef: PO / sales order / subject reference",
+      "- customerName: bill-to / account / company requesting the quote",
       "- readyDate: YYYY-MM-DD or null",
       "- shipper: {name, address1, city, state, zipCode, country, phone}",
       "- lanes: array of {",
@@ -121,7 +124,7 @@ async function callQuoteExtractionModel(client, payload) {
       "- Inline origin + destination (GPA Perris CA → HGR6 Hagerstown MD)",
       "- Amazon FC codes: HGR6, FBA shipment ids in body",
       "- AAFES / military bases / forts / AFB / naval stations / exchanges",
-      "- Multi-pallet lines: 1 pallet 48x40x65 @ 602.5 lbs",
+      "- Multi-pallet lines: 1 pallet 40x48x65 @ 602.5 lbs",
       "- Pickup address blocks without Ship From label (Petra / CTA Digital)",
       "- Subject may be just \"Quote\" — still extract shipper/consignee",
       "  from Pickup Location / Shipping To blocks in the body.",
@@ -130,6 +133,12 @@ async function callQuoteExtractionModel(client, payload) {
       "- Group table rows by destination city/state/zip into one lane each.",
       "- Sum weight and pallets per lane when table groups freight blocks.",
       "- weightType should be total unless clearly per-piece.",
+      "  If the email says Total weight / \"total weight – N\", weightType",
+      "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
+      "- Pallet L×W is always 40 x 48 (length 40, width 48), never 48x40.",
+      "  If the email says 48*40 or 48x40, store length:40, width:48.",
+      "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
+      "  and dimType PLT — do not invent dims over explicit values.",
       "- dimType must be Primus packaging enum (not inch/cm):",
       "  PLT, CTN, CRT, DRM, CON, BOX, BDL, ENV, CYL, CAS, OTH, TOT,",
       "  or TRUCK LOAD. Use PLT for pallets/skids. Country codes ISO2",
@@ -140,8 +149,8 @@ async function callQuoteExtractionModel(client, payload) {
       "- If the email has both Total Cartons (N) and Number of Pallet(s)",
       "  (M), freightInfo qty MUST be M with dimType PLT — not N.",
       "  Example: Total Cartons 35, Number of Pallet 1, weight 137,",
-      "  Pallet dimensions 48*40*28 → [{qty:1, weight:137, length:48,",
-      "  width:40, height:28, dimType:\"PLT\"}]. Mention carton count",
+      "  Pallet dimensions 48*40*28 → [{qty:1, weight:137, length:40,",
+      "  width:48, height:28, dimType:\"PLT\"}]. Mention carton count",
       "  in specialInstructions only.",
       "- If class missing, set flags.missingClass true on that lane.",
       "- If pallet count seems wrong (>20), suspiciousPalletCount true.",
@@ -266,15 +275,16 @@ function extractPalletFreight(body) {
       "gi");
   let m;
   while ((m = pattern.exec(String(body || ""))) !== null) {
-    freight.push({
+    freight.push(freightDims.normalizePalletDims({
       qty: 1,
       weight: Number(m[2]),
+      weightType: "total",
       class: null,
       length: Number(m[3]),
       width: Number(m[4]),
       height: Number(m[5]),
       dimType: "PLT",
-    });
+    }));
   }
   return freight;
 }
@@ -359,13 +369,14 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
     rows = [{
       qty: palletCount != null ? palletCount : 1,
       weight: lab.weight != null ? lab.weight : null,
+      weightType: "total",
       class: null,
       length: lab.length != null ? lab.length : null,
       width: lab.width != null ? lab.width : null,
       height: lab.height != null ? lab.height : null,
       dimType: "PLT",
     }];
-    return rows;
+    return rows.map((r) => freightDims.normalizePalletDims(r));
   }
 
   if (both) {
@@ -383,9 +394,9 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
         width: lab.width != null ? lab.width : (base.width || null),
         height: lab.height != null ? lab.height : (base.height || null),
         dimType: "PLT",
+        weightType: "total",
       };
-      if (base.weightType) corrected.weightType = base.weightType;
-      return [corrected];
+      return [freightDims.normalizePalletDims(corrected)];
     }
   }
 
@@ -397,10 +408,15 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
       row.qty = palletCount;
       row.dimType = "PLT";
     }
-    return [row];
+    if (lab.weight != null) row.weightType = "total";
+    return [freightDims.normalizePalletDims(row)];
   }
 
-  return rows.map((r) => fillLabeledFreightFields(r, lab));
+  return rows.map((r) => {
+    const filled = fillLabeledFreightFields(r, lab);
+    if (lab.weight != null) filled.weightType = "total";
+    return freightDims.normalizePalletDims(filled);
+  });
 }
 
 /**
@@ -461,16 +477,21 @@ function heuristicExtractQuote(opts) {
     freightInfo = applyLabeledFreightTotals(freightInfo, labeled);
   } else if (!freightInfo.length) {
     const pallets = body.match(/Number of Pallets:\s*(\d+)/i);
-    freightInfo = [{
+    freightInfo = [freightDims.normalizePalletDims({
       qty: pallets ? Number(pallets[1]) : 1,
       weight: null,
+      weightType: "total",
       class: null,
       length: null,
       width: null,
       height: null,
       dimType: "PLT",
-    }];
+    })];
   }
+  freightInfo = freightInfo.map((r) => freightDims.normalizePalletDims({
+    ...r,
+    weightType: r.weightType || "total",
+  }));
 
   const special = [];
   // eslint-disable-next-line max-len
@@ -649,6 +670,52 @@ function normalizeSoleAddressToConsignee(extracted) {
   }
 
   // Consignee(s) already hold the only address — nothing to do.
+  return extracted;
+}
+
+/**
+ * Total weight in the RFQ wins over per-pallet / each.
+ * @param {string} body Email body.
+ * @return {"total"|"each"}
+ */
+function inferWeightTypeFromBody(body) {
+  const text = String(body || "");
+  if (/total\s+weight/i.test(text)) return "total";
+  if (/(?:weight\s+(?:per|each)|per[\s-]*(?:pallet|piece|skid)|each\s+pallet)/i
+      .test(text)) {
+    return "each";
+  }
+  return "total";
+}
+
+/**
+ * Pallet 40×48 (not 48×40), default missing pallet dims to 40×48×60,
+ * and force weightType total when the email gives a total weight.
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function normalizeFreightOnExtract(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const weightType = inferWeightTypeFromBody(body);
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+    lane.freightInfo = rows.map((row) => {
+      const base = row && typeof row === "object" ? {...row} : {};
+      const next = freightDims.normalizePalletDims(base);
+      const raw = String(next.weightType || "").trim().toLowerCase();
+      if (weightType === "total") {
+        next.weightType = "total";
+      } else if (raw === "each" || raw === "perpiece" || raw === "per-piece") {
+        next.weightType = "each";
+      } else {
+        next.weightType = weightType;
+      }
+      return freightDims.sanitizeImplausiblePalletWeight(next);
+    });
+  }
   return extracted;
 }
 
@@ -855,4 +922,6 @@ module.exports = {
   applyLabeledFreightTotals,
   correctCartonVsPalletFreight,
   heuristicExtractQuote,
+  inferWeightTypeFromBody,
+  normalizeFreightOnExtract,
 };

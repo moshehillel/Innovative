@@ -15,6 +15,7 @@ const quoteDispatchers = require("./quote-dispatchers");
 const quoteOutlook = require("./quote-outlook");
 const quoteAccCatalog = require("./quote-accessorial-catalog");
 const quoteEmailAcc = require("./quote-email-accessorials");
+const freightDims = require("./quote-freight-dims");
 
 let deps = {};
 
@@ -49,9 +50,19 @@ async function resolveCustomerMatch(opts) {
   const ref = String(opts.customerRef || "");
   const customerName = String(
       opts.customerName || opts.shippingLocationName || "").trim();
-  const hay = `${ref} ${customerName} ${opts.from || ""}`;
+  const shipperName = String(opts.shipperName || "").trim();
+  const hay = `${ref} ${customerName} ${shipperName} ${opts.from || ""}`;
   const searchTerms = [];
   if (customerName) searchTerms.push(customerName);
+  if (shipperName && shipperName.toLowerCase() !== customerName.toLowerCase()) {
+    searchTerms.push(shipperName);
+  }
+  const refHead = ref.split(/[/|,]/)[0].trim();
+  if (refHead.length > 2 && !/^\d+$/.test(refHead) &&
+      refHead.toLowerCase() !== customerName.toLowerCase() &&
+      refHead.toLowerCase() !== shipperName.toLowerCase()) {
+    searchTerms.push(refHead);
+  }
   if (/menards/i.test(hay)) searchTerms.push("menards");
   if (/sleeptone|sanders/i.test(hay)) {
     searchTerms.push("sanders", "sleeptone");
@@ -67,22 +78,47 @@ async function resolveCustomerMatch(opts) {
   const match = await rateShop.resolveCustomerForQuote({
     from: opts.from,
     customerRef: opts.customerRef,
-    customerName,
+    customerName: customerName || shipperName,
     searchTerms,
   });
-  if (match && match.id) {
+
+  /**
+   * Fill Primus location name when search returned an id only.
+   * @param {object} row Match or fallback.
+   * @param {string} status matched|default|no_match.
+   * @return {Promise<object>}
+   */
+  async function withName(row, status) {
+    const id = row && row.id ? String(row.id) : null;
+    let name = (row && row.name) || null;
+    if (id && !name) {
+      try {
+        const loc = await rateShop.getShippingLocationById(id);
+        if (loc && loc.name) name = loc.name;
+      } catch (_) {
+        // keep id without name
+      }
+    }
     return {
-      id: String(match.id),
-      name: match.name || null,
-      code: match.code || null,
-      searchTerm: match.searchTerm || null,
+      id,
+      name,
+      code: (row && row.code) || null,
+      searchTerm: (row && row.searchTerm) || null,
+      lookupStatus: status,
     };
   }
+
+  if (match && match.id) {
+    return withName(match, "matched");
+  }
   if (opts.allowDefault === false) {
-    return {id: null, name: null};
+    return {id: null, name: null, lookupStatus: "no_match"};
   }
   const fallback = process.env.QUOTE_DEFAULT_SHIPPING_LOCATION_ID || null;
-  return {id: fallback, name: null};
+  if (fallback) {
+    return withName({id: fallback, name: null}, "default");
+  }
+  return {id: null, name: null, lookupStatus: "no_match"};
 }
 
 /**
@@ -101,7 +137,10 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
   const customerRef = String(
       patch.customerRef != null ? patch.customerRef :
         (data.customerRef || "")).trim();
-  const hasLookupSignal = !!(customerName || customerRef);
+  const shipperName = String(
+      (patch.shipper && patch.shipper.name) ||
+      (data.shipper && data.shipper.name) || "").trim();
+  const hasLookupSignal = !!(customerName || customerRef || shipperName);
   if (!hasLookupSignal) {
     return {customerMatch: null, customerMatchMessage: null};
   }
@@ -109,7 +148,8 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
   const match = await resolveCustomerMatch({
     from: data.from || "",
     customerRef,
-    customerName,
+    customerName: customerName || shipperName,
+    shipperName,
     allowDefault: false,
   });
 
@@ -117,7 +157,8 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
     patch.shippingLocationId = String(match.id);
     if (match.name) patch.shippingLocationName = match.name;
     patch.customerLookupStatus = "matched";
-    patch.customerLookupQuery = customerName || customerRef || null;
+    patch.customerLookupQuery = customerName || customerRef ||
+      shipperName || null;
     const customerMatch = {
       id: String(match.id),
       name: match.name || null,
@@ -128,7 +169,8 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
 
   // Keep previous shippingLocationId; surface failed name lookup.
   patch.customerLookupStatus = "no_match";
-  patch.customerLookupQuery = customerName || customerRef || null;
+  patch.customerLookupQuery = customerName || customerRef ||
+    shipperName || null;
   return {
     customerMatch: null,
     customerMatchMessage: "No Primus match for name",
@@ -233,7 +275,7 @@ function normalizeFreightRows(rows) {
     const weightType =
       (weightTypeRaw === "each" || weightTypeRaw === "perpiece" ||
         weightTypeRaw === "per-piece") ? "each" : "total";
-    return {
+    return freightDims.normalizePalletDims({
       qty: numOrNull(r.qty),
       weight: numOrNull(r.weight),
       weightType,
@@ -248,7 +290,7 @@ function normalizeFreightRows(rows) {
       height: numOrNull(r.height),
       dimType: r.dimType != null && String(r.dimType).trim() ?
         String(r.dimType).trim() : "PLT",
-    };
+    });
   }).filter((r) =>
     r.qty != null || r.weight != null || r.length != null ||
     r.width != null || r.height != null || r.class != null);
@@ -543,6 +585,16 @@ function validateLaneForRating(lane) {
  * @return {Promise<object>}
  */
 async function rateLane(lane, ctx) {
+  if (lane && typeof lane === "object") {
+    if (lane.shipper) {
+      lane.shipper = await addressEnrichment.fillPartyCityStateFromZip(
+          lane.shipper);
+    }
+    if (lane.consignee) {
+      lane.consignee = await addressEnrichment.fillPartyCityStateFromZip(
+          lane.consignee);
+    }
+  }
   const odCheck = validateLaneForRating(lane);
   if (!odCheck.ok) {
     return {
@@ -555,8 +607,10 @@ async function rateLane(lane, ctx) {
   }
 
   // Always overwrite email class with Primus density class when
-  // weight + L×W×H are present.
-  const classFix = rateShop.ensureFreightClasses(lane.freightInfo || [], {
+  // weight + L×W×H are present. Pallet missing dims → 40×48×60 first.
+  const freightNormalized = freightDims.normalizePalletFreightRows(
+      lane.freightInfo || []);
+  const classFix = rateShop.ensureFreightClasses(freightNormalized, {
     UOM: "US",
   });
   const freightWithClass = classFix.freightInfo;
@@ -733,11 +787,22 @@ async function processQuoteEmail(opts) {
 
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
+  const extractedCustomerName = String(
+      extracted.customerName ||
+      extracted.shippingLocationName ||
+      (extracted.shipper && extracted.shipper.name) ||
+      "").trim();
   const customerMatch = await resolveCustomerMatch({
-    from, customerRef: extracted.customerRef,
+    from,
+    customerRef: extracted.customerRef,
+    customerName: extractedCustomerName,
+    shipperName: extracted.shipper && extracted.shipper.name,
   });
   const shippingLocationId = customerMatch.id || null;
-  const shippingLocationName = customerMatch.name || null;
+  const shippingLocationName = customerMatch.name ||
+    extractedCustomerName || null;
+  const customerLookupStatus = customerMatch.lookupStatus ||
+    (shippingLocationId ? "matched" : "no_match");
   const rules = await quoteRules.loadActiveRules(tenant);
 
   const enrichLog = (level, category, message, data) =>
@@ -804,6 +869,9 @@ async function processQuoteEmail(opts) {
     specialInstructionsGlobal: extracted.specialInstructionsGlobal || "",
     shippingLocationId,
     shippingLocationName,
+    customerLookupStatus,
+    customerLookupQuery: extractedCustomerName ||
+      customerMatch.searchTerm || null,
     lanes: ratedLanes,
     customerDraftText: "",
     status: "awaiting_dispatcher",
@@ -930,6 +998,11 @@ function serializeInboxQuote(doc, data) {
     assignedDispatcherEmail: data.assignedDispatcherEmail,
     receivedMailboxEmail: data.receivedMailboxEmail,
     dispatcherQuoteUrl: data.dispatcherQuoteUrl,
+    shippingLocationId: data.shippingLocationId || null,
+    shippingLocationName: data.shippingLocationName || null,
+    customerLookupStatus: data.customerLookupStatus || null,
+    customerMatched: !!(data.shippingLocationId &&
+      data.customerLookupStatus !== "no_match"),
     lanesPreview: (data.lanes || []).map((lane) => ({
       laneKey: lane.laneKey,
       label: lane.label,
@@ -942,13 +1015,74 @@ function serializeInboxQuote(doc, data) {
         rateId: o.id,
         name: o.name,
         SCAC: o.SCAC,
-        sellRate: o.sellRate,
+        sellRate: o.sellRate != null ? o.sellRate : o.total,
+        cost: o.total != null ? o.total : o.cost,
         transitDays: o.transitDays,
       })),
       optionCount: (lane.options || []).length,
       rateError: lane.rateError || null,
     })),
   };
+}
+
+/**
+ * True when quote belongs to this dispatcher (id + optional email match).
+ * @param {object} data Quote fields.
+ * @param {string} dispatcherId Dispatcher id.
+ * @param {string} dispatcherEmail Normalized email or "".
+ * @return {boolean}
+ */
+function quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail) {
+  if (data.assignedDispatcherId !== dispatcherId) return false;
+  if (dispatcherEmail && data.assignedDispatcherEmail &&
+    quoteDispatchers.normalizeEmail(data.assignedDispatcherEmail) !==
+    dispatcherEmail) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Counts all quotes assigned to one dispatcher by status.
+ * @param {object} tenant Tenant.
+ * @param {object} dispatcher Dispatcher row (id + email).
+ * @return {Promise<object>}
+ */
+async function countQuotesForDispatcher(tenant, dispatcher) {
+  const dispatcherId = String(dispatcher.id || dispatcher);
+  const dispatcherEmail = quoteDispatchers.normalizeEmail(
+      dispatcher.email || "");
+  const snap = await col(tenant, "quoteRequests")
+      .where("assignedDispatcherId", "==", dispatcherId)
+      .select("status", "dismissedAt", "assignedDispatcherEmail")
+      .get();
+  const counts = {
+    total: 0,
+    pending: 0,
+    awaiting: 0,
+    draftReady: 0,
+    dismissed: 0,
+  };
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    if (!quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail)) {
+      continue;
+    }
+    counts.total += 1;
+    if (isDismissedQuote(data)) {
+      counts.dismissed += 1;
+      continue;
+    }
+    const status = normalizeQuoteStatus(data.status);
+    if (status === "awaiting_dispatcher") {
+      counts.awaiting += 1;
+      counts.pending += 1;
+    } else if (status === "draft_ready") {
+      counts.draftReady += 1;
+      counts.pending += 1;
+    }
+  }
+  return counts;
 }
 
 /**
@@ -965,33 +1099,24 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
   const dispatcherId = String(dispatcher.id || dispatcher);
   const dispatcherEmail = quoteDispatchers.normalizeEmail(
       dispatcher.email || "");
-  const snap = await col(tenant, "quoteRequests")
-      .orderBy("createdAt", "desc")
-      .limit(limit * 5)
-      .get();
+  const [snap, counts] = await Promise.all([
+    col(tenant, "quoteRequests")
+        .orderBy("createdAt", "desc")
+        .limit(limit * 5)
+        .get(),
+    countQuotesForDispatcher(tenant, dispatcher),
+  ]);
   const items = [];
-  let pendingCount = 0;
-  let totalCount = 0;
   for (const doc of snap.docs) {
     const data = doc.data();
-    if (data.assignedDispatcherId !== dispatcherId) continue;
-    if (dispatcherEmail && data.assignedDispatcherEmail &&
-      quoteDispatchers.normalizeEmail(data.assignedDispatcherEmail) !==
-      dispatcherEmail) {
+    if (!quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail)) {
       continue;
-    }
-    if (!isDismissedQuote(data)) {
-      totalCount += 1;
-      if (isPendingQuote(data)) pendingCount += 1;
     }
     if (!matchesInboxStatus(data, opts.status)) continue;
     if (items.length >= limit) continue;
     items.push(serializeInboxQuote(doc, data));
   }
-  return {
-    items,
-    counts: {pending: pendingCount, total: totalCount},
-  };
+  return {items, counts};
 }
 
 /**

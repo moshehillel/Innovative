@@ -50,6 +50,13 @@ check("AI 35 PLT → dimType PLT",
     aiWrong.lanes[0].freightInfo[0].dimType, "PLT");
 check("AI 35 PLT → weight 137",
     aiWrong.lanes[0].freightInfo[0].weight, 137);
+check("AI 48x40 → 40x48", [
+  aiWrong.lanes[0].freightInfo[0].length,
+  aiWrong.lanes[0].freightInfo[0].width,
+  aiWrong.lanes[0].freightInfo[0].height,
+], [40, 48, 28]);
+check("AI total weight → weightType total",
+    aiWrong.lanes[0].freightInfo[0].weightType, "total");
 
 const heuristicBody = [
   "Pickup Location:",
@@ -74,11 +81,13 @@ check("heuristic dimType PLT",
     heuristic && heuristic.lanes[0].freightInfo[0].dimType, "PLT");
 check("heuristic weight 137",
     heuristic && heuristic.lanes[0].freightInfo[0].weight, 137);
-check("heuristic dims 48x40x28", [
+check("heuristic dims 40x48x28 not 48x40", [
   heuristic && heuristic.lanes[0].freightInfo[0].length,
   heuristic && heuristic.lanes[0].freightInfo[0].width,
   heuristic && heuristic.lanes[0].freightInfo[0].height,
-], [48, 40, 28]);
+], [40, 48, 28]);
+check("heuristic weightType total",
+    heuristic && heuristic.lanes[0].freightInfo[0].weightType, "total");
 
 const extracted = {
   shipper: {
@@ -104,6 +113,69 @@ const ruled = freightRules.applyFreightRules(extracted);
 check("no 26-cap split after carton fix", ruled.lanes.length, 1);
 check("ruled qty still 1 pallet",
     ruled.lanes[0].freightInfo[0].qty, 1);
+
+check("infer total weight",
+    intake.inferWeightTypeFromBody("Total weight – 2000"), "total");
+check("infer each pallet",
+    intake.inferWeightTypeFromBody("weight per pallet 500"), "each");
+check("total wins over each",
+    intake.inferWeightTypeFromBody(
+        "4 pallets, weight per pallet, Total weight – 2000"), "total");
+
+const missingDims = {
+  lanes: [{
+    freightInfo: [{
+      qty: 4, weight: 2000, dimType: "PLT", weightType: "each",
+    }],
+  }],
+};
+intake.normalizeFreightOnExtract(missingDims, "Total weight – 2000");
+check("missing pallet dims → 40x48x60", [
+  missingDims.lanes[0].freightInfo[0].length,
+  missingDims.lanes[0].freightInfo[0].width,
+  missingDims.lanes[0].freightInfo[0].height,
+], [40, 48, 60]);
+check("total-weight email forces weightType total",
+    missingDims.lanes[0].freightInfo[0].weightType, "total");
+
+const explicit = {
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 400, length: 42, width: 36, height: 30, dimType: "PLT",
+    }],
+  }],
+};
+intake.normalizeFreightOnExtract(explicit, "1 pallet 42x36x30");
+check("explicit non-standard dims kept", [
+  explicit.lanes[0].freightInfo[0].length,
+  explicit.lanes[0].freightInfo[0].width,
+  explicit.lanes[0].freightInfo[0].height,
+], [42, 36, 30]);
+
+const cartons = {
+  lanes: [{
+    freightInfo: [{qty: 10, weight: 100, dimType: "CTN"}],
+  }],
+};
+intake.normalizeFreightOnExtract(cartons, "10 cartons");
+check("cartons do not get pallet defaults", [
+  cartons.lanes[0].freightInfo[0].length || null,
+  cartons.lanes[0].freightInfo[0].width || null,
+  cartons.lanes[0].freightInfo[0].height || null,
+], [null, null, null]);
+
+const stripped = {
+  lanes: [{
+    freightInfo: [{
+      qty: 19, weight: 814605, dimType: "PLT", weightType: "each",
+    }],
+  }],
+};
+intake.normalizeFreightOnExtract(stripped, "Total weight – 8146");
+check("stripped decimals 814605 → 8146.05",
+    stripped.lanes[0].freightInfo[0].weight, 8146.05);
+check("stripped weight still total",
+    stripped.lanes[0].freightInfo[0].weightType, "total");
 
 if (failures) {
   console.log(`\n${failures} failed`);

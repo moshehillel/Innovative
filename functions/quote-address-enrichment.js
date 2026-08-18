@@ -100,6 +100,65 @@ function normalizeAddressKey(consignee) {
 }
 
 /**
+ * True when a party has a ZIP but is missing city and/or state.
+ * @param {object|null|undefined} party Address.
+ * @return {boolean}
+ */
+function partyNeedsCityStateFromZip(party) {
+  if (!party || typeof party !== "object") return false;
+  const zip = String(party.zipCode || party.zipcode || party.zip || "").trim();
+  if (!zip) return false;
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim();
+  return !city || !state;
+}
+
+/**
+ * US ZIP → city/state via Zippopotam (no API key).
+ * @param {string} zip Raw ZIP.
+ * @return {Promise<{city: string, state: string, zipCode: string}|null>}
+ */
+async function lookupUsZip(zip) {
+  const z = String(zip || "").replace(/\D/g, "").slice(0, 5);
+  if (!/^\d{5}$/.test(z)) return null;
+  try {
+    const resp = await fetch(`https://api.zippopotam.us/us/${z}`, {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    const place = json && json.places && json.places[0];
+    if (!place) return null;
+    const city = String(place["place name"] || "").trim();
+    const state = String(place["state abbreviation"] || "").trim();
+    if (!city || !state) return null;
+    return {city, state, zipCode: z};
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Fill missing city/state from ZIP so Primus can rate zip-only RFQs.
+ * @param {object|null|undefined} party Address.
+ * @return {Promise<object|null|undefined>}
+ */
+async function fillPartyCityStateFromZip(party) {
+  if (!partyNeedsCityStateFromZip(party)) return party;
+  const zip = party.zipCode || party.zipcode || party.zip;
+  const loc = await lookupUsZip(zip);
+  if (!loc) return party;
+  return {
+    ...party,
+    city: String(party.city || "").trim() || loc.city,
+    state: String(party.state || "").trim() || loc.state,
+    zipCode: String(party.zipCode || party.zipcode || party.zip || loc.zipCode)
+        .trim(),
+    country: String(party.country || "US").trim() || "US",
+  };
+}
+
+/**
  * @param {string} addressKey Cache key.
  * @return {string} Firestore-safe doc id.
  */
@@ -1033,6 +1092,14 @@ async function enrichLaneShipper(lane, tenant, opts = {}) {
  * @return {Promise<object>} Enriched lane (same reference).
  */
 async function enrichLaneAddresses(lane, tenant, opts = {}) {
+  if (lane && typeof lane === "object") {
+    if (lane.shipper) {
+      lane.shipper = await fillPartyCityStateFromZip(lane.shipper);
+    }
+    if (lane.consignee) {
+      lane.consignee = await fillPartyCityStateFromZip(lane.consignee);
+    }
+  }
   await enrichLaneShipper(lane, tenant, opts);
   await enrichLaneConsignee(lane, tenant, opts);
   return lane;
@@ -1064,4 +1131,7 @@ module.exports = {
   mapGoogleTypesToSiteType,
   isBareStreetGeocode,
   isAddressOnlyOrWeakName,
+  lookupUsZip,
+  fillPartyCityStateFromZip,
+  partyNeedsCityStateFromZip,
 };

@@ -71,6 +71,31 @@ checkIncludes(
     email,
     "• $245.00 – 2-day transit (estimated) – Central Transport · Q# 98765",
 );
+
+const costOnlyEmail = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#D5555",
+  shippingLocationName: "Acme Logistics",
+  shippingLocationId: "4170250",
+  lanes: [{
+    selectedOptions: [{
+      id: "r2",
+      name: "Estes",
+      total: 180,
+      transitDays: 3,
+      quoteNumber: "E9",
+    }],
+  }],
+}, {style: "bullet"});
+checkIncludes(
+    "email uses cost when sellRate missing",
+    costOnlyEmail,
+    "$180.00",
+);
+checkIncludes(
+    "email includes Primus customer name",
+    costOnlyEmail,
+    "Customer: Acme Logistics (Primus ID 4170250)",
+);
 checkNotIncludes(
     "email excludes carrier note lines",
     email,

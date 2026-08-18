@@ -16,9 +16,10 @@ const dispatcherAuth = require("./quote-dispatcher-auth");
 const quoteFirebaseAuth = require("./quote-firebase-auth");
 const quoteOutlook = require("./quote-outlook");
 const quoteAccCatalog = require("./quote-accessorial-catalog");
+const quotePasswordReset = require("./quote-password-reset");
 
 /** Bumped when quote-auth-client.js API changes (cache-bust HTML). */
-const QUOTE_AUTH_CLIENT_VERSION = "2";
+const QUOTE_AUTH_CLIENT_VERSION = "3";
 
 let deps = {};
 
@@ -461,6 +462,8 @@ async function handleGetQuoteRequests(req, res) {
         status: data.status,
         laneCount: (data.lanes || []).length,
         createdAt: data.createdAt,
+        shippingLocationId: data.shippingLocationId || null,
+        shippingLocationName: data.shippingLocationName || null,
       };
     });
     return res.json({ok: true, items});
@@ -851,9 +854,11 @@ async function handleGetQuoteDispatcherInbox(req, res) {
         });
     const items = Array.isArray(listed) ? listed : (listed.items || []);
     const counts = listed.counts || {
-      pending: items.filter(quoteAutomation.isPendingQuote).length,
-      total: items.filter((row) =>
-        !quoteAutomation.isDismissedQuote(row)).length,
+      total: 0,
+      pending: 0,
+      awaiting: 0,
+      draftReady: 0,
+      dismissed: 0,
     };
     const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
       "https://us-central1-tai-invoice-automation.cloudfunctions.net";
@@ -896,6 +901,44 @@ async function handleGetQuoteAuthConfig(req, res) {
     });
   } catch (err) {
     return res.status(500).json({ok: false, error: err.message});
+  }
+}
+
+/**
+ * POST send password-reset email via Gmail SMTP (no Firebase noreply).
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleSendQuotePasswordReset(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST"});
+  }
+  try {
+    const tenant = await deps.resolveDashboardTenant(req);
+    const email = (req.body && req.body.email) ||
+      (req.query && req.query.email) || "";
+    const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
+      "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+    const continueUrl =
+      `${base}/quoteDispatcherHomePage?tenantId=` +
+      encodeURIComponent(tenant.tenantId);
+    await quotePasswordReset.sendQuotePasswordReset(
+        tenant, email, continueUrl);
+    return res.json({
+      ok: true,
+      message: "If that email is on the quote roster, a reset link was sent.",
+    });
+  } catch (err) {
+    const status = Number(err && err.status) || 500;
+    if (status >= 500) {
+      console.error("sendQuotePasswordReset:", err.message || err);
+    }
+    return res.status(status).json({
+      ok: false,
+      error: err.message || "Could not send reset email",
+    });
   }
 }
 
@@ -1252,6 +1295,7 @@ module.exports = {
   handleGetQuoteDispatcherInbox,
   handleGetQuoteDispatchers,
   handleGetQuoteAuthConfig,
+  handleSendQuotePasswordReset,
   handleGetQuoteOutlookConnectUrl,
   handleQuoteOutlookDisconnect,
   handleQuoteOutlookOAuthCallback,

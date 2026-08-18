@@ -1073,10 +1073,12 @@
     function defaultCustomerPrice(opt) {
       if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
         const override = Number(opt.customerPrice);
-        if (isFinite(override)) return override;
+        if (isFinite(override) && override > 0) return override;
       }
       const sell = Number(opt && opt.sellRate);
-      return isFinite(sell) ? sell : "";
+      if (isFinite(sell) && sell > 0) return sell;
+      const cost = Number(opt && (opt.cost != null ? opt.cost : opt.total));
+      return isFinite(cost) && cost > 0 ? cost : "";
     }
 
     function collectSelections() {
@@ -1230,7 +1232,13 @@
     function applyQuote(q) {
       quote = q;
       document.getElementById("title").textContent = quote.batchQuoteId || "Quote";
+      const custBits = [];
+      if (quote.shippingLocationName) custBits.push(quote.shippingLocationName);
+      if (quote.shippingLocationId) {
+        custBits.push("ID " + quote.shippingLocationId);
+      }
       document.getElementById("meta").textContent =
+        (custBits.length ? custBits.join(" · ") + " — " : "") +
         (quote.from || "") + " — " + (quote.subject || "");
       renderCustomerMatch(quote);
       const badge = document.getElementById("status-badge");
@@ -1464,6 +1472,9 @@
       html += "<div><label class='field-label'>Customer name</label>" +
         "<input class='field-input' data-q='customerName' value='" +
         esc(q.shippingLocationName || "") + "'></div>";
+      html += "<div><label class='field-label'>Primus customer ID</label>" +
+        "<input class='field-input' data-q='shippingLocationId' readonly " +
+        "value='" + esc(q.shippingLocationId || "") + "'></div>";
       html += "<div><label class='field-label'>Customer ref</label>" +
         "<input class='field-input' data-q='customerRef' value='" +
         esc(q.customerRef || "") + "'></div>";

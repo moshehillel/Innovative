@@ -215,6 +215,7 @@
       line-height: 1.1;
     }
     .stat .lbl { color: var(--muted); font-size: 0.8125rem; margin-top: 6px; font-weight: 500; }
+    .stat .num.muted { color: var(--muted); }
     button, .btn {
       background: var(--primary);
       color: #fff;
@@ -439,6 +440,12 @@
       margin-top: 4px;
       line-height: 1.45;
     }
+    .quote-card-customer {
+      color: var(--text-secondary);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      margin-top: 2px;
+    }
     .quote-card-body {
       display: none;
       padding: 0 18px 18px;
@@ -560,15 +567,14 @@
         <div class="status warn" id="outlook-status">
           Connect your Outlook mailbox to receive quotes sent to your email.
         </div>
-        <button type="button" class="ghost" id="btn-outlook-sync" disabled>
-          Sync Outlook
-        </button>
         <button type="button" class="ghost" id="btn-outlook-connect">Connect Outlook</button>
         <button type="button" class="ghost hidden" id="btn-outlook-disconnect">Disconnect</button>
       </div>
       <div class="stats">
-        <div class="stat"><div class="num" id="stat-pending">—</div><div class="lbl">Pending</div></div>
-        <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Recent quotes</div></div>
+        <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Total quotes</div></div>
+        <div class="stat"><div class="num" id="stat-awaiting">—</div><div class="lbl">Awaiting</div></div>
+        <div class="stat"><div class="num" id="stat-draft">—</div><div class="lbl">Draft ready</div></div>
+        <div class="stat"><div class="num muted" id="stat-dismissed">—</div><div class="lbl">Dismissed</div></div>
       </div>
       <div class="filter-bar">
         <button type="button" id="filter-pending" class="ghost">Pending only</button>
@@ -740,10 +746,21 @@
       return isFinite(n) ? n : 0;
     }
 
+    function applyCounts(counts) {
+      const c = counts || {};
+      writeStat("stat-total", Number(c.total) || 0);
+      writeStat("stat-awaiting", Number(c.awaiting) || 0);
+      writeStat("stat-draft", Number(c.draftReady) || 0);
+      writeStat("stat-dismissed", Number(c.dismissed) || 0);
+    }
+
     function applyLocalDismissStats(status) {
-      writeStat("stat-total", readStat("stat-total") - 1);
-      if (isPendingItem({status: status})) {
-        writeStat("stat-pending", readStat("stat-pending") - 1);
+      writeStat("stat-dismissed", readStat("stat-dismissed") + 1);
+      const s = quoteStatusOf({status: status});
+      if (s === "awaiting_dispatcher") {
+        writeStat("stat-awaiting", readStat("stat-awaiting") - 1);
+      } else if (s === "draft_ready") {
+        writeStat("stat-draft", readStat("stat-draft") - 1);
       }
     }
 
@@ -762,13 +779,6 @@
           });
       if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
       return res2;
-    }
-
-    function setSyncButtonBusy(busy, label) {
-      const btn = document.getElementById("btn-outlook-sync");
-      if (!btn) return;
-      btn.disabled = busy || !outlookConnected;
-      btn.textContent = label || (busy ? "Syncing…" : "Sync Outlook");
     }
 
     async function loadProfile() {
@@ -797,7 +807,6 @@
         connectBtn.classList.remove("hidden");
         disconnectBtn.classList.add("hidden");
       }
-      setSyncButtonBusy(!!syncInFlight);
       return res;
     }
 
@@ -818,12 +827,8 @@
       }
       const visible = (res.items || []).filter((i) => !isDismissedItem(i));
       const pendingItems = visible.filter(isPendingItem);
-      const counts = res.counts || {
-        total: visible.length,
-        pending: pendingItems.length,
-      };
-      writeStat("stat-total", Number(counts.total) || 0);
-      writeStat("stat-pending", Number(counts.pending) || 0);
+      const counts = res.counts || {};
+      applyCounts(counts);
       let items = pendingView ? pendingItems : visible;
       if (!items.length) {
         root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
@@ -835,7 +840,8 @@
         const lanesHtml = lanes.map((lane) => {
           const opts = (lane.topOptions || []).map((o) =>
             '<div class="rate-line"><span class="sell">$' +
-            num(o.sellRate) + "</span> · " + esc(o.name || o.SCAC || "Carrier") +
+            num(o.sellRate != null ? o.sellRate : o.cost) + "</span> · " +
+            esc(o.name || o.SCAC || "Carrier") +
             (o.transitDays ? " · " + o.transitDays + " days" : "") +
             "</div>"
           ).join("");
@@ -853,11 +859,21 @@
             more + acc + "</div>";
         }).join("");
 
+        const custName = item.shippingLocationName || "";
+        const custId = item.shippingLocationId || "";
+        const custHtml = (custName || custId) ?
+          '<div class="quote-card-customer">' +
+            esc(custName || "Primus customer") +
+            (custId ? " · ID " + esc(String(custId)) : "") +
+          "</div>" :
+          '<div class="quote-card-customer">No Primus customer match</div>';
+
         return `<div class="quote-card" data-id="${esc(item.id)}" data-status="${esc(item.status || "")}">
           <div class="quote-card-head">
             <span class="chevron">▶</span>
             <div>
               <div class="quote-card-title">${esc(item.batchQuoteId || "—")}</div>
+              ${custHtml}
               <div class="quote-card-sub">${esc(item.from || "")}<br>${esc(item.subject || "")}<br>${item.laneCount || 0} lane(s)</div>
             </div>
             <span class="badge ${pending ? "pending" : ""}">${esc(item.status || "")}</span>
@@ -944,7 +960,6 @@
       if (!force && (Date.now() - lastSyncAt()) < SYNC_THROTTLE_MS) {
         return Promise.resolve();
       }
-      setSyncButtonBusy(true);
       syncInFlight = (async () => {
         try {
           await loadInbox({sync: true});
@@ -953,7 +968,6 @@
           // Non-fatal: scheduler still syncs ~every 20 min.
         } finally {
           syncInFlight = null;
-          setSyncButtonBusy(false);
         }
       })();
       return syncInFlight;
@@ -1019,9 +1033,6 @@
     });
 
     document.getElementById("btn-signout").addEventListener("click", () => QuoteAuth.signOut());
-    document.getElementById("btn-outlook-sync").addEventListener("click", () => {
-      syncOutlookInBackground({force: true});
-    });
     document.getElementById("btn-outlook-connect").addEventListener("click", async () => {
       try {
         const res = await apiFetch("/getQuoteOutlookConnectUrl?tenantId=" +

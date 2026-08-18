@@ -56,6 +56,30 @@ check("query destinationCountry US", q.destinationCountry, "US");
 const freight = JSON.parse(q.freightInfo);
 check("query freight dimType PLT", freight[0].dimType, "PLT");
 
+const swapped = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},
+  consignee: {city: "B", state: "MA", zipCode: "01040", country: "US"},
+  freightInfo: [{
+    qty: 1, weight: 137, weightType: "total",
+    length: 48, width: 40, height: 28, dimType: "PLT",
+  }],
+}, {UOM: "US"});
+const swappedFreight = JSON.parse(swapped.freightInfo);
+check("rate payload 48x40 → L 40", swappedFreight[0].length, 40);
+check("rate payload 48x40 → W 48", swappedFreight[0].width, 48);
+check("rate payload height kept", swappedFreight[0].height, 28);
+
+const missingDimsQ = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},
+  consignee: {city: "B", state: "MA", zipCode: "01040", country: "US"},
+  freightInfo: [{qty: 1, weight: 500, dimType: "PLT"}],
+}, {UOM: "US"});
+const missingFreight = JSON.parse(missingDimsQ.freightInfo);
+check("missing dims default L 40", missingFreight[0].length, 40);
+check("missing dims default W 48", missingFreight[0].width, 48);
+check("missing dims default H 60", missingFreight[0].height, 60);
+check("missing dims weightType total", missingFreight[0].weightType, "total");
+
 // Density → class (Primus-compatible NMFC table)
 check("density 24.375 → 65", rateShop.classFromDensity(24.375), 65);
 check("density 12.36 → 85", rateShop.classFromDensity(12.36), 85);

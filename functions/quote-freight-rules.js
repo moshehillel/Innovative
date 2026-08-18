@@ -12,6 +12,7 @@
 "use strict";
 
 const rateShop = require("./quote-rate-shop");
+const freightDims = require("./quote-freight-dims");
 
 const DEFAULT_MAX_PALLETS_PER_TRAILER = 26;
 
@@ -181,7 +182,8 @@ function freightForPortion(freightInfo, portionQty, totalPallets) {
   if (base.width != null) row.width = base.width;
   if (base.height != null) row.height = base.height;
   if (base.weightType != null) row.weightType = base.weightType;
-  return [row];
+  else row.weightType = "total";
+  return [freightDims.normalizePalletDims(row)];
 }
 
 /**

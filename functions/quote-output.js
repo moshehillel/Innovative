@@ -6,6 +6,7 @@
 
 const quoteRules = require("./quote-accessorial-rules");
 const addressEnrichment = require("./quote-address-enrichment");
+const freightDims = require("./quote-freight-dims");
 
 /** Common accessorial toggles for dispatcher re-rate UI. */
 const COMMON_ACCESSORIALS = [
@@ -101,6 +102,24 @@ function money(n) {
 }
 
 /**
+ * Primus customer line for dispatcher cards / customer email.
+ * @param {object} quote Quote doc.
+ * @return {string} Empty if unknown.
+ */
+function formatQuoteCustomerLine(quote) {
+  const q = quote || {};
+  const name = String(q.shippingLocationName || q.matchedCustomerName || "")
+      .trim();
+  const id = q.shippingLocationId != null &&
+    String(q.shippingLocationId).trim() !== "" ?
+    String(q.shippingLocationId).trim() : "";
+  if (!name && !id) return "";
+  if (name && id) return `Customer: ${name} (Primus ID ${id})`;
+  if (name) return `Customer: ${name}`;
+  return `Customer: Primus ID ${id}`;
+}
+
+/**
  * Human-readable site type for customer notes.
  * @param {string} siteType Internal enum.
  * @return {string}
@@ -187,12 +206,16 @@ function buildAccessorialWhy(lane) {
  */
 function buildCustomerDraftText(quote) {
   const batchId = quote.batchQuoteId || "Q#????";
+  const customerLine = formatQuoteCustomerLine(quote);
   const lines = [
     "Hi,",
     "",
     `See your options below — ${batchId}:`,
     "",
   ];
+  if (customerLine) {
+    lines.splice(3, 0, customerLine);
+  }
 
   for (const lane of quote.lanes || []) {
     const destCity =
@@ -247,12 +270,19 @@ function buildAccessorialsIncludedSection(lanes) {
  */
 function effectiveCustomerRate(opt) {
   if (!opt || typeof opt !== "object") return null;
-  if (opt.customerPrice != null && opt.customerPrice !== "") {
-    const override = Number(opt.customerPrice);
-    if (Number.isFinite(override)) return override;
+  const candidates = [
+    opt.customerPrice,
+    opt.sellRate,
+    opt.total,
+    opt.cost,
+    opt.customerRate,
+  ];
+  for (const value of candidates) {
+    if (value == null || value === "") continue;
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
   }
-  const sell = Number(opt.sellRate);
-  return Number.isFinite(sell) ? sell : null;
+  return null;
 }
 
 /**
@@ -272,12 +302,13 @@ function customerNoteFromOption(opt) {
  * @return {string}
  */
 function formatCustomerPricingLineBullet(opt) {
-  const price = money(effectiveCustomerRate(opt));
+  const amount = money(effectiveCustomerRate(opt));
+  const priceBit = amount ? `$${amount}` : "$TBD";
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const days = opt.transitDays || "?";
   const svc = opt.guaranteed ? "guaranteed" : "estimated";
-  return `• $${price} – ${days}-day transit (${svc}) – ${carrier} · Q# ${q}`;
+  return `• ${priceBit} – ${days}-day transit (${svc}) – ${carrier} · Q# ${q}`;
 }
 
 /**
@@ -286,12 +317,13 @@ function formatCustomerPricingLineBullet(opt) {
  * @return {string}
  */
 function formatCustomerPricingLineSimple(opt) {
-  const price = money(effectiveCustomerRate(opt));
+  const amount = money(effectiveCustomerRate(opt));
+  const priceBit = amount ? `$${amount}` : "$TBD";
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "";
   const days = opt.transitDays || "?";
   let line =
-    `$${price} · ${carrier} · ${days}-day transit (estimated)`;
+    `${priceBit} · ${carrier} · ${days}-day transit (estimated)`;
   if (q) line += ` · Q# ${q}`;
   return line;
 }
@@ -302,12 +334,13 @@ function formatCustomerPricingLineSimple(opt) {
  * @return {string}
  */
 function formatCustomerPricingLine(opt) {
-  const price = money(effectiveCustomerRate(opt));
+  const amount = money(effectiveCustomerRate(opt));
+  const priceBit = amount ? `$${amount}` : "$TBD";
   const carrier = opt.name || opt.SCAC || "Carrier";
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const transit = opt.transitDays ? `${opt.transitDays}` : "?";
   return (
-    `$${price} · ${transit} standard business days (estimated) · ` +
+    `${priceBit} · ${transit} standard business days (estimated) · ` +
     `${carrier} · Q# ${q}`
   );
 }
@@ -347,12 +380,16 @@ function resolveSelectedOptions(lane) {
 function buildCustomerEmailFromSelections(quote, opts = {}) {
   const batchId = quote.batchQuoteId || "Q#????";
   const formatLine = pricingFormatter(opts.style || "bullet");
+  const customerLine = formatQuoteCustomerLine(quote);
   const lines = [
     "Hi,",
     "",
     `See your options below — ${batchId}:`,
     "",
   ];
+  if (customerLine) {
+    lines.splice(3, 0, customerLine);
+  }
 
   const multiLane = (quote.lanes || []).length > 1;
   for (const lane of quote.lanes || []) {
@@ -502,7 +539,8 @@ function serializeForDispatcherPage(quote) {
       label: lane.label,
       shipper: lane.shipper || quoteShipper || null,
       consignee: lane.consignee,
-      freightInfo: Array.isArray(lane.freightInfo) ? lane.freightInfo : [],
+      freightInfo: Array.isArray(lane.freightInfo) ?
+        freightDims.normalizePalletFreightRows(lane.freightInfo) : [],
       specialInstructions: lane.specialInstructions || "",
       notesForCustomer: lane.notesForCustomer || null,
       siteType: lane.siteType || null,
@@ -528,8 +566,9 @@ function serializeForDispatcherPage(quote) {
           rateId: o.id,
           name: o.name,
           SCAC: o.SCAC,
-          cost: o.total,
-          sellRate: o.sellRate,
+          cost: o.total != null ? o.total : o.cost,
+          sellRate: o.sellRate != null ? o.sellRate :
+            (o.total != null ? o.total : o.cost),
           customerPrice: o.customerPrice != null ?
             Number(o.customerPrice) : null,
           transitDays: o.transitDays,
@@ -564,4 +603,5 @@ module.exports = {
   collectAppliedAccessorials,
   resolveSelectedOptions,
   COMMON_ACCESSORIALS,
+  formatQuoteCustomerLine,
 };

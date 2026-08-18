@@ -6,6 +6,7 @@
 "use strict";
 
 const quoteOutput = require("./quote-output");
+const freightDims = require("./quote-freight-dims");
 
 let getPrimusToken = null;
 
@@ -812,11 +813,13 @@ function ensureFreightClasses(freightInfo, opts = {}) {
  * @return {Array<object>}
  */
 function normalizeFreightInfoForRate(freightInfo, opts = {}) {
-  const ensured = ensureFreightClasses(freightInfo, opts);
+  const dimmed = freightDims.normalizePalletFreightRows(freightInfo);
+  const ensured = ensureFreightClasses(dimmed, opts);
   return ensured.freightInfo.map((row) => {
     const r = row && typeof row === "object" ? {...row} : {};
     r.dimType = normalizeDimType(r.dimType, r);
     // Primus requires weightType; AI extract often omits it.
+    // Default total unless clearly per-piece (never treat omitted as each).
     const wt = String(r.weightType || "").trim().toLowerCase();
     r.weightType = (wt === "each" || wt === "perpiece" || wt === "per-piece") ?
       "each" : "total";
@@ -1043,4 +1046,5 @@ module.exports = {
   ensureFreightClasses,
   VALID_NMFC_CLASSES,
   DENSITY_CLASS_TABLE,
+  freightDims,
 };
