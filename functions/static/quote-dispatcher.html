@@ -508,6 +508,15 @@
       margin: 0 0 14px;
       font-size: 0.8125rem;
     }
+    .quote-warnings {
+      margin: -6px 0 14px;
+    }
+    .quote-warnings .warn { margin-top: 6px; }
+    .badge.market {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border-color: #fcd34d;
+    }
     .badge.match {
       background: var(--success-bg);
       color: var(--success);
@@ -899,6 +908,7 @@
         <span id="status-badge" class="badge" style="margin-left:8px"></span>
       </div>
       <div id="customer-match" class="customer-match hidden"></div>
+      <div id="quote-warnings" class="quote-warnings hidden"></div>
       <div class="toolbar">
         <button type="button" id="btn-generate">Save rate and generate draft email</button>
         <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
@@ -1124,27 +1134,62 @@
     function renderCustomerMatch(q) {
       const el = document.getElementById("customer-match");
       if (!el) return;
+      const bits = [];
       if (q.customerLookupStatus === "no_match" ||
           q.customerMatchMessage === "No Primus match for name") {
         const qName = q.customerLookupQuery || q.shippingLocationName || "";
-        el.innerHTML = "<span class='badge nomatch'>" +
-          "No Primus match for name" +
+        bits.push("<span class='badge nomatch'>No Primus match" +
           (qName ? " (“" + esc(qName) + "”)" : "") +
-          "</span>";
-        el.classList.remove("hidden");
-        return;
-      }
-      if (q.customerMatched && q.shippingLocationId) {
+          "</span>");
+      } else if (q.customerMatched && q.shippingLocationId) {
         const name = q.shippingLocationName ?
           esc(q.shippingLocationName) + " · " : "";
-        el.innerHTML = "<span class='badge match'>Primus customer: " +
-          name + "ID " + esc(q.shippingLocationId) + "</span>";
-        el.classList.remove("hidden");
+        bits.push("<span class='badge match'>Primus customer: " +
+          name + "ID " + esc(q.shippingLocationId) + "</span>");
       } else {
-        el.innerHTML = "<span class='badge nomatch'>" +
-          "No customer match — set customer rates manually</span>";
-        el.classList.remove("hidden");
+        bits.push("<span class='badge nomatch'>" +
+          "No Primus match — set customer rates manually</span>");
       }
+      if (q.rateSource === "market_fallback") {
+        bits.push("<span class='badge market'>rate source: market fallback" +
+          "</span>");
+      } else if (q.rateSource === "customer") {
+        bits.push("<span class='badge match'>rate source: customer</span>");
+      }
+      el.innerHTML = bits.join(" ");
+      el.classList.remove("hidden");
+    }
+
+    function uniqueWarns(list) {
+      const out = [];
+      (list || []).forEach((w) => {
+        const t = String(w || "").trim();
+        if (t && out.indexOf(t) < 0) out.push(t);
+      });
+      return out;
+    }
+
+    function renderQuoteWarnings(q) {
+      const el = document.getElementById("quote-warnings");
+      if (!el) return;
+      const warns = uniqueWarns(q.extractionWarnings);
+      (q.lanes || []).forEach((lane) => {
+        uniqueWarns(lane.extractionWarnings).forEach((w) => {
+          if (warns.indexOf(w) < 0) warns.push(w);
+        });
+      });
+      if (q.rateSource === "market_fallback" &&
+          warns.indexOf("market fallback") < 0) {
+        warns.push("market fallback");
+      }
+      if (!warns.length) {
+        el.innerHTML = "";
+        el.classList.add("hidden");
+        return;
+      }
+      el.innerHTML = warns.map((w) =>
+        "<div class='warn'>" + esc(w) + "</div>").join("");
+      el.classList.remove("hidden");
     }
 
     async function persistSelections() {
@@ -1241,6 +1286,7 @@
         (custBits.length ? custBits.join(" · ") + " — " : "") +
         (quote.from || "") + " — " + (quote.subject || "");
       renderCustomerMatch(quote);
+      renderQuoteWarnings(quote);
       const badge = document.getElementById("status-badge");
       badge.textContent = quote.status || "";
       badge.className = "badge " + (quote.status || "");
@@ -1872,6 +1918,17 @@
         } else if (lane.rateWarning) {
           optsHtml = "<div class='warn'>" + esc(lane.rateWarning) + "</div>";
         }
+        if (lane.rateSource === "market_fallback" && !lane.rateWarning) {
+          optsHtml += "<div class='warn'>Primus customer matched but no " +
+            "customer tariffs — showing market rates.</div>";
+        }
+        uniqueWarns(lane.extractionWarnings).forEach((w) => {
+          if (lane.rateWarning && lane.rateWarning.indexOf(w) >= 0) return;
+          if (w === "market fallback" && lane.rateSource === "market_fallback") {
+            return;
+          }
+          optsHtml += "<div class='warn'>" + esc(w) + "</div>";
+        });
         (lane.options || []).forEach((opt) => {
           const isChecked = selected.has(String(opt.rateId));
           const rateId = String(opt.rateId);

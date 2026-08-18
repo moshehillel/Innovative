@@ -268,6 +268,52 @@ intake.applyEmailPalletBlocks(twoPalletsPhrase, "please quote 2 pallets");
 check("2 pallets phrase does not collapse to 1",
     twoPalletsPhrase.lanes[0].freightInfo[0].qty, 2);
 
+const normalized = intake.normalizeExtractedQuote({
+  lanes: [{
+    laneKey: "NN_VA",
+    freightInfo: [{
+      qty: 35, weight: 137, dimType: "PLT", length: 48, width: 40, height: 28,
+    }],
+  }],
+}, {subject: "RFQ", body: D8986_BODY});
+check("normalizeExtractedQuote qty 1 not 35",
+    normalized.lanes[0].freightInfo[0].qty, 1);
+check("normalizeExtractedQuote 40x48", [
+  normalized.lanes[0].freightInfo[0].length,
+  normalized.lanes[0].freightInfo[0].width,
+], [40, 48]);
+check("normalizeExtractedQuote weightType total",
+    normalized.lanes[0].freightInfo[0].weightType, "total");
+check("normalizeExtractedQuote defaulted dims warning absent when dims given",
+    (normalized.extractionWarnings || []).includes("defaulted dims"), false);
+
+const missingNorm = intake.normalizeExtractedQuote({
+  lanes: [{freightInfo: [{qty: 2, weight: 400, dimType: "PLT"}]}],
+}, {body: "2 pallets total weight 400"});
+check("normalizeExtractedQuote defaults 40x48x60", [
+  missingNorm.lanes[0].freightInfo[0].length,
+  missingNorm.lanes[0].freightInfo[0].width,
+  missingNorm.lanes[0].freightInfo[0].height,
+], [40, 48, 60]);
+check("normalizeExtractedQuote warns defaulted dims",
+    (missingNorm.extractionWarnings || []).includes("defaulted dims"), true);
+
+const noApptNorm = intake.normalizeExtractedQuote({
+  lanes: [{
+    specialInstructions: "No Appointment necessary",
+    freightInfo: [{qty: 1, weight: 100, dimType: "PLT"}],
+  }],
+  customerRequest: {requestedAccessorials: ["APD"]},
+}, {subject: "RFQ", body: "No Appointment necessary"});
+check("normalizeExtractedQuote strips APD warning",
+    (noApptNorm.extractionWarnings || [])
+        .includes("stripped APD: customer said no appt"), true);
+check("normalizeExtractedQuote declined APD persisted",
+    (noApptNorm.customerDeclinedAccessorials || []).includes("APD"), true);
+check("normalizeExtractedQuote requestedAccessorials no APD",
+    !(noApptNorm.customerRequest.requestedAccessorials || []).includes("APD"),
+    true);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

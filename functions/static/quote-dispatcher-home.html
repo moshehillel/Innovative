@@ -446,6 +446,13 @@
       font-weight: 600;
       margin-top: 2px;
     }
+    .quote-card-customer.nomatch { color: var(--warning); }
+    .quote-card-warn {
+      color: var(--warning);
+      font-size: 0.75rem;
+      font-weight: 600;
+      margin-top: 4px;
+    }
     .quote-card-body {
       display: none;
       padding: 0 18px 18px;
@@ -859,14 +866,36 @@
             more + acc + "</div>";
         }).join("");
 
+        const matched = !!item.customerMatched;
         const custName = item.shippingLocationName || "";
         const custId = item.shippingLocationId || "";
-        const custHtml = (custName || custId) ?
+        const custHtml = matched && (custName || custId) ?
           '<div class="quote-card-customer">' +
             esc(custName || "Primus customer") +
             (custId ? " · ID " + esc(String(custId)) : "") +
           "</div>" :
-          '<div class="quote-card-customer">No Primus customer match</div>';
+          '<div class="quote-card-customer nomatch">No Primus match</div>';
+        const warnBits = [];
+        if (item.rateSource === "market_fallback") {
+          warnBits.push("market fallback");
+        } else if (item.rateSource === "customer") {
+          warnBits.push("customer rates");
+        }
+        (item.extractionWarnings || []).forEach((w) => {
+          if (w && warnBits.indexOf(w) < 0) warnBits.push(w);
+        });
+        (lanes || []).forEach((lane) => {
+          if (lane.rateWarning && warnBits.indexOf(lane.rateWarning) < 0) {
+            warnBits.push(lane.rateWarning);
+          }
+          if (lane.rateSource === "market_fallback" &&
+              warnBits.indexOf("market fallback") < 0) {
+            warnBits.push("market fallback");
+          }
+        });
+        const warnHtml = warnBits.length ?
+          '<div class="quote-card-warn">' +
+            esc(warnBits.join(" · ")) + "</div>" : "";
 
         return `<div class="quote-card" data-id="${esc(item.id)}" data-status="${esc(item.status || "")}">
           <div class="quote-card-head">
@@ -874,6 +903,7 @@
             <div>
               <div class="quote-card-title">${esc(item.batchQuoteId || "—")}</div>
               ${custHtml}
+              ${warnHtml}
               <div class="quote-card-sub">${esc(item.from || "")}<br>${esc(item.subject || "")}<br>${item.laneCount || 0} lane(s)</div>
             </div>
             <span class="badge ${pending ? "pending" : ""}">${esc(item.status || "")}</span>

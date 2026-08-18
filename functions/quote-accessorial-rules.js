@@ -9,7 +9,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
-const appointmentText = require("./quote-appointment-text");
+const declinedAcc = require("./quote-declined-accessorials");
 
 const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both"];
 const DEFAULT_IDENTIFY_VIA = "both";
@@ -493,20 +493,24 @@ function ruleMatchViaText(lane, context, rule, side = "dest") {
   }
   if (match.instructionsContains &&
     containsAny(instr, match.instructionsContains)) {
-    const addsAppt = (rule.addAccessorials || []).some((c) => {
-      const u = String(c || "").toUpperCase();
-      return u === "APD" || u === "APO";
-    });
     const declineText = [
       instr,
       context.emailBody,
       context.subject,
       context.body,
+      context.specialInstructionsGlobal,
     ].filter(Boolean).join(" ");
-    if (addsAppt &&
-      appointmentText.declinesAppointmentDelivery(declineText)) {
-      // Negative "no appointment" wins over the appointment keyword.
-    } else {
+    const declined = new Set(
+        declinedAcc.detectDeclinedAccessorials(declineText).codes);
+    const extra = Array.isArray(context.customerDeclinedAccessorials) ?
+      context.customerDeclinedAccessorials : [];
+    for (const c of extra) declined.add(String(c || "").toUpperCase());
+    const adds = (rule.addAccessorials || [])
+        .map((c) => String(c || "").toUpperCase())
+        .filter(Boolean);
+    const allDeclined = adds.length > 0 &&
+      adds.every((c) => declined.has(c));
+    if (!allDeclined) {
       return "instructions";
     }
   }
@@ -685,36 +689,20 @@ function applyRulesToLane(lane, rules, context = {}) {
     context.subject,
     context.body,
   ].filter(Boolean).join(" ");
-  if (appointmentText.declinesAppointmentDelivery(declineText)) {
-    const hadAppt = codes.has("APD") || codes.has("APO");
-    codes.delete("APD");
-    codes.delete("APO");
-    const kept = applied.filter((row) =>
-      row.ruleId !== "appointment_delivery_text");
-    applied.length = 0;
-    applied.push(...kept);
-    if (hadAppt) {
-      applied.push({
-        ruleId: "email_no_appointment",
-        name: "No appointment needed",
-        notes: "Customer said no appointment is needed — APD not applied.",
-        matchVia: "email",
-      });
-    }
-    const filteredData = withData.filter((row) => {
-      const c = String(row && row.code || "").toUpperCase();
-      return c !== "APD" && c !== "APO";
-    });
-    withData.length = 0;
-    withData.push(...filteredData);
-  }
-
-  return {
+  const stripped = declinedAcc.applyDeclinedAccessorials({
     accessorials: [...codes],
     accessorialsWithData: withData,
-    filterCarrierWarnings: filterWarnings,
     appliedRules: applied,
+  }, declineText, context.customerDeclinedAccessorials);
+
+  return {
+    accessorials: stripped.accessorials,
+    accessorialsWithData: stripped.accessorialsWithData,
+    filterCarrierWarnings: filterWarnings,
+    appliedRules: stripped.appliedRules,
     requiresConfirm,
+    customerDeclinedAccessorials: stripped.customerDeclinedAccessorials ||
+      [],
   };
 }
 

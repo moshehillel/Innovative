@@ -162,27 +162,21 @@ function summarizeNoRateErrors(noRates) {
 }
 
 /**
- * True when empty rates are mostly customer-profile / class failures
- * that often clear if we rate without a customerId.
- * Primus sometimes returns empty rates AND empty noRates for customers
- * with no carrier profiles (no error text to key off) — treat that as
- * a profile miss too so market fallback still fires.
- * @param {Array<object>} noRates Carrier failure rows.
+ * Dispatcher-visible warning when customer tariffs are empty and we
+ * show market rates instead. Never imply those are contract rates.
+ */
+const MARKET_FALLBACK_WARNING =
+  "Primus customer matched but no customer tariffs — showing market rates.";
+
+/**
+ * Always retry /rate/multiple without customerId when the customer
+ * call returned no rates — empty noRates, profile errors, class
+ * errors, or any other Primus miss.
+ * @param {Array<object>} [_noRates] Carrier failure rows (unused).
  * @return {boolean}
  */
-function shouldRetryRatesWithoutCustomer(noRates) {
-  const rows = Array.isArray(noRates) ? noRates : [];
-  if (!rows.length) return true;
-  let hits = 0;
-  for (const row of rows) {
-    const err = String((row && row.error) || "").toLowerCase();
-    if (err.includes("customer profile") ||
-        err.includes("class invalid") ||
-        err.includes("invalid class")) {
-      hits += 1;
-    }
-  }
-  return hits >= Math.max(1, Math.ceil(rows.length * 0.5));
+function shouldRetryRatesWithoutCustomer(_noRates) {
+  return true;
 }
 
 /**
@@ -380,8 +374,9 @@ function expandCustomerSearchTerms(term) {
   };
   add(term);
   const tokens = distinctiveCustomerNameTokens(term);
-  const stem = tokens[0] || "";
-  if (stem.length >= 5) add(stem);
+  for (const tok of tokens) {
+    if (tok.length >= 4) add(tok);
+  }
   return out;
 }
 
@@ -492,7 +487,9 @@ async function resolveCustomerForQuote(opts = {}) {
     customerName: opts.customerName || opts.name || "",
   };
 
+  const searchesTried = [];
   for (const term of searches) {
+    searchesTried.push(term);
     try {
       const res = await searchShippingLocations({
         name: term,
@@ -509,6 +506,7 @@ async function resolveCustomerForQuote(opts = {}) {
           customer: best.customer === true,
           email: best.email || null,
           searchTerm: term,
+          searchesTried,
         };
       }
     } catch (err) {
@@ -516,7 +514,7 @@ async function resolveCustomerForQuote(opts = {}) {
           err && err.message);
     }
   }
-  return null;
+  return {id: null, name: null, searchesTried};
 }
 
 /**
@@ -1108,6 +1106,7 @@ module.exports = {
   parseNoRatesFromResponse,
   summarizeNoRateErrors,
   shouldRetryRatesWithoutCustomer,
+  MARKET_FALLBACK_WARNING,
   normalizeIsoCountry,
   normalizeDimType,
   normalizeFreightInfoForRate,

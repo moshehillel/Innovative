@@ -141,13 +141,20 @@ async function lookupUsZip(zip) {
 /**
  * Fill missing city/state from ZIP so Primus can rate zip-only RFQs.
  * @param {object|null|undefined} party Address.
+ * @param {object} [lane] Optional lane to stamp "zip filled" warning.
  * @return {Promise<object|null|undefined>}
  */
-async function fillPartyCityStateFromZip(party) {
+async function fillPartyCityStateFromZip(party, lane) {
   if (!partyNeedsCityStateFromZip(party)) return party;
   const zip = party.zipCode || party.zipcode || party.zip;
   const loc = await lookupUsZip(zip);
   if (!loc) return party;
+  if (lane && typeof lane === "object") {
+    const list = Array.isArray(lane.extractionWarnings) ?
+      lane.extractionWarnings : [];
+    if (!list.includes("zip filled")) list.push("zip filled");
+    lane.extractionWarnings = list;
+  }
   return {
     ...party,
     city: String(party.city || "").trim() || loc.city,
@@ -1094,10 +1101,10 @@ async function enrichLaneShipper(lane, tenant, opts = {}) {
 async function enrichLaneAddresses(lane, tenant, opts = {}) {
   if (lane && typeof lane === "object") {
     if (lane.shipper) {
-      lane.shipper = await fillPartyCityStateFromZip(lane.shipper);
+      lane.shipper = await fillPartyCityStateFromZip(lane.shipper, lane);
     }
     if (lane.consignee) {
-      lane.consignee = await fillPartyCityStateFromZip(lane.consignee);
+      lane.consignee = await fillPartyCityStateFromZip(lane.consignee, lane);
     }
   }
   await enrichLaneShipper(lane, tenant, opts);

@@ -529,6 +529,12 @@ function serializeForDispatcherPage(quote) {
     customerMatchMessage,
     customerLookupStatus,
     customerLookupQuery: quote.customerLookupQuery || null,
+    customerLookupQueries: quote.customerLookupQueries || [],
+    customerDeclinedAccessorials: quote.customerDeclinedAccessorials ||
+      (quote.extracted && quote.extracted.customerDeclinedAccessorials) ||
+      [],
+    rateSource: quote.rateSource || null,
+    extractionWarnings: quote.extractionWarnings || [],
     // Text draft only — omit unused HTML/catalog fields for leaner payload.
     customerDraftText: storedEmail || buildCustomerDraftText(quote),
     customerEmailText: storedEmail,
@@ -556,6 +562,8 @@ function serializeForDispatcherPage(quote) {
         (lane.selectedRateId ? [lane.selectedRateId] : []),
       rateError: lane.rateError || null,
       rateWarning: lane.rateWarning || null,
+      rateSource: lane.rateSource || quote.rateSource || null,
+      extractionWarnings: lane.extractionWarnings || [],
       options: (lane.options || []).map((o) => {
         const warningText = cleanCarrierNote(o.warnings || o.rateRemarks);
         // UI truncates notes to ~200 chars; trim payload for multi-rate lanes.

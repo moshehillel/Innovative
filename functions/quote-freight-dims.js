@@ -78,6 +78,24 @@ function normalizePalletDims(row) {
 }
 
 /**
+ * True when missing pallet L/W/H were filled with 40×48×60.
+ * Orientation rewrite (48×40 → 40×48) is not a default.
+ * @param {object} before Row before normalizePalletDims.
+ * @param {object} after Row after normalizePalletDims.
+ * @return {boolean}
+ */
+function palletDimsWereDefaulted(before, after) {
+  if (!after || !isPalletPackaging(after)) return false;
+  const b = before && typeof before === "object" ? before : {};
+  const missingL = !(Number(b.length) > 0);
+  const missingW = !(Number(b.width) > 0);
+  const missingH = !(Number(b.height) > 0);
+  if (!missingL && !missingW && !missingH) return false;
+  return Number(after.length) > 0 && Number(after.width) > 0 &&
+    Number(after.height) > 0;
+}
+
+/**
  * @param {Array<object>|null|undefined} rows Freight lines.
  * @return {Array<object>}
  */
@@ -125,4 +143,5 @@ module.exports = {
   normalizePalletDims,
   normalizePalletFreightRows,
   sanitizeImplausiblePalletWeight,
+  palletDimsWereDefaulted,
 };

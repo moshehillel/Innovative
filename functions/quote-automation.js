@@ -104,21 +104,45 @@ async function resolveCustomerMatch(opts) {
       name,
       code: (row && row.code) || null,
       searchTerm: (row && row.searchTerm) || null,
+      searchesTried: (row && row.searchesTried) || [],
       lookupStatus: status,
     };
+  }
+
+  if (typeof deps.writeLog === "function") {
+    await deps.writeLog("info", "quote", "Primus customer lookup", {
+      queries: (match && match.searchesTried) || searchTerms,
+      matchId: (match && match.id) || null,
+      matchName: (match && match.name) || null,
+      searchTerm: (match && match.searchTerm) || null,
+    });
   }
 
   if (match && match.id) {
     return withName(match, "matched");
   }
   if (opts.allowDefault === false) {
-    return {id: null, name: null, lookupStatus: "no_match"};
+    return {
+      id: null,
+      name: null,
+      lookupStatus: "no_match",
+      searchesTried: (match && match.searchesTried) || [],
+    };
   }
   const fallback = process.env.QUOTE_DEFAULT_SHIPPING_LOCATION_ID || null;
   if (fallback) {
-    return withName({id: fallback, name: null}, "default");
+    return withName({
+      id: fallback,
+      name: null,
+      searchesTried: (match && match.searchesTried) || [],
+    }, "default");
   }
-  return {id: null, name: null, lookupStatus: "no_match"};
+  return {
+    id: null,
+    name: null,
+    lookupStatus: "no_match",
+    searchesTried: (match && match.searchesTried) || [],
+  };
 }
 
 /**
@@ -159,6 +183,7 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
     patch.customerLookupStatus = "matched";
     patch.customerLookupQuery = customerName || shipperName ||
       customerRef || null;
+    patch.customerLookupQueries = match.searchesTried || [];
     const customerMatch = {
       id: String(match.id),
       name: match.name || null,
@@ -171,6 +196,7 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
   patch.customerLookupStatus = "no_match";
   patch.customerLookupQuery = customerName || shipperName ||
     customerRef || null;
+  patch.customerLookupQueries = (match && match.searchesTried) || [];
   return {
     customerMatch: null,
     customerMatchMessage: "No Primus match for name",
@@ -579,6 +605,43 @@ function validateLaneForRating(lane) {
 }
 
 /**
+ * Unique dispatcher-facing extraction / rating warnings for a quote.
+ * @param {object} extracted Intake payload.
+ * @param {Array<object>} lanes Rated lanes.
+ * @return {Array<string>}
+ */
+function collectQuoteWarnings(extracted, lanes) {
+  const out = [];
+  const add = (msg) => {
+    if (msg && !out.includes(msg)) out.push(msg);
+  };
+  (extracted && extracted.extractionWarnings || []).forEach(add);
+  for (const lane of lanes || []) {
+    (lane.extractionWarnings || []).forEach(add);
+    if (lane.rateSource === "market_fallback") add("market fallback");
+    if (lane.rateWarning === rateShop.MARKET_FALLBACK_WARNING) {
+      add("market fallback");
+    }
+  }
+  return out;
+}
+
+/**
+ * Quote-level rateSource from rated lanes.
+ * @param {Array<object>} lanes Rated lanes.
+ * @param {string|null} shippingLocationId Matched customer id.
+ * @return {string|null}
+ */
+function quoteRateSource(lanes, shippingLocationId) {
+  const rows = Array.isArray(lanes) ? lanes : [];
+  if (rows.some((l) => l && l.rateSource === "market_fallback")) {
+    return "market_fallback";
+  }
+  if (rows.some((l) => l && l.rateSource === "customer")) return "customer";
+  return shippingLocationId ? "customer" : null;
+}
+
+/**
  * Rates one lane and returns top options with sell rates.
  * @param {object} lane Lane with shipper, consignee, freightInfo.
  * @param {object} ctx Context with rules, shippingLocationId, margin opts.
@@ -588,11 +651,11 @@ async function rateLane(lane, ctx) {
   if (lane && typeof lane === "object") {
     if (lane.shipper) {
       lane.shipper = await addressEnrichment.fillPartyCityStateFromZip(
-          lane.shipper);
+          lane.shipper, lane);
     }
     if (lane.consignee) {
       lane.consignee = await addressEnrichment.fillPartyCityStateFromZip(
-          lane.consignee);
+          lane.consignee, lane);
     }
   }
   const odCheck = validateLaneForRating(lane);
@@ -634,6 +697,10 @@ async function rateLane(lane, ctx) {
   const laneForRate = {...lane, freightInfo: freightWithClass};
 
   let rulesOut;
+  const extracted = ctx.extracted && typeof ctx.extracted === "object" ?
+    ctx.extracted : {};
+  const declinedCodes = ctx.customerDeclinedAccessorials ||
+    extracted.customerDeclinedAccessorials || [];
   if (Array.isArray(ctx.accessorialOverride)) {
     const codes = quoteAccCatalog.normalizeRerunAccessorialCodes(
         ctx.accessorialOverride);
@@ -653,16 +720,25 @@ async function rateLane(lane, ctx) {
       requiresConfirm: false,
     };
   } else {
+    const extractCtx = {
+      ...extracted,
+      emailBody: ctx.emailBody || extracted._sourceBody || "",
+      subject: ctx.subject || extracted._sourceSubject || "",
+      customerDeclinedAccessorials: declinedCodes,
+    };
     rulesOut = quoteRules.applyRulesToLane(
-        laneForRate, ctx.rules, ctx.extracted || {});
+        laneForRate, ctx.rules, extractCtx);
     const emailText = [
       lane.specialInstructions,
-      ctx.extracted && ctx.extracted.specialInstructionsGlobal,
+      extracted.specialInstructionsGlobal,
+      extractCtx.emailBody,
     ].filter(Boolean).join("\n");
     const requested = quoteEmailAcc.resolveRequestedAccessorials(
-        ctx.extracted || {}, {body: emailText});
+        extracted, {body: emailText, subject: extractCtx.subject});
     rulesOut = quoteEmailAcc.applyEmailRequestedAccessorials(
         rulesOut, requested, quoteRules.formatAccessorialLabels);
+    rulesOut = quoteEmailAcc.applyDeclinedAccessorials(
+        rulesOut, emailText, declinedCodes);
   }
   const mergedLane = {
     ...laneForRate,
@@ -670,19 +746,19 @@ async function rateLane(lane, ctx) {
     accessorialsWithData: rulesOut.accessorialsWithData,
     appliedRules: rulesOut.appliedRules,
     requiresConfirm: rulesOut.requiresConfirm,
+    customerDeclinedAccessorials: declinedCodes,
   };
 
   const wantsGuaranteed = !!(
-    ctx.extracted &&
-    ctx.extracted.customerRequest &&
-    ctx.extracted.customerRequest.wantsGuaranteedOptions
+    extracted.customerRequest &&
+    extracted.customerRequest.wantsGuaranteedOptions
   );
 
   const query = rateShop.buildRateMultipleQuery(mergedLane, {
     shippingLocationId: ctx.shippingLocationId,
     customerId: ctx.shippingLocationId,
     UOM: "US",
-    pickupDate: ctx.extracted && ctx.extracted.readyDate,
+    pickupDate: extracted.readyDate,
     includeGuaranteed: wantsGuaranteed,
     returnValidAccsOnly: process.env.QUOTE_RETURN_VALID_ACCS_ONLY === "true",
     timeout: process.env.QUOTE_RATE_TIMEOUT || undefined,
@@ -692,20 +768,19 @@ async function rateLane(lane, ctx) {
   let rates = fetched.rates || [];
   let noRates = fetched.noRates || [];
   let rateNote = null;
+  let rateSource = ctx.shippingLocationId ? "customer" : null;
 
-  // Matched customers without carrier profiles (or missing class) often
-  // return empty rates. Keep the match on the quote, but fall back to
-  // market rates so the dispatcher still has options.
-  if (!rates.length && ctx.shippingLocationId &&
-      rateShop.shouldRetryRatesWithoutCustomer(noRates)) {
+  // Customer tariffs empty for any reason → retry market rates.
+  // Keep the Primus customer match; never present market as contract.
+  if (!rates.length && ctx.shippingLocationId) {
     const fallbackQuery = {...query};
     delete fallbackQuery.customerId;
     fetched = await rateShop.fetchMultipleRates(fallbackQuery);
     rates = fetched.rates || [];
     noRates = fetched.noRates || [];
     if (rates.length) {
-      rateNote = "Customer matched, but Primus had no customer-specific " +
-        "carrier profiles. Showing market rates.";
+      rateSource = "market_fallback";
+      rateNote = rateShop.MARKET_FALLBACK_WARNING;
     }
   }
 
@@ -738,6 +813,15 @@ async function rateLane(lane, ctx) {
 
   let rateError = null;
   let rateWarning = null;
+  const extractionWarnings = [];
+  const addWarn = (msg) => {
+    if (msg && !extractionWarnings.includes(msg)) {
+      extractionWarnings.push(msg);
+    }
+  };
+  (lane.extractionWarnings || []).forEach(addWarn);
+  if (rateSource === "market_fallback") addWarn("market fallback");
+  for (const w of rulesOut.extractionWarnings || []) addWarn(w);
   if (!options.length) {
     rateError = rateShop.summarizeNoRateErrors(noRates) ||
       "No rates returned from Primus.";
@@ -751,6 +835,8 @@ async function rateLane(lane, ctx) {
     options,
     rateError,
     rateWarning,
+    rateSource,
+    extractionWarnings,
   };
 }
 
@@ -837,6 +923,10 @@ async function processQuoteEmail(opts) {
         shippingLocationId,
         extracted,
         customerPrefs: {},
+        emailBody,
+        subject,
+        customerDeclinedAccessorials:
+          extracted.customerDeclinedAccessorials || [],
       });
       ratedLanes.push(rated);
     } catch (err) {
@@ -846,6 +936,8 @@ async function processQuoteEmail(opts) {
         options: [],
         rateError: err.message,
         rateWarning: null,
+        rateSource: shippingLocationId ? "customer" : null,
+        extractionWarnings: lane.extractionWarnings || [],
         appliedRules: Array.isArray(lane.freightRulesApplied) ?
           lane.freightRulesApplied : [],
       });
@@ -872,6 +964,11 @@ async function processQuoteEmail(opts) {
     customerLookupStatus,
     customerLookupQuery: extractedCustomerName ||
       customerMatch.searchTerm || null,
+    customerLookupQueries: customerMatch.searchesTried || [],
+    customerDeclinedAccessorials: extracted.customerDeclinedAccessorials ||
+      [],
+    extractionWarnings: collectQuoteWarnings(extracted, ratedLanes),
+    rateSource: quoteRateSource(ratedLanes, shippingLocationId),
     lanes: ratedLanes,
     customerDraftText: "",
     status: "awaiting_dispatcher",
@@ -1003,6 +1100,9 @@ function serializeInboxQuote(doc, data) {
     customerLookupStatus: data.customerLookupStatus || null,
     customerMatched: !!(data.shippingLocationId &&
       data.customerLookupStatus !== "no_match"),
+    customerLookupQuery: data.customerLookupQuery || null,
+    rateSource: data.rateSource || null,
+    extractionWarnings: data.extractionWarnings || [],
     lanesPreview: (data.lanes || []).map((lane) => ({
       laneKey: lane.laneKey,
       label: lane.label,
@@ -1021,6 +1121,8 @@ function serializeInboxQuote(doc, data) {
       })),
       optionCount: (lane.options || []).length,
       rateError: lane.rateError || null,
+      rateWarning: lane.rateWarning || null,
+      rateSource: lane.rateSource || null,
     })),
   };
 }
@@ -1347,6 +1449,11 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         shippingLocationId,
         extracted: data.extracted || {},
         customerPrefs: {},
+        emailBody: (data.extracted && data.extracted._sourceBody) || "",
+        subject: data.subject || "",
+        customerDeclinedAccessorials: data.customerDeclinedAccessorials ||
+          (data.extracted && data.extracted.customerDeclinedAccessorials) ||
+          [],
         accessorialOverride: accessorialOverride != null ?
           accessorialOverride : undefined,
         accessorialsWithDataOverride:
@@ -1382,6 +1489,9 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
     ...customerPatch,
     lanes: ratedLanes,
     status: "awaiting_dispatcher",
+    extractionWarnings: collectQuoteWarnings(
+        data.extracted || {}, ratedLanes),
+    rateSource: quoteRateSource(ratedLanes, shippingLocationId),
     customerEmailText: admin.firestore.FieldValue.delete(),
     customerEmailHtml: admin.firestore.FieldValue.delete(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1398,6 +1508,8 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
     shippingLocationId,
     shippingLocationName,
     lanes: ratedLanes,
+    extractionWarnings: patch.extractionWarnings,
+    rateSource: patch.rateSource,
   };
   return {
     ok: true,

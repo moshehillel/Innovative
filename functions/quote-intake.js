@@ -45,20 +45,90 @@ function toPlainText(input) {
 }
 
 /**
+ * Append a unique dispatcher-visible extraction warning.
+ * @param {object} extracted Intake payload.
+ * @param {string} msg Warning text.
+ * @return {void}
+ */
+function pushExtractWarning(extracted, msg) {
+  if (!extracted || typeof extracted !== "object") return;
+  const text = String(msg || "").trim();
+  if (!text) return;
+  const list = Array.isArray(extracted.extractionWarnings) ?
+    extracted.extractionWarnings : [];
+  if (!list.includes(text)) list.push(text);
+  extracted.extractionWarnings = list;
+}
+
+/**
+ * Deterministic post-processor that ALWAYS runs after AI (and heuristic)
+ * extract. Does not trust the LLM for cartons vs pallets, Pallet N
+ * blocks, 40×48 dims, total-weight, or accessorial negation.
+ * @param {object} extracted extractQuoteRequest result.
+ * @param {object} [opts] subject, body.
+ * @return {object}
+ */
+function normalizeExtractedQuote(extracted, opts) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const next = extracted;
+  if (!Array.isArray(next.extractionWarnings)) {
+    next.extractionWarnings = [];
+  }
+  if (opts && opts.subject) {
+    next._sourceSubject = String(opts.subject);
+  }
+  if (opts && opts.body) {
+    next._sourceBody = String(opts.body).slice(0, 12000);
+  }
+  const missingDimsBefore = palletRowsMissingDims(next);
+  normalizeSoleAddressToConsignee(next);
+  applyEmailPalletBlocks(next, opts);
+  correctCartonVsPalletFreight(next, opts && opts.body);
+  normalizeFreightOnExtract(next, opts && opts.body);
+  if (missingDimsBefore && !palletRowsMissingDims(next)) {
+    pushExtractWarning(next, "defaulted dims");
+  }
+  emailAccessorials.attachRequestedAccessorials(next, {
+    subject: opts && opts.subject,
+    body: opts && opts.body,
+  });
+  const declined = emailAccessorials.detectDeclinedAccessorials(
+      emailAccessorials.extractedAccessorialText(next, opts));
+  for (const w of declined.warnings || []) {
+    pushExtractWarning(next, w);
+  }
+  return next;
+}
+
+/**
+ * True when any pallet freight row is missing L, W, or H.
+ * @param {object} extracted Intake payload.
+ * @return {boolean}
+ */
+function palletRowsMissingDims(extracted) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return false;
+  for (const lane of extracted.lanes) {
+    const rows = lane && Array.isArray(lane.freightInfo) ?
+      lane.freightInfo : [];
+    for (const row of rows) {
+      if (!freightDims.isPalletPackaging(row)) continue;
+      if (!(Number(row.length) > 0) || !(Number(row.width) > 0) ||
+          !(Number(row.height) > 0)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Normalize sole-address + stamp email-requested accessorial codes.
  * @param {object} extracted Intake payload.
  * @param {object} opts subject, body.
  * @return {object}
  */
 function finishExtract(extracted, opts) {
-  const next = normalizeSoleAddressToConsignee(extracted);
-  applyEmailPalletBlocks(next, opts);
-  correctCartonVsPalletFreight(next, opts && opts.body);
-  normalizeFreightOnExtract(next, opts && opts.body);
-  return emailAccessorials.attachRequestedAccessorials(next, {
-    subject: opts && opts.subject,
-    body: opts && opts.body,
-  });
+  return normalizeExtractedQuote(extracted, opts);
 }
 
 /**
@@ -853,12 +923,16 @@ function normalizeFreightOnExtract(extracted, body) {
   if (!extracted || typeof extracted !== "object") return extracted;
   const weightType = inferWeightTypeFromBody(body);
   if (!Array.isArray(extracted.lanes)) return extracted;
+  let defaultedDims = false;
   for (const lane of extracted.lanes) {
     if (!lane || typeof lane !== "object") continue;
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     lane.freightInfo = rows.map((row) => {
       const base = row && typeof row === "object" ? {...row} : {};
       const next = freightDims.normalizePalletDims(base);
+      if (freightDims.palletDimsWereDefaulted(base, next)) {
+        defaultedDims = true;
+      }
       const raw = String(next.weightType || "").trim().toLowerCase();
       if (weightType === "total") {
         next.weightType = "total";
@@ -870,6 +944,7 @@ function normalizeFreightOnExtract(extracted, body) {
       return freightDims.sanitizeImplausiblePalletWeight(next);
     });
   }
+  if (defaultedDims) pushExtractWarning(extracted, "defaulted dims");
   return extracted;
 }
 
@@ -1072,6 +1147,8 @@ module.exports = {
   normalizeSoleAddressToConsignee,
   partyHasPhysicalAddress,
   finishExtract,
+  normalizeExtractedQuote,
+  pushExtractWarning,
   parseLabeledFreightTotals,
   applyLabeledFreightTotals,
   correctCartonVsPalletFreight,

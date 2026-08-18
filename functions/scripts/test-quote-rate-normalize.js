@@ -164,11 +164,14 @@ check("customer profile error retries market",
       {error: "Customer Profile not found"},
       {error: "Customer Profile not found"},
     ]), true);
-check("unrelated noRates does not retry market",
+check("any empty rates retries market",
     rateShop.shouldRetryRatesWithoutCustomer([
       {error: "Destination city is required"},
       {error: "Invalid zipcode"},
-    ]), false);
+    ]), true);
+check("market fallback warning text",
+    rateShop.MARKET_FALLBACK_WARNING,
+    "Primus customer matched but no customer tariffs — showing market rates.");
 
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);

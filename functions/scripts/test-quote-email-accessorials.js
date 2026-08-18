@@ -116,6 +116,32 @@ check("no extra why when all already from rules",
     (noNew.appliedRules || []).some((r) => r.ruleId === "email_requested"),
     false);
 
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "No liftgate needed. Dock available.");
+checkNotHas("no liftgate does not add LFD", codes, "LFD");
+checkNotHas("no liftgate does not add LFO", codes, "LFO");
+check("declines liftgate",
+    emailAcc.declinesLiftgate("no liftgate needed"), true);
+check("does not decline loading dock as liftgate",
+    emailAcc.declinesLiftgate("no loading dock"), false);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "No limited access. Warehouse with dock.");
+checkNotHas("no limited access does not add LAD", codes, "LAD");
+checkNotHas("no limited access does not add LAO", codes, "LAO");
+check("declines limited access",
+    emailAcc.declinesLimitedAccess("no limited access"), true);
+
+const declinedLift = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "No liftgate needed",
+  customerRequest: {requestedAccessorials: ["LFD", "LFO"]},
+  lanes: [],
+}, {subject: "RFQ", body: "No liftgate needed"});
+checkNotHas("AI LFD stripped when email says no liftgate",
+    declinedLift.customerRequest.requestedAccessorials, "LFD");
+check("persisted declined LFD",
+    (declinedLift.customerDeclinedAccessorials || []).includes("LFD"), true);
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

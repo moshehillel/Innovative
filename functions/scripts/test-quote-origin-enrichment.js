@@ -176,6 +176,27 @@ check("Amazon dest + no appt records suppress",
     (outAmzNoAppt.appliedRules || [])
         .some((r) => r.ruleId === "email_no_appointment"), true);
 
+const milNoAppt = {
+  ...d8986,
+  specialInstructions: "No Appointment necessary",
+};
+const outMilNoAppt = quoteRules.applyRulesToLane(milNoAppt, rules, {
+  specialInstructionsGlobal: "No Appointment necessary",
+});
+checkHas("military + no appt still LAD", outMilNoAppt.accessorials, "LAD");
+checkNotHas("military + no appt strips APD", outMilNoAppt.accessorials, "APD");
+
+const milNoLift = {
+  ...d8986,
+  specialInstructions: "no liftgate needed",
+};
+const outMilNoLift = quoteRules.applyRulesToLane(milNoLift, rules, {
+  specialInstructionsGlobal: "no liftgate needed",
+});
+checkHas("military + no liftgate still LAD", outMilNoLift.accessorials, "LAD");
+checkHas("military + no liftgate still APD", outMilNoLift.accessorials, "APD");
+checkNotHas("military + no liftgate no LFD", outMilNoLift.accessorials, "LFD");
+
 const destRes = {
   consignee: {name: "Jane Doe", city: "Austin", state: "TX"},
   shipper: {name: "Weida warehouse", city: "Rancho Cucamonga", state: "CA"},

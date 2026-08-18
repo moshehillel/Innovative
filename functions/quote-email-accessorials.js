@@ -6,7 +6,7 @@
 "use strict";
 
 const catalog = require("./quote-accessorial-catalog");
-const appointmentText = require("./quote-appointment-text");
+const declinedAcc = require("./quote-declined-accessorials");
 
 /**
  * Extra codes not always present in static fallback tables.
@@ -126,28 +126,27 @@ function extractRequestedAccessorialsFromText(text) {
   if (!blob.trim()) return [];
   const known = knownAccessorialCodes();
   const codes = [];
-  const skipAppt = appointmentText.declinesAppointmentDelivery(blob);
+  const declined = new Set(declinedAcc.detectDeclinedAccessorials(blob).codes);
   for (const pair of PAIR_PATTERNS) {
-    if (skipAppt && (pair.dest === "APD" || pair.origin === "APO")) {
-      continue;
-    }
     const originHit = pair.originRe && pair.originRe.test(blob);
     const destHit = pair.destRe && pair.destRe.test(blob);
     const bareHit = pair.bareRe && pair.bareRe.test(blob);
-    if (originHit) codes.push(pair.origin);
-    if (destHit) codes.push(pair.dest);
+    if (originHit && !declined.has(pair.origin)) codes.push(pair.origin);
+    if (destHit && !declined.has(pair.dest)) codes.push(pair.dest);
     if (!originHit && !destHit && bareHit) {
       if (pair.bothIfBare) {
-        codes.push(pair.origin, pair.dest);
-      } else {
+        if (!declined.has(pair.origin)) codes.push(pair.origin);
+        if (!declined.has(pair.dest)) codes.push(pair.dest);
+      } else if (!declined.has(pair.dest)) {
         codes.push(pair.dest);
       }
     }
   }
   for (const row of SINGLE_PATTERNS) {
-    if (row.re.test(blob)) codes.push(row.code);
+    if (row.re.test(blob) && !declined.has(row.code)) codes.push(row.code);
   }
-  return uniqueCodes(codes).filter((c) => isKnownCode(c, known));
+  return uniqueCodes(codes).filter((c) => isKnownCode(c, known) &&
+    !declined.has(c));
 }
 
 /**
@@ -212,15 +211,20 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
   const fromAi = normalizeRequestedCodeList(cr.requestedAccessorials);
   const fromText = extractRequestedAccessorialsFromText(
       extractedAccessorialText(ex, opts));
+  const scanText = extractedAccessorialText(ex, opts);
+  const declined = declinedAcc.detectDeclinedAccessorials(scanText);
+  const persisted = Array.isArray(ex.customerDeclinedAccessorials) ?
+    ex.customerDeclinedAccessorials : [];
+  const ban = new Set(declinedAcc.uniqueCodes([
+    ...declined.codes,
+    ...persisted,
+  ]));
   const codes = uniqueCodes([...fromAi, ...fromText]);
-  if (cr.wantsLimitedAccessInQuote && !codes.includes("LAD")) {
+  if (cr.wantsLimitedAccessInQuote && !codes.includes("LAD") &&
+      !ban.has("LAD")) {
     codes.push("LAD");
   }
-  if (appointmentText.declinesAppointmentDelivery(
-      extractedAccessorialText(ex, opts))) {
-    return codes.filter((c) => c !== "APD" && c !== "APO");
-  }
-  return codes;
+  return codes.filter((c) => !ban.has(c));
 }
 
 /**
@@ -234,9 +238,16 @@ function attachRequestedAccessorials(extracted, opts = {}) {
   const cr = ex.customerRequest && typeof ex.customerRequest === "object" ?
     {...ex.customerRequest} : {};
   const codes = resolveRequestedAccessorials(ex, opts);
+  const declined = declinedAcc.detectDeclinedAccessorials(
+      extractedAccessorialText(ex, opts));
   cr.requestedAccessorials = codes;
   if (codes.includes("LAD")) cr.wantsLimitedAccessInQuote = true;
   ex.customerRequest = cr;
+  ex.customerDeclinedAccessorials = declinedAcc.uniqueCodes([
+    ...(Array.isArray(ex.customerDeclinedAccessorials) ?
+      ex.customerDeclinedAccessorials : []),
+    ...declined.codes,
+  ]);
   return ex;
 }
 
@@ -288,7 +299,12 @@ function applyEmailRequestedAccessorials(
 
 module.exports = {
   knownAccessorialCodes,
-  declinesAppointmentDelivery: appointmentText.declinesAppointmentDelivery,
+  declinesAppointmentDelivery: declinedAcc.declinesAppointmentDelivery,
+  declinesLiftgate: declinedAcc.declinesLiftgate,
+  declinesLimitedAccess: declinedAcc.declinesLimitedAccess,
+  detectDeclinedAccessorials: declinedAcc.detectDeclinedAccessorials,
+  stripDeclinedCodes: declinedAcc.stripDeclinedCodes,
+  applyDeclinedAccessorials: declinedAcc.applyDeclinedAccessorials,
   extractRequestedAccessorialsFromText,
   normalizeRequestedCodeList,
   resolveRequestedAccessorials,
