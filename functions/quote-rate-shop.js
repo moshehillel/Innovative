@@ -337,6 +337,67 @@ function normalizeCustomerName(value) {
       .trim();
 }
 
+/** Role/legal words that should not drive Primus customer search. */
+const GENERIC_CUSTOMER_NAME_TOKENS = new Set([
+  "inc", "llc", "ltd", "corp", "corporation", "co", "company",
+  "warehouse", "warehousing", "shipping", "logistics", "freight",
+  "trucking", "distribution", "dist", "dc", "plant", "facility",
+  "kitchenware", "kitchen", "the", "and", "of", "group", "services",
+  "service", "international", "intl", "usa", "america", "us",
+  "united", "american", "national", "global", "general", "first",
+  "new", "great", "best", "city", "state", "north", "south", "east",
+  "west",
+]);
+
+/**
+ * Distinctive tokens from a company / shipper name.
+ * @param {string} value Raw or normalized name.
+ * @return {Array<string>}
+ */
+function distinctiveCustomerNameTokens(value) {
+  return normalizeCustomerName(value)
+      .split(" ")
+      .filter((t) => t.length >= 4 && !GENERIC_CUSTOMER_NAME_TOKENS.has(t));
+}
+
+/**
+ * Extra Primus search strings for a company name.
+ * Primus `name=` is phrase-like, so "Kadra Warehouse" misses
+ * "Kadra Kitchenware"; also search the distinctive first token.
+ * @param {string} term Raw search term.
+ * @return {Array<string>}
+ */
+function expandCustomerSearchTerms(term) {
+  const out = [];
+  const add = (raw) => {
+    const t = String(raw || "").trim();
+    if (t.length < 2) return;
+    if (/^\d+$/.test(t)) return;
+    if (!out.some((s) => s.toLowerCase() === t.toLowerCase())) out.push(t);
+  };
+  add(term);
+  const tokens = distinctiveCustomerNameTokens(term);
+  const stem = tokens[0] || "";
+  if (stem.length >= 5) add(stem);
+  return out;
+}
+
+/**
+ * True when query and Primus names share a distinctive 5+ char token.
+ * "Kadra Warehouse" matches "Kadra Kitchenware"; "Acme Warehouse"
+ * does not match "Acme Industries".
+ * @param {string} wantRaw Query name.
+ * @param {string} haveRaw Primus location name.
+ * @return {boolean}
+ */
+function customerNamesShareDistinctiveToken(wantRaw, haveRaw) {
+  const wantToks = distinctiveCustomerNameTokens(wantRaw);
+  const haveToks = distinctiveCustomerNameTokens(haveRaw);
+  if (!wantToks.length || !haveToks.length) return false;
+  const haveSet = new Set(haveToks);
+  return wantToks.some((t) => t.length >= 5 && haveSet.has(t));
+}
+
 /**
  * Picks best customer match from search results.
  * @param {Array<object>} results Shipping locations.
@@ -360,12 +421,19 @@ function pickBestCustomerMatch(results, opts = {}) {
         return row;
       }
     }
+    for (const row of results) {
+      if (customerNamesShareDistinctiveToken(wantName, row.name)) {
+        return row;
+      }
+    }
   }
 
   for (const row of results) {
     const email = String(row.email || "").toLowerCase();
     if (email && from.includes(email)) return row;
   }
+  // Name-driven search: do not pick an unrelated customer:true hit.
+  if (wantName) return null;
   for (const row of results) {
     if (row.customer === true) return row;
   }
@@ -373,8 +441,6 @@ function pickBestCustomerMatch(results, opts = {}) {
     const name = String(row.name || "").toLowerCase();
     if (name && (from.includes(name) || ref.includes(name))) return row;
   }
-  // Name-driven search: avoid picking an unrelated first hit.
-  if (wantName) return null;
   return results[0];
 }
 
@@ -389,10 +455,10 @@ async function resolveCustomerForQuote(opts = {}) {
   const email = emailMatch ? (emailMatch[1] || emailMatch[2]) : "";
   const searches = [];
   const addSearch = (term) => {
-    const t = String(term || "").trim();
-    if (t.length < 2) return;
-    if (!searches.some((s) => s.toLowerCase() === t.toLowerCase())) {
-      searches.push(t);
+    for (const t of expandCustomerSearchTerms(term)) {
+      if (!searches.some((s) => s.toLowerCase() === t.toLowerCase())) {
+        searches.push(t);
+      }
     }
   };
 
@@ -442,8 +508,9 @@ async function resolveCustomerForQuote(opts = {}) {
           searchTerm: term,
         };
       }
-    } catch (_) {
-      // try next term
+    } catch (err) {
+      console.warn("resolveCustomerForQuote search failed", term,
+          err && err.message);
     }
   }
   return null;
@@ -1019,6 +1086,8 @@ module.exports = {
   getShippingLocationById,
   resolveCustomerForQuote,
   pickBestCustomerMatch,
+  expandCustomerSearchTerms,
+  normalizeCustomerName,
   fetchVendorsByCustomer,
   fetchRateTypes,
   searchCostQuotes,

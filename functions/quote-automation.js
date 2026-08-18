@@ -157,8 +157,8 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
     patch.shippingLocationId = String(match.id);
     if (match.name) patch.shippingLocationName = match.name;
     patch.customerLookupStatus = "matched";
-    patch.customerLookupQuery = customerName || customerRef ||
-      shipperName || null;
+    patch.customerLookupQuery = customerName || shipperName ||
+      customerRef || null;
     const customerMatch = {
       id: String(match.id),
       name: match.name || null,
@@ -169,8 +169,8 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
 
   // Keep previous shippingLocationId; surface failed name lookup.
   patch.customerLookupStatus = "no_match";
-  patch.customerLookupQuery = customerName || customerRef ||
-    shipperName || null;
+  patch.customerLookupQuery = customerName || shipperName ||
+    customerRef || null;
   return {
     customerMatch: null,
     customerMatchMessage: "No Primus match for name",

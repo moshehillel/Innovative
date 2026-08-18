@@ -131,6 +131,31 @@ const qFilled = rateShop.buildRateMultipleQuery({
 const freightFilled = JSON.parse(qFilled.freightInfo);
 check("query auto class 110", freightFilled[0].class, 110);
 
+const kadraHits = [{
+  id: 1410005738, name: "Kadra Kitchenware", customer: true,
+}];
+check("Kadra Warehouse → Kitchenware",
+    (rateShop.pickBestCustomerMatch(kadraHits, {
+      customerName: "Kadra Warehouse",
+    }) || {}).id, 1410005738);
+check("Kadra → Kitchenware",
+    (rateShop.pickBestCustomerMatch(kadraHits, {
+      customerName: "Kadra",
+    }) || {}).id, 1410005738);
+check("Acme Warehouse does not match Acme Industries",
+    rateShop.pickBestCustomerMatch([{
+      id: 9, name: "Acme Industries", customer: true,
+    }], {customerName: "Acme Warehouse"}), null);
+check("Ruelily → Ruelily Inc",
+    (rateShop.pickBestCustomerMatch([{
+      id: 2, name: "Ruelily Inc", customer: true,
+    }], {customerName: "Ruelily"}) || {}).id, 2);
+check("expand Kadra Warehouse includes Kadra",
+    rateShop.expandCustomerSearchTerms("Kadra Warehouse").join("|"),
+    "Kadra Warehouse|kadra");
+check("expand skips zip-only",
+    rateShop.expandCustomerSearchTerms("22911").join("|"), "");
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
