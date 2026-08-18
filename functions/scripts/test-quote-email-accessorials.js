@@ -41,6 +41,34 @@ checkHas("residential → RSD", codes, "RSD");
 checkNotHas("appointment at dest does not add APO", codes, "APO");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Dock 4. Mon-Fri 8:30am - 4:30pm. No Appointment necessary.");
+checkNotHas("no appointment necessary does not add APD", codes, "APD");
+checkNotHas("no appointment necessary does not add APO", codes, "APO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "no appt needed, liftgate at delivery");
+checkNotHas("no appt needed does not add APD", codes, "APD");
+checkHas("no appt needed still adds LFD", codes, "LFD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "appointment not required");
+checkNotHas("appointment not required does not add APD", codes, "APD");
+
+check("declines no appointment necessary",
+    emailAcc.declinesAppointmentDelivery("No Appointment necessary"), true);
+check("does not decline bare appointment",
+    emailAcc.declinesAppointmentDelivery("appointment delivery required"),
+    false);
+
+const declinedAi = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "No Appointment necessary",
+  customerRequest: {requestedAccessorials: ["APD"]},
+  lanes: [],
+}, {subject: "RFQ", body: "No Appointment necessary"});
+checkNotHas("AI APD stripped when email says no appt",
+    declinedAi.customerRequest.requestedAccessorials, "APD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
     "Liftgate at pickup only");
 checkHas("liftgate pickup → LFO", codes, "LFO");
 checkNotHas("liftgate pickup not LFD", codes, "LFD");

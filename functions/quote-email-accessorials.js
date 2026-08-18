@@ -6,6 +6,7 @@
 "use strict";
 
 const catalog = require("./quote-accessorial-catalog");
+const appointmentText = require("./quote-appointment-text");
 
 /**
  * Extra codes not always present in static fallback tables.
@@ -125,7 +126,11 @@ function extractRequestedAccessorialsFromText(text) {
   if (!blob.trim()) return [];
   const known = knownAccessorialCodes();
   const codes = [];
+  const skipAppt = appointmentText.declinesAppointmentDelivery(blob);
   for (const pair of PAIR_PATTERNS) {
+    if (skipAppt && (pair.dest === "APD" || pair.origin === "APO")) {
+      continue;
+    }
     const originHit = pair.originRe && pair.originRe.test(blob);
     const destHit = pair.destRe && pair.destRe.test(blob);
     const bareHit = pair.bareRe && pair.bareRe.test(blob);
@@ -211,6 +216,10 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
   if (cr.wantsLimitedAccessInQuote && !codes.includes("LAD")) {
     codes.push("LAD");
   }
+  if (appointmentText.declinesAppointmentDelivery(
+      extractedAccessorialText(ex, opts))) {
+    return codes.filter((c) => c !== "APD" && c !== "APO");
+  }
   return codes;
 }
 
@@ -279,6 +288,7 @@ function applyEmailRequestedAccessorials(
 
 module.exports = {
   knownAccessorialCodes,
+  declinesAppointmentDelivery: appointmentText.declinesAppointmentDelivery,
   extractRequestedAccessorialsFromText,
   normalizeRequestedCodeList,
   resolveRequestedAccessorials,

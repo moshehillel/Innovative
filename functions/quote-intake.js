@@ -52,6 +52,7 @@ function toPlainText(input) {
  */
 function finishExtract(extracted, opts) {
   const next = normalizeSoleAddressToConsignee(extracted);
+  applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body);
   return emailAccessorials.attachRequestedAccessorials(next, {
@@ -152,6 +153,17 @@ async function callQuoteExtractionModel(client, payload) {
       "  Pallet dimensions 48*40*28 → [{qty:1, weight:137, length:40,",
       "  width:48, height:28, dimType:\"PLT\"}]. Mention carton count",
       "  in specialInstructions only.",
+      "- Pallet 1 / Pallet 2 / Pallet N blocks are separate freight",
+      "  lines (qty 1 each) with that line's dims and weight. Do not",
+      "  drop Pallet 2. Do not collapse to qty 1 unless the email",
+      "  explicitly says 1 pallet (Number of Pallet - 1).",
+      "- If the email asks to quote the SAME freight to multiple",
+      "  destinations (e.g. subject \"quote to 90723 and 11216\") and",
+      "  does not assign which pallet goes to which zip, copy ALL",
+      "  pallet lines onto EVERY lane. Do not split Pallet 1 to dest A",
+      "  and Pallet 2 to dest B unless the email assigns them.",
+      "- \"No appointment necessary / no appt needed / appointment not",
+      "  required\" is NOT a request for APD. Do not add APD.",
       "- If class missing, set flags.missingClass true on that lane.",
       "- If pallet count seems wrong (>20), suspiciousPalletCount true.",
       "- Detect liftgate / no dock in global or lane instructions.",
@@ -162,7 +174,9 @@ async function callQuoteExtractionModel(client, payload) {
       "  customerRequest.requestedAccessorials:",
       "  liftgate pickup/origin → LFO; liftgate delivery or bare",
       "  liftgate/no dock → LFD (+ LFO if unspecified); appointment",
-      "  → APD (APO if pickup); residential → RSD; limited/restricted",
+      "  → APD (APO if pickup) UNLESS the email says no appointment",
+      "  / no appt needed / appointment not required;",
+      "  residential → RSD; limited/restricted",
       "  access → LAD (LAO if pickup); inside delivery → IND;",
       "  inside pickup → INO; insurance → INS; hazmat → HAZ.",
       "- Set flags.residentialDelivery true when residential/",
@@ -261,7 +275,59 @@ function parseAddressBlock(block) {
 }
 
 /**
- * Extract pallet dims/weights from LTLFlow-style bodies.
+ * Compact Pallet N + LxWxH + lbs lines (not LTLFlow Weight:/Length:).
+ * @param {string} body Plain text body.
+ * @return {Array<object>}
+ */
+function extractCompactPalletBlocks(body) {
+  const freight = [];
+  const seen = new Set();
+  const pattern = new RegExp(
+      "Pallet\\s+(\\d+)\\s*[:.\\-]?\\s+" +
+      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*,?\\s*" +
+      "([\\d.,]+)\\s*lbs",
+      "gi");
+  let m;
+  while ((m = pattern.exec(String(body || ""))) !== null) {
+    const n = Number(m[1]);
+    if (seen.has(n)) continue;
+    seen.add(n);
+    const weight = Number(String(m[5]).replace(/,/g, ""));
+    freight.push(freightDims.normalizePalletDims({
+      qty: 1,
+      weight: Number.isFinite(weight) ? weight : null,
+      weightType: "total",
+      class: null,
+      length: Number(m[2]),
+      width: Number(m[3]),
+      height: Number(m[4]),
+      dimType: "PLT",
+    }));
+  }
+  return freight;
+}
+
+/**
+ * "2 pallets" / "2 plt" / "2 skids" — number before the word.
+ * Does not treat "Pallet 1" as qty 1.
+ * @param {string} text Body.
+ * @return {number|null}
+ */
+function parseInformalPalletCount(text) {
+  const re = /\b(\d+)\s*(?:pallets?|plts?|skids?)\b/gi;
+  let max = null;
+  let m;
+  while ((m = re.exec(String(text || ""))) !== null) {
+    const n = Number(m[1]);
+    if (!Number.isFinite(n) || n < 1) continue;
+    if (max == null || n > max) max = n;
+  }
+  return max;
+}
+
+/**
+ * Extract pallet dims/weights from LTLFlow-style bodies, then compact
+ * Pallet N / LxWxH / lbs blocks.
  * @param {string} body Plain text body.
  * @return {Array<object>}
  */
@@ -286,7 +352,88 @@ function extractPalletFreight(body) {
       dimType: "PLT",
     }));
   }
-  return freight;
+  if (freight.length) return freight;
+  return extractCompactPalletBlocks(body);
+}
+
+/**
+ * True when the email maps a pallet number to a destination zip.
+ * @param {string} text Subject + body.
+ * @param {Array<object>} lanes Extracted lanes.
+ * @return {boolean}
+ */
+function emailAssignsPalletsToDestinations(text, lanes) {
+  const blob = String(text || "");
+  const zips = [...new Set((lanes || []).map((lane) => {
+    const zip = String((lane && lane.consignee &&
+      lane.consignee.zipCode) || "").replace(/\D/g, "").slice(0, 5);
+    return zip.length === 5 ? zip : "";
+  }).filter(Boolean))];
+  if (zips.length < 2) return false;
+  for (const zip of zips) {
+    const re = new RegExp(
+        "pallet\\s*\\d+[\\s\\S]{0,80}" + zip + "|" +
+        zip + "[\\s\\S]{0,80}pallet\\s*\\d+",
+        "i");
+    if (re.test(blob)) return true;
+  }
+  return false;
+}
+
+/**
+ * Copy Pallet 1 + Pallet 2 (+ …) onto every lane when the RFQ lists
+ * them without assigning a pallet to a destination zip.
+ * @param {object} extracted Parsed quote request.
+ * @param {object|string} opts subject/body or body string.
+ * @return {object}
+ */
+function applyEmailPalletBlocks(extracted, opts) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes) || !extracted.lanes.length) {
+    return extracted;
+  }
+  const body = typeof opts === "string" ? opts :
+    (opts && opts.body) || "";
+  const subject = typeof opts === "string" ? "" :
+    (opts && opts.subject) || "";
+  const blob = [subject, body].filter(Boolean).join("\n");
+  let blocks = extractPalletFreight(body);
+  if (!blocks.length) blocks = extractCompactPalletBlocks(body);
+  const informal = parseInformalPalletCount(blob);
+  if (!blocks.length && informal != null && informal > 1) {
+    for (const lane of extracted.lanes) {
+      if (!lane || typeof lane !== "object") continue;
+      const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+      const qty = rows.reduce((sum, r) =>
+        sum + (Math.max(0, Number(r.qty) || 0)), 0);
+      if (qty <= 1 && rows.length <= 1) {
+        const base = rows[0] && typeof rows[0] === "object" ? rows[0] : {};
+        lane.freightInfo = [freightDims.normalizePalletDims({
+          ...base,
+          qty: informal,
+          dimType: "PLT",
+          weightType: base.weightType || "total",
+        })];
+      }
+    }
+    return extracted;
+  }
+  if (blocks.length < 2) return extracted;
+  if (emailAssignsPalletsToDestinations(blob, extracted.lanes)) {
+    return extracted;
+  }
+  const emailQty = blocks.reduce((sum, r) =>
+    sum + (Math.max(0, Number(r.qty) || 0)), 0);
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+    const qty = rows.reduce((sum, r) =>
+      sum + (Math.max(0, Number(r.qty) || 0)), 0);
+    const sameCount = rows.length === blocks.length && qty === emailQty;
+    if (sameCount) continue;
+    lane.freightInfo = blocks.map((row) => ({...row}));
+  }
+  return extracted;
 }
 
 /**
@@ -315,6 +462,13 @@ function parseLabeledFreightTotals(body) {
   if (palletCount == null) {
     palletCount = matchLabeledNumber(text,
         /Pallet\s+Counts?\s*[-–—:=]?\s*(\d+)/i);
+  }
+  if (palletCount == null) {
+    const blocks = extractCompactPalletBlocks(text);
+    if (blocks.length) palletCount = blocks.length;
+  }
+  if (palletCount == null) {
+    palletCount = parseInformalPalletCount(text);
   }
   const cartonCount = matchLabeledNumber(text,
       /Total\s+Cartons?\s*[-–—:=]?\s*(\d+)/i);
@@ -921,6 +1075,10 @@ module.exports = {
   parseLabeledFreightTotals,
   applyLabeledFreightTotals,
   correctCartonVsPalletFreight,
+  extractCompactPalletBlocks,
+  extractPalletFreight,
+  applyEmailPalletBlocks,
+  parseInformalPalletCount,
   heuristicExtractQuote,
   inferWeightTypeFromBody,
   normalizeFreightOnExtract,

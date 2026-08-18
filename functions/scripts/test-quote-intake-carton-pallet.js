@@ -177,6 +177,97 @@ check("stripped decimals 814605 → 8146.05",
 check("stripped weight still total",
     stripped.lanes[0].freightInfo[0].weightType, "total");
 
+const D9338_BODY = [
+  "From: Alrossa Warehouse <warehouse@alrossa.com>",
+  "Subject: pls qout to 90723 and 11216",
+  "",
+  "EvoBox",
+  "5020 W 2700 N",
+  "Lehi, UT 84045",
+  "Dock 4",
+  "Mon-Fri 8:30am - 4:30pm",
+  "No Appointment necessary",
+  "",
+  "Pallet 1",
+  "40x48x70",
+  "1822 lbs",
+  "",
+  "Pallet 2",
+  "40x48x66",
+  "1702 lbs",
+].join("\n");
+
+const d9338Blocks = intake.extractCompactPalletBlocks(D9338_BODY);
+check("D9338 compact Pallet 1+2", d9338Blocks.map((r) => ({
+  qty: r.qty, weight: r.weight, length: r.length, width: r.width,
+  height: r.height, dimType: r.dimType,
+})), [
+  {qty: 1, weight: 1822, length: 40, width: 48, height: 70, dimType: "PLT"},
+  {qty: 1, weight: 1702, length: 40, width: 48, height: 66, dimType: "PLT"},
+]);
+check("D9338 labeled palletCount 2 not 1",
+    intake.parseLabeledFreightTotals(D9338_BODY).palletCount, 2);
+
+const d9338Split = {
+  lanes: [
+    {
+      laneKey: "90723",
+      consignee: {zipCode: "90723", city: "Paramount", state: "CA"},
+      freightInfo: [{
+        qty: 1, weight: 1822, length: 40, width: 48, height: 70,
+        dimType: "PLT",
+      }],
+    },
+    {
+      laneKey: "11216",
+      consignee: {zipCode: "11216", city: "Brooklyn", state: "NY"},
+      freightInfo: [{
+        qty: 1, weight: 1702, length: 40, width: 48, height: 66,
+        dimType: "PLT",
+      }],
+    },
+  ],
+};
+intake.applyEmailPalletBlocks(d9338Split, {
+  subject: "FW: pls qout to 90723 and 11216",
+  body: D9338_BODY,
+});
+check("D9338 dest 90723 gets both pallets",
+    d9338Split.lanes[0].freightInfo.map((r) => r.weight), [1822, 1702]);
+check("D9338 dest 11216 gets both pallets",
+    d9338Split.lanes[1].freightInfo.map((r) => r.weight), [1822, 1702]);
+
+const assigned = {
+  lanes: [
+    {
+      consignee: {zipCode: "90723"},
+      freightInfo: [{qty: 1, weight: 1822, dimType: "PLT"}],
+    },
+    {
+      consignee: {zipCode: "11216"},
+      freightInfo: [{qty: 1, weight: 1702, dimType: "PLT"}],
+    },
+  ],
+};
+intake.applyEmailPalletBlocks(assigned, {
+  subject: "RFQ",
+  body: "Pallet 1 to 90723\n40x48x70\n1822 lbs\nPallet 2 to 11216\n" +
+    "40x48x66\n1702 lbs",
+});
+check("assigned Pallet 1 stays on 90723",
+    assigned.lanes[0].freightInfo.map((r) => r.weight), [1822]);
+check("assigned Pallet 2 stays on 11216",
+    assigned.lanes[1].freightInfo.map((r) => r.weight), [1702]);
+
+const twoPalletsPhrase = {
+  lanes: [{
+    freightInfo: [{qty: 1, weight: 2000, dimType: "PLT"}],
+  }],
+};
+intake.applyEmailPalletBlocks(twoPalletsPhrase, "please quote 2 pallets");
+check("2 pallets phrase does not collapse to 1",
+    twoPalletsPhrase.lanes[0].freightInfo[0].qty, 2);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

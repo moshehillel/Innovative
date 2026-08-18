@@ -9,6 +9,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const appointmentText = require("./quote-appointment-text");
 
 const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both"];
 const DEFAULT_IDENTIFY_VIA = "both";
@@ -492,7 +493,22 @@ function ruleMatchViaText(lane, context, rule, side = "dest") {
   }
   if (match.instructionsContains &&
     containsAny(instr, match.instructionsContains)) {
-    return "instructions";
+    const addsAppt = (rule.addAccessorials || []).some((c) => {
+      const u = String(c || "").toUpperCase();
+      return u === "APD" || u === "APO";
+    });
+    const declineText = [
+      instr,
+      context.emailBody,
+      context.subject,
+      context.body,
+    ].filter(Boolean).join(" ");
+    if (addsAppt &&
+      appointmentText.declinesAppointmentDelivery(declineText)) {
+      // Negative "no appointment" wins over the appointment keyword.
+    } else {
+      return "instructions";
+    }
   }
   if (match.referenceContains) {
     const refs = (lane.referenceNumbers || []).join(" ");
@@ -660,6 +676,37 @@ function applyRulesToLane(lane, rules, context = {}) {
         withData.push(...rule.addAccessorialsWithData);
       }
     }
+  }
+
+  const declineText = [
+    lane.specialInstructions,
+    context.specialInstructionsGlobal,
+    context.emailBody,
+    context.subject,
+    context.body,
+  ].filter(Boolean).join(" ");
+  if (appointmentText.declinesAppointmentDelivery(declineText)) {
+    const hadAppt = codes.has("APD") || codes.has("APO");
+    codes.delete("APD");
+    codes.delete("APO");
+    const kept = applied.filter((row) =>
+      row.ruleId !== "appointment_delivery_text");
+    applied.length = 0;
+    applied.push(...kept);
+    if (hadAppt) {
+      applied.push({
+        ruleId: "email_no_appointment",
+        name: "No appointment needed",
+        notes: "Customer said no appointment is needed — APD not applied.",
+        matchVia: "email",
+      });
+    }
+    const filteredData = withData.filter((row) => {
+      const c = String(row && row.code || "").toUpperCase();
+      return c !== "APD" && c !== "APO";
+    });
+    withData.length = 0;
+    withData.push(...filteredData);
   }
 
   return {

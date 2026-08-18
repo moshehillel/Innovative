@@ -150,6 +150,32 @@ checkNotHas("origin Amazon does not get dest APD",
 checkNotHas("origin Amazon does not auto APO",
     outOriginAmz.accessorials, "APO");
 
+const noApptLane = {
+  consignee: {name: "Warehouse", city: "Paramount", state: "CA"},
+  shipper: {name: "EvoBox", city: "Lehi", state: "UT"},
+  specialInstructions: "No Appointment necessary",
+  flags: {},
+  siteType: "other",
+};
+const outNoAppt = quoteRules.applyRulesToLane(noApptLane, rules, {
+  specialInstructionsGlobal: "No Appointment necessary",
+});
+checkNotHas("no appointment necessary does not add APD",
+    outNoAppt.accessorials, "APD");
+
+const amzNoAppt = {
+  ...destAmazon,
+  specialInstructions: "appointment not required",
+};
+const outAmzNoAppt = quoteRules.applyRulesToLane(amzNoAppt, rules, {
+  specialInstructionsGlobal: "appointment not required",
+});
+checkNotHas("Amazon dest + no appt still no APD",
+    outAmzNoAppt.accessorials, "APD");
+check("Amazon dest + no appt records suppress",
+    (outAmzNoAppt.appliedRules || [])
+        .some((r) => r.ruleId === "email_no_appointment"), true);
+
 const destRes = {
   consignee: {name: "Jane Doe", city: "Austin", state: "TX"},
   shipper: {name: "Weida warehouse", city: "Rancho Cucamonga", state: "CA"},
