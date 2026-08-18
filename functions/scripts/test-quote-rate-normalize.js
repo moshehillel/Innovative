@@ -155,6 +155,20 @@ check("expand Kadra Warehouse includes Kadra",
     "Kadra Warehouse|kadra");
 check("expand skips zip-only",
     rateShop.expandCustomerSearchTerms("22911").join("|"), "");
+check("empty noRates retries market",
+    rateShop.shouldRetryRatesWithoutCustomer([]), true);
+check("null noRates retries market",
+    rateShop.shouldRetryRatesWithoutCustomer(null), true);
+check("customer profile error retries market",
+    rateShop.shouldRetryRatesWithoutCustomer([
+      {error: "Customer Profile not found"},
+      {error: "Customer Profile not found"},
+    ]), true);
+check("unrelated noRates does not retry market",
+    rateShop.shouldRetryRatesWithoutCustomer([
+      {error: "Destination city is required"},
+      {error: "Invalid zipcode"},
+    ]), false);
 
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);

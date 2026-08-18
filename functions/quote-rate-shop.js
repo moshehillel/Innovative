@@ -164,12 +164,15 @@ function summarizeNoRateErrors(noRates) {
 /**
  * True when empty rates are mostly customer-profile / class failures
  * that often clear if we rate without a customerId.
+ * Primus sometimes returns empty rates AND empty noRates for customers
+ * with no carrier profiles (no error text to key off) — treat that as
+ * a profile miss too so market fallback still fires.
  * @param {Array<object>} noRates Carrier failure rows.
  * @return {boolean}
  */
 function shouldRetryRatesWithoutCustomer(noRates) {
   const rows = Array.isArray(noRates) ? noRates : [];
-  if (!rows.length) return false;
+  if (!rows.length) return true;
   let hits = 0;
   for (const row of rows) {
     const err = String((row && row.error) || "").toLowerCase();
