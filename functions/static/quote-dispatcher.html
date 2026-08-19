@@ -131,10 +131,12 @@
     }
     @media (min-width: 720px) {
       .lane-summary { grid-template-columns: 1fr 1fr; }
-      .lane-summary .freight-block { grid-column: 1 / -1; }
+      .lane-summary .freight-block,
+      .lane-summary .span-2 { grid-column: 1 / -1; }
     }
     .lane-summary .addr-block h3,
-    .lane-summary .freight-block h3 {
+    .lane-summary .freight-block h3,
+    .details-panel .addr-block h3 {
       margin: 0 0 4px;
       font-size: 0.6875rem;
       font-weight: 700;
@@ -142,22 +144,26 @@
       text-transform: uppercase;
       color: var(--muted);
     }
-    .lane-summary .addr-name {
+    .lane-summary .addr-name,
+    .details-panel .addr-name {
       font-weight: 650;
       font-size: 0.875rem;
       color: var(--text);
     }
-    .lane-summary .addr-lines {
+    .lane-summary .addr-lines,
+    .details-panel .addr-lines {
       font-size: 0.8125rem;
       color: var(--text-secondary);
       white-space: pre-line;
     }
     .lane-summary .addr-missing,
-    .lane-summary .freight-missing {
+    .lane-summary .freight-missing,
+    .details-panel .addr-missing {
       font-size: 0.8125rem;
       color: var(--muted);
       font-style: italic;
     }
+    .details-panel .addr-block { margin-top: 12px; }
     .freight-table {
       width: 100%;
       border-collapse: collapse;
@@ -188,11 +194,40 @@
       margin-bottom: 16px;
       box-shadow: var(--shadow-sm);
     }
+    .details-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
     .details-panel h3 {
       margin: 0 0 12px;
       font-size: 0.9375rem;
       font-weight: 700;
       color: var(--primary-dark);
+    }
+    .details-head h3 { margin: 0; flex: 1; }
+    .details-head button {
+      padding: 7px 12px;
+      font-size: 0.8125rem;
+    }
+    .facts-grid {
+      display: grid;
+      gap: 8px 16px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 720px) {
+      .facts-grid { grid-template-columns: 1fr 1fr; }
+      .facts-grid .span-2 { grid-column: 1 / -1; }
+    }
+    .fact-value {
+      font-size: 0.8125rem;
+      color: var(--text);
+      white-space: pre-line;
+    }
+    .fact-value.muted {
+      color: var(--muted);
+      font-style: italic;
     }
     .details-grid {
       display: grid;
@@ -352,13 +387,23 @@
       padding: 0 10px 10px;
     }
     .acc-section.open .acc-list { display: flex; }
-    .rates-section {
+    .rates-section,
+    .rules-section {
       border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--surface);
       overflow: hidden;
       margin-top: 14px;
     }
+    .rules-section { margin-top: 0; margin-bottom: 14px; }
+    .rules-list {
+      margin: 0;
+      padding: 0 0 0 18px;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+    .rules-list li { margin: 0 0 6px; }
+    .rules-list li:last-child { margin-bottom: 0; }
     .rates-section-toggle {
       display: flex;
       align-items: center;
@@ -380,7 +425,8 @@
       transition: transform 0.15s ease;
       flex-shrink: 0;
     }
-    .rates-section.open .rates-chevron { transform: rotate(90deg); }
+    .rates-section.open .rates-chevron,
+    .rules-section.open .rates-chevron { transform: rotate(90deg); }
     .rates-section-toggle h4 {
       margin: 0;
       font-size: 0.8125rem;
@@ -394,11 +440,13 @@
       color: var(--muted);
       white-space: nowrap;
     }
-    .rates-section .rates-list {
+    .rates-section .rates-list,
+    .rules-section .rates-list {
       display: none;
       padding: 0 12px 12px;
     }
-    .rates-section.open .rates-list { display: block; }
+    .rates-section.open .rates-list,
+    .rules-section.open .rates-list { display: block; }
     .acc-section label {
       display: flex;
       align-items: flex-start;
@@ -950,6 +998,7 @@
     const hasLegacyToken = DISPATCHER_ID && TOKEN;
     let accessorialCatalog = null;
     let accessorialCatalogPromise = null;
+    let detailsEditMode = false;
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
     let thinkingStep = 0;
@@ -1276,6 +1325,7 @@
 
     function applyQuote(q) {
       quote = q;
+      detailsEditMode = false;
       document.getElementById("title").textContent = quote.batchQuoteId || "Quote";
       const custBits = [];
       if (quote.shippingLocationName) custBits.push(quote.shippingLocationName);
@@ -1355,6 +1405,226 @@
         other: "commercial / other",
       };
       return labels[t] || String(t).replace(/_/g, " ");
+    }
+
+    function displayText(value) {
+      return value == null ? "" : String(value).trim();
+    }
+
+    function renderFact(label, value, span2) {
+      const v = displayText(value);
+      return "<div class='fact" + (span2 ? " span-2" : "") + "'>" +
+        "<span class='field-label'>" + esc(label) + "</span>" +
+        "<div class='fact-value" + (v ? "" : " muted") + "'>" +
+        (v ? esc(v) : "—") + "</div></div>";
+    }
+
+    function renderAddressReadonly(party, title, enrichment, fallbackType) {
+      const p = party || {};
+      const name = displayText(partyField(p, "name"));
+      const a1 = displayText(partyField(p, "address1"));
+      const a2 = displayText(partyField(p, "address2"));
+      const city = displayText(partyField(p, "city"));
+      const state = displayText(partyField(p, "state"));
+      const zip = displayText(partyField(p, "zipCode"));
+      const country = displayText(partyField(p, "country"));
+      const phone = displayText(partyField(p, "phone"));
+      const cityLine = [city, state].filter(Boolean).join(", ") +
+        (zip ? (city || state ? " " : "") + zip : zip);
+      const lines = [a1, a2, cityLine, country, phone].filter(Boolean);
+      let html = "<div class='addr-block'>";
+      html += "<h3>" + esc(title);
+      const typeLabel = siteTypeLabel(enrichment, fallbackType);
+      if (typeLabel) {
+        const place = enrichment && enrichment.placeName ?
+          " · " + enrichment.placeName : "";
+        html += "<span class='site-type-chip'>" + esc(typeLabel + place) +
+          "</span>";
+      }
+      html += "</h3>";
+      if (name) html += "<div class='addr-name'>" + esc(name) + "</div>";
+      if (lines.length) {
+        html += "<div class='addr-lines'>" + esc(lines.join("\n")) + "</div>";
+      } else if (!name) {
+        html += "<div class='addr-missing'>No address</div>";
+      }
+      html += "</div>";
+      return html;
+    }
+
+    function renderFreightReadonly(freightInfo) {
+      const rows = Array.isArray(freightInfo) ?
+        freightInfo.filter(Boolean) : [];
+      let html = "<div class='freight-block'>";
+      html += "<h3>Freight / dimensions</h3>";
+      if (!rows.length) {
+        html += "<div class='freight-missing'>No freight lines</div></div>";
+        return html;
+      }
+      html += "<table class='freight-table'><thead><tr>" +
+        "<th>Qty</th><th>Weight</th><th>Class</th><th>L×W×H</th><th>Type</th>" +
+        "</tr></thead><tbody>";
+      rows.forEach((f) => {
+        const wt = [f.weight, f.weightType].filter((v) =>
+          v != null && v !== "").join(" ");
+        const dims = [f.length, f.width, f.height]
+            .filter((v) => v != null && v !== "").join("×");
+        const dimType = f.dimType || f.packaging || "";
+        html += "<tr>" +
+          "<td>" + esc(f.qty != null && f.qty !== "" ? f.qty : "—") + "</td>" +
+          "<td>" + esc(wt || "—") + "</td>" +
+          "<td>" + esc(f.class != null && f.class !== "" ? f.class : "—") +
+          "</td>" +
+          "<td>" + esc(dims || "—") + "</td>" +
+          "<td>" + esc(dimType || "—") + "</td>" +
+          "</tr>";
+      });
+      html += "</tbody></table>";
+      const densityRows = rows.filter((f) => f.classSource === "density");
+      if (densityRows.length) {
+        const bits = densityRows.map((f) => {
+          if (f.emailClass != null && Number(f.emailClass) !== Number(f.class)) {
+            return "email class " + f.emailClass + " → Primus " + f.class;
+          }
+          return "Primus class " + f.class;
+        });
+        html += "<p class='class-hint'>Class from Primus density " +
+          "(weight × L×W×H; email class ignored): " +
+          esc(bits.join("; ")) + ".</p>";
+      }
+      html += "</div>";
+      return html;
+    }
+
+    function rulesStorageKey(laneKey) {
+      return "qd-rules-open:" + QUOTE_ID + ":" + laneKey;
+    }
+
+    function getRulesOpen(laneKey) {
+      try {
+        return sessionStorage.getItem(rulesStorageKey(laneKey)) === "1";
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function persistRulesOpen(laneKey, open) {
+      try {
+        sessionStorage.setItem(rulesStorageKey(laneKey), open ? "1" : "0");
+      } catch (_) { /* ignore */ }
+    }
+
+    function setRulesSectionOpen(section, open) {
+      if (!section) return;
+      section.classList.toggle("open", !!open);
+      const btn = section.querySelector("[data-rules-toggle]");
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+      const laneKey = section.getAttribute("data-lane");
+      if (laneKey) persistRulesOpen(laneKey, !!open);
+    }
+
+    function bindRulesSectionToggles(root) {
+      (root || document).querySelectorAll("[data-rules-toggle]").forEach((btn) => {
+        if (btn.dataset.boundRulesToggle === "1") return;
+        btn.dataset.boundRulesToggle = "1";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const section = btn.closest(".rules-section");
+          if (!section) return;
+          setRulesSectionOpen(section, !section.classList.contains("open"));
+        });
+      });
+    }
+
+    function countedAppliedRules(lane) {
+      const rules = Array.isArray(lane.appliedRules) ? lane.appliedRules : [];
+      if (rules.length) return rules.length;
+      return (lane.accessorialWhy || []).length;
+    }
+
+    function renderRulesSection(lane) {
+      const why = lane.accessorialWhy || [];
+      const n = countedAppliedRules(lane);
+      const open = getRulesOpen(lane.laneKey);
+      let body;
+      if (why.length) {
+        body = "<ul class='rules-list'>" + why.map((w) => {
+          const notes = w.notes ? " — " + w.notes : "";
+          return "<li>" + esc(w.name || "Rule") + esc(notes) + "</li>";
+        }).join("") + "</ul>";
+      } else if ((lane.accessorials || []).length) {
+        body = "<div class='rules-list' style='padding-left:0;list-style:none'>" +
+          "Applied from quote rules / address classification." +
+          (lane.accessorialLabels ? " " + esc(lane.accessorialLabels) : "") +
+          "</div>";
+      } else {
+        body = "<div class='fact-value muted'>No rules applied.</div>";
+      }
+      return "<div class='rules-section" + (open ? " open" : "") +
+        "' data-rules-section='1' data-lane='" + esc(lane.laneKey) + "'>" +
+        "<button type='button' class='rates-section-toggle' " +
+          "aria-expanded='" + (open ? "true" : "false") +
+          "' data-rules-toggle='1'>" +
+          "<span class='rates-chevron'>▶</span>" +
+          "<h4>Rules (" + n + " applied)</h4>" +
+        "</button>" +
+        "<div class='rates-list'>" + body + "</div>" +
+      "</div>";
+    }
+
+    function bindFreightEditors(root) {
+      (root || document).querySelectorAll(".btn-add-freight").forEach((btn) => {
+        if (btn.dataset.boundFreight === "1") return;
+        btn.dataset.boundFreight = "1";
+        btn.addEventListener("click", () => {
+          const block = btn.closest("[data-freight-lane]");
+          if (!block) return;
+          const tbody = block.querySelector("tbody");
+          if (!tbody) return;
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            "<td><input data-f='qty' value=''></td>" +
+            "<td><input data-f='weight' value=''></td>" +
+            "<td><select data-f='weightType'>" +
+            "<option value='total' selected>total</option>" +
+            "<option value='each'>each</option></select></td>" +
+            "<td><input data-f='class' value=''></td>" +
+            "<td><input data-f='length' value=''></td>" +
+            "<td><input data-f='width' value=''></td>" +
+            "<td><input data-f='height' value=''></td>" +
+            "<td><input data-f='dimType' value='PLT'></td>" +
+            "<td><button type='button' class='ghost btn-rm-freight' " +
+            "title='Remove line'>×</button></td>";
+          tbody.appendChild(tr);
+          const rm = tr.querySelector(".btn-rm-freight");
+          if (rm) {
+            rm.dataset.boundFreight = "1";
+            rm.addEventListener("click", () => tr.remove());
+          }
+        });
+      });
+      (root || document).querySelectorAll(".btn-rm-freight").forEach((btn) => {
+        if (btn.dataset.boundFreight === "1") return;
+        btn.dataset.boundFreight = "1";
+        btn.addEventListener("click", () => {
+          const tr = btn.closest("tr");
+          if (tr) tr.remove();
+        });
+      });
+    }
+
+    function setDetailsEditMode(on) {
+      detailsEditMode = !!on;
+      renderQuoteDetails(quote);
+      document.querySelectorAll(".lane[data-lane-key]").forEach((laneEl) => {
+        const laneKey = laneEl.getAttribute("data-lane-key");
+        const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+        const holder = laneEl.querySelector("[data-lane-summary]");
+        if (!holder || !lane) return;
+        holder.innerHTML = renderLaneSummaryBody(lane);
+        if (detailsEditMode) bindFreightEditors(holder);
+      });
     }
 
     function renderAddressEditor(prefix, party, title, enrichment, fallbackType) {
@@ -1487,13 +1757,15 @@
 
     function collectQuoteDetailsPayload() {
       const detailsRoot = document.getElementById("quote-details");
+      const val = (sel) => {
+        const node = detailsRoot && detailsRoot.querySelector(sel);
+        return node ? node.value : "";
+      };
       const payload = {
-        customerRef: detailsRoot.querySelector("[data-q='customerRef']").value,
-        shippingLocationName:
-          detailsRoot.querySelector("[data-q='customerName']").value,
-        readyDate: detailsRoot.querySelector("[data-q='readyDate']").value,
-        specialInstructionsGlobal:
-          detailsRoot.querySelector("[data-q='specialGlobal']").value,
+        customerRef: val("[data-q='customerRef']"),
+        shippingLocationName: val("[data-q='customerName']"),
+        readyDate: val("[data-q='readyDate']"),
+        specialInstructionsGlobal: val("[data-q='specialGlobal']"),
         shipper: readAddressBlock(detailsRoot, "[data-addr='quote-shipper']"),
         lanes: [],
       };
@@ -1514,7 +1786,48 @@
     function renderQuoteDetails(q) {
       const el = document.getElementById("quote-details");
       if (!el) return;
-      let html = "<h3>Quote details</h3><div class='details-grid'>";
+      if (!detailsEditMode) {
+        let html = "<div class='details-head'><h3>Quote details</h3>" +
+          "<button type='button' class='ghost' id='btn-edit-details'>" +
+          "Edit</button></div>";
+        html += "<div class='facts-grid'>";
+        html += renderFact("Customer", q.shippingLocationName);
+        html += renderFact("Primus match",
+            q.customerMatched && q.shippingLocationId ?
+              ("Matched · ID " + q.shippingLocationId) :
+              (q.customerMatchMessage || "No Primus match"));
+        html += renderFact("Customer ref", q.customerRef);
+        html += renderFact("Ready date",
+            (q.readyDate || "").toString().slice(0, 10));
+        html += renderFact("Special instructions",
+            q.specialInstructionsGlobal, true);
+        html += "</div>";
+        html += renderAddressReadonly(
+            q.shipper, "Default from (shipper)",
+            q.originEnrichmentMeta, q.originSiteType);
+        const accBits = (q.lanes || []).map((lane) => {
+          const labels = lane.accessorialLabels ||
+            (lane.accessorials || []).join(", ");
+          if (!labels) return "";
+          return (lane.label || lane.laneKey) + ": " + labels;
+        }).filter(Boolean);
+        if (accBits.length) {
+          html += "<div class='facts-grid' style='margin-top:12px'>" +
+            renderFact("Accessorials", accBits.join("\n"), true) +
+            "</div>";
+        }
+        el.innerHTML = html;
+        document.getElementById("btn-edit-details")
+            .addEventListener("click", () => setDetailsEditMode(true));
+        return;
+      }
+
+      let html = "<div class='details-head'><h3>Quote details</h3>" +
+        "<button type='button' class='ghost' id='btn-cancel-details'>" +
+        "Cancel</button></div>";
+      html += "<p class='class-hint' style='margin:0 0 10px'>" +
+        "From, To, and freight are editable in each lane below.</p>";
+      html += "<div class='details-grid'>";
       html += "<div><label class='field-label'>Customer name</label>" +
         "<input class='field-input' data-q='customerName' value='" +
         esc(q.shippingLocationName || "") + "'></div>";
@@ -1541,6 +1854,9 @@
         "Save details &amp; rerun rates</button>" +
         "</div>";
       el.innerHTML = html;
+
+      document.getElementById("btn-cancel-details")
+          .addEventListener("click", () => setDetailsEditMode(false));
 
       const save = async (rerun) => {
         const btn = document.getElementById(
@@ -1612,9 +1928,11 @@
         } catch (err) {
           showMsg(err.message || "Save details failed", false);
         } finally {
-          btn.disabled = false;
-          other.disabled = false;
-          btn.textContent = prev;
+          if (btn.isConnected) {
+            btn.disabled = false;
+            other.disabled = false;
+            btn.textContent = prev;
+          }
         }
       };
       document.getElementById("btn-save-details")
@@ -1623,8 +1941,36 @@
           .addEventListener("click", () => save(true));
     }
 
-    function renderLaneSummary(lane) {
-      let html = "<div class='lane-summary'>";
+    function renderLaneSummaryBody(lane) {
+      if (!detailsEditMode) {
+        let html = renderAddressReadonly(
+            lane.shipper || (quote && quote.shipper) || null,
+            "From (shipper)",
+            lane.originEnrichmentMeta,
+            lane.originSiteType);
+        html += renderAddressReadonly(
+            lane.consignee || null, "To (consignee)",
+            lane.enrichmentMeta, lane.siteType);
+        html += renderFreightReadonly(lane.freightInfo);
+        html += renderFact("Special instructions (lane)",
+            lane.specialInstructions, true);
+        if (lane.accessorialLabels || (lane.accessorials || []).length) {
+          html += renderFact("Accessorials",
+              lane.accessorialLabels || (lane.accessorials || []).join(", "),
+              true);
+        }
+        if (lane.rateWarning || lane.rateError) {
+          html += "<div class='warn span-2' style='grid-column:1/-1'>" +
+            esc(lane.rateError || lane.rateWarning) + "</div>";
+        }
+        if (lane.notesForCustomer) {
+          html += "<div class='dispatcher-note span-2' style='grid-column:1/-1'>" +
+            "<strong>Dispatcher note (not emailed)</strong>" +
+            esc(lane.notesForCustomer) + "</div>";
+        }
+        return html;
+      }
+      let html = "";
       html += renderAddressEditor(
           "shipper",
           lane.shipper || (quote && quote.shipper) || null,
@@ -1644,8 +1990,12 @@
           "<strong>Dispatcher note (not emailed)</strong>" +
           esc(lane.notesForCustomer) + "</div>";
       }
-      html += "</div>";
       return html;
+    }
+
+    function renderLaneSummary(lane) {
+      return "<div class='lane-summary' data-lane-summary='1'>" +
+        renderLaneSummaryBody(lane) + "</div>";
     }
 
     function countCheckedInItems(items, accSet) {
@@ -1880,21 +2230,7 @@
         const selected = new Set(selections[lane.laneKey] || []);
         const accSet = new Set(laneAccessorials[lane.laneKey] || lane.accessorials || []);
 
-        let whyHtml = "";
-        const why = lane.accessorialWhy || [];
-        if ((lane.accessorials || []).length || why.length) {
-          whyHtml = "<div class='why'><strong>Accessorials" +
-            (lane.accessorialLabels ? ": " + esc(lane.accessorialLabels) : "") +
-            "</strong>";
-          if (why.length) {
-            whyHtml += why.map((w) =>
-              "• " + esc(w.name) + (w.notes ? " — " + esc(w.notes) : "")
-            ).join("<br>");
-          } else {
-            whyHtml += "Applied from quote rules / address classification.";
-          }
-          whyHtml += "</div>";
-        }
+        const whyHtml = renderRulesSection(lane);
 
         let toggles = "<div class='acc-panel' data-lane-acc='" + esc(lane.laneKey) + "'" +
           (loaded ? " data-acc-filled='1'" : "") + ">";
@@ -2005,8 +2341,10 @@
       });
 
       bindRatesSectionToggles(root);
+      bindRulesSectionToggles(root);
       bindAccSectionToggles(root);
       bindAccCheckboxHandlers(root);
+      if (detailsEditMode) bindFreightEditors(root);
 
       root.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
         input.addEventListener("change", () => {
@@ -2113,39 +2451,6 @@
             btn.disabled = false;
             btn.textContent = "Rerun quote with these accessorials";
           }
-        });
-      });
-
-      root.querySelectorAll(".btn-add-freight").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const block = btn.closest("[data-freight-lane]");
-          if (!block) return;
-          const tbody = block.querySelector("tbody");
-          if (!tbody) return;
-          const tr = document.createElement("tr");
-          tr.innerHTML =
-            "<td><input data-f='qty' value=''></td>" +
-            "<td><input data-f='weight' value=''></td>" +
-            "<td><select data-f='weightType'>" +
-            "<option value='total' selected>total</option>" +
-            "<option value='each'>each</option></select></td>" +
-            "<td><input data-f='class' value=''></td>" +
-            "<td><input data-f='length' value=''></td>" +
-            "<td><input data-f='width' value=''></td>" +
-            "<td><input data-f='height' value=''></td>" +
-            "<td><input data-f='dimType' value='PLT'></td>" +
-            "<td><button type='button' class='ghost btn-rm-freight' " +
-            "title='Remove line'>×</button></td>";
-          tbody.appendChild(tr);
-          tr.querySelector(".btn-rm-freight").addEventListener("click", () => {
-            tr.remove();
-          });
-        });
-      });
-      root.querySelectorAll(".btn-rm-freight").forEach((btn) => {
-        btn.addEventListener("click", () => {
-          const tr = btn.closest("tr");
-          if (tr) tr.remove();
         });
       });
     }
