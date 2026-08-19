@@ -788,14 +788,15 @@ async function rateLane(lane, ctx) {
       rates, rulesOut.filterCarrierWarnings);
 
   const marginOpts = {
-    marginPercent: Number(process.env.QUOTE_MARGIN_PERCENT) || null,
-    marginMinDollars: Number(process.env.QUOTE_MARGIN_MIN_DOLLARS) || 10,
+    marginPercent: Number(process.env.QUOTE_MARGIN_PERCENT) || 10,
+    marginMinDollars: Number(process.env.QUOTE_MARGIN_MIN_DOLLARS) || 55,
   };
 
   const enriched = filtered.map((r) => {
     const billToTotal = r.billTo && r.billTo.total;
     const sellRate = rateShop.computeSellRate(r.total, {
       billToTotal,
+      rateSource,
       ...marginOpts,
     });
     return {...r, sellRate};

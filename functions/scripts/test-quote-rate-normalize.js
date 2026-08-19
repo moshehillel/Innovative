@@ -173,6 +173,19 @@ check("market fallback warning text",
     rateShop.MARKET_FALLBACK_WARNING,
     "Primus customer matched but no customer tariffs — showing market rates.");
 
+check("market sell uses min($55, 10%) — low cost",
+    rateShop.computeSellRate(300), 330);
+check("market sell uses min($55, 10%) — high cost",
+    rateShop.computeSellRate(2000), 2055);
+check("market sell at crossover",
+    rateShop.computeSellRate(550), 605);
+check("customer billTo passes through below floor",
+    rateShop.computeSellRate(300, {billToTotal: 320}), 320);
+check("customer rateSource passes through without floor",
+    rateShop.computeSellRate(400, {rateSource: "customer"}), 400);
+check("market_fallback applies markup",
+    rateShop.computeSellRate(300, {rateSource: "market_fallback"}), 330);
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
