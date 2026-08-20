@@ -586,6 +586,7 @@
       address_text: "Address text",
       ai: "AI classification",
       both: "Address text or AI",
+      email: "Sender email",
     };
 
     function formatIdentifyVia(rule) {
@@ -657,6 +658,13 @@
           applyTo === "both" ? "Pickup or delivery site" : "Delivery site";
         lines.push(`${kind} is identified as ${SITE_TYPE_LABELS[match.siteType] || match.siteType.replace(/_/g, " ")}`);
       }
+      const fromEmails = [].concat(match.fromEmails || []).concat(match.senderEmails || []);
+      if (fromEmails.length) {
+        lines.push(`Sender From email is ${quoteList(fromEmails)}`);
+      }
+      if (match.senderDomains && match.senderDomains.length) {
+        lines.push(`Sender domain is ${quoteList(match.senderDomains.map((d) => String(d).startsWith("@") ? d : "@" + d))}`);
+      }
       if (!lines.length) {
         lines.push("Custom match conditions (see Advanced for details).");
       }
@@ -665,6 +673,19 @@
 
     function describeActions(rule) {
       const lines = [];
+      if (rule.customerName) {
+        lines.push(`Attach Primus customer "${rule.customerName}"`);
+      }
+      if (rule.protocolOnly) {
+        lines.push("Protocol only — match this customer from the sender email");
+      }
+      if (rule.defaultDims && typeof rule.defaultDims === "object") {
+        const d = rule.defaultDims;
+        const L = d.length != null ? d.length : "?";
+        const W = d.width != null ? d.width : "?";
+        const H = d.height != null ? d.height : "?";
+        lines.push(`Default missing pallet dims to ${L}×${W}×${H}`);
+      }
       const acc = rule.addAccessorials || [];
       if (acc.length) {
         lines.push(`Add accessorial${acc.length > 1 ? "s" : ""}: ${acc.map(formatAccessorial).join("; ")}`);
@@ -673,7 +694,7 @@
       if (filters.length) {
         lines.push(`Do not use carriers that warn about: ${filters.map(f => `"${f}"`).join(", ")}`);
       }
-      if (!acc.length && !filters.length) {
+      if (!acc.length && !filters.length && !rule.customerName && !rule.defaultDims) {
         lines.push("No accessorials or carrier filters — rule may only set flags or notes.");
       }
       if (rule.requiresConfirm) {
@@ -726,7 +747,7 @@
         ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
         <details class="rule-advanced">
           <summary>Advanced (rule ID &amp; technical data)</summary>
-          <pre>${esc(JSON.stringify({ id: rule.id, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
+          <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
         </details>
       `;
       return card;
@@ -907,6 +928,14 @@
       }
       if (patch.addAccessorials) {
         parts.push(`Add: ${patch.addAccessorials.map(formatAccessorial).map(esc).join("; ")}`);
+      }
+      if (patch.customerName) {
+        parts.push(`Customer: ${esc(patch.customerName)}`);
+      }
+      if (patch.protocolOnly) parts.push("Protocol only");
+      if (patch.defaultDims && typeof patch.defaultDims === "object") {
+        const d = patch.defaultDims;
+        parts.push(`Default dims: ${esc([d.length, d.width, d.height].filter((n) => n != null).join("×"))}`);
       }
       if (patch.active === false) parts.push("This rule will be turned off.");
       if (patch.active === true) parts.push("This rule will be turned on.");

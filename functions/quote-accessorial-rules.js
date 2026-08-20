@@ -11,10 +11,11 @@
 const admin = require("firebase-admin");
 const declinedAcc = require("./quote-declined-accessorials");
 
-const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both"];
+const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both", "email"];
 const DEFAULT_IDENTIFY_VIA = "both";
 const APPLY_TO_VALUES = ["dest", "origin", "both"];
 const DEFAULT_APPLY_TO = "dest";
+const RULE_KIND_SENDER_CUSTOMER = "sender_customer";
 
 /** Dest accessorial → pickup equivalent when a rule applies to origin. */
 const DEST_TO_ORIGIN_ACCESSORIAL = {
@@ -32,7 +33,11 @@ const DEST_TO_ORIGIN_ACCESSORIAL = {
  * Default rule ids whose addAccessorials / name / notes are force-synced
  * from DEFAULT_RULES on load (overrides stale Firestore seed values).
  */
-const MANAGED_DEFAULT_RULE_IDS = new Set(["amazon_fc"]);
+const MANAGED_DEFAULT_RULE_IDS = new Set([
+  "amazon_fc",
+  "sender_mike_oseback",
+  "sender_jared_berman",
+]);
 
 /**
  * Former product defaults that must never be re-seeded after delete,
@@ -44,6 +49,45 @@ const RETIRED_DEFAULT_RULE_IDS = new Set([
 ]);
 
 const DEFAULT_RULES = [
+  {
+    id: "sender_mike_oseback",
+    active: true,
+    priority: 5,
+    name: "Sender → Mike Oseback",
+    ruleKind: RULE_KIND_SENDER_CUSTOMER,
+    identifyVia: "email",
+    match: {
+      fromEmails: ["mike.oseback@ediexpressinc.com"],
+    },
+    customerName: "Mike Oseback",
+    protocolOnly: true,
+    addAccessorials: [],
+    applyTo: "dest",
+    notes: "Map EDI Express sender to Mike Oseback (protocol only). " +
+      "Does not add accessorials.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
+  {
+    id: "sender_jared_berman",
+    active: true,
+    priority: 5,
+    name: "Sender → Brumis Imports Inc",
+    ruleKind: RULE_KIND_SENDER_CUSTOMER,
+    identifyVia: "email",
+    match: {
+      fromEmails: ["jared.berman@corehome.com"],
+    },
+    customerName: "Brumis Imports Inc",
+    protocolOnly: false,
+    defaultDims: {length: 40, width: 48, height: 62},
+    addAccessorials: [],
+    applyTo: "dest",
+    notes: "Map Jared Berman / Corehome to Brumis Imports Inc; " +
+      "default missing pallet dims to 40×48×62.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
   {
     id: "liftgate_no_dock",
     active: true,
@@ -238,11 +282,30 @@ function ruleSides(rule) {
 
 /**
  * @param {object} rule Rule document.
- * @return {"address_text"|"ai"|"both"}
+ * @return {"address_text"|"ai"|"both"|"email"}
  */
 function normalizeIdentifyVia(rule) {
   const v = rule && rule.identifyVia;
   return IDENTIFY_VIA_VALUES.includes(v) ? v : DEFAULT_IDENTIFY_VIA;
+}
+
+/**
+ * Sender→customer mapping rules are applied at intake,
+ * not as lane accessorials.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isSenderCustomerRule(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  if (rule.ruleKind === RULE_KIND_SENDER_CUSTOMER) return true;
+  if (normalizeIdentifyVia(rule) === "email" && rule.customerName) return true;
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  const emails = []
+      .concat(match.fromEmails || [])
+      .concat(match.senderEmails || []);
+  const domains = [].concat(match.senderDomains || []);
+  return emails.some((e) => String(e || "").includes("@")) ||
+    domains.some((d) => !!String(d || "").trim());
 }
 
 /**
@@ -356,18 +419,39 @@ function queueManagedDefaultSync(batch, ref, existing) {
     const haveCodes = (data.addAccessorials || []).map(String);
     const codesSame = wantCodes.length === haveCodes.length &&
       wantCodes.every((c, i) => c === haveCodes[i]);
-    if (codesSame &&
-        data.name === rule.name &&
-        data.notes === rule.notes) {
-      continue;
-    }
-    batch.set(ref.doc(rule.id), {
+    const senderSync = isSenderCustomerRule(rule);
+    const wantMatch = JSON.stringify(rule.match || {});
+    const haveMatch = JSON.stringify(data.match || {});
+    const wantDims = JSON.stringify(rule.defaultDims || null);
+    const haveDims = JSON.stringify(data.defaultDims || null);
+    const sameCore = codesSame &&
+      data.name === rule.name &&
+      data.notes === rule.notes;
+    const sameSender = !senderSync || (
+      data.customerName === rule.customerName &&
+      !!data.protocolOnly === !!rule.protocolOnly &&
+      data.ruleKind === rule.ruleKind &&
+      data.identifyVia === rule.identifyVia &&
+      wantMatch === haveMatch &&
+      wantDims === haveDims
+    );
+    if (sameCore && sameSender) continue;
+    const patch = {
       addAccessorials: wantCodes,
       name: rule.name,
       notes: rule.notes || "",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedBy: "system-sync-managed-defaults",
-    }, {merge: true});
+    };
+    if (senderSync) {
+      patch.ruleKind = rule.ruleKind;
+      patch.identifyVia = rule.identifyVia;
+      patch.match = rule.match || {};
+      patch.customerName = rule.customerName || "";
+      patch.protocolOnly = !!rule.protocolOnly;
+      if (rule.defaultDims) patch.defaultDims = rule.defaultDims;
+    }
+    batch.set(ref.doc(rule.id), patch, {merge: true});
     writes++;
   }
   return writes;
@@ -659,6 +743,9 @@ function applyRulesToLane(lane, rules, context = {}) {
 
   for (const rule of rules) {
     if (!rule.active) continue;
+    // Sender→customer rules attach Primus customer / dims at intake —
+    // they must not invent site accessorials here.
+    if (isSenderCustomerRule(rule)) continue;
     for (const side of ruleSides(rule)) {
       const via = ruleMatchVia(lane, context, rule, side);
       if (!via) continue;
@@ -800,6 +887,7 @@ module.exports = {
   APPLY_TO_VALUES,
   DEFAULT_APPLY_TO,
   DEST_TO_ORIGIN_ACCESSORIAL,
+  RULE_KIND_SENDER_CUSTOMER,
   MANAGED_DEFAULT_RULE_IDS,
   RETIRED_DEFAULT_RULE_IDS,
   loadActiveRules,
@@ -822,4 +910,5 @@ module.exports = {
   accessorialsForSide,
   formatAccessorialLabels,
   ACCESSORIAL_LABELS,
+  isSenderCustomerRule,
 };

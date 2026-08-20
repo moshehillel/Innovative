@@ -1,6 +1,13 @@
 /**
  * Sender-specific quote intake rules (customer attach + pallet dim defaults).
- * Match From email case-insensitively. Global pallet default remains 40×48×60.
+ * Match From email / domain case-insensitively.
+ *
+ * Sources (merged, Firestore wins on same email):
+ * 1. Built-in SENDER_RULES (always-on fallback)
+ * 2. quoteRules docs with ruleKind "sender_customer" or match.fromEmails /
+ *    match.senderEmails / match.senderDomains
+ *
+ * Global pallet default remains 40×48×60 unless a sender rule sets defaultDims.
  */
 
 "use strict";
@@ -15,13 +22,22 @@ const {
  * Map of normalized From email → rule.
  * defaultDims only fill missing L/W/H (and may replace AI-invented global
  * 40×48×60 when the email body has no explicit height).
- * @type {Object<string, {customerName?: string,
- *   defaultDims?: {length: number, width: number, height: number}}>}
+ * @type {Object<string, {customerName?: string, protocolOnly?: boolean,
+ *   defaultDims?: {length: number, width: number, height: number},
+ *   ruleId?: string, name?: string}>}
  */
 const SENDER_RULES = {
   "jared.berman@corehome.com": {
     customerName: "Brumis Imports Inc",
     defaultDims: {length: 40, width: 48, height: 62},
+    ruleId: "sender_jared_berman",
+    name: "Sender → Brumis Imports Inc",
+  },
+  "mike.oseback@ediexpressinc.com": {
+    customerName: "Mike Oseback",
+    protocolOnly: true,
+    ruleId: "sender_mike_oseback",
+    name: "Sender → Mike Oseback",
   },
 };
 
@@ -40,14 +56,145 @@ function extractSenderEmail(from) {
 }
 
 /**
- * @param {string} from Raw From header.
- * @return {object|null} Sender rule or null.
+ * @param {string} email Lowercase email.
+ * @return {string} Domain without leading @, or "".
  */
-function resolveSenderRule(from) {
+function emailDomain(email) {
+  const e = String(email || "").toLowerCase();
+  const at = e.lastIndexOf("@");
+  return at >= 0 ? e.slice(at + 1) : "";
+}
+
+/**
+ * Normalize domain needles (`@foo.com`, `foo.com` → `foo.com`).
+ * @param {string} raw Domain.
+ * @return {string}
+ */
+function normalizeDomainNeedle(raw) {
+  return String(raw || "").trim().toLowerCase().replace(/^@+/, "");
+}
+
+/**
+ * True when a quoteRules doc is a sender→customer mapping rule.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isSenderCustomerRule(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  if (rule.ruleKind === "sender_customer") return true;
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  const emails = []
+      .concat(match.fromEmails || [])
+      .concat(match.senderEmails || []);
+  const domains = [].concat(match.senderDomains || []);
+  return emails.some((e) => String(e || "").includes("@")) ||
+    domains.some((d) => !!normalizeDomainNeedle(d));
+}
+
+/**
+ * Convert a Firestore quoteRules doc into a resolved sender rule payload.
+ * @param {object} rule Quote rule doc.
+ * @return {object|null}
+ */
+function senderPayloadFromQuoteRule(rule) {
+  if (!isSenderCustomerRule(rule) || rule.active === false) return null;
+  const customerName = String(rule.customerName || "").trim();
+  const defaultDims = rule.defaultDims && typeof rule.defaultDims === "object" ?
+    {
+      length: Number(rule.defaultDims.length) || undefined,
+      width: Number(rule.defaultDims.width) || undefined,
+      height: Number(rule.defaultDims.height) || undefined,
+    } : null;
+  const dims = defaultDims &&
+    (defaultDims.length || defaultDims.width || defaultDims.height) ?
+    defaultDims : null;
+  if (!customerName && !dims) return null;
+  return {
+    customerName: customerName || undefined,
+    protocolOnly: !!rule.protocolOnly,
+    defaultDims: dims || undefined,
+    ruleId: rule.id ? String(rule.id) : undefined,
+    name: rule.name ? String(rule.name) : undefined,
+  };
+}
+
+/**
+ * Collect fromEmails / senderEmails from a rule match.
+ * @param {object} match Match object.
+ * @return {Array<string>} Lowercase emails.
+ */
+function emailsFromMatch(match) {
+  const m = match && typeof match === "object" ? match : {};
+  return []
+      .concat(m.fromEmails || [])
+      .concat(m.senderEmails || [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+}
+
+/**
+ * Collect senderDomains from a rule match.
+ * @param {object} match Match object.
+ * @return {Array<string>} Lowercase domains without @.
+ */
+function domainsFromMatch(match) {
+  const m = match && typeof match === "object" ? match : {};
+  return []
+      .concat(m.senderDomains || [])
+      .map(normalizeDomainNeedle)
+      .filter(Boolean);
+}
+
+/**
+ * Match a From address against a list of quoteRules (sender_customer).
+ * Exact email wins over domain. First active match by priority asc.
+ * @param {string} from Raw From.
+ * @param {Array<object>} quoteRules Active quote rules.
+ * @return {object|null}
+ */
+function resolveSenderRuleFromQuoteRules(from, quoteRules) {
   const email = extractSenderEmail(from);
   if (!email) return null;
-  const rule = SENDER_RULES[email];
-  return rule && typeof rule === "object" ? {...rule} : null;
+  const domain = emailDomain(email);
+  const list = (quoteRules || [])
+      .filter((r) => r && r.active !== false && isSenderCustomerRule(r))
+      .slice()
+      .sort((a, b) =>
+        (Number(a.priority) || 100) - (Number(b.priority) || 100));
+
+  let domainHit = null;
+  for (const rule of list) {
+    const emails = emailsFromMatch(rule.match);
+    if (emails.includes(email)) {
+      return senderPayloadFromQuoteRule(rule);
+    }
+    if (!domainHit && domain) {
+      const domains = domainsFromMatch(rule.match);
+      if (domains.includes(domain)) {
+        domainHit = senderPayloadFromQuoteRule(rule);
+      }
+    }
+  }
+  return domainHit;
+}
+
+/**
+ * @param {string} from Raw From header.
+ * @param {Array<object>} [quoteRules] Optional Firestore quoteRules.
+ * @return {object|null} Sender rule or null.
+ */
+function resolveSenderRule(from, quoteRules) {
+  const email = extractSenderEmail(from);
+  if (!email) return null;
+
+  const fromFs = resolveSenderRuleFromQuoteRules(from, quoteRules || []);
+  if (fromFs) return {...fromFs};
+
+  const builtin = SENDER_RULES[email];
+  if (builtin && typeof builtin === "object") return {...builtin};
+
+  // Built-in domain fallbacks are not used — only exact builtins + FS domains.
+  return null;
 }
 
 /**
@@ -67,10 +214,11 @@ function bodyHasExplicitPalletHeight(body) {
 /**
  * Dim opts for normalizePalletDims / normalizePalletFreightRows.
  * @param {string} from Raw From.
+ * @param {Array<object>} [quoteRules] Optional Firestore rules.
  * @return {object} `{defaultDims}` or `{}`.
  */
-function dimOptsForSender(from) {
-  const rule = resolveSenderRule(from);
+function dimOptsForSender(from, quoteRules) {
+  const rule = resolveSenderRule(from, quoteRules);
   if (!rule || !rule.defaultDims) return {};
   return {defaultDims: {...rule.defaultDims}};
 }
@@ -81,10 +229,11 @@ function dimOptsForSender(from) {
  * @param {object} extracted Intake payload.
  * @param {string} from Raw From.
  * @param {string} body Email body.
+ * @param {Array<object>} [quoteRules] Optional Firestore rules.
  * @return {object}
  */
-function applySenderDefaultedDimOverrides(extracted, from, body) {
-  const rule = resolveSenderRule(from);
+function applySenderDefaultedDimOverrides(extracted, from, body, quoteRules) {
+  const rule = resolveSenderRule(from, quoteRules);
   if (!rule || !rule.defaultDims || !extracted ||
       !Array.isArray(extracted.lanes)) {
     return extracted;
@@ -118,10 +267,11 @@ function applySenderDefaultedDimOverrides(extracted, from, body) {
  * Force customerName / shippingLocationName from sender rule when set.
  * @param {object} extracted Intake payload.
  * @param {string} from Raw From.
+ * @param {Array<object>} [quoteRules] Optional Firestore rules.
  * @return {object}
  */
-function applySenderCustomerOverride(extracted, from) {
-  const rule = resolveSenderRule(from);
+function applySenderCustomerOverride(extracted, from, quoteRules) {
+  const rule = resolveSenderRule(from, quoteRules);
   if (!rule || !rule.customerName || !extracted ||
       typeof extracted !== "object") {
     return extracted;
@@ -130,12 +280,22 @@ function applySenderCustomerOverride(extracted, from) {
   if (!name) return extracted;
   extracted.customerName = name;
   extracted.shippingLocationName = name;
+  if (rule.protocolOnly) {
+    extracted.senderProtocolOnly = true;
+  }
+  if (rule.ruleId) {
+    extracted.senderRuleId = String(rule.ruleId);
+  }
   return extracted;
 }
 
 module.exports = {
   SENDER_RULES,
   extractSenderEmail,
+  emailDomain,
+  isSenderCustomerRule,
+  senderPayloadFromQuoteRule,
+  resolveSenderRuleFromQuoteRules,
   resolveSenderRule,
   bodyHasExplicitPalletHeight,
   dimOptsForSender,

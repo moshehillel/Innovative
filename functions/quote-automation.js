@@ -44,11 +44,13 @@ function col(tenant, name) {
 
 /**
  * Resolves Primus customer match from sender email domain / customer name.
- * @param {object} opts from, customerRef, customerName, allowDefault?.
+ * @param {object} opts from, customerRef, customerName, allowDefault?,
+ *   quoteRules?.
  * @return {Promise<object>} `{id, name, code?, searchTerm?}` — id may be null.
  */
 async function resolveCustomerMatch(opts) {
-  const senderRule = senderRules.resolveSenderRule(opts.from || "");
+  const senderRule = senderRules.resolveSenderRule(
+      opts.from || "", opts.quoteRules || []);
   const ref = String(opts.customerRef || "");
   const customerName = String(
       (senderRule && senderRule.customerName) ||
@@ -78,12 +80,18 @@ async function resolveCustomerMatch(opts) {
     searchTerms.push("coreforce", "lifeworks");
   }
   // Sender rule customer name is authoritative — search it first.
+  // protocolOnly: match only that customer (no shipper/ref heuristics).
   if (senderRule && senderRule.customerName) {
     const forced = String(senderRule.customerName).trim();
-    const rest = searchTerms.filter((t) =>
-      String(t).trim().toLowerCase() !== forced.toLowerCase());
-    searchTerms.length = 0;
-    searchTerms.push(forced, ...rest);
+    if (senderRule.protocolOnly) {
+      searchTerms.length = 0;
+      searchTerms.push(forced);
+    } else {
+      const rest = searchTerms.filter((t) =>
+        String(t).trim().toLowerCase() !== forced.toLowerCase());
+      searchTerms.length = 0;
+      searchTerms.push(forced, ...rest);
+    }
   }
 
   const match = await rateShop.resolveCustomerForQuote({
@@ -186,6 +194,7 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
     customerName: customerName || shipperName,
     shipperName,
     allowDefault: false,
+    quoteRules: opts.quoteRules || [],
   });
 
   if (match && match.id) {
@@ -350,6 +359,10 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
     throw new Error("Quote was dismissed");
   }
 
+  const quoteRulesList = await quoteRules.loadActiveRules(tenant);
+  const senderDimOpts = senderRules.dimOptsForSender(
+      data.from || "", quoteRulesList);
+
   const patch = {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
@@ -405,8 +418,7 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
         next = {
           ...next,
           freightInfo: normalizeFreightRows(
-              row.freightInfo,
-              senderRules.dimOptsForSender(data.from || "")),
+              row.freightInfo, senderDimOpts),
         };
       }
       if (row.specialInstructions !== undefined) {
@@ -444,7 +456,9 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
       patch.shippingLocationName =
         String(details.customerName).trim() || null;
     }
-    const lookup = await applyCustomerLookupToPatch(data, patch);
+    const lookup = await applyCustomerLookupToPatch(data, patch, {
+      quoteRules: quoteRulesList,
+    });
     customerMatch = lookup.customerMatch;
     customerMatchMessage = lookup.customerMatchMessage;
   }
@@ -689,7 +703,8 @@ async function rateLane(lane, ctx) {
   // Always overwrite email class with Primus density class when
   // weight + L×W×H are present. Pallet missing dims → sender or
   // global 40×48×60 first.
-  const dimOpts = senderRules.dimOptsForSender(ctx.from || "");
+  const dimOpts = senderRules.dimOptsForSender(
+      ctx.from || "", ctx.rules || []);
   const freightNormalized = freightDims.normalizePalletFreightRows(
       lane.freightInfo || [], dimOpts);
   const classFix = rateShop.ensureFreightClasses(freightNormalized, {
@@ -891,6 +906,13 @@ async function processQuoteEmail(opts) {
   // Built-in freight rules: combine same-OD ≤26 PLT, then split >26 PLT.
   extracted = freightRules.applyFreightRules(extracted);
 
+  const rules = await quoteRules.loadActiveRules(tenant);
+  // Re-apply sender→customer / defaultDims using Firestore rules (chat-created
+  // mappings) in addition to built-in SENDER_RULES.
+  senderRules.applySenderCustomerOverride(extracted, from, rules);
+  senderRules.applySenderDefaultedDimOverrides(
+      extracted, from, emailBody, rules);
+
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
   const extractedCustomerName = String(
@@ -903,13 +925,13 @@ async function processQuoteEmail(opts) {
     customerRef: extracted.customerRef,
     customerName: extractedCustomerName,
     shipperName: extracted.shipper && extracted.shipper.name,
+    quoteRules: rules,
   });
   const shippingLocationId = customerMatch.id || null;
   const shippingLocationName = customerMatch.name ||
     extractedCustomerName || null;
   const customerLookupStatus = customerMatch.lookupStatus ||
     (shippingLocationId ? "matched" : "no_match");
-  const rules = await quoteRules.loadActiveRules(tenant);
 
   const enrichLog = (level, category, message, data) =>
     deps.writeLog(level, category, message, data);

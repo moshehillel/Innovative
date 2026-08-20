@@ -10,6 +10,7 @@ const {
   IDENTIFY_VIA_VALUES,
   DEFAULT_IDENTIFY_VIA,
   ACCESSORIAL_LABELS,
+  RULE_KIND_SENDER_CUSTOMER,
 } = require("./quote-accessorial-rules");
 
 // Stronger than gpt-5.6-luna for freeform rule chat. Override via env.
@@ -27,6 +28,10 @@ const PATCH_FIELDS = [
   "requiresConfirm",
   "identifyVia",
   "addAccessorialsWithData",
+  "ruleKind",
+  "customerName",
+  "protocolOnly",
+  "defaultDims",
 ];
 
 const QUICK_REPLY_CAN_BE =
@@ -313,13 +318,19 @@ function looksLikeMilitaryAccessorialIntent(messages) {
  * @return {string}
  */
 function fallbackUnclearReply(messages) {
+  if (looksLikeSenderCustomerIntent(messages)) {
+    return "I can map a sender email to a Primus customer. " +
+      "Tell me the From address and customer name " +
+      "(and protocol only / default dims if needed).";
+  }
   if (isMilitaryTopicBlob(userTopicBlob(messages))) {
     return "I can add or update the military / AAFES site rule " +
       "(limited access and appointment delivery). Tell me LAD, APD, " +
       "or both and I'll propose it.";
   }
   return "Tell me the site (for example military bases) and which " +
-    "accessorials to add (LAD, APD, …). I'll propose a rule to Confirm.";
+    "accessorials to add (LAD, APD, …), or map a sender email to a " +
+    "customer. I'll propose a rule to Confirm.";
 }
 
 /**
@@ -882,6 +893,376 @@ function buildMilitaryAccessorialProposal(messages, existingRules) {
 }
 
 /**
+ * Extract email addresses from freeform text.
+ * @param {string} text User text.
+ * @return {Array<string>} Lowercase unique emails.
+ */
+function extractEmailsFromText(text) {
+  const raw = String(text || "");
+  const found = raw.match(/[\w.+-]+@[\w.-]+\.\w+/g) || [];
+  const out = [];
+  const seen = new Set();
+  for (const e of found) {
+    const lower = String(e).trim().toLowerCase();
+    if (!lower || seen.has(lower)) continue;
+    seen.add(lower);
+    out.push(lower);
+  }
+  return out;
+}
+
+/**
+ * Extract @domain needles from text.
+ * @param {string} text User text.
+ * @return {Array<string>} Domains without @.
+ */
+function extractSenderDomainsFromText(text) {
+  const raw = String(text || "");
+  const out = [];
+  const seen = new Set();
+  const re = /@([a-z0-9.-]+\.[a-z]{2,})\b/gi;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const d = String(m[1] || "").toLowerCase();
+    if (!d || seen.has(d)) continue;
+    // Skip if this is part of a full email we already treat as fromEmails.
+    seen.add(d);
+    out.push(d);
+  }
+  // Only keep domains that were mentioned as domain-only (not email).
+  // If the only @ hits are full emails, still return their domains when
+  // the user said "domain" / "@company.com" without a local-part intent.
+  if (/\b(domain|sender domain|anyone@|any\s*@)\b/i.test(raw)) {
+    return out;
+  }
+  // Domain-only tokens like "@ediexpressinc.com" without a local part.
+  const bare = [];
+  const bareRe = /(?:^|[\s(,])@([a-z0-9.-]+\.[a-z]{2,})\b/gi;
+  let bm;
+  while ((bm = bareRe.exec(raw)) !== null) {
+    const d = String(bm[1] || "").toLowerCase();
+    if (d && !bare.includes(d)) bare.push(d);
+  }
+  return bare;
+}
+
+/**
+ * Parse optional default dims (e.g. 40x48x62).
+ * @param {string} text User text.
+ * @return {object|null} `{length,width,height}` or null.
+ */
+function parseDefaultDimsFromText(text) {
+  const t = String(text || "");
+  const m = t.match(
+      /\b(\d{2})\s*[x×*]\s*(\d{2})\s*[x×*]\s*(\d{2,3})\b/i);
+  if (!m) return null;
+  return {
+    length: Number(m[1]),
+    width: Number(m[2]),
+    height: Number(m[3]),
+  };
+}
+
+/**
+ * True when user wants protocol-only customer attach.
+ * @param {string} text User text.
+ * @return {boolean}
+ */
+function parseProtocolOnlyFromText(text) {
+  const t = String(text || "").toLowerCase();
+  return /\bprotocol[\s-]*only\b/.test(t) ||
+    /\bonly\s+protocol\b/.test(t) ||
+    /\bprotocol\s+pricing\b/.test(t);
+}
+
+/**
+ * Guess customer name from mapping phrasing.
+ * @param {string} text User text.
+ * @param {Array<string>} emails Emails already found (strip from name).
+ * @return {string}
+ */
+function parseCustomerNameFromSenderText(text, emails) {
+  let t = String(text || "").replace(/\s+/g, " ").trim();
+  for (const e of emails || []) {
+    t = t.replace(new RegExp(e.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "ig"),
+        " ");
+  }
+  t = t.replace(/\bprotocol[\s-]*only\b/ig, " ");
+  t = t.replace(/\bdefault\s+dims?\b[^.]*$/ig, " ");
+  t = t.replace(/\b\d{2}\s*[x×*]\s*\d{2}\s*[x×*]\s*\d{2,3}\b/ig, " ");
+  t = t.replace(/\bwhen\s+missing\b/ig, " ");
+
+  /**
+   * @param {string} name Raw capture.
+   * @return {string}
+   */
+  function cleanName(name) {
+    let n = String(name || "").trim()
+        .replace(/^["'`]+|["'`]+$/g, "")
+        .replace(/\b(protocol[\s-]*only|please|thanks)\b/ig, "")
+        .replace(/\bdefault\s+dims?\b.*$/ig, "")
+        .replace(/\b\d{2}\s*[x×*]\s*\d{2}\s*[x×*]\s*\d{2,3}\b.*$/ig, "")
+        .replace(/\bwhen\s+missing\b.*$/ig, "")
+        .replace(/[,;:\s]+$/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+    n = n.replace(/\s+and\s+.*$/i, "").trim();
+    return n;
+  }
+
+  const patterns = [
+    new RegExp(
+        "\\b(?:map|match)\\s+(?:this\\s+)?(?:email|sender|from)?\\s*" +
+        "(?:to|with)\\s+(?:customer\\s+)?(?:name\\s+)?(.+?)(?:\\.|$)",
+        "i"),
+    /\b(?:use|to)\s+customer\s+(?:name\s+)?(.+?)(?:\.|$)/i,
+    /\b(?:customer|account)\s*(?:name)?\s*[:=]\s*(.+?)(?:\.|$)/i,
+    /(?:^|[\s:])(?:to|→|->|=>)\s+([A-Z][\w .&'-]{2,80})(?:[,.]|$)/,
+    /\bfor\s+customer\s+(.+?)(?:\.|$)/i,
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m && m[1]) {
+      const name = cleanName(m[1]);
+      if (name.length >= 2 && !/@/.test(name)) return name;
+    }
+  }
+
+  // "mike.oseback@… to Mike Oseback" / "Jared … → Brumis Imports Inc"
+  const arrow = String(text || "").match(
+      /@[\w.-]+\s+(?:to|→|->|as)\s+(.+?)(?:\.|$)/i);
+  if (arrow && arrow[1]) {
+    const name = cleanName(arrow[1]);
+    if (name.length >= 2 && !/@/.test(name)) return name;
+  }
+  return "";
+}
+
+/**
+ * Build a stable snake_case rule id from customer / email.
+ * @param {string} customerName Customer.
+ * @param {Array<string>} emails Emails.
+ * @return {string}
+ */
+function senderRuleIdFromParts(customerName, emails) {
+  const fromName = String(customerName || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "")
+      .slice(0, 40);
+  if (fromName) return `sender_${fromName}`;
+  const local = String((emails && emails[0]) || "custom")
+      .split("@")[0]
+      .replace(/[^a-z0-9]+/g, "_")
+      .slice(0, 30);
+  return `sender_${local || "custom"}`;
+}
+
+/**
+ * Infer sender→customer mapping fields from chat history.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object|null}
+ */
+function inferSenderCustomerTopic(messages) {
+  const blob = (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (!blob.trim()) return null;
+  const emails = extractEmailsFromText(blob);
+  const domains = extractSenderDomainsFromText(blob);
+  // Prefer domain-only when user said domain and we have no useful email
+  // local-part intent — still allow emails when present.
+  const customerName = parseCustomerNameFromSenderText(blob, emails);
+  const protocolOnly = parseProtocolOnlyFromText(blob);
+  const defaultDims = parseDefaultDimsFromText(blob);
+  if (!emails.length && !domains.length) return null;
+  if (!customerName && !defaultDims) return null;
+  return {
+    emails,
+    domains,
+    customerName,
+    protocolOnly,
+    defaultDims,
+  };
+}
+
+/**
+ * User wants a sender email → Primus customer rule (not accessorials).
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function looksLikeSenderCustomerIntent(messages) {
+  if (looksLikeDeleteRuleIntent(messages)) return false;
+  if (looksLikeMilitaryAccessorialIntent(messages)) return false;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (!lastText || /^\[applied\]/i.test(lastText.trim())) return false;
+  if (isMetaFollowUpText(lastText)) {
+    // Fall back to full user blob for "i asked you…" after a sender request.
+    const blob = userTopicBlob(messages);
+    return /\b(map|match).{0,40}\b(email|sender)\b/.test(blob) ||
+      /\b(when|from).{0,40}@/.test(blob) ||
+      /\bsender\b.{0,40}\bcustomer\b/.test(blob) ||
+      /\bprotocol[\s-]*only\b/.test(blob);
+  }
+  const t = lastText.toLowerCase();
+  const hasEmail = extractEmailsFromText(lastText).length > 0 ||
+    extractSenderDomainsFromText(lastText).length > 0;
+  const mappingVerb =
+    /\b(map|match|tie|link|route|assign)\b/.test(t) ||
+    /\buse\s+customer\b/.test(t) ||
+    /\bwhen\s+(email\s+)?from\b/.test(t) ||
+    /\bfrom\s+emails?\b/.test(t) ||
+    /\bsender\b/.test(t) ||
+    /\bprotocol[\s-]*only\b/.test(t) ||
+    (/\bcustomer\b/.test(t) && /@/.test(lastText));
+  if (hasEmail && mappingVerb) return true;
+  if (hasEmail && /(?:\bto\b|→|->|=>)/.test(lastText) &&
+      /\b(customer|imports|inc|llc|protocol|brumis)\b/i.test(lastText)) {
+    return true;
+  }
+  // Full conversation already established a sender mapping mid-flow.
+  const topic = inferSenderCustomerTopic(messages);
+  if (topic && (topic.emails.length || topic.domains.length) &&
+      (topic.customerName || topic.defaultDims)) {
+    if (mappingVerb || /(?:\bto\b|→|->|=>)/.test(lastText) ||
+        /\bprotocol[\s-]*only\b/.test(t) ||
+        /\bdefault\s+dims?\b/.test(t)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Find an existing sender rule that overlaps emails/domains/customer.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object} topic Inferred topic.
+ * @return {object|null}
+ */
+function findExistingSenderRule(existingRules, topic) {
+  const emails = new Set((topic.emails || []).map((e) => e.toLowerCase()));
+  const domains = new Set((topic.domains || []).map((d) => d.toLowerCase()));
+  const wantName = String(topic.customerName || "").trim().toLowerCase();
+  for (const r of existingRules || []) {
+    if (!r || r.active === false) continue;
+    const match = r.match && typeof r.match === "object" ? r.match : {};
+    const ruleEmails = []
+        .concat(match.fromEmails || [])
+        .concat(match.senderEmails || [])
+        .map((e) => String(e || "").toLowerCase());
+    const ruleDomains = []
+        .concat(match.senderDomains || [])
+        .map((d) => String(d || "").toLowerCase().replace(/^@/, ""));
+    const emailHit = ruleEmails.some((e) => emails.has(e));
+    const domainHit = ruleDomains.some((d) => domains.has(d));
+    const nameHit = wantName &&
+      String(r.customerName || "").trim().toLowerCase() === wantName;
+    const kindHit = r.ruleKind === RULE_KIND_SENDER_CUSTOMER ||
+      r.identifyVia === "email";
+    if ((emailHit || domainHit || (nameHit && kindHit)) &&
+        (kindHit || emailHit || domainHit)) {
+      return r;
+    }
+  }
+  return null;
+}
+
+/**
+ * Deterministic create/update proposal for sender→customer mapping.
+ * Skips site-type / accessorial questionnaire.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {object|null}
+ */
+function buildSenderCustomerProposal(messages, existingRules) {
+  if (!looksLikeSenderCustomerIntent(messages)) return null;
+  const topic = inferSenderCustomerTopic(messages);
+  if (!topic || (!topic.emails.length && !topic.domains.length)) {
+    return {
+      reply: "I can map a sender email (or @domain) to a Primus customer. " +
+        "Please include the From address and the customer name " +
+        "(optional: protocol only, default dims like 40×48×62).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+  if (!topic.customerName && !topic.defaultDims) {
+    return {
+      reply: "Got the sender email — which Primus customer name should " +
+        "we attach? You can also say protocol only or default dims " +
+        "(e.g. 40×48×62).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
+  const live = findExistingSenderRule(existingRules || [], topic);
+  const emails = topic.emails.slice();
+  const domains = topic.domains.filter((d) =>
+    !emails.some((e) => e.endsWith("@" + d)));
+  const match = {};
+  if (emails.length) match.fromEmails = emails;
+  if (domains.length) match.senderDomains = domains;
+
+  const customerName = topic.customerName ||
+    (live && live.customerName) || "";
+  const protocolOnly = topic.protocolOnly ||
+    !!(live && live.protocolOnly);
+  const defaultDims = topic.defaultDims ||
+    (live && live.defaultDims) || null;
+
+  const ruleId = live ? String(live.id) :
+    senderRuleIdFromParts(customerName, emails);
+  const name = customerName ?
+    `Sender → ${customerName}` :
+    (live && live.name) || "Sender customer rule";
+
+  const bits = [];
+  if (emails.length) bits.push(`From ${emails.join(", ")}`);
+  if (domains.length) {
+    bits.push(`domain ${domains.map((d) => "@" + d).join(", ")}`);
+  }
+  if (customerName) bits.push(`customer "${customerName}"`);
+  if (protocolOnly) bits.push("protocol only");
+  if (defaultDims) {
+    bits.push(
+        `default dims ${defaultDims.length}×${defaultDims.width}×` +
+        `${defaultDims.height} when missing`);
+  }
+
+  const patch = {
+    active: true,
+    priority: (live && live.priority) || 5,
+    name,
+    ruleKind: RULE_KIND_SENDER_CUSTOMER,
+    identifyVia: "email",
+    match,
+    customerName: customerName || undefined,
+    protocolOnly: !!protocolOnly,
+    addAccessorials: [],
+    notes: protocolOnly ?
+      "Sender email maps to Primus customer (protocol only)." :
+      "Sender email maps to Primus customer.",
+    autoApply: true,
+    requiresConfirm: false,
+  };
+  if (defaultDims) patch.defaultDims = defaultDims;
+
+  return {
+    reply: `Here's a sender→customer rule: ${bits.join("; ")}. ` +
+      "Identified via From email (no site-type / accessorials). " +
+      "Click Confirm to apply it.",
+    action: live ? "propose_update_rule" : "propose_create_rule",
+    proposal: {ruleId, patch},
+    quickReplies: [],
+  };
+}
+
+/**
  * Enforce identify questionnaire before create proposals.
  * @param {object} result Model JSON result.
  * @param {Array} messages Chat history including latest user turn.
@@ -913,6 +1294,9 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
   const militaryOut = buildMilitaryAccessorialProposal(
       messages, existingRules || []);
   if (militaryOut) return militaryOut;
+  const senderOut = buildSenderCustomerProposal(
+      messages, existingRules || []);
+  if (senderOut) return senderOut;
 
   const gate = detectCreateIdentifyGate(messages);
   const extras = collectCreateFlowExtras(messages);
@@ -939,6 +1323,13 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
 
   // Mid create-flow (Cannot-be + accessorials): don't let a mis-tagged
   // update/delete skip the deterministic create proposal.
+  // Sender→customer mappings never enter the site/accessorial questionnaire.
+  if (looksLikeSenderCustomerIntent(messages)) {
+    const forced = buildSenderCustomerProposal(
+        messages, existingRules || []);
+    if (forced) return forced;
+  }
+
   const addressOnlyReady = gate.status === "ready" &&
     gate.source === "address_only";
   if (action === "propose_update_rule" ||
@@ -952,6 +1343,11 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
   if (!creating && action !== "ask_identify_source" &&
       action !== "ask_email_signals") {
     return out;
+  }
+
+  // Never ask LAD/APD / site-type for sender email mapping.
+  if (looksLikeSenderCustomerIntent(messages)) {
+    return buildSenderCustomerProposal(messages, existingRules || []) || out;
   }
 
   if (gate.status === "ready") {
@@ -1097,6 +1493,8 @@ async function runQuoteRulesChatTurn(opts) {
   const militaryOut = buildMilitaryAccessorialProposal(
       chatTurns, existingRules);
   if (militaryOut) return militaryOut;
+  const senderOut = buildSenderCustomerProposal(chatTurns, existingRules);
+  if (senderOut) return senderOut;
 
   const gateHint = detectCreateIdentifyGate(chatTurns);
   const last = lastUserTurn(chatTurns);
@@ -1130,8 +1528,11 @@ async function runQuoteRulesChatTurn(opts) {
   ).slice(0, 8000);
 
   const systemPrompt = [
-    "You help freight dispatchers manage LTL quote accessorial rules.",
-    "Rules map site types or instructions to Primus accessorial codes.",
+    "You help freight dispatchers manage LTL quote accessorial rules",
+    "AND sender→customer mapping rules.",
+    "Accessorial rules map site types or instructions to Primus codes.",
+    "Sender rules map From emails (or @domains) to a Primus customerName,",
+    "optional protocolOnly, and optional defaultDims.",
     "Common codes: LFO LFD (liftgate), APD (appointment dest),",
     "LAD (limited access), NUD (nursing home), HOD (hotel),",
     "RSD (residential), SCD (school), INS (insurance).",
@@ -1155,9 +1556,27 @@ async function runQuoteRulesChatTurn(opts) {
     "}",
     "",
     "Rule patch fields: active, priority, name, match, addAccessorials,",
-    "filterCarrierWarnings, notes, autoApply, requiresConfirm, identifyVia.",
+    "filterCarrierWarnings, notes, autoApply, requiresConfirm, identifyVia,",
+    "ruleKind, customerName, protocolOnly, defaultDims.",
     "match may use: consigneeNameContains, consigneeAddressContains,",
-    "instructionsContains, referenceContains, flags, siteType.",
+    "instructionsContains, referenceContains, flags, siteType,",
+    "fromEmails, senderEmails, senderDomains.",
+    "",
+    "=== Sender email → customer (IMPORTANT) ===",
+    "Phrases: map this email to customer X, when email from Y use",
+    "customer Z, protocol only, match customer name to that email,",
+    "default dims 40x48x62 when missing.",
+    "→ propose_create_rule (or update) immediately.",
+    "identifyVia MUST be \"email\"; ruleKind \"sender_customer\".",
+    "match.fromEmails: array of emails (one rule can list many).",
+    "Optional match.senderDomains: [\"ediexpressinc.com\"].",
+    "Set customerName; protocolOnly true when they say protocol only;",
+    "defaultDims {length,width,height} when they give missing dims.",
+    "addAccessorials: []. Do NOT ask site type, LAD, APD, or the",
+    "Can-be / Cannot-be questionnaire for these.",
+    "Example ids: sender_mike_oseback, sender_jared_berman /",
+    "\"Sender → Mike Oseback\".",
+    "NEVER reply \"I could not process that\" for sender mapping.",
     "",
     "=== Follow the user's LAST intent ===",
     "Read the full conversation. Do not restart the identify",
@@ -1184,10 +1603,10 @@ async function runQuoteRulesChatTurn(opts) {
     "\"delete aafes\"): action MUST be propose_delete_rule. Do NOT ask",
     "identify. Ask them to click Confirm; do not claim the rule is gone.",
     "",
-    "=== Identify questionnaire (new rules only, unknown how-to-spot) ===",
-    "Ask identify ONLY when creating a NEW rule and it is NOT a known",
-    "site type (military / nursing / hotel) and they have not already",
-    "chosen Cannot be. Updates skip this.",
+    "=== Identify questionnaire (new accessorial rules only) ===",
+    "Ask identify ONLY when creating a NEW accessorial/site rule and",
+    "it is NOT a known site type and NOT a sender→customer mapping",
+    "and they have not already chosen Cannot be. Updates skip this.",
     "Step 1 action ask_identify_source with exactly two quickReplies:",
     "  \"" + QUICK_REPLY_CAN_BE + "\"",
     "  \"" + QUICK_REPLY_CANNOT_BE + "\"",
@@ -1213,6 +1632,7 @@ async function runQuoteRulesChatTurn(opts) {
     "If accessorials are listed, propose now.",
     "",
     "identifyVia values:",
+    "  email — sender From address / domain → customer mapping.",
     "  address_text — match from email/text fields only.",
     "  ai — match only from AI address classification.",
     "  both — either text OR AI signals (default when both apply).",
@@ -1225,7 +1645,8 @@ async function runQuoteRulesChatTurn(opts) {
     "  - Always copy name and match from the current rule into patch",
     "    so the proposal is self-contained even for partial edits.",
     "For propose_create_rule: patch MUST include name and a NON-EMPTY",
-    "match (siteType and/or flags for address-only; text needles for email).",
+    "match (siteType and/or flags for address-only; text needles for email;",
+    "fromEmails/senderDomains for sender→customer).",
     "Never use match: {}.",
     "",
     "Never claim you saved, updated, or deleted a rule.",
@@ -1367,6 +1788,23 @@ function normalizePartialPatch(patch) {
   if (Array.isArray(patch.addAccessorialsWithData)) {
     normalized.addAccessorialsWithData = patch.addAccessorialsWithData;
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "ruleKind")) {
+    normalized.ruleKind = String(patch.ruleKind || "");
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "customerName")) {
+    normalized.customerName = String(patch.customerName || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
+    normalized.protocolOnly = !!patch.protocolOnly;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "defaultDims") &&
+      patch.defaultDims && typeof patch.defaultDims === "object") {
+    normalized.defaultDims = {
+      length: Number(patch.defaultDims.length) || undefined,
+      width: Number(patch.defaultDims.width) || undefined,
+      height: Number(patch.defaultDims.height) || undefined,
+    };
+  }
   return normalized;
 }
 
@@ -1395,6 +1833,22 @@ function normalizeCreatePatch(patch, ruleId) {
   };
   if (Array.isArray(patch.addAccessorialsWithData)) {
     normalized.addAccessorialsWithData = patch.addAccessorialsWithData;
+  }
+  if (patch.ruleKind) {
+    normalized.ruleKind = String(patch.ruleKind);
+  }
+  if (patch.customerName != null && String(patch.customerName).trim()) {
+    normalized.customerName = String(patch.customerName).trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
+    normalized.protocolOnly = !!patch.protocolOnly;
+  }
+  if (patch.defaultDims && typeof patch.defaultDims === "object") {
+    normalized.defaultDims = {
+      length: Number(patch.defaultDims.length) || undefined,
+      width: Number(patch.defaultDims.width) || undefined,
+      height: Number(patch.defaultDims.height) || undefined,
+    };
   }
   return normalized;
 }
@@ -1487,8 +1941,11 @@ module.exports = {
   looksLikeDeleteRuleIntent,
   looksLikeCreateRuleIntent,
   looksLikeMilitaryAccessorialIntent,
+  looksLikeSenderCustomerIntent,
   buildDeleteRuleProposal,
   buildMilitaryAccessorialProposal,
+  buildSenderCustomerProposal,
+  inferSenderCustomerTopic,
   isMilitaryTopicBlob,
   RULES_CHAT_MODEL,
   IDENTIFY_QUICK_REPLIES,

@@ -106,6 +106,51 @@ checkTrue("follow-up proposes update not email-signals",
 checkTrue("follow-up not could not process",
     followOut && !/could not process/i.test(followOut.reply));
 
+const mikeMsg = [{
+  role: "user",
+  content: "Map mike.oseback@ediexpressinc.com to customer name Mike Oseback. " +
+    "Protocol only. Match that customer name and protocol to that email address.",
+}];
+checkTrue("mike oseback is sender intent",
+    chat.looksLikeSenderCustomerIntent(mikeMsg));
+const mikeOut = chat.buildSenderCustomerProposal(mikeMsg, []);
+check("mike action create", mikeOut && mikeOut.action, "propose_create_rule");
+check("mike rule id", mikeOut && mikeOut.proposal && mikeOut.proposal.ruleId,
+    "sender_mike_oseback");
+check("mike identifyVia email",
+    mikeOut && mikeOut.proposal.patch.identifyVia, "email");
+check("mike customerName",
+    mikeOut && mikeOut.proposal.patch.customerName, "Mike Oseback");
+checkTrue("mike protocolOnly",
+    mikeOut && mikeOut.proposal.patch.protocolOnly === true);
+checkTrue("mike has fromEmails",
+    mikeOut &&
+    Array.isArray(mikeOut.proposal.patch.match.fromEmails) &&
+    mikeOut.proposal.patch.match.fromEmails
+        .includes("mike.oseback@ediexpressinc.com"));
+checkTrue("mike never asks LAD/APD",
+    mikeOut && !/\b(LAD|APD|site type|accessorial)\b/i.test(mikeOut.reply));
+checkTrue("mike never could not process",
+    mikeOut && !/could not process/i.test(mikeOut.reply));
+
+const jaredMsg = [{
+  role: "user",
+  content: "Jared Berman Jared.Berman@corehome.com → Brumis Imports Inc, " +
+    "default dims 40x48x62 when missing",
+}];
+checkTrue("jared is sender intent",
+    chat.looksLikeSenderCustomerIntent(jaredMsg));
+const jaredOut = chat.buildSenderCustomerProposal(jaredMsg, []);
+check("jared customer",
+    jaredOut && jaredOut.proposal.patch.customerName, "Brumis Imports Inc");
+checkTrue("jared defaultDims 62",
+    jaredOut && jaredOut.proposal.patch.defaultDims &&
+    jaredOut.proposal.patch.defaultDims.height === 62);
+checkTrue("jared from email",
+    jaredOut &&
+    jaredOut.proposal.patch.match.fromEmails
+        .includes("jared.berman@corehome.com"));
+
 (async () => {
   const smokePhrases = [
     "add appointment delivery for military facilities",
@@ -131,6 +176,26 @@ checkTrue("follow-up not could not process",
       console.log("  reply:", out && out.reply);
       console.log("  codes:", codes);
     }
+  }
+
+  const senderSmoke = await chat.runQuoteRulesChatTurn({
+    messages: mikeMsg,
+    existingRules: [],
+  });
+  const senderOk = senderSmoke &&
+    senderSmoke.action === "propose_create_rule" &&
+    senderSmoke.proposal &&
+    senderSmoke.proposal.patch &&
+    senderSmoke.proposal.patch.customerName === "Mike Oseback" &&
+    senderSmoke.proposal.patch.protocolOnly === true &&
+    !/could not process|which accessorials|LAD|APD|site type/i
+        .test(senderSmoke.reply || "");
+  checkTrue("smoke: mike oseback sender mapping", senderOk);
+  if (!senderOk) {
+    console.log("  action:", senderSmoke && senderSmoke.action);
+    console.log("  reply:", senderSmoke && senderSmoke.reply);
+    console.log("  patch:", senderSmoke && senderSmoke.proposal &&
+      senderSmoke.proposal.patch);
   }
 
   if (failures) {
