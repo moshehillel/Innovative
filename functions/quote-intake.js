@@ -208,7 +208,7 @@ function quoteExtractSystemPrompt() {
     "    label: e.g. TO PIONEER, OH,",
     "    consignee: {name, address1, city, state, zipCode, country, phone},",
     "    siteType: menards_dc | amazon_fc | aafes_military |",
-    "      nursing_home | hotel | residential | other,",
+    "      chain_store | nursing_home | hotel | residential | other,",
     "    freightInfo: [{qty, weight, weightType, class, length, width,",
     "      height, dimType}],",
     "    referenceNumbers: [PO numbers],",

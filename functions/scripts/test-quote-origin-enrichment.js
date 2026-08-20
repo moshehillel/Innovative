@@ -176,6 +176,44 @@ check("Amazon dest + no appt records suppress",
     (outAmzNoAppt.appliedRules || [])
         .some((r) => r.ruleId === "email_no_appointment"), true);
 
+const destChain = {
+  consignee: {
+    name: "ALBERTSONS LLC / SAFEWAY INC",
+    city: "Auburn",
+    state: "WA",
+    zipCode: "98047",
+  },
+  shipper: {name: "STG", city: "Santa Fe Springs", state: "CA"},
+  flags: {},
+  siteType: "chain_store",
+  enrichmentMeta: {classifiedAs: "chain_store", source: "name_heuristic"},
+};
+const outChain = quoteRules.applyRulesToLane(destChain, rules, {});
+checkHas("dest Albertsons/Safeway → APD", outChain.accessorials, "APD");
+check("chain rule applied",
+    (outChain.appliedRules || [])
+        .some((r) => r.ruleId === "chain_store_appointment"), true);
+
+const chainNoAppt = {
+  ...destChain,
+  specialInstructions: "no appt needed",
+};
+const outChainNoAppt = quoteRules.applyRulesToLane(chainNoAppt, rules, {
+  specialInstructionsGlobal: "no appt needed",
+});
+checkNotHas("chain + no appt strips APD", outChainNoAppt.accessorials, "APD");
+
+const walmartH = addressEnrichment.classifyFromNameHeuristics({
+  name: "Walmart Supercenter #1234",
+});
+check("Walmart heuristic chain_store",
+    walmartH && walmartH.siteType, "chain_store");
+const tjH = addressEnrichment.classifyFromNameHeuristics({
+  name: "TJ Maxx Store",
+});
+check("TJ Maxx heuristic chain_store",
+    tjH && tjH.siteType, "chain_store");
+
 const milNoAppt = {
   ...d8986,
   specialInstructions: "No Appointment necessary",

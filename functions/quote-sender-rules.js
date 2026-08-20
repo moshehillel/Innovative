@@ -76,7 +76,9 @@ function extractSenderEmail(from) {
   const raw = String(from || "").trim();
   if (!raw) return "";
   const angle = raw.match(/<([^>]+@[^>]+)>/);
-  if (angle) return String(angle[1]).trim().toLowerCase();
+  if (angle) {
+    return String(angle[1]).replace(/\s+/g, "").trim().toLowerCase();
+  }
   const bare = raw.match(/[\w.+-]+@[\w.-]+/);
   return bare ? String(bare[0]).trim().toLowerCase() : "";
 }
@@ -143,8 +145,9 @@ function extractEmbeddedSenderFromBody(body) {
   const text = String(body || "");
   if (!text.trim()) return "";
 
-  // Prefer any known sender email that still appears in the body.
-  const lower = text.toLowerCase();
+  // Prefer any known sender email that still appears in the body
+  // (normalize spaces inside angle-bracket addresses).
+  const lower = text.toLowerCase().replace(/\s+(@)\s+/g, "$1");
   for (const email of Object.keys(SENDER_RULES)) {
     if (lower.includes(email)) return email;
   }

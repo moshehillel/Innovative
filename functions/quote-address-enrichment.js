@@ -31,7 +31,7 @@ const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 
 const SITE_TYPES = [
   "nursing_home", "hotel", "amazon_fc", "menards_dc",
-  "aafes_military", "residential", "other",
+  "aafes_military", "chain_store", "residential", "other",
 ];
 
 const SITE_TYPE_LABELS = {
@@ -40,9 +40,60 @@ const SITE_TYPE_LABELS = {
   amazon_fc: "Amazon fulfillment center",
   menards_dc: "Menards DC",
   aafes_military: "AAFES / military exchange",
+  chain_store: "chain store",
   residential: "residential",
   other: "commercial / other",
 };
+
+/**
+ * Big-box / grocery chain names commonly needing delivery appointment (APD).
+ * Matched case-insensitively against consignee / place name.
+ */
+const CHAIN_STORE_NAME_RE = new RegExp([
+  "\\bwal[- ]?marts?\\b",
+  "\\btargets?\\b",
+  "\\btj\\s*maxx\\b",
+  "\\bt\\.\\s*j\\.\\s*maxx\\b",
+  "\\bmarshalls?\\b",
+  "\\bhomegoods\\b",
+  "\\bbj'?s(\\s+wholesale)?\\b",
+  "\\balbertsons?\\b",
+  "\\balbersons\\b", // common misspelling
+  "\\bsafeways?\\b",
+  "\\bcostcos?\\b",
+  "\\bsam'?s(\\s+club)?\\b",
+  "\\bhome\\s*depots?\\b",
+  "\\blowe'?s\\b",
+  "\\bkrogers?\\b",
+  "\\bpublix\\b",
+  "\\bmeijers?\\b",
+  "\\bshoprite\\b",
+  "\\bshop\\s*rite\\b",
+  "\\bfood\\s*lions?\\b",
+  "\\bwinn[- ]?dixie\\b",
+  "\\bheb\\b",
+  "\\bh-?e-?b\\b",
+  "\\bwhole\\s*foods\\b",
+  "\\btrader\\s*joe'?s\\b",
+  "\\bcvs\\b",
+  "\\bwalgreens\\b",
+  "\\bdollar\\s*generals?\\b",
+  "\\bdollar\\s*trees?\\b",
+  "\\bfamily\\s*dollars?\\b",
+  "\\bbest\\s*buys?\\b",
+  "\\boffice\\s*depots?\\b",
+  "\\bstaples\\b",
+  "\\bbed\\s*bath\\s*(&|and)\\s*beyond\\b",
+  "\\bmacy'?s\\b",
+  "\\bkohl'?s\\b",
+  "\\bj\\.?c\\.?\\s*penney'?s?\\b",
+  "\\bsears\\b",
+  "\\bgiant(\\s+eagle|\\s+food)?\\b",
+  "\\bstop\\s*&\\s*shop\\b",
+  "\\bwegmans\\b",
+  "\\bingles\\b",
+  "\\bharris\\s*teeter\\b",
+].join("|"), "i");
 
 /** Minimum confidence to accept residential / RSD from AI. */
 const RESIDENTIAL_MIN_CONFIDENCE = 0.75;
@@ -564,6 +615,13 @@ function classifyFromNameHeuristics(consignee, extraName) {
     /\b[a-z]{3}\d\b/.test(name)) {
     return heuristicResult("amazon_fc", name || "Amazon FC", 0.85);
   }
+  if (CHAIN_STORE_NAME_RE.test(text) || CHAIN_STORE_NAME_RE.test(name)) {
+    return heuristicResult(
+        "chain_store",
+        (consignee && consignee.name) || extraName || "Chain store",
+        0.9,
+    );
+  }
   // Facility keywords — must win over any street geocode.
   if (/nursing|rehab|skilled nursing|care center|assisted living|convalescent/
       .test(text) ||
@@ -658,6 +716,7 @@ function mapGoogleTypesToSiteType(types, placeName) {
     /\b[a-z]{3}\d\b/.test(name)) {
     return "amazon_fc";
   }
+  if (CHAIN_STORE_NAME_RE.test(name)) return "chain_store";
   if (t.has("nursing_home") || t.has("hospital") ||
     /nursing|rehab|skilled nursing|care center|assisted living/.test(name)) {
     return "nursing_home";
@@ -1359,6 +1418,7 @@ module.exports = {
   init,
   SITE_TYPES,
   SITE_TYPE_LABELS,
+  CHAIN_STORE_NAME_RE,
   RESIDENTIAL_MIN_CONFIDENCE,
   normalizeAddressKey,
   normalizePart,

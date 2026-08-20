@@ -35,6 +35,7 @@ const DEST_TO_ORIGIN_ACCESSORIAL = {
  */
 const MANAGED_DEFAULT_RULE_IDS = new Set([
   "amazon_fc",
+  "chain_store_appointment",
   "sender_mike_oseback",
   "sender_jared_berman",
   "sender_lifeworks_picking",
@@ -204,6 +205,34 @@ const DEFAULT_RULES = [
     notes: "Amazon fulfillment center — appointment delivery only (no LAD).",
     autoApply: true,
     requiresConfirm: true,
+  },
+  {
+    id: "chain_store_appointment",
+    active: true,
+    priority: 55,
+    name: "Chain stores — appointment delivery",
+    identifyVia: "both",
+    match: {
+      consigneeNameContains: [
+        "walmart", "wal-mart", "target", "tj maxx", "tjmaxx",
+        "marshalls", "homegoods", "bj's", "bjs", "albertsons",
+        "albersons", "safeway", "costco", "sam's club", "sams club",
+        "home depot", "lowe's", "lowes", "kroger", "publix", "meijer",
+        "shoprite", "shop rite", "food lion", "winn-dixie", "heb",
+        "whole foods", "trader joe", "cvs", "walgreens",
+        "dollar general", "dollar tree", "family dollar", "best buy",
+        "office depot", "staples", "macy's", "macys", "kohl's",
+        "kohls", "jcpenney", "sears", "giant eagle", "stop & shop",
+        "wegmans", "ingles", "harris teeter",
+      ],
+      siteType: "chain_store",
+    },
+    addAccessorials: ["APD"],
+    applyTo: "dest",
+    notes: "Big-box / grocery chain consignee — appointment delivery (APD). " +
+      "Skipped when customer declined appointment.",
+    autoApply: true,
+    requiresConfirm: false,
   },
   {
     id: "residential_delivery",

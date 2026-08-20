@@ -395,6 +395,16 @@ function inferCreateTopic(messages) {
       notes: "Menards distribution center.",
     };
   }
+  if (/\b(walmart|target|costco|safeway|albertsons?|albersons)\b/
+      .test(blob) ||
+    /\b(tj\s*maxx|chain\s*stores?)\b/.test(blob)) {
+    return {
+      ruleId: "chain_store_appointment",
+      name: "Chain stores",
+      siteType: "chain_store",
+      notes: "Big-box / grocery chain store.",
+    };
+  }
   if (/\bresidential\b/.test(blob)) {
     return {
       ruleId: "residential_delivery",
@@ -479,7 +489,8 @@ function buildAddressOnlyCreateProposal(messages, accessorials) {
     return {
       reply: "I need a site type to match before I can propose that rule. " +
         "Known types: aafes_military (military bases / AAFES), " +
-        "nursing_home, hotel, amazon_fc, menards_dc, residential. " +
+        "nursing_home, hotel, amazon_fc, menards_dc, chain_store, " +
+        "residential. " +
         "Which site should this apply to?",
       action: "none",
       proposal: null,
@@ -1663,7 +1674,7 @@ async function runQuoteRulesChatTurn(opts) {
     "CANNOT BE: identifyVia ai; match.siteType and/or flags; never",
     "invent email keywords; never match: {}.",
     "Known siteType: nursing_home, hotel, amazon_fc, menards_dc,",
-    "aafes_military, residential, other.",
+    "aafes_military, chain_store, residential, other.",
     "Codes: LAD LFD APD RSD NUD LTD LFO HOD SCD INS; \"limited access\";",
     "LOAD = LAD; \"delivery appointment\" = APD.",
     "",
