@@ -114,6 +114,33 @@ function partyNeedsCityStateFromZip(party) {
 }
 
 /**
+ * True when a party has city+state but is missing ZIP (Primus needs ZIP).
+ * @param {object|null|undefined} party Address.
+ * @return {boolean}
+ */
+function partyNeedsZipFromCityState(party) {
+  if (!party || typeof party !== "object") return false;
+  const zip = String(party.zipCode || party.zipcode || party.zip || "").trim();
+  if (zip) return false;
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim();
+  return !!(city && state);
+}
+
+/**
+ * Stamp a lane extraction warning once.
+ * @param {object} [lane] Lane.
+ * @param {string} warning Warning label.
+ */
+function pushLaneZipWarning(lane, warning) {
+  if (!lane || typeof lane !== "object") return;
+  const list = Array.isArray(lane.extractionWarnings) ?
+    lane.extractionWarnings : [];
+  if (!list.includes(warning)) list.push(warning);
+  lane.extractionWarnings = list;
+}
+
+/**
  * US ZIP → city/state via Zippopotam (no API key).
  * @param {string} zip Raw ZIP.
  * @return {Promise<{city: string, state: string, zipCode: string}|null>}
@@ -139,6 +166,192 @@ async function lookupUsZip(zip) {
 }
 
 /**
+ * City/state (+ optional name/street) → ZIP via Google Geocoding / Places.
+ * Locality-only queries often omit postal_code; include name when present.
+ * Prefer space-joined queries (comma-joined "Name, City, ST" often geocodes
+ * as a bare locality without ZIP).
+ * @param {object} party Address party.
+ * @return {Promise<object|null>} `{city, state, zipCode, address1?}`.
+ */
+async function lookupZipFromCityState(party) {
+  if (!party || typeof party !== "object") return null;
+  const name = String(party.name || "").trim();
+  const address1 = String(party.address1 || "").trim();
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim();
+  if (!city || !state) return null;
+
+  const apiKey = getGoogleApiKey();
+  if (apiKey) {
+    const partsNamed = [name, address1, city, state, "USA"].filter(Boolean);
+    const partsCity = [city, state, "USA"].filter(Boolean);
+    const queries = [];
+    if (name || address1) {
+      queries.push(partsNamed.join(" "));
+      queries.push(partsNamed.join(", "));
+    }
+    queries.push(partsCity.join(" "));
+    queries.push(partsCity.join(", "));
+
+    for (const query of queries) {
+      const loc = await geocodeAddressToZip(query, apiKey, city, state);
+      if (loc) return loc;
+    }
+
+    // Places findplace often resolves facility names (e.g. STG) to a postal ZIP
+    // when Geocode returns a bare locality.
+    if (name) {
+      const placeLoc = await placesFindZip(
+          [name, city, state].filter(Boolean).join(" "), apiKey, city, state);
+      if (placeLoc) return placeLoc;
+    }
+  }
+
+  // Zippopotam city/state fallback (no key) when Google misses postal_code.
+  return lookupUsZipFromCityState(city, state);
+}
+
+/**
+ * City/state → ZIP via Zippopotam (no API key). First place when multiple.
+ * @param {string} city City.
+ * @param {string} state State abbrev or name.
+ * @return {Promise<{city: string, state: string, zipCode: string}|null>}
+ */
+async function lookupUsZipFromCityState(city, state) {
+  const c = String(city || "").trim();
+  const st = String(state || "").trim();
+  if (!c || !st) return null;
+  const stateSlug = st.length === 2 ? st.toLowerCase() : st.toLowerCase();
+  const citySlug = encodeURIComponent(c.toLowerCase());
+  try {
+    const resp = await fetch(
+        `https://api.zippopotam.us/us/${stateSlug}/${citySlug}`, {
+          signal: AbortSignal.timeout(8000),
+        });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    const place = json && json.places && json.places[0];
+    if (!place) return null;
+    const zipCode = String(place["post code"] || "").replace(/\D/g, "")
+        .slice(0, 5);
+    if (!/^\d{5}$/.test(zipCode)) return null;
+    return {
+      city: String(place["place name"] || c).trim() || c,
+      state: String(json["state abbreviation"] || st).trim() || st,
+      zipCode,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Parse Google address_components into city/state/zip/street.
+ * @param {Array<object>} comps Address components.
+ * @param {string} fallbackCity City fallback.
+ * @param {string} fallbackState State fallback.
+ * @return {object|null} `{city, state, zipCode, address1?}`.
+ */
+function parseGoogleAddressComponents(comps, fallbackCity, fallbackState) {
+  const list = Array.isArray(comps) ? comps : [];
+  const get = (type, short = true) => {
+    const row = list.find((c) =>
+      Array.isArray(c.types) && c.types.includes(type));
+    if (!row) return "";
+    return String((short ? row.short_name : row.long_name) ||
+      row.long_name || row.short_name || "").trim();
+  };
+  const zipCode = get("postal_code");
+  if (!/^\d{5}$/.test(zipCode)) return null;
+  const streetNum = get("street_number");
+  const route = get("route");
+  const street = [streetNum, route].filter(Boolean).join(" ").trim();
+  return {
+    city: get("locality", false) || fallbackCity,
+    state: get("administrative_area_level_1") || fallbackState,
+    zipCode,
+    address1: street || undefined,
+  };
+}
+
+/**
+ * Geocode one address string → ZIP.
+ * @param {string} query Address query.
+ * @param {string} apiKey Google key.
+ * @param {string} fallbackCity City.
+ * @param {string} fallbackState State.
+ * @return {Promise<object|null>}
+ */
+async function geocodeAddressToZip(query, apiKey, fallbackCity, fallbackState) {
+  if (!query || !apiKey) return null;
+  try {
+    const url = new URL("https://maps.googleapis.com/maps/api/geocode/json");
+    url.searchParams.set("address", query);
+    url.searchParams.set("key", apiKey);
+    const resp = await fetch(url.toString(), {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!resp.ok) return null;
+    const json = await resp.json();
+    if (json.status !== "OK" || !json.results || !json.results.length) {
+      return null;
+    }
+    return parseGoogleAddressComponents(
+        json.results[0].address_components,
+        fallbackCity,
+        fallbackState);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Places Find Place → Details for postal_code.
+ * @param {string} query Text query.
+ * @param {string} apiKey Google key.
+ * @param {string} fallbackCity City.
+ * @param {string} fallbackState State.
+ * @return {Promise<object|null>}
+ */
+async function placesFindZip(query, apiKey, fallbackCity, fallbackState) {
+  if (!query || !apiKey) return null;
+  try {
+    const findUrl = new URL(
+        "https://maps.googleapis.com/maps/api/place/findplacefromtext/json");
+    findUrl.searchParams.set("input", query);
+    findUrl.searchParams.set("inputtype", "textquery");
+    findUrl.searchParams.set("fields", "place_id");
+    findUrl.searchParams.set("key", apiKey);
+    const findResp = await fetch(findUrl.toString(), {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!findResp.ok) return null;
+    const findData = await findResp.json();
+    const placeId = findData && findData.candidates &&
+      findData.candidates[0] && findData.candidates[0].place_id;
+    if (!placeId) return null;
+
+    const detailsUrl = new URL(
+        "https://maps.googleapis.com/maps/api/place/details/json");
+    detailsUrl.searchParams.set("place_id", placeId);
+    detailsUrl.searchParams.set("fields", "address_component");
+    detailsUrl.searchParams.set("key", apiKey);
+    const detResp = await fetch(detailsUrl.toString(), {
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!detResp.ok) return null;
+    const detData = await detResp.json();
+    if (detData.status !== "OK" || !detData.result) return null;
+    return parseGoogleAddressComponents(
+        detData.result.address_components,
+        fallbackCity,
+        fallbackState);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Fill missing city/state from ZIP so Primus can rate zip-only RFQs.
  * @param {object|null|undefined} party Address.
  * @param {object} [lane] Optional lane to stamp "zip filled" warning.
@@ -149,12 +362,7 @@ async function fillPartyCityStateFromZip(party, lane) {
   const zip = party.zipCode || party.zipcode || party.zip;
   const loc = await lookupUsZip(zip);
   if (!loc) return party;
-  if (lane && typeof lane === "object") {
-    const list = Array.isArray(lane.extractionWarnings) ?
-      lane.extractionWarnings : [];
-    if (!list.includes("zip filled")) list.push("zip filled");
-    lane.extractionWarnings = list;
-  }
+  pushLaneZipWarning(lane, "zip filled");
   return {
     ...party,
     city: String(party.city || "").trim() || loc.city,
@@ -163,6 +371,40 @@ async function fillPartyCityStateFromZip(party, lane) {
         .trim(),
     country: String(party.country || "US").trim() || "US",
   };
+}
+
+/**
+ * Fill missing ZIP from city/state (and name/street when available).
+ * @param {object|null|undefined} party Address.
+ * @param {object} [lane] Optional lane to stamp "zip filled" warning.
+ * @return {Promise<object|null|undefined>}
+ */
+async function fillPartyZipFromCityState(party, lane) {
+  if (!partyNeedsZipFromCityState(party)) return party;
+  const loc = await lookupZipFromCityState(party);
+  if (!loc) return party;
+  pushLaneZipWarning(lane, "zip filled");
+  const existingStreet = String(party.address1 || "").trim();
+  return {
+    ...party,
+    city: String(party.city || "").trim() || loc.city,
+    state: String(party.state || "").trim() || loc.state,
+    zipCode: loc.zipCode,
+    address1: existingStreet || loc.address1 || party.address1 || null,
+    country: String(party.country || "US").trim() || "US",
+  };
+}
+
+/**
+ * Fill whichever OD side is incomplete: zip→city/state or city/state→zip.
+ * @param {object|null|undefined} party Address.
+ * @param {object} [lane] Optional lane.
+ * @return {Promise<object|null|undefined>}
+ */
+async function fillPartyOdFromZipOrCityState(party, lane) {
+  let next = await fillPartyCityStateFromZip(party, lane);
+  next = await fillPartyZipFromCityState(next, lane);
+  return next;
 }
 
 /**
@@ -1101,10 +1343,11 @@ async function enrichLaneShipper(lane, tenant, opts = {}) {
 async function enrichLaneAddresses(lane, tenant, opts = {}) {
   if (lane && typeof lane === "object") {
     if (lane.shipper) {
-      lane.shipper = await fillPartyCityStateFromZip(lane.shipper, lane);
+      lane.shipper = await fillPartyOdFromZipOrCityState(lane.shipper, lane);
     }
     if (lane.consignee) {
-      lane.consignee = await fillPartyCityStateFromZip(lane.consignee, lane);
+      lane.consignee = await fillPartyOdFromZipOrCityState(
+          lane.consignee, lane);
     }
   }
   await enrichLaneShipper(lane, tenant, opts);
@@ -1139,6 +1382,11 @@ module.exports = {
   isBareStreetGeocode,
   isAddressOnlyOrWeakName,
   lookupUsZip,
+  lookupUsZipFromCityState,
+  lookupZipFromCityState,
   fillPartyCityStateFromZip,
+  fillPartyZipFromCityState,
+  fillPartyOdFromZipOrCityState,
   partyNeedsCityStateFromZip,
+  partyNeedsZipFromCityState,
 };

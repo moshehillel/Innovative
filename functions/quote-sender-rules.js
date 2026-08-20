@@ -32,14 +32,21 @@ const SENDER_RULES = {
     defaultDims: {length: 40, width: 48, height: 62},
     ruleId: "sender_jared_berman",
     name: "Sender → Brumis Imports Inc",
+    fromNames: ["jared berman"],
   },
   "mike.oseback@ediexpressinc.com": {
     customerName: "Mike Oseback",
     protocolOnly: true,
     ruleId: "sender_mike_oseback",
     name: "Sender → Mike Oseback",
+    fromNames: ["mike oseback"],
   },
 };
+
+/** Internal / mailbox domains that FW RFQs through (not the real shipper). */
+const INTERNAL_SENDER_DOMAINS = new Set([
+  "innovativecarriers.com",
+]);
 
 /**
  * Extract a bare email from a From header / display string.
@@ -53,6 +60,86 @@ function extractSenderEmail(from) {
   if (angle) return String(angle[1]).trim().toLowerCase();
   const bare = raw.match(/[\w.+-]+@[\w.-]+/);
   return bare ? String(bare[0]).trim().toLowerCase() : "";
+}
+
+/**
+ * True when From is an Innovative mailbox (FW / quotes inbox), not the RFQ
+ * customer.
+ * @param {string} from Raw From.
+ * @return {boolean}
+ */
+function isInternalMailboxFrom(from) {
+  const email = extractSenderEmail(from);
+  if (!email) return false;
+  const domain = emailDomain(email);
+  return INTERNAL_SENDER_DOMAINS.has(domain);
+}
+
+/**
+ * Pull the first embedded Outlook/Gmail "From: Name <email>" line from a
+ * forwarded RFQ body (skips internal Innovative addresses).
+ * Also recovers known sender names when the address was stripped from plain
+ * text (`From: Jared Berman` without `<email>`).
+ * @param {string} body Email body.
+ * @return {string} Raw From display string or "".
+ */
+function extractEmbeddedSenderFromBody(body) {
+  const text = String(body || "");
+  if (!text.trim()) return "";
+
+  // Prefer any known sender email that still appears in the body.
+  const lower = text.toLowerCase();
+  for (const email of Object.keys(SENDER_RULES)) {
+    if (lower.includes(email)) return email;
+  }
+
+  const re = /(?:^|\n)\s*From\s*:\s*(.+)/gi;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const raw = String(m[1] || "").trim();
+    if (!raw) continue;
+    // Drop trailing "Sent:" / "To:" crumbs on the same line.
+    const cleaned = raw
+        .replace(/\s+Sent\s*:.*$/i, "")
+        .replace(/\s+To\s*:.*$/i, "")
+        .trim();
+    const email = extractSenderEmail(cleaned);
+    if (email && !isInternalMailboxFrom(cleaned)) {
+      return cleaned.includes("<") ? cleaned : email;
+    }
+    // Name-only FW header → known sender map.
+    const nameKey = cleaned
+        .replace(/<[^>]*>/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+    if (!nameKey) continue;
+    for (const [ruleEmail, rule] of Object.entries(SENDER_RULES)) {
+      const names = (rule && rule.fromNames) || [];
+      if (names.some((n) => nameKey === String(n).toLowerCase() ||
+        nameKey.startsWith(String(n).toLowerCase() + " "))) {
+        return ruleEmail;
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * Effective RFQ sender for sender→customer rules.
+ * Prefer outer From when it is the real customer; for Innovative FW
+ * mailboxes, use the embedded original From in the body.
+ * @param {string} from Outer From header.
+ * @param {string} [body] Email body (may include FW headers).
+ * @return {string} From string to use for sender rules.
+ */
+function resolveQuoteSenderFrom(from, body) {
+  const outer = String(from || "").trim();
+  const outerEmail = extractSenderEmail(outer);
+  if (outerEmail && !isInternalMailboxFrom(outer)) return outer;
+  const embedded = extractEmbeddedSenderFromBody(body);
+  if (embedded) return embedded;
+  return outer;
 }
 
 /**
@@ -291,8 +378,12 @@ function applySenderCustomerOverride(extracted, from, quoteRules) {
 
 module.exports = {
   SENDER_RULES,
+  INTERNAL_SENDER_DOMAINS,
   extractSenderEmail,
   emailDomain,
+  isInternalMailboxFrom,
+  extractEmbeddedSenderFromBody,
+  resolveQuoteSenderFrom,
   isSenderCustomerRule,
   senderPayloadFromQuoteRule,
   resolveSenderRuleFromQuoteRules,

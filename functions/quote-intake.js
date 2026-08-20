@@ -85,15 +85,17 @@ function normalizeExtractedQuote(extracted, opts) {
     next._sourceBody = String(opts.body).slice(0, 12000);
   }
   const from = opts && opts.from != null ? String(opts.from) : "";
-  const dimOpts = senderRules.dimOptsForSender(from);
-  senderRules.applySenderCustomerOverride(next, from);
+  const senderFrom = senderRules.resolveQuoteSenderFrom(
+      from, opts && opts.body);
+  const dimOpts = senderRules.dimOptsForSender(senderFrom);
+  senderRules.applySenderCustomerOverride(next, senderFrom);
   const missingDimsBefore = palletRowsMissingDims(next);
   normalizeSoleAddressToConsignee(next);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
   senderRules.applySenderDefaultedDimOverrides(
-      next, from, opts && opts.body);
+      next, senderFrom, opts && opts.body);
   if (missingDimsBefore && !palletRowsMissingDims(next)) {
     pushExtractWarning(next, "defaulted dims");
   }

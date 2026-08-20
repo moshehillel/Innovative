@@ -183,13 +183,19 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
   const shipperName = String(
       (patch.shipper && patch.shipper.name) ||
       (data.shipper && data.shipper.name) || "").trim();
-  const hasLookupSignal = !!(customerName || customerRef || shipperName);
+  const hasLookupSignal = !!(customerName || customerRef || shipperName ||
+    data.from || data.senderFrom || opts.from || opts.emailBody);
   if (!hasLookupSignal) {
     return {customerMatch: null, customerMatchMessage: null};
   }
 
+  const senderFrom = senderRules.resolveQuoteSenderFrom(
+      opts.from || data.senderFrom || data.from || "",
+      opts.emailBody ||
+        (data.extracted && data.extracted._sourceBody) || "");
+
   const match = await resolveCustomerMatch({
-    from: data.from || "",
+    from: senderFrom,
     customerRef,
     customerName: customerName || shipperName,
     shipperName,
@@ -360,8 +366,11 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
   }
 
   const quoteRulesList = await quoteRules.loadActiveRules(tenant);
+  const senderFrom = senderRules.resolveQuoteSenderFrom(
+      data.senderFrom || data.from || "",
+      (data.extracted && data.extracted._sourceBody) || "");
   const senderDimOpts = senderRules.dimOptsForSender(
-      data.from || "", quoteRulesList);
+      senderFrom, quoteRulesList);
 
   const patch = {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -681,11 +690,11 @@ function quoteRateSource(lanes, shippingLocationId) {
 async function rateLane(lane, ctx) {
   if (lane && typeof lane === "object") {
     if (lane.shipper) {
-      lane.shipper = await addressEnrichment.fillPartyCityStateFromZip(
+      lane.shipper = await addressEnrichment.fillPartyOdFromZipOrCityState(
           lane.shipper, lane);
     }
     if (lane.consignee) {
-      lane.consignee = await addressEnrichment.fillPartyCityStateFromZip(
+      lane.consignee = await addressEnrichment.fillPartyOdFromZipOrCityState(
           lane.consignee, lane);
     }
   }
@@ -702,9 +711,15 @@ async function rateLane(lane, ctx) {
 
   // Always overwrite email class with Primus density class when
   // weight + L×W×H are present. Pallet missing dims → sender or
-  // global 40×48×60 first.
+  // global 40×48×60 first. Also replace invented 40×48×60 with sender
+  // defaults (e.g. Brumis 40×48×62) when the RFQ never stated a height.
   const dimOpts = senderRules.dimOptsForSender(
       ctx.from || "", ctx.rules || []);
+  senderRules.applySenderDefaultedDimOverrides(
+      {lanes: [lane]},
+      ctx.from || "",
+      ctx.emailBody || "",
+      ctx.rules || []);
   const freightNormalized = freightDims.normalizePalletFreightRows(
       lane.freightInfo || [], dimOpts);
   const classFix = rateShop.ensureFreightClasses(freightNormalized, {
@@ -886,13 +901,14 @@ async function processQuoteEmail(opts) {
   const subject = opts.subject || "";
   const from = opts.from || "";
   const emailBody = opts.emailBody || "";
+  const senderFrom = senderRules.resolveQuoteSenderFrom(from, emailBody);
 
   await deps.writeLog("info", "quote", "Processing quote request email", {
-    messageId, subject, from,
+    messageId, subject, from, senderFrom,
   });
 
   let extracted = await quoteIntake.extractQuoteRequest({
-    subject, from, body: emailBody,
+    subject, from: senderFrom || from, body: emailBody,
   });
 
   if (!extracted.lanes || !extracted.lanes.length) {
@@ -909,9 +925,9 @@ async function processQuoteEmail(opts) {
   const rules = await quoteRules.loadActiveRules(tenant);
   // Re-apply sender→customer / defaultDims using Firestore rules (chat-created
   // mappings) in addition to built-in SENDER_RULES.
-  senderRules.applySenderCustomerOverride(extracted, from, rules);
+  senderRules.applySenderCustomerOverride(extracted, senderFrom, rules);
   senderRules.applySenderDefaultedDimOverrides(
-      extracted, from, emailBody, rules);
+      extracted, senderFrom, emailBody, rules);
 
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
@@ -921,7 +937,7 @@ async function processQuoteEmail(opts) {
       (extracted.shipper && extracted.shipper.name) ||
       "").trim();
   const customerMatch = await resolveCustomerMatch({
-    from,
+    from: senderFrom,
     customerRef: extracted.customerRef,
     customerName: extractedCustomerName,
     shipperName: extracted.shipper && extracted.shipper.name,
@@ -967,7 +983,7 @@ async function processQuoteEmail(opts) {
         customerPrefs: {},
         emailBody,
         subject,
-        from,
+        from: senderFrom,
         customerDeclinedAccessorials:
           extracted.customerDeclinedAccessorials || [],
       });
@@ -993,6 +1009,7 @@ async function processQuoteEmail(opts) {
     tenantId: tenant.tenantId,
     subject,
     from,
+    senderFrom: senderFrom || null,
     customerRef: extracted.customerRef || subject,
     batchQuoteId,
     format: extracted.format,
@@ -1455,10 +1472,40 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
       opts.accessorialsWithData : null;
   const targetKey = opts.laneKey ? String(opts.laneKey) : null;
 
+  let emailBody = opts.emailBody ||
+    (data.extracted && data.extracted._sourceBody) || "";
+  // Prefer Outlook queue body when stored extract stripped emails from From:.
+  if ((!emailBody || !/@/.test(emailBody)) && data.outlookMessageId) {
+    try {
+      const qsnap = await col(tenant, "quoteMailQueue")
+          .where("outlookMessageId", "==", data.outlookMessageId)
+          .limit(1)
+          .get();
+      if (!qsnap.empty) {
+        const queuedBody = String(qsnap.docs[0].data().emailBody || "");
+        if (queuedBody.trim()) emailBody = queuedBody;
+      }
+    } catch (_) {
+      // keep extract body
+    }
+  }
+  const senderFrom = senderRules.resolveQuoteSenderFrom(
+      data.senderFrom || data.from || "", emailBody);
+
   // Re-resolve Primus customer from name/ref before rate shop.
   const customerPatch = {};
+  if (senderFrom) customerPatch.senderFrom = senderFrom;
+  const senderRule = senderRules.resolveSenderRule(senderFrom, rules);
+  if (senderRule && senderRule.customerName) {
+    // Authoritative sender→customer mapping (e.g. Jared → Brumis).
+    customerPatch.shippingLocationName = String(senderRule.customerName)
+        .trim();
+  }
   const lookup = await applyCustomerLookupToPatch(data, customerPatch, {
     forceLookup: true,
+    quoteRules: rules,
+    from: senderFrom,
+    emailBody,
   });
   const shippingLocationId = customerPatch.shippingLocationId != null ?
     customerPatch.shippingLocationId : data.shippingLocationId;
@@ -1493,9 +1540,9 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         shippingLocationId,
         extracted: data.extracted || {},
         customerPrefs: {},
-        emailBody: (data.extracted && data.extracted._sourceBody) || "",
+        emailBody,
         subject: data.subject || "",
-        from: data.from || "",
+        from: senderFrom || data.from || "",
         customerDeclinedAccessorials: data.customerDeclinedAccessorials ||
           (data.extracted && data.extracted.customerDeclinedAccessorials) ||
           [],
@@ -1541,6 +1588,10 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
     customerEmailHtml: admin.firestore.FieldValue.delete(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
+  // Keep quote-level shipper in sync with enriched lane OD (ZIP fill).
+  if (ratedLanes[0] && ratedLanes[0].shipper) {
+    patch.shipper = ratedLanes[0].shipper;
+  }
   if (accessorialOverride != null) {
     patch.lastAccessorialOverride = accessorialOverride;
   }
@@ -1552,6 +1603,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
     ...customerPatch,
     shippingLocationId,
     shippingLocationName,
+    shipper: patch.shipper || data.shipper,
     lanes: ratedLanes,
     extractionWarnings: patch.extractionWarnings,
     rateSource: patch.rateSource,

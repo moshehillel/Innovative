@@ -83,6 +83,7 @@ const DEFAULT_RULES = [
     defaultDims: {length: 40, width: 48, height: 62},
     addAccessorials: [],
     applyTo: "dest",
+    fromNames: ["jared berman"],
     notes: "Map Jared Berman / Corehome to Brumis Imports Inc; " +
       "default missing pallet dims to 40×48×62.",
     autoApply: true,
