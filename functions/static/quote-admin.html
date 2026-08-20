@@ -125,33 +125,72 @@
     .badge.on { background: var(--success-bg); color: var(--success); border-color: #a7f3d0; }
     .badge.off { opacity: 0.6; }
     .badge.confirm { background: var(--warning-bg); color: var(--warning); border-color: #fcd34d; }
-    .rules-list { display: flex; flex-direction: column; gap: 14px; }
+    .rules-list { display: flex; flex-direction: column; gap: 8px; }
     .rule-card {
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 18px 20px;
+      padding: 0;
       background: var(--surface-muted);
       transition: box-shadow 0.15s ease, border-color 0.15s ease;
+      overflow: hidden;
     }
     .rule-card:hover {
       border-color: #c7d2fe;
       box-shadow: var(--shadow-sm);
     }
     .rule-card.inactive { opacity: 0.65; }
-    .rule-header {
+    .rule-toggle {
       display: flex;
       align-items: flex-start;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 12px;
+      gap: 10px;
+      width: 100%;
+      margin: 0;
+      padding: 12px 14px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+      color: inherit;
+    }
+    .rule-toggle:hover { background: var(--primary-light); }
+    .rule-chevron {
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1.6;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .rule-card.open .rule-chevron { transform: rotate(90deg); }
+    .rule-toggle-main { flex: 1; min-width: 0; }
+    .rule-toggle-badges {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      flex-shrink: 0;
+      max-width: 46%;
     }
     .rule-title {
-      font-size: 1rem;
+      font-size: 0.9375rem;
       font-weight: 700;
       margin: 0;
       line-height: 1.35;
       color: var(--text);
     }
+    .rule-compact-summary {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      margin-top: 3px;
+      line-height: 1.4;
+    }
+    .rule-body {
+      display: none;
+      padding: 0 16px 16px;
+      border-top: 1px solid var(--border);
+    }
+    .rule-card.open .rule-body { display: block; }
     .rule-meta { font-size: 0.8125rem; color: var(--muted); margin-top: 4px; }
     .rule-section { margin-top: 14px; }
     .rule-section-label {
@@ -714,42 +753,82 @@
       return `Runs later (priority ${n})`;
     }
 
+    function compactAccessorialsSummary(rule) {
+      const parts = [];
+      const acc = rule.addAccessorials || [];
+      if (acc.length) {
+        parts.push(acc.map((c) => ACCESSORIAL_LABELS[c] || c).join(", "));
+      }
+      if (rule.customerName) {
+        parts.push("customer " + rule.customerName);
+      }
+      const filters = rule.filterCarrierWarnings || [];
+      if (filters.length) {
+        parts.push("filter " + filters.join(", "));
+      }
+      if (!parts.length) return "No accessorials";
+      return parts.join(" · ");
+    }
+
+    function setRuleCardOpen(card, open) {
+      if (!card) return;
+      card.classList.toggle("open", !!open);
+      const btn = card.querySelector("[data-rule-toggle]");
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    function bindRuleCardToggles(root) {
+      (root || document).querySelectorAll("[data-rule-toggle]").forEach((btn) => {
+        if (btn.dataset.boundRuleToggle === "1") return;
+        btn.dataset.boundRuleToggle = "1";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          const card = btn.closest(".rule-card");
+          if (!card) return;
+          setRuleCardOpen(card, !card.classList.contains("open"));
+        });
+      });
+    }
+
     function renderRuleCard(rule) {
       const card = document.createElement("article");
       card.className = "rule-card" + (rule.active === false ? " inactive" : "");
 
       const whenLines = describeMatch(rule.match, rule.applyTo);
       const thenLines = describeActions(rule);
+      const summary = compactAccessorialsSummary(rule);
 
       const badges = [];
       badges.push(`<span class="badge ${rule.active !== false ? "on" : "off"}">${rule.active !== false ? "Active" : "Turned off"}</span>`);
       if (rule.requiresConfirm) {
         badges.push('<span class="badge confirm">Needs confirmation</span>');
       }
-      badges.push(`<span class="badge">${esc(formatIdentifyVia(rule))}</span>`);
 
       card.innerHTML = `
-        <div class="rule-header">
-          <div>
+        <button type="button" class="rule-toggle" data-rule-toggle="1" aria-expanded="false">
+          <span class="rule-chevron" aria-hidden="true">▶</span>
+          <div class="rule-toggle-main">
             <h3 class="rule-title">${esc(rule.name || rule.id || "Unnamed rule")}</h3>
-            <div class="rule-meta">${esc(priorityLabel(rule.priority))}</div>
+            <div class="rule-compact-summary">${esc(summary)} · ${esc(priorityLabel(rule.priority))}</div>
           </div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">${badges.join("")}</div>
+          <div class="rule-toggle-badges">${badges.join("")}</div>
+        </button>
+        <div class="rule-body">
+          <div class="rule-section">
+            <div class="rule-section-label">When this happens</div>
+            <ul>${whenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+            <div class="rule-meta" style="margin-top:6px">Identified via: ${esc(formatIdentifyVia(rule))}</div>
+          </div>
+          <div class="rule-section">
+            <div class="rule-section-label">Then do this</div>
+            <ul>${thenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+          </div>
+          ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
+          <details class="rule-advanced">
+            <summary>Advanced (rule ID &amp; technical data)</summary>
+            <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
+          </details>
         </div>
-        <div class="rule-section">
-          <div class="rule-section-label">When this happens</div>
-          <ul>${whenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
-          <div class="rule-meta" style="margin-top:6px">Identified via: ${esc(formatIdentifyVia(rule))}</div>
-        </div>
-        <div class="rule-section">
-          <div class="rule-section-label">Then do this</div>
-          <ul>${thenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
-        </div>
-        ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
-        <details class="rule-advanced">
-          <summary>Advanced (rule ID &amp; technical data)</summary>
-          <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
-        </details>
       `;
       return card;
     }
@@ -773,6 +852,7 @@
         }
         const sorted = [...rules].sort((a, b) => (Number(a.priority) || 999) - (Number(b.priority) || 999));
         sorted.forEach(r => list.appendChild(renderRuleCard(r)));
+        bindRuleCardToggles(list);
         const active = rules.filter(r => r.active !== false).length;
         countEl.textContent = `${active} active · ${rules.length} total`;
       } catch (e) {
