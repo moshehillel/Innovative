@@ -15,10 +15,21 @@ It builds examples shaped like:
 
 `(subject, from, body snippet, AI intent, actual outcome / correction signal)`
 
+and **correlates by `messageId`** across BigQuery + Firestore so intent and
+finalStatus land on the same row when possible.
+
+Feedback buckets include:
+
+- `false_pod_heuristic_blocked_by_ai`
+- `false_payment_ignore` / `payment_notification_ignored`
+- `misrouted_carrier_invoice` / `possible_noa_vs_invoice_conflict`
+- `correct_carrier_invoice`
+- `requeue_or_correction`
+
 Then suggests:
 
-- subject-token heuristics for false POD / payment-ignore clusters
-- few-shot JSON examples you can paste into prompts or regression tests
+- subject-token heuristics for mistake clusters
+- few-shot JSON examples (positive + negative) for prompts / regression tests
 
 ## Auth
 

@@ -37,12 +37,30 @@ FALSE_POD_MARKERS = (
     "false POD",
     "not a POD request",
 )
-PAYMENT_IGNORE_STATUSES = ("payment_notification_ignored",)
+PAYMENT_IGNORE_STATUSES = frozenset({
+    "payment_notification_ignored",
+})
+NOA_IGNORE_STATUSES = frozenset({
+    "noa_ignored",
+})
+SUCCESS_INVOICE_STATUSES = frozenset({
+    "processing",
+    "already_billed_skipped",
+    "additional_charge_pending_approval",
+})
+MISROUTE_IGNORE_STATUSES = frozenset({
+    "payment_notification_ignored",
+    "noa_ignored",
+    "emodal_broadcast_ignored",
+    "past_due_only",
+    "statement_ignored_abe_cc",
+    "no_attachment",
+    "no_invoice_pdf",
+})
 REQUEUE_MARKERS = ("requeue", "reprocess", "misrouted")
-CLASSIFICATION_MESSAGES = (
-    "Email classification",
-    "AI classification",
-    "classifyIncomingEmail",
+INVOICE_SUBJECT_RE = re.compile(
+    r"invoice|e-?invoice|payment\s+request|pro\s*#?\s*\d|bol\s*#?\s*\d",
+    re.I,
 )
 
 
@@ -176,32 +194,82 @@ def fetch_firestore_email_intake(days: int, limit: int) -> List[Dict[str, Any]]:
     return out
 
 
+def _clip(text: Any, n: int = 400) -> Optional[str]:
+    if text is None:
+        return None
+    s = str(text)
+    return s if len(s) <= n else s[:n]
+
+
+def label_intent_vs_outcome(
+    intent: Optional[str],
+    final_status: Optional[str],
+    subject: Optional[str] = None,
+) -> Optional[str]:
+    """Map AI intent + finalStatus into a feedback bucket."""
+    intent_s = str(intent or "").strip()
+    status = str(final_status or "").strip()
+    sub = str(subject or "")
+
+    if status in PAYMENT_IGNORE_STATUSES:
+        if intent_s == "carrier_invoice" or INVOICE_SUBJECT_RE.search(sub):
+            return "false_payment_ignore"
+        return "payment_notification_ignored"
+
+    if status in NOA_IGNORE_STATUSES and intent_s == "carrier_invoice":
+        return "possible_noa_vs_invoice_conflict"
+
+    if intent_s == "carrier_invoice" and status in SUCCESS_INVOICE_STATUSES:
+        return "correct_carrier_invoice"
+
+    if intent_s == "carrier_invoice" and status in MISROUTE_IGNORE_STATUSES:
+        return "misrouted_carrier_invoice"
+
+    if intent_s == "pod_request" and status and "pod" not in status.lower():
+        if status in MISROUTE_IGNORE_STATUSES or status in (
+            "forwarded",
+            "processing",
+        ):
+            return "possible_pod_misroute"
+
+    if intent_s and status:
+        return f"intent:{intent_s}|status:{status}"
+    if intent_s:
+        return f"intent:{intent_s}"
+    if status:
+        return f"status:{status}"
+    return None
+
+
 def row_to_example(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     details = row.get("details") or {}
     message = str(row.get("message") or "")
     intent = _detail(details, "intent")
     subject = _detail(details, "subject")
     from_addr = _detail(details, "from", "fromAddress", "sender")
-    body_snip = _detail(details, "bodySnippet", "bodyPreview", "emailBody")
-    if isinstance(body_snip, str) and len(body_snip) > 400:
-        body_snip = body_snip[:400]
+    body_snip = _clip(
+        _detail(details, "bodySnippet", "bodyPreview", "emailBody", "reasoning")
+    )
     final_status = _detail(details, "finalStatus", "outcomeReason", "status")
     message_id = _detail(details, "messageId", "gmailMessageId")
+    reasoning = _detail(details, "reasoning")
 
     label = None
     msg_l = message.lower()
     if "pod heuristic skipped" in msg_l:
         label = "false_pod_heuristic_blocked_by_ai"
-    elif final_status in PAYMENT_IGNORE_STATUSES:
-        label = "payment_notification_ignored"
-    elif any(m in msg_l for m in ("requeue", "reprocess")):
+    elif message == "Incoming email classified":
+        label = label_intent_vs_outcome(intent, final_status, subject) or (
+            f"intent:{intent}" if intent else "incoming_email_classified"
+        )
+    elif any(m in msg_l for m in REQUEUE_MARKERS):
         label = "requeue_or_correction"
-    elif intent:
-        label = f"intent:{intent}"
-    elif "classification" in msg_l:
-        label = "classification_event"
     else:
-        return None
+        label = label_intent_vs_outcome(intent, final_status, subject)
+        if not label and "classification" in msg_l:
+            label = "classification_event"
+        if not label:
+            return None
 
     return {
         "timestamp": row.get("timestamp"),
@@ -212,9 +280,11 @@ def row_to_example(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "from": from_addr,
         "bodySnippet": body_snip,
         "aiIntent": intent,
+        "aiReasoning": _clip(reasoning, 240),
         "finalStatus": final_status,
         "feedbackLabel": label,
         "detailsKeys": sorted(list(details.keys()))[:30],
+        "source": "bigquery_logs",
     }
 
 
@@ -223,9 +293,12 @@ def intake_to_example(row: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(cls, dict):
         cls = {}
     subject = row.get("subject")
-    body = row.get("bodySnippet") or row.get("bodyPreview") or ""
-    if isinstance(body, str) and len(body) > 400:
-        body = body[:400]
+    body = _clip(row.get("bodySnippet") or row.get("bodyPreview") or "")
+    intent = cls.get("intent") or row.get("intent")
+    final_status = row.get("finalStatus") or row.get("outcomeReason")
+    label = label_intent_vs_outcome(intent, final_status, subject) or (
+        f"intake:{(final_status or 'unknown')}"
+    )
     return {
         "timestamp": str(row.get("discoveredAt") or row.get("finishedAt") or ""),
         "message": "emailIntake",
@@ -234,11 +307,108 @@ def intake_to_example(row: Dict[str, Any]) -> Dict[str, Any]:
         "subject": subject,
         "from": row.get("from") or row.get("fromAddress"),
         "bodySnippet": body,
-        "aiIntent": cls.get("intent") or row.get("intent"),
-        "finalStatus": row.get("finalStatus") or row.get("outcomeReason"),
-        "feedbackLabel": f"intake:{(row.get('finalStatus') or 'unknown')}",
+        "aiIntent": intent,
+        "aiReasoning": _clip(cls.get("reasoning"), 240),
+        "finalStatus": final_status,
+        "feedbackLabel": label,
         "source": "firestore_emailIntake",
     }
+
+
+def correlate_by_message_id(
+    bq_rows: List[Dict[str, Any]],
+    intake_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Join AI classification logs with later outcomes for the same messageId."""
+    by_id: Dict[str, Dict[str, Any]] = collections.defaultdict(dict)
+
+    for row in bq_rows:
+        details = row.get("details") or {}
+        mid = str(_detail(details, "messageId", "gmailMessageId") or "").strip()
+        if not mid:
+            continue
+        slot = by_id[mid]
+        msg = str(row.get("message") or "")
+        if msg == "Incoming email classified" or (
+            "classification" in msg.lower() and _detail(details, "intent")
+        ):
+            slot["aiIntent"] = _detail(details, "intent") or slot.get("aiIntent")
+            slot["aiReasoning"] = _detail(details, "reasoning") or slot.get(
+                "aiReasoning"
+            )
+            slot["subject"] = _detail(details, "subject") or slot.get("subject")
+            slot["from"] = (
+                _detail(details, "from", "fromAddress", "sender")
+                or slot.get("from")
+            )
+            slot["classifiedAt"] = row.get("timestamp")
+        if "pod heuristic skipped" in msg.lower():
+            slot["podHeuristicBlocked"] = True
+            slot["podBlockReasoning"] = _detail(details, "reasoning")
+            slot["subject"] = _detail(details, "subject") or slot.get("subject")
+            slot["aiIntent"] = _detail(details, "intent") or slot.get("aiIntent")
+        status = _detail(details, "finalStatus", "outcomeReason", "status")
+        if status:
+            slot["finalStatus"] = status
+        if any(m in msg.lower() for m in REQUEUE_MARKERS):
+            slot["requeued"] = True
+
+    for row in intake_rows:
+        mid = str(row.get("id") or row.get("gmailMessageId") or "").strip()
+        if not mid:
+            continue
+        slot = by_id[mid]
+        cls = row.get("classification") or row.get("emailClassification") or {}
+        if not isinstance(cls, dict):
+            cls = {}
+        slot["aiIntent"] = cls.get("intent") or row.get("intent") or slot.get(
+            "aiIntent"
+        )
+        slot["aiReasoning"] = cls.get("reasoning") or slot.get("aiReasoning")
+        slot["subject"] = row.get("subject") or slot.get("subject")
+        slot["from"] = (
+            row.get("from") or row.get("fromAddress") or slot.get("from")
+        )
+        slot["finalStatus"] = (
+            row.get("finalStatus")
+            or row.get("outcomeReason")
+            or slot.get("finalStatus")
+        )
+        slot["bodySnippet"] = _clip(
+            row.get("bodySnippet") or row.get("bodyPreview") or ""
+        )
+        slot["intakeSource"] = True
+
+    correlated: List[Dict[str, Any]] = []
+    for mid, slot in by_id.items():
+        intent = slot.get("aiIntent")
+        status = slot.get("finalStatus")
+        subject = slot.get("subject")
+        if slot.get("podHeuristicBlocked"):
+            label = "false_pod_heuristic_blocked_by_ai"
+        elif slot.get("requeued"):
+            label = "requeue_or_correction"
+        else:
+            label = label_intent_vs_outcome(intent, status, subject)
+        if not label:
+            continue
+        correlated.append(
+            {
+                "timestamp": slot.get("classifiedAt") or "",
+                "message": "correlated_message_outcome",
+                "category": "learned",
+                "messageId": mid,
+                "subject": subject,
+                "from": slot.get("from"),
+                "bodySnippet": slot.get("bodySnippet"),
+                "aiIntent": intent,
+                "aiReasoning": _clip(slot.get("aiReasoning"), 240),
+                "finalStatus": status,
+                "feedbackLabel": label,
+                "source": "correlated",
+            }
+        )
+    return correlated
 
 
 def tokenize_subject(subject: Optional[str]) -> List[str]:
@@ -269,29 +439,40 @@ def mine_patterns(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
             status = ex.get("finalStatus") or "?"
             intent_vs_status[f"{intent} -> {status}"] += 1
 
-    # Suggested few-shot / heuristic candidates from mistake-like labels.
-    mistake_labels = {
+    # Mistake + success buckets for few-shot / heuristic candidates.
+    priority_labels = [
         "false_pod_heuristic_blocked_by_ai",
-        "payment_notification_ignored",
+        "false_payment_ignore",
+        "misrouted_carrier_invoice",
+        "possible_noa_vs_invoice_conflict",
+        "possible_pod_misroute",
         "requeue_or_correction",
-    }
+        "payment_notification_ignored",
+        "correct_carrier_invoice",
+    ]
     few_shot: List[Dict[str, Any]] = []
     suggested_rules: List[Dict[str, Any]] = []
 
-    for label in sorted(mistake_labels):
+    for label in priority_labels:
         items = by_label.get(label) or []
-        for ex in items[:25]:
+        # Prefer successes as positive few-shots; mistakes as negatives.
+        cap = 15 if label == "correct_carrier_invoice" else 25
+        for ex in items[:cap]:
             few_shot.append(
                 {
                     "why": label,
                     "subject": ex.get("subject"),
                     "from": ex.get("from"),
                     "aiIntent": ex.get("aiIntent"),
+                    "aiReasoning": ex.get("aiReasoning"),
                     "finalStatus": ex.get("finalStatus"),
                     "bodySnippet": ex.get("bodySnippet"),
+                    "messageId": ex.get("messageId"),
                     "note": (
-                        "Use as a negative/positive few-shot when prompting "
-                        "classifyIncomingEmail, or as a regression fixture."
+                        "Positive few-shot"
+                        if label.startswith("correct_")
+                        else "Negative/correction few-shot — use in "
+                        "classifyIncomingEmail prompts or regression fixtures."
                     ),
                 }
             )
@@ -312,31 +493,27 @@ def mine_patterns(examples: List[Dict[str, Any]]) -> Dict[str, Any]:
                 }
             )
 
-    # payment ignore false-positive hint: invoice-like subjects with that status
-    payment_items = by_label.get("payment_notification_ignored") or []
-    invoice_like = []
-    for ex in payment_items:
-        sub = str(ex.get("subject") or "")
-        if re.search(r"invoice|e-?invoice|payment request", sub, re.I):
-            invoice_like.append(ex)
-    if invoice_like:
+    false_pay = by_label.get("false_payment_ignore") or []
+    if false_pay:
         suggested_rules.append(
             {
-                "label": "payment_notification_ignored",
+                "label": "false_payment_ignore",
                 "type": "possible_false_positive",
-                "count": len(invoice_like),
+                "count": len(false_pay),
                 "examples": [
                     {
                         "subject": e.get("subject"),
                         "from": e.get("from"),
                         "aiIntent": e.get("aiIntent"),
+                        "finalStatus": e.get("finalStatus"),
                     }
-                    for e in invoice_like[:15]
+                    for e in false_pay[:15]
                 ],
                 "suggestion": (
-                    "Subjects that look like carrier invoices but ended as "
+                    "Invoice-like mail (or AI intent carrier_invoice) ended as "
                     "payment_notification_ignored — tighten "
-                    "isPaymentNotificationEmail / looksLikeInvoiceEmailContent."
+                    "isPaymentNotificationEmail / looksLikeInvoiceEmailContent "
+                    "/ ACH alert verbs."
                 ),
             }
         )
@@ -499,7 +676,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     for row in intake_rows:
         examples.append(intake_to_example(row))
 
-    mined = mine_patterns(examples)
+    correlated = correlate_by_message_id(bq_rows, intake_rows)
+    print(f"  correlated messageId outcomes: {len(correlated)}")
+    # Prefer correlated rows (richer intent+outcome); keep raw as fallback.
+    seen_ids = {
+        str(ex.get("messageId"))
+        for ex in correlated
+        if ex.get("messageId")
+    }
+    merged: List[Dict[str, Any]] = list(correlated)
+    for ex in examples:
+        mid = str(ex.get("messageId") or "")
+        if mid and mid in seen_ids:
+            continue
+        merged.append(ex)
+
+    mined = mine_patterns(merged)
     meta = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "project": args.project,
@@ -507,11 +699,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "days": args.days,
         "bqRows": len(bq_rows),
         "intakeRows": len(intake_rows),
+        "correlatedRows": len(correlated),
         "note": (
             "Feedback mining + suggested heuristics/few-shots; "
             "not Claude fine-tuning."
         ),
     }
+    examples = merged
     out_dir = Path(args.out_dir)
     examples_path, suggestions_path, report_path = write_report(
         out_dir, examples, mined, meta
