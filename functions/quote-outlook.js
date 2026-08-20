@@ -122,13 +122,21 @@ async function getDispatcherTokens(tenant, dispatcherId) {
  * @return {Promise<void>}
  */
 async function saveDispatcherTokens(tenant, dispatcherId, tokens, profile) {
-  await col(tenant, "quoteDispatchers").doc(String(dispatcherId)).set({
+  const patch = {
     outlookTokens: tokens,
     outlookConnectedEmail: profile.email || null,
     outlookConnectedDisplayName: profile.displayName || null,
     outlookConnectedAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  }, {merge: true});
+  };
+  if (profile.userPrincipalName !== undefined) {
+    patch.outlookConnectedUpn = profile.userPrincipalName || null;
+  }
+  if (profile.mail !== undefined) {
+    patch.outlookConnectedMail = profile.mail || null;
+  }
+  await col(tenant, "quoteDispatchers").doc(String(dispatcherId)).set(
+      patch, {merge: true});
 }
 
 /**
@@ -144,6 +152,8 @@ async function getOutlookStatus(tenant, dispatcherId) {
   return {
     connected: true,
     email: doc.outlookConnectedEmail || null,
+    upn: doc.outlookConnectedUpn || null,
+    mail: doc.outlookConnectedMail || null,
     displayName: doc.outlookConnectedDisplayName || null,
     connectedAt: doc.outlookConnectedAt || null,
   };
@@ -158,6 +168,8 @@ async function disconnectOutlook(tenant, dispatcherId) {
   await col(tenant, "quoteDispatchers").doc(String(dispatcherId)).set({
     outlookTokens: admin.firestore.FieldValue.delete(),
     outlookConnectedEmail: admin.firestore.FieldValue.delete(),
+    outlookConnectedUpn: admin.firestore.FieldValue.delete(),
+    outlookConnectedMail: admin.firestore.FieldValue.delete(),
     outlookConnectedDisplayName: admin.firestore.FieldValue.delete(),
     outlookConnectedAt: admin.firestore.FieldValue.delete(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -186,10 +198,14 @@ async function handleOAuthCallback(parsed, code, getTenant, getDispatcher) {
     await saveDispatcherTokens(
         tenant, dispatcher.id, updated, {
           email: dispatcher.outlookConnectedEmail,
+          userPrincipalName: dispatcher.outlookConnectedUpn,
+          mail: dispatcher.outlookConnectedMail,
           displayName: dispatcher.outlookConnectedDisplayName,
         });
   };
-  const profile = await outlookMail.fetchMailboxProfile(tokens, onUpdate);
+  const profile = await outlookMail.fetchMailboxProfile(tokens, onUpdate, {
+    rosterEmail: dispatcher.email,
+  });
 
   const rosterEmail = normalizeEmail(dispatcher.email);
   const connectedEmail = normalizeEmail(profile.email);
@@ -198,34 +214,171 @@ async function handleOAuthCallback(parsed, code, getTenant, getDispatcher) {
     console.warn(
         "[quote-outlook] Mailbox differs from roster for " +
         String(dispatcher.id) + ": roster=" + rosterEmail +
-        " connected=" + connectedEmail);
+        " connected=" + connectedEmail +
+        " mail=" + normalizeEmail(profile.mail) +
+        " upn=" + normalizeEmail(profile.userPrincipalName) +
+        " preferredUsername=" +
+        normalizeEmail(profile.preferredUsername));
+  } else {
+    console.log(
+        "[quote-outlook] Outlook connected for " +
+        String(dispatcher.id) + ": email=" + connectedEmail +
+        " mail=" + normalizeEmail(profile.mail) +
+        " upn=" + normalizeEmail(profile.userPrincipalName));
   }
 
   await saveDispatcherTokens(tenant, dispatcher.id, tokens, {
     email: profile.email,
+    mail: profile.mail,
+    userPrincipalName: profile.userPrincipalName,
     displayName: profile.displayName,
   });
 
   return {
     ok: true,
     email: profile.email,
+    mail: profile.mail,
+    upn: profile.userPrincipalName,
     dispatcherName: dispatcher.name,
   };
 }
 
 /**
+ * Whether a prior emailIntake row should be retried.
+ * Parse failures used to permanently block reprocessing.
+ * @param {object|null} prev Prior intake data.
+ * @param {object} opts Sync options.
+ * @return {boolean}
+ */
+function shouldRetryIntake(prev, opts) {
+  if (!prev) return true;
+  if (prev.quoteId) return false;
+  if (opts.forceReprocess) return true;
+  const status = String(prev.finalStatus || "");
+  if (status === "quote_processed") return false;
+  if (status === "quote_queued") return false;
+  const reason = String(prev.skipReason || "");
+  if (reason.startsWith("Parse failed") || reason === "empty model response") {
+    return true;
+  }
+  // Permanent classifier / not-a-quote skips stay skipped unless forced.
+  // Heuristic fallback after Luna/API failure is unreliable — retry.
+  if (status === "skipped_not_quote") {
+    const src = String(prev.classifySource || "");
+    if (src === "heuristic_fallback" || /Luna failed/i.test(reason)) {
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Drain quoteMailQueue for one dispatcher.
+ * @param {object} tenant Tenant.
+ * @param {object} dispatcher Dispatcher row.
+ * @param {Function} processQuoteEmail Handler.
+ * @return {Promise<object>} {processed, errors}
+ */
+async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
+  const quoteMailQueue = require("./quote-mail-queue");
+  const queued = await quoteMailQueue.listQueuedForDispatcher(
+      tcolFn, tenant, dispatcher.id, 15);
+  let processed = 0;
+  let errors = 0;
+
+  for (const job of queued) {
+    const claimed = await quoteMailQueue.claimQueuedJob(
+        tcolFn, tenant, job.id);
+    if (!claimed) continue;
+
+    try {
+      const result = await processQuoteEmail({
+        messageId: claimed.id || job.id,
+        subject: claimed.subject || "",
+        from: claimed.from || "",
+        to: claimed.to || "",
+        cc: claimed.cc || "",
+        emailBody: claimed.emailBody || "",
+        tenant,
+        assignedDispatcher: dispatcher,
+        outlookMessageId: claimed.outlookMessageId,
+        receivedMailboxEmail: claimed.receivedMailboxEmail ||
+          dispatcher.outlookConnectedEmail || dispatcher.email,
+      });
+
+      if (result.quoteId) {
+        processed += 1;
+        await quoteMailQueue.completeQueuedJob(tcolFn, tenant, job.id, {
+          quoteId: result.quoteId,
+          finalStatus: result.status || "quote_processed",
+        });
+        await col(tenant, "emailIntake").doc(job.id).set({
+          source: "dispatcher_outlook",
+          dispatcherId: dispatcher.id,
+          dispatcherEmail: dispatcher.email,
+          gmailMessageId: job.id,
+          outlookMessageId: claimed.outlookMessageId || null,
+          subject: claimed.subject || "",
+          from: claimed.from || "",
+          quoteId: result.quoteId,
+          finalStatus: result.status || "quote_processed",
+          skipReason: admin.firestore.FieldValue.delete(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+        try {
+          await col(tenant, "quoteRequests").doc(result.quoteId).set({
+            outlookMessageId: claimed.outlookMessageId || null,
+          }, {merge: true});
+        } catch (_) {
+          // non-fatal
+        }
+      } else {
+        errors += 1;
+        const reason = result.reason || result.status || "not_a_quote";
+        await quoteMailQueue.failQueuedJob(tcolFn, tenant, job.id, reason);
+        await col(tenant, "emailIntake").doc(job.id).set({
+          source: "dispatcher_outlook",
+          dispatcherId: dispatcher.id,
+          quoteId: null,
+          finalStatus: "skipped_not_quote",
+          skipReason: reason,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+      }
+    } catch (err) {
+      errors += 1;
+      writeLogFn("error", "quote", "Quote queue process failed", {
+        dispatcherId: dispatcher.id,
+        docId: job.id,
+        error: err.message,
+      });
+      await quoteMailQueue.failQueuedJob(
+          tcolFn, tenant, job.id, err.message);
+    }
+  }
+
+  return {processed, errors};
+}
+
+/**
  * Sync recent quote RFQs from a dispatcher's connected Outlook inbox.
+ * Luna classifies from email body; only quotes are marked read and queued.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {Function} processQuoteEmail quote-automation.processQuoteEmail.
+ * @param {object} [opts] includeRead, forceReprocess.
  * @return {Promise<object>}
  */
-async function syncDispatcherInbox(tenant, dispatcher, processQuoteEmail) {
+async function syncDispatcherInbox(
+    tenant, dispatcher, processQuoteEmail, opts = {}) {
+  const quoteMailQueue = require("./quote-mail-queue");
   const tokens = await getDispatcherTokens(tenant, dispatcher.id);
   if (!tokens) {
     return {ok: true, synced: 0, skipped: "not_connected"};
   }
 
+  const includeRead = Boolean(opts.includeRead);
   const onUpdate = async (updated) => {
     await saveDispatcherTokens(tenant, dispatcher.id, updated, {
       email: dispatcher.outlookConnectedEmail,
@@ -233,26 +386,39 @@ async function syncDispatcherInbox(tenant, dispatcher, processQuoteEmail) {
     });
   };
   const client = outlookMail.createOutlookMailClient(tokens, onUpdate);
+
+  const drainedFirst = await drainQuoteQueue(
+      tenant, dispatcher, processQuoteEmail);
+
   const after = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const q = `after:${after.getUTCFullYear()}/` +
     `${after.getUTCMonth() + 1}/${after.getUTCDate()}`;
   const listResp = await client.users.messages.list({
     maxResults: 40,
-    includeRead: false,
+    includeRead,
     q,
   });
   const messages = (listResp.data && listResp.data.messages) || [];
-  let synced = 0;
+  let enqueued = 0;
+  let skippedExisting = 0;
+  let skippedNotQuote = 0;
+  let processErrors = 0;
 
   for (const row of messages) {
     const messageId = row.id;
     if (!messageId) continue;
-    const intakeId = `outlook_${dispatcher.id}_${messageId}`;
+    const intakeId = quoteMailQueue.queueDocId(dispatcher.id, messageId);
     const intakeSnap = await col(tenant, "emailIntake").doc(intakeId).get();
-    if (intakeSnap.exists) continue;
+    const prev = intakeSnap.exists ? (intakeSnap.data() || {}) : null;
+    if (intakeSnap.exists && !shouldRetryIntake(prev, opts)) {
+      skippedExisting += 1;
+      continue;
+    }
 
     let subject = "";
     let from = "";
+    let to = "";
+    let cc = "";
     let emailBody = "";
     try {
       const full = await client.users.messages.get({id: messageId});
@@ -265,8 +431,11 @@ async function syncDispatcherInbox(tenant, dispatcher, processQuoteEmail) {
       };
       subject = h("Subject");
       from = h("From");
-      emailBody = extractPlainBody(payload);
+      to = h("To");
+      cc = h("Cc");
+      emailBody = quoteIntake.toPlainText(extractPlainBody(payload));
     } catch (err) {
+      processErrors += 1;
       writeLogFn("warn", "quote", "Outlook sync message read failed", {
         dispatcherId: dispatcher.id,
         messageId,
@@ -275,72 +444,124 @@ async function syncDispatcherInbox(tenant, dispatcher, processQuoteEmail) {
       continue;
     }
 
-    const looksQuote = quoteIntake.looksLikeQuoteRequest(subject, emailBody);
-    if (!looksQuote) continue;
-
+    let classify;
     try {
-      const result = await processQuoteEmail({
-        messageId: intakeId,
+      classify = await quoteIntake.classifyIsQuoteRequest({
         subject,
         from,
-        emailBody,
-        tenant,
-        assignedDispatcher: dispatcher,
+        body: emailBody,
+      });
+    } catch (err) {
+      processErrors += 1;
+      writeLogFn("warn", "quote", "Luna quote classify failed", {
+        dispatcherId: dispatcher.id,
+        messageId,
+        error: err.message,
+      });
+      continue;
+    }
+
+    if (!classify.isQuote) {
+      skippedNotQuote += 1;
+      // Heuristic-only "no" after API failure is unreliable (e.g. PO-only
+      // subjects). Leave unread and do not permanently skip.
+      if (classify.source === "heuristic_fallback") {
+        writeLogFn("warn", "quote",
+            "Quote classify fallback said not_a_quote; will retry", {
+              dispatcherId: dispatcher.id,
+              messageId,
+              subject,
+              reason: classify.reasoning || null,
+            });
+        continue;
+      }
+      await col(tenant, "emailIntake").doc(intakeId).set({
+        source: "dispatcher_outlook",
+        dispatcherId: dispatcher.id,
+        dispatcherEmail: dispatcher.email,
+        gmailMessageId: intakeId,
         outlookMessageId: messageId,
+        subject,
+        from,
+        quoteId: null,
+        finalStatus: "skipped_not_quote",
+        skipReason: classify.reasoning || "luna_not_quote",
+        classifySource: classify.source || null,
+        classifyConfidence: classify.confidence || null,
+        createdAt: prev && prev.createdAt ?
+          prev.createdAt : admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      // Leave unread — dispatcher can still see/handle non-quote mail.
+      continue;
+    }
+
+    try {
+      const enq = await quoteMailQueue.enqueueQuoteEmail({
+        tcol: tcolFn,
+        tenant,
+        dispatcher,
+        outlookMessageId: messageId,
+        subject,
+        from,
+        to,
+        cc,
+        emailBody,
         receivedMailboxEmail: dispatcher.outlookConnectedEmail ||
           dispatcher.email,
+        classify: {
+          isQuote: true,
+          confidence: classify.confidence,
+          reasoning: classify.reasoning,
+          source: classify.source,
+        },
+        forceReprocess: Boolean(opts.forceReprocess),
       });
-      if (result.quoteId) {
-        synced += 1;
-        await col(tenant, "emailIntake").doc(intakeId).set({
-          source: "dispatcher_outlook",
+
+      if (!enq.ok && enq.reason !== "already_queued") {
+        processErrors += 1;
+        writeLogFn("warn", "quote", "Quote enqueue failed", {
           dispatcherId: dispatcher.id,
-          dispatcherEmail: dispatcher.email,
-          gmailMessageId: intakeId,
-          outlookMessageId: messageId,
-          subject,
-          from,
-          quoteId: result.quoteId,
-          finalStatus: result.status || "quote_processed",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, {merge: true});
-        if (result.quoteId) {
-          try {
-            await col(tenant, "quoteRequests").doc(result.quoteId).set({
-              outlookMessageId: messageId,
-            }, {merge: true});
-          } catch (_) {
-            // non-fatal
-          }
-        }
-        try {
-          await client.users.messages.modify({
-            id: messageId,
-            requestBody: {removeLabelIds: ["UNREAD"]},
-          });
-        } catch (markReadErr) {
-          writeLogFn("warn", "quote", "Outlook mark read failed", {
-            dispatcherId: dispatcher.id,
-            messageId,
-            error: markReadErr.message,
-          });
-        }
-      } else {
-        await col(tenant, "emailIntake").doc(intakeId).set({
-          source: "dispatcher_outlook",
+          messageId,
+          reason: enq.reason,
+        });
+        continue;
+      }
+
+      enqueued += 1;
+      await col(tenant, "emailIntake").doc(intakeId).set({
+        source: "dispatcher_outlook",
+        dispatcherId: dispatcher.id,
+        dispatcherEmail: dispatcher.email,
+        gmailMessageId: intakeId,
+        outlookMessageId: messageId,
+        subject,
+        from,
+        quoteId: null,
+        finalStatus: "quote_queued",
+        skipReason: admin.firestore.FieldValue.delete(),
+        classifySource: classify.source || null,
+        classifyConfidence: classify.confidence || null,
+        createdAt: prev && prev.createdAt ?
+          prev.createdAt : admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+
+      try {
+        await client.users.messages.modify({
+          id: messageId,
+          requestBody: {removeLabelIds: ["UNREAD"]},
+        });
+      } catch (markReadErr) {
+        writeLogFn("warn", "quote", "Outlook mark read failed", {
           dispatcherId: dispatcher.id,
-          dispatcherEmail: dispatcher.email,
-          gmailMessageId: intakeId,
-          subject,
-          from,
-          quoteId: null,
-          finalStatus: "skipped_not_quote",
-          skipReason: result.reason || result.status || "not_a_quote",
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, {merge: true});
+          messageId,
+          error: markReadErr.message,
+        });
       }
     } catch (err) {
-      writeLogFn("error", "quote", "Outlook sync quote process failed", {
+      processErrors += 1;
+      writeLogFn("error", "quote", "Outlook sync quote enqueue failed", {
         dispatcherId: dispatcher.id,
         messageId,
         error: err.message,
@@ -348,7 +569,21 @@ async function syncDispatcherInbox(tenant, dispatcher, processQuoteEmail) {
     }
   }
 
-  return {ok: true, synced, scanned: messages.length};
+  const drainedAfter = await drainQuoteQueue(
+      tenant, dispatcher, processQuoteEmail);
+  const synced = drainedFirst.processed + drainedAfter.processed;
+  processErrors += drainedFirst.errors + drainedAfter.errors;
+
+  return {
+    ok: true,
+    synced,
+    enqueued,
+    scanned: messages.length,
+    includeRead,
+    skippedExisting,
+    skippedNotQuote,
+    processErrors,
+  };
 }
 
 /**

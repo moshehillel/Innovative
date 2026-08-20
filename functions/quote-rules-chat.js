@@ -976,6 +976,25 @@ function parseProtocolOnlyFromText(text) {
 }
 
 /**
+ * True when user wants the mapping to also fire on Cc/To (not only From).
+ * @param {string} text User text.
+ * @return {boolean}
+ */
+function parseMatchCcToFromText(text) {
+  const t = String(text || "").toLowerCase();
+  return /\bcc'?d\b/.test(t) ||
+    /\bon\s+cc\b/.test(t) ||
+    /\bin\s+cc\b/.test(t) ||
+    /\balso\s+(?:when\s+)?(?:on\s+)?cc\b/.test(t) ||
+    /\bwhen\s+(?:cc|to)\b/.test(t) ||
+    /\bcc\s*(?:\/|or)\s*to\b/.test(t) ||
+    /\bto\s*(?:\/|or)\s*cc\b/.test(t) ||
+    /\b(cc|to)\s+and\s+(cc|to)\b/.test(t) ||
+    /\bparticipant\b/.test(t) ||
+    /\balso\s+match\s+(?:cc|to)\b/.test(t);
+}
+
+/**
  * Guess customer name from mapping phrasing.
  * @param {string} text User text.
  * @param {Array<string>} emails Emails already found (strip from name).
@@ -1075,6 +1094,7 @@ function inferSenderCustomerTopic(messages) {
   // local-part intent — still allow emails when present.
   const customerName = parseCustomerNameFromSenderText(blob, emails);
   const protocolOnly = parseProtocolOnlyFromText(blob);
+  const matchCcTo = parseMatchCcToFromText(blob);
   const defaultDims = parseDefaultDimsFromText(blob);
   if (!emails.length && !domains.length) return null;
   if (!customerName && !defaultDims) return null;
@@ -1083,6 +1103,7 @@ function inferSenderCustomerTopic(messages) {
     domains,
     customerName,
     protocolOnly,
+    matchCcTo,
     defaultDims,
   };
 }
@@ -1116,6 +1137,7 @@ function looksLikeSenderCustomerIntent(messages) {
     /\bfrom\s+emails?\b/.test(t) ||
     /\bsender\b/.test(t) ||
     /\bprotocol[\s-]*only\b/.test(t) ||
+    parseMatchCcToFromText(lastText) ||
     (/\bcustomer\b/.test(t) && /@/.test(lastText));
   if (hasEmail && mappingVerb) return true;
   if (hasEmail && /(?:\bto\b|→|->|=>)/.test(lastText) &&
@@ -1151,6 +1173,8 @@ function findExistingSenderRule(existingRules, topic) {
     const ruleEmails = []
         .concat(match.fromEmails || [])
         .concat(match.senderEmails || [])
+        .concat(match.ccEmails || [])
+        .concat(match.toEmails || [])
         .map((e) => String(e || "").toLowerCase());
     const ruleDomains = []
         .concat(match.senderDomains || [])
@@ -1207,6 +1231,16 @@ function buildSenderCustomerProposal(messages, existingRules) {
   const match = {};
   if (emails.length) match.fromEmails = emails;
   if (domains.length) match.senderDomains = domains;
+  const liveMatch = live && live.match && typeof live.match === "object" ?
+    live.match : {};
+  const liveHasCcTo =
+    (Array.isArray(liveMatch.ccEmails) && liveMatch.ccEmails.length > 0) ||
+    (Array.isArray(liveMatch.toEmails) && liveMatch.toEmails.length > 0);
+  const matchCcTo = !!(topic.matchCcTo || liveHasCcTo);
+  if (matchCcTo && emails.length) {
+    match.ccEmails = emails.slice();
+    match.toEmails = emails.slice();
+  }
 
   const customerName = topic.customerName ||
     (live && live.customerName) || "";
@@ -1223,6 +1257,9 @@ function buildSenderCustomerProposal(messages, existingRules) {
 
   const bits = [];
   if (emails.length) bits.push(`From ${emails.join(", ")}`);
+  if (matchCcTo && emails.length) {
+    bits.push(`also Cc/To ${emails.join(", ")}`);
+  }
   if (domains.length) {
     bits.push(`domain ${domains.map((d) => "@" + d).join(", ")}`);
   }
@@ -1245,8 +1282,12 @@ function buildSenderCustomerProposal(messages, existingRules) {
     protocolOnly: !!protocolOnly,
     addAccessorials: [],
     notes: protocolOnly ?
-      "Sender email maps to Primus customer (protocol only)." :
-      "Sender email maps to Primus customer.",
+      (matchCcTo ?
+        "Sender From/Cc/To maps to Primus customer (protocol only)." :
+        "Sender email maps to Primus customer (protocol only).") :
+      (matchCcTo ?
+        "Sender From/Cc/To maps to Primus customer." :
+        "Sender email maps to Primus customer."),
     autoApply: true,
     requiresConfirm: false,
   };
@@ -1254,7 +1295,9 @@ function buildSenderCustomerProposal(messages, existingRules) {
 
   return {
     reply: `Here's a sender→customer rule: ${bits.join("; ")}. ` +
-      "Identified via From email (no site-type / accessorials). " +
+      (matchCcTo ?
+        "Identified via From/Cc/To email (no site-type / accessorials). " :
+        "Identified via From email (no site-type / accessorials). ") +
       "Click Confirm to apply it.",
     action: live ? "propose_update_rule" : "propose_create_rule",
     proposal: {ruleId, patch},
@@ -1560,21 +1603,24 @@ async function runQuoteRulesChatTurn(opts) {
     "ruleKind, customerName, protocolOnly, defaultDims.",
     "match may use: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType,",
-    "fromEmails, senderEmails, senderDomains.",
+    "fromEmails, senderEmails, senderDomains, ccEmails, toEmails.",
     "",
     "=== Sender email → customer (IMPORTANT) ===",
     "Phrases: map this email to customer X, when email from Y use",
     "customer Z, protocol only, match customer name to that email,",
-    "default dims 40x48x62 when missing.",
+    "default dims 40x48x62 when missing, also when CC'd / on Cc or To.",
     "→ propose_create_rule (or update) immediately.",
     "identifyVia MUST be \"email\"; ruleKind \"sender_customer\".",
     "match.fromEmails: array of emails (one rule can list many).",
     "Optional match.senderDomains: [\"ediexpressinc.com\"].",
+    "When they say CC'd / Cc / To / participant: also set",
+    "match.ccEmails and match.toEmails to the same addresses.",
     "Set customerName; protocolOnly true when they say protocol only;",
     "defaultDims {length,width,height} when they give missing dims.",
     "addAccessorials: []. Do NOT ask site type, LAD, APD, or the",
     "Can-be / Cannot-be questionnaire for these.",
-    "Example ids: sender_mike_oseback, sender_jared_berman /",
+    "Example ids: sender_mike_oseback, sender_jared_berman,",
+    "sender_lifeworks_picking, sender_shaya_jacobowitz /",
     "\"Sender → Mike Oseback\".",
     "NEVER reply \"I could not process that\" for sender mapping.",
     "",

@@ -133,6 +133,35 @@ checkTrue("mike never asks LAD/APD",
 checkTrue("mike never could not process",
     mikeOut && !/could not process/i.test(mikeOut.reply));
 
+const mikeCcMsg = [{
+  role: "user",
+  content: "Also when mike.oseback@ediexpressinc.com is CC'd or on To, " +
+    "map to Mike Oseback protocol only.",
+}];
+checkTrue("mike cc is sender intent",
+    chat.looksLikeSenderCustomerIntent(mikeCcMsg));
+const mikeCcOut = chat.buildSenderCustomerProposal(mikeCcMsg, [{
+  id: "sender_mike_oseback",
+  active: true,
+  ruleKind: "sender_customer",
+  identifyVia: "email",
+  customerName: "Mike Oseback",
+  protocolOnly: true,
+  match: {fromEmails: ["mike.oseback@ediexpressinc.com"]},
+}]);
+check("mike cc action update",
+    mikeCcOut && mikeCcOut.action, "propose_update_rule");
+checkTrue("mike cc has ccEmails",
+    mikeCcOut &&
+    Array.isArray(mikeCcOut.proposal.patch.match.ccEmails) &&
+    mikeCcOut.proposal.patch.match.ccEmails
+        .includes("mike.oseback@ediexpressinc.com"));
+checkTrue("mike cc has toEmails",
+    mikeCcOut &&
+    Array.isArray(mikeCcOut.proposal.patch.match.toEmails) &&
+    mikeCcOut.proposal.patch.match.toEmails
+        .includes("mike.oseback@ediexpressinc.com"));
+
 const jaredMsg = [{
   role: "user",
   content: "Jared Berman Jared.Berman@corehome.com → Brumis Imports Inc, " +
@@ -150,6 +179,31 @@ checkTrue("jared from email",
     jaredOut &&
     jaredOut.proposal.patch.match.fromEmails
         .includes("jared.berman@corehome.com"));
+
+const lifeworksMsg = [{
+  role: "user",
+  content: "Map lfwpicking@coreforce.com to Lifeworks Technology Group",
+}];
+const lifeworksOut = chat.buildSenderCustomerProposal(lifeworksMsg, []);
+check("lifeworks customer",
+    lifeworksOut && lifeworksOut.proposal.patch.customerName,
+    "Lifeworks Technology Group");
+checkTrue("lifeworks not protocolOnly",
+    lifeworksOut && lifeworksOut.proposal.patch.protocolOnly === false);
+
+const shayaMsg = [{
+  role: "user",
+  content: "Shaya Jacobowitz shaya@primepackaging.com → Prime Packaging Inc",
+}];
+const shayaOut = chat.buildSenderCustomerProposal(shayaMsg, []);
+check("shaya customer",
+    shayaOut && shayaOut.proposal.patch.customerName, "Prime Packaging Inc");
+checkTrue("shaya from email",
+    shayaOut &&
+    shayaOut.proposal.patch.match.fromEmails
+        .includes("shaya@primepackaging.com"));
+checkTrue("shaya not protocolOnly",
+    shayaOut && shayaOut.proposal.patch.protocolOnly === false);
 
 (async () => {
   const smokePhrases = [

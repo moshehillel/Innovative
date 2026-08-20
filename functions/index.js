@@ -7858,6 +7858,7 @@ async function processGmailMessage(
   let subject = String(options.subject || "");
   let from = String(options.from || "");
   let to = String(options.to || "");
+  let cc = String(options.cc || "");
   const tenant = options.tenant || currentTenant() || DEFAULT_TENANT;
   const isTai = tenant.tms === "tai";
 
@@ -7882,6 +7883,7 @@ async function processGmailMessage(
     const subjectHeader = headers.find((h) => h.name === "Subject");
     const fromHeader = headers.find((h) => h.name === "From");
     const toHeader = headers.find((h) => h.name === "To");
+    const ccHeader = headers.find((h) => h.name === "Cc");
 
     if (!subject) {
       subject = subjectHeader ? subjectHeader.value : "";
@@ -7891,6 +7893,9 @@ async function processGmailMessage(
     }
     if (!to) {
       to = toHeader ? toHeader.value : "";
+    }
+    if (!cc) {
+      cc = ccHeader ? ccHeader.value : "";
     }
 
     const emailBody = extractEmailBody(payload);
@@ -8327,6 +8332,8 @@ async function processGmailMessage(
               messageId,
               subject,
               from,
+              to,
+              cc,
               emailBody,
               tenant,
             });
@@ -8447,6 +8454,8 @@ async function processGmailMessage(
               messageId,
               subject,
               from,
+              to,
+              cc,
               emailBody,
               tenant,
             });
@@ -14402,6 +14411,8 @@ exports.processQuoteWorkflow = onRequest({
       messageId: body.messageId || `manual-${Date.now()}`,
       subject: body.subject || "Manual quote",
       from: body.from || "",
+      to: body.to || "",
+      cc: body.cc || "",
       emailBody: body.emailBody || body.body || "",
       tenant,
     });

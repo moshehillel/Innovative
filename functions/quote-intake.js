@@ -87,15 +87,21 @@ function normalizeExtractedQuote(extracted, opts) {
   const from = opts && opts.from != null ? String(opts.from) : "";
   const senderFrom = senderRules.resolveQuoteSenderFrom(
       from, opts && opts.body);
-  const dimOpts = senderRules.dimOptsForSender(senderFrom);
-  senderRules.applySenderCustomerOverride(next, senderFrom);
+  const recipientOpts = {
+    cc: opts && opts.cc,
+    to: opts && opts.to,
+  };
+  const dimOpts = senderRules.dimOptsForSender(
+      senderFrom, undefined, recipientOpts);
+  senderRules.applySenderCustomerOverride(
+      next, senderFrom, undefined, recipientOpts);
   const missingDimsBefore = palletRowsMissingDims(next);
   normalizeSoleAddressToConsignee(next);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
   senderRules.applySenderDefaultedDimOverrides(
-      next, senderFrom, opts && opts.body);
+      next, senderFrom, opts && opts.body, undefined, recipientOpts);
   if (missingDimsBefore && !palletRowsMissingDims(next)) {
     pushExtractWarning(next, "defaulted dims");
   }

@@ -1,11 +1,14 @@
 /**
  * Sender-specific quote intake rules (customer attach + pallet dim defaults).
- * Match From email / domain case-insensitively.
+ * Match From email / domain case-insensitively; optional Cc/To participant
+ * match for rules that list match.ccEmails / match.toEmails (or builtin
+ * matchCcTo).
  *
  * Sources (merged, Firestore wins on same email):
  * 1. Built-in SENDER_RULES (always-on fallback)
  * 2. quoteRules docs with ruleKind "sender_customer" or match.fromEmails /
- *    match.senderEmails / match.senderDomains
+ *    match.senderEmails / match.senderDomains / match.ccEmails /
+ *    match.toEmails
  *
  * Global pallet default remains 40×48×60 unless a sender rule sets defaultDims.
  */
@@ -22,9 +25,12 @@ const {
  * Map of normalized From email → rule.
  * defaultDims only fill missing L/W/H (and may replace AI-invented global
  * 40×48×60 when the email body has no explicit height).
+ * matchCcTo: also apply when this email appears in Cc or To (someone else
+ * may be the outer From).
  * @type {Object<string, {customerName?: string, protocolOnly?: boolean,
  *   defaultDims?: {length: number, width: number, height: number},
- *   ruleId?: string, name?: string}>}
+ *   ruleId?: string, name?: string, fromNames?: Array<string>,
+ *   matchCcTo?: boolean}>}
  */
 const SENDER_RULES = {
   "jared.berman@corehome.com": {
@@ -40,6 +46,19 @@ const SENDER_RULES = {
     ruleId: "sender_mike_oseback",
     name: "Sender → Mike Oseback",
     fromNames: ["mike oseback"],
+    matchCcTo: true,
+  },
+  "lfwpicking@coreforce.com": {
+    customerName: "Lifeworks Technology Group",
+    ruleId: "sender_lifeworks_picking",
+    name: "Sender → Lifeworks Technology Group",
+    fromNames: ["lifeworks picking"],
+  },
+  "shaya@primepackaging.com": {
+    customerName: "Prime Packaging Inc",
+    ruleId: "sender_shaya_jacobowitz",
+    name: "Sender → Prime Packaging Inc",
+    fromNames: ["shaya jacobowitz"],
   },
 };
 
@@ -60,6 +79,43 @@ function extractSenderEmail(from) {
   if (angle) return String(angle[1]).trim().toLowerCase();
   const bare = raw.match(/[\w.+-]+@[\w.-]+/);
   return bare ? String(bare[0]).trim().toLowerCase() : "";
+}
+
+/**
+ * Collect all emails from a To/Cc header string or array of strings.
+ * @param {string|Array<string>|null|undefined} raw Header value(s).
+ * @return {Array<string>} Lowercase unique emails.
+ */
+function extractRecipientEmails(raw) {
+  const parts = Array.isArray(raw) ? raw : [raw];
+  const out = [];
+  const seen = new Set();
+  for (const part of parts) {
+    const text = String(part || "");
+    if (!text.trim()) continue;
+    const re = /[\w.+-]+@[\w.-]+/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const email = String(m[0]).trim().toLowerCase();
+      if (!email || seen.has(email)) continue;
+      seen.add(email);
+      out.push(email);
+    }
+  }
+  return out;
+}
+
+/**
+ * Normalize opts.cc / opts.to into email lists.
+ * @param {object} [opts] {cc?, to?}.
+ * @return {{cc: Array<string>, to: Array<string>}}
+ */
+function recipientListsFromOpts(opts) {
+  const o = opts && typeof opts === "object" ? opts : {};
+  return {
+    cc: extractRecipientEmails(o.cc),
+    to: extractRecipientEmails(o.to),
+  };
 }
 
 /**
@@ -172,7 +228,9 @@ function isSenderCustomerRule(rule) {
   const match = rule.match && typeof rule.match === "object" ? rule.match : {};
   const emails = []
       .concat(match.fromEmails || [])
-      .concat(match.senderEmails || []);
+      .concat(match.senderEmails || [])
+      .concat(match.ccEmails || [])
+      .concat(match.toEmails || []);
   const domains = [].concat(match.senderDomains || []);
   return emails.some((e) => String(e || "").includes("@")) ||
     domains.some((d) => !!normalizeDomainNeedle(d));
@@ -220,6 +278,19 @@ function emailsFromMatch(match) {
 }
 
 /**
+ * @param {object} match Match object.
+ * @param {"ccEmails"|"toEmails"} key Field.
+ * @return {Array<string>}
+ */
+function listEmailsFromMatchField(match, key) {
+  const m = match && typeof match === "object" ? match : {};
+  return []
+      .concat(m[key] || [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+}
+
+/**
  * Collect senderDomains from a rule match.
  * @param {object} match Match object.
  * @return {Array<string>} Lowercase domains without @.
@@ -234,14 +305,16 @@ function domainsFromMatch(match) {
 
 /**
  * Match a From address against a list of quoteRules (sender_customer).
- * Exact email wins over domain. First active match by priority asc.
+ * Exact From email wins over Cc/To participant and domain.
+ * First active match by priority asc within each tier.
  * @param {string} from Raw From.
  * @param {Array<object>} quoteRules Active quote rules.
+ * @param {object} [opts] {cc?, to?}.
  * @return {object|null}
  */
-function resolveSenderRuleFromQuoteRules(from, quoteRules) {
+function resolveSenderRuleFromQuoteRules(from, quoteRules, opts) {
   const email = extractSenderEmail(from);
-  if (!email) return null;
+  const {cc: ccEmails, to: toEmails} = recipientListsFromOpts(opts);
   const domain = emailDomain(email);
   const list = (quoteRules || [])
       .filter((r) => r && r.active !== false && isSenderCustomerRule(r))
@@ -250,10 +323,24 @@ function resolveSenderRuleFromQuoteRules(from, quoteRules) {
         (Number(a.priority) || 100) - (Number(b.priority) || 100));
 
   let domainHit = null;
+  let ccHit = null;
+  let toHit = null;
   for (const rule of list) {
     const emails = emailsFromMatch(rule.match);
-    if (emails.includes(email)) {
+    if (email && emails.includes(email)) {
       return senderPayloadFromQuoteRule(rule);
+    }
+    if (!ccHit && ccEmails.length) {
+      const wantCc = listEmailsFromMatchField(rule.match, "ccEmails");
+      if (wantCc.some((e) => ccEmails.includes(e))) {
+        ccHit = senderPayloadFromQuoteRule(rule);
+      }
+    }
+    if (!toHit && toEmails.length) {
+      const wantTo = listEmailsFromMatchField(rule.match, "toEmails");
+      if (wantTo.some((e) => toEmails.includes(e))) {
+        toHit = senderPayloadFromQuoteRule(rule);
+      }
     }
     if (!domainHit && domain) {
       const domains = domainsFromMatch(rule.match);
@@ -262,23 +349,48 @@ function resolveSenderRuleFromQuoteRules(from, quoteRules) {
       }
     }
   }
-  return domainHit;
+  return ccHit || toHit || domainHit;
+}
+
+/**
+ * Built-in match when From missed but email is on Cc/To and rule opts in.
+ * @param {object} [opts] {cc?, to?}.
+ * @return {object|null}
+ */
+function resolveBuiltinCcToRule(opts) {
+  const {cc, to} = recipientListsFromOpts(opts);
+  const recipients = [...cc, ...to];
+  for (const email of recipients) {
+    const builtin = SENDER_RULES[email];
+    if (builtin && builtin.matchCcTo) return {...builtin};
+  }
+  return null;
 }
 
 /**
  * @param {string} from Raw From header.
  * @param {Array<object>} [quoteRules] Optional Firestore quoteRules.
+ * @param {object} [opts] {cc?, to?} recipient headers for participant match.
  * @return {object|null} Sender rule or null.
  */
-function resolveSenderRule(from, quoteRules) {
+function resolveSenderRule(from, quoteRules, opts) {
   const email = extractSenderEmail(from);
-  if (!email) return null;
+  const hasRecipients = recipientListsFromOpts(opts).cc.length > 0 ||
+    recipientListsFromOpts(opts).to.length > 0;
 
-  const fromFs = resolveSenderRuleFromQuoteRules(from, quoteRules || []);
-  if (fromFs) return {...fromFs};
+  if (email || hasRecipients) {
+    const fromFs = resolveSenderRuleFromQuoteRules(
+        from, quoteRules || [], opts);
+    if (fromFs) return {...fromFs};
+  }
 
-  const builtin = SENDER_RULES[email];
-  if (builtin && typeof builtin === "object") return {...builtin};
+  if (email) {
+    const builtin = SENDER_RULES[email];
+    if (builtin && typeof builtin === "object") return {...builtin};
+  }
+
+  const ccToBuiltin = resolveBuiltinCcToRule(opts);
+  if (ccToBuiltin) return ccToBuiltin;
 
   // Built-in domain fallbacks are not used — only exact builtins + FS domains.
   return null;
@@ -302,10 +414,11 @@ function bodyHasExplicitPalletHeight(body) {
  * Dim opts for normalizePalletDims / normalizePalletFreightRows.
  * @param {string} from Raw From.
  * @param {Array<object>} [quoteRules] Optional Firestore rules.
+ * @param {object} [opts] {cc?, to?}.
  * @return {object} `{defaultDims}` or `{}`.
  */
-function dimOptsForSender(from, quoteRules) {
-  const rule = resolveSenderRule(from, quoteRules);
+function dimOptsForSender(from, quoteRules, opts) {
+  const rule = resolveSenderRule(from, quoteRules, opts);
   if (!rule || !rule.defaultDims) return {};
   return {defaultDims: {...rule.defaultDims}};
 }
@@ -317,10 +430,12 @@ function dimOptsForSender(from, quoteRules) {
  * @param {string} from Raw From.
  * @param {string} body Email body.
  * @param {Array<object>} [quoteRules] Optional Firestore rules.
+ * @param {object} [opts] {cc?, to?}.
  * @return {object}
  */
-function applySenderDefaultedDimOverrides(extracted, from, body, quoteRules) {
-  const rule = resolveSenderRule(from, quoteRules);
+function applySenderDefaultedDimOverrides(
+    extracted, from, body, quoteRules, opts) {
+  const rule = resolveSenderRule(from, quoteRules, opts);
   if (!rule || !rule.defaultDims || !extracted ||
       !Array.isArray(extracted.lanes)) {
     return extracted;
@@ -355,10 +470,11 @@ function applySenderDefaultedDimOverrides(extracted, from, body, quoteRules) {
  * @param {object} extracted Intake payload.
  * @param {string} from Raw From.
  * @param {Array<object>} [quoteRules] Optional Firestore rules.
+ * @param {object} [opts] {cc?, to?}.
  * @return {object}
  */
-function applySenderCustomerOverride(extracted, from, quoteRules) {
-  const rule = resolveSenderRule(from, quoteRules);
+function applySenderCustomerOverride(extracted, from, quoteRules, opts) {
+  const rule = resolveSenderRule(from, quoteRules, opts);
   if (!rule || !rule.customerName || !extracted ||
       typeof extracted !== "object") {
     return extracted;
@@ -380,6 +496,7 @@ module.exports = {
   SENDER_RULES,
   INTERNAL_SENDER_DOMAINS,
   extractSenderEmail,
+  extractRecipientEmails,
   emailDomain,
   isInternalMailboxFrom,
   extractEmbeddedSenderFromBody,

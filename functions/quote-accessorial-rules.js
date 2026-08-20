@@ -37,6 +37,8 @@ const MANAGED_DEFAULT_RULE_IDS = new Set([
   "amazon_fc",
   "sender_mike_oseback",
   "sender_jared_berman",
+  "sender_lifeworks_picking",
+  "sender_shaya_jacobowitz",
 ]);
 
 /**
@@ -58,13 +60,15 @@ const DEFAULT_RULES = [
     identifyVia: "email",
     match: {
       fromEmails: ["mike.oseback@ediexpressinc.com"],
+      ccEmails: ["mike.oseback@ediexpressinc.com"],
+      toEmails: ["mike.oseback@ediexpressinc.com"],
     },
     customerName: "Mike Oseback",
     protocolOnly: true,
     addAccessorials: [],
     applyTo: "dest",
-    notes: "Map EDI Express sender to Mike Oseback (protocol only). " +
-      "Does not add accessorials.",
+    notes: "Map EDI Express From/Cc/To to Mike Oseback (protocol only). " +
+      "Applies when Mike sends or is CC'd/To'd. Does not add accessorials.",
     autoApply: true,
     requiresConfirm: false,
   },
@@ -86,6 +90,46 @@ const DEFAULT_RULES = [
     fromNames: ["jared berman"],
     notes: "Map Jared Berman / Corehome to Brumis Imports Inc; " +
       "default missing pallet dims to 40×48×62.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
+  {
+    id: "sender_lifeworks_picking",
+    active: true,
+    priority: 5,
+    name: "Sender → Lifeworks Technology Group",
+    ruleKind: RULE_KIND_SENDER_CUSTOMER,
+    identifyVia: "email",
+    match: {
+      fromEmails: ["lfwpicking@coreforce.com"],
+    },
+    customerName: "Lifeworks Technology Group",
+    protocolOnly: false,
+    addAccessorials: [],
+    applyTo: "dest",
+    fromNames: ["lifeworks picking"],
+    notes: "Map Lifeworks Picking (lfwpicking@coreforce.com) to " +
+      "Lifeworks Technology Group; FW body From resolved like Jared.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
+  {
+    id: "sender_shaya_jacobowitz",
+    active: true,
+    priority: 5,
+    name: "Sender → Prime Packaging Inc",
+    ruleKind: RULE_KIND_SENDER_CUSTOMER,
+    identifyVia: "email",
+    match: {
+      fromEmails: ["shaya@primepackaging.com"],
+    },
+    customerName: "Prime Packaging Inc",
+    protocolOnly: false,
+    addAccessorials: [],
+    applyTo: "dest",
+    fromNames: ["shaya jacobowitz"],
+    notes: "Map Shaya Jacobowitz / Prime Packaging to " +
+      "Prime Packaging Inc; FW body From resolved like Jared.",
     autoApply: true,
     requiresConfirm: false,
   },
@@ -303,7 +347,9 @@ function isSenderCustomerRule(rule) {
   const match = rule.match && typeof rule.match === "object" ? rule.match : {};
   const emails = []
       .concat(match.fromEmails || [])
-      .concat(match.senderEmails || []);
+      .concat(match.senderEmails || [])
+      .concat(match.ccEmails || [])
+      .concat(match.toEmails || []);
   const domains = [].concat(match.senderDomains || []);
   return emails.some((e) => String(e || "").includes("@")) ||
     domains.some((d) => !!String(d || "").trim());

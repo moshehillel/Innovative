@@ -50,7 +50,10 @@ function col(tenant, name) {
  */
 async function resolveCustomerMatch(opts) {
   const senderRule = senderRules.resolveSenderRule(
-      opts.from || "", opts.quoteRules || []);
+      opts.from || "", opts.quoteRules || [], {
+        cc: opts.cc,
+        to: opts.to,
+      });
   const ref = String(opts.customerRef || "");
   const customerName = String(
       (senderRule && senderRule.customerName) ||
@@ -201,6 +204,8 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
     shipperName,
     allowDefault: false,
     quoteRules: opts.quoteRules || [],
+    cc: opts.cc != null ? opts.cc : data.cc,
+    to: opts.to != null ? opts.to : data.to,
   });
 
   if (match && match.id) {
@@ -370,7 +375,7 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
       data.senderFrom || data.from || "",
       (data.extracted && data.extracted._sourceBody) || "");
   const senderDimOpts = senderRules.dimOptsForSender(
-      senderFrom, quoteRulesList);
+      senderFrom, quoteRulesList, {cc: data.cc, to: data.to});
 
   const patch = {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -900,15 +905,19 @@ async function processQuoteEmail(opts) {
   const messageId = opts.messageId;
   const subject = opts.subject || "";
   const from = opts.from || "";
+  const to = opts.to || "";
+  const cc = opts.cc || "";
   const emailBody = opts.emailBody || "";
   const senderFrom = senderRules.resolveQuoteSenderFrom(from, emailBody);
+  const recipientOpts = {cc, to};
 
   await deps.writeLog("info", "quote", "Processing quote request email", {
-    messageId, subject, from, senderFrom,
+    messageId, subject, from, senderFrom, to: to || null, cc: cc || null,
   });
 
   let extracted = await quoteIntake.extractQuoteRequest({
     subject, from: senderFrom || from, body: emailBody,
+    cc, to,
   });
 
   if (!extracted.lanes || !extracted.lanes.length) {
@@ -925,9 +934,10 @@ async function processQuoteEmail(opts) {
   const rules = await quoteRules.loadActiveRules(tenant);
   // Re-apply sender→customer / defaultDims using Firestore rules (chat-created
   // mappings) in addition to built-in SENDER_RULES.
-  senderRules.applySenderCustomerOverride(extracted, senderFrom, rules);
+  senderRules.applySenderCustomerOverride(
+      extracted, senderFrom, rules, recipientOpts);
   senderRules.applySenderDefaultedDimOverrides(
-      extracted, senderFrom, emailBody, rules);
+      extracted, senderFrom, emailBody, rules, recipientOpts);
 
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
@@ -942,6 +952,8 @@ async function processQuoteEmail(opts) {
     customerName: extractedCustomerName,
     shipperName: extracted.shipper && extracted.shipper.name,
     quoteRules: rules,
+    cc,
+    to,
   });
   const shippingLocationId = customerMatch.id || null;
   const shippingLocationName = customerMatch.name ||
@@ -1009,6 +1021,8 @@ async function processQuoteEmail(opts) {
     tenantId: tenant.tenantId,
     subject,
     from,
+    to: to || null,
+    cc: cc || null,
     senderFrom: senderFrom || null,
     customerRef: extracted.customerRef || subject,
     batchQuoteId,
@@ -1495,7 +1509,9 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
   // Re-resolve Primus customer from name/ref before rate shop.
   const customerPatch = {};
   if (senderFrom) customerPatch.senderFrom = senderFrom;
-  const senderRule = senderRules.resolveSenderRule(senderFrom, rules);
+  const recipientOpts = {cc: data.cc, to: data.to};
+  const senderRule = senderRules.resolveSenderRule(
+      senderFrom, rules, recipientOpts);
   if (senderRule && senderRule.customerName) {
     // Authoritative sender→customer mapping (e.g. Jared → Brumis).
     customerPatch.shippingLocationName = String(senderRule.customerName)
@@ -1506,6 +1522,8 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
     quoteRules: rules,
     from: senderFrom,
     emailBody,
+    cc: data.cc,
+    to: data.to,
   });
   const shippingLocationId = customerPatch.shippingLocationId != null ?
     customerPatch.shippingLocationId : data.shippingLocationId;
