@@ -46,16 +46,37 @@ function isPalletPackaging(row) {
 }
 
 /**
- * Rewrite 48×40 → 40×48; fill missing pallet L/W/H with 40×48×60.
- * Does not overwrite explicit non-standard footprints.
+ * Resolve L/W/H defaults (global 40×48×60 unless opts.defaultDims set).
+ * @param {object} [opts] Optional `defaultDims` {length, width, height}.
+ * @return {{length: number, width: number, height: number}}
+ */
+function resolvePalletDimDefaults(opts = {}) {
+  const d = opts && opts.defaultDims && typeof opts.defaultDims === "object" ?
+    opts.defaultDims : {};
+  const length = Number(d.length);
+  const width = Number(d.width);
+  const height = Number(d.height);
+  return {
+    length: length > 0 ? length : STANDARD_PALLET_LENGTH,
+    width: width > 0 ? width : STANDARD_PALLET_WIDTH,
+    height: height > 0 ? height : DEFAULT_PALLET_HEIGHT,
+  };
+}
+
+/**
+ * Rewrite 48×40 → 40×48; fill missing pallet L/W/H with defaults
+ * (global 40×48×60, or opts.defaultDims for sender-specific rules).
+ * Does not overwrite explicit non-standard footprints or present dims.
  * @param {object} row Freight row.
+ * @param {object} [opts] Optional `defaultDims` {length, width, height}.
  * @return {object}
  */
-function normalizePalletDims(row) {
+function normalizePalletDims(row, opts = {}) {
   if (!row || typeof row !== "object") return row;
   const next = {...row};
   if (!isPalletPackaging(next)) return next;
 
+  const defaults = resolvePalletDimDefaults(opts);
   const L = Number(next.length);
   const W = Number(next.width);
   const H = Number(next.height);
@@ -69,10 +90,10 @@ function normalizePalletDims(row) {
       next.width = STANDARD_PALLET_WIDTH;
     }
   } else {
-    if (!hasL) next.length = STANDARD_PALLET_LENGTH;
-    if (!hasW) next.width = STANDARD_PALLET_WIDTH;
+    if (!hasL) next.length = defaults.length;
+    if (!hasW) next.width = defaults.width;
   }
-  if (!hasH) next.height = DEFAULT_PALLET_HEIGHT;
+  if (!hasH) next.height = defaults.height;
   if (!String(next.dimType || "").trim()) next.dimType = "PLT";
   return next;
 }
@@ -97,12 +118,13 @@ function palletDimsWereDefaulted(before, after) {
 
 /**
  * @param {Array<object>|null|undefined} rows Freight lines.
+ * @param {object} [opts] Optional `defaultDims` {length, width, height}.
  * @return {Array<object>}
  */
-function normalizePalletFreightRows(rows) {
+function normalizePalletFreightRows(rows, opts = {}) {
   if (!Array.isArray(rows)) return [];
   return rows.map((row) => sanitizeImplausiblePalletWeight(
-      normalizePalletDims(row)));
+      normalizePalletDims(row, opts)));
 }
 
 /**
@@ -140,6 +162,7 @@ module.exports = {
   DEFAULT_PALLET_HEIGHT,
   isStandardPalletFootprint,
   isPalletPackaging,
+  resolvePalletDimDefaults,
   normalizePalletDims,
   normalizePalletFreightRows,
   sanitizeImplausiblePalletWeight,

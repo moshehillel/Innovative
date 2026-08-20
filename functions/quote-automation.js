@@ -16,6 +16,7 @@ const quoteOutlook = require("./quote-outlook");
 const quoteAccCatalog = require("./quote-accessorial-catalog");
 const quoteEmailAcc = require("./quote-email-accessorials");
 const freightDims = require("./quote-freight-dims");
+const senderRules = require("./quote-sender-rules");
 
 let deps = {};
 
@@ -47,8 +48,10 @@ function col(tenant, name) {
  * @return {Promise<object>} `{id, name, code?, searchTerm?}` — id may be null.
  */
 async function resolveCustomerMatch(opts) {
+  const senderRule = senderRules.resolveSenderRule(opts.from || "");
   const ref = String(opts.customerRef || "");
   const customerName = String(
+      (senderRule && senderRule.customerName) ||
       opts.customerName || opts.shippingLocationName || "").trim();
   const shipperName = String(opts.shipperName || "").trim();
   const hay = `${ref} ${customerName} ${shipperName} ${opts.from || ""}`;
@@ -73,6 +76,14 @@ async function resolveCustomerMatch(opts) {
   }
   if (/coreforce|isnetusa|lifeworks/i.test(hay)) {
     searchTerms.push("coreforce", "lifeworks");
+  }
+  // Sender rule customer name is authoritative — search it first.
+  if (senderRule && senderRule.customerName) {
+    const forced = String(senderRule.customerName).trim();
+    const rest = searchTerms.filter((t) =>
+      String(t).trim().toLowerCase() !== forced.toLowerCase());
+    searchTerms.length = 0;
+    searchTerms.push(forced, ...rest);
   }
 
   const match = await rateShop.resolveCustomerForQuote({
@@ -286,9 +297,10 @@ function normalizeAddressParty(party) {
 /**
  * Normalizes freight rows from dispatcher edits.
  * @param {Array<object>|null|undefined} rows Freight lines.
+ * @param {object} [dimOpts] Sender defaultDims.
  * @return {Array<object>}
  */
-function normalizeFreightRows(rows) {
+function normalizeFreightRows(rows, dimOpts = {}) {
   if (!Array.isArray(rows)) return [];
   return rows.map((row) => {
     const r = row && typeof row === "object" ? row : {};
@@ -316,7 +328,7 @@ function normalizeFreightRows(rows) {
       height: numOrNull(r.height),
       dimType: r.dimType != null && String(r.dimType).trim() ?
         String(r.dimType).trim() : "PLT",
-    });
+    }, dimOpts);
   }).filter((r) =>
     r.qty != null || r.weight != null || r.length != null ||
     r.width != null || r.height != null || r.class != null);
@@ -390,7 +402,12 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
         next = {...next, consignee: normalizeAddressParty(row.consignee)};
       }
       if (row.freightInfo !== undefined) {
-        next = {...next, freightInfo: normalizeFreightRows(row.freightInfo)};
+        next = {
+          ...next,
+          freightInfo: normalizeFreightRows(
+              row.freightInfo,
+              senderRules.dimOptsForSender(data.from || "")),
+        };
       }
       if (row.specialInstructions !== undefined) {
         next = {
@@ -670,9 +687,11 @@ async function rateLane(lane, ctx) {
   }
 
   // Always overwrite email class with Primus density class when
-  // weight + L×W×H are present. Pallet missing dims → 40×48×60 first.
+  // weight + L×W×H are present. Pallet missing dims → sender or
+  // global 40×48×60 first.
+  const dimOpts = senderRules.dimOptsForSender(ctx.from || "");
   const freightNormalized = freightDims.normalizePalletFreightRows(
-      lane.freightInfo || []);
+      lane.freightInfo || [], dimOpts);
   const classFix = rateShop.ensureFreightClasses(freightNormalized, {
     UOM: "US",
   });
@@ -926,6 +945,7 @@ async function processQuoteEmail(opts) {
         customerPrefs: {},
         emailBody,
         subject,
+        from,
         customerDeclinedAccessorials:
           extracted.customerDeclinedAccessorials || [],
       });
@@ -1453,6 +1473,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         customerPrefs: {},
         emailBody: (data.extracted && data.extracted._sourceBody) || "",
         subject: data.subject || "",
+        from: data.from || "",
         customerDeclinedAccessorials: data.customerDeclinedAccessorials ||
           (data.extracted && data.extracted.customerDeclinedAccessorials) ||
           [],

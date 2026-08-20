@@ -9,6 +9,7 @@ const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const emailAccessorials = require("./quote-email-accessorials");
 const freightDims = require("./quote-freight-dims");
+const senderRules = require("./quote-sender-rules");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
 // Live bake-off tied (Haiku / Sonnet 4.5 / Sonnet 5 / luna / sol / gpt-4o
@@ -68,7 +69,7 @@ function pushExtractWarning(extracted, msg) {
  * extract. Does not trust the LLM for cartons vs pallets, Pallet N
  * blocks, 40×48 dims, total-weight, or accessorial negation.
  * @param {object} extracted extractQuoteRequest result.
- * @param {object} [opts] subject, body.
+ * @param {object} [opts] subject, body, from.
  * @return {object}
  */
 function normalizeExtractedQuote(extracted, opts) {
@@ -83,11 +84,16 @@ function normalizeExtractedQuote(extracted, opts) {
   if (opts && opts.body) {
     next._sourceBody = String(opts.body).slice(0, 12000);
   }
+  const from = opts && opts.from != null ? String(opts.from) : "";
+  const dimOpts = senderRules.dimOptsForSender(from);
+  senderRules.applySenderCustomerOverride(next, from);
   const missingDimsBefore = palletRowsMissingDims(next);
   normalizeSoleAddressToConsignee(next);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
-  normalizeFreightOnExtract(next, opts && opts.body);
+  normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
+  senderRules.applySenderDefaultedDimOverrides(
+      next, from, opts && opts.body);
   if (missingDimsBefore && !palletRowsMissingDims(next)) {
     pushExtractWarning(next, "defaulted dims");
   }
@@ -127,7 +133,7 @@ function palletRowsMissingDims(extracted) {
 /**
  * Normalize sole-address + stamp email-requested accessorial codes.
  * @param {object} extracted Intake payload.
- * @param {object} opts subject, body.
+ * @param {object} opts subject, body, from.
  * @return {object}
  */
 function finishExtract(extracted, opts) {
@@ -1003,13 +1009,15 @@ function inferWeightTypeFromBody(body) {
 }
 
 /**
- * Pallet 40×48 (not 48×40), default missing pallet dims to 40×48×60,
- * and force weightType total when the email gives a total weight.
+ * Pallet 40×48 (not 48×40), default missing pallet dims to 40×48×60
+ * (or sender-specific defaults via dimOpts), and force weightType total
+ * when the email gives a total weight.
  * @param {object} extracted Parsed quote request.
  * @param {string} body Email body.
+ * @param {object} [dimOpts] defaultDims from sender rules.
  * @return {object}
  */
-function normalizeFreightOnExtract(extracted, body) {
+function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
   if (!extracted || typeof extracted !== "object") return extracted;
   const weightType = inferWeightTypeFromBody(body);
   if (!Array.isArray(extracted.lanes)) return extracted;
@@ -1019,7 +1027,7 @@ function normalizeFreightOnExtract(extracted, body) {
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     lane.freightInfo = rows.map((row) => {
       const base = row && typeof row === "object" ? {...row} : {};
-      const next = freightDims.normalizePalletDims(base);
+      const next = freightDims.normalizePalletDims(base, dimOpts);
       if (freightDims.palletDimsWereDefaulted(base, next)) {
         defaultedDims = true;
       }
@@ -1065,7 +1073,7 @@ async function extractQuoteRequest(opts) {
     const heuristic = heuristicExtractQuote({subject, from, body});
     if (heuristic) {
       heuristic.extractModel = "heuristic";
-      return finishExtract(heuristic, {subject, body});
+      return finishExtract(heuristic, {subject, body, from});
     }
     fallback.error = isOpenAiExtractModel(extractModel) ?
       "OpenAI API key not configured" :
@@ -1089,7 +1097,7 @@ async function extractQuoteRequest(opts) {
       if (!parsed.flags) parsed.flags = {};
       parsed.extractModel = extractModel;
       if (parsed.lanes.length) {
-        return finishExtract(parsed, {subject, body});
+        return finishExtract(parsed, {subject, body, from});
       }
       lastErr = new Error("model returned zero lanes");
     } catch (err) {
@@ -1100,7 +1108,7 @@ async function extractQuoteRequest(opts) {
   const heuristic = heuristicExtractQuote({subject, from, body});
   if (heuristic) {
     heuristic.extractModel = "heuristic";
-    return finishExtract(heuristic, {subject, body});
+    return finishExtract(heuristic, {subject, body, from});
   }
 
   fallback.error = `Parse failed: ${(lastErr && lastErr.message) || "unknown"}`;
