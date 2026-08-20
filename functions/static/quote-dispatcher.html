@@ -1130,14 +1130,18 @@
     }
 
     function defaultCustomerPrice(opt) {
-      if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
-        const override = Number(opt.customerPrice);
-        if (isFinite(override) && override > 0) return override;
+      function ceilDollar(n) {
+        const v = Number(n);
+        if (!isFinite(v) || v <= 0) return "";
+        return Math.ceil(v);
       }
-      const sell = Number(opt && opt.sellRate);
-      if (isFinite(sell) && sell > 0) return sell;
-      const cost = Number(opt && (opt.cost != null ? opt.cost : opt.total));
-      return isFinite(cost) && cost > 0 ? cost : "";
+      if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
+        const override = ceilDollar(opt.customerPrice);
+        if (override !== "") return override;
+      }
+      const sell = ceilDollar(opt && opt.sellRate);
+      if (sell !== "") return sell;
+      return ceilDollar(opt && (opt.cost != null ? opt.cost : opt.total));
     }
 
     function collectSelections() {
@@ -1151,7 +1155,7 @@
           const raw = byLane[rateId];
           const n = raw != null && raw !== "" ? Number(raw) :
             Number(defaultCustomerPrice(opt));
-          if (isFinite(n)) prices[rateId] = n;
+          if (isFinite(n) && n > 0) prices[rateId] = Math.ceil(n);
         });
         return {
           laneKey,
@@ -2271,10 +2275,12 @@
           const custVal = customerPrices[lane.laneKey] &&
             customerPrices[lane.laneKey][rateId] != null ?
             customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
-          const custStr = custVal === "" || custVal == null ? "" : num(custVal);
+          const custStr = custVal === "" || custVal == null ? "" :
+            (isFinite(Number(custVal)) ?
+              String(Math.ceil(Number(custVal))) : "");
           const sellHint = Number(opt.sellRate);
           const showSuggested = isFinite(sellHint) &&
-            Number(custVal) !== sellHint;
+            Number(custVal) !== Math.ceil(sellHint);
           optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
             <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(opt.rateId)}"${isChecked ? " checked" : ""}>
             <div>
@@ -2283,7 +2289,7 @@
               <div class="rate-row">
                 <span class="rate-cost">Cost $${num(opt.cost)}</span>
                 <label class="customer-rate-field">Customer rate $
-                  <input type="number" min="0.01" step="0.01"
+                  <input type="number" min="1" step="1"
                     data-customer-rate="1"
                     data-lane="${esc(lane.laneKey)}"
                     data-rate="${esc(opt.rateId)}"

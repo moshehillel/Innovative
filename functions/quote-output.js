@@ -92,13 +92,24 @@ function generateBatchQuoteId(prefix = "D") {
 }
 
 /**
- * @param {number|null} n Amount.
+ * Round customer/sell amount UP to the next whole dollar.
+ * @param {number|null|undefined} n Amount.
+ * @return {number|null}
+ */
+function ceilWholeDollar(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return null;
+  return Math.ceil(v);
+}
+
+/**
+ * @param {number|null} n Amount (already whole dollars preferred).
  * @return {string}
  */
 function money(n) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return "";
-  return v.toFixed(2);
+  const v = ceilWholeDollar(n);
+  if (v == null) return "";
+  return String(v);
 }
 
 /**
@@ -201,21 +212,18 @@ function buildAccessorialWhy(lane) {
 /**
  * Universal customer draft — same template for all customers.
  * Pricing lines are placeholders for dispatcher.
+ * Primus customer match stays on the dispatcher UI only (not in draft).
  * @param {object} quote Quote request doc data.
  * @return {string} Plain-text email draft.
  */
 function buildCustomerDraftText(quote) {
   const batchId = quote.batchQuoteId || "Q#????";
-  const customerLine = formatQuoteCustomerLine(quote);
   const lines = [
     "Hi,",
     "",
     `See your options below — ${batchId}:`,
     "",
   ];
-  if (customerLine) {
-    lines.splice(3, 0, customerLine);
-  }
 
   for (const lane of quote.lanes || []) {
     const destCity =
@@ -265,6 +273,7 @@ function buildAccessorialsIncludedSection(lanes) {
 
 /**
  * Customer-facing sell amount: dispatcher override, else margin sellRate.
+ * Always rounded UP to the next whole dollar.
  * @param {object} opt Rate option.
  * @return {number|null}
  */
@@ -279,10 +288,65 @@ function effectiveCustomerRate(opt) {
   ];
   for (const value of candidates) {
     if (value == null || value === "") continue;
-    const n = Number(value);
-    if (Number.isFinite(n) && n > 0) return n;
+    const whole = ceilWholeDollar(value);
+    if (whole != null) return whole;
   }
   return null;
+}
+
+/**
+ * Carrier advisory notes for selected rates in the customer email draft.
+ * Match is flexible (name contains); one note line per advisory group.
+ * @type {Array<{id: string, test: Function, note: string}>}
+ */
+const CUSTOMER_EMAIL_CARRIER_NOTE_RULES = [
+  {
+    id: "pickup_delays",
+    test: (name) => /central|aaa\s*cooper/i.test(name),
+    note: "often has delays at pickup.",
+  },
+  {
+    id: "reclass_fees",
+    test: (name) => /\bxpo\b|saia/i.test(name),
+    note: "has a lot of reclass fees if the pallet info are not exact.",
+  },
+  {
+    id: "frontline_consolidated",
+    test: (name) => /frontline/i.test(name),
+    note: "moves consolidated — may have major delays in transit",
+  },
+];
+
+/**
+ * Builds Notes lines for carriers selected into the customer email.
+ * @param {Array<object>} lanes Quote lanes with selections.
+ * @return {Array<string>} Empty if none of the advisory carriers are selected.
+ */
+function buildSelectedCarrierNoteLines(lanes) {
+  const byRule = new Map();
+  for (const lane of lanes || []) {
+    for (const opt of resolveSelectedOptions(lane)) {
+      const name = String(opt.name || opt.SCAC || "").trim();
+      if (!name) continue;
+      for (const rule of CUSTOMER_EMAIL_CARRIER_NOTE_RULES) {
+        if (!rule.test(name)) continue;
+        let entry = byRule.get(rule.id);
+        if (!entry) {
+          entry = {note: rule.note, names: []};
+          byRule.set(rule.id, entry);
+        }
+        if (!entry.names.includes(name)) entry.names.push(name);
+      }
+    }
+  }
+  const lines = [];
+  for (const rule of CUSTOMER_EMAIL_CARRIER_NOTE_RULES) {
+    const entry = byRule.get(rule.id);
+    if (!entry) continue;
+    lines.push(`• ${entry.names.join(" / ")}: ${entry.note}`);
+  }
+  if (!lines.length) return [];
+  return ["Notes:", ...lines];
 }
 
 /**
@@ -373,6 +437,7 @@ function resolveSelectedOptions(lane) {
 
 /**
  * Builds customer email body from checked rate options.
+ * Primus customer line is UI-only — never included in the customer draft.
  * @param {object} quote Quote doc.
  * @param {object} [opts] style.
  * @return {string}
@@ -380,16 +445,12 @@ function resolveSelectedOptions(lane) {
 function buildCustomerEmailFromSelections(quote, opts = {}) {
   const batchId = quote.batchQuoteId || "Q#????";
   const formatLine = pricingFormatter(opts.style || "bullet");
-  const customerLine = formatQuoteCustomerLine(quote);
   const lines = [
     "Hi,",
     "",
     `See your options below — ${batchId}:`,
     "",
   ];
-  if (customerLine) {
-    lines.splice(3, 0, customerLine);
-  }
 
   const multiLane = (quote.lanes || []).length > 1;
   for (const lane of quote.lanes || []) {
@@ -410,9 +471,14 @@ function buildCustomerEmailFromSelections(quote, opts = {}) {
           sellRate: customerRate,
         };
         lines.push(formatLine(priced));
-        // Carrier / dispatcher notes are UI-only — never in customer email.
       }
     }
+    lines.push("");
+  }
+
+  const carrierNotes = buildSelectedCarrierNoteLines(quote.lanes);
+  if (carrierNotes.length) {
+    lines.push(...carrierNotes);
     lines.push("");
   }
 
@@ -575,10 +641,11 @@ function serializeForDispatcherPage(quote) {
           name: o.name,
           SCAC: o.SCAC,
           cost: o.total != null ? o.total : o.cost,
-          sellRate: o.sellRate != null ? o.sellRate :
-            (o.total != null ? o.total : o.cost),
+          sellRate: ceilWholeDollar(
+              o.sellRate != null ? o.sellRate :
+                (o.total != null ? o.total : o.cost)),
           customerPrice: o.customerPrice != null ?
-            Number(o.customerPrice) : null,
+            ceilWholeDollar(o.customerPrice) : null,
           transitDays: o.transitDays,
           quoteNumber,
           costQuoteId: o.costQuoteId || null,
@@ -595,9 +662,11 @@ function serializeForDispatcherPage(quote) {
 module.exports = {
   generateBatchQuoteId,
   cleanCarrierNote,
+  ceilWholeDollar,
   buildCustomerDraftText,
   buildCustomerDraftHtml,
   buildCustomerEmailFromSelections,
+  buildSelectedCarrierNoteLines,
   textToEmailHtml,
   serializeForDispatcherPage,
   effectiveCustomerRate,

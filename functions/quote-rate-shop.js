@@ -967,17 +967,18 @@ function buildRateMultipleQuery(lane, opts = {}) {
  * Applies margin to carrier cost.
  * Customer contract rates (billTo.total or rateSource customer) pass through.
  * Market rates: cost + min(flat $ markup, percent of cost), default $55 / 10%.
+ * All sell rates round UP to the next whole dollar (Math.ceil).
  * @param {number} cost Carrier cost.
  * @param {object} [opts] billToTotal, rateSource, marginPercent, marginMinDollars.
  * @return {number|null}
  */
 function computeSellRate(cost, opts = {}) {
   const billTo = Number(opts.billToTotal);
-  if (Number.isFinite(billTo) && billTo > 0) return billTo;
+  if (Number.isFinite(billTo) && billTo > 0) return Math.ceil(billTo);
   const c = Number(cost);
   if (!Number.isFinite(c)) return null;
   if (opts.rateSource === "customer") {
-    return Math.round(c * 100) / 100;
+    return Math.ceil(c);
   }
   const flat = Number.isFinite(Number(opts.marginMinDollars)) ?
     Number(opts.marginMinDollars) : 55;
@@ -986,7 +987,7 @@ function computeSellRate(cost, opts = {}) {
     Number(opts.marginPercent) : 10;
   const markup = Math.min(flat, c * (pct / 100));
   const sell = c + markup;
-  return Math.round(sell * 100) / 100;
+  return Math.ceil(sell);
 }
 
 /**

@@ -185,6 +185,14 @@ check("customer rateSource passes through without floor",
     rateShop.computeSellRate(400, {rateSource: "customer"}), 400);
 check("market_fallback applies markup",
     rateShop.computeSellRate(300, {rateSource: "market_fallback"}), 330);
+check("sell rate ceils fractional market markup",
+    rateShop.computeSellRate(301.1), 332);
+check("sell rate ceils fractional billTo",
+    rateShop.computeSellRate(300, {billToTotal: 753.15}), 754);
+check("sell rate keeps whole billTo",
+    rateShop.computeSellRate(300, {billToTotal: 754}), 754);
+check("customer rateSource ceils fractional",
+    rateShop.computeSellRate(400.01, {rateSource: "customer"}), 401);
 
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);

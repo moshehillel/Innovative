@@ -69,7 +69,12 @@ const email = quoteOutput.buildCustomerEmailFromSelections({
 checkIncludes(
     "email has clean pricing bullet",
     email,
-    "• $245.00 – 2-day transit (estimated) – Central Transport · Q# 98765",
+    "• $245 – 2-day transit (estimated) – Central Transport · Q# 98765",
+);
+checkIncludes(
+    "email notes Central pickup delays",
+    email,
+    "• Central Transport: often has delays at pickup.",
 );
 
 const costOnlyEmail = quoteOutput.buildCustomerEmailFromSelections({
@@ -80,26 +85,31 @@ const costOnlyEmail = quoteOutput.buildCustomerEmailFromSelections({
     selectedOptions: [{
       id: "r2",
       name: "Estes",
-      total: 180,
+      total: 180.15,
       transitDays: 3,
       quoteNumber: "E9",
     }],
   }],
 }, {style: "bullet"});
 checkIncludes(
-    "email uses cost when sellRate missing",
+    "email ceils fractional cost to whole dollar",
     costOnlyEmail,
-    "$180.00",
-);
-checkIncludes(
-    "email includes Primus customer name",
-    costOnlyEmail,
-    "Customer: Acme Logistics (Primus ID 4170250)",
+    "$181",
 );
 checkNotIncludes(
-    "email excludes carrier note lines",
-    email,
-    "Note:",
+    "email omits Primus customer line",
+    costOnlyEmail,
+    "Customer:",
+);
+checkNotIncludes(
+    "email omits Primus ID",
+    costOnlyEmail,
+    "Primus ID",
+);
+checkNotIncludes(
+    "email excludes carrier note lines for non-advisory carriers",
+    costOnlyEmail,
+    "Notes:",
 );
 checkNotIncludes(
     "email excludes raw note content",
@@ -128,11 +138,41 @@ const emptyNoteEmail = quoteOutput.buildCustomerEmailFromSelections({
     notesForCustomer: "Dispatcher-only enrichment note",
   }],
 }, {style: "bullet"});
-checkNotIncludes("skips Note: after strip", emptyNoteEmail, "Note:");
+checkNotIncludes("skips Note: after strip for Estes", emptyNoteEmail, "Note:");
 checkNotIncludes(
     "excludes notesForCustomer from email",
     emptyNoteEmail,
     "Dispatcher-only enrichment note",
+);
+
+const advisoryEmail = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#D7777",
+  lanes: [{
+    selectedOptions: [
+      {name: "XPO Logistics", sellRate: 753.15, transitDays: 2, quoteNumber: "X1"},
+      {name: "Saia LTL", sellRate: 754, transitDays: 3, quoteNumber: "S1"},
+      {name: "Frontline Freight", sellRate: 800.01, transitDays: 4, quoteNumber: "F1"},
+      {name: "AAA Cooper Transportation", sellRate: 900, transitDays: 2, quoteNumber: "A1"},
+    ],
+  }],
+}, {style: "bullet"});
+checkIncludes("ceils 753.15 to $754", advisoryEmail, "$754");
+checkIncludes("keeps whole $754", advisoryEmail, "• $754 – 3-day");
+checkIncludes("ceils 800.01 to $801", advisoryEmail, "$801");
+checkIncludes(
+    "groups XPO / Saia reclass note",
+    advisoryEmail,
+    "• XPO Logistics / Saia LTL: has a lot of reclass fees if the pallet info are not exact.",
+);
+checkIncludes(
+    "Frontline consolidated note",
+    advisoryEmail,
+    "• Frontline Freight: moves consolidated — may have major delays in transit",
+);
+checkIncludes(
+    "AAA Cooper pickup delay note",
+    advisoryEmail,
+    "• AAA Cooper Transportation: often has delays at pickup.",
 );
 
 const page = quoteOutput.serializeForDispatcherPage({
