@@ -37,6 +37,10 @@ const apexCapitalIntake = require("./apex-capital-intake");
 const dailyActivityReport = require("./daily-activity-report");
 const podRequestIntake = require("./pod-request-intake");
 const podSendDedup = require("./pod-send-dedup");
+const {
+  toOutboundEmailSafeSubject,
+  toOutboundEmailSafeText,
+} = require("./email-outbound-safe");
 const administrativeEmailIntake = require("./administrative-email-intake");
 const drayageIntake = require("./drayage-intake");
 const invoiceLoadEntry = require("./invoice-load-entry");
@@ -4702,8 +4706,10 @@ async function sendViaGmail(
   const boundary = `msg_${crypto.randomBytes(16).toString("hex")}`;
   const safeTo = String(to || "").replace(/[\r\n]/g, "");
   const safeCc = String(opts && opts.cc || "").replace(/[\r\n]/g, "");
-  const safeSubject = String(subject || "").replace(/[\r\n]/g, " ");
-  const htmlB64 = encodeMimeBase64(Buffer.from(String(html || ""), "utf8"));
+  const safeSubject = toOutboundEmailSafeSubject(
+      String(subject || "").replace(/[\r\n]/g, " "));
+  const htmlB64 = encodeMimeBase64(Buffer.from(
+      toOutboundEmailSafeText(String(html || "")), "utf8"));
   const inlineAttachments = Array.isArray(opts.inlineAttachments) ?
     opts.inlineAttachments : [];
 
@@ -5632,7 +5638,7 @@ async function saveOutboundEmail(email) {
     try {
       await sendViaGmail(
           to,
-          email.subject || "",
+          toOutboundEmailSafeSubject(email.subject || ""),
           htmlToSend,
           Array.isArray(email.attachments) ? email.attachments : [],
           tenant,
@@ -6767,7 +6773,8 @@ async function handlePodRequestEmail(opts) {
   } = opts;
 
   const intent = emailClassification && emailClassification.intent;
-  if (!podRequestIntake.isPodRequestEmail(subject, emailBody, intent)) {
+  if (!podRequestIntake.isPodRequestEmail(
+      subject, emailBody, intent, emailClassification)) {
     return {handled: false};
   }
 
@@ -6898,7 +6905,7 @@ async function handlePodRequestEmail(opts) {
     booking,
     loadNumber,
     recipientEmail: requesterEmail,
-    subject: `Proof of Delivery — Load #${loadNumber}`,
+    subject: `Proof of Delivery - Load #${loadNumber}`,
   });
 
   if (!sendResult.ok) {
@@ -7173,7 +7180,7 @@ async function handlePodOnlyDeliveryEmail(opts) {
 }
 
 /** Queue items stuck in "processing" longer than this are retried. */
-const STALE_GMAIL_QUEUE_MS = 10 * 60 * 1000;
+const STALE_GMAIL_QUEUE_MS = 31 * 60 * 1000;
 
 /** Min wait before auto-requeue of a failed mail item. */
 const FAILED_REQUEUE_MIN_MS = 3 * 60 * 1000;
@@ -7184,14 +7191,14 @@ const FAILED_REQUEUE_MAX_ATTEMPTS = 15;
 /** Max failed gmailQueue docs scanned per recoverFailedGmailQueueItems pass. */
 const FAILED_REQUEUE_BATCH_SIZE = 100;
 
-/** Max queued emails per batch (fits 540s timeout on heavy invoices). */
+/** Max queued emails per batch (fits 1800s timeout on heavy invoices). */
 const MAIL_QUEUE_PROCESS_BATCH_SIZE = 10;
 
-/** Stop new queue work before the Cloud Function hard timeout (540s). */
-const MAIL_QUEUE_RUN_BUDGET_MS = 8 * 60 * 1000;
+/** Stop new queue work before the Cloud Function hard timeout (1800s). */
+const MAIL_QUEUE_RUN_BUDGET_MS = 28.5 * 60 * 1000;
 
 /** Stale queue-processor lock expires so a crashed run cannot block forever. */
-const QUEUE_PROCESS_LOCK_MS = 11 * 60 * 1000;
+const QUEUE_PROCESS_LOCK_MS = 32 * 60 * 1000;
 
 /**
  * @param {object|null|undefined} queueData gmailQueue document fields.
@@ -8364,8 +8371,6 @@ async function processGmailMessage(
       }
 
       if (!isTai) {
-        const podRequestCandidate = podRequestIntake.looksLikePodRequest(
-            subject, emailBody);
         const skipPodForCarrierInvoice =
           administrativeEmailIntake.hasInvoiceVeto({
             subject,
@@ -8373,7 +8378,13 @@ async function processGmailMessage(
             attachments,
             emailClassification,
           });
-        if (!skipPodForCarrierInvoice &&
+        // Do not let heuristic override an explicit AI "not POD" / non-pod
+        // intent (e.g. scheduling reply with POD boilerplate in a signature).
+        const aiRejectsPod =
+          podRequestIntake.aiRejectsPodRequest(emailClassification);
+        const podRequestCandidate = !aiRejectsPod &&
+          podRequestIntake.looksLikePodRequest(subject, emailBody);
+        if (!skipPodForCarrierInvoice && !aiRejectsPod &&
           (podRequestCandidate ||
           (emailClassification.intent === "pod_request"))) {
           try {
@@ -8382,33 +8393,44 @@ async function processGmailMessage(
               emailClassification = await classifyIncomingEmail(
                   subject, from, emailBody, attachments);
             }
-            const podReqResult = await handlePodRequestEmail({
-              messageId,
-              subject,
-              from,
-              emailBody,
-              tenant,
-              emailClassification,
-            });
-            if (podReqResult.handled) {
-              await mailIntakeQueue.completeIntakeRecord({
+            if (podRequestIntake.aiRejectsPodRequest(emailClassification) &&
+                emailClassification.intent !== "pod_request") {
+              await writeLog("info", "mail",
+                  "POD heuristic skipped — AI says not POD request", {
+                    messageId,
+                    subject,
+                    intent: emailClassification.intent || null,
+                    reasoning: emailClassification.reasoning || null,
+                  });
+            } else {
+              const podReqResult = await handlePodRequestEmail({
+                messageId,
+                subject,
+                from,
+                emailBody,
                 tenant,
-                docId: queueDocId,
-                parentMessageId: messageId,
-                outcome: mailIntakeQueue.OUTCOME.PROCESSED,
-                finalStatus: podReqResult.status || "pod_request",
-                extra: {
-                  gmailMessageId: messageId,
-                  subject,
-                  from,
-                  loadNumber: podReqResult.loadNumber || null,
-                  requesterEmail: podReqResult.requesterEmail || null,
-                  escalatedToLisa: !!podReqResult.escalatedToLisa,
-                  emailClassification,
-                  deleteAt: getDeleteAt(30),
-                },
+                emailClassification,
               });
-              return;
+              if (podReqResult.handled) {
+                await mailIntakeQueue.completeIntakeRecord({
+                  tenant,
+                  docId: queueDocId,
+                  parentMessageId: messageId,
+                  outcome: mailIntakeQueue.OUTCOME.PROCESSED,
+                  finalStatus: podReqResult.status || "pod_request",
+                  extra: {
+                    gmailMessageId: messageId,
+                    subject,
+                    from,
+                    loadNumber: podReqResult.loadNumber || null,
+                    requesterEmail: podReqResult.requesterEmail || null,
+                    escalatedToLisa: !!podReqResult.escalatedToLisa,
+                    emailClassification,
+                    deleteAt: getDeleteAt(30),
+                  },
+                });
+                return;
+              }
             }
           } catch (podReqErr) {
             await writeLog("warn", "mail", "POD request handler failed", {
@@ -13249,7 +13271,7 @@ async function runMailQueueProcessForTenant(tenant, flowId) {
 }
 
 exports.processGmailQueue = onRequest(
-    {timeoutSeconds: 540, memory: "1GiB"},
+    {timeoutSeconds: 1800, memory: "1GiB"},
     async (req, res) => {
       try {
         await writeLog("info", "mail", "Starting mail queue processing");

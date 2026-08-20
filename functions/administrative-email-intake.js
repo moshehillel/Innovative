@@ -20,6 +20,25 @@ function isEmodalBroadcast(subject, from, body) {
   return /today'?s emodal broadcasts/i.test(hay);
 }
 
+/**
+ * True when the From header is Hafstaff (ops: always forward to Lisa).
+ * Matches display name or domain; tolerates Halfstaff / spacing variants.
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isHafstaffSender(from) {
+  const raw = String(from || "").toLowerCase();
+  if (!raw.trim()) return false;
+  // User spelling: Hafstaff. Also Halfstaff and spaced forms.
+  if (/haf\s*-?staff|half\s*-?staff/.test(raw)) return true;
+  const emailMatch = raw.match(/<([^>]+)>/) || raw.match(/([\w.+-]+@[\w.-]+)/);
+  const addr = String(emailMatch && emailMatch[1] || raw).toLowerCase();
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1).replace(/[^a-z0-9]/g, "");
+  return domain.includes("hafstaff") || domain.includes("halfstaff");
+}
+
 /** Default accounting contact for carrier payment questions. */
 const PAYMENT_INQUIRY_EMAIL_DEFAULT = "abe@innovativecarriers.com";
 
@@ -37,7 +56,19 @@ function isPaymentNotificationEmail(subject, from, body) {
       .test(hay)) {
     return true;
   }
-  if (/ach (?:payment|transfer|credit|debit)/i.test(hay)) return true;
+  // Require alert verbs — carrier invoice boilerplate often offers ACH
+  // remittance options ("utilize ACH payments") without being a bank alert.
+  const achNoun = "(?:payment|transfer|credit|debit|deposit)";
+  const achVerb =
+    "(?:sent|received|posted|completed|processed|confirmed|" +
+    "notification|alert)";
+  const achAlert = new RegExp(
+      `ach ${achNoun}.{0,40}${achVerb}`, "i");
+  const achAlertReverse = new RegExp(
+      `${achVerb}.{0,40}ach ${achNoun}`, "i");
+  if (achAlert.test(hay) || achAlertReverse.test(hay)) {
+    return true;
+  }
   if (/wire transfer (?:sent|received|completed|notification)/i.test(hay)) {
     return true;
   }
@@ -118,6 +149,22 @@ function looksLikeInvoiceEmailContent(subject, body) {
   const content = `${subject || ""}\n${body || ""}`.toLowerCase();
   if (/^(?:fw:\s*)?invoice\s+#?\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
+  // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."
+  if (/\be-?invoices?\b/.test(sub)) return true;
+  // QuickBooks: "New payment request from X - invoice 173867"
+  // (body often has Zelle/ACH remittance tips — not a bank payment alert)
+  if (/\bpayment\s+request\b/.test(sub) &&
+      /\binvoice\s+#?\d+\b/.test(sub)) {
+    return true;
+  }
+  if (/your invoice is ready/i.test(content) &&
+      /\binvoice\s+#?\d+\b/.test(sub)) {
+    return true;
+  }
+  if (/your invoice is attached/i.test(content) &&
+      /\binvoice\s+#?\d+\b/.test(sub)) {
+    return true;
+  }
   if (/\binvoice\s+#?\d+[\s-]+(?:for\s+)?(?:bol|load)\s+#?\d{5,9}/i
       .test(content)) {
     return true;
@@ -127,6 +174,11 @@ function looksLikeInvoiceEmailContent(subject, body) {
   }
   if (/\bfreight invoice\b/.test(content) &&
       /\b(?:load|bol)\s+#?\d{5,9}/i.test(content)) {
+    return true;
+  }
+  if (/attached are the invoices?/i.test(content)) return true;
+  if (/\be-?invoices?\b/.test(content) &&
+      /\b(?:pronumber|pro\s*#?|attached)\b/i.test(content)) {
     return true;
   }
   return false;
@@ -152,15 +204,22 @@ function shouldIgnoreAsPaymentNotification(
 }
 
 /**
- * Subject/body mentions Notice of Assignment (not sufficient alone to ignore).
+ * Subject/body mentions Notice of Assignment / factoring remittance
+ * (not sufficient alone to ignore — see shouldIgnoreNoaOnlyPackage).
  * @param {string} subject Email subject.
  * @param {string} body Plain body.
+ * @param {string} [from] From header (optional; FactorView remits).
  * @return {boolean}
  */
-function looksLikeNoaEmailContent(subject, body) {
-  const content = `${subject || ""}\n${body || ""}`.toLowerCase();
+function looksLikeNoaEmailContent(subject, body, from) {
+  const sub = String(subject || "");
+  const content = `${sub}\n${body || ""}`.toLowerCase();
   if (!content.trim()) return false;
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  // FactorView / Surety-style remittance notices (not freight invoices).
+  if (/^\s*(?:(?:fw|fwd|re):\s*)*remit\s+for\s+payment\b/i.test(sub)) {
+    return true;
+  }
   if (/\bnoa\b/.test(content) || content.includes("notice of assignment")) {
     return true;
   }
@@ -171,17 +230,33 @@ function looksLikeNoaEmailContent(subject, body) {
       /assignment|remit to|payments should be directed/i.test(content)) {
     return true;
   }
+  if (/remit(?:tance)?\s+(?:all\s+)?(?:future\s+)?(?:payments?|invoices?)/i
+      .test(content)) {
+    return true;
+  }
+  const remitDirectedRe = new RegExp(
+      "payments?\\s+(?:should|must|are to)\\s+be\\s+" +
+      "(?:directed|remitted|sent|made)\\s+to",
+      "i");
+  if (remitDirectedRe.test(content)) {
+    return true;
+  }
+  const fromL = String(from || "").toLowerCase();
+  if (fromL.includes("factorview.com") &&
+      /remit|assignment|factor(?:ing)?|funding|surety/i.test(content)) {
+    return true;
+  }
   return false;
 }
 
 /**
  * @param {string} subject Email subject.
- * @param {string} _from From header (unused).
+ * @param {string} from From header.
  * @param {string} body Plain body.
  * @return {boolean}
  */
-function isNoticeOfAssignmentEmail(subject, _from, body) {
-  return looksLikeNoaEmailContent(subject, body);
+function isNoticeOfAssignmentEmail(subject, from, body) {
+  return looksLikeNoaEmailContent(subject, body, from);
 }
 
 /**
@@ -192,7 +267,7 @@ function isNoticeOfAssignmentEmail(subject, _from, body) {
  * @return {boolean}
  */
 function isRtsNoaEmail(subject, from, body) {
-  return looksLikeNoaEmailContent(subject, body);
+  return looksLikeNoaEmailContent(subject, body, from);
 }
 
 /**
@@ -252,10 +327,11 @@ function rtsNoaAttachmentsLookNoaOnly(attachments) {
  * @param {string} body Plain body.
  * @param {Array<object>} attachments Attachment metadata.
  * @param {number} [invoicePdfCount] Invoice PDFs after doc classification.
+ * @param {string} [from] From header (optional).
  * @return {boolean}
  */
 function shouldIgnoreNoaOnlyPackage(
-    subject, body, attachments, invoicePdfCount) {
+    subject, body, attachments, invoicePdfCount, from) {
   const list = Array.isArray(attachments) ? attachments : [];
   if (Number(invoicePdfCount) > 0) return false;
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
@@ -263,10 +339,10 @@ function shouldIgnoreNoaOnlyPackage(
     return false;
   }
   if (rtsNoaAttachmentsLookNoaOnly(list)) return true;
-  if (looksLikeNoaEmailContent(subject, body) && list.length === 0) {
+  if (looksLikeNoaEmailContent(subject, body, from) && list.length === 0) {
     return true;
   }
-  if (looksLikeNoaEmailContent(subject, body) &&
+  if (looksLikeNoaEmailContent(subject, body, from) &&
       Number(invoicePdfCount) === 0 &&
       list.length > 0) {
     return true;
@@ -279,6 +355,7 @@ function shouldIgnoreNoaOnlyPackage(
  * @param {object} signals Veto inputs gathered at the call site.
  * @param {string} [signals.subject] Email subject.
  * @param {string} [signals.body] Plain email body.
+ * @param {string} [signals.from] From header.
  * @param {Array<object>} [signals.attachments] Attachment metadata.
  * @param {object} [signals.emailClassification] Incoming email classifier.
  * @param {number} [signals.invoicePdfCount] Classified invoice PDF count.
@@ -288,6 +365,7 @@ function hasInvoiceVeto(signals = {}) {
   const {
     subject = "",
     body = "",
+    from = "",
     attachments = [],
     emailClassification = null,
     invoicePdfCount,
@@ -300,12 +378,19 @@ function hasInvoiceVeto(signals = {}) {
     return true;
   }
 
+  if (Number(invoicePdfCount) > 0) return true;
+
   if (emailClassification &&
       emailClassification.intent === "carrier_invoice") {
+    // Classifier often mislabels FactorView "Remit for Payment" / NOA
+    // packages as carrier_invoice. Do not force invoice_veto or block
+    // NOA ignore when there is no invoice PDF evidence.
+    if (looksLikeNoaEmailContent(subject, body, from) &&
+        Number(invoicePdfCount || 0) === 0) {
+      return false;
+    }
     return true;
   }
-
-  if (Number(invoicePdfCount) > 0) return true;
 
   return false;
 }
@@ -327,7 +412,7 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
   }
   // Before PDF classification: only ignore when filenames clearly NOA-only.
   if (rtsNoaAttachmentsLookNoaOnly(attachments) &&
-      looksLikeNoaEmailContent(subject, body) &&
+      looksLikeNoaEmailContent(subject, body, from) &&
       !looksLikeInvoiceEmailContent(subject, body)) {
     return {
       ignore: true,
@@ -341,6 +426,7 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
 module.exports = {
   PAYMENT_INQUIRY_EMAIL_DEFAULT,
   isEmodalBroadcast,
+  isHafstaffSender,
   isPaymentNotificationEmail,
   shouldIgnoreAsPaymentNotification,
   isPaymentInquiryEmail,

@@ -1,5 +1,10 @@
 "use strict";
 
+const {
+  toOutboundEmailSafeSubject,
+  toOutboundEmailSafeText,
+} = require("./email-outbound-safe");
+
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
 const TOKEN_URL =
   "https://login.microsoftonline.com/common/oauth2/v2.0/token";
@@ -304,9 +309,9 @@ function parseOutboundMimeForGraph(mimeBuffer) {
   const headerBlock = splitIdx >= 0 ? raw.slice(0, splitIdx) : raw;
   const bodyBlock = splitIdx >= 0 ? raw.slice(splitIdx + splitAt.length) : "";
 
-  const subject = decodeMimeUtf8Text(
+  const subject = toOutboundEmailSafeSubject(decodeMimeUtf8Text(
       getMimeHeader(headerBlock, "Subject") || "",
-  );
+  ));
   const toRecipients = parseGraphRecipients(getMimeHeader(headerBlock, "To"));
   const ccRecipients = parseGraphRecipients(getMimeHeader(headerBlock, "Cc"));
 
@@ -454,12 +459,12 @@ async function sendSimpleMail(opts, tokens, onTokenUpdate) {
       .filter(Boolean);
   const useHtml = !!(opts.bodyHtml && String(opts.bodyHtml).trim());
   const message = {
-    subject: String(opts.subject || "(no subject)"),
+    subject: toOutboundEmailSafeSubject(opts.subject || "(no subject)"),
     body: {
       contentType: useHtml ? "HTML" : "Text",
       content: useHtml ?
-        String(opts.bodyHtml) :
-        String(opts.bodyText || ""),
+        toOutboundEmailSafeText(opts.bodyHtml) :
+        toOutboundEmailSafeText(opts.bodyText || ""),
     },
     toRecipients: toList.map((address) => ({
       emailAddress: {address},
@@ -779,19 +784,110 @@ function createOutlookMailClient(tokens, onTokenUpdate) {
 }
 
 /**
+ * @param {string} email Email address.
+ * @return {string}
+ */
+function normalizeProfileEmail(email) {
+  let value = String(email || "").trim().toLowerCase();
+  // Consumer MSA UPNs sometimes look like live.com#user@outlook.com
+  const hashIdx = value.indexOf("#");
+  if (hashIdx >= 0 && value.includes("@", hashIdx + 1)) {
+    value = value.slice(hashIdx + 1);
+  }
+  return value;
+}
+
+/**
+ * Microsoft consumer / work mailbox domains users typically mean when
+ * they say "Outlook", vs linked aliases (Gmail, Yahoo, etc.).
+ * @param {string} email Email.
+ * @return {boolean}
+ */
+function isMicrosoftMailboxEmail(email) {
+  const domain = normalizeProfileEmail(email).split("@")[1] || "";
+  return /^(outlook|hotmail|live|msn)\.com$/.test(domain) ||
+    domain.endsWith(".onmicrosoft.com") ||
+    domain.endsWith(".mail.protection.outlook.com");
+}
+
+/**
+ * Decode preferred_username / email from an OAuth id_token when present.
+ * That claim is usually the account chosen in the Microsoft picker.
+ * @param {object} tokens Token payload.
+ * @return {string|null}
+ */
+function preferredUsernameFromIdToken(tokens) {
+  const raw = tokens && tokens.id_token;
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parts = raw.split(".");
+    if (parts.length < 2) return null;
+    const json = Buffer.from(
+        parts[1].replace(/-/g, "+").replace(/_/g, "/"),
+        "base64",
+    ).toString("utf8");
+    const claims = JSON.parse(json);
+    return normalizeProfileEmail(
+        claims.preferred_username || claims.email || claims.upn || "") ||
+      null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Choose the mailbox address to show/store as "connected".
+ * Graph often puts a linked Gmail alias in `mail` while UPN / id_token
+ * still carry the outlook.com identity the user picked.
+ * @param {object} opts mail, userPrincipalName, preferredUsername, rosterEmail.
+ * @return {string|null}
+ */
+function pickPreferredMailboxEmail(opts = {}) {
+  const mail = normalizeProfileEmail(opts.mail);
+  const upn = normalizeProfileEmail(opts.userPrincipalName);
+  const preferred = normalizeProfileEmail(opts.preferredUsername);
+  const roster = normalizeProfileEmail(opts.rosterEmail);
+  const candidates = [...new Set(
+      [mail, upn, preferred].filter(Boolean))];
+
+  if (roster && candidates.includes(roster)) return roster;
+
+  const msHit = candidates.find(isMicrosoftMailboxEmail);
+  if (msHit) return msHit;
+
+  // Sign-in identity over contact/alias mail when they differ.
+  if (preferred) return preferred;
+  if (upn) return upn;
+  return mail || null;
+}
+
+/**
  * Returns the Outlook mailbox profile for connected OAuth tokens.
  * @param {object} tokens OAuth tokens.
  * @param {Function} [onTokenUpdate] Persist refreshed tokens.
- * @return {Promise<object>} Profile with email and displayName fields.
+ * @param {object} [opts] Optional rosterEmail to prefer when it matches.
+ * @return {Promise<object>} Profile with email, mail, upn, displayName.
  */
-async function fetchMailboxProfile(tokens, onTokenUpdate) {
+async function fetchMailboxProfile(tokens, onTokenUpdate, opts = {}) {
   const me = await graphFetch(
       "/me?$select=displayName,mail,userPrincipalName",
       tokens,
       onTokenUpdate,
   );
+  const mail = (me && me.mail) || null;
+  const userPrincipalName = (me && me.userPrincipalName) || null;
+  const preferredUsername = preferredUsernameFromIdToken(tokens);
+  const email = pickPreferredMailboxEmail({
+    mail,
+    userPrincipalName,
+    preferredUsername,
+    rosterEmail: opts.rosterEmail || null,
+  });
   return {
-    email: (me && (me.mail || me.userPrincipalName)) || null,
+    email,
+    mail: mail || null,
+    userPrincipalName: userPrincipalName || null,
+    preferredUsername: preferredUsername || null,
     displayName: (me && me.displayName) || null,
   };
 }
@@ -802,6 +898,7 @@ module.exports = {
   exchangeOutlookCode,
   createOutlookMailClient,
   fetchMailboxProfile,
+  pickPreferredMailboxEmail,
   getOutlookOAuthConfig,
   sendSimpleMail,
   extractEmailAddress,

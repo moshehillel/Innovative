@@ -34,6 +34,10 @@ const {
   defaultPrimusEmailDocsBody,
   appendCustomerInvoiceEmailSignature,
 } = require("./customer-invoice-email-body");
+const {
+  toOutboundEmailSafeSubject,
+  toOutboundEmailSafeText,
+} = require("./email-outbound-safe");
 const workflowErrors = require("./workflow-error-messages");
 
 const admin = require("firebase-admin");
@@ -157,6 +161,28 @@ async function loadCachedSession() {
   if (!data.cookie || !data.expiresAt) return null;
   if (Date.now() >= Number(data.expiresAt)) return null;
   return {cookie: data.cookie, expiresAt: Number(data.expiresAt)};
+}
+
+/**
+ * Drop the cached PHPSESSID so the next getUiSessionCookie() re-logins.
+ * @return {Promise<void>}
+ */
+async function clearCachedSession() {
+  await firestore().doc(SESSION_DOC).delete().catch(() => {});
+}
+
+/**
+ * True when manage.php rejected the request because the UI session is dead.
+ * Primus often returns plain text "No session started." (HTTP 200) instead of
+ * 401 — that must trigger a re-login + retry, not a billing failure alert.
+ * @param {number} status HTTP status.
+ * @param {string} [text] Response body.
+ * @return {boolean}
+ */
+function isUiSessionAuthFailure(status, text) {
+  if (status === 401 || status === 403) return true;
+  return /no session started|session expired|not logged|login/i
+      .test(String(text || ""));
 }
 
 /**
@@ -334,12 +360,17 @@ async function managePhpPost(params, retryOnAuthFail = true) {
   };
 
   let result = await postWithNetworkRetry(cookie);
-  const looksLikeAuthFailure =
-    result.status === 401 ||
-    result.status === 403 ||
-    /session expired|not logged|login/i.test(result.text || "");
-
-  if (looksLikeAuthFailure && retryOnAuthFail) {
+  if (retryOnAuthFail &&
+      isUiSessionAuthFailure(result.status, result.text)) {
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Primus UI session dead — re-login and retry", {
+            action: params && params.action,
+            status: result.status,
+            bodyPreview: String(result.text || "").slice(0, 120),
+          });
+    }
+    await clearCachedSession();
     cookie = await loginUi();
     result = await postWithNetworkRetry(cookie);
   }
@@ -396,12 +427,17 @@ async function managePhpUpload(
   };
 
   let result = await doUpload(cookie);
-  const looksLikeAuthFailure =
-    result.status === 401 ||
-    result.status === 403 ||
-    /session expired|not logged|login/i.test(result.text || "");
-
-  if (looksLikeAuthFailure && retryOnAuthFail) {
+  if (retryOnAuthFail &&
+      isUiSessionAuthFailure(result.status, result.text)) {
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Primus UI session dead — re-login and retry upload", {
+            action: fields && fields.action,
+            status: result.status,
+            bodyPreview: String(result.text || "").slice(0, 120),
+          });
+    }
+    await clearCachedSession();
     cookie = await loginUi();
     result = await doUpload(cookie);
   }
@@ -1732,14 +1768,15 @@ async function emailBOLDocs(args) {
     };
   }
 
-  const subject = args.subject ||
-    `Invoice for BOL#${loadNumber}`;
+  const subject = toOutboundEmailSafeSubject(
+      args.subject || `Invoice for BOL#${loadNumber}`);
   const customBody = process.env.PRIMUS_UI_EMAIL_DOCS_BODY;
-  const body = customBody ?
+  const bodyRaw = customBody ?
     (customBody.includes("cardknox.com/innovativecarriers") ?
       customBody :
       appendCustomerInvoiceEmailSignature(customBody)) :
     DEFAULT_EMAIL_DOCS_BODY;
+  const body = toOutboundEmailSafeText(bodyRaw);
   const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
     "accounting@innovativecarriers.com";
 
@@ -1858,12 +1895,12 @@ async function emailPodDocs(args) {
 
   const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
     "accounting@innovativecarriers.com";
-  const subject = args.subject ||
-    `Proof of Delivery — Load #${loadNumber}`;
-  const body = args.body ||
-    `<p>Please find the Proof of Delivery for load ` +
+  const subject = toOutboundEmailSafeSubject(
+      args.subject || `Proof of Delivery - Load #${loadNumber}`);
+  const body = toOutboundEmailSafeText(args.body ||
+    (`<p>Please find the Proof of Delivery for load ` +
     `<strong>#${loadNumber}</strong> attached.</p>` +
-    `<p>Thank you,<br>Innovative Carriers Accounting</p>`;
+    `<p>Thank you,<br>Innovative Carriers Accounting</p>`));
 
   const params = {
     action: "emailBOLDocs",
@@ -2187,6 +2224,118 @@ function baseCompanyNameForMatch(nameNorm) {
 }
 
 /**
+ * Parenthetical suffix on a Primus location name, e.g. KA from
+ * "Fleet Equipment LLC (KA)".
+ * @param {string|undefined} name
+ * @return {string}
+ */
+function locationNameSuffix(name) {
+  const match = String(name || "").match(/\(([a-z0-9]{1,4})\)\s*$/i);
+  return match ? match[1].toLowerCase() : "";
+}
+
+/**
+ * @param {string} a
+ * @param {string} b
+ * @return {number}
+ */
+function editDistance(a, b) {
+  const s = String(a || "");
+  const t = String(b || "");
+  const n = s.length;
+  const m = t.length;
+  if (!n) return m;
+  if (!m) return n;
+  const prev = new Array(m + 1);
+  const cur = new Array(m + 1);
+  for (let j = 0; j <= m; j++) prev[j] = j;
+  for (let i = 1; i <= n; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= m; j++) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let j = 0; j <= m; j++) prev[j] = cur[j];
+  }
+  return prev[m];
+}
+
+/**
+ * True when two company names are the same or one typo apart.
+ * @param {string|undefined} a
+ * @param {string|undefined} b
+ * @return {boolean}
+ */
+function namesAreCloseForBillto(a, b) {
+  const na = baseCompanyNameForMatch(normalizeCompanyName(a));
+  const nb = baseCompanyNameForMatch(normalizeCompanyName(b));
+  if (!na || !nb) return false;
+  if (na === nb) return true;
+  const max = Math.max(na.length, nb.length);
+  if (max < 8) return false;
+  return editDistance(na, nb) <= 1;
+}
+
+/**
+ * Initials from a person name ("Karen Adams" → "ka").
+ * @param {string|undefined} name
+ * @return {string}
+ */
+function initialsFromPersonName(name) {
+  const parts = String(name || "").trim().split(/\s+/).filter(Boolean);
+  if (parts.length < 2) return "";
+  const first = parts[0][0];
+  const last = parts[parts.length - 1][0];
+  if (!first || !last) return "";
+  return (first + last).toLowerCase();
+}
+
+/**
+ * Preferred (JB)/(KA) suffix from the booking's control user / sales rep.
+ * @param {object} booking
+ * @return {string}
+ */
+function preferredBilltoSuffixFromBooking(booking) {
+  const info = booking && booking.contactInformation;
+  const control = info && info.controlUser;
+  const fromControl = initialsFromPersonName(control && control.name);
+  if (fromControl) return fromControl;
+  const sales = info && info.salesRep;
+  const firstRep = Array.isArray(sales) ? sales[0] : sales;
+  if (firstRep) {
+    const fromRep = initialsFromPersonName(firstRep.name ||
+      `${firstRep.firstName || ""} ${firstRep.lastName || ""}`);
+    if (fromRep) return fromRep;
+  }
+  return "";
+}
+
+/**
+ * When bill-to is a stub/typo (no id, no zip), copy name/zip from consignee
+ * if the names are clearly the same customer.
+ * @param {object} party
+ * @param {object} booking
+ * @return {object}
+ */
+function enrichBillToPartyFromConsignee(party, booking) {
+  const consignee = booking && booking.consignee;
+  if (!party || !consignee || !consignee.name) return party;
+  const partyZip = String(party.zipCode || party.zipcode || "").trim();
+  const partyIdMissing = party.id == null || party.id === "";
+  if (!partyIdMissing && partyZip) return party;
+  if (!namesAreCloseForBillto(party.name, consignee.name)) return party;
+  return {
+    ...party,
+    name: String(consignee.name).trim(),
+    zipCode: partyZip || consignee.zipCode || consignee.zipcode || "",
+    zipcode: partyZip || consignee.zipcode || consignee.zipCode || "",
+    city: party.city || consignee.city || "",
+    state: party.state || consignee.state || "",
+    email: party.email || consignee.email || "",
+  };
+}
+
+/**
  * Search terms for manage.php / REST location lookup (strip Inc/LLC etc.).
  * @param {string} partyName Raw bill-to party name from booking.
  * @return {Array<string>}
@@ -2210,25 +2359,46 @@ function buildShippingLocationSearchTerms(partyName) {
 }
 
 /**
- * @param {Array<object>} list manage.php shipping_locations rows.
- * @param {object} party Bill-to party from booking.
+ * @param {Array<object>} candidates
+ * @param {string} preferredSuffix
+ * @param {string} normZip
  * @return {number|null}
  */
-function pickManageLocationFromList(list, party) {
+function pickFromLocationCandidates(candidates, preferredSuffix, normZip) {
+  if (!candidates.length) return null;
+  let pool = candidates;
+  if (preferredSuffix) {
+    const suffixed = candidates.filter((row) =>
+      locationNameSuffix(row.name) === preferredSuffix);
+    if (suffixed.length) pool = suffixed;
+  }
+  if (pool.length > 1 && normZip) {
+    const zipMatch = pool.find((row) =>
+      normalizeLookupText(row.zipcode || row.zipCode) === normZip);
+    if (zipMatch) return Number(zipMatch.id);
+  }
+  return Number(pool[0].id);
+}
+
+/**
+ * @param {Array<object>} list manage.php shipping_locations rows.
+ * @param {object} party Bill-to party from booking.
+ * @param {object} [opts] preferredSuffix.
+ * @return {number|null}
+ */
+function pickManageLocationFromList(list, party, opts) {
   if (!Array.isArray(list) || !list.length || !party) return null;
   const partyZip = String(party.zipCode || party.zipcode || "").trim();
   const partyName = normalizeLookupText(party.name);
   const partyBase = baseCompanyNameForMatch(normalizeCompanyName(party.name));
   const normZip = normalizeLookupText(partyZip);
+  const preferredSuffix = opts && opts.preferredSuffix ?
+    String(opts.preferredSuffix).toLowerCase() : "";
 
   const exactName = list.filter((row) =>
     normalizeLookupText(row.name) === partyName);
-  if (exactName.length === 1) return Number(exactName[0].id);
-  if (exactName.length > 1 && normZip) {
-    const zipMatch = exactName.find((row) =>
-      normalizeLookupText(row.zipcode) === normZip);
-    if (zipMatch) return Number(zipMatch.id);
-    return Number(exactName[0].id);
+  if (exactName.length) {
+    return pickFromLocationCandidates(exactName, preferredSuffix, normZip);
   }
 
   const baseMatches = list.filter((row) => {
@@ -2237,21 +2407,17 @@ function pickManageLocationFromList(list, party) {
     const partyNameNorm = normalizeCompanyName(party.name);
     if (rowNorm === partyNameNorm) return true;
     if (partyNameNorm && rowNorm.startsWith(partyNameNorm + " ")) return true;
-    return rowBase === partyBase;
+    if (rowBase === partyBase) return true;
+    return namesAreCloseForBillto(rowBase, partyBase);
   });
-  if (baseMatches.length === 1) return Number(baseMatches[0].id);
-  if (baseMatches.length > 1 && normZip) {
-    const zipMatch = baseMatches.find((row) =>
-      normalizeLookupText(row.zipcode) === normZip);
-    if (zipMatch) return Number(zipMatch.id);
-    return Number(baseMatches[0].id);
+  if (baseMatches.length) {
+    return pickFromLocationCandidates(baseMatches, preferredSuffix, normZip);
   }
-  if (baseMatches.length > 1) return Number(baseMatches[0].id);
 
   if (list.length === 1) return Number(list[0].id);
   if (normZip) {
     const zipOnly = list.filter((row) =>
-      normalizeLookupText(row.zipcode) === normZip);
+      normalizeLookupText(row.zipcode || row.zipCode) === normZip);
     if (zipOnly.length === 1) return Number(zipOnly[0].id);
   }
   return null;
@@ -2285,10 +2451,11 @@ function resolveFromBookingShippingLocations(party, booking) {
  * @param {string} term Search query.
  * @param {object} party Bill-to party.
  * @param {boolean} customersOnly Restrict to customer locations.
+ * @param {object} [opts] preferredSuffix for (JB)/(KA) pick.
  * @return {Promise<number|null>}
  */
 async function restShippingLocationSearchTerm(
-    quoteRateShop, term, party, customersOnly) {
+    quoteRateShop, term, party, customersOnly, opts) {
   const partyName = String(party.name || "").trim();
   const partyEmail = String(party.email || "").trim();
   const res = await quoteRateShop.searchShippingLocations({
@@ -2298,7 +2465,7 @@ async function restShippingLocationSearchTerm(
     isCustomer: customersOnly,
   });
   const list = res.results || [];
-  const fromList = pickManageLocationFromList(list, party);
+  const fromList = pickManageLocationFromList(list, party, opts);
   if (fromList) return fromList;
   if (customersOnly) {
     const best = quoteRateShop.pickBestCustomerMatch(list, {
@@ -2316,9 +2483,10 @@ async function restShippingLocationSearchTerm(
 /**
  * REST shipping-location search fallback (quote-rate-shop helpers).
  * @param {object} party Bill-to party.
+ * @param {object} [opts] preferredSuffix for (JB)/(KA) pick.
  * @return {Promise<number|null>}
  */
-async function resolveManageShippingLocationIdViaRest(party) {
+async function resolveManageShippingLocationIdViaRest(party, opts) {
   let quoteRateShop;
   try {
     quoteRateShop = require("./quote-rate-shop");
@@ -2336,10 +2504,10 @@ async function resolveManageShippingLocationIdViaRest(party) {
     if (!q) continue;
     try {
       const fromCustomers = await restShippingLocationSearchTerm(
-          quoteRateShop, q, party, true);
+          quoteRateShop, q, party, true, opts);
       if (fromCustomers) return fromCustomers;
       const fromAll = await restShippingLocationSearchTerm(
-          quoteRateShop, q, party, false);
+          quoteRateShop, q, party, false, opts);
       if (fromAll) return fromAll;
     } catch (err) {
       if (writeLog) {
@@ -2359,9 +2527,10 @@ async function resolveManageShippingLocationIdViaRest(party) {
  * manage.php getShippingLocations search with optional customer filter.
  * @param {object} party Bill-to party.
  * @param {boolean} customersOnly When true, onlyCustomers=true.
+ * @param {object} [opts] preferredSuffix for (JB)/(KA) pick.
  * @return {Promise<number|null>}
  */
-async function searchManagePhpShippingLocation(party, customersOnly) {
+async function searchManagePhpShippingLocation(party, customersOnly, opts) {
   const partyZip = String(party.zipCode || party.zipcode || "").trim();
   for (const query of buildShippingLocationSearchTerms(party.name)) {
     const result = await managePhpPost({
@@ -2391,7 +2560,7 @@ async function searchManagePhpShippingLocation(party, customersOnly) {
     const list = result.json &&
       Array.isArray(result.json.shipping_locations) ?
       result.json.shipping_locations : [];
-    const picked = pickManageLocationFromList(list, party);
+    const picked = pickManageLocationFromList(list, party, opts);
     if (picked) return picked;
   }
   return null;
@@ -2405,17 +2574,27 @@ async function searchManagePhpShippingLocation(party, customersOnly) {
  */
 async function resolveManageShippingLocationId(party, booking) {
   if (!party || !party.name) return null;
+  const lookupParty = enrichBillToPartyFromConsignee(party, booking);
+  const opts = {
+    preferredSuffix: preferredBilltoSuffixFromBooking(booking),
+  };
+  const stubBillTo = party.id == null || party.id === "";
 
-  const fromBookingLocs = resolveFromBookingShippingLocations(party, booking);
-  if (fromBookingLocs) return fromBookingLocs;
+  if (!stubBillTo) {
+    const fromBookingLocs =
+        resolveFromBookingShippingLocations(lookupParty, booking);
+    if (fromBookingLocs) return fromBookingLocs;
+  }
 
-  const fromCustomers = await searchManagePhpShippingLocation(party, true);
+  const fromCustomers =
+      await searchManagePhpShippingLocation(lookupParty, true, opts);
   if (fromCustomers) return fromCustomers;
 
-  const fromAll = await searchManagePhpShippingLocation(party, false);
+  const fromAll =
+      await searchManagePhpShippingLocation(lookupParty, false, opts);
   if (fromAll) return fromAll;
 
-  return resolveManageShippingLocationIdViaRest(party);
+  return resolveManageShippingLocationIdViaRest(lookupParty, opts);
 }
 
 /**
@@ -5274,6 +5453,10 @@ exports._internal = {
   resolveManageShippingLocationId,
   normalizeCompanyName,
   pickManageLocationFromList,
+  namesAreCloseForBillto,
+  enrichBillToPartyFromConsignee,
+  preferredBilltoSuffixFromBooking,
+  initialsFromPersonName,
   pickAccountingEmails,
   isAccountingContactType,
   isAccountingStyleEmail,
