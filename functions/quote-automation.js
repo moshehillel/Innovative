@@ -896,6 +896,39 @@ async function rateLane(lane, ctx) {
 }
 
 /**
+ * Prefer the Outlook queue body when the caller passed a stripped RFQ
+ * (common on Innovative FW mailboxes missing embedded From: lines).
+ * @param {object} opts processQuoteEmail options.
+ * @param {object} tenant Tenant.
+ * @param {string} from Outer From header.
+ * @param {string} emailBody Body from caller.
+ * @return {Promise<string>}
+ */
+async function resolveQuoteEmailBody(opts, tenant, from, emailBody) {
+  let body = String(emailBody || "");
+  const senderFromBody = senderRules.resolveQuoteSenderFrom(from, body);
+  const needsQueueBody = opts.outlookMessageId && (
+    !body.trim() ||
+    !/@/.test(body) ||
+    (senderRules.isInternalMailboxFrom(from) &&
+      senderRules.isInternalMailboxFrom(senderFromBody)));
+  if (!needsQueueBody) return body;
+  try {
+    const qsnap = await col(tenant, "quoteMailQueue")
+        .where("outlookMessageId", "==", opts.outlookMessageId)
+        .limit(1)
+        .get();
+    if (!qsnap.empty) {
+      const queuedBody = String(qsnap.docs[0].data().emailBody || "");
+      if (queuedBody.trim()) body = queuedBody;
+    }
+  } catch (_) {
+    // keep caller body
+  }
+  return body;
+}
+
+/**
  * Main handler for a classified quote_request email.
  * @param {object} opts messageId, subject, from, emailBody, tenant.
  * @return {Promise<object>}
@@ -907,7 +940,8 @@ async function processQuoteEmail(opts) {
   const from = opts.from || "";
   const to = opts.to || "";
   const cc = opts.cc || "";
-  const emailBody = opts.emailBody || "";
+  const emailBody = await resolveQuoteEmailBody(opts, tenant, from,
+      opts.emailBody || "");
   const senderFrom = senderRules.resolveQuoteSenderFrom(from, emailBody);
   const recipientOpts = {cc, to};
 
