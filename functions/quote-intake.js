@@ -489,7 +489,7 @@ function extractCompactPalletBlocks(body) {
   const cartonPattern = new RegExp(
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*" +
       "[–\\-—]\\s*(\\d+)\\s*ctns?\\s*" +
-      "[–\\-—]\\s*([\\d.,]+)\\s*lbs",
+      "[–\\-—]\\s*([\\d.,]+)\\s*(?:lbs|ctns)\\b",
       "gi");
   let cm;
   while ((cm = cartonPattern.exec(String(body || ""))) !== null) {
@@ -585,6 +585,80 @@ function emailAssignsPalletsToDestinations(text, lanes) {
 }
 
 /**
+ * Split "Shipment 1:" / "Shipment 2:" RFQs into per-destination sections.
+ * @param {string} body Plain text body.
+ * @return {Array<object>}
+ */
+function extractNumberedShipmentSections(body) {
+  const text = String(body || "");
+  const headerRe = /\bShipment\s+(\d+)\s*:?\s*(?:\r?\n|$)/gi;
+  const headers = [...text.matchAll(headerRe)];
+  if (headers.length < 2) return [];
+
+  const sections = [];
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const start = h.index + h[0].length;
+    const end = i + 1 < headers.length ? headers[i + 1].index : text.length;
+    const block = text.slice(start, end);
+    const addr = block.match(
+        /\b([A-Za-z][A-Za-z.\s]+?)\s+([A-Z]{2})\s+(\d{5})\d*\b/);
+    sections.push({
+      num: Number(h[1]),
+      text: block,
+      city: addr ? addr[1].trim() : "",
+      state: addr ? addr[2].toUpperCase() : "",
+      zip: addr ? addr[3] : "",
+      blocks: extractCompactPalletBlocks(block),
+    });
+  }
+  return sections;
+}
+
+/**
+ * Match a lane consignee to a numbered shipment section.
+ * @param {object} lane Extracted lane.
+ * @param {object} section Parsed shipment section.
+ * @return {boolean}
+ */
+function laneMatchesShipmentSection(lane, section) {
+  const consignee = lane && lane.consignee;
+  if (!consignee || !section) return false;
+  const laneZip = String(consignee.zipCode || "")
+      .replace(/\D/g, "").slice(0, 5);
+  if (laneZip.length === 5 && section.zip === laneZip) return true;
+  const laneCity = String(consignee.city || "").trim().toUpperCase();
+  const laneState = String(consignee.state || "").trim().toUpperCase();
+  const secCity = String(section.city || "").trim().toUpperCase();
+  const secState = String(section.state || "").trim().toUpperCase();
+  return !!(laneCity && secCity && laneState && secState &&
+    laneCity === secCity && laneState === secState);
+}
+
+/**
+ * Assign carton/pallet dim rows from numbered shipment sections to lanes.
+ * Prevents Shipment 2 freight from bleeding into Shipment 1 lanes.
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Plain text body.
+ * @return {boolean} True when per-shipment assignment ran.
+ */
+function applyNumberedShipmentPalletBlocks(extracted, body) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return false;
+  const sections = extractNumberedShipmentSections(body);
+  if (sections.length < 2) return false;
+
+  let matched = 0;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const section = sections.find((s) => laneMatchesShipmentSection(lane, s));
+    if (!section || !section.blocks.length) continue;
+    lane.freightInfo = section.blocks.map((row) => ({...row}));
+    matched++;
+  }
+  return matched > 0;
+}
+
+/**
  * Copy Pallet 1 + Pallet 2 (+ …) onto every lane when the RFQ lists
  * them without assigning a pallet to a destination zip.
  * @param {object} extracted Parsed quote request.
@@ -600,6 +674,9 @@ function applyEmailPalletBlocks(extracted, opts) {
     (opts && opts.body) || "";
   const subject = typeof opts === "string" ? "" :
     (opts && opts.subject) || "";
+  if (applyNumberedShipmentPalletBlocks(extracted, body)) {
+    return extracted;
+  }
   const blob = [subject, body].filter(Boolean).join("\n");
   let blocks = extractPalletFreight(body);
   if (!blocks.length) blocks = extractCompactPalletBlocks(body);
@@ -1460,6 +1537,8 @@ module.exports = {
   correctCartonVsPalletFreight,
   extractCompactPalletBlocks,
   extractPalletFreight,
+  extractNumberedShipmentSections,
+  applyNumberedShipmentPalletBlocks,
   applyEmailPalletBlocks,
   parseInformalPalletCount,
   heuristicExtractQuote,

@@ -259,6 +259,74 @@ check("assigned Pallet 1 stays on 90723",
 check("assigned Pallet 2 stays on 11216",
     assigned.lanes[1].freightInfo.map((r) => r.weight), [1702]);
 
+const D7365_BODY = [
+  "Shipment 1:",
+  "",
+  "BJS WHOLESALES CLUB 0800",
+  "869 QUAKER HWY",
+  "UXBRIDGE MA 015692252 US",
+  "",
+  "PO# 117785611//PT# 2354258",
+  "52ctns - 2pallets",
+  "48*40*54 - 27ctns - 923lbs (canned air)",
+  "48*45*39 - 25ctns - 262lbs (charging cables)",
+  "1185lbs",
+  "",
+  "Shipment 2:",
+  "",
+  "BJS WHOLESALES CLUB 0820",
+  "BURLINGTON NJ 08016 US",
+  "",
+  "PO# 117785717//PT# 2354259",
+  "97ctns - 4pallets",
+  "48*40*54 - 30ctns - 1020lbs",
+  "48*41*39 - 26ctns - 276lbs",
+  "48*40*44 - 18ctns - 464lbs",
+  "48*41*39 - 23ctns - 241lbs",
+  "2001lbs",
+].join("\n");
+
+const d7365Sections = intake.extractNumberedShipmentSections(D7365_BODY);
+check("D7365 two shipment sections", d7365Sections.length, 2);
+const d7365TypoBody = D7365_BODY.replace(
+    "48*41*39 - 23ctns - 241lbs",
+    "48*41*39 - 23ctns - 241ctns (charging cables)");
+check("D7365 typo 241ctns parsed",
+    intake.extractNumberedShipmentSections(d7365TypoBody)[1].blocks.map((r) => r.weight),
+    [1020, 276, 464, 241]);
+check("D7365 shipment 1 zip", d7365Sections[0].zip, "01569");
+check("D7365 shipment 2 zip", d7365Sections[1].zip, "08016");
+check("D7365 shipment 1 blocks", d7365Sections[0].blocks.map((r) => r.weight),
+    [923, 262]);
+check("D7365 shipment 2 blocks", d7365Sections[1].blocks.map((r) => r.weight),
+    [1020, 276, 464, 241]);
+
+const d7365Split = {
+  lanes: [
+    {
+      laneKey: "BJS_UXBRIDGE_MA",
+      consignee: {city: "UXBRIDGE", state: "MA", zipCode: "01569"},
+      freightInfo: [{qty: 1, weight: 923, dimType: "PLT"}],
+    },
+    {
+      laneKey: "BJS_BURLINGTON_NJ",
+      consignee: {city: "BURLINGTON", state: "NJ", zipCode: "08016"},
+      freightInfo: [{qty: 1, weight: 1020, dimType: "PLT"}],
+    },
+  ],
+};
+intake.applyEmailPalletBlocks(d7365Split, {body: D7365_BODY});
+const d7365Lane1Qty = d7365Split.lanes[0].freightInfo
+    .reduce((s, r) => s + (Number(r.qty) || 0), 0);
+const d7365Lane2Qty = d7365Split.lanes[1].freightInfo
+    .reduce((s, r) => s + (Number(r.qty) || 0), 0);
+check("D7365 lane1 pallet count 2", d7365Lane1Qty, 2);
+check("D7365 lane2 pallet count 4", d7365Lane2Qty, 4);
+check("D7365 lane1 weights", d7365Split.lanes[0].freightInfo.map((r) => r.weight),
+    [923, 262]);
+check("D7365 lane2 weights", d7365Split.lanes[1].freightInfo.map((r) => r.weight),
+    [1020, 276, 464, 241]);
+
 const twoPalletsPhrase = {
   lanes: [{
     freightInfo: [{qty: 1, weight: 2000, dimType: "PLT"}],
