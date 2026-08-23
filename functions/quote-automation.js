@@ -941,7 +941,13 @@ async function processQuoteEmail(opts) {
 
   const batchQuoteId = quoteOutput.generateBatchQuoteId(
       process.env.QUOTE_BATCH_PREFIX || "D");
+  const senderRuleForBillTo = senderRules.resolveSenderRule(
+      senderFrom, rules, recipientOpts);
+  const billToFromSender = senderRuleForBillTo &&
+    senderRuleForBillTo.customerName ?
+    String(senderRuleForBillTo.customerName).trim() : "";
   const extractedCustomerName = String(
+      billToFromSender ||
       extracted.customerName ||
       extracted.shippingLocationName ||
       (extracted.shipper && extracted.shipper.name) ||
@@ -957,6 +963,7 @@ async function processQuoteEmail(opts) {
   });
   const shippingLocationId = customerMatch.id || null;
   const shippingLocationName = customerMatch.name ||
+    billToFromSender ||
     extractedCustomerName || null;
   const customerLookupStatus = customerMatch.lookupStatus ||
     (shippingLocationId ? "matched" : "no_match");

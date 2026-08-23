@@ -97,6 +97,8 @@ function normalizeExtractedQuote(extracted, opts) {
       next, senderFrom, undefined, recipientOpts);
   const missingDimsBefore = palletRowsMissingDims(next);
   normalizeSoleAddressToConsignee(next);
+  applyStgShippingFromSections(next, opts && opts.body);
+  fillShipperFromLaneLabelOrigin(next);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
@@ -269,10 +271,16 @@ function quoteExtractSystemPrompt() {
     "- weightType should be total unless clearly per-piece.",
     "  If the email says Total weight / \"total weight – N\", weightType",
     "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
-    "- Pallet L×W is always 40 x 48 (length 40, width 48), never 48x40.",
+    "- Standard GMA pallet footprint is 40 x 48 (length 40, width 48).",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
+    "  Non-standard footprints (e.g. 48*45*39) keep the stated L and W",
+    "  (length 48, width 45, height 39) — do NOT collapse to 40x48.",
     "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
     "  and dimType PLT — do not invent dims over explicit values.",
+    "- Multiple \"Shipping From STG <city>, <ST>\" sections in one email",
+    "  mean separate origin warehouses. Create one lane per origin +",
+    "  destination row — never merge freight from different STG origins",
+    "  into one lane. Each lane shipper must have that section's city/state.",
     "- dimType must be Primus packaging enum (not inch/cm):",
     "  PLT, CTN, CRT, DRM, CON, BOX, BDL, ENV, CYL, CAS, OTH, TOT,",
     "  or TRUCK LOAD. Use PLT for pallets/skids. Country codes ISO2",
@@ -475,6 +483,28 @@ function extractCompactPalletBlocks(body) {
       length: Number(m[2]),
       width: Number(m[3]),
       height: Number(m[4]),
+      dimType: "PLT",
+    }));
+  }
+  const cartonPattern = new RegExp(
+      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*" +
+      "[–\\-—]\\s*(\\d+)\\s*ctns?\\s*" +
+      "[–\\-—]\\s*([\\d.,]+)\\s*lbs",
+      "gi");
+  let cm;
+  while ((cm = cartonPattern.exec(String(body || ""))) !== null) {
+    const key = [cm[1], cm[2], cm[3], cm[5]].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const weight = Number(String(cm[5]).replace(/,/g, ""));
+    freight.push(freightDims.normalizePalletDims({
+      qty: 1,
+      weight: Number.isFinite(weight) ? weight : null,
+      weightType: "total",
+      class: null,
+      length: Number(cm[1]),
+      width: Number(cm[2]),
+      height: Number(cm[3]),
       dimType: "PLT",
     }));
   }
@@ -942,6 +972,154 @@ function moveAddressOntoConsignee(fromParty, consignee) {
 }
 
 /**
+ * Fill empty lane shipper from "(STG City, ST)" in the lane label.
+ * @param {object} extracted Parsed quote request.
+ * @return {object}
+ */
+function fillShipperFromLaneLabelOrigin(extracted) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return extracted;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const ship = lane.shipper && typeof lane.shipper === "object" ?
+      lane.shipper : {};
+    const hasOd = String(ship.city || "").trim() &&
+      String(ship.state || "").trim();
+    if (hasOd) continue;
+    const label = String(lane.label || lane.laneKey || "");
+    const m = label.match(/\(STG\s+([^,]+),\s*([A-Z]{2})\)/i);
+    if (!m) continue;
+    lane.shipper = {
+      ...ship,
+      name: ship.name || "STG",
+      city: m[1].trim(),
+      state: m[2].toUpperCase(),
+      country: ship.country || "US",
+    };
+  }
+  return extracted;
+}
+
+/**
+ * Parse one Core Home STG table row for a known destination.
+ * Supports tab-separated rows and newline-separated (one field per line).
+ * @param {string} block STG origin section text.
+ * @param {object} dest Destination descriptor.
+ * @return {object|null}
+ */
+function parseStgRowForDest(block, dest) {
+  const cityEsc = dest.city.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const zipEsc = dest.zip.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const anchorRe = new RegExp(
+      cityEsc + "[\\s\\n]+" + dest.state + "[\\s\\n]+" + zipEsc,
+      "i");
+  const anchor = anchorRe.exec(block);
+  if (!anchor) return null;
+
+  const before = block.slice(0, anchor.index);
+  const tailRe =
+    /(\d[\d,]*(?:\.\d+)?)[\s\n]+(\d+)[\s\n]+(\d+)[\s\n]+\d{2}\/\d{2}\/\d{2,4}\b/gi;
+  let tail = null;
+  let tailMatch;
+  while ((tailMatch = tailRe.exec(before)) !== null) {
+    tail = tailMatch;
+  }
+  if (!tail) return null;
+
+  const weight = Number(String(tail[1]).replace(/,/g, ""));
+  const pallets = Number(tail[3]);
+  if (!(pallets > 0) || !(weight > 0)) return null;
+
+  const head = before.slice(0, tail.index);
+  let freightClass = null;
+  const classRe =
+    /(?:^|[\n\r])\s*(\d+(?:\.\d+)?)\s*(?:[\n\r]|\t)\s*LIDL/gi;
+  let classMatch;
+  while ((classMatch = classRe.exec(head)) !== null) {
+    freightClass = Number(classMatch[1]);
+  }
+  if (freightClass == null) {
+    const classMatch2 = head.match(/(?:^|\n)\s*(\d+(?:\.\d+)?)\b/);
+    if (classMatch2) freightClass = Number(classMatch2[1]);
+  }
+
+  return {weight, pallets, freightClass};
+}
+
+/**
+ * Core Home STG multi-warehouse table: rebuild lanes per origin section.
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyStgShippingFromSections(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const text = String(body || "");
+  const headerRe = /Shipping\s+From\s+STG\s+([^,\n]+),\s*([A-Z]{2})\b/gi;
+  const headers = [...text.matchAll(headerRe)];
+  if (headers.length < 2) return extracted;
+
+  const dests = [
+    {key: "FREDERICKSBURG", city: "Fredericksburg", state: "VA", zip: "22407",
+      name: "Lidl US, RDC Fredericksburg"},
+    {key: "GRAHAM", city: "Mebane", state: "NC", zip: "27302",
+      name: "Lidl US, RDC Graham"},
+    {key: "PERRYVILLE", city: "Perryville", state: "MD", zip: "21903",
+      name: "Lidl US, RDC Perryville"},
+  ];
+
+  const lanes = [];
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const start = h.index + h[0].length;
+    const end = i + 1 < headers.length ? headers[i + 1].index : text.length;
+    const block = text.slice(start, end);
+    const originCity = h[1].trim();
+    const originState = h[2].toUpperCase();
+    const shipper = {
+      name: "STG",
+      city: originCity,
+      state: originState,
+      country: "US",
+    };
+
+    for (const dest of dests) {
+      const row = parseStgRowForDest(block, dest);
+      if (!row) continue;
+      lanes.push({
+        laneKey: `STG_${originCity.replace(/\s+/g, "_").toUpperCase()}_${dest.key}`,
+        label: `TO ${dest.name}, ${dest.state} ${dest.zip} (STG ${originCity}, ${originState})`,
+        shipper: {...shipper},
+        consignee: {
+          name: dest.name,
+          city: dest.city,
+          state: dest.state,
+          zipCode: dest.zip,
+          country: "US",
+        },
+        freightInfo: [{
+          qty: row.pallets,
+          weight: row.weight,
+          weightType: "total",
+          class: row.freightClass,
+          length: 40,
+          width: 48,
+          height: 60,
+          dimType: "PLT",
+        }],
+        flags: {},
+      });
+    }
+  }
+
+  if (lanes.length >= 3) {
+    extracted.lanes = lanes;
+    extracted.format = "multi_lane_table";
+    pushExtractWarning(extracted, "stg multi-origin rebuild");
+  }
+  return extracted;
+}
+
+/**
  * Default: a sole physical address in an RFQ is the destination
  * (consignee / Ship To), not the shipper pickup.
  * Future sender-specific rules may override this to treat the sole
@@ -1271,6 +1449,8 @@ module.exports = {
   classifyIsQuoteRequest,
   toPlainText,
   normalizeSoleAddressToConsignee,
+  fillShipperFromLaneLabelOrigin,
+  applyStgShippingFromSections,
   partyHasPhysicalAddress,
   finishExtract,
   normalizeExtractedQuote,

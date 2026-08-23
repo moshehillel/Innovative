@@ -1057,10 +1057,29 @@ function filterBlockedCarriers(rates, blockContains = []) {
 function pickTopOptions(rates, n = 4, opts = {}) {
   const sorted = [...rates].sort((a, b) =>
     (Number(a.sellRate) || Infinity) - (Number(b.sellRate) || Infinity));
-  const out = [];
-  const seenScac = new Set();
   const cheapestMode = opts.mode === "cheapest";
 
+  // Cheapest mode: always rank by sellRate. Do not float guaranteed to the top
+  // (that hid the lowest option — see Q#D7365).
+  if (cheapestMode) {
+    let out = sorted.slice(0, n);
+    if (opts.ensureGuaranteed && !out.some((r) => r.guaranteed)) {
+      const bestGuaranteed = sorted.find((r) => r.guaranteed);
+      if (bestGuaranteed && !out.includes(bestGuaranteed)) {
+        if (out.length < n) {
+          out.push(bestGuaranteed);
+        } else {
+          out = [...sorted.slice(0, n - 1), bestGuaranteed];
+        }
+        out.sort((a, b) =>
+          (Number(a.sellRate) || Infinity) - (Number(b.sellRate) || Infinity));
+      }
+    }
+    return out;
+  }
+
+  const out = [];
+  const seenScac = new Set();
   if (opts.ensureGuaranteed) {
     const bestGuaranteed = sorted.find((r) => r.guaranteed);
     if (bestGuaranteed) {
@@ -1073,11 +1092,9 @@ function pickTopOptions(rates, n = 4, opts = {}) {
   for (const r of sorted) {
     if (out.length >= n) break;
     if (out.includes(r)) continue;
-    if (!cheapestMode) {
-      const scac = String(r.SCAC || r.name || "").slice(0, 20);
-      if (seenScac.has(scac) && out.length >= 2) continue;
-      seenScac.add(scac);
-    }
+    const scac = String(r.SCAC || r.name || "").slice(0, 20);
+    if (seenScac.has(scac) && out.length >= 2) continue;
+    seenScac.add(scac);
     out.push(r);
   }
   return out;
