@@ -3905,7 +3905,7 @@ async function handleStatementOnlyEmail(args) {
     subject,
     from,
     emailClassification: emailClassification || null,
-    deleteAt: getDeleteAt(30),
+    deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
   };
 
   if (isAbeCopiedOnEmail(headers)) {
@@ -3970,7 +3970,7 @@ async function handleDrayageInvoiceEmail(args) {
     subject,
     from,
     containerNumber: containerNumber || null,
-    deleteAt: getDeleteAt(30),
+    deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
   };
   await forwardToHumanReview(
       gmail, messageId, subject, from,
@@ -4068,7 +4068,7 @@ async function handleDrayageMissingDetailsFromLeo(args) {
       subject,
       from,
       missingFields,
-      deleteAt: getDeleteAt(30),
+      deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
     },
   });
 }
@@ -4231,7 +4231,7 @@ async function handlePaymentInquiryEmail(args) {
     subject,
     from,
     emailClassification: emailClassification || null,
-    deleteAt: getDeleteAt(30),
+    deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
   };
 
   if (isAbeCopiedOnEmail(headers)) {
@@ -4332,7 +4332,7 @@ async function completeAdministrativeIgnore(args) {
       gmailMessageId: messageId,
       subject,
       from,
-      deleteAt: getDeleteAt(30),
+      deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
     }, extra || {}),
   });
 }
@@ -8088,7 +8088,7 @@ async function processGmailMessage(
                   subject,
                   from,
                   emailClassification,
-                  deleteAt: getDeleteAt(30),
+                  deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
                 },
               });
               return;
@@ -8151,7 +8151,7 @@ async function processGmailMessage(
                   insuranceVendorInvoiceNumber:
                   (insResult.invoice && insResult.invoice.invoiceNumber) ||
                   null,
-                  deleteAt: getDeleteAt(30),
+                  deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
                 },
               });
               return;
@@ -8182,7 +8182,7 @@ async function processGmailMessage(
                 from,
                 insuranceFailureReason: insResult.reason || "unknown",
                 emailClassification,
-                deleteAt: getDeleteAt(30),
+                deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
               },
             });
             return;
@@ -8210,7 +8210,7 @@ async function processGmailMessage(
                 from,
                 emailClassification,
                 error: String(insErr.message || "").slice(0, 1000),
-                deleteAt: getDeleteAt(30),
+                deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
               },
             });
             return;
@@ -8302,7 +8302,7 @@ async function processGmailMessage(
                   gmailMessageId: messageId,
                   subject,
                   from,
-                  deleteAt: getDeleteAt(30),
+                  deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
                 },
               });
               return;
@@ -8373,7 +8373,7 @@ async function processGmailMessage(
                     requesterEmail: podReqResult.requesterEmail || null,
                     escalatedToLisa: !!podReqResult.escalatedToLisa,
                     emailClassification,
-                    deleteAt: getDeleteAt(30),
+                    deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
                   },
                 });
                 return;
@@ -8439,7 +8439,7 @@ async function processGmailMessage(
                   gmailMessageId: messageId,
                   subject,
                   from,
-                  deleteAt: getDeleteAt(30),
+                  deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
                 },
               });
               return;
@@ -8494,7 +8494,7 @@ async function processGmailMessage(
             gmailMessageId: messageId,
             subject,
             from,
-            deleteAt: getDeleteAt(30),
+            deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
           },
         });
         return;
@@ -8911,7 +8911,7 @@ async function processGmailMessage(
                 from,
                 matchedInvoiceId: podResult.invoiceId || null,
                 loadNumber: podResult.loadNumber || null,
-                deleteAt: getDeleteAt(30),
+                deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
               },
             });
             return;
@@ -9061,7 +9061,7 @@ async function processGmailMessage(
             subject,
             from,
             skippedAttachmentTypes: skippedDocTypes,
-            deleteAt: getDeleteAt(30),
+            deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
           },
         });
         return;
@@ -9218,7 +9218,7 @@ async function processGmailMessage(
       status: "processing",
       inboxFlowId: inboxFlowId || null,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      deleteAt: getDeleteAt(7),
+      deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
     }, {merge: true});
 
     const intakeSnapForLoad = await emailIntakeRef.get();
