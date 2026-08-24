@@ -493,6 +493,35 @@ function workflowUrlForTenant(tenant) {
   return workflowUrlForTms(tenant && tenant.tms);
 }
 
+/**
+ * Re-invokes the Innovative Primus workflow for a Firestore invoice id.
+ * Used by delayed retry after a transient Primus/network crash.
+ * @param {string} invoiceId Invoice document id.
+ * @param {object} [extraBody] Extra POST fields (resumeFrom, tenantId).
+ * @return {Promise<object>} HTTP result.
+ */
+async function kickPrimusWorkflow(invoiceId, extraBody) {
+  const url = workflowUrlForTms("primus");
+  if (!url) {
+    throw new Error("No Primus workflow URL configured");
+  }
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      invoiceId,
+      tenantId: "default",
+      ...(extraBody || {}),
+    }),
+  });
+  const payload = await resp.json().catch(() => ({}));
+  return {
+    ok: resp.ok && payload.ok !== false,
+    status: resp.status,
+    payload,
+  };
+}
+
 // Tenant context for logging. Routing a tenant through every one of the dozens
 // of writeLog/logWorkflowStep calls in the ingestion + workflow paths would be
 // error-prone, so we stash the active tenant in async-local storage for the
@@ -2065,6 +2094,15 @@ async function runPodFollowUpChecks() {
 }
 
 /**
+ * Bound after innovative-primus init so checkStuckFlows can retry
+ * transient Primus crashes without a circular require.
+ * @type {function(): Promise<object>}
+ */
+let retryPendingTransientWorkflowsImpl = async () => ({
+  checked: 0, kicked: [],
+});
+
+/**
  * Continues the stuck-flow checker (re-open so we can call follow-ups).
  */
 exports.checkStuckFlows = onRequest(async (req, res) => {
@@ -2165,11 +2203,20 @@ exports.checkStuckFlows = onRequest(async (req, res) => {
       console.error("runPodFollowUpChecks from stuck:", fuErr.message);
     }
 
+    let delayedRetries = {checked: 0, kicked: []};
+    try {
+      delayedRetries = await retryPendingTransientWorkflowsImpl();
+    } catch (retryErr) {
+      console.error("retryPendingTransientWorkflows from stuck:",
+          retryErr.message);
+    }
+
     return res.json({
       ok: true,
       checked: lockedSnap.size,
       stuck: results,
       podFollowUps,
+      delayedRetries,
     });
   } catch (error) {
     console.error("checkStuckFlows error:", error);
@@ -5451,6 +5498,22 @@ async function saveOutboundEmail(email) {
     ];
   }
 
+  // Persist first so a Gmail/network outage cannot swallow the record
+  // (workflow_failed for 266499 never appeared in outboundEmails because
+  // send ran before the Firestore write and hung/failed the request).
+  const emailToStore = {...email, html: htmlToSend};
+  delete emailToStore.tenant;
+  delete emailToStore.skipAgentGreeting;
+  delete emailToStore.forceRecipient;
+  const emailRef = await tcol(tenant, "outboundEmails").add({
+    ...emailToStore,
+    to,
+    cc,
+    sendResult: null,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    deleteAt: getDeleteAt(7),
+  });
+
   if (to) {
     try {
       await sendViaGmail(
@@ -5466,24 +5529,17 @@ async function saveOutboundEmail(email) {
       sendResult = {ok: false, error: sendErr.message};
       console.error("saveOutboundEmail send error:", sendErr.message);
     }
+    try {
+      await emailRef.update({sendResult});
+    } catch (updErr) {
+      console.error("saveOutboundEmail sendResult update:", updErr.message);
+    }
   } else {
     console.warn("saveOutboundEmail: no recipient, email not sent", {
       type: email.type,
       invoiceId: email.invoiceId,
     });
   }
-
-  // The tenant object is internal routing metadata; don't persist it.
-  const emailToStore = {...email, html: htmlToSend};
-  delete emailToStore.tenant;
-  delete emailToStore.skipAgentGreeting;
-  delete emailToStore.forceRecipient;
-  await tcol(tenant, "outboundEmails").add({
-    ...emailToStore,
-    sendResult: sendResult,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    deleteAt: getDeleteAt(7),
-  });
 
   await writeLog("info", "email", "Outbound email sent", {
     type: email.type,
@@ -5798,6 +5854,14 @@ async function maybeFetchXpoWeightCert(messageId, aiResult) {
  */
 async function maybeFetchFedExFreightPod(invoiceId, invoice) {
   if (!invoice || !fedexFreightPod.isFedExFreightCarrier(invoice.carrierName)) {
+    if (invoice && /fed\s*ex/i.test(String(invoice.carrierName || ""))) {
+      await writeLog("info", "workflow",
+          "FedEx Freight POD fetch skipped — carrier name did not match", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            carrierName: invoice.carrierName || null,
+          });
+    }
     return null;
   }
   const proNumber = fedexFreightPod.resolveFedExFreightPro({
@@ -5900,6 +5964,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
           "POD not detected in this invoice — no extraction attempted", {
             invoiceId,
             loadNumber: invoice && invoice.loadNumber,
+            carrierName: invoice && invoice.carrierName,
             podFound: podNormalized && podNormalized.found,
             podSource: podNormalized && podNormalized.source,
             podDocumentCount: documents.length,
@@ -13506,7 +13571,7 @@ async function primusRequest(method, path, body) {
             error: txt.slice(0, 300),
           });
           await new Promise((resolve) => setTimeout(resolve,
-              workflowErrors.TRANSIENT_NETWORK_RETRY_MS));
+              workflowErrors.transientRetryDelayMs(attempt)));
           lastErr = err;
           continue;
         }
@@ -13526,7 +13591,7 @@ async function primusRequest(method, path, body) {
               error: msg,
             });
         await new Promise((resolve) => setTimeout(resolve,
-            workflowErrors.TRANSIENT_NETWORK_RETRY_MS));
+            workflowErrors.transientRetryDelayMs(attempt)));
         continue;
       }
       throw err;
@@ -14267,6 +14332,7 @@ dailyActivityReport.init({
 const innovativePrimus = require("./innovative-primus");
 innovativePrimus.init({
   ...primusBundle,
+  kickPrimusWorkflow,
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
   runPrimusUiBillingFlow: primusUiBridge.runPrimusUiBillingFlow,
   emailBOLDocs: primusUiBridge.emailBOLDocs,
@@ -14287,6 +14353,25 @@ innovativePrimus.init({
   },
 });
 exports.processPrimusWorkflow = innovativePrimus.processPrimusWorkflow;
+if (typeof innovativePrimus.retryPendingTransientWorkflows ===
+    "function") {
+  retryPendingTransientWorkflowsImpl =
+    innovativePrimus.retryPendingTransientWorkflows;
+}
+
+/** Retry invoices that crashed on transient Primus/network errors. */
+exports.retryTransientWorkflowFailures = onSchedule({
+  schedule: "every 5 minutes",
+  timeoutSeconds: 540,
+  memory: "512MiB",
+}, async () => {
+  try {
+    const result = await retryPendingTransientWorkflowsImpl();
+    console.log("retryTransientWorkflowFailures:", JSON.stringify(result));
+  } catch (error) {
+    console.error("retryTransientWorkflowFailures error:", error.message);
+  }
+});
 
 const innovativeInsurance = require("./innovative-insurance");
 innovativeInsurance.init({
