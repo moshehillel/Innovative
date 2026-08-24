@@ -16,6 +16,7 @@ const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const loadResolution = require("./invoice-load-resolution");
 const workflowErrors = require("./workflow-error-messages");
+const mailIntakeQueue = require("./mail-intake-queue");
 
 // Injected from index.js (see init). Declared at module scope so the moved
 // workflow code below can call them by their original bare names, unchanged.
@@ -416,12 +417,15 @@ async function handlePrimusWorkflowCrash(opts) {
   let carrierName = null;
   let scheduledRetry = false;
   let delayedRetryCount = 0;
+  let invoiceData = null;
+  let opsHold = false;
 
   if (invoiceId) {
     try {
       const invoiceDoc = await db.collection("invoices").doc(invoiceId).get();
       if (invoiceDoc.exists) {
         const inv = invoiceDoc.data() || {};
+        invoiceData = inv;
         loadNumber = inv.loadNumber || null;
         carrierName = inv.carrierName || null;
         delayedRetryCount = Number(inv.delayedRetryCount) || 0;
@@ -432,6 +436,11 @@ async function handlePrimusWorkflowCrash(opts) {
         const missingAccountingEmail =
           inv.decisionStage === "missing_accounting_email" ||
           inv.finalWorkflowStatus === "missing_accounting_email";
+        const awaitingRate =
+          inv.decisionStage === "needs_customer_rate_review" ||
+          inv.finalWorkflowStatus === "needs_customer_rate_review";
+        opsHold = extraChargePending || podHold || missingAccountingEmail ||
+          awaitingRate;
         scheduledRetry = workflowErrors.shouldDelayWorkflowRetry({
           errorMessage: errMsg,
           delayedRetryCount,
@@ -482,6 +491,24 @@ async function handlePrimusWorkflowCrash(opts) {
   } catch (logErr) {
     console.error("handlePrimusWorkflowCrash writeLog:",
         logErr && logErr.message);
+  }
+
+  if (invoiceId && !scheduledRetry && !opsHold) {
+    try {
+      await mailIntakeQueue.failIntakeForWorkflowCrash({
+        tenant: {
+          tenantId: (invoiceData && invoiceData.tenantId) ||
+            (req.body && req.body.tenantId) || "default",
+        },
+        invoice: invoiceData || {},
+        invoiceId,
+        error: errMsg,
+        outcomeReason: mailIntakeQueue.OUTCOME_REASON.WORKFLOW_FAILED,
+      });
+    } catch (intakeErr) {
+      console.error("failIntakeForWorkflowCrash:",
+          intakeErr && intakeErr.message);
+    }
   }
 
   if (invoiceId && !scheduledRetry) {
@@ -1715,6 +1742,13 @@ exports.processPrimusWorkflow = onRequest(
           }
 
           if (!amountValidation.ok || !amountValidation.validAmount) {
+            const validationErr = amountValidation.error ||
+              amountValidation.reason || "";
+            if (!amountValidation.ok &&
+                (workflowErrors.isTransientNetworkError(validationErr) ||
+                  workflowErrors.looksLikeSystemError(validationErr))) {
+              throw new Error(validationErr || "Primus fetch failed");
+            }
             const primusAmountFromValidation = amountValidation.amount || null;
             const submitted = amountValidation.submittedAmount ||
           invoice.invoiceAmount;

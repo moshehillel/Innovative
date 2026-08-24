@@ -48,7 +48,8 @@ function detailsTable(rows) {
 function isSystemUiBillingStep(step) {
   const s = String(step || "").toLowerCase();
   if (!s) return false;
-  return /session|cookie|getterms|manage\.php|bookingid|upload|internal|/ +
+  return /session|cookie|getterms|manage\.php|bookingid|upload|internal/
+      .test(s) ||
     /timeout|network|fetch failed|not configured|off$/.test(s);
 }
 
@@ -61,8 +62,9 @@ function looksLikeSystemError(message, step) {
   if (isSystemUiBillingStep(step)) return true;
   const m = String(message || "").toLowerCase();
   if (!m) return false;
-  return /internal server|unexpected|cannot read|undefined is not|/ +
-    /typeerror|referenceerror|manage\.php|session|not configured|env |/ +
+  return /internal server|unexpected|cannot read|undefined is not/.test(m) ||
+    /typeerror|referenceerror|manage\.php|session|not configured|env /
+        .test(m) ||
     /timeout|econnreset|fetch failed|status 5\d\d/.test(m);
 }
 
@@ -567,8 +569,8 @@ function shouldDelayWorkflowRetry(opts) {
 function isTransientNetworkError(message) {
   const m = String(message || "").toLowerCase();
   if (!m) return false;
-  return /timeout|timed out|econnreset|econnrefused|enetunreach|/ +
-    /fetch failed|network error|socket hang up|/ +
+  return /timeout|timed out|econnreset|econnrefused|enetunreach/.test(m) ||
+    /fetch failed|network error|socket hang up/.test(m) ||
     /status 502|status 503|status 504|aborted/.test(m);
 }
 
@@ -585,7 +587,7 @@ function isTransientPrimusApiError(status, message) {
     return true;
   }
   const m = String(message || "").toLowerCase();
-  return /internal server error|service unavailable|bad gateway|/ +
+  return /internal server error|service unavailable|bad gateway/.test(m) ||
     /gateway timeout|too many requests/.test(m);
 }
 
