@@ -32,6 +32,12 @@ const OUTCOME = Object.freeze({
 /** Firestore TTL for emailIntake / gmailQueue docs, from discovery time. */
 const INTAKE_TTL_DAYS = 60;
 
+/** Searchable outcomeReason values for system/workflow crashes. */
+const OUTCOME_REASON = Object.freeze({
+  WORKFLOW_FAILED: "workflow_failed",
+  SYSTEM_ERROR: "system_error",
+});
+
 /**
  * @param {string} parentMessageId Parent message id.
  * @param {number} itemIndex Invoice item index.
@@ -140,6 +146,8 @@ function buildIntakeSummary(data) {
       hafstaff_forwarded_to_lisa: "Forwarded — Hafstaff to Lisa (ops rule)",
       no_attachment: "Forwarded — no attachments",
       no_invoice_pdf: "Forwarded — no processable invoice PDF",
+      workflow_failed: "Failed — invoice workflow system error",
+      system_error: "Failed — invoice workflow system error",
     };
     if (finalStatus && statusSummary[finalStatus]) {
       core = statusSummary[finalStatus];
@@ -409,33 +417,116 @@ async function completeIntakeRecord(opts) {
 }
 
 /**
+ * Resolves parent emailIntake id and gmailQueue id from an invoice.
+ * @param {object} invoice Invoice document data.
+ * @return {{parentMessageId: string, queueDocId: string}}
+ */
+function resolveIntakeIdsFromInvoice(invoice) {
+  const data = invoice || {};
+  const parentMessageId = String(
+      data.gmailMessageId ||
+      data.sourceMessageId ||
+      data.messageId ||
+      "",
+  ).trim();
+  let queueDocId = String(data.queueDocId || "").trim();
+  if (!queueDocId && parentMessageId &&
+      data.itemIndex != null && data.itemIndex !== "") {
+    queueDocId = childQueueDocId(parentMessageId, data.itemIndex);
+  }
+  if (!queueDocId) queueDocId = parentMessageId;
+  return {parentMessageId, queueDocId};
+}
+
+/**
  * @param {object} tenant Tenant config.
- * @param {string} docId Doc id.
+ * @param {string} docId Queue doc id (parent or child).
  * @param {string} error Error message.
+ * @param {object} [opts]
+ * @param {string} [opts.outcomeReason] Searchable reason, e.g. workflow_failed.
+ * @param {string} [opts.finalStatus] Alias for outcomeReason.
+ * @param {object} [opts.extra] Extra Firestore fields.
  * @return {Promise<void>}
  */
-async function failIntakeRecord(tenant, docId, error) {
-  const summary = buildIntakeSummary({
-    outcome: OUTCOME.FAILED,
-    error: error || "Unknown error",
-  });
+async function failIntakeRecord(tenant, docId, error, opts) {
+  opts = opts || {};
+  const parentMessageId = isChildQueueDocId(docId) ?
+    docId.replace(/__item_\d+$/, "") : String(docId || "");
+  let existing = {};
+  try {
+    const existingSnap = await col(tenant, "emailIntake")
+        .doc(parentMessageId).get();
+    existing = existingSnap.exists ? (existingSnap.data() || {}) : {};
+  } catch (_e) {
+    existing = {};
+  }
+  const outcomeReason = opts.outcomeReason || opts.finalStatus || null;
+  const summary = opts.summary || buildIntakeSummary(Object.assign(
+      {}, existing, {
+        outcome: OUTCOME.FAILED,
+        outcomeReason,
+        finalStatus: outcomeReason,
+        error: error || "Unknown error",
+        summary: null,
+        ignoreReason: null,
+        _rebuildSummary: true,
+      }));
   const now = admin.firestore.FieldValue.serverTimestamp();
-  const patch = {
+  const patch = Object.assign({
     intakeStatus: QUEUE_STATUS.FAILED,
     status: QUEUE_STATUS.FAILED,
     outcome: OUTCOME.FAILED,
+    outcomeReason,
     summary,
     error: String(error || "").slice(0, 1000),
     finishedAt: now,
     updatedAt: now,
-  };
+  }, opts.extra || {});
   await col(tenant, "gmailQueue").doc(docId).set(patch, {merge: true});
-  const parentMessageId = isChildQueueDocId(docId) ?
-    docId.replace(/__item_\d+$/, "") : docId;
-  if (!isChildQueueDocId(docId)) {
-    await col(tenant, "emailIntake").doc(parentMessageId).set(
-        patch, {merge: true});
+  if (isChildQueueDocId(docId)) {
+    return;
   }
+  await col(tenant, "emailIntake").doc(parentMessageId).set(
+      Object.assign({}, patch, {
+        gmailMessageId: parentMessageId,
+        tenantId: tenant.tenantId,
+      }), {merge: true});
+}
+
+/**
+ * Marks parent emailIntake (and mirrored gmailQueue / split child) failed
+ * after a Primus workflow system crash. Ops holds should not call this.
+ * @param {object} opts Options.
+ * @param {object} [opts.tenant] Tenant config.
+ * @param {object} [opts.invoice] Invoice document data.
+ * @param {string} [opts.invoiceId] Invoice id stored on the intake row.
+ * @param {string} [opts.error] Error message for summary.
+ * @param {string} [opts.outcomeReason] Defaults to workflow_failed.
+ * @return {Promise<object>} Result with ok / ids.
+ */
+async function failIntakeForWorkflowCrash(opts) {
+  const o = opts || {};
+  const tenant = o.tenant || {tenantId: "default"};
+  const ids = resolveIntakeIdsFromInvoice(o.invoice);
+  if (!ids.parentMessageId) {
+    return {ok: false, reason: "missing_message_id"};
+  }
+  const failOpts = {
+    outcomeReason: o.outcomeReason || OUTCOME_REASON.WORKFLOW_FAILED,
+    extra: o.invoiceId ? {failedInvoiceId: String(o.invoiceId)} : {},
+  };
+  const error = o.error || failOpts.outcomeReason;
+  const seen = new Set();
+  for (const id of [ids.queueDocId, ids.parentMessageId]) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    await failIntakeRecord(tenant, id, error, failOpts);
+  }
+  return {
+    ok: true,
+    parentMessageId: ids.parentMessageId,
+    queueDocId: ids.queueDocId,
+  };
 }
 
 /**
@@ -617,6 +708,8 @@ module.exports = {
   DOC_TYPE,
   QUEUE_STATUS,
   OUTCOME,
+  OUTCOME,
+  OUTCOME_REASON,
   INTAKE_TTL_DAYS,
   childQueueDocId,
   isChildQueueDocId,
@@ -629,6 +722,8 @@ module.exports = {
   markIntakeProcessing,
   completeIntakeRecord,
   failIntakeRecord,
+  failIntakeForWorkflowCrash,
+  resolveIntakeIdsFromInvoice,
   createInvoiceChildJobs,
   listIntakeForDigest,
   listIgnoredIntakeForReport,
