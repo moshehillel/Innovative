@@ -1,0 +1,2722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Quote — Dispatcher</title>
+  <style>
+    :root {
+      --primary: #1f4fd8;
+      --primary-dark: #153a9e;
+      --primary-light: #eef2ff;
+      --bg: #f0f4fa;
+      --surface: #ffffff;
+      --surface-muted: #f8fafc;
+      --border: #e2e8f0;
+      --text: #1f2937;
+      --text-secondary: #475569;
+      --muted: #64748b;
+      --success: #059669;
+      --success-bg: #ecfdf5;
+      --warning: #d97706;
+      --warning-bg: #fffbeb;
+      --error: #dc2626;
+      --error-bg: #fef2f2;
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+      --shadow: 0 4px 6px rgba(15, 23, 42, 0.04), 0 12px 24px rgba(15, 23, 42, 0.06);
+      --radius: 12px;
+      --radius-lg: 16px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px 20px 48px;
+      max-width: 1040px;
+      margin-left: auto;
+      margin-right: auto;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    h1 {
+      font-size: 1.375rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--primary-dark);
+      margin: 0 0 6px;
+    }
+    .meta { color: var(--muted); font-size: 0.9375rem; margin-bottom: 16px; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 20px;
+      align-items: center;
+    }
+    .lane {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      margin-bottom: 14px;
+      box-shadow: var(--shadow-sm);
+      overflow: hidden;
+    }
+    .lane-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 18px;
+      cursor: pointer;
+      user-select: none;
+      background: var(--surface-muted);
+      border-bottom: 1px solid transparent;
+    }
+    .lane.open .lane-head { border-bottom-color: var(--border); }
+    .lane-head h2 {
+      margin: 0;
+      font-size: 1.0625rem;
+      font-weight: 700;
+      flex: 1;
+    }
+    .chevron {
+      color: var(--muted);
+      transition: transform 0.15s ease;
+      font-size: 0.875rem;
+    }
+    .lane.open .chevron { transform: rotate(90deg); }
+    .lane-body { display: none; padding: 16px 18px 20px; }
+    .lane.open .lane-body { display: block; }
+    .why {
+      background: var(--primary-light);
+      border: 1px solid #c7d2fe;
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 14px;
+      font-size: 0.8125rem;
+      color: var(--primary-dark);
+    }
+    .why strong { display: block; margin-bottom: 4px; }
+    .class-hint {
+      font-size: 12px;
+      color: var(--muted);
+      margin: 6px 0 0;
+    }
+    .acc-panel {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-muted);
+      padding: 12px 14px;
+      margin: 8px 0 14px;
+    }
+    .acc-search {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 0.8125rem;
+      margin-bottom: 10px;
+      background: var(--surface);
+    }
+    .lane-summary {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface);
+      padding: 12px 14px;
+      margin-bottom: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    @media (min-width: 720px) {
+      .lane-summary { grid-template-columns: 1fr 1fr; }
+      .lane-summary .freight-block,
+      .lane-summary .span-2 { grid-column: 1 / -1; }
+    }
+    .lane-summary .addr-block h3,
+    .lane-summary .freight-block h3,
+    .details-panel .addr-block h3 {
+      margin: 0 0 4px;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .lane-summary .addr-name,
+    .details-panel .addr-name {
+      font-weight: 650;
+      font-size: 0.875rem;
+      color: var(--text);
+    }
+    .lane-summary .addr-lines,
+    .details-panel .addr-lines {
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      white-space: pre-line;
+    }
+    .lane-summary .addr-missing,
+    .lane-summary .freight-missing,
+    .details-panel .addr-missing {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      font-style: italic;
+    }
+    .details-panel .addr-block { margin-top: 12px; }
+    .freight-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8125rem;
+    }
+    .freight-table th {
+      text-align: left;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 4px 8px 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .freight-table td {
+      padding: 6px 8px 6px 0;
+      color: var(--text-secondary);
+      border-bottom: 1px solid #f1f5f9;
+      vertical-align: top;
+    }
+    .freight-table tr:last-child td { border-bottom: none; }
+    .details-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 16px 18px 18px;
+      margin-bottom: 16px;
+      box-shadow: var(--shadow-sm);
+    }
+    .details-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .details-panel h3 {
+      margin: 0 0 12px;
+      font-size: 0.9375rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+    }
+    .details-head h3 { margin: 0; flex: 1; }
+    .details-head button {
+      padding: 7px 12px;
+      font-size: 0.8125rem;
+    }
+    .facts-grid {
+      display: grid;
+      gap: 8px 16px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 720px) {
+      .facts-grid { grid-template-columns: 1fr 1fr; }
+      .facts-grid .span-2 { grid-column: 1 / -1; }
+    }
+    .fact-value {
+      font-size: 0.8125rem;
+      color: var(--text);
+      white-space: pre-line;
+    }
+    .fact-value.muted {
+      color: var(--muted);
+      font-style: italic;
+    }
+    .details-grid {
+      display: grid;
+      gap: 10px 14px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 720px) {
+      .details-grid { grid-template-columns: 1fr 1fr; }
+      .details-grid .span-2 { grid-column: 1 / -1; }
+    }
+    .field-label {
+      display: block;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .field-input,
+    .field-textarea,
+    .freight-edit input,
+    .freight-edit select,
+    .addr-edit input {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 0.8125rem;
+      background: var(--surface);
+      color: var(--text);
+    }
+    .field-textarea { min-height: 64px; resize: vertical; }
+    .addr-edit {
+      display: grid;
+      gap: 8px;
+    }
+    .addr-edit .addr-row {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr;
+    }
+    @media (min-width: 560px) {
+      .addr-edit .addr-row.cols-2 { grid-template-columns: 1fr 1fr; }
+      .addr-edit .addr-row.cols-3 { grid-template-columns: 2fr 1fr 1fr; }
+    }
+    .site-type-chip {
+      display: inline-block;
+      margin-left: 8px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.6875rem;
+      font-weight: 650;
+      letter-spacing: 0.02em;
+      text-transform: none;
+      background: var(--primary-light);
+      color: var(--primary-dark);
+      border: 1px solid #c7d2fe;
+      vertical-align: middle;
+    }
+    .freight-edit {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.75rem;
+    }
+    .freight-edit th {
+      text-align: left;
+      font-size: 0.625rem;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--muted);
+      padding: 4px 4px 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .freight-edit td {
+      padding: 4px 4px 4px 0;
+      vertical-align: middle;
+    }
+    .freight-edit input,
+    .freight-edit select {
+      padding: 6px 6px;
+      min-width: 0;
+    }
+    .details-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+      align-items: center;
+    }
+    .dispatcher-note {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      background: #fff7ed;
+      border: 1px solid #fed7aa;
+      font-size: 0.8125rem;
+      color: #9a3412;
+    }
+    .dispatcher-note strong { display: block; margin-bottom: 2px; }
+    .acc-sections {
+      display: grid;
+      gap: 8px;
+    }
+    .acc-section {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden;
+    }
+    .acc-section-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      margin: 0;
+      padding: 8px 10px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+      color: var(--primary-dark);
+    }
+    .acc-section-toggle:hover { background: var(--primary-light); }
+    .acc-section-toggle .acc-chevron {
+      color: var(--muted);
+      font-size: 0.75rem;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+    }
+    .acc-section.open .acc-chevron { transform: rotate(90deg); }
+    .acc-section-toggle h4 {
+      margin: 0;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--primary-dark);
+      flex: 1;
+    }
+    .acc-section-toggle .acc-count {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .acc-section .acc-list {
+      display: none;
+      max-height: 220px;
+      overflow: auto;
+      flex-direction: column;
+      gap: 4px;
+      padding: 0 10px 10px;
+    }
+    .acc-section.open .acc-list { display: flex; }
+    .rates-section,
+    .rules-section {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface);
+      overflow: hidden;
+      margin-top: 14px;
+    }
+    .rules-section { margin-top: 0; margin-bottom: 14px; }
+    .rules-list {
+      margin: 0;
+      padding: 0 0 0 18px;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+    }
+    .rules-list li { margin: 0 0 6px; }
+    .rules-list li:last-child { margin-bottom: 0; }
+    .rates-section-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+      margin: 0;
+      padding: 10px 12px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+      color: var(--primary-dark);
+    }
+    .rates-section-toggle:hover { background: var(--primary-light); }
+    .rates-section-toggle .rates-chevron {
+      color: var(--muted);
+      font-size: 0.75rem;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+    }
+    .rates-section.open .rates-chevron,
+    .rules-section.open .rates-chevron { transform: rotate(90deg); }
+    .rates-section-toggle h4 {
+      margin: 0;
+      font-size: 0.8125rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+      flex: 1;
+    }
+    .rates-section-toggle .rates-count {
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .rates-section .rates-list,
+    .rules-section .rates-list {
+      display: none;
+      padding: 0 12px 12px;
+    }
+    .rates-section.open .rates-list,
+    .rules-section.open .rates-list { display: block; }
+    .acc-section label {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      font-size: 0.75rem;
+      color: var(--text-secondary);
+      cursor: pointer;
+      line-height: 1.35;
+    }
+    .acc-section label.disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .acc-section label .code {
+      color: var(--muted);
+      font-size: 0.6875rem;
+      white-space: nowrap;
+    }
+    .acc-section label.hidden-acc { display: none; }
+    .acc-toggles {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      margin: 10px 0 14px;
+      font-size: 0.8125rem;
+    }
+    .acc-toggles label {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      cursor: pointer;
+      color: var(--text-secondary);
+    }
+    .opt {
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 10px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-top: 8px;
+      background: var(--surface-muted);
+      align-items: start;
+    }
+    .opt:hover { border-color: #c7d2fe; background: var(--surface); }
+    .opt.checked {
+      border-color: var(--success);
+      background: var(--success-bg);
+      box-shadow: 0 0 0 2px rgba(5, 150, 105, 0.12);
+    }
+    .opt input[type="checkbox"] { margin-top: 4px; width: 16px; height: 16px; }
+    .tags { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+    .tag {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: var(--primary-light);
+      color: var(--primary-dark);
+      border: 1px solid #c7d2fe;
+    }
+    .price { font-size: 1rem; font-weight: 600; margin-top: 2px; }
+    .sell { color: var(--success); }
+    .rate-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      margin-top: 8px;
+      font-size: 0.875rem;
+    }
+    .rate-cost {
+      font-weight: 700;
+      color: var(--text);
+    }
+    .customer-rate-field {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: 600;
+      color: var(--success);
+    }
+    .customer-rate-field input[type="number"] {
+      width: 104px;
+      margin: 0;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font: inherit;
+      font-size: 0.875rem;
+      font-weight: 600;
+      color: var(--text);
+      background: var(--surface);
+    }
+    .customer-rate-field input[type="number"]:focus {
+      outline: none;
+      border-color: var(--success);
+      box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.15);
+    }
+    .rate-meta { color: var(--muted); font-weight: 500; }
+    .suggested-sell {
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-weight: 500;
+    }
+    .customer-match {
+      margin: 0 0 14px;
+      font-size: 0.8125rem;
+    }
+    .quote-warnings {
+      margin: -6px 0 14px;
+    }
+    .quote-warnings .warn { margin-top: 6px; }
+    .badge.market {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border-color: #fcd34d;
+    }
+    .badge.match {
+      background: var(--success-bg);
+      color: var(--success);
+      border-color: #6ee7b7;
+    }
+    .badge.nomatch {
+      background: var(--warning-bg);
+      color: var(--warning);
+      border-color: #fcd34d;
+    }
+    .warn {
+      color: var(--warning);
+      background: var(--warning-bg);
+      font-size: 0.8125rem;
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 8px;
+    }
+    .draft {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 20px;
+      margin-top: 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .draft-head {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+    .draft h3 {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+      flex: 1;
+      min-width: 140px;
+    }
+    .draft-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .draft textarea {
+      width: 100%;
+      min-height: 220px;
+      font-family: inherit;
+      font-size: 0.875rem;
+      line-height: 1.55;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--surface-muted);
+      color: var(--text-secondary);
+      resize: vertical;
+    }
+    button, .btn {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 11px 18px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.875rem;
+      transition: background 0.15s ease;
+    }
+    button:hover { background: var(--primary-dark); }
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    button.ghost, .btn.ghost {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+    }
+    button.ghost:hover {
+      background: var(--primary-light);
+      border-color: #c7d2fe;
+      color: var(--primary-dark);
+    }
+    button.danger {
+      background: var(--error);
+    }
+    button.danger:hover { background: #b91c1c; }
+    button.success { background: var(--success); }
+    button.success:hover { background: #047857; }
+    .msg {
+      margin-top: 12px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+    }
+    .msg.ok { background: var(--success-bg); color: var(--success); }
+    .msg.err { background: var(--error-bg); color: var(--error); }
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--warning-bg);
+      color: var(--warning);
+      border: 1px solid #fcd34d;
+    }
+    .badge.sent { background: var(--success-bg); color: var(--success); border-color: #6ee7b7; }
+    .badge.dismissed { background: var(--surface-muted); color: var(--muted); border-color: var(--border); }
+    .badge.draft_ready { background: var(--primary-light); color: var(--primary-dark); border-color: #c7d2fe; }
+
+    .login-page {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 32px 20px;
+      margin: -24px -20px;
+      background:
+        radial-gradient(ellipse 90% 70% at 50% -20%, rgba(31, 79, 216, 0.12), transparent),
+        var(--bg);
+    }
+    .login {
+      width: 100%;
+      max-width: 420px;
+      text-align: center;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 40px 36px 32px;
+      box-shadow: var(--shadow);
+    }
+    .login h2 {
+      margin: 0 0 8px;
+      font-size: 1.375rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+      letter-spacing: -0.02em;
+    }
+    .login-desc { color: var(--muted); font-size: 0.9375rem; margin: 0 0 24px; }
+    .login-form { text-align: left; display: grid; gap: 18px; }
+    .login-form label {
+      display: grid;
+      gap: 8px;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+    .login-form input {
+      width: 100%;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.9375rem;
+      font-family: inherit;
+    }
+    .login-form input:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(31, 79, 216, 0.15);
+    }
+    .btn-login {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 13px 20px;
+      border-radius: 10px;
+      cursor: pointer;
+      width: 100%;
+      margin-top: 4px;
+      font-weight: 600;
+      font-family: inherit;
+      box-shadow: 0 2px 8px rgba(31, 79, 216, 0.25);
+    }
+    .btn-login:hover { background: var(--primary-dark); }
+    .login-links { margin: 16px 0 0; text-align: center; }
+    .link-btn {
+      background: none;
+      border: none;
+      color: var(--primary);
+      cursor: pointer;
+      font-size: 0.875rem;
+      padding: 6px 10px;
+      font-family: inherit;
+      font-weight: 500;
+      border-radius: 6px;
+    }
+    .link-btn:hover { background: var(--primary-light); }
+    .login-msg { margin-top: 14px; font-size: 0.875rem; }
+    .login-msg.ok { color: var(--success); background: var(--success-bg); padding: 10px 14px; border-radius: 8px; }
+    .login-err {
+      color: var(--error);
+      background: var(--error-bg);
+      margin-top: 14px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.875rem;
+    }
+    .hidden { display: none !important; }
+    .home-link {
+      color: var(--primary);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 600;
+    }
+    .home-link:hover { text-decoration: underline; }
+
+    /* Thinking / working wait — first paint before JS */
+    .page-thinking {
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+      min-height: 42vh;
+      padding: 8px 0 24px;
+    }
+    .page-thinking.hidden { display: none !important; }
+    .thinking-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 28px 26px 24px;
+      box-shadow: var(--shadow-sm);
+      max-width: 520px;
+    }
+    .thinking-eyebrow {
+      margin: 0 0 10px;
+      font-size: 0.6875rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--primary);
+    }
+    .thinking-status {
+      margin: 0;
+      font-size: 1.125rem;
+      font-weight: 650;
+      letter-spacing: -0.015em;
+      color: var(--primary-dark);
+      display: flex;
+      align-items: baseline;
+      gap: 2px;
+      min-height: 1.5em;
+      transition: opacity 0.22s ease;
+    }
+    .thinking-status.is-fading { opacity: 0; }
+    .thinking-dots span {
+      display: inline-block;
+      width: 0.35em;
+      opacity: 0.25;
+      animation: thinking-dot 1.2s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes thinking-dot {
+      0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+      40% { opacity: 1; transform: translateY(-1px); }
+    }
+    .thinking-pulse {
+      margin-top: 18px;
+      height: 3px;
+      border-radius: 999px;
+      background: #e8eefc;
+      overflow: hidden;
+      position: relative;
+    }
+    .thinking-pulse::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      width: 42%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, transparent, var(--primary), transparent);
+      opacity: 0.85;
+      animation: thinking-bar 1.45s ease-in-out infinite;
+    }
+    @keyframes thinking-bar {
+      0% { transform: translateX(-120%); }
+      100% { transform: translateX(280%); }
+    }
+    .thinking-skel {
+      display: grid;
+      gap: 12px;
+    }
+    .skel {
+      background: linear-gradient(
+        90deg,
+        #e8eef8 0%,
+        #f4f7fc 45%,
+        #e8eef8 90%
+      );
+      background-size: 200% 100%;
+      animation: skel-shimmer 1.35s ease-in-out infinite;
+      border-radius: 10px;
+    }
+    @keyframes skel-shimmer {
+      0% { background-position: 100% 0; }
+      100% { background-position: -100% 0; }
+    }
+    .skel-title { height: 22px; width: 42%; }
+    .skel-meta { height: 14px; width: 68%; }
+    .skel-lane {
+      height: 64px;
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--border);
+      background:
+        linear-gradient(90deg, #eef2f8 0%, #f8fafc 50%, #eef2f8 100%);
+      background-size: 200% 100%;
+      animation: skel-shimmer 1.5s ease-in-out infinite;
+      box-shadow: var(--shadow-sm);
+    }
+    .skel-lane:nth-child(3) { animation-delay: 0.12s; }
+    .skel-lane:nth-child(4) { animation-delay: 0.24s; }
+    .quote-ready {
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.28s ease, transform 0.28s ease;
+      pointer-events: none;
+    }
+    .quote-ready.is-visible {
+      opacity: 1;
+      transform: none;
+      pointer-events: auto;
+    }
+    .quote-ready.hidden { display: none !important; }
+
+    @media (max-width: 640px) {
+      body { padding: 16px 16px 40px; }
+      .login { padding: 32px 24px 28px; }
+      .login-page { margin: -16px; }
+      .thinking-panel { padding: 22px 18px 20px; }
+    }
+  </style>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+</head>
+<body>
+  <section id="login-screen" class="login-page hidden">
+    <div class="login">
+      <h2>Sign in to review quote</h2>
+      <p class="login-desc">Use your dispatcher email and password.</p>
+      <form id="login-form" class="login-form">
+        <label>Email
+          <input type="email" id="login-email" autocomplete="username" required>
+        </label>
+        <label>Password
+          <input type="password" id="login-password" autocomplete="current-password" required>
+        </label>
+        <button type="submit" class="btn-login">Sign in</button>
+      </form>
+      <p class="login-links">
+        <button type="button" class="link-btn" id="btn-forgot">Forgot password?</button>
+      </p>
+      <p id="login-success" class="login-msg ok hidden"></p>
+      <p id="login-error" class="login-err hidden"></p>
+    </div>
+  </section>
+
+  <!-- Visible on first paint so "Open full review" never lands on a blank page -->
+  <div id="app">
+    <div id="page-thinking" class="page-thinking" aria-live="polite" aria-busy="true">
+      <div class="thinking-panel">
+        <p class="thinking-eyebrow">Quote review</p>
+        <p class="thinking-status" id="thinking-status">
+          Searching out all carriers for you<span class="thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+        </p>
+        <div class="thinking-pulse" aria-hidden="true"></div>
+      </div>
+      <div class="thinking-skel" aria-hidden="true">
+        <div class="skel skel-title"></div>
+        <div class="skel skel-meta"></div>
+        <div class="skel-lane"></div>
+        <div class="skel-lane"></div>
+      </div>
+    </div>
+
+    <div id="quote-ready" class="quote-ready hidden">
+      <div style="margin-bottom:12px">
+        <a class="home-link" id="home-link" href="#">← Back to dashboard</a>
+      </div>
+      <h1 id="title">Quote review</h1>
+      <div class="meta">
+        <span id="meta"></span>
+        <span id="status-badge" class="badge" style="margin-left:8px"></span>
+      </div>
+      <div id="customer-match" class="customer-match hidden"></div>
+      <div id="quote-warnings" class="quote-warnings hidden"></div>
+      <div class="toolbar">
+        <button type="button" id="btn-generate">Save rate and generate draft email</button>
+        <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
+        <span style="flex:1"></span>
+        <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
+      </div>
+      <div id="action-msg" class="msg hidden"></div>
+      <div id="quote-details" class="details-panel"></div>
+      <div id="lanes"></div>
+      <div class="draft">
+        <div class="draft-head">
+          <h3>Customer email draft</h3>
+          <div class="draft-actions">
+            <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
+          </div>
+        </div>
+        <p style="color:var(--muted);font-size:0.875rem;margin:0 0 12px">
+          Check rates above (collapse the rates list anytime), click Save rate and generate draft email
+          (saves to Primus first), edit if needed, then Approve here to send via your Outlook.
+          Dispatcher notes stay on this page only and are not emailed.
+        </p>
+        <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
+      </div>
+    </div>
+  </div>
+
+  <script src="__API_BASE__/quoteAuthClient?v=__AUTH_CLIENT_VERSION__"></script>
+  <script>
+    const TENANT_ID = "__TENANT_ID__";
+    const QUOTE_ID = "__QUOTE_ID__";
+    const DISPATCHER_ID = "__DISPATCHER_ID__";
+    const TOKEN = "__TOKEN__";
+    const API = "__API_BASE__";
+    let quote = null;
+    const selections = {};
+    const customerPrices = {};
+    const laneAccessorials = {};
+    let draftReady = false;
+    const hasLegacyToken = DISPATCHER_ID && TOKEN;
+    let accessorialCatalog = null;
+    let accessorialCatalogPromise = null;
+    let detailsEditMode = false;
+    let thinkingTimer = null;
+    let thinkingFadeTimer = null;
+    let thinkingStep = 0;
+    // Visual-only rotation. Never delays API calls.
+    const THINKING_ROTATE_MS = 1500;
+    const THINKING_FADE_MS = 220;
+    const THINKING_PHRASES = [
+      "Searching out all carriers for you",
+      "Looking over data",
+      "Processing",
+      "Thinking",
+      "Reviewing quote details",
+      "Checking rates and transit",
+      "Matching the best options",
+      "Preparing your results",
+    ];
+
+    function thinkingDotsEl() {
+      const dots = document.createElement("span");
+      dots.className = "thinking-dots";
+      dots.setAttribute("aria-hidden", "true");
+      dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
+      return dots;
+    }
+
+    function applyThinkingPhrase(phrase) {
+      const statusEl = document.getElementById("thinking-status");
+      if (!statusEl) return;
+      statusEl.textContent = "";
+      statusEl.appendChild(document.createTextNode(phrase));
+      statusEl.appendChild(thinkingDotsEl());
+    }
+
+    function setThinkingCopy(step, withFade) {
+      const phrase = THINKING_PHRASES[step % THINKING_PHRASES.length];
+      const statusEl = document.getElementById("thinking-status");
+      if (!statusEl) return;
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+      if (!withFade) {
+        statusEl.classList.remove("is-fading");
+        applyThinkingPhrase(phrase);
+        return;
+      }
+      statusEl.classList.add("is-fading");
+      thinkingFadeTimer = setTimeout(() => {
+        applyThinkingPhrase(phrase);
+        statusEl.classList.remove("is-fading");
+        thinkingFadeTimer = null;
+      }, THINKING_FADE_MS);
+    }
+
+    function stopThinkingRotation() {
+      if (thinkingTimer) {
+        clearInterval(thinkingTimer);
+        thinkingTimer = null;
+      }
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+    }
+
+    function startThinkingRotation() {
+      thinkingStep = 0;
+      setThinkingCopy(0, false);
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      thinkingTimer = setInterval(() => {
+        thinkingStep += 1;
+        setThinkingCopy(thinkingStep, true);
+      }, THINKING_ROTATE_MS);
+    }
+
+    function showThinking(active) {
+      const panel = document.getElementById("page-thinking");
+      const ready = document.getElementById("quote-ready");
+      if (!panel || !ready) return;
+      if (active) {
+        ready.classList.add("hidden");
+        ready.classList.remove("is-visible");
+        panel.classList.remove("hidden");
+        panel.setAttribute("aria-busy", "true");
+        startThinkingRotation();
+      } else {
+        stopThinkingRotation();
+        panel.classList.add("hidden");
+        panel.setAttribute("aria-busy", "false");
+        ready.classList.remove("hidden");
+        // Force reflow so fade-in runs after unhiding.
+        void ready.offsetWidth;
+        ready.classList.add("is-visible");
+      }
+    }
+
+    async function apiFetch(path, opts) {
+      let authHeaders = {};
+      try {
+        authHeaders = await QuoteAuth.authHeaders();
+      } catch (_) { /* legacy / unsigned */ }
+      const headers = Object.assign(
+          {"Content-Type": "application/json"},
+          authHeaders,
+          (opts && opts.headers) || {});
+      let url = API + path;
+      if (hasLegacyToken) {
+        url += (path.indexOf("?") >= 0 ? "&" : "?") +
+          "dispatcherId=" + encodeURIComponent(DISPATCHER_ID) +
+          "&token=" + encodeURIComponent(TOKEN);
+      }
+      const res = await fetch(url, Object.assign({}, opts || {}, {headers}));
+      const text = await res.text();
+      let data = {};
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (_) {
+        throw new Error(res.status === 200 ?
+          "Invalid response" : ("Request failed (" + res.status + ")"));
+      }
+      return data;
+    }
+
+    function showMsg(text, ok) {
+      const el = document.getElementById("action-msg");
+      el.textContent = text;
+      el.className = "msg " + (ok ? "ok" : "err");
+      el.classList.remove("hidden");
+    }
+
+    function defaultCustomerPrice(opt) {
+      function ceilDollar(n) {
+        const v = Number(n);
+        if (!isFinite(v) || v <= 0) return "";
+        return Math.ceil(v);
+      }
+      if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
+        const override = ceilDollar(opt.customerPrice);
+        if (override !== "") return override;
+      }
+      const sell = ceilDollar(opt && opt.sellRate);
+      if (sell !== "") return sell;
+      return ceilDollar(opt && (opt.cost != null ? opt.cost : opt.total));
+    }
+
+    function collectSelections() {
+      return (quote.lanes || []).map((lane) => {
+        const laneKey = lane.laneKey;
+        const rateIds = selections[laneKey] || [];
+        const prices = {};
+        const byLane = customerPrices[laneKey] || {};
+        (lane.options || []).forEach((opt) => {
+          const rateId = String(opt.rateId);
+          const raw = byLane[rateId];
+          const n = raw != null && raw !== "" ? Number(raw) :
+            Number(defaultCustomerPrice(opt));
+          if (isFinite(n) && n > 0) prices[rateId] = Math.ceil(n);
+        });
+        return {
+          laneKey,
+          rateIds,
+          customerPrices: prices,
+        };
+      });
+    }
+
+    function validateCheckedCustomerRates() {
+      const missing = [];
+      (quote.lanes || []).forEach((lane) => {
+        const rateIds = selections[lane.laneKey] || [];
+        const byLane = customerPrices[lane.laneKey] || {};
+        rateIds.forEach((rateId) => {
+          const opt = (lane.options || [])
+              .find((o) => String(o.rateId) === String(rateId));
+          const raw = byLane[rateId];
+          const n = raw != null && raw !== "" ? Number(raw) :
+            Number(defaultCustomerPrice(opt));
+          if (!(n > 0)) {
+            missing.push((opt && (opt.name || opt.SCAC)) || rateId);
+          }
+        });
+      });
+      return missing;
+    }
+
+    function renderCustomerMatch(q) {
+      const el = document.getElementById("customer-match");
+      if (!el) return;
+      const bits = [];
+      if (q.customerLookupStatus === "no_match" ||
+          q.customerMatchMessage === "No Primus match for name") {
+        const qName = q.customerLookupQuery || q.shippingLocationName || "";
+        bits.push("<span class='badge nomatch'>No Primus match" +
+          (qName ? " (“" + esc(qName) + "”)" : "") +
+          "</span>");
+      } else if (q.customerMatched && q.shippingLocationId) {
+        const name = q.shippingLocationName ?
+          esc(q.shippingLocationName) + " · " : "";
+        bits.push("<span class='badge match'>Primus customer: " +
+          name + "ID " + esc(q.shippingLocationId) + "</span>");
+      } else {
+        bits.push("<span class='badge nomatch'>" +
+          "No Primus match — set customer rates manually</span>");
+      }
+      if (q.rateSource === "market_fallback") {
+        bits.push("<span class='badge market'>rate source: market fallback" +
+          "</span>");
+      } else if (q.rateSource === "customer") {
+        bits.push("<span class='badge match'>rate source: customer</span>");
+      }
+      el.innerHTML = bits.join(" ");
+      el.classList.remove("hidden");
+    }
+
+    function uniqueWarns(list) {
+      const out = [];
+      (list || []).forEach((w) => {
+        const t = String(w || "").trim();
+        if (t && out.indexOf(t) < 0) out.push(t);
+      });
+      return out;
+    }
+
+    function renderQuoteWarnings(q) {
+      const el = document.getElementById("quote-warnings");
+      if (!el) return;
+      const warns = uniqueWarns(q.extractionWarnings);
+      (q.lanes || []).forEach((lane) => {
+        uniqueWarns(lane.extractionWarnings).forEach((w) => {
+          if (warns.indexOf(w) < 0) warns.push(w);
+        });
+      });
+      if (q.rateSource === "market_fallback" &&
+          warns.indexOf("market fallback") < 0) {
+        warns.push("market fallback");
+      }
+      if (!warns.length) {
+        el.innerHTML = "";
+        el.classList.add("hidden");
+        return;
+      }
+      el.innerHTML = warns.map((w) =>
+        "<div class='warn'>" + esc(w) + "</div>").join("");
+      el.classList.remove("hidden");
+    }
+
+    async function persistSelections() {
+      try {
+        await apiFetch("/saveQuoteSelections", {
+          method: "POST",
+          body: JSON.stringify({
+            tenantId: TENANT_ID,
+            quoteId: QUOTE_ID,
+            selections: collectSelections(),
+            dispatcherId: DISPATCHER_ID || undefined,
+            token: TOKEN || undefined,
+          }),
+        });
+      } catch (_) { /* non-fatal */ }
+    }
+
+    function fallbackAccessorialCatalog() {
+      return {
+        origin: [
+          {label: "Liftgate at Origin", code: "LFO", selectable: true},
+          {label: "Appointment at Origin", code: "APO", selectable: true},
+          {label: "Limited Access Pickup", code: "LAO", selectable: true},
+          {label: "Residential Pickup", code: "RSO", selectable: true},
+        ],
+        destination: [
+          {label: "Liftgate at Destination", code: "LFD", selectable: true},
+          {label: "Appointment at Destination", code: "APD", selectable: true},
+          {label: "Limited Access Delivery", code: "LAD", selectable: true},
+          {label: "Residential Delivery", code: "RSD", selectable: true},
+          {label: "Nursing Home Delivery", code: "NUD", selectable: true},
+          {label: "Hotel Delivery", code: "HOD", selectable: true},
+        ],
+        other: [],
+        source: "client-fallback",
+      };
+    }
+
+    async function loadAccessorialCatalog() {
+      try {
+        const res = await apiFetch("/getQuoteAccessorialCatalog?tenantId=" +
+          encodeURIComponent(TENANT_ID));
+        if (res && res.ok !== false &&
+            (res.origin || res.destination || res.other)) {
+          accessorialCatalog = res;
+          return accessorialCatalog;
+        }
+      } catch (_) { /* use fallback below */ }
+      accessorialCatalog = fallbackAccessorialCatalog();
+      return accessorialCatalog;
+    }
+
+    function ensureAccessorialCatalog() {
+      if (accessorialCatalog) return Promise.resolve(accessorialCatalog);
+      if (!accessorialCatalogPromise) {
+        accessorialCatalogPromise = loadAccessorialCatalog()
+            .catch(() => {
+              accessorialCatalog = fallbackAccessorialCatalog();
+              return accessorialCatalog;
+            })
+            .finally(() => {
+              accessorialCatalogPromise = null;
+            });
+      }
+      return accessorialCatalogPromise;
+    }
+
+    async function load() {
+      showThinking(true);
+      const url = "/getQuoteDispatcherData?id=" +
+        encodeURIComponent(QUOTE_ID) + "&tenantId=" + encodeURIComponent(TENANT_ID);
+      // Kick catalog in parallel — never block first paint on Primus catalog.
+      ensureAccessorialCatalog();
+      const res = await apiFetch(url);
+      if (!res.ok) {
+        showThinking(false);
+        document.getElementById("meta").textContent = res.error || "Failed to load";
+        return;
+      }
+      quote = res.quote;
+      applyQuote(quote);
+      showThinking(false);
+    }
+
+    function applyQuote(q) {
+      quote = q;
+      detailsEditMode = false;
+      document.getElementById("title").textContent = quote.batchQuoteId || "Quote";
+      const custBits = [];
+      if (quote.shippingLocationName) custBits.push(quote.shippingLocationName);
+      if (quote.shippingLocationId) {
+        custBits.push("ID " + quote.shippingLocationId);
+      }
+      document.getElementById("meta").textContent =
+        (custBits.length ? custBits.join(" · ") + " — " : "") +
+        (quote.from || "") + " — " + (quote.subject || "");
+      renderCustomerMatch(quote);
+      renderQuoteWarnings(quote);
+      const badge = document.getElementById("status-badge");
+      badge.textContent = quote.status || "";
+      badge.className = "badge " + (quote.status || "");
+      draftReady = quote.status === "draft_ready" || quote.status === "sent" ||
+        !!(quote.customerEmailText);
+      document.getElementById("draft-text").value =
+        quote.customerEmailText || quote.customerDraftText || "";
+      document.getElementById("btn-approve").disabled =
+        !draftReady || quote.status === "sent" || quote.status === "dismissed";
+      document.getElementById("btn-copy").disabled =
+        !document.getElementById("draft-text").value;
+      document.getElementById("btn-generate").disabled =
+        quote.status === "sent" || quote.status === "dismissed";
+      document.getElementById("btn-dismiss").disabled =
+        quote.status === "sent" || quote.status === "dismissed";
+
+      (quote.lanes || []).forEach((lane) => {
+        selections[lane.laneKey] = (lane.selectedRateIds || []).slice();
+        laneAccessorials[lane.laneKey] = (lane.accessorials || []).slice();
+        const prices = {};
+        (lane.options || []).forEach((opt) => {
+          prices[String(opt.rateId)] = defaultCustomerPrice(opt);
+        });
+        customerPrices[lane.laneKey] = prices;
+      });
+      renderQuoteDetails(quote);
+      renderLanes();
+      if (draftReady) collapseRatesSections();
+      // If catalog finished while we rendered, fill panels without a second trip.
+      if (accessorialCatalog) {
+        document.querySelectorAll(".acc-panel").forEach((panel) => {
+          if (!panel.dataset.accFilled) {
+            fillAccPanel(panel, accessorialCatalog);
+            panel.dataset.accFilled = "1";
+          }
+        });
+      } else {
+        ensureAccessorialCatalog().then((cat) => {
+          document.querySelectorAll(".acc-panel").forEach((panel) => {
+            if (panel.dataset.accFilled) return;
+            fillAccPanel(panel, cat);
+            panel.dataset.accFilled = "1";
+          });
+        });
+      }
+    }
+
+    function partyField(party, field) {
+      const p = party && typeof party === "object" ? party : {};
+      if (field === "zipCode") {
+        return p.zipCode || p.zip || p.zipcode || "";
+      }
+      return p[field] != null ? p[field] : "";
+    }
+
+    function siteTypeLabel(meta, fallback) {
+      const t = (meta && meta.classifiedAs) || fallback;
+      if (!t) return "";
+      const labels = {
+        nursing_home: "nursing home",
+        hotel: "hotel",
+        amazon_fc: "Amazon FC",
+        menards_dc: "Menards DC",
+        aafes_military: "AAFES / military",
+        chain_store: "chain store",
+        residential: "residential",
+        other: "commercial / other",
+      };
+      return labels[t] || String(t).replace(/_/g, " ");
+    }
+
+    function displayText(value) {
+      return value == null ? "" : String(value).trim();
+    }
+
+    function renderFact(label, value, span2) {
+      const v = displayText(value);
+      return "<div class='fact" + (span2 ? " span-2" : "") + "'>" +
+        "<span class='field-label'>" + esc(label) + "</span>" +
+        "<div class='fact-value" + (v ? "" : " muted") + "'>" +
+        (v ? esc(v) : "—") + "</div></div>";
+    }
+
+    function renderAddressReadonly(party, title, enrichment, fallbackType) {
+      const p = party || {};
+      const name = displayText(partyField(p, "name"));
+      const a1 = displayText(partyField(p, "address1"));
+      const a2 = displayText(partyField(p, "address2"));
+      const city = displayText(partyField(p, "city"));
+      const state = displayText(partyField(p, "state"));
+      const zip = displayText(partyField(p, "zipCode"));
+      const country = displayText(partyField(p, "country"));
+      const phone = displayText(partyField(p, "phone"));
+      const cityLine = [city, state].filter(Boolean).join(", ") +
+        (zip ? (city || state ? " " : "") + zip : zip);
+      const lines = [a1, a2, cityLine, country, phone].filter(Boolean);
+      let html = "<div class='addr-block'>";
+      html += "<h3>" + esc(title);
+      const typeLabel = siteTypeLabel(enrichment, fallbackType);
+      if (typeLabel) {
+        const place = enrichment && enrichment.placeName ?
+          " · " + enrichment.placeName : "";
+        html += "<span class='site-type-chip'>" + esc(typeLabel + place) +
+          "</span>";
+      }
+      html += "</h3>";
+      if (name) html += "<div class='addr-name'>" + esc(name) + "</div>";
+      if (lines.length) {
+        html += "<div class='addr-lines'>" + esc(lines.join("\n")) + "</div>";
+      } else if (!name) {
+        html += "<div class='addr-missing'>No address</div>";
+      }
+      html += "</div>";
+      return html;
+    }
+
+    function renderFreightReadonly(freightInfo) {
+      const rows = Array.isArray(freightInfo) ?
+        freightInfo.filter(Boolean) : [];
+      let html = "<div class='freight-block'>";
+      html += "<h3>Freight / dimensions</h3>";
+      if (!rows.length) {
+        html += "<div class='freight-missing'>No freight lines</div></div>";
+        return html;
+      }
+      html += "<table class='freight-table'><thead><tr>" +
+        "<th>Qty</th><th>Weight</th><th>Class</th><th>L×W×H</th><th>Type</th>" +
+        "</tr></thead><tbody>";
+      rows.forEach((f) => {
+        const wt = [f.weight, f.weightType].filter((v) =>
+          v != null && v !== "").join(" ");
+        const dims = [f.length, f.width, f.height]
+            .filter((v) => v != null && v !== "").join("×");
+        const dimType = f.dimType || f.packaging || "";
+        html += "<tr>" +
+          "<td>" + esc(f.qty != null && f.qty !== "" ? f.qty : "—") + "</td>" +
+          "<td>" + esc(wt || "—") + "</td>" +
+          "<td>" + esc(f.class != null && f.class !== "" ? f.class : "—") +
+          "</td>" +
+          "<td>" + esc(dims || "—") + "</td>" +
+          "<td>" + esc(dimType || "—") + "</td>" +
+          "</tr>";
+      });
+      html += "</tbody></table>";
+      const densityRows = rows.filter((f) => f.classSource === "density");
+      if (densityRows.length) {
+        const bits = densityRows.map((f) => {
+          if (f.emailClass != null && Number(f.emailClass) !== Number(f.class)) {
+            return "email class " + f.emailClass + " → Primus " + f.class;
+          }
+          return "Primus class " + f.class;
+        });
+        html += "<p class='class-hint'>Class from Primus density " +
+          "(weight × L×W×H; email class ignored): " +
+          esc(bits.join("; ")) + ".</p>";
+      }
+      html += "</div>";
+      return html;
+    }
+
+    function rulesStorageKey(laneKey) {
+      return "qd-rules-open:" + QUOTE_ID + ":" + laneKey;
+    }
+
+    function getRulesOpen(laneKey) {
+      try {
+        return sessionStorage.getItem(rulesStorageKey(laneKey)) === "1";
+      } catch (_) {
+        return false;
+      }
+    }
+
+    function persistRulesOpen(laneKey, open) {
+      try {
+        sessionStorage.setItem(rulesStorageKey(laneKey), open ? "1" : "0");
+      } catch (_) { /* ignore */ }
+    }
+
+    function setRulesSectionOpen(section, open) {
+      if (!section) return;
+      section.classList.toggle("open", !!open);
+      const btn = section.querySelector("[data-rules-toggle]");
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+      const laneKey = section.getAttribute("data-lane");
+      if (laneKey) persistRulesOpen(laneKey, !!open);
+    }
+
+    function bindRulesSectionToggles(root) {
+      (root || document).querySelectorAll("[data-rules-toggle]").forEach((btn) => {
+        if (btn.dataset.boundRulesToggle === "1") return;
+        btn.dataset.boundRulesToggle = "1";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const section = btn.closest(".rules-section");
+          if (!section) return;
+          setRulesSectionOpen(section, !section.classList.contains("open"));
+        });
+      });
+    }
+
+    function countedAppliedRules(lane) {
+      const rules = Array.isArray(lane.appliedRules) ? lane.appliedRules : [];
+      if (rules.length) return rules.length;
+      return (lane.accessorialWhy || []).length;
+    }
+
+    function renderRulesSection(lane) {
+      const why = lane.accessorialWhy || [];
+      const n = countedAppliedRules(lane);
+      const open = getRulesOpen(lane.laneKey);
+      let body;
+      if (why.length) {
+        body = "<ul class='rules-list'>" + why.map((w) => {
+          const notes = w.notes ? " — " + w.notes : "";
+          return "<li>" + esc(w.name || "Rule") + esc(notes) + "</li>";
+        }).join("") + "</ul>";
+      } else if ((lane.accessorials || []).length) {
+        body = "<div class='rules-list' style='padding-left:0;list-style:none'>" +
+          "Applied from quote rules / address classification." +
+          (lane.accessorialLabels ? " " + esc(lane.accessorialLabels) : "") +
+          "</div>";
+      } else {
+        body = "<div class='fact-value muted'>No rules applied.</div>";
+      }
+      return "<div class='rules-section" + (open ? " open" : "") +
+        "' data-rules-section='1' data-lane='" + esc(lane.laneKey) + "'>" +
+        "<button type='button' class='rates-section-toggle' " +
+          "aria-expanded='" + (open ? "true" : "false") +
+          "' data-rules-toggle='1'>" +
+          "<span class='rates-chevron'>▶</span>" +
+          "<h4>Rules (" + n + " applied)</h4>" +
+        "</button>" +
+        "<div class='rates-list'>" + body + "</div>" +
+      "</div>";
+    }
+
+    function bindFreightEditors(root) {
+      (root || document).querySelectorAll(".btn-add-freight").forEach((btn) => {
+        if (btn.dataset.boundFreight === "1") return;
+        btn.dataset.boundFreight = "1";
+        btn.addEventListener("click", () => {
+          const block = btn.closest("[data-freight-lane]");
+          if (!block) return;
+          const tbody = block.querySelector("tbody");
+          if (!tbody) return;
+          const tr = document.createElement("tr");
+          tr.innerHTML =
+            "<td><input data-f='qty' value=''></td>" +
+            "<td><input data-f='weight' value=''></td>" +
+            "<td><select data-f='weightType'>" +
+            "<option value='total' selected>total</option>" +
+            "<option value='each'>each</option></select></td>" +
+            "<td><input data-f='class' value=''></td>" +
+            "<td><input data-f='length' value=''></td>" +
+            "<td><input data-f='width' value=''></td>" +
+            "<td><input data-f='height' value=''></td>" +
+            "<td><input data-f='dimType' value='PLT'></td>" +
+            "<td><button type='button' class='ghost btn-rm-freight' " +
+            "title='Remove line'>×</button></td>";
+          tbody.appendChild(tr);
+          const rm = tr.querySelector(".btn-rm-freight");
+          if (rm) {
+            rm.dataset.boundFreight = "1";
+            rm.addEventListener("click", () => tr.remove());
+          }
+        });
+      });
+      (root || document).querySelectorAll(".btn-rm-freight").forEach((btn) => {
+        if (btn.dataset.boundFreight === "1") return;
+        btn.dataset.boundFreight = "1";
+        btn.addEventListener("click", () => {
+          const tr = btn.closest("tr");
+          if (tr) tr.remove();
+        });
+      });
+    }
+
+    function setDetailsEditMode(on) {
+      detailsEditMode = !!on;
+      renderQuoteDetails(quote);
+      document.querySelectorAll(".lane[data-lane-key]").forEach((laneEl) => {
+        const laneKey = laneEl.getAttribute("data-lane-key");
+        const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+        const holder = laneEl.querySelector("[data-lane-summary]");
+        if (!holder || !lane) return;
+        holder.innerHTML = renderLaneSummaryBody(lane);
+        if (detailsEditMode) bindFreightEditors(holder);
+      });
+    }
+
+    function renderAddressEditor(prefix, party, title, enrichment, fallbackType) {
+      const p = party || {};
+      let html = "<div class='addr-block addr-edit' data-addr='" + esc(prefix) + "'>";
+      html += "<h3>" + esc(title);
+      const typeLabel = siteTypeLabel(enrichment, fallbackType);
+      if (typeLabel) {
+        const place = enrichment && enrichment.placeName ?
+          " · " + enrichment.placeName : "";
+        html += "<span class='site-type-chip'>" + esc(typeLabel + place) +
+          "</span>";
+      }
+      html += "</h3>";
+      html += "<label class='field-label'>Name</label>" +
+        "<input class='field-input' data-f='name' value='" +
+        esc(partyField(p, "name")) + "'>";
+      html += "<label class='field-label'>Address 1</label>" +
+        "<input class='field-input' data-f='address1' value='" +
+        esc(partyField(p, "address1")) + "'>";
+      html += "<label class='field-label'>Address 2</label>" +
+        "<input class='field-input' data-f='address2' value='" +
+        esc(partyField(p, "address2")) + "'>";
+      html += "<div class='addr-row cols-3'>";
+      html += "<div><label class='field-label'>City</label>" +
+        "<input class='field-input' data-f='city' value='" +
+        esc(partyField(p, "city")) + "'></div>";
+      html += "<div><label class='field-label'>State</label>" +
+        "<input class='field-input' data-f='state' value='" +
+        esc(partyField(p, "state")) + "'></div>";
+      html += "<div><label class='field-label'>Zip</label>" +
+        "<input class='field-input' data-f='zipCode' value='" +
+        esc(partyField(p, "zipCode")) + "'></div>";
+      html += "</div>";
+      html += "<div class='addr-row cols-2'>";
+      html += "<div><label class='field-label'>Country</label>" +
+        "<input class='field-input' data-f='country' value='" +
+        esc(partyField(p, "country") || "US") + "'></div>";
+      html += "<div><label class='field-label'>Phone</label>" +
+        "<input class='field-input' data-f='phone' value='" +
+        esc(partyField(p, "phone")) + "'></div>";
+      html += "</div></div>";
+      return html;
+    }
+
+    function renderFreightEditor(laneKey, freightInfo) {
+      const rows = Array.isArray(freightInfo) && freightInfo.length ?
+        freightInfo.slice() : [{
+          qty: "", weight: "", weightType: "total", class: "",
+          length: "", width: "", height: "", dimType: "PLT",
+        }];
+      let html = "<div class='freight-block' data-freight-lane='" +
+        esc(laneKey) + "'>";
+      html += "<h3>Freight / dimensions</h3>";
+      html += "<table class='freight-edit'><thead><tr>" +
+        "<th>Qty</th><th>Weight</th><th>Wt type</th><th>Class</th>" +
+        "<th>L</th><th>W</th><th>H</th><th>Dim type</th><th></th>" +
+        "</tr></thead><tbody>";
+      rows.forEach((f, i) => {
+        const wt = f.weightType === "each" ? "each" : "total";
+        html += "<tr data-freight-row='" + i + "'>";
+        ["qty", "weight"].forEach((k) => {
+          html += "<td><input data-f='" + k + "' value='" +
+            esc(f[k] != null ? f[k] : "") + "'></td>";
+        });
+        html += "<td><select data-f='weightType'>" +
+          "<option value='total'" + (wt === "total" ? " selected" : "") +
+          ">total</option>" +
+          "<option value='each'" + (wt === "each" ? " selected" : "") +
+          ">each</option></select></td>";
+        html += "<td><input data-f='class' value='" +
+          esc(f.class != null ? f.class : "") + "'" +
+          (f.classSource === "density" ?
+            " title='Primus density class from weight and L×W×H'" : "") +
+          "></td>";
+        ["length", "width", "height"].forEach((k) => {
+          html += "<td><input data-f='" + k + "' value='" +
+            esc(f[k] != null ? f[k] : "") + "'></td>";
+        });
+        html += "<td><input data-f='dimType' value='" +
+          esc(f.dimType || f.packaging || "PLT") + "'></td>";
+        html += "<td><button type='button' class='ghost btn-rm-freight' " +
+          "title='Remove line'>×</button></td>";
+        html += "</tr>";
+      });
+      html += "</tbody></table>";
+      const densityRows = rows.filter((f) => f.classSource === "density");
+      if (densityRows.length) {
+        const bits = densityRows.map((f) => {
+          if (f.emailClass != null && Number(f.emailClass) !== Number(f.class)) {
+            return "email class " + f.emailClass + " → Primus " + f.class;
+          }
+          return "Primus class " + f.class;
+        });
+        html += "<p class='class-hint'>Class from Primus density " +
+          "(weight × L×W×H; email class ignored): " +
+          esc(bits.join("; ")) + ".</p>";
+      }
+      html += "<button type='button' class='ghost btn-add-freight' " +
+        "data-lane='" + esc(laneKey) +
+        "' style='margin-top:8px'>Add freight line</button>";
+      html += "</div>";
+      return html;
+    }
+
+    function readAddressBlock(root, selector) {
+      const block = root.querySelector(selector);
+      if (!block) return null;
+      const out = {};
+      block.querySelectorAll("[data-f]").forEach((el) => {
+        out[el.getAttribute("data-f")] = el.value;
+      });
+      return out;
+    }
+
+    function readFreightBlock(root, laneKey) {
+      const block = root.querySelector(
+          '[data-freight-lane="' + laneKey + '"]');
+      if (!block) return [];
+      const rows = [];
+      block.querySelectorAll("tbody tr").forEach((tr) => {
+        const row = {};
+        tr.querySelectorAll("[data-f]").forEach((el) => {
+          row[el.getAttribute("data-f")] = el.value;
+        });
+        rows.push(row);
+      });
+      return rows;
+    }
+
+    function collectQuoteDetailsPayload() {
+      const detailsRoot = document.getElementById("quote-details");
+      const val = (sel) => {
+        const node = detailsRoot && detailsRoot.querySelector(sel);
+        return node ? node.value : "";
+      };
+      const payload = {
+        customerRef: val("[data-q='customerRef']"),
+        shippingLocationName: val("[data-q='customerName']"),
+        readyDate: val("[data-q='readyDate']"),
+        specialInstructionsGlobal: val("[data-q='specialGlobal']"),
+        shipper: readAddressBlock(detailsRoot, "[data-addr='quote-shipper']"),
+        lanes: [],
+      };
+      document.querySelectorAll(".lane[data-lane-key]").forEach((laneEl) => {
+        const laneKey = laneEl.getAttribute("data-lane-key");
+        payload.lanes.push({
+          laneKey,
+          shipper: readAddressBlock(laneEl, "[data-addr='shipper']"),
+          consignee: readAddressBlock(laneEl, "[data-addr='consignee']"),
+          freightInfo: readFreightBlock(laneEl, laneKey),
+          specialInstructions: (laneEl.querySelector("[data-lane-special]") ||
+            {value: ""}).value,
+        });
+      });
+      return payload;
+    }
+
+    function renderQuoteDetails(q) {
+      const el = document.getElementById("quote-details");
+      if (!el) return;
+      if (!detailsEditMode) {
+        let html = "<div class='details-head'><h3>Quote details</h3>" +
+          "<button type='button' class='ghost' id='btn-edit-details'>" +
+          "Edit</button></div>";
+        html += "<div class='facts-grid'>";
+        html += renderFact("Customer", q.shippingLocationName);
+        html += renderFact("Primus match",
+            q.customerMatched && q.shippingLocationId ?
+              ("Matched · ID " + q.shippingLocationId) :
+              (q.customerMatchMessage || "No Primus match"));
+        html += renderFact("Customer ref", q.customerRef);
+        html += renderFact("Ready date",
+            (q.readyDate || "").toString().slice(0, 10));
+        html += renderFact("Special instructions",
+            q.specialInstructionsGlobal, true);
+        html += "</div>";
+        html += renderAddressReadonly(
+            q.shipper, "Default from (shipper)",
+            q.originEnrichmentMeta, q.originSiteType);
+        const accBits = (q.lanes || []).map((lane) => {
+          const labels = lane.accessorialLabels ||
+            (lane.accessorials || []).join(", ");
+          if (!labels) return "";
+          return (lane.label || lane.laneKey) + ": " + labels;
+        }).filter(Boolean);
+        if (accBits.length) {
+          html += "<div class='facts-grid' style='margin-top:12px'>" +
+            renderFact("Accessorials", accBits.join("\n"), true) +
+            "</div>";
+        }
+        el.innerHTML = html;
+        document.getElementById("btn-edit-details")
+            .addEventListener("click", () => setDetailsEditMode(true));
+        return;
+      }
+
+      let html = "<div class='details-head'><h3>Quote details</h3>" +
+        "<button type='button' class='ghost' id='btn-cancel-details'>" +
+        "Cancel</button></div>";
+      html += "<p class='class-hint' style='margin:0 0 10px'>" +
+        "From, To, and freight are editable in each lane below.</p>";
+      html += "<div class='details-grid'>";
+      html += "<div><label class='field-label'>Customer name</label>" +
+        "<input class='field-input' data-q='customerName' value='" +
+        esc(q.shippingLocationName || "") + "'></div>";
+      html += "<div><label class='field-label'>Primus customer ID</label>" +
+        "<input class='field-input' data-q='shippingLocationId' readonly " +
+        "value='" + esc(q.shippingLocationId || "") + "'></div>";
+      html += "<div><label class='field-label'>Customer ref</label>" +
+        "<input class='field-input' data-q='customerRef' value='" +
+        esc(q.customerRef || "") + "'></div>";
+      html += "<div><label class='field-label'>Ready date</label>" +
+        "<input class='field-input' data-q='readyDate' type='date' value='" +
+        esc((q.readyDate || "").toString().slice(0, 10)) + "'></div>";
+      html += "<div class='span-2'><label class='field-label'>" +
+        "Special instructions (global)</label>" +
+        "<textarea class='field-textarea' data-q='specialGlobal'>" +
+        esc(q.specialInstructionsGlobal || "") + "</textarea></div>";
+      html += "</div>";
+      html += renderAddressEditor(
+          "quote-shipper", q.shipper, "Default from (shipper)",
+          q.originEnrichmentMeta, q.originSiteType);
+      html += "<div class='details-actions'>" +
+        "<button type='button' id='btn-save-details'>Save details</button>" +
+        "<button type='button' class='ghost' id='btn-save-rerate'>" +
+        "Save details &amp; rerun rates</button>" +
+        "</div>";
+      el.innerHTML = html;
+
+      document.getElementById("btn-cancel-details")
+          .addEventListener("click", () => setDetailsEditMode(false));
+
+      const save = async (rerun) => {
+        const btn = document.getElementById(
+            rerun ? "btn-save-rerate" : "btn-save-details");
+        const other = document.getElementById(
+            rerun ? "btn-save-details" : "btn-save-rerate");
+        btn.disabled = true;
+        other.disabled = true;
+        const prev = btn.textContent;
+        btn.textContent = rerun ? "Saving & re-rating…" : "Saving…";
+        try {
+          const details = collectQuoteDetailsPayload();
+          const res = await apiFetch("/updateQuoteDetails", {
+            method: "POST",
+            body: JSON.stringify({
+              tenantId: TENANT_ID,
+              quoteId: QUOTE_ID,
+              details,
+              dispatcherId: DISPATCHER_ID || undefined,
+              token: TOKEN || undefined,
+            }),
+          });
+          if (!res.ok) throw new Error(res.error || "Save details failed");
+          if (rerun) {
+            const rateRes = await apiFetch("/rerunQuoteRates", {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: QUOTE_ID,
+                dispatcherId: DISPATCHER_ID || undefined,
+                token: TOKEN || undefined,
+              }),
+            });
+            if (!rateRes.ok) {
+              throw new Error(rateRes.error || "Rerun rates failed");
+            }
+            applyQuote(rateRes.quote);
+            const emptyLane = (rateRes.quote && rateRes.quote.lanes || [])
+                .find((l) => !(l.options || []).length);
+            if (emptyLane && emptyLane.rateError) {
+              showMsg(emptyLane.rateError, false);
+            } else if (rateRes.customerMatchMessage) {
+              showMsg(rateRes.customerMatchMessage +
+                " — rates used prior customer id if any.", true);
+            } else if (rateRes.customerMatch && rateRes.customerMatch.id) {
+              const warn = (rateRes.quote.lanes || [])
+                  .map((l) => l.rateWarning).find(Boolean);
+              showMsg("Details saved, Primus customer matched (" +
+                (rateRes.customerMatch.name || rateRes.customerMatch.id) +
+                "), rates refreshed." +
+                (warn ? " " + warn : ""), true);
+            } else {
+              showMsg("Details saved and rates refreshed.", true);
+            }
+          } else {
+            applyQuote(res.quote);
+            if (res.customerMatchMessage) {
+              showMsg(res.customerMatchMessage, true);
+            } else if (res.customerMatch && res.customerMatch.id) {
+              showMsg("Details saved. Primus customer: " +
+                (res.customerMatch.name || res.customerMatch.id) +
+                ". Rerun rates to refresh carrier options.", true);
+            } else {
+              showMsg(
+                  "Details saved. Rerun rates to refresh carrier options.",
+                  true);
+            }
+          }
+        } catch (err) {
+          showMsg(err.message || "Save details failed", false);
+        } finally {
+          if (btn.isConnected) {
+            btn.disabled = false;
+            other.disabled = false;
+            btn.textContent = prev;
+          }
+        }
+      };
+      document.getElementById("btn-save-details")
+          .addEventListener("click", () => save(false));
+      document.getElementById("btn-save-rerate")
+          .addEventListener("click", () => save(true));
+    }
+
+    function renderLaneSummaryBody(lane) {
+      if (!detailsEditMode) {
+        let html = renderAddressReadonly(
+            lane.shipper || (quote && quote.shipper) || null,
+            "From (shipper)",
+            lane.originEnrichmentMeta,
+            lane.originSiteType);
+        html += renderAddressReadonly(
+            lane.consignee || null, "To (consignee)",
+            lane.enrichmentMeta, lane.siteType);
+        html += renderFreightReadonly(lane.freightInfo);
+        html += renderFact("Special instructions (lane)",
+            lane.specialInstructions, true);
+        if (lane.accessorialLabels || (lane.accessorials || []).length) {
+          html += renderFact("Accessorials",
+              lane.accessorialLabels || (lane.accessorials || []).join(", "),
+              true);
+        }
+        if (lane.rateWarning || lane.rateError) {
+          html += "<div class='warn span-2' style='grid-column:1/-1'>" +
+            esc(lane.rateError || lane.rateWarning) + "</div>";
+        }
+        if (lane.notesForCustomer) {
+          html += "<div class='dispatcher-note span-2' style='grid-column:1/-1'>" +
+            "<strong>Dispatcher note (not emailed)</strong>" +
+            esc(lane.notesForCustomer) + "</div>";
+        }
+        return html;
+      }
+      let html = "";
+      html += renderAddressEditor(
+          "shipper",
+          lane.shipper || (quote && quote.shipper) || null,
+          "From (shipper)",
+          lane.originEnrichmentMeta,
+          lane.originSiteType);
+      html += renderAddressEditor(
+          "consignee", lane.consignee || null, "To (consignee)",
+          lane.enrichmentMeta, lane.siteType);
+      html += renderFreightEditor(lane.laneKey, lane.freightInfo);
+      html += "<div class='span-2' style='grid-column:1/-1'>" +
+        "<label class='field-label'>Special instructions (lane)</label>" +
+        "<textarea class='field-textarea' data-lane-special>" +
+        esc(lane.specialInstructions || "") + "</textarea></div>";
+      if (lane.notesForCustomer) {
+        html += "<div class='dispatcher-note span-2' style='grid-column:1/-1'>" +
+          "<strong>Dispatcher note (not emailed)</strong>" +
+          esc(lane.notesForCustomer) + "</div>";
+      }
+      return html;
+    }
+
+    function renderLaneSummary(lane) {
+      return "<div class='lane-summary' data-lane-summary='1'>" +
+        renderLaneSummaryBody(lane) + "</div>";
+    }
+
+    function countCheckedInItems(items, accSet) {
+      let n = 0;
+      (items || []).forEach((a) => {
+        if (a && a.code && accSet.has(a.code)) n += 1;
+      });
+      return n;
+    }
+
+    function renderAccOptionsHtml(items, accSet, laneKey) {
+      let html = "";
+      (items || []).forEach((a) => {
+        const code = a.code || "";
+        const label = a.label || a.name || code;
+        const selectable = a.selectable !== false && !!code;
+        const checked = code && accSet.has(code) ? " checked" : "";
+        const disabled = selectable ? "" : " disabled";
+        const cls = selectable ? "" : " disabled";
+        const search = (label + " " + code).toLowerCase();
+        html += "<label class='" + cls + "' data-search='" + esc(search) + "'>" +
+          "<input type='checkbox' data-acc='" + esc(code) +
+          "' data-lane='" + esc(laneKey) + "'" + checked + disabled + "> " +
+          "<span>" + esc(label) +
+          (code ? " <span class='code'>(" + esc(code) + ")</span>" : "") +
+          "</span></label>";
+      });
+      return html;
+    }
+
+    function renderAccSection(sectionKey, title, items, accSet, laneKey, opts) {
+      const loaded = !!(opts && opts.loaded);
+      const loading = !!(opts && opts.loading);
+      const checkedCount = loaded ?
+        countCheckedInItems(items, accSet) :
+        (accSet && accSet.size) || 0;
+      let countLabel;
+      if (loading) countLabel = "Loading…";
+      else if (!loaded) countLabel = checkedCount ?
+        checkedCount + " selected · expand to edit" :
+        "Expand to load";
+      else if (checkedCount) countLabel = checkedCount + " selected";
+      else countLabel = (items || []).length + " options";
+
+      let html = "<div class='acc-section' data-section='" + sectionKey + "'>";
+      html += "<button type='button' class='acc-section-toggle' " +
+        "aria-expanded='false' data-acc-toggle='1'>" +
+        "<span class='acc-chevron'>▶</span>" +
+        "<h4>" + esc(title) + "</h4>" +
+        "<span class='acc-count'>" + esc(countLabel) + "</span>" +
+        "</button>";
+      html += "<div class='acc-list' data-acc-list='1'>";
+      if (loading) {
+        html += "<div class='empty' style='padding:8px'>Loading accessorials…</div>";
+      } else if (loaded) {
+        html += renderAccOptionsHtml(items, accSet, laneKey);
+      }
+      html += "</div></div>";
+      return html;
+    }
+
+    function bindAccCheckboxHandlers(root) {
+      (root || document).querySelectorAll("input[data-acc]").forEach((input) => {
+        if (input.dataset.boundAcc === "1") return;
+        input.dataset.boundAcc = "1";
+        input.addEventListener("change", () => {
+          const laneKey = input.dataset.lane;
+          const code = input.dataset.acc;
+          if (!code) return;
+          const set = new Set(laneAccessorials[laneKey] || []);
+          if (input.checked) set.add(code);
+          else set.delete(code);
+          laneAccessorials[laneKey] = [...set];
+        });
+      });
+    }
+
+    function fillAccPanel(panel, cat) {
+      if (!panel || !cat) return;
+      const laneKey = panel.getAttribute("data-lane-acc");
+      const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey) || {};
+      const accSet = new Set(laneAccessorials[laneKey] || lane.accessorials || []);
+      const openSections = {};
+      panel.querySelectorAll(".acc-section").forEach((section) => {
+        openSections[section.getAttribute("data-section")] =
+          section.classList.contains("open");
+      });
+      const searchEl = panel.querySelector(".acc-search");
+      const searchVal = searchEl ? searchEl.value : "";
+
+      const sectionsHost = panel.querySelector(".acc-sections");
+      if (!sectionsHost) return;
+      sectionsHost.innerHTML =
+        renderAccSection("origin", "Origin (pickup)", cat.origin, accSet, laneKey,
+            {loaded: true}) +
+        renderAccSection("destination", "Destination (delivery)", cat.destination,
+            accSet, laneKey, {loaded: true}) +
+        renderAccSection("other", "Other", cat.other, accSet, laneKey,
+            {loaded: true});
+
+      sectionsHost.querySelectorAll(".acc-section").forEach((section) => {
+        const key = section.getAttribute("data-section");
+        if (openSections[key]) {
+          section.classList.add("open");
+          const btn = section.querySelector("[data-acc-toggle]");
+          if (btn) btn.setAttribute("aria-expanded", "true");
+        }
+      });
+      bindAccSectionToggles(panel);
+      bindAccCheckboxHandlers(panel);
+      if (searchEl && searchVal) {
+        searchEl.value = searchVal;
+        searchEl.dispatchEvent(new Event("input"));
+      }
+    }
+
+    async function ensureCatalogForPanel(panel, openSection) {
+      if (!panel) return;
+      const sectionKey = openSection && openSection.getAttribute ?
+        openSection.getAttribute("data-section") : null;
+
+      function openByKey(key) {
+        if (!key) return;
+        const fresh = panel.querySelector(
+            '.acc-section[data-section="' + key + '"]');
+        if (!fresh) return;
+        fresh.classList.add("open");
+        const btn = fresh.querySelector("[data-acc-toggle]");
+        if (btn) btn.setAttribute("aria-expanded", "true");
+      }
+
+      if (accessorialCatalog) {
+        if (!panel.dataset.accFilled) {
+          fillAccPanel(panel, accessorialCatalog);
+          panel.dataset.accFilled = "1";
+        }
+        openByKey(sectionKey);
+        return;
+      }
+      panel.querySelectorAll(".acc-section").forEach((section) => {
+        const list = section.querySelector("[data-acc-list]");
+        const count = section.querySelector(".acc-count");
+        if (list) {
+          list.innerHTML =
+            "<div class='empty' style='padding:8px'>Loading accessorials…</div>";
+        }
+        if (count) count.textContent = "Loading…";
+      });
+      openByKey(sectionKey);
+      const cat = await ensureAccessorialCatalog();
+      fillAccPanel(panel, cat);
+      panel.dataset.accFilled = "1";
+      openByKey(sectionKey);
+    }
+
+    function bindAccSectionToggles(root) {
+      (root || document).querySelectorAll("[data-acc-toggle]").forEach((btn) => {
+        if (btn.dataset.boundToggle === "1") return;
+        btn.dataset.boundToggle = "1";
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const section = btn.closest(".acc-section");
+          const panel = btn.closest(".acc-panel");
+          if (!section || !panel) return;
+          const willOpen = !section.classList.contains("open");
+          if (willOpen) {
+            await ensureCatalogForPanel(panel, section);
+          } else {
+            section.classList.remove("open");
+            btn.setAttribute("aria-expanded", "false");
+          }
+        });
+      });
+    }
+
+    function ratesSectionCountLabel(rateCount, selectedCount) {
+      if (!rateCount) return "No rates";
+      if (selectedCount) {
+        return selectedCount + " selected · check to include in email";
+      }
+      return rateCount + " options · check to include in email";
+    }
+
+    function updateRatesSectionCount(laneEl, selectedCount) {
+      if (!laneEl) return;
+      const countEl = laneEl.querySelector(".rates-section .rates-count");
+      if (!countEl) return;
+      const laneKey = laneEl.getAttribute("data-lane-key");
+      const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+      const rateCount = ((lane && lane.options) || []).length;
+      countEl.textContent = ratesSectionCountLabel(rateCount, selectedCount);
+    }
+
+    function setRatesSectionOpen(section, open) {
+      if (!section) return;
+      section.classList.toggle("open", !!open);
+      const btn = section.querySelector("[data-rates-toggle]");
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    function collapseRatesSections(root) {
+      (root || document).querySelectorAll(".rates-section").forEach((section) => {
+        setRatesSectionOpen(section, false);
+      });
+    }
+
+    function bindRatesSectionToggles(root) {
+      (root || document).querySelectorAll("[data-rates-toggle]").forEach((btn) => {
+        if (btn.dataset.boundRatesToggle === "1") return;
+        btn.dataset.boundRatesToggle = "1";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const section = btn.closest(".rates-section");
+          if (!section) return;
+          setRatesSectionOpen(section, !section.classList.contains("open"));
+        });
+      });
+    }
+
+    function renderLanes() {
+      const root = document.getElementById("lanes");
+      root.innerHTML = "";
+      const cat = accessorialCatalog;
+      const loaded = !!cat;
+
+      (quote.lanes || []).forEach((lane, idx) => {
+        const div = document.createElement("div");
+        div.className = "lane" + (idx === 0 ? " open" : "");
+        div.setAttribute("data-lane-key", lane.laneKey);
+        const selected = new Set(selections[lane.laneKey] || []);
+        const accSet = new Set(laneAccessorials[lane.laneKey] || lane.accessorials || []);
+
+        const whyHtml = renderRulesSection(lane);
+
+        let toggles = "<div class='acc-panel' data-lane-acc='" + esc(lane.laneKey) + "'" +
+          (loaded ? " data-acc-filled='1'" : "") + ">";
+        toggles += "<input type='search' class='acc-search' placeholder='Search accessorials…' " +
+          "data-lane='" + esc(lane.laneKey) + "'>";
+        toggles += "<div class='acc-sections'>";
+        toggles += renderAccSection("origin", "Origin (pickup)",
+            loaded ? cat.origin : [], accSet, lane.laneKey, {loaded});
+        toggles += renderAccSection("destination", "Destination (delivery)",
+            loaded ? cat.destination : [], accSet, lane.laneKey, {loaded});
+        toggles += renderAccSection("other", "Other",
+            loaded ? cat.other : [], accSet, lane.laneKey, {loaded});
+        toggles += "</div>";
+        toggles += "<button type='button' class='ghost btn-rerun' data-lane='" +
+          esc(lane.laneKey) + "'>Rerun quote with these accessorials</button>";
+        toggles += "</div>";
+
+        let optsHtml = "";
+        if (lane.rateError) {
+          optsHtml = "<div class='warn'>Rate error: " + esc(lane.rateError) + "</div>";
+        } else if (lane.rateWarning) {
+          optsHtml = "<div class='warn'>" + esc(lane.rateWarning) + "</div>";
+        }
+        if (lane.rateSource === "market_fallback" && !lane.rateWarning) {
+          optsHtml += "<div class='warn'>Primus customer matched but no " +
+            "customer tariffs — showing market rates.</div>";
+        }
+        uniqueWarns(lane.extractionWarnings).forEach((w) => {
+          if (lane.rateWarning && lane.rateWarning.indexOf(w) >= 0) return;
+          if (w === "market fallback" && lane.rateSource === "market_fallback") {
+            return;
+          }
+          optsHtml += "<div class='warn'>" + esc(w) + "</div>";
+        });
+        (lane.options || []).forEach((opt) => {
+          const isChecked = selected.has(String(opt.rateId));
+          const rateId = String(opt.rateId);
+          const custVal = customerPrices[lane.laneKey] &&
+            customerPrices[lane.laneKey][rateId] != null ?
+            customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
+          const custStr = custVal === "" || custVal == null ? "" :
+            (isFinite(Number(custVal)) ?
+              String(Math.ceil(Number(custVal))) : "");
+          const sellHint = Number(opt.sellRate);
+          const showSuggested = isFinite(sellHint) &&
+            Number(custVal) !== Math.ceil(sellHint);
+          optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
+            <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(opt.rateId)}"${isChecked ? " checked" : ""}>
+            <div>
+              <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
+              <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
+              <div class="rate-row">
+                <span class="rate-cost">Cost $${num(opt.cost)}</span>
+                <label class="customer-rate-field">Customer rate $
+                  <input type="number" min="1" step="1"
+                    data-customer-rate="1"
+                    data-lane="${esc(lane.laneKey)}"
+                    data-rate="${esc(opt.rateId)}"
+                    value="${esc(custStr)}">
+                </label>
+                ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
+                <span class="rate-meta">${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}${opt.costQuoteId ? " · saved" : ""}</span>
+              </div>
+              ${(() => {
+                const note = cleanNote(opt.warnings);
+                return note ? '<div class="warn">'+esc(note.slice(0,200))+'</div>' : "";
+              })()}
+            </div>
+          </div>`;
+        });
+        if (!(lane.options || []).length && !lane.rateError) {
+          optsHtml = "<p style='color:var(--muted);font-size:0.875rem'>No rates returned.</p>";
+        }
+
+        const ratesCountLabel = ratesSectionCountLabel(
+            (lane.options || []).length, selected.size);
+        const ratesSectionHtml =
+          "<div class='rates-section open' data-rates-section='1'>" +
+            "<button type='button' class='rates-section-toggle' " +
+              "aria-expanded='true' data-rates-toggle='1'>" +
+              "<span class='rates-chevron'>▶</span>" +
+              "<h4>Cheapest rates</h4>" +
+              "<span class='rates-count'>" + esc(ratesCountLabel) + "</span>" +
+            "</button>" +
+            "<div class='rates-list'>" + optsHtml + "</div>" +
+          "</div>";
+
+        div.innerHTML =
+          "<div class='lane-head'>" +
+            "<span class='chevron'>▶</span>" +
+            "<h2>" + esc(lane.label || lane.laneKey) + "</h2>" +
+            "<span style='color:var(--muted);font-size:0.8125rem'>" +
+              (lane.options || []).length + " rates · " +
+              selected.size + " selected</span>" +
+          "</div>" +
+          "<div class='lane-body'>" +
+            renderLaneSummary(lane) +
+            whyHtml +
+            "<p style='margin:0 0 4px;font-size:0.8125rem;font-weight:600;color:var(--text-secondary)'>Accessorials for re-rate</p>" +
+            toggles +
+            ratesSectionHtml +
+          "</div>";
+        root.appendChild(div);
+      });
+
+      root.querySelectorAll(".lane-head").forEach((el) => {
+        el.addEventListener("click", () => {
+          el.parentElement.classList.toggle("open");
+        });
+      });
+
+      bindRatesSectionToggles(root);
+      bindRulesSectionToggles(root);
+      bindAccSectionToggles(root);
+      bindAccCheckboxHandlers(root);
+      if (detailsEditMode) bindFreightEditors(root);
+
+      root.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
+        input.addEventListener("change", () => {
+          const laneKey = input.dataset.lane;
+          const rateId = String(input.dataset.rate);
+          const set = new Set(selections[laneKey] || []);
+          if (input.checked) set.add(rateId);
+          else set.delete(rateId);
+          selections[laneKey] = [...set];
+          input.closest(".opt").classList.toggle("checked", input.checked);
+          const laneEl = input.closest(".lane");
+          const headMeta = laneEl && laneEl.querySelector(".lane-head span:last-child");
+          if (headMeta) {
+            const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+            headMeta.textContent =
+              ((lane && lane.options) || []).length + " rates · " +
+              set.size + " selected";
+          }
+          updateRatesSectionCount(laneEl, set.size);
+          draftReady = false;
+          document.getElementById("btn-approve").disabled = true;
+          persistSelections();
+        });
+      });
+
+      root.querySelectorAll("input[data-customer-rate]").forEach((input) => {
+        const sync = () => {
+          const laneKey = input.dataset.lane;
+          const rateId = String(input.dataset.rate);
+          if (!customerPrices[laneKey]) customerPrices[laneKey] = {};
+          customerPrices[laneKey][rateId] = input.value;
+          draftReady = false;
+          document.getElementById("btn-approve").disabled = true;
+        };
+        input.addEventListener("click", (e) => e.stopPropagation());
+        input.addEventListener("mousedown", (e) => e.stopPropagation());
+        input.addEventListener("change", () => {
+          sync();
+          persistSelections();
+        });
+        input.addEventListener("blur", () => {
+          sync();
+          persistSelections();
+        });
+      });
+
+      root.querySelectorAll(".acc-search").forEach((input) => {
+        input.addEventListener("focus", () => {
+          const panel = input.closest(".acc-panel");
+          ensureCatalogForPanel(panel, null);
+        });
+        input.addEventListener("input", async () => {
+          const panel = input.closest(".acc-panel");
+          if (!panel) return;
+          if (!accessorialCatalog) {
+            await ensureCatalogForPanel(panel, null);
+          }
+          const q = String(input.value || "").trim().toLowerCase();
+          panel.querySelectorAll("label[data-search]").forEach((lab) => {
+            const hay = lab.getAttribute("data-search") || "";
+            lab.classList.toggle("hidden-acc", q && hay.indexOf(q) < 0);
+          });
+          // While searching, auto-expand sections that still have matches.
+          panel.querySelectorAll(".acc-section").forEach((section) => {
+            const btn = section.querySelector("[data-acc-toggle]");
+            if (!q) {
+              section.classList.remove("open");
+              if (btn) btn.setAttribute("aria-expanded", "false");
+              return;
+            }
+            const visible = section.querySelectorAll(
+                "label[data-search]:not(.hidden-acc)");
+            const open = visible.length > 0;
+            section.classList.toggle("open", open);
+            if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+          });
+        });
+      });
+
+      root.querySelectorAll(".btn-rerun").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          const laneKey = btn.dataset.lane;
+          btn.disabled = true;
+          btn.textContent = "Re-rating…";
+          try {
+            const codes = laneAccessorials[laneKey] || [];
+            const res = await apiFetch("/rerunQuoteRates", {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: QUOTE_ID,
+                laneKey,
+                accessorials: codes.map((code) => ({code})),
+                accessorialsWithData: codes.map((code) => ({code})),
+                dispatcherId: DISPATCHER_ID || undefined,
+                token: TOKEN || undefined,
+              }),
+            });
+            if (!res.ok) throw new Error(res.error || "Rerun failed");
+            applyQuote(res.quote);
+            showMsg("Rates refreshed for this lane.", true);
+          } catch (err) {
+            showMsg(err.message || "Rerun failed", false);
+            btn.disabled = false;
+            btn.textContent = "Rerun quote with these accessorials";
+          }
+        });
+      });
+    }
+
+    document.getElementById("btn-generate").addEventListener("click", async () => {
+      const checked = collectSelections().some((s) => s.rateIds.length);
+      if (!checked) {
+        showMsg("Check at least one rate before generating the email.", false);
+        return;
+      }
+      const missing = validateCheckedCustomerRates();
+      if (missing.length) {
+        showMsg(
+            "Set a customer rate (> 0) for: " + missing.join(", "),
+            false);
+        return;
+      }
+      const btn = document.getElementById("btn-generate");
+      btn.disabled = true;
+      const prevLabel = btn.textContent;
+      btn.textContent = "Saving rates…";
+      try {
+        const res = await apiFetch("/generateQuoteEmail", {
+          method: "POST",
+          body: JSON.stringify({
+            tenantId: TENANT_ID,
+            quoteId: QUOTE_ID,
+            selections: collectSelections(),
+            style: "bullet",
+            dispatcherId: DISPATCHER_ID || undefined,
+            token: TOKEN || undefined,
+          }),
+        });
+        if (!res.ok) throw new Error(res.error || "Generate failed");
+        if (res.quote) applyQuote(res.quote);
+        document.getElementById("draft-text").value = res.text || "";
+        draftReady = true;
+        document.getElementById("btn-approve").disabled = false;
+        document.getElementById("btn-copy").disabled = false;
+        document.getElementById("status-badge").textContent = "draft_ready";
+        document.getElementById("status-badge").className = "badge draft_ready";
+        collapseRatesSections();
+        const draftEl = document.querySelector(".draft");
+        if (draftEl && draftEl.scrollIntoView) {
+          draftEl.scrollIntoView({behavior: "smooth", block: "nearest"});
+        }
+        const failed = (res.saveResults || []).filter((r) => !r.ok);
+        if (res.partial || failed.length) {
+          const names = failed.map((r) => r.name || r.rateId).join(", ");
+          showMsg(
+              "Draft generated for " + (res.savedCount || 0) +
+              " saved rate(s). Failed to save: " + names +
+              ". Failed rates were left out of the email.",
+              false);
+        } else {
+          showMsg(
+              "Rates saved to Primus and email draft generated. " +
+              "Review, then Approve to send.",
+              true);
+        }
+      } catch (err) {
+        showMsg(err.message || "Generate failed", false);
+      } finally {
+        btn.disabled = quote &&
+          (quote.status === "sent" || quote.status === "dismissed");
+        btn.textContent = prevLabel;
+      }
+    });
+
+    document.getElementById("btn-approve").addEventListener("click", async () => {
+      const missing = validateCheckedCustomerRates();
+      if (missing.length) {
+        showMsg(
+            "Set a customer rate (> 0) for: " + missing.join(", "),
+            false);
+        return;
+      }
+      if (!confirm("Send this email to the customer via your connected Outlook?")) return;
+      try {
+        const res = await apiFetch("/approveQuoteEmail", {
+          method: "POST",
+          body: JSON.stringify({
+            tenantId: TENANT_ID,
+            quoteId: QUOTE_ID,
+            bodyText: document.getElementById("draft-text").value,
+            dispatcherId: DISPATCHER_ID || undefined,
+            token: TOKEN || undefined,
+          }),
+        });
+        if (!res.ok) throw new Error(res.error || "Send failed");
+        document.getElementById("status-badge").textContent = "sent";
+        document.getElementById("status-badge").className = "badge sent";
+        document.getElementById("btn-approve").disabled = true;
+        document.getElementById("btn-generate").disabled = true;
+        document.getElementById("btn-dismiss").disabled = true;
+        showMsg("Email sent to " + (res.to && res.to.join(", ")) + ".", true);
+      } catch (err) {
+        showMsg(err.message || "Send failed", false);
+      }
+    });
+
+    document.getElementById("btn-dismiss").addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const btn = document.getElementById("btn-dismiss");
+      if (btn.disabled) return;
+      if (btn.getAttribute("data-confirm") !== "1") {
+        btn.setAttribute("data-confirm", "1");
+        btn.textContent = "Confirm dismiss?";
+        setTimeout(() => {
+          if (btn.getAttribute("data-confirm") === "1" && !btn.disabled) {
+            btn.removeAttribute("data-confirm");
+            btn.textContent = "Dismiss";
+          }
+        }, 4000);
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "Dismissing…";
+      try {
+        const res = await apiFetch(
+            "/dismissQuote?tenantId=" + encodeURIComponent(TENANT_ID) +
+            "&quoteId=" + encodeURIComponent(QUOTE_ID), {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: QUOTE_ID,
+                id: QUOTE_ID,
+                dispatcherId: DISPATCHER_ID || undefined,
+                token: TOKEN || undefined,
+              }),
+            });
+        if (!res.ok) throw new Error(res.error || "Dismiss failed");
+        document.getElementById("status-badge").textContent = "dismissed";
+        document.getElementById("status-badge").className = "badge dismissed";
+        document.getElementById("btn-approve").disabled = true;
+        document.getElementById("btn-generate").disabled = true;
+        btn.disabled = true;
+        btn.textContent = "Dismissed";
+        showMsg("Quote dismissed. Returning to inbox…", true);
+        setTimeout(() => {
+          window.location.href = API + "/quoteDispatcherHomePage?tenantId=" +
+            encodeURIComponent(TENANT_ID);
+        }, 700);
+      } catch (err) {
+        btn.disabled = false;
+        btn.removeAttribute("data-confirm");
+        btn.textContent = "Dismiss";
+        showMsg(err.message || "Dismiss failed", false);
+      }
+    });
+
+    document.getElementById("btn-copy").addEventListener("click", () => {
+      navigator.clipboard.writeText(document.getElementById("draft-text").value);
+      showMsg("Draft copied.", true);
+    });
+
+    document.getElementById("home-link").href =
+      API + "/quoteDispatcherHomePage?tenantId=" + encodeURIComponent(TENANT_ID);
+
+    function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/"/g,"&quot;"); }
+    function num(n) { const v = Number(n); return isFinite(v) ? v.toFixed(2) : "___"; }
+    /** Strip HTML / Word junk from carrier notes before UI display. */
+    function cleanNote(input) {
+      let text = String(input == null ? "" : input);
+      if (!text.trim()) return "";
+      text = text
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<br\s*\/?>/gi, " ")
+        .replace(/<\/(?:p|div|tr|li)>/gi, " ")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&#160;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, "\"")
+        .replace(/\bMso[A-Za-z0-9]+\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!text || /^[\s.,;:/\-_|]+$/.test(text)) return "";
+      return text;
+    }
+
+    function showApp(show) {
+      document.getElementById("login-screen").classList.toggle("hidden", show);
+      document.getElementById("app").classList.toggle("hidden", !show);
+      if (show) showThinking(true);
+    }
+
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      document.getElementById("login-error").textContent = "";
+      document.getElementById("login-error").classList.add("hidden");
+      document.getElementById("login-success").classList.add("hidden");
+      try {
+        await QuoteAuth.signInWithEmailPassword(
+            document.getElementById("login-email").value,
+            document.getElementById("login-password").value);
+      } catch (err) {
+        const errEl = document.getElementById("login-error");
+        errEl.textContent = err.message;
+        errEl.classList.remove("hidden");
+      }
+    });
+
+    document.getElementById("btn-forgot").addEventListener("click", async () => {
+      document.getElementById("login-error").textContent = "";
+      document.getElementById("login-error").classList.add("hidden");
+      document.getElementById("login-success").classList.add("hidden");
+      const email = document.getElementById("login-email").value;
+      if (!email) {
+        const errEl = document.getElementById("login-error");
+        errEl.textContent = "Enter your email above, then click Forgot password.";
+        errEl.classList.remove("hidden");
+        document.getElementById("login-email").focus();
+        return;
+      }
+      try {
+        await QuoteAuth.sendPasswordResetEmail(email);
+        document.getElementById("login-success").textContent =
+          "Password reset email sent. Check your inbox.";
+        document.getElementById("login-success").classList.remove("hidden");
+      } catch (err) {
+        const errEl = document.getElementById("login-error");
+        errEl.textContent = err.message || "Could not send reset email";
+        errEl.classList.remove("hidden");
+      }
+    });
+
+    if (!QUOTE_ID) {
+      showThinking(false);
+      document.getElementById("meta").textContent = "Missing quote id";
+    } else if (hasLegacyToken) {
+      showApp(true);
+      load();
+    } else {
+      // Keep thinking motion alive while Firebase auth resolves.
+      showThinking(true);
+      QuoteAuth.init({apiBase: API, tenantId: TENANT_ID}).then(() => {
+        QuoteAuth.onAuth((user) => {
+          if (!user) {
+            stopThinkingRotation();
+            showApp(false);
+            return;
+          }
+          showApp(true);
+          load();
+        });
+      }).catch((e) => {
+        stopThinkingRotation();
+        showApp(false);
+        const errEl = document.getElementById("login-error");
+        errEl.textContent = e.message;
+        errEl.classList.remove("hidden");
+      });
+    }
+  </script>
+</body>
+</html>

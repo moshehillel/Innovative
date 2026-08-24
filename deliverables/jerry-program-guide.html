@@ -1,0 +1,992 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>Advanced Automations — Jerry Program Guide for Innovative Carriers</title>
+  <style>
+    @page {
+      size: letter;
+      margin: 0;
+    }
+    @page:first {
+      margin: 0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", Inter, Arial, Helvetica, sans-serif;
+      color: #172335;
+      font-size: 10.5pt;
+      line-height: 1.55;
+      margin: 0;
+      padding: 0;
+    }
+
+    /* ── Cover ── */
+    .cover {
+      page-break-after: always;
+      width: 8.5in;
+      height: 11in;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: 0.75in 0.85in 0.55in;
+      background:
+        radial-gradient(circle at 88% 12%, rgba(25,199,212,0.22), transparent 42%),
+        radial-gradient(circle at 8% 78%, rgba(66,211,146,0.12), transparent 38%),
+        linear-gradient(152deg, #060d18 0%, #0c1a30 38%, #123072 72%, #1956c8 100%);
+      color: #fff;
+      position: relative;
+      overflow: hidden;
+    }
+    .cover-grid {
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: linear-gradient(180deg, rgba(0,0,0,0.5), transparent 85%);
+      pointer-events: none;
+    }
+    .cover-accent {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      width: 6px;
+      background: linear-gradient(180deg, #19c7d4, #42d392);
+    }
+    .cover-top { position: relative; z-index: 1; }
+    .logo-wrap {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 16px;
+      padding: 18px 22px;
+      display: inline-block;
+      margin-bottom: 36px;
+      box-shadow: 0 18px 40px rgba(0,0,0,0.22);
+    }
+    .logo-wrap img {
+      width: 320px;
+      max-width: 100%;
+      height: auto;
+      display: block;
+    }
+    .logo-wrap.light {
+      background: #08111f;
+      border: 1px solid #dbe5f0;
+      box-shadow: 0 8px 24px rgba(8,17,31,0.12);
+    }
+    .cover-eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 9pt;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: #19c7d4;
+      margin-bottom: 14px;
+      font-weight: 700;
+    }
+    .cover-eyebrow::before {
+      content: "";
+      width: 28px;
+      height: 2px;
+      background: #42d392;
+      border-radius: 2px;
+    }
+    .cover h1 {
+      font-size: 32pt;
+      font-weight: 800;
+      margin: 0 0 8px;
+      line-height: 1.08;
+      max-width: 640px;
+      letter-spacing: -0.02em;
+    }
+    .cover .client-name {
+      font-size: 17pt;
+      font-weight: 600;
+      color: #42d392;
+      margin: 0 0 16px;
+    }
+    .cover .subtitle {
+      font-size: 13pt;
+      font-weight: 400;
+      opacity: 0.92;
+      max-width: 580px;
+      margin: 0 0 24px;
+      line-height: 1.5;
+    }
+    .cover-pills {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .cover-pill {
+      font-size: 8.5pt;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.18);
+      background: rgba(255,255,255,0.07);
+      color: rgba(255,255,255,0.92);
+      font-weight: 600;
+    }
+    .cover-bottom {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(255,255,255,0.14);
+    }
+    .cover-meta-label {
+      font-size: 8pt;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.55);
+      margin-bottom: 4px;
+    }
+    .cover-meta-value {
+      font-size: 10.5pt;
+      font-weight: 600;
+      color: #fff;
+    }
+    .cover-meta-value.accent { color: #42d392; }
+    .cover-footer-logo {
+      position: relative;
+      z-index: 1;
+      text-align: center;
+      padding-top: 16px;
+      margin-top: 8px;
+      border-top: 1px solid rgba(255,255,255,0.1);
+    }
+    .cover-footer-logo img {
+      height: 28px;
+      width: auto;
+      opacity: 0.85;
+    }
+
+    /* ── Content pages ── */
+    .content-wrap { padding: 0; }
+
+    .page-header {
+      font-size: 8.5pt;
+      color: #667085;
+      border-bottom: 1px solid #dbe5f0;
+      padding-bottom: 7px;
+      margin-bottom: 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .page-header strong { color: #153a9e; }
+
+    h2 {
+      color: #153a9e;
+      font-size: 16pt;
+      margin: 22px 0 10px;
+      padding-bottom: 5px;
+      border-bottom: 2px solid #dbeafe;
+      page-break-after: avoid;
+    }
+    h2:first-of-type { margin-top: 0; }
+    h3 {
+      color: #1f4fd8;
+      font-size: 12pt;
+      margin: 14px 0 7px;
+      page-break-after: avoid;
+    }
+    h4 {
+      color: #344054;
+      font-size: 10.5pt;
+      margin: 12px 0 6px;
+      font-weight: 700;
+      page-break-after: avoid;
+    }
+    p { margin: 0 0 9px; }
+    ul, ol { margin: 0 0 11px; padding-left: 20px; }
+    li { margin-bottom: 5px; }
+    .lead {
+      font-size: 11.5pt;
+      color: #344054;
+      margin-bottom: 12px;
+    }
+
+    /* Table of contents */
+    .toc {
+      background: #f7fafc;
+      border: 1px solid #dbe5f0;
+      border-radius: 12px;
+      padding: 18px 22px;
+      margin: 0 0 22px;
+      page-break-inside: avoid;
+    }
+    .toc h2 {
+      margin-top: 0;
+      font-size: 14pt;
+      border: none;
+      padding: 0;
+      margin-bottom: 12px;
+    }
+    .toc-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      columns: 2;
+      column-gap: 28px;
+    }
+    .toc-list li {
+      margin-bottom: 6px;
+      font-size: 10pt;
+      break-inside: avoid;
+    }
+    .toc-list a {
+      color: #153a9e;
+      text-decoration: none;
+      font-weight: 500;
+    }
+    .toc-num {
+      display: inline-block;
+      width: 22px;
+      color: #667085;
+      font-weight: 600;
+    }
+
+    /* Stat cards */
+    .stat-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+      margin: 14px 0 20px;
+      page-break-inside: avoid;
+    }
+    .stat-card {
+      background: linear-gradient(135deg, #153a9e, #2477ff);
+      color: #fff;
+      border-radius: 10px;
+      padding: 12px 14px;
+      text-align: center;
+    }
+    .stat-card.green {
+      background: linear-gradient(135deg, #0d6b4a, #42d392);
+    }
+    .stat-card.dark {
+      background: linear-gradient(135deg, #08111f, #0f2340);
+    }
+    .stat-card.teal {
+      background: linear-gradient(135deg, #0a5c7a, #19c7d4);
+    }
+    .stat-card .num {
+      font-size: 18pt;
+      font-weight: 800;
+      line-height: 1.1;
+      margin-bottom: 2px;
+    }
+    .stat-card .lbl {
+      font-size: 7.5pt;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      opacity: 0.9;
+    }
+
+    /* Letter & highlight boxes */
+    .letter-box {
+      background: #f7fafc;
+      border: 1px solid #dbe5f0;
+      border-left: 4px solid #2477ff;
+      border-radius: 0 12px 12px 0;
+      padding: 16px 18px;
+      margin: 14px 0 20px;
+      page-break-inside: avoid;
+    }
+    .letter-box .sig {
+      margin-top: 12px;
+      font-weight: 600;
+      color: #153a9e;
+    }
+    .highlight-box {
+      background: #eef6ff;
+      border-left: 4px solid #2477ff;
+      padding: 12px 16px;
+      margin: 14px 0 18px;
+      border-radius: 0 8px 8px 0;
+      page-break-inside: avoid;
+    }
+    .warn-box {
+      background: #fff8ee;
+      border-left: 4px solid #f59e0b;
+      padding: 12px 16px;
+      margin: 14px 0 18px;
+      border-radius: 0 8px 8px 0;
+      page-break-inside: avoid;
+    }
+
+    /* Grid cards */
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin: 14px 0 18px;
+    }
+    .grid-3 {
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+    .card {
+      border: 1px solid #dbe5f0;
+      border-radius: 10px;
+      padding: 12px 14px;
+      background: #fff;
+      page-break-inside: avoid;
+    }
+    .card strong {
+      display: block;
+      color: #153a9e;
+      margin-bottom: 5px;
+      font-size: 10.5pt;
+    }
+    .card p { font-size: 9.5pt; margin: 0; color: #667085; }
+    .card .icon {
+      font-size: 16pt;
+      margin-bottom: 4px;
+      display: block;
+    }
+
+    /* Workflow steps */
+    .flow {
+      margin: 16px 0 20px;
+      page-break-inside: avoid;
+    }
+    .flow-step {
+      display: flex;
+      gap: 14px;
+      margin-bottom: 10px;
+      align-items: flex-start;
+    }
+    .flow-num {
+      flex-shrink: 0;
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      background: #153a9e;
+      color: #fff;
+      font-weight: 700;
+      font-size: 11pt;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .flow-body {
+      flex: 1;
+      background: #f7fafc;
+      border: 1px solid #dbe5f0;
+      border-radius: 8px;
+      padding: 10px 14px;
+    }
+    .flow-body strong {
+      color: #153a9e;
+      display: block;
+      margin-bottom: 3px;
+    }
+    .flow-body p {
+      font-size: 9.5pt;
+      color: #667085;
+      margin: 0;
+    }
+
+    /* Data table */
+    table.data {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+      font-size: 9.5pt;
+      page-break-inside: avoid;
+    }
+    table.data th {
+      background: #153a9e;
+      color: #fff;
+      text-align: left;
+      padding: 8px 12px;
+      font-weight: 600;
+    }
+    table.data td {
+      border: 1px solid #dbe5f0;
+      padding: 7px 12px;
+      vertical-align: top;
+    }
+    table.data tr:nth-child(even) td {
+      background: #f7fafc;
+    }
+
+    /* Back page */
+    .footer-page {
+      page-break-before: always;
+      min-height: 9in;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      padding: 40px 24px;
+      background:
+        radial-gradient(circle at 50% 20%, rgba(25,199,212,0.08), transparent 50%),
+        linear-gradient(180deg, #f7fafc 0%, #eef6ff 100%);
+      border-radius: 12px;
+      border: 1px solid #dbe5f0;
+    }
+    .footer-page .logo-wrap {
+      margin: 0 auto 28px;
+    }
+    .footer-page .logo-wrap img {
+      width: 360px;
+    }
+    .footer-page h2 {
+      border: none;
+      font-size: 20pt;
+      margin: 0 0 12px;
+      color: #153a9e;
+    }
+    .contact-block {
+      margin: 22px auto 0;
+      max-width: 460px;
+      text-align: left;
+      background: #fff;
+      border: 1px solid #dbe5f0;
+      border-radius: 12px;
+      padding: 18px 22px;
+      box-shadow: 0 4px 16px rgba(8,17,31,0.06);
+    }
+    .contact-block div { margin-bottom: 8px; font-size: 10pt; }
+    .contact-block strong { color: #153a9e; }
+    .tagline {
+      margin-top: 16px;
+      font-size: 9pt;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: #667085;
+    }
+    .back-logo-strip {
+      margin-top: 28px;
+      padding-top: 18px;
+      border-top: 1px solid #dbe5f0;
+      width: 100%;
+      text-align: center;
+    }
+    .back-logo-strip img {
+      height: 32px;
+      width: auto;
+    }
+
+    .section-id {
+      scroll-margin-top: 20px;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════ COVER ═══════════════════ -->
+<section class="cover">
+  <div class="cover-grid"></div>
+  <div class="cover-accent"></div>
+  <div class="cover-top">
+    <div class="logo-wrap">
+      <img src="data:image/png;base64,__AA_LOGO_BASE64__" alt="Advanced Automations"/>
+    </div>
+    <div class="cover-eyebrow">Prepared exclusively for</div>
+    <h1>Jerry Invoice &amp;<br/>Billing Automation</h1>
+    <p class="client-name">Innovative Carriers</p>
+    <p class="subtitle">
+      Your complete program guide — from carrier invoice intake through
+      ShipPrimus billing, customer invoicing, payables, QuickBooks sync,
+      and operations visibility. Everything Jerry delivers for your team,
+      documented in detail.
+    </p>
+    <div class="cover-pills">
+      <span class="cover-pill">ShipPrimus</span>
+      <span class="cover-pill">QuickBooks Sync</span>
+      <span class="cover-pill">24/7 Automation</span>
+      <span class="cover-pill">Smart Alerts</span>
+      <span class="cover-pill">Ops Dashboard</span>
+    </div>
+  </div>
+  <div class="cover-bottom">
+    <div>
+      <div class="cover-meta-label">Delivered by</div>
+      <div class="cover-meta-value accent">Advanced Automations</div>
+      <div class="cover-meta-label" style="margin-top:12px">Website</div>
+      <div class="cover-meta-value" style="font-size:10pt;font-weight:500">
+        AdvancedAutomations.net
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div class="cover-meta-label">Document</div>
+      <div class="cover-meta-value">Program Guide — Full Edition</div>
+      <div class="cover-meta-label" style="margin-top:12px">Classification</div>
+      <div class="cover-meta-value" style="font-size:10pt;font-weight:500;opacity:0.9">
+        Confidential — Innovative Carriers
+      </div>
+    </div>
+  </div>
+  <div class="cover-footer-logo">
+    <img src="data:image/png;base64,__AA_LOGO_BASE64__" alt="Advanced Automations"/>
+  </div>
+</section>
+
+<div class="content-wrap">
+
+<div class="page-header">
+  <span><strong>Advanced Automations</strong> · Jerry for Innovative Carriers</span>
+  <span>Confidential</span>
+</div>
+
+<!-- Table of Contents -->
+<nav class="toc">
+  <h2>Contents</h2>
+  <ol class="toc-list">
+    <li><span class="toc-num">1.</span> Welcome &amp; Overview</li>
+    <li><span class="toc-num">2.</span> Jerry at a Glance</li>
+    <li><span class="toc-num">3.</span> End-to-End Workflow</li>
+    <li><span class="toc-num">4.</span> Carrier Invoice Intake</li>
+    <li><span class="toc-num">5.</span> Rate &amp; Amount Validation</li>
+    <li><span class="toc-num">6.</span> Proof of Delivery (POD)</li>
+    <li><span class="toc-num">7.</span> Customer Invoicing</li>
+    <li><span class="toc-num">8.</span> Broker Commission Rules</li>
+    <li><span class="toc-num">9.</span> Additional Charges</li>
+    <li><span class="toc-num">10.</span> Cargo Insurance (Redkik)</li>
+    <li><span class="toc-num">11.</span> Special Email Handlers</li>
+    <li><span class="toc-num">12.</span> Payables &amp; QuickBooks</li>
+    <li><span class="toc-num">13.</span> Operations Dashboard</li>
+    <li><span class="toc-num">14.</span> Shipment Modes</li>
+    <li><span class="toc-num">15.</span> Jerry Email Standards</li>
+    <li><span class="toc-num">16.</span> Support &amp; Contact</li>
+  </ol>
+</nav>
+
+<h2 class="section-id" id="welcome">Welcome, Innovative Carriers Team</h2>
+
+<div class="letter-box">
+  <p class="lead" style="margin-top:0">
+    Dear Innovative Carriers team,
+  </p>
+  <p>
+    Thank you for partnering with <strong>Advanced Automations</strong>. We
+    built Jerry — your dedicated billing assistant — to take the manual burden
+    off your accounting and dispatch teams so you can move freight with
+    confidence and get paid faster.
+  </p>
+  <p>
+    This guide describes everything Jerry does for Innovative Carriers today:
+    what runs automatically in ShipPrimus, when your team receives a helpful
+    email, and how each notification guides you to a quick resolution. Our goal
+    is simple — less paperwork, fewer errors, and a billing process that
+    feels like an extension of your own team.
+  </p>
+  <p class="sig">
+    — The Advanced Automations Team<br/>
+    <span style="font-weight:400;color:#667085">AdvancedAutomations.net</span>
+  </p>
+</div>
+
+<div class="highlight-box">
+  <strong>What Jerry delivers for Innovative Carriers</strong><br/>
+  Faster invoice turnaround, fewer manual entry mistakes, proactive alerts
+  when a human decision is needed, and a complete activity history on every
+  load — all integrated with your ShipPrimus workflow and visible on your
+  operations dashboard.
+</div>
+
+<h2 class="section-id" id="glance">Jerry at a Glance</h2>
+<p>
+  Jerry is always on — monitoring your accounting inbox, working inside
+  ShipPrimus, and keeping Lisa and dispatch in the loop only when needed.
+</p>
+
+<div class="stat-row">
+  <div class="stat-card">
+    <div class="num">24/7</div>
+    <div class="lbl">Inbox Monitoring</div>
+  </div>
+  <div class="stat-card green">
+    <div class="num">Auto</div>
+    <div class="lbl">Carrier Bill Upload</div>
+  </div>
+  <div class="stat-card teal">
+    <div class="num">Smart</div>
+    <div class="lbl">Human Escalation</div>
+  </div>
+  <div class="stat-card dark">
+    <div class="num">Full</div>
+    <div class="lbl">Activity History</div>
+  </div>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <span class="icon">&#128229;</span>
+    <strong>Watch</strong>
+    <p>Monitors your invoice mailbox and picks up new carrier bills, insurance spreadsheets, and special request emails automatically.</p>
+  </div>
+  <div class="card">
+    <span class="icon">&#128279;</span>
+    <strong>Match</strong>
+    <p>Links each document to the correct load using load number, PRO, BOL, order number, PO, and other reference fields.</p>
+  </div>
+  <div class="card">
+    <span class="icon">&#9989;</span>
+    <strong>Validate</strong>
+    <p>Compares carrier charges against booked rates, lumpers, accessorials, and Primus invoice actuals before billing proceeds.</p>
+  </div>
+  <div class="card">
+    <span class="icon">&#9889;</span>
+    <strong>Complete</strong>
+    <p>Finishes invoicing, payables, QuickBooks sync, and follow-ups — or asks for help with a clear email and one-click action link.</p>
+  </div>
+</div>
+
+<h2 class="section-id" id="workflow">End-to-End Workflow</h2>
+<p>
+  From the moment a carrier email arrives to the moment your books are updated,
+  Jerry follows a consistent, auditable path for every shipment.
+</p>
+
+<div class="flow">
+  <div class="flow-step">
+    <div class="flow-num">1</div>
+    <div class="flow-body">
+      <strong>Email arrives</strong>
+      <p>Jerry reads the inbox, classifies the message (carrier invoice, insurance, POD request, administrative, etc.), and extracts attachments.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">2</div>
+    <div class="flow-body">
+      <strong>AI document parsing</strong>
+      <p>PDFs and spreadsheets are parsed for load number, PRO, carrier name, invoice amount, line items, POD images, and supporting receipts.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">3</div>
+    <div class="flow-body">
+      <strong>Primus lookup &amp; validation</strong>
+      <p>Jerry finds the shipment in ShipPrimus, compares amounts, checks for duplicates, and validates lumpers and accessorials.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">4</div>
+    <div class="flow-body">
+      <strong>Carrier bill posted</strong>
+      <p>Validated carrier bills are uploaded to ShipPrimus; costs are entered and the customer invoice workflow begins.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">5</div>
+    <div class="flow-body">
+      <strong>Customer invoice &amp; email</strong>
+      <p>Customer invoices are created, reviewed when configured, and emailed with Innovative Carriers payment instructions.</p>
+    </div>
+  </div>
+  <div class="flow-step">
+    <div class="flow-num">6</div>
+    <div class="flow-body">
+      <strong>Payables &amp; QuickBooks</strong>
+      <p>Carrier payables advance through approval; data syncs to QuickBooks so accounting stays current with operations.</p>
+    </div>
+  </div>
+</div>
+
+<h2 class="section-id" id="intake">Carrier Invoice Intake</h2>
+
+<h3>Intelligent document reading</h3>
+<ul>
+  <li>Reads carrier invoices from PDF and email attachments — including multi-invoice packets (e.g. LTL statement cover pages followed by individual freight bills).</li>
+  <li>Extracts load number, PRO, carrier BOL, order number, PO, shipment reference, invoice amount, dates, and line-item charges.</li>
+  <li>Matches each document to the correct shipment in ShipPrimus using multiple lookup keys when the load number alone is not present.</li>
+  <li>Flags amount mismatches, duplicate submissions, missing proof documents, and unrecognized charges before billing proceeds.</li>
+</ul>
+
+<h3>Multi-key load matching</h3>
+<p>
+  When a carrier bill references a BOL, order number, or PO instead of an
+  Innovative load number, Jerry attempts resolution in ShipPrimus using
+  every available reference field — reducing manual matching work for your team.
+</p>
+
+<table class="data">
+  <tr>
+    <th>Reference on invoice</th>
+    <th>What Jerry does</th>
+  </tr>
+  <tr>
+    <td>Load number</td>
+    <td>Primary lookup — matched directly to ShipPrimus booking.</td>
+  </tr>
+  <tr>
+    <td>PRO number</td>
+    <td>Secondary lookup when load number is missing or incorrect.</td>
+  </tr>
+  <tr>
+    <td>Carrier BOL / order / PO</td>
+    <td>Additional keys used to find the correct shipment when needed.</td>
+  </tr>
+  <tr>
+    <td>No match found</td>
+    <td>Forwarded to billing review with extracted data for manual resolution.</td>
+  </tr>
+</table>
+
+<h2 class="section-id" id="validation">Rate &amp; Amount Validation</h2>
+<ul>
+  <li>Compares the carrier bill to the booked carrier cost in ShipPrimus.</li>
+  <li>Subtracts lumper charges from the invoice total before comparing base freight to the Primus rate.</li>
+  <li>Auto-approves charges already reflected in the Primus carrier cost when totals match.</li>
+  <li>Pauses and notifies dispatch when numbers do not align — with load number, carrier, and dollar amounts in plain language.</li>
+  <li>Flags loads with profit below the $10 minimum threshold so dispatch can review customer rate vs. carrier cost.</li>
+</ul>
+
+<h3>Duplicate &amp; re-submission protection</h3>
+<ul>
+  <li>Detects when the same carrier invoice has already been processed for a load.</li>
+  <li>Prevents double-posting of carrier costs and duplicate customer invoice lines.</li>
+</ul>
+
+<h2 class="section-id" id="pod">Proof of Delivery (POD)</h2>
+<p>
+  Jerry treats proof of delivery as a gatekeeper for billing. Where a POD is
+  required, your team gets a clear notice — not a surprise later in the process.
+</p>
+<ul>
+  <li>Detects when a load is missing a POD in ShipPrimus before customer invoicing.</li>
+  <li>Uploads POD documents from carrier emails directly onto the booking.</li>
+  <li>Supports truckload, power-only, and drayage workflows with mode-appropriate rules.</li>
+  <li>For truckload shipments without a POD, Jerry sends structured follow-up reminders to the carrier on a business-day schedule before escalating to your team.</li>
+  <li>Retrieves FedEx Freight proof-of-delivery documents when applicable.</li>
+  <li>Alerts Lisa and dispatch when a POD shows damage, shortage, or other discrepancies.</li>
+  <li>Creates dashboard tasks for signed-POD requests that need ops attention.</li>
+</ul>
+
+<h2 class="section-id" id="customer">Customer Invoicing</h2>
+<ul>
+  <li>Creates and completes customer invoices in ShipPrimus using the correct customer rate.</li>
+  <li>Sends professional customer invoice emails with Innovative Carriers payment instructions.</li>
+  <li>Supports a reviewer approval step before a customer email is sent — with a full load summary and one-click approve/reject links.</li>
+  <li>Handles power-only loads with unit numbers on the bill-to reference field.</li>
+  <li>Holds customer email when a truckload POD is still missing — carrier billing continues, but your customer is not invoiced prematurely.</li>
+  <li>Reuses existing issued invoices in Primus when present — preventing duplicate draft invoices and double freight lines.</li>
+</ul>
+
+<h2 class="section-id" id="broker">Broker Commission Rules</h2>
+<p>
+  When a load's profit falls below your company's 10% threshold, Jerry
+  evaluates whether the broker's commission rate should be adjusted
+  automatically in ShipPrimus.
+</p>
+
+<div class="warn-box">
+  <strong>Important: Profit % vs. GP%</strong><br/>
+  Jerry uses the <strong>Profit %</strong> shown in the Primus invoice summary
+  (profit divided by actual cost) — not GP% (profit divided by revenue).
+  These are different numbers on the same load. Broker decisions always
+  follow Primus Profit %.
+</div>
+
+<table class="data">
+  <tr>
+    <th>Scenario</th>
+    <th>Jerry's action</th>
+  </tr>
+  <tr>
+    <td>Profit % ≥ 10%</td>
+    <td>No commission change — load proceeds normally.</td>
+  </tr>
+  <tr>
+    <td>Profit % &lt; 10%, broker has 10% variant</td>
+    <td>Automatically swaps broker to the 10% sales-rep code in ShipPrimus.</td>
+  </tr>
+  <tr>
+    <td>Profit % &lt; 10%, Karen Adams</td>
+    <td>Exempt — commission is never changed for designated brokers.</td>
+  </tr>
+  <tr>
+    <td>Profit % &lt; 10%, no 10% variant exists</td>
+    <td>Lisa is notified; invoicing continues without blocking the load.</td>
+  </tr>
+  <tr>
+    <td>Insurance premium posted to load</td>
+    <td>Fresh Profit % review runs after the premium is added.</td>
+  </tr>
+</table>
+
+<h2 class="section-id" id="charges">Additional Charges &amp; Accessorials</h2>
+<ul>
+  <li>Detects lumper, detention, reweigh, and other accessorial charges on carrier invoices.</li>
+  <li>Routes four-option approval requests when a charge needs a human decision: pay carrier, bill customer, dispute, or other resolution paths.</li>
+  <li>Skips unnecessary dispatcher notifications when the carrier total already matches Primus.</li>
+  <li>Requires supporting receipts for certain charge types before auto-approval.</li>
+  <li>Creates dashboard tasks for open additional-charge items so nothing is lost between emails.</li>
+  <li>Supports dispute and resolution workflows when a charge is rejected.</li>
+</ul>
+
+<h2 class="section-id" id="insurance">Cargo Insurance (Redkik)</h2>
+<ul>
+  <li>Processes Redkik cargo insurance emails with invoice PDF, ACH authorization, and Excel allocation spreadsheet.</li>
+  <li>Extracts invoice number and total premium from the insurance invoice PDF.</li>
+  <li>Allocates premiums across shipments listed in the spreadsheet and posts insurance charges to each load in ShipPrimus.</li>
+  <li>Skips loads that already have insurance posted (idempotent re-runs).</li>
+  <li>Sends reconciliation summaries showing posted, skipped, and manual-review items.</li>
+  <li>Triggers a broker commission Profit % review after insurance is posted to each load.</li>
+</ul>
+
+<h2 class="section-id" id="special-email">Special Email Handlers</h2>
+<p>
+  Not every email is a carrier invoice. Jerry recognizes several special
+  message types and handles them without forwarding noise to your team.
+</p>
+
+<div class="grid grid-3">
+  <div class="card">
+    <strong>Apex / administrative</strong>
+    <p>Recognizes administrative broadcast emails and marks them as intentionally ignored — no false billing alerts.</p>
+  </div>
+  <div class="card">
+    <strong>POD requests</strong>
+    <p>When someone requests a signed POD, Jerry looks up the load and sends it from ShipPrimus — or escalates to Lisa when needed.</p>
+  </div>
+  <div class="card">
+    <strong>eModal broadcasts</strong>
+    <p>Port and drayage system notifications are classified and ignored when they are not actionable invoices.</p>
+  </div>
+</div>
+
+<h2 class="section-id" id="payables">Carrier Payables &amp; QuickBooks</h2>
+<ul>
+  <li>Marks shipments delivered in ShipPrimus when billing criteria are met.</li>
+  <li>Advances carrier bill approval through your established workflow.</li>
+  <li>Syncs carrier payables to QuickBooks so your books stay current with operations.</li>
+  <li>Validates vendor bill amounts against ShipPrimus before sync.</li>
+</ul>
+
+<h2 class="section-id" id="dashboard">Operations Dashboard</h2>
+<p>
+  Your team has a live operations dashboard at
+  <strong>advancedautomations.net</strong> — one place to monitor Jerry's
+  activity across Innovative Carriers.
+</p>
+
+<h3>Dashboard features</h3>
+<ul>
+  <li><strong>Gmail connection status</strong> — confirms Jerry is connected and polling your invoice mailbox.</li>
+  <li><strong>Statistics</strong> — invoices processed by day, week, month, and year; includes loads with additional charges.</li>
+  <li><strong>Recent invoices</strong> — quick view of the latest completed and in-progress workflows.</li>
+  <li><strong>AI-summarized activity logs</strong> — human-readable summaries of each workflow (not raw engine logs), with "show more" for detail.</li>
+  <li><strong>Open tasks</strong> — items forwarded for review: additional charges, signed POD requests, human-review escalations, and similar.</li>
+  <li><strong>Dismiss tasks</strong> — mark each task handled when resolved so the queue stays clean.</li>
+  <li><strong>Support chat</strong> — ask questions about recent activity and get guided answers.</li>
+</ul>
+
+<h3>Who gets notified vs. who uses the dashboard</h3>
+<table class="data">
+  <tr>
+    <th>Channel</th>
+    <th>Used for</th>
+  </tr>
+  <tr>
+    <td>Dispatcher email</td>
+    <td>Operational items: missing customer, low profit, rate mismatches, POD issues.</td>
+  </tr>
+  <tr>
+    <td>Lisa / accounting email</td>
+    <td>Financial exceptions: broker commission swaps, charge approvals, POD discrepancies.</td>
+  </tr>
+  <tr>
+    <td>Dashboard tasks</td>
+    <td>Persistent open items that need ops attention — visible until dismissed.</td>
+  </tr>
+</table>
+
+<h3>Other automated reports</h3>
+<ul>
+  <li><strong>Weekly undelivered shipment report</strong> — dispatchers receive loads picked up more than two weeks ago with no delivery date.</li>
+  <li><strong>Stuck workflow monitoring</strong> — Jerry watches for invoices that stopped mid-process and can alert your team.</li>
+</ul>
+
+<h2 class="section-id" id="modes">Shipment Modes Supported</h2>
+
+<div class="grid grid-3">
+  <div class="card">
+    <strong>Truckload (TL)</strong>
+    <p>POD required; structured carrier follow-up schedule; customer email held until POD is on file.</p>
+  </div>
+  <div class="card">
+    <strong>Power Only</strong>
+    <p>Trailer photos and unit-number billing references supported on customer invoices.</p>
+  </div>
+  <div class="card">
+    <strong>Drayage</strong>
+    <p>Mode-aware validation and billing steps; eModal broadcasts filtered appropriately.</p>
+  </div>
+</div>
+<div class="grid" style="margin-top:12px">
+  <div class="card">
+    <strong>LTL</strong>
+    <p>Multi-invoice PDF handling — statement cover pages with nested freight bills parsed correctly.</p>
+  </div>
+  <div class="card">
+    <strong>FedEx Freight</strong>
+    <p>Automated proof-of-delivery retrieval and carrier-specific validation where configured.</p>
+  </div>
+</div>
+
+<h2 class="section-id" id="emails">What to Expect in Every Jerry Email</h2>
+<ul>
+  <li>A plain-language explanation of what happened and why — written for dispatch and accounting, not engineers.</li>
+  <li>Load number, carrier name, and relevant dollar amounts clearly displayed.</li>
+  <li>A direct button to fix the issue when action is needed (set customer rate, approve a charge, approve customer email, resume workflow, etc.).</li>
+  <li>Confirmation pages on sensitive actions so nothing happens from an accidental click or email scanner.</li>
+  <li>The right people copied — dispatchers for operational items, Lisa and accounting for financial exceptions.</li>
+  <li>Profit % (not GP%) shown on broker commission notifications when a percentage is included.</li>
+</ul>
+
+<!-- ═══════════════════ BACK PAGE ═══════════════════ -->
+<section class="footer-page">
+  <div class="logo-wrap light">
+    <img src="data:image/png;base64,__AA_LOGO_BASE64__" alt="Advanced Automations"/>
+  </div>
+  <h2>We Are Always Here For You</h2>
+  <p class="lead" style="text-align:center; max-width:520px; margin:0 auto 8px;">
+    Jerry runs around the clock so your team does not have to. When you need a
+    person — whether it is a question about a paused load, a new workflow idea,
+    or help with a specific shipment — <strong>Advanced Automations</strong> is
+    always here for Innovative Carriers. Your success is our success.
+  </p>
+  <p style="text-align:center; margin-bottom:6px;">
+    Thank you for trusting us with your billing automation.
+  </p>
+  <p class="tagline">Custom Software · Intelligent Automation · Real Results</p>
+  <div class="contact-block">
+    <div><strong>Advanced Automations</strong><br/>
+      AdvancedAutomations.net
+    </div>
+    <div><strong>Email</strong><br/>
+      info@advancedautomations.net
+    </div>
+    <div><strong>Your program</strong><br/>
+      Jerry — Invoice &amp; Billing Automation for Innovative Carriers
+    </div>
+    <div><strong>Dashboard</strong><br/>
+      advancedautomations.net — live ops visibility for your team
+    </div>
+    <div style="margin-top:12px; font-size:9.5pt; color:#667085;">
+      This document describes capabilities delivered under your Jerry program.
+      Features may evolve as your workflow grows. For program support, contact
+      Advanced Automations at info@advancedautomations.net.
+    </div>
+  </div>
+  <div class="back-logo-strip">
+    <img src="data:image/png;base64,__AA_LOGO_BASE64__" alt="Advanced Automations"/>
+  </div>
+</section>
+
+</div><!-- .content-wrap -->
+</body>
+</html>

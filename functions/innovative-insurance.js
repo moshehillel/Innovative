@@ -17,10 +17,9 @@
  *     how many premiums were added, how many were not, the dollar sums on each
  *     side, and the precise reason each skipped row was left out.
  *
- * Business rule (ops): post what we can, email the rest with exact detail.
- *
- * The functions here are pure/injectable so they can be unit-tested and run as
- * a dry run (see scripts/insurance-allocate.js) without touching Primus.
+ * Detection: an early AI email classifier (see index.js classifyIncomingEmail)
+ * routes insurance_premium emails here. Posting still requires a workbook that
+ * passes validateInsuranceWorkbook — sender address alone is never enough.
  */
 
 "use strict";
@@ -31,19 +30,34 @@
  * @type {Object<string, RegExp[]>}
  */
 const COLUMN_MATCHERS = {
-  carrier: [/carrier/i, /vendor/i, /scac/i],
-  tracking: [/tracking/i, /\bpro\b/i, /\bbol\b/i, /reference/i, /\bload\b/i],
-  description: [/description/i, /notes?/i, /detail/i, /memo/i, /commodity/i],
-  amount: [/premium/i, /\bamount\b/i, /\btotal\b/i, /\bcost\b/i, /charge/i,
-    /price/i],
+  // Prefer real party/carrier labels; avoid Status/Organization false hits.
+  carrier: [/carrier/i, /insured\s*party/i, /vendor/i, /scac/i],
+  // "Tracking Code" before "Reference" (Redkik refs look like RED-RHP-#####).
+  tracking: [
+    /tracking\s*code/i, /tracking/i, /\bbol\b/i, /\bpro\b/i, /\bload\b/i,
+  ],
+  description: [
+    /commodity\s*description/i, /description/i, /notes?/i, /detail/i,
+    /memo/i, /commodity/i,
+  ],
+  // Never match "Cost Center" — premium lives in Total / Premium / Amount.
+  amount: [
+    /premium/i, /\btotal\b/i, /\bamount\b/i, /charge/i, /price/i,
+  ],
 };
 
 /**
  * Positional fallback used when header names cannot be matched. These indices
- * come from the observed Redkik "Innovative Carriers" workbook layout.
+ * come from the observed Redkik "Innovative Carriers" workbook layout
+ * (Tracking Code=7, Commodity Description=15, Total=25, Insured Party=18).
  * @type {Object<string, number>}
  */
-const FALLBACK_COLUMNS = {carrier: 5, tracking: 7, description: 15, amount: 25};
+const FALLBACK_COLUMNS = {
+  carrier: 18,
+  tracking: 7,
+  description: 15,
+  amount: 25,
+};
 
 /** Money tolerance (cents) when comparing sums. @type {number} */
 const MONEY_EPSILON = 0.005;
@@ -56,6 +70,8 @@ const SKIP_REASON = {
   NO_BOL: "NO_BOL",
   LOAD_NOT_FOUND: "LOAD_NOT_FOUND",
   ZERO_AMOUNT: "ZERO_AMOUNT",
+  CREDIT_MANUAL: "CREDIT_MANUAL",
+  DUPLICATE_INSURANCE: "DUPLICATE_INSURANCE",
   POST_FAILED: "POST_FAILED",
 };
 
@@ -75,6 +91,16 @@ function skipReasonText(code, ctx = {}) {
         "Primus.";
     case SKIP_REASON.ZERO_AMOUNT:
       return "Premium amount is zero or unreadable on the Excel row.";
+    case SKIP_REASON.CREDIT_MANUAL:
+      return "Credit for a canceled premium — enter manually in Primus " +
+        "(Jerry does not auto-post credits).";
+    case SKIP_REASON.DUPLICATE_INSURANCE:
+      return "This load already has an insurance charge in Primus" +
+        (ctx.existingBill ? ` (bill # ${ctx.existingBill}` +
+          (ctx.existingAmount != null ?
+            `, $${Number(ctx.existingAmount).toFixed(2)}` : "") +
+          ")" : "") +
+        " — review before adding another.";
     case SKIP_REASON.POST_FAILED:
       return "Premium could not be posted to Primus" +
         (ctx.error ? `: ${ctx.error}` : ".");
@@ -161,10 +187,37 @@ function extractBol(row, cols) {
   const track = String(row[cols.tracking] == null ? "" : row[cols.tracking]);
   const desc = String(
       row[cols.description] == null ? "" : row[cols.description]);
-  const match = track.match(/(\d{5,})/) ||
-    desc.match(/BOL#?\s*:?\s*(\d{5,})/i) ||
-    desc.match(/\b(\d{6,})\b/);
-  return match ? match[1] : "";
+  // Prefer explicit BOL# in the description over other digit runs (e.g.
+  // Redkik Reference RED-RHP-301549).
+  const fromDesc = desc.match(/BOL#?\s*:?\s*(\d{5,})/i);
+  if (fromDesc) return fromDesc[1];
+  const fromTrack = track.match(/(\d{5,})/);
+  if (fromTrack) return fromTrack[1];
+  const looseDesc = desc.match(/\b(\d{6,})\b/);
+  return looseDesc ? looseDesc[1] : "";
+}
+
+/**
+ * True when an Excel row is a subtotal / invoice-total footer, not a shipment.
+ * @param {object} row Normalized row {carrier, description, bol, amount}.
+ * @param {Array<*>} raw Raw sheet row cells.
+ * @return {boolean}
+ */
+function isInsuranceSummaryRow(row, raw) {
+  const cells = Array.isArray(raw) ? raw : [];
+  const combined = [
+    row.carrier, row.description, row.bol,
+    ...cells.map((c) => String(c == null ? "" : c)),
+  ].join(" ").toLowerCase();
+  if (/sub\s*total|subtotal|invoice\s*total|grand\s*total/.test(combined) ||
+      /total\s*due|amount\s*due|total\s*invoice/.test(combined)) {
+    return true;
+  }
+  // Footer rows: dollar total with no carrier and no BOL (Redkik sheet totals).
+  if (!row.bol && !String(row.carrier || "").trim() && Number(row.amount) > 0) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -193,18 +246,113 @@ function parseInsuranceExcel(input) {
     const amount = parseAmount(raw[columns.amount]);
     const carrier = String(raw[columns.carrier] == null ?
       "" : raw[columns.carrier]).trim();
-    // Skip fully blank trailing rows that carry neither carrier nor amount.
-    if (!carrier && amount === 0) continue;
-    rows.push({
+    const description = String(raw[columns.description] == null ?
+      "" : raw[columns.description]).trim();
+    const bol = extractBol(raw, columns);
+    const row = {
       rowIndex: i + 1,
-      bol: extractBol(raw, columns),
+      bol,
       carrier,
       amount,
-      description: String(raw[columns.description] == null ?
-        "" : raw[columns.description]).trim(),
-    });
+      description,
+    };
+    if (isInsuranceSummaryRow(row, raw)) continue;
+    // Skip fully blank trailing rows that carry neither carrier nor amount.
+    if (!carrier && amount === 0) continue;
+    rows.push(row);
   }
   return {columns, rows};
+}
+
+/** Words that PDF regex must not treat as an invoice number. */
+const INVALID_INVOICE_TOKENS = new Set([
+  "can", "cad", "usd", "due", "net", "the", "from", "date", "total",
+  "amount", "bill", "paid", "pay", "com", "www", "redkik", "invoice",
+]);
+
+/**
+ * True when a candidate looks like a real vendor invoice / bill number.
+ * @param {string} candidate Raw match.
+ * @return {boolean}
+ */
+function isPlausibleInsuranceInvoiceNumber(candidate) {
+  const value = String(candidate || "").trim();
+  if (!value) return false;
+  const lower = value.toLowerCase();
+  if (INVALID_INVOICE_TOKENS.has(lower)) return false;
+  if (/^redkik/i.test(value)) return false;
+  if (/\.com$/i.test(value)) return false;
+  const digits = value.replace(/\D/g, "");
+  if (/^\d+$/.test(value)) return digits.length >= 3;
+  if (value.length < 4) return false;
+  if (/\d/.test(value)) return true;
+  return value.length >= 5;
+}
+
+/**
+ * Pulls the best insurance vendor invoice number from PDF text and/or email
+ * subject/body (QuickBooks notices often carry the number outside the PDF).
+ * @param {string} text Combined searchable text.
+ * @return {string|null}
+ */
+function extractInsuranceInvoiceNumber(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) return null;
+
+  const patterns = [
+    /\binvoice\s+(\d{4,})\s+from\b/gi,
+    /invoice\s*(?:#|no\.?|number)\s*:?\s*([A-Z0-9][\w-]{2,})/gi,
+    /invoice\s+#?\s*(\d{3,})/gi,
+    /inv(?:oice)?\s*#\s*(\d{3,})/gi,
+    /bill\s*(?:#|no\.?)\s*:?\s*([A-Z0-9][\w-]{3,})/gi,
+    /reference\s*(?:#|no\.?)\s*:?\s*([A-Z0-9][\w-]{3,})/gi,
+  ];
+
+  const candidates = [];
+  for (const pattern of patterns) {
+    for (const match of raw.matchAll(pattern)) {
+      const token = String(match[1] || "").trim();
+      if (isPlausibleInsuranceInvoiceNumber(token)) {
+        candidates.push(token);
+      }
+    }
+  }
+
+  if (!candidates.length) return null;
+
+  candidates.sort((a, b) => {
+    const aDigits = /^\d+$/.test(a) ? 1 : 0;
+    const bDigits = /^\d+$/.test(b) ? 1 : 0;
+    if (bDigits !== aDigits) return bDigits - aDigits;
+    return b.length - a.length;
+  });
+  return candidates[0];
+}
+
+/**
+ * Resolves vendor invoice number from PDF parse plus email context.
+ * @param {object} invoice Parsed PDF header fields.
+ * @param {object} [emailCtx] {subject, body}.
+ * @return {{invoiceNumber: string, invoiceNumberSource: string}}
+ */
+function resolveInsuranceVendorInvoiceNumber(invoice, emailCtx) {
+  const pdfNum = invoice && invoice.invoiceNumber &&
+    isPlausibleInsuranceInvoiceNumber(invoice.invoiceNumber) ?
+    String(invoice.invoiceNumber).trim() : "";
+  if (pdfNum) {
+    return {invoiceNumber: pdfNum, invoiceNumberSource: "pdf"};
+  }
+
+  const emailText = [
+    emailCtx && emailCtx.subject,
+    emailCtx && emailCtx.body,
+  ].filter(Boolean).join("\n");
+  const fromEmail = extractInsuranceInvoiceNumber(emailText);
+  if (fromEmail) {
+    return {invoiceNumber: fromEmail, invoiceNumberSource: "email"};
+  }
+
+  return {invoiceNumber: "", invoiceNumberSource: ""};
 }
 
 /**
@@ -232,14 +380,14 @@ async function parseInsuranceInvoicePdf(input) {
       .filter((n) => n > 0);
   // The invoice total is the largest money figure on a Redkik statement.
   const invoiceTotal = totals.length ? Math.max(...totals) : 0;
-  const invNumMatch = text.match(/invoice\s*#?\s*:?\s*(\w[\w-]*)/i);
+  const invoiceNumber = extractInsuranceInvoiceNumber(text) || "";
   const dateMatch = text.match(
       /(\d{1,2}\/\d{1,2}\/\d{2,4}|\d{4}-\d{2}-\d{2})/);
   const vendorMatch = text.match(/\b(Redkik[\w,.\s]*?)(?:\n|Invoice|$)/i);
 
   return {
     vendorName: vendorMatch ? vendorMatch[1].trim() : "",
-    invoiceNumber: invNumMatch ? invNumMatch[1] : "",
+    invoiceNumber,
     invoiceTotal,
     invoiceDate: dateMatch ? dateMatch[1] : "",
     rawText: text,
@@ -256,7 +404,9 @@ function classifyRows(rows) {
   const addable = [];
   const skipped = [];
   for (const row of rows) {
-    if (row.amount <= 0) {
+    if (row.amount < 0) {
+      skipped.push({...row, reason: SKIP_REASON.CREDIT_MANUAL});
+    } else if (row.amount <= 0) {
       skipped.push({...row, reason: SKIP_REASON.ZERO_AMOUNT});
     } else if (!row.bol) {
       skipped.push({...row, reason: SKIP_REASON.NO_BOL});
@@ -302,7 +452,19 @@ async function applyPremiums(opts) {
       result = {ok: false, error: err && err.message};
     }
     if (result && result.ok) {
-      posted.push({...row, loadNumber: result.loadNumber || null});
+      posted.push({
+        ...row,
+        loadNumber: result.loadNumber || null,
+        alreadyPosted: !!result.skipped,
+      });
+    } else if (result && result.duplicate) {
+      failed.push({
+        ...row,
+        reason: SKIP_REASON.DUPLICATE_INSURANCE,
+        existingBill: result.existingBill || null,
+        existingAmount: result.existingAmount,
+        error: result.error,
+      });
     } else if (result && result.notFound) {
       failed.push({...row, reason: SKIP_REASON.LOAD_NOT_FOUND});
     } else {
@@ -362,22 +524,50 @@ function buildReconciliationEmail(opts) {
   const invNo = invoice.invoiceNumber ? ` #${invoice.invoiceNumber}` : "";
 
   const money = (n) => `$${Number(n || 0).toFixed(2)}`;
-  const skippedRowsHtml = skipped.length ?
-    skipped.map((r) =>
-      `<tr>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `${escapeHtml(r.carrier || "—")}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `${escapeHtml(r.bol || "(none)")}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee;` +
-      `text-align:right">${money(r.amount)}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `Row ${r.rowIndex}</td>` +
-      `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
-      `${escapeHtml(skipReasonText(r.reason, r))}</td>` +
-      `</tr>`).join("") :
-    `<tr><td colspan="5" style="padding:8px 12px;color:#16a34a">` +
-      `Every premium was posted — nothing skipped.</td></tr>`;
+  const rowTable = (rows, emptyMsg) => {
+    if (!rows.length) {
+      return `<p style="color:#6b7280;font-size:14px">${emptyMsg}</p>`;
+    }
+    return `<table style="border-collapse:collapse;font-size:13px;` +
+      `min-width:640px;margin:8px 0 16px">` +
+      `<thead><tr>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">Carrier</th>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">BOL</th>` +
+      `<th style="padding:4px 12px;text-align:right;border-bottom:2px solid ` +
+      `#ccc">Premium</th>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">Excel</th>` +
+      `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
+      `#ccc">Action</th>` +
+      `</tr></thead><tbody>` +
+      rows.map((r) =>
+        `<tr>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `${escapeHtml(r.carrier || "—")}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `${escapeHtml(r.bol || "(none)")}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee;` +
+        `text-align:right">${money(r.amount)}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `Row ${r.rowIndex}</td>` +
+        `<td style="padding:4px 12px;border-bottom:1px solid #eee">` +
+        `${escapeHtml(skipReasonText(r.reason, r))}</td>` +
+        `</tr>`).join("") +
+      `</tbody></table>`;
+  };
+
+  const credits = skipped.filter((r) => r.reason === SKIP_REASON.CREDIT_MANUAL);
+  const duplicates = skipped.filter(
+      (r) => r.reason === SKIP_REASON.DUPLICATE_INSURANCE);
+  const missingLoad = skipped.filter((r) =>
+    r.reason === SKIP_REASON.NO_BOL || r.reason === SKIP_REASON.LOAD_NOT_FOUND);
+  const otherSkipped = skipped.filter((r) =>
+    r.reason !== SKIP_REASON.CREDIT_MANUAL &&
+    r.reason !== SKIP_REASON.DUPLICATE_INSURANCE &&
+    r.reason !== SKIP_REASON.NO_BOL &&
+    r.reason !== SKIP_REASON.LOAD_NOT_FOUND);
 
   const reconLine = rec.matchesInvoice ?
     `<span style="color:#16a34a;font-weight:700">` +
@@ -392,6 +582,13 @@ function buildReconciliationEmail(opts) {
     `${escapeHtml(invNo)}</h2>` +
     `<p>${reconLine}</p>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
+    (invoice.invoiceNumber ?
+      `<tr><td style="padding:4px 16px 4px 0">Vendor bill # (Primus)</td>` +
+      `<td style="font-weight:700">${escapeHtml(invoice.invoiceNumber)}` +
+      `${invoice.invoiceNumberSource ?
+        ` <span style="font-weight:400;color:#6b7280">(` +
+        `${escapeHtml(invoice.invoiceNumberSource)})</span>` : ""}` +
+      `</td></tr>` : "") +
     `<tr><td style="padding:4px 16px 4px 0">Invoice total (PDF)</td>` +
     `<td style="font-weight:700">${money(rec.invoiceTotal)}</td></tr>` +
     `<tr><td style="padding:4px 16px 4px 0">Premiums posted</td>` +
@@ -400,26 +597,38 @@ function buildReconciliationEmail(opts) {
     `<tr><td style="padding:4px 16px 4px 0">Premiums NOT posted</td>` +
     `<td style="font-weight:700">${rec.skippedCount} ` +
     `(${money(rec.skippedSum)})</td></tr>` +
-    `<tr><td style="padding:4px 16px 4px 0">Excel total (all rows)</td>` +
+    `<tr><td style="padding:4px 16px 4px 0">Excel total (shipment rows)</td>` +
     `<td>${money(rec.excelSum)} across ${rec.excelRowCount} rows</td></tr>` +
     `</table>` +
-    `<h3>Rows not posted (${rec.skippedCount})</h3>` +
-    `<table style="border-collapse:collapse;font-size:13px;min-width:640px">` +
-    `<thead><tr>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">Carrier</th>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">BOL</th>` +
-    `<th style="padding:4px 12px;text-align:right;border-bottom:2px solid ` +
-    `#ccc">Premium</th>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">Excel</th>` +
-    `<th style="padding:4px 12px;text-align:left;border-bottom:2px solid ` +
-    `#ccc">Why not posted</th>` +
-    `</tr></thead><tbody>${skippedRowsHtml}</tbody></table>`;
+    (credits.length ?
+      `<h3 style="color:#b45309">Credits — enter manually (${credits.length})` +
+      `</h3>` +
+      `<p style="font-size:14px">These are canceled-premium credits. Jerry ` +
+      `did not post them — please enter in Primus yourself.</p>` +
+      rowTable(credits, "") : "") +
+    (duplicates.length ?
+      `<h3 style="color:#dc2626">Duplicate insurance on load (` +
+      `${duplicates.length})</h3>` +
+      `<p style="font-size:14px">These loads already had an insurance charge ` +
+      `in Primus. Jerry did not add a second premium.</p>` +
+      rowTable(duplicates, "") : "") +
+    (missingLoad.length ?
+      `<h3>Could not find load — needs review (${missingLoad.length})</h3>` +
+      `<p style="font-size:14px">No BOL on the Excel row, or the BOL did ` +
+      `not match a load in Primus. Please locate the shipment and handle ` +
+      `manually.</p>` +
+      rowTable(missingLoad, "") : "") +
+    (otherSkipped.length ?
+      `<h3>Other rows not posted (${otherSkipped.length})</h3>` +
+      rowTable(otherSkipped, "") : "") +
+    (!skipped.length ?
+      `<p style="color:#16a34a;font-weight:600">Every premium was posted — ` +
+      `nothing skipped.</p>` : "");
 
   const subject = `Insurance reconciliation — ${vendor}${invNo}: ` +
-    `${rec.postedCount} posted, ${rec.skippedCount} skipped`;
+    `${rec.postedCount} posted, ${rec.skippedCount} skipped` +
+    (credits.length ? `, ${credits.length} credit(s)` : "") +
+    (duplicates.length ? `, ${duplicates.length} duplicate(s)` : "");
   return {subject, html};
 }
 
@@ -452,7 +661,7 @@ let deps = {};
 /**
  * Receives shared helpers from index.js.
  * @param {object} bundle {writeLog, saveOutboundEmail, fetchPrimusBooking,
- *   addInsurancePremiumToLoad, isManagePhpEnabled}.
+ *   addInsurancePremiumToLoad, resolveInsuranceVendor, isManagePhpEnabled}.
  * @return {void}
  */
 function init(bundle) {
@@ -506,10 +715,198 @@ function extractFromEmail(from) {
 }
 
 /**
+ * Returns true when a filename loosely matches a classifier hint.
+ * @param {string} filename Attachment filename.
+ * @param {string} hint Filename hint from the email classifier.
+ * @return {boolean}
+ */
+function filenameMatchesHint(filename, hint) {
+  const file = String(filename || "").trim().toLowerCase();
+  const needle = String(hint || "").trim().toLowerCase();
+  if (!file || !needle) return false;
+  if (file === needle) return true;
+  const fileBase = file.replace(/\.[^.]+$/, "");
+  const hintBase = needle.replace(/\.[^.]+$/, "");
+  return file.includes(needle) || needle.includes(file) ||
+    (fileBase && hintBase && fileBase === hintBase);
+}
+
+/**
+ * @param {Array<object>} attachments Attachment metadata.
+ * @return {Array<object>}
+ */
+function listSpreadsheetAttachments(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.filter((a) => a && (
+    SPREADSHEET_EXT.test(String(a.filename || "")) ||
+    /spreadsheet|excel|csv/i.test(String(a.mimeType || ""))));
+}
+
+/**
+ * @param {Array<object>} attachments Attachment metadata.
+ * @return {Array<object>}
+ */
+function listPdfAttachments(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.filter((a) => a && (
+    /\.pdf$/i.test(String(a.filename || "")) ||
+    String(a.mimeType || "") === "application/pdf"));
+}
+
+/**
+ * Validates that a workbook looks like a per-shipment insurance premium sheet.
+ * @param {Buffer} buffer Spreadsheet bytes.
+ * @return {object} Validation summary with rows and postable counts.
+ */
+function validateInsuranceWorkbook(buffer) {
+  const {rows} = parseInsuranceExcel(buffer);
+  const {addable} = classifyRows(rows);
+  const premiumRowCount = rows.filter((r) => r.amount > 0).length;
+  if (!rows.length) {
+    return {
+      valid: false,
+      rows,
+      addableCount: 0,
+      premiumRowCount: 0,
+      rowCount: 0,
+      reason: "no rows parsed from spreadsheet",
+    };
+  }
+  if (addable.length < 1) {
+    return {
+      valid: false,
+      rows,
+      addableCount: 0,
+      premiumRowCount,
+      rowCount: rows.length,
+      reason: "no postable premium rows with BOL and amount",
+    };
+  }
+  return {
+    valid: true,
+    rows,
+    addableCount: addable.length,
+    premiumRowCount,
+    rowCount: rows.length,
+    reason: null,
+  };
+}
+
+/**
+ * Scores a parsed insurance invoice PDF for attachment selection.
+ * @param {object} invoice Parsed invoice fields.
+ * @param {object} att Attachment metadata.
+ * @param {string|null} filenameHint Classifier filename hint.
+ * @return {number}
+ */
+function scoreInsuranceInvoicePdf(invoice, att, filenameHint) {
+  let score = 0;
+  if (invoice.invoiceTotal > 0) score += 3;
+  if (invoice.invoiceNumber) score += 2;
+  if (/redkik|insurance/i.test(invoice.vendorName || "")) score += 2;
+  if (/redkik|insurance|premium/i.test(invoice.rawText || "")) score += 1;
+  if (filenameHint && filenameMatchesHint(att.filename, filenameHint)) {
+    score += 5;
+  }
+  if (/invoice|statement/i.test(String(att.filename || ""))) score += 1;
+  return score;
+}
+
+/**
+ * Downloads spreadsheet/PDF candidates and picks insurance attachments.
+ * @param {object} opts Options.
+ * @param {Array<object>} opts.attachments Attachment metadata from Gmail.
+ * @param {function(object): Promise<Buffer>} opts.downloadAttachment
+ *   Async callback that returns bytes for one attachment object.
+ * @param {string} [opts.spreadsheetFilename] Classifier spreadsheet hint.
+ * @param {string} [opts.invoicePdfFilename] Classifier invoice PDF hint.
+ * @return {Promise<object>} Resolved excel/pdf buffers and validation.
+ */
+async function resolveInsuranceAttachments(opts) {
+  const attachments = (opts && opts.attachments) || [];
+  const downloadAttachment = opts && opts.downloadAttachment;
+  const spreadsheetHint = opts && opts.spreadsheetFilename;
+  const pdfHint = opts && opts.invoicePdfFilename;
+
+  if (typeof downloadAttachment !== "function") {
+    throw new Error("downloadAttachment callback required");
+  }
+
+  const spreadsheets = listSpreadsheetAttachments(attachments);
+  let bestExcel = null;
+  let bestExcelFilename = null;
+  let bestValidation = null;
+  let bestExcelScore = -1;
+
+  for (const att of spreadsheets) {
+    let buffer;
+    try {
+      buffer = await downloadAttachment(att);
+    } catch (err) {
+      continue;
+    }
+    const validation = validateInsuranceWorkbook(buffer);
+    let score = validation.addableCount * 10 + validation.premiumRowCount;
+    if (spreadsheetHint && filenameMatchesHint(att.filename, spreadsheetHint)) {
+      score += 50;
+    }
+    if (score > bestExcelScore) {
+      bestExcelScore = score;
+      bestValidation = validation;
+      if (validation.valid) {
+        bestExcel = buffer;
+        bestExcelFilename = att.filename || null;
+      }
+    }
+  }
+
+  const pdfs = listPdfAttachments(attachments);
+  let bestPdf = null;
+  let bestPdfFilename = null;
+  let bestPdfScore = -1;
+
+  for (const att of pdfs) {
+    let buffer;
+    try {
+      buffer = await downloadAttachment(att);
+    } catch (err) {
+      continue;
+    }
+    try {
+      const invoice = await parseInsuranceInvoicePdf(buffer);
+      const score = scoreInsuranceInvoicePdf(invoice, att, pdfHint);
+      if (score > bestPdfScore) {
+        bestPdfScore = score;
+        bestPdf = buffer;
+        bestPdfFilename = att.filename || null;
+      }
+    } catch (err) {
+      if (pdfHint && filenameMatchesHint(att.filename, pdfHint)) {
+        const hintScore = 4;
+        if (hintScore > bestPdfScore) {
+          bestPdfScore = hintScore;
+          bestPdf = buffer;
+          bestPdfFilename = att.filename || null;
+        }
+      }
+    }
+  }
+
+  return {
+    excelBuffer: bestExcel,
+    pdfBuffer: bestPdf,
+    excelFilename: bestExcelFilename,
+    pdfFilename: bestPdfFilename,
+    validation: bestValidation,
+  };
+}
+
+/**
  * Insurance intake is keyed off the QuickBooks sender only. All other
  * senders follow the regular carrier / forward-to-human flow.
  * @param {object} opts {from}.
  * @return {boolean}
+ * @deprecated Prefer AI email classification plus validateInsuranceWorkbook.
  */
 function isInsuranceEmail(opts) {
   const fromEmail = extractFromEmail(opts && opts.from);
@@ -531,7 +928,7 @@ function isInsuranceEmail(opts) {
 async function processInsuranceEmail(opts) {
   const {
     writeLog, saveOutboundEmail, fetchPrimusBooking,
-    addInsurancePremiumToLoad, isManagePhpEnabled,
+    addInsurancePremiumToLoad, resolveInsuranceVendor, isManagePhpEnabled,
   } = deps;
   const log = writeLog || (async () => {});
 
@@ -542,10 +939,12 @@ async function processInsuranceEmail(opts) {
     return {handled: false, reason: "manage.php off"};
   }
 
-  const {rows} = parseInsuranceExcel(opts.excelBuffer);
-  if (!rows.length) {
-    return {handled: false, reason: "no rows parsed from spreadsheet"};
+  const workbookCheck = validateInsuranceWorkbook(opts.excelBuffer);
+  if (!workbookCheck.valid) {
+    return {handled: false, reason: workbookCheck.reason || "invalid workbook"};
   }
+
+  const {rows} = workbookCheck;
 
   let invoice = {};
   let invoiceTotal = 0;
@@ -561,8 +960,51 @@ async function processInsuranceEmail(opts) {
   }
 
   const billDate = invoice.invoiceDate || new Date();
-  const vendorInvoiceNumber = invoice.invoiceNumber ||
-    `REDKIK-${roundMoney(new Date(billDate).getTime())}`;
+  const resolvedInv = resolveInsuranceVendorInvoiceNumber(invoice, {
+    subject: opts.subject,
+    body: opts.emailBody,
+  });
+  let vendorInvoiceNumber = resolvedInv.invoiceNumber;
+  if (!vendorInvoiceNumber) {
+    vendorInvoiceNumber = `REDKIK-${roundMoney(new Date(billDate).getTime())}`;
+    await log("warn", "insurance",
+        "Could not parse Redkik invoice number — using fallback ref", {
+          subject: opts.subject || null,
+          pdfInvoiceNumber: invoice.invoiceNumber || null,
+          fallback: vendorInvoiceNumber,
+        });
+  } else if (invoice.invoiceNumber &&
+      !isPlausibleInsuranceInvoiceNumber(invoice.invoiceNumber)) {
+    await log("warn", "insurance",
+        "Ignored implausible PDF invoice number", {
+          rejected: invoice.invoiceNumber,
+          used: vendorInvoiceNumber,
+          source: resolvedInv.invoiceNumberSource,
+          subject: opts.subject || null,
+        });
+  }
+  invoice.invoiceNumber = vendorInvoiceNumber;
+  invoice.invoiceNumberSource = resolvedInv.invoiceNumberSource ||
+    (vendorInvoiceNumber.startsWith("REDKIK-") ? "fallback" : "pdf");
+
+  let insuranceVendor = null;
+  if (!opts.dryRun) {
+    if (typeof resolveInsuranceVendor !== "function") {
+      return {handled: false, reason: "resolveInsuranceVendor not configured"};
+    }
+    try {
+      insuranceVendor = await resolveInsuranceVendor(invoice.vendorName);
+    } catch (err) {
+      await log("warn", "insurance", "Insurance vendor lookup failed", {
+        vendorName: invoice.vendorName || null,
+        error: err && err.message,
+      });
+      return {
+        handled: false,
+        reason: err && err.message || "insurance vendor lookup failed",
+      };
+    }
+  }
 
   const postPremiumToLoad = opts.dryRun ? undefined :
     createInsurancePostAdapter({
@@ -570,6 +1012,9 @@ async function processInsuranceEmail(opts) {
       addInsurancePremiumToLoad,
       vendorInvoiceNumber,
       billDate,
+      insuranceVendor,
+      maybeAdjustBrokerAfterInsurance: deps.maybeAdjustBrokerAfterInsurance,
+      writeLog,
     });
 
   const result = await allocateInsurancePremiums({
@@ -581,6 +1026,7 @@ async function processInsuranceEmail(opts) {
       type: "insurance_reconciliation",
       subject: result.email.subject,
       html: result.email.html,
+      gmailMessageId: opts.gmailMessageId || null,
     });
   }
 
@@ -588,6 +1034,8 @@ async function processInsuranceEmail(opts) {
     from: opts.from || null,
     subject: opts.subject || null,
     vendorInvoiceNumber,
+    insuranceVendorId: insuranceVendor && insuranceVendor.id || null,
+    insuranceVendorName: insuranceVendor && insuranceVendor.name || null,
     ...result.reconciliation,
   });
 
@@ -604,9 +1052,13 @@ module.exports = {
   parseAmount,
   detectColumns,
   extractBol,
+  isPlausibleInsuranceInvoiceNumber,
+  extractInsuranceInvoiceNumber,
+  resolveInsuranceVendorInvoiceNumber,
   parseInsuranceExcel,
   parseInsuranceInvoicePdf,
   classifyRows,
+  isInsuranceSummaryRow,
   sumAmounts,
   applyPremiums,
   buildReconciliation,
@@ -615,6 +1067,10 @@ module.exports = {
   init,
   findSpreadsheetAttachment,
   findPdfAttachment,
+  listSpreadsheetAttachments,
+  listPdfAttachments,
+  validateInsuranceWorkbook,
+  resolveInsuranceAttachments,
   extractFromEmail,
   isInsuranceEmail,
   processInsuranceEmail,
@@ -630,6 +1086,7 @@ module.exports = {
  * @param {string} deps.vendorInvoiceNumber Redkik invoice number for all rows.
  * @param {string|Date} deps.billDate Insurance invoice date.
  * @param {string|Date} [deps.billDueDate] Insurance due date.
+ * @param {object} deps.insuranceVendor Resolved {id, name} for the whole sheet.
  * @return {function(object): Promise<object>}
  */
 function createInsurancePostAdapter(deps) {
@@ -639,6 +1096,8 @@ function createInsurancePostAdapter(deps) {
     vendorInvoiceNumber,
     billDate,
     billDueDate,
+    insuranceVendor,
+    maybeAdjustBrokerAfterInsurance,
   } = deps;
 
   return async function postPremiumToLoad(row) {
@@ -662,9 +1121,19 @@ function createInsurancePostAdapter(deps) {
       vendorInvoiceNumber,
       billDate,
       billDueDate,
+      insuranceVendor,
     });
     if (result.notFound) {
       return {ok: false, notFound: true, error: result.error};
+    }
+    if (result.duplicate) {
+      return {
+        ok: false,
+        duplicate: true,
+        error: result.error,
+        existingBill: result.existingBill,
+        existingAmount: result.existingAmount,
+      };
     }
     if (!result.ok) {
       return {
@@ -672,6 +1141,25 @@ function createInsurancePostAdapter(deps) {
         error: result.error || result.step || "post failed",
       };
     }
+
+    if (typeof maybeAdjustBrokerAfterInsurance === "function") {
+      try {
+        await maybeAdjustBrokerAfterInsurance({
+          loadNumber,
+          booking,
+          premium: row.amount,
+          invoiceId: result.invoiceId || null,
+        });
+      } catch (marginErr) {
+        const log = deps.writeLog || (async () => {});
+        await log("warn", "insurance",
+            "Post-insurance broker commission check failed", {
+              loadNumber,
+              error: marginErr && marginErr.message,
+            });
+      }
+    }
+
     return {
       ok: true,
       loadNumber: result.loadNumber,

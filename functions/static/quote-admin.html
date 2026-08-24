@@ -1,0 +1,1387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Innovative — Quote Rules Admin</title>
+  <style>
+    :root {
+      --primary: #1f4fd8;
+      --primary-dark: #153a9e;
+      --primary-light: #eef2ff;
+      --bg: #f0f4fa;
+      --surface: #ffffff;
+      --surface-muted: #f8fafc;
+      --border: #e2e8f0;
+      --text: #1f2937;
+      --text-secondary: #475569;
+      --muted: #64748b;
+      --success: #059669;
+      --success-bg: #ecfdf5;
+      --warning: #d97706;
+      --warning-bg: #fffbeb;
+      --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+      --shadow: 0 4px 6px rgba(15, 23, 42, 0.04), 0 12px 24px rgba(15, 23, 42, 0.06);
+      --radius: 12px;
+      --radius-lg: 16px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    header {
+      background: var(--surface);
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      box-shadow: var(--shadow-sm);
+    }
+    header h1 {
+      font-size: 1.125rem;
+      margin: 0;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--primary-dark);
+    }
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-left: auto;
+      flex-wrap: wrap;
+      background: var(--surface-muted);
+      padding: 4px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+    }
+    .tabs button {
+      background: transparent;
+      border: none;
+      color: var(--muted);
+      padding: 8px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      font-family: inherit;
+      transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .tabs button:hover { color: var(--text-secondary); background: rgba(255,255,255,0.7); }
+    .tabs button.active {
+      background: var(--surface);
+      color: var(--primary-dark);
+      box-shadow: var(--shadow-sm);
+    }
+    main {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      padding: 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .panel h2 {
+      font-size: 1.125rem;
+      margin: 0 0 8px;
+      color: var(--primary-dark);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+    .panel-intro {
+      font-size: 0.9375rem;
+      color: var(--muted);
+      margin: 0 0 20px;
+      line-height: 1.6;
+    }
+    .panel-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .badge {
+      display: inline-block;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--surface-muted);
+      color: var(--text-secondary);
+      border: 1px solid var(--border);
+    }
+    .badge.on { background: var(--success-bg); color: var(--success); border-color: #a7f3d0; }
+    .badge.off { opacity: 0.6; }
+    .badge.confirm { background: var(--warning-bg); color: var(--warning); border-color: #fcd34d; }
+    .rules-list { display: flex; flex-direction: column; gap: 8px; }
+    .rule-card {
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0;
+      background: var(--surface-muted);
+      transition: box-shadow 0.15s ease, border-color 0.15s ease;
+      overflow: hidden;
+    }
+    .rule-card:hover {
+      border-color: #c7d2fe;
+      box-shadow: var(--shadow-sm);
+    }
+    .rule-card.inactive { opacity: 0.65; }
+    .rule-toggle {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      width: 100%;
+      margin: 0;
+      padding: 12px 14px;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+      font: inherit;
+      text-align: left;
+      color: inherit;
+    }
+    .rule-toggle:hover { background: var(--primary-light); }
+    .rule-chevron {
+      color: var(--muted);
+      font-size: 0.75rem;
+      line-height: 1.6;
+      transition: transform 0.15s ease;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .rule-card.open .rule-chevron { transform: rotate(90deg); }
+    .rule-toggle-main { flex: 1; min-width: 0; }
+    .rule-toggle-badges {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      flex-shrink: 0;
+      max-width: 46%;
+    }
+    .rule-title {
+      font-size: 0.9375rem;
+      font-weight: 700;
+      margin: 0;
+      line-height: 1.35;
+      color: var(--text);
+    }
+    .rule-compact-summary {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      margin-top: 3px;
+      line-height: 1.4;
+    }
+    .rule-body {
+      display: none;
+      padding: 0 16px 16px;
+      border-top: 1px solid var(--border);
+    }
+    .rule-card.open .rule-body { display: block; }
+    .rule-meta { font-size: 0.8125rem; color: var(--muted); margin-top: 4px; }
+    .rule-section { margin-top: 14px; }
+    .rule-section-label {
+      font-size: 0.6875rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--primary);
+      margin-bottom: 8px;
+    }
+    .rule-section ul { margin: 0; padding-left: 18px; font-size: 0.875rem; line-height: 1.6; color: var(--text-secondary); }
+    .rule-section li { margin-bottom: 4px; }
+    .rule-notes {
+      margin-top: 12px;
+      font-size: 0.875rem;
+      color: var(--muted);
+      font-style: italic;
+      padding: 10px 12px;
+      background: var(--surface);
+      border-radius: 8px;
+      border-left: 3px solid var(--primary-light);
+    }
+    .rule-advanced { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; }
+    .rule-advanced summary {
+      cursor: pointer;
+      font-size: 0.8125rem;
+      color: var(--muted);
+      user-select: none;
+      font-weight: 500;
+    }
+    .rule-advanced summary:hover { color: var(--primary); }
+    .rule-advanced pre {
+      margin: 10px 0 0;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 0.75rem;
+      overflow: auto;
+      color: var(--text-secondary);
+    }
+    .empty-state {
+      text-align: center;
+      padding: 48px 20px;
+      color: var(--muted);
+      background: var(--surface-muted);
+      border-radius: var(--radius);
+      border: 1px dashed var(--border);
+    }
+    .empty-state strong {
+      display: block;
+      color: var(--text);
+      margin-bottom: 8px;
+      font-size: 1rem;
+    }
+
+    /* Chat panel */
+    .chat-panel { display: flex; flex-direction: column; min-height: 520px; }
+    .chat-log {
+      flex: 1;
+      min-height: 360px;
+      max-height: 480px;
+      overflow-y: auto;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 14px;
+      background: var(--surface-muted);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .msg { display: flex; max-width: 88%; }
+    .msg.user { margin-left: auto; justify-content: flex-end; }
+    .msg.assistant { justify-content: flex-start; }
+    .msg .bubble {
+      padding: 12px 14px;
+      border-radius: 16px;
+      font-size: 0.9375rem;
+      white-space: pre-wrap;
+      line-height: 1.55;
+      box-shadow: var(--shadow-sm);
+    }
+    .msg.assistant .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-bottom-left-radius: 4px;
+    }
+    .msg.user .bubble {
+      background: var(--primary);
+      color: #fff;
+      border-bottom-right-radius: 4px;
+    }
+    .msg.thinking .bubble {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--primary-dark);
+      font-weight: 650;
+      display: flex;
+      align-items: baseline;
+      gap: 2px;
+    }
+    .thinking-status {
+      margin: 0;
+      display: flex;
+      align-items: baseline;
+      gap: 2px;
+      min-height: 1.4em;
+      transition: opacity 0.22s ease;
+    }
+    .thinking-status.is-fading { opacity: 0; }
+    .thinking-dots span {
+      display: inline-block;
+      width: 0.35em;
+      opacity: 0.25;
+      animation: thinking-dot 1.2s ease-in-out infinite;
+    }
+    .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes thinking-dot {
+      0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+      40% { opacity: 1; transform: translateY(-1px); }
+    }
+    .chat-quick-replies {
+      display: none;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 12px;
+    }
+    .chat-quick-replies.visible { display: flex; }
+    .chat-quick-replies button {
+      background: var(--surface);
+      border: 1px solid #c7d2fe;
+      color: var(--primary-dark);
+      padding: 8px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      line-height: 1.35;
+      text-align: left;
+      max-width: 100%;
+      transition: background 0.15s ease, border-color 0.15s ease;
+    }
+    .chat-quick-replies button:hover {
+      background: var(--primary-light);
+      border-color: var(--primary);
+    }
+    .chat-quick-replies button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    .chat-input {
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+    }
+    .chat-input textarea {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      resize: vertical;
+      min-height: 72px;
+      font-family: inherit;
+      font-size: 0.9375rem;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .chat-input textarea:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(31, 79, 216, 0.12);
+    }
+    button.primary {
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      padding: 12px 18px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-weight: 600;
+      font-family: inherit;
+      font-size: 0.875rem;
+      transition: background 0.15s ease;
+      white-space: nowrap;
+    }
+    button.primary:hover { background: var(--primary-dark); }
+    button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.ghost {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text-secondary);
+      padding: 10px 14px;
+      border-radius: 10px;
+      cursor: pointer;
+      font-family: inherit;
+      font-weight: 600;
+      font-size: 0.875rem;
+    }
+    button.ghost:hover { background: var(--primary-light); border-color: #c7d2fe; color: var(--primary-dark); }
+    .proposal {
+      margin-top: 16px;
+      padding: 18px;
+      background: var(--warning-bg);
+      border-radius: var(--radius);
+      border: 1px solid #fcd34d;
+      font-size: 0.875rem;
+    }
+    .proposal > strong { color: var(--warning); font-size: 0.9375rem; }
+    .proposal-summary { line-height: 1.6; margin: 10px 0 14px; color: var(--text-secondary); }
+    .proposal pre { overflow: auto; font-size: 0.75rem; margin: 8px 0; }
+
+    /* Test panel */
+    .test-form label {
+      display: block;
+      font-size: 0.875rem;
+      color: var(--text);
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .test-form .hint {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      font-weight: 400;
+      margin-top: -2px;
+      margin-bottom: 8px;
+    }
+    .test-form input, .test-form textarea {
+      width: 100%;
+      margin-bottom: 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 11px 14px;
+      font-family: inherit;
+      font-size: 0.9375rem;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .test-form input:focus, .test-form textarea:focus {
+      outline: none;
+      border-color: var(--primary);
+      box-shadow: 0 0 0 3px rgba(31, 79, 216, 0.12);
+    }
+    .test-form .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      font-size: 0.9375rem;
+      cursor: pointer;
+    }
+    .test-form .checkbox-row input {
+      width: auto;
+      margin: 0;
+    }
+    .test-result {
+      margin-top: 20px;
+      padding: 18px 20px;
+      background: var(--primary-light);
+      border: 1px solid #c7d2fe;
+      border-radius: var(--radius);
+      font-size: 0.9375rem;
+      line-height: 1.6;
+    }
+    .test-result h3 {
+      margin: 16px 0 8px;
+      font-size: 0.75rem;
+      color: var(--primary-dark);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .test-result h3:first-child { margin-top: 0; }
+    .test-result ul { margin: 0; padding-left: 20px; color: var(--text-secondary); }
+    .test-result .none { color: var(--muted); font-style: italic; }
+    .hidden { display: none !important; }
+    #status { font-size: 0.8125rem; color: var(--muted); }
+
+    @media (max-width: 720px) {
+      header { padding: 14px 16px; }
+      .tabs { margin-left: 0; width: 100%; }
+      .tabs button { flex: 1; text-align: center; padding: 10px 8px; font-size: 0.75rem; }
+      main { padding: 16px; }
+      .panel { padding: 18px; }
+      .chat-input { flex-direction: column; align-items: stretch; }
+      button.primary { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Quote Rules</h1>
+    <span id="status">Tenant: __TENANT_ID__</span>
+    <div class="tabs">
+      <button type="button" data-tab="rules" class="active">Rules list</button>
+      <button type="button" data-tab="chat">Ask AI to change rules</button>
+      <button type="button" data-tab="test">Try an address</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel" id="panel-rules">
+      <h2>Automatic quote rules</h2>
+      <p class="panel-intro">
+        These rules run when a quote email comes in. Each rule checks the delivery location and instructions,
+        then adds the right accessorials (liftgate, appointment, limited access, etc.) before rate shopping.
+        Rules with lower priority numbers run first.
+      </p>
+      <div class="panel-toolbar">
+        <button type="button" class="ghost" id="reload-rules">Refresh list</button>
+        <span id="rules-count" style="font-size:0.8rem;color:var(--muted)"></span>
+      </div>
+      <div class="rules-list" id="rules-list"></div>
+    </section>
+
+    <section class="panel hidden chat-panel" id="panel-chat">
+      <h2>Change rules in plain English</h2>
+      <p class="panel-intro">
+        Describe what you want changed — for example, add appointment delivery
+        for military facilities, or update accessorials for nursing homes.
+        The assistant will propose a change; click <strong>Confirm</strong> to apply it.
+        Press Enter to send (Shift+Enter for a new line).
+      </p>
+      <div class="chat-log" id="chat-log"></div>
+      <div class="chat-quick-replies" id="chat-quick-replies" aria-label="Quick replies"></div>
+      <div class="chat-input">
+        <textarea id="chat-input" placeholder="Example: For military facilities, add limited access and appointment delivery."></textarea>
+        <button type="button" class="primary" id="chat-send">Send</button>
+      </div>
+      <div id="proposal-box" class="proposal hidden">
+        <strong>Proposed rule change — click Confirm to apply</strong>
+        <div id="proposal-summary" class="proposal-summary"></div>
+        <details class="rule-advanced">
+          <summary>Technical details (for IT)</summary>
+          <pre id="proposal-json"></pre>
+        </details>
+        <div style="margin-top:12px;display:flex;gap:8px">
+          <button type="button" class="primary" id="confirm-proposal">Confirm</button>
+          <button type="button" class="ghost" id="dismiss-proposal">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel hidden" id="panel-test">
+      <h2>Try an address</h2>
+      <p class="panel-intro">
+        Enter Ship From and/or Ship To addresses to see which rules would apply and what accessorials
+        would be added — without sending a real quote.
+      </p>
+      <div class="test-form">
+        <label for="test-from-name">Who is shipping the freight?</label>
+        <p class="hint">Shipper / pickup location name (Ship From)</p>
+        <input id="test-from-name" placeholder="Weida Freight System">
+        <label for="test-from-address">Pickup address</label>
+        <p class="hint">Street, city, and state</p>
+        <input id="test-from-address" placeholder="9050 Hermosa Ave, Rancho Cucamonga CA">
+        <label for="test-name">Who is receiving the freight?</label>
+        <p class="hint">Consignee / delivery location name (Ship To)</p>
+        <input id="test-name" placeholder="Sunrise Nursing Home">
+        <label for="test-address">Delivery address</label>
+        <p class="hint">Street, city, and state</p>
+        <input id="test-address" placeholder="123 Main St, Dallas TX">
+        <label for="test-instructions">Special instructions from the email</label>
+        <p class="hint">Anything about dock, liftgate, appointment, etc.</p>
+        <textarea id="test-instructions" rows="3" placeholder="No loading dock — liftgate required"></textarea>
+        <label class="checkbox-row">
+          <input type="checkbox" id="test-classify">
+          Classify From + To (Google Places or AI lookup + cache)
+        </label>
+        <button type="button" class="primary" id="run-test">Check which rules apply</button>
+        <div id="test-result" class="test-result hidden"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const TENANT_ID = "__TENANT_ID__";
+    const API = "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+    let chatMessages = [];
+    let pendingProposal = null;
+    let pendingQuickReplies = [];
+    let thinkingTimer = null;
+    let thinkingFadeTimer = null;
+    let thinkingStep = 0;
+    const THINKING_ROTATE_MS = 1500;
+    const THINKING_FADE_MS = 220;
+    const THINKING_PHRASES = [
+      "Thinking",
+      "Looking over data",
+      "Processing",
+      "Reviewing your request",
+      "Preparing a proposal",
+    ];
+
+    const ACCESSORIAL_LABELS = {
+      LFO: "Liftgate at pickup",
+      LFO: "Liftgate at pickup",
+      LFD: "Liftgate at delivery",
+      APO: "Appointment pickup",
+      APD: "Appointment required",
+      LAO: "Limited access pickup",
+      LAD: "Limited access delivery",
+      RSO: "Residential pickup",
+      NUD: "Nursing home delivery",
+      HOD: "Hotel delivery",
+      RSD: "Residential delivery",
+      SCD: "School delivery",
+      INS: "Insurance",
+    };
+
+    const SITE_TYPE_LABELS = {
+      nursing_home: "Nursing home",
+      hotel: "Hotel",
+      amazon_fc: "Amazon fulfillment center",
+      menards_dc: "Menards DC",
+      aafes_military: "AAFES / military exchange",
+      chain_store: "Chain store",
+      residential: "Residential",
+      other: "Commercial / other",
+    };
+
+    const FLAG_LABELS = {
+      residentialDelivery: "Residential delivery",
+      residentialPickup: "Residential pickup",
+    };
+
+    const IDENTIFY_VIA_LABELS = {
+      address_text: "Address text",
+      ai: "AI classification",
+      both: "Address text or AI",
+      email: "Sender email",
+    };
+
+    function formatIdentifyVia(rule) {
+      const key = rule.identifyVia || "both";
+      return IDENTIFY_VIA_LABELS[key] || IDENTIFY_VIA_LABELS.both;
+    }
+
+    function api(path, opts = {}) {
+      const url = path.startsWith("http") ? path : API + path;
+      const sep = url.includes("?") ? "&" : "?";
+      const full = url.includes("tenantId=") ? url : url + sep + "tenantId=" + encodeURIComponent(TENANT_ID);
+      return fetch(full, {
+        ...opts,
+        headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+      }).then(r => r.json());
+    }
+
+    function esc(s) {
+      const d = document.createElement("div");
+      d.textContent = s || "";
+      return d.innerHTML;
+    }
+
+    function quoteList(items) {
+      if (!items || !items.length) return "";
+      if (items.length === 1) return `"${items[0]}"`;
+      const head = items.slice(0, -1).map(i => `"${i}"`).join(", ");
+      return `${head}, or "${items[items.length - 1]}"`;
+    }
+
+    function formatAccessorial(code) {
+      const label = ACCESSORIAL_LABELS[code];
+      return label ? `${label} (${code})` : code;
+    }
+
+    function describeMatch(match, applyTo) {
+      const lines = [];
+      if (!match || typeof match !== "object") {
+        lines.push("Always applies (no specific trigger configured).");
+        return lines;
+      }
+      if (applyTo === "origin") {
+        lines.push("Applies to pickup / Ship From only");
+      } else if (applyTo === "both") {
+        lines.push("Applies to pickup and delivery (origin vs dest codes)");
+      }
+      if (match.consigneeNameContains && match.consigneeNameContains.length) {
+        lines.push(`Consignee name includes ${quoteList(match.consigneeNameContains)}`);
+      }
+      if (match.consigneeAddressContains && match.consigneeAddressContains.length) {
+        lines.push(`Delivery address includes ${quoteList(match.consigneeAddressContains)}`);
+      }
+      if (match.shipperNameContains && match.shipperNameContains.length) {
+        lines.push(`Shipper name includes ${quoteList(match.shipperNameContains)}`);
+      }
+      if (match.instructionsContains && match.instructionsContains.length) {
+        lines.push(`Special instructions mention ${quoteList(match.instructionsContains)}`);
+      }
+      if (match.referenceContains && match.referenceContains.length) {
+        lines.push(`Reference / PO number includes ${quoteList(match.referenceContains)}`);
+      }
+      if (match.flags && match.flags.length) {
+        match.flags.forEach(f => {
+          lines.push(`Shipment is flagged as ${FLAG_LABELS[f] || f.replace(/([A-Z])/g, " $1").toLowerCase().trim()}`);
+        });
+      }
+      if (match.siteType) {
+        const kind = applyTo === "origin" ? "Pickup site" :
+          applyTo === "both" ? "Pickup or delivery site" : "Delivery site";
+        lines.push(`${kind} is identified as ${SITE_TYPE_LABELS[match.siteType] || match.siteType.replace(/_/g, " ")}`);
+      }
+      const fromEmails = [].concat(match.fromEmails || []).concat(match.senderEmails || []);
+      if (fromEmails.length) {
+        lines.push(`Sender From email is ${quoteList(fromEmails)}`);
+      }
+      if (match.senderDomains && match.senderDomains.length) {
+        lines.push(`Sender domain is ${quoteList(match.senderDomains.map((d) => String(d).startsWith("@") ? d : "@" + d))}`);
+      }
+      if (!lines.length) {
+        lines.push("Custom match conditions (see Advanced for details).");
+      }
+      return lines;
+    }
+
+    function describeActions(rule) {
+      const lines = [];
+      if (rule.customerName) {
+        lines.push(`Attach Primus customer "${rule.customerName}"`);
+      }
+      if (rule.protocolOnly) {
+        lines.push("Protocol only — match this customer from the sender email");
+      }
+      if (rule.defaultDims && typeof rule.defaultDims === "object") {
+        const d = rule.defaultDims;
+        const L = d.length != null ? d.length : "?";
+        const W = d.width != null ? d.width : "?";
+        const H = d.height != null ? d.height : "?";
+        lines.push(`Default missing pallet dims to ${L}×${W}×${H}`);
+      }
+      const acc = rule.addAccessorials || [];
+      if (acc.length) {
+        lines.push(`Add accessorial${acc.length > 1 ? "s" : ""}: ${acc.map(formatAccessorial).join("; ")}`);
+      }
+      const filters = rule.filterCarrierWarnings || [];
+      if (filters.length) {
+        lines.push(`Do not use carriers that warn about: ${filters.map(f => `"${f}"`).join(", ")}`);
+      }
+      if (!acc.length && !filters.length && !rule.customerName && !rule.defaultDims) {
+        lines.push("No accessorials or carrier filters — rule may only set flags or notes.");
+      }
+      if (rule.requiresConfirm) {
+        lines.push("Ask dispatcher to confirm before quoting");
+      } else if (rule.autoApply !== false) {
+        lines.push("Apply automatically — no confirmation needed");
+      }
+      return lines;
+    }
+
+    function priorityLabel(priority) {
+      const n = Number(priority);
+      if (!Number.isFinite(n)) return "Standard priority";
+      if (n <= 15) return `Runs early (priority ${n})`;
+      if (n <= 35) return `Normal priority (${n})`;
+      return `Runs later (priority ${n})`;
+    }
+
+    function compactAccessorialsSummary(rule) {
+      const parts = [];
+      const acc = rule.addAccessorials || [];
+      if (acc.length) {
+        parts.push(acc.map((c) => ACCESSORIAL_LABELS[c] || c).join(", "));
+      }
+      if (rule.customerName) {
+        parts.push("customer " + rule.customerName);
+      }
+      const filters = rule.filterCarrierWarnings || [];
+      if (filters.length) {
+        parts.push("filter " + filters.join(", "));
+      }
+      if (!parts.length) return "No accessorials";
+      return parts.join(" · ");
+    }
+
+    function setRuleCardOpen(card, open) {
+      if (!card) return;
+      card.classList.toggle("open", !!open);
+      const btn = card.querySelector("[data-rule-toggle]");
+      if (btn) btn.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    function bindRuleCardToggles(root) {
+      (root || document).querySelectorAll("[data-rule-toggle]").forEach((btn) => {
+        if (btn.dataset.boundRuleToggle === "1") return;
+        btn.dataset.boundRuleToggle = "1";
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          const card = btn.closest(".rule-card");
+          if (!card) return;
+          setRuleCardOpen(card, !card.classList.contains("open"));
+        });
+      });
+    }
+
+    function renderRuleCard(rule) {
+      const card = document.createElement("article");
+      card.className = "rule-card" + (rule.active === false ? " inactive" : "");
+
+      const whenLines = describeMatch(rule.match, rule.applyTo);
+      const thenLines = describeActions(rule);
+      const summary = compactAccessorialsSummary(rule);
+
+      const badges = [];
+      badges.push(`<span class="badge ${rule.active !== false ? "on" : "off"}">${rule.active !== false ? "Active" : "Turned off"}</span>`);
+      if (rule.requiresConfirm) {
+        badges.push('<span class="badge confirm">Needs confirmation</span>');
+      }
+
+      card.innerHTML = `
+        <button type="button" class="rule-toggle" data-rule-toggle="1" aria-expanded="false">
+          <span class="rule-chevron" aria-hidden="true">▶</span>
+          <div class="rule-toggle-main">
+            <h3 class="rule-title">${esc(rule.name || rule.id || "Unnamed rule")}</h3>
+            <div class="rule-compact-summary">${esc(summary)} · ${esc(priorityLabel(rule.priority))}</div>
+          </div>
+          <div class="rule-toggle-badges">${badges.join("")}</div>
+        </button>
+        <div class="rule-body">
+          <div class="rule-section">
+            <div class="rule-section-label">When this happens</div>
+            <ul>${whenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+            <div class="rule-meta" style="margin-top:6px">Identified via: ${esc(formatIdentifyVia(rule))}</div>
+          </div>
+          <div class="rule-section">
+            <div class="rule-section-label">Then do this</div>
+            <ul>${thenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
+          </div>
+          ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
+          <details class="rule-advanced">
+            <summary>Advanced (rule ID &amp; technical data)</summary>
+            <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
+          </details>
+        </div>
+      `;
+      return card;
+    }
+
+    async function loadRules() {
+      const list = document.getElementById("rules-list");
+      const countEl = document.getElementById("rules-count");
+      list.innerHTML = '<div class="empty-state">Loading rules…</div>';
+      try {
+        const data = await api("/getQuoteRules");
+        const rules = data.rules || [];
+        list.innerHTML = "";
+        if (!rules.length) {
+          list.innerHTML = `
+            <div class="empty-state">
+              <strong>No rules configured yet</strong>
+              Default rules will appear after the first quote is processed, or use the AI chat tab to add one.
+            </div>`;
+          countEl.textContent = "";
+          return;
+        }
+        const sorted = [...rules].sort((a, b) => (Number(a.priority) || 999) - (Number(b.priority) || 999));
+        sorted.forEach(r => list.appendChild(renderRuleCard(r)));
+        bindRuleCardToggles(list);
+        const active = rules.filter(r => r.active !== false).length;
+        countEl.textContent = `${active} active · ${rules.length} total`;
+      } catch (e) {
+        list.innerHTML = `<div class="empty-state"><strong>Could not load rules</strong>${esc(e.message)}</div>`;
+        countEl.textContent = "";
+      }
+    }
+
+    function formatClassificationBlock(title, enrichment, addressKey) {
+      let html = `<h3>${esc(title)}</h3>`;
+      if (!enrichment) {
+        html += '<p class="none">Not classified.</p>';
+        return html;
+      }
+      if (enrichment.error) {
+        html += `<p class="none">Classification failed: ${esc(enrichment.error)}</p>`;
+        return html;
+      }
+      const cache = enrichment.cacheHit ? "cache hit" : "cache miss (saved)";
+      const type = SITE_TYPE_LABELS[enrichment.classifiedAs] || enrichment.classifiedAs;
+      html += "<ul>";
+      html += `<li><strong>Site type:</strong> ${esc(type || "unknown")}</li>`;
+      if (enrichment.placeName) {
+        html += `<li><strong>Place name:</strong> ${esc(enrichment.placeName)}</li>`;
+      }
+      html += `<li><strong>Source:</strong> ${esc(enrichment.source || "unknown")} (${cache})</li>`;
+      if (addressKey) {
+        html += `<li><strong>Cache key:</strong> <code>${esc(addressKey)}</code></li>`;
+      }
+      html += "</ul>";
+      return html;
+    }
+
+    function formatTestResult(result, enrichment, addressKey, originEnrichment, originAddressKey) {
+      if (!result) return '<p class="none">No result returned.</p>';
+      const applied = result.appliedRules || [];
+      const acc = result.accessorials || [];
+      const filters = result.filterCarrierWarnings || [];
+      let html = "";
+
+      if (originEnrichment || enrichment) {
+        if (originEnrichment) {
+          html += formatClassificationBlock(
+              "From (origin) classification", originEnrichment, originAddressKey);
+        }
+        if (enrichment) {
+          html += formatClassificationBlock(
+              "To (destination) classification", enrichment, addressKey);
+        }
+      }
+
+      html += "<h3>Rules that matched</h3>";
+      if (applied.length) {
+        html += "<ul>" + applied.map(r => {
+          const sideLabel = r.applyTo === "origin" ? " (pickup)" :
+            r.applyTo === "dest" ? " (delivery)" : "";
+          const viaLabel = r.fromEnrichment ?
+            " (via AI classification)" :
+            (r.matchVia === "consigneeName" ? " (via consignee name in email)" :
+              r.matchVia === "shipperName" ? " (via shipper name)" :
+              r.matchVia === "instructions" ? " (via special instructions)" :
+                r.matchVia === "siteType" && r.identifyVia === "address_text" ?
+                  " (via site type in email)" : "");
+          return `<li><strong>${esc(r.name)}</strong>${sideLabel}${viaLabel}${r.notes ? " — " + esc(r.notes) : ""}</li>`;
+        }).join("") + "</ul>";
+      } else {
+        html += '<p class="none">No rules matched this address.</p>';
+      }
+
+      html += "<h3>Accessorials that would be added</h3>";
+      if (acc.length) {
+        html += "<ul>" + acc.map(c => `<li>${esc(formatAccessorial(c))}</li>`).join("") + "</ul>";
+      } else {
+        html += '<p class="none">None — no extra accessorials from rules.</p>';
+      }
+
+      if (filters.length) {
+        html += "<h3>Carrier restrictions</h3>";
+        html += "<ul>" + filters.map(f => `<li>Exclude carriers warning about "${esc(f)}"</li>`).join("") + "</ul>";
+      }
+
+      if (result.requiresConfirm) {
+        html += '<p style="margin-top:12px;color:var(--warning)"><strong>Dispatcher confirmation would be required</strong> before quoting.</p>';
+      }
+
+      return html;
+    }
+
+    function isDeleteAction(action) {
+      return action === "propose_delete_rule" || action === "delete";
+    }
+
+    function isCreateAction(action) {
+      return action === "propose_create_rule" || action === "create";
+    }
+
+    function normalizeChatProposal(res) {
+      if (!res || typeof res !== "object") return res;
+      const action = res.action;
+      if (!action || action === "none") return res;
+      let proposal = res.proposal;
+      if (!proposal || typeof proposal !== "object") {
+        if (res.ruleId || res.patch || res.deleteRuleId) {
+          proposal = {
+            ruleId: res.ruleId || res.deleteRuleId || null,
+            patch: res.patch || null,
+            deleteRuleId: res.deleteRuleId || res.ruleId || null,
+          };
+        } else {
+          return res;
+        }
+      }
+      if (isDeleteAction(action)) {
+        const id = proposal.deleteRuleId || proposal.ruleId ||
+          (proposal.patch && (proposal.patch.deleteRuleId || proposal.patch.ruleId));
+        if (id) {
+          proposal = {
+            ...proposal,
+            ruleId: proposal.ruleId || id,
+            deleteRuleId: proposal.deleteRuleId || id,
+          };
+        }
+      }
+      return {...res, proposal};
+    }
+
+    function summarizeProposal(res) {
+      if (!res || !res.proposal) return "The assistant proposed a rule change. Click Confirm to apply it.";
+      const p = res.proposal;
+      const patch = (p.patch && typeof p.patch === "object") ? p.patch : {};
+      const action = res.action || "propose_update_rule";
+      const parts = [];
+      const ruleLabel = p.ruleId || p.deleteRuleId || patch.id || "unknown";
+
+      if (isDeleteAction(action)) {
+        const ids = Array.isArray(p.deleteRuleIds) && p.deleteRuleIds.length
+          ? p.deleteRuleIds
+          : [ruleLabel];
+        parts.push(`<strong>Delete</strong> ${ids.length === 1 ? "the rule" : ids.length + " rules"}: ${ids.map((id) => `"${esc(id)}"`).join(", ")}.`);
+        return parts.join("<br>");
+      } else if (isCreateAction(action)) {
+        parts.push(`<strong>Create a new rule:</strong> "${esc(patch.name || p.ruleId || "new rule")}".`);
+      } else {
+        parts.push(`<strong>Update rule</strong> "${esc(p.ruleId || patch.id || "existing rule")}".`);
+      }
+
+      if (patch.name) parts.push(`Name: ${esc(patch.name)}`);
+      if (patch.match) {
+        const when = describeMatch(patch.match, patch.applyTo);
+        parts.push(`When: ${when.map(esc).join("; ")}`);
+      }
+      if (patch.identifyVia) {
+        parts.push(`Identified via: ${esc(formatIdentifyVia(patch))}`);
+      }
+      if (patch.addAccessorials) {
+        parts.push(`Add: ${patch.addAccessorials.map(formatAccessorial).map(esc).join("; ")}`);
+      }
+      if (patch.customerName) {
+        parts.push(`Customer: ${esc(patch.customerName)}`);
+      }
+      if (patch.protocolOnly) parts.push("Protocol only");
+      if (patch.defaultDims && typeof patch.defaultDims === "object") {
+        const d = patch.defaultDims;
+        parts.push(`Default dims: ${esc([d.length, d.width, d.height].filter((n) => n != null).join("×"))}`);
+      }
+      if (patch.active === false) parts.push("This rule will be turned off.");
+      if (patch.active === true) parts.push("This rule will be turned on.");
+
+      return parts.join("<br>");
+    }
+
+    document.querySelectorAll(".tabs button").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        ["rules", "chat", "test"].forEach(t => {
+          document.getElementById("panel-" + t).classList.toggle("hidden", t !== btn.dataset.tab);
+        });
+      });
+    });
+
+    document.getElementById("reload-rules").addEventListener("click", loadRules);
+
+    function clearQuickReplies() {
+      pendingQuickReplies = [];
+      const el = document.getElementById("chat-quick-replies");
+      if (!el) return;
+      el.innerHTML = "";
+      el.classList.remove("visible");
+    }
+
+    function renderQuickReplies(replies) {
+      const el = document.getElementById("chat-quick-replies");
+      if (!el) return;
+      const list = Array.isArray(replies) ?
+        replies.map((r) => String(r || "").trim()).filter(Boolean) : [];
+      pendingQuickReplies = list;
+      el.innerHTML = "";
+      if (!list.length) {
+        el.classList.remove("visible");
+        return;
+      }
+      list.forEach((label) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.textContent = label;
+        btn.addEventListener("click", () => {
+          if (document.getElementById("chat-send").disabled) return;
+          const input = document.getElementById("chat-input");
+          input.value = label;
+          clearQuickReplies();
+          sendChatMessage();
+        });
+        el.appendChild(btn);
+      });
+      el.classList.add("visible");
+    }
+
+    function appendChat(role, text) {
+      const log = document.getElementById("chat-log");
+      const div = document.createElement("div");
+      div.className = "msg " + (role === "user" ? "user" : "assistant");
+      div.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function thinkingDotsEl() {
+      const dots = document.createElement("span");
+      dots.className = "thinking-dots";
+      dots.setAttribute("aria-hidden", "true");
+      dots.innerHTML = "<span>.</span><span>.</span><span>.</span>";
+      return dots;
+    }
+
+    function applyThinkingPhrase(phrase) {
+      const statusEl = document.getElementById("chat-thinking-status");
+      if (!statusEl) return;
+      statusEl.textContent = "";
+      statusEl.appendChild(document.createTextNode(phrase));
+      statusEl.appendChild(thinkingDotsEl());
+    }
+
+    function setThinkingCopy(step, withFade) {
+      const phrase = THINKING_PHRASES[step % THINKING_PHRASES.length];
+      const statusEl = document.getElementById("chat-thinking-status");
+      if (!statusEl) return;
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+      if (!withFade) {
+        statusEl.classList.remove("is-fading");
+        applyThinkingPhrase(phrase);
+        return;
+      }
+      statusEl.classList.add("is-fading");
+      thinkingFadeTimer = setTimeout(() => {
+        applyThinkingPhrase(phrase);
+        statusEl.classList.remove("is-fading");
+        thinkingFadeTimer = null;
+      }, THINKING_FADE_MS);
+    }
+
+    function stopThinkingRotation() {
+      if (thinkingTimer) {
+        clearInterval(thinkingTimer);
+        thinkingTimer = null;
+      }
+      if (thinkingFadeTimer) {
+        clearTimeout(thinkingFadeTimer);
+        thinkingFadeTimer = null;
+      }
+    }
+
+    function startThinkingRotation() {
+      thinkingStep = 0;
+      setThinkingCopy(0, false);
+      if (thinkingTimer) clearInterval(thinkingTimer);
+      thinkingTimer = setInterval(() => {
+        thinkingStep += 1;
+        setThinkingCopy(thinkingStep, true);
+      }, THINKING_ROTATE_MS);
+    }
+
+    function showChatThinking(active) {
+      const log = document.getElementById("chat-log");
+      if (!log) return;
+      let row = document.getElementById("chat-thinking");
+      if (active) {
+        if (!row) {
+          row = document.createElement("div");
+          row.id = "chat-thinking";
+          row.className = "msg assistant thinking";
+          row.setAttribute("aria-live", "polite");
+          row.innerHTML =
+            '<div class="bubble"><span class="thinking-status" id="chat-thinking-status"></span></div>';
+          log.appendChild(row);
+        } else {
+          log.appendChild(row);
+        }
+        row.classList.remove("hidden");
+        row.setAttribute("aria-busy", "true");
+        startThinkingRotation();
+        log.scrollTop = log.scrollHeight;
+      } else {
+        stopThinkingRotation();
+        if (row) row.remove();
+      }
+    }
+
+    function isTypedConfirm(text) {
+      return /^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
+        .test(String(text || "").trim());
+    }
+
+    async function applyPendingProposal() {
+      if (!pendingProposal) return;
+      clearQuickReplies();
+      const confirmBtn = document.getElementById("confirm-proposal");
+      const wasDelete = isDeleteAction(pendingProposal.action);
+      const ruleId = pendingProposal.ruleId || pendingProposal.deleteRuleId;
+      const deleteRuleIds = Array.isArray(pendingProposal.deleteRuleIds) &&
+        pendingProposal.deleteRuleIds.length
+        ? pendingProposal.deleteRuleIds
+        : (ruleId ? [ruleId] : []);
+      if (wasDelete && !ruleId && !deleteRuleIds.length) {
+        appendChat("assistant", "Failed: missing rule id to delete. Ask the assistant to propose the delete again.");
+        return;
+      }
+      const body = {
+        tenantId: TENANT_ID,
+        action: pendingProposal.action,
+        ruleId: ruleId || deleteRuleIds[0],
+        patch: pendingProposal.patch || {},
+        deleteRuleId: pendingProposal.deleteRuleId || ruleId || deleteRuleIds[0],
+        deleteRuleIds,
+        updatedBy: "quote-admin-ui",
+      };
+      if (confirmBtn) confirmBtn.disabled = true;
+      showChatThinking(true);
+      try {
+        const res = await api("/applyQuoteRule", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        showChatThinking(false);
+        if (!res || !res.ok) {
+          const errMsg = "Failed: " + ((res && res.error) || "applyQuoteRule did not succeed");
+          appendChat("assistant", errMsg);
+          chatMessages.push({ role: "assistant", content: errMsg });
+          return;
+        }
+        // Ground-truth for later turns — only after applyQuoteRule ok.
+        const applied = wasDelete
+          ? `[APPLIED] Deleted rule "${ruleId}" via Confirm (applyQuoteRule ok).`
+          : `[APPLIED] Saved rule "${ruleId}" via Confirm (applyQuoteRule ok).`;
+        const okMsg = wasDelete
+          ? `Applied: removed "${ruleId}". It stays gone on refresh.`
+          : `Applied: saved "${ruleId}". Refresh the Rules list to see the update.`;
+        appendChat("assistant", okMsg);
+        chatMessages.push({ role: "assistant", content: applied });
+        document.getElementById("proposal-box").classList.add("hidden");
+        pendingProposal = null;
+        await loadRules();
+      } catch (e) {
+        showChatThinking(false);
+        const errMsg = "Failed: " + e.message;
+        appendChat("assistant", errMsg);
+        chatMessages.push({ role: "assistant", content: errMsg });
+      } finally {
+        showChatThinking(false);
+        if (confirmBtn) confirmBtn.disabled = false;
+      }
+    }
+
+    async function sendChatMessage() {
+      const input = document.getElementById("chat-input");
+      const sendBtn = document.getElementById("chat-send");
+      const text = input.value.trim();
+      if (!text || sendBtn.disabled) return;
+
+      // Typing Confirm with a pending proposal uses applyQuoteRule — never the model.
+      if (pendingProposal && isTypedConfirm(text)) {
+        input.value = "";
+        clearQuickReplies();
+        chatMessages.push({ role: "user", content: text });
+        appendChat("user", text);
+        await applyPendingProposal();
+        return;
+      }
+      if (!pendingProposal && isTypedConfirm(text)) {
+        input.value = "";
+        clearQuickReplies();
+        chatMessages.push({ role: "user", content: text });
+        appendChat("user", text);
+        const tip = "There is no pending proposal. Ask me to remove or change a rule first, then click the Confirm button (typing Confirm alone does nothing).";
+        chatMessages.push({ role: "assistant", content: tip });
+        appendChat("assistant", tip);
+        return;
+      }
+
+      clearQuickReplies();
+      chatMessages.push({ role: "user", content: text });
+      appendChat("user", text);
+      input.value = "";
+      sendBtn.disabled = true;
+      showChatThinking(true);
+      try {
+        let res = await api("/quoteRulesChat", {
+          method: "POST",
+          body: JSON.stringify({ tenantId: TENANT_ID, messages: chatMessages }),
+        });
+        showChatThinking(false);
+        res = normalizeChatProposal(res) || res;
+        if (res.reply) {
+          chatMessages.push({ role: "assistant", content: res.reply });
+          appendChat("assistant", res.reply);
+        }
+        if (res.action === "ask_identify_source" &&
+            (!Array.isArray(res.quickReplies) || !res.quickReplies.length)) {
+          res.quickReplies = [
+            "Can be identified from the email",
+            "Cannot be — address / site classification only",
+          ];
+        }
+        // Prefer server-provided identify quick replies (canonical payloads).
+        if (res.action === "ask_identify_source" &&
+            Array.isArray(res.quickReplies) && res.quickReplies.length >= 2) {
+          const canon = [
+            "Can be identified from the email",
+            "Cannot be — address / site classification only",
+          ];
+          // Keep exact server strings when present; else force canon labels
+          // the identify parser accepts (1/2 and full button text).
+          res.quickReplies = res.quickReplies.map((label, i) => {
+            const s = String(label || "").trim();
+            return s || canon[i] || s;
+          });
+        }
+        if (Array.isArray(res.quickReplies) && res.quickReplies.length) {
+          renderQuickReplies(res.quickReplies);
+        }
+        if (res.action && res.action !== "none" &&
+            res.action !== "ask_identify_source" &&
+            res.action !== "ask_email_signals" &&
+            res.proposal) {
+          const proposal = res.proposal;
+          const ruleId = proposal.ruleId || proposal.deleteRuleId || null;
+          const patch = (proposal.patch && typeof proposal.patch === "object")
+            ? proposal.patch
+            : (isDeleteAction(res.action) ? {} : proposal);
+          pendingProposal = {
+            action: res.action,
+            ruleId,
+            deleteRuleId: proposal.deleteRuleId || ruleId,
+            deleteRuleIds: Array.isArray(proposal.deleteRuleIds)
+              ? proposal.deleteRuleIds
+              : (ruleId ? [ruleId] : []),
+            patch,
+          };
+          document.getElementById("proposal-summary").innerHTML = summarizeProposal(res);
+          document.getElementById("proposal-json").textContent = JSON.stringify(res, null, 2);
+          document.getElementById("proposal-box").classList.remove("hidden");
+          document.getElementById("proposal-box").scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+        if (Array.isArray(res.activeRuleIds)) {
+          await loadRules();
+        }
+      } catch (e) {
+        showChatThinking(false);
+        appendChat("assistant", "Error: " + e.message);
+      }
+      showChatThinking(false);
+      sendBtn.disabled = false;
+      input.focus();
+    }
+
+    document.getElementById("chat-send").addEventListener("click", () => {
+      sendChatMessage();
+    });
+
+    document.getElementById("chat-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+
+    document.getElementById("confirm-proposal").addEventListener("click", async () => {
+      await applyPendingProposal();
+    });
+
+    document.getElementById("dismiss-proposal").addEventListener("click", () => {
+      document.getElementById("proposal-box").classList.add("hidden");
+      pendingProposal = null;
+      clearQuickReplies();
+    });
+
+    document.getElementById("run-test").addEventListener("click", async () => {
+      const resultEl = document.getElementById("test-result");
+      resultEl.classList.remove("hidden");
+      resultEl.innerHTML = "<p class=\"none\">Checking rules…</p>";
+      const sample = {
+        shipper: {
+          name: document.getElementById("test-from-name").value,
+          address1: document.getElementById("test-from-address").value,
+        },
+        consignee: {
+          name: document.getElementById("test-name").value,
+          address1: document.getElementById("test-address").value,
+        },
+        specialInstructions: document.getElementById("test-instructions").value,
+      };
+      const classifyAddress = document.getElementById("test-classify").checked;
+      try {
+        const res = await api("/testQuoteRules", {
+          method: "POST",
+          body: JSON.stringify({ tenantId: TENANT_ID, sample, classifyAddress }),
+        });
+        resultEl.innerHTML = formatTestResult(
+            res.result, res.enrichment, res.addressKey,
+            res.originEnrichment, res.originAddressKey);
+      } catch (e) {
+        resultEl.innerHTML = `<p class="none">Error: ${esc(e.message)}</p>`;
+      }
+    });
+
+    loadRules();
+  </script>
+</body>
+</html>

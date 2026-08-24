@@ -1270,22 +1270,22 @@ exports.processCtcTaiWorkflow = onRequest(
               "Could not match this invoice to a TAI shipment yet",
           );
           const baseUrl = `https://${req.get("host")}`;
+          const alert = h.buildWorkflowAlertEmail({
+            code: "TAI_SHIPMENT_NOT_FOUND",
+            context: {
+              loadNumber: invoice.loadNumber,
+              proNumber: invoice.proNumber,
+            },
+            baseUrl,
+            invoiceId,
+            tenantId: tenant.tenantId,
+          });
           await h.saveOutboundEmail({
             tenant,
             type: "customer_missing",
             invoiceId,
-            subject: `Action needed — No TAI shipment match for ` +
-              `Load ${invoice.loadNumber}`,
-            html:
-              `<h2>TAI shipment not found</h2>` +
-              `<p>No TAI shipment is indexed for load ` +
-              `<strong>${h.escapeHtml(invoice.loadNumber || "")}</strong>` +
-              (invoice.proNumber ?
-                ` / PRO ${h.escapeHtml(invoice.proNumber)}` : "") +
-              `. This usually means the shipment webhook has not arrived ` +
-              `yet, or the reference number on the carrier invoice does not ` +
-              `match TAI.</p>` +
-              h.buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId),
+            subject: alert.subject,
+            html: alert.html,
           });
           return res.json({ok: true, workflowStatus: "tai_shipment_not_found"});
         }
@@ -1517,14 +1517,22 @@ exports.processCtcTaiWorkflow = onRequest(
               "Test customer detected - paused",
           );
           const baseUrl = `https://${req.get("host")}`;
+          const alert = h.buildWorkflowAlertEmail({
+            code: "TEST_CUSTOMER",
+            context: {
+              loadNumber: invoice.loadNumber,
+              customerName,
+            },
+            baseUrl,
+            invoiceId,
+            tenantId: tenant.tenantId,
+          });
           await h.saveOutboundEmail({
             tenant,
             type: "customer_missing",
             invoiceId,
-            subject: "Customer requires confirmation",
-            html: `<p>Invoice ${invoiceId} is for a test customer ` +
-              `(${h.escapeHtml(customerName)}).</p>` +
-              h.buildContinueButtonHtml(baseUrl, invoiceId, tenant.tenantId),
+            subject: alert.subject,
+            html: alert.html,
           });
           return res.json({ok: true, workflowStatus: "test_customer_review"});
         }
@@ -1584,19 +1592,22 @@ exports.processCtcTaiWorkflow = onRequest(
               invoiceRef, "get_rate", "needs_customer_rate_review",
               "Missing customer rate");
           const baseUrl = `https://${req.get("host")}`;
+          const alert = h.buildWorkflowAlertEmail({
+            code: "MISSING_RATE",
+            context: {
+              loadNumber: invoice.loadNumber,
+              carrierName: invoice.carrierName,
+            },
+            baseUrl,
+            invoiceId,
+            tenantId: tenant.tenantId,
+          });
           await h.saveOutboundEmail({
             tenant,
             type: "rate_missing",
             invoiceId,
-            subject: `Action needed — No customer rate for Load ` +
-              `${invoice.loadNumber}`,
-            html: `<h2>Customer Rate Missing</h2>` +
-              `<p>No customer rate was found in TAI for load ` +
-              `${h.escapeHtml(invoice.loadNumber || "")}.</p>` +
-              `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-              `${encodeURIComponent(invoiceId)}` +
-              `&tenantId=${encodeURIComponent(tenant.tenantId)}` +
-              `">Set Customer Rate</a>`,
+            subject: alert.subject,
+            html: alert.html,
           });
           return res.json({
             ok: true,
@@ -1635,21 +1646,25 @@ exports.processCtcTaiWorkflow = onRequest(
               invoiceRef, "get_rate", "needs_customer_rate_review",
               pauseReason);
           const baseUrl = `https://${req.get("host")}`;
+          const alert = h.buildWorkflowAlertEmail({
+            code: "LOW_MARGIN",
+            context: {
+              loadNumber: invoice.loadNumber,
+              carrierCost,
+              customerRate,
+              profit,
+              marginPct,
+            },
+            baseUrl,
+            invoiceId,
+            tenantId: tenant.tenantId,
+          });
           await h.saveOutboundEmail({
             tenant,
             type: "rate_missing",
             invoiceId,
-            subject: `Action needed — Low margin for Load ` +
-              `${invoice.loadNumber}`,
-            html: `<h2>Low Margin Warning — Load ` +
-              `${h.escapeHtml(invoice.loadNumber || "")}</h2>` +
-              `<p>Carrier cost $${Number(carrierCost).toFixed(2)}, ` +
-              `customer rate $${Number(customerRate).toFixed(2)}, ` +
-              `profit $${Number(profit).toFixed(2)} (${marginPct}%).</p>` +
-              `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-              `${encodeURIComponent(invoiceId)}` +
-              `&tenantId=${encodeURIComponent(tenant.tenantId)}` +
-              `">Update Customer Rate</a>`,
+            subject: alert.subject,
+            html: alert.html,
           });
           return res.json({
             ok: true,
@@ -1688,19 +1703,22 @@ exports.processCtcTaiWorkflow = onRequest(
               updatedAt: h.FieldValue.serverTimestamp(),
             });
             const baseUrl = `https://${req.get("host")}`;
+            const alert = h.buildWorkflowAlertEmail({
+              code: "INVOICE_GENERATION_FAILED",
+              context: {
+                loadNumber: invoice.loadNumber,
+                errorMessage: invoiceGen.error || "",
+              },
+              baseUrl,
+              invoiceId,
+              tenantId: tenant.tenantId,
+            });
             await h.saveOutboundEmail({
               tenant,
               type: "invoice_generation_failed",
               invoiceId,
-              subject: `Action needed — Invoice issue on Load ` +
-                `${invoice.loadNumber}`,
-              html: `<h2>Invoice generation issue — Load ` +
-                `${h.escapeHtml(invoice.loadNumber || "")}</h2>` +
-                `<p>${h.escapeHtml(invoiceGen.error || "")}</p>` +
-                `<a href="${baseUrl}/setCustomerRate?invoiceId=` +
-                `${encodeURIComponent(invoiceId)}` +
-                `&tenantId=${encodeURIComponent(tenant.tenantId)}` +
-                `">Resume Workflow</a>`,
+              subject: alert.subject,
+              html: alert.html,
             });
             return res.json({
               ok: false,
@@ -1819,21 +1837,44 @@ exports.processCtcTaiWorkflow = onRequest(
             stack: error.stack,
           });
           if (invoiceId) {
-            // Re-resolve the tenant so the lock is released on the SAME
-            // (prefixed) collection the workflow read from, never the root.
             const cleanupTenant = await resolveTenant(
                 tenantId || CTC_TENANT_ID);
             const ref =
               tcolFor(cleanupTenant, "invoices").doc(String(invoiceId));
             const snap = await ref.get();
+            let loadNumber = null;
             if (snap.exists) {
+              const inv = snap.data() || {};
+              loadNumber = inv.loadNumber || null;
               await ref.update({
                 processingLock: false,
                 finalWorkflowStatus: "failed",
                 lastHeartbeatAt: h.FieldValue.serverTimestamp(),
-                currentStep: (snap.data() || {}).currentStep || "failed",
+                currentStep: inv.currentStep || "failed",
                 updatedAt: h.FieldValue.serverTimestamp(),
               });
+            }
+            try {
+              const baseUrl = `https://${req.get("host")}`;
+              const alert = h.buildWorkflowAlertEmail({
+                code: "WORKFLOW_FAILED",
+                context: {
+                  loadNumber,
+                  errorMessage: error.message,
+                },
+                baseUrl,
+                invoiceId,
+                tenantId: cleanupTenant.tenantId,
+              });
+              await h.saveOutboundEmail({
+                tenant: cleanupTenant,
+                type: "workflow_failed",
+                invoiceId,
+                subject: alert.subject,
+                html: alert.html,
+              });
+            } catch (emailErr) {
+              console.error("CTC workflow_failed alert:", emailErr.message);
             }
           }
         } catch (cleanupErr) {

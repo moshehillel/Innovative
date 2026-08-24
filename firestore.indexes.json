@@ -15,6 +15,23 @@
         {"fieldPath": "status", "order": "ASCENDING"},
         {"fieldPath": "claimedAt", "order": "ASCENDING"}
       ]
+    },
+    {
+      "collectionGroup": "dashboardTasks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "tenantId", "order": "ASCENDING"},
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "createdAt", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "additionalCharges",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "resolved", "order": "ASCENDING"},
+        {"fieldPath": "createdAt", "order": "DESCENDING"}
+      ]
     }
   ],
   "fieldOverrides": []

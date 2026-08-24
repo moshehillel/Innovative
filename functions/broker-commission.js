@@ -1,0 +1,618 @@
+"use strict";
+
+/**
+ * Low-margin broker commission rules:
+ * - Karen Adams: never change her rate.
+ * - Other brokers with a 10% Primus variant: swap when Profit % < 10%.
+ *   (Primus Summary "Profit %" = profit / actual cost — not GP%.)
+ * - No 10% variant: email Lisa and continue invoicing.
+ */
+
+const KAREN_ADAMS_UI_IDS = new Set(["2140"]);
+const KAREN_NAME_PATTERN = /^karen\s+adams/i;
+const CATALOG_TTL_MS = 60 * 60 * 1000;
+
+let deps = {};
+let catalogCache = null;
+let catalogCacheAt = 0;
+
+/**
+ * @param {object} bundle Dependencies:
+ *   writeLog, saveOutboundEmail, workflowErrors, primusUiBridge,
+ *   fetchPrimusBooking, checkProfitMargin, readCustomerRateFromAcct,
+ *   isCarrierBillAlreadyEnteredInPrimus
+ */
+function init(bundle) {
+  deps = bundle || {};
+}
+exports.init = init;
+
+/**
+ * @param {string} name Display or person name.
+ * @return {string}
+ */
+function stripRateSuffix(name) {
+  return String(name || "")
+      .replace(/\s*\.\d+\s*$/i, "")
+      .replace(/\s*\d+(\.\d+)?%\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+}
+
+/**
+ * @param {object} row Corporate sales person row.
+ * @return {string}
+ */
+function normalizeRepKey(row) {
+  const email = String(row.email || "").trim().toLowerCase();
+  if (email) return `email:${email}`;
+  const fn = String(row.firstName || "").trim().toLowerCase();
+  const ln = String(row.lastName || "").trim().toLowerCase();
+  if (fn || ln) return `name:${fn}|${ln}`;
+  return `display:${stripRateSuffix(row.display || row.name || "")}`;
+}
+
+/**
+ * @param {object} row Sales rep row from catalog or booking.
+ * @return {boolean}
+ */
+function isKarenAdams(row) {
+  if (!row) return false;
+  const id = String(row.id || row.salesPersonId || "");
+  if (KAREN_ADAMS_UI_IDS.has(id)) return true;
+  const display = String(row.display || "").trim() ||
+    `${row.firstName || ""} ${row.lastName || ""}`.trim();
+  return KAREN_NAME_PATTERN.test(display);
+}
+
+/**
+ * @param {Array<object>} rows Corporate sales people from manage.php.
+ * @return {object}
+ */
+function buildCatalogIndex(rows) {
+  const byId = new Map();
+  const byKey = new Map();
+  for (const row of rows || []) {
+    const id = String(row.id || row.salesPersonId || "");
+    if (!id) continue;
+    byId.set(id, row);
+    const key = normalizeRepKey(row);
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key).push(row);
+  }
+  return {byId, byKey, rows: rows || []};
+}
+
+/**
+ * @return {Promise<object>}
+ */
+async function loadCatalog() {
+  const bridge = deps.primusUiBridge;
+  if (!bridge || typeof bridge.fetchAllCorporateSalesPeople !== "function") {
+    throw new Error("Primus sales catalog not configured");
+  }
+  const now = Date.now();
+  if (catalogCache && (now - catalogCacheAt) < CATALOG_TTL_MS) {
+    return catalogCache;
+  }
+  const rows = await bridge.fetchAllCorporateSalesPeople();
+  catalogCache = buildCatalogIndex(rows);
+  catalogCacheAt = now;
+  return catalogCache;
+}
+
+/**
+ * Base broker name without rate suffix (for matching 10%/20% variants).
+ * @param {object} row Sales rep row.
+ * @return {string}
+ */
+function baseRepNameKey(row) {
+  const display = String(row.display || "").trim() ||
+    `${row.firstName || ""} ${row.lastName || ""}`.trim();
+  return stripRateSuffix(display);
+}
+
+/**
+ * @param {string|number} currentRepId UI salesPersonId on the load.
+ * @param {object} catalog Indexed catalog.
+ * @return {object|null}
+ */
+function findTenPctVariant(currentRepId, catalog) {
+  const current = catalog.byId.get(String(currentRepId));
+  if (!current) return null;
+  const base = baseRepNameKey(current);
+  const family = (catalog.rows || []).filter((row) =>
+    baseRepNameKey(row) === base);
+  if (!family.length) {
+    const keyed = catalog.byKey.get(normalizeRepKey(current)) || [current];
+    return keyed.find((row) => Number(row.percentage) === 10) || null;
+  }
+  return family.find((row) => Number(row.percentage) === 10) || null;
+}
+
+/**
+ * @param {object} row Catalog row for the current rep.
+ * @return {boolean}
+ */
+function isAlreadyTenPctRow(row) {
+  return !!row && Number(row.percentage) === 10;
+}
+
+/**
+ * @param {string} loadNumber Load/BOL number.
+ * @param {object} booking Primus REST booking (optional).
+ * @return {Promise<{bookingId: string, salesReps: Array<object>}>}
+ */
+async function resolveBookingSalesReps(loadNumber, booking) {
+  const bridge = deps.primusUiBridge;
+  let resolvedBooking = booking;
+  if (!resolvedBooking && deps.fetchPrimusBooking) {
+    resolvedBooking = await deps.fetchPrimusBooking(loadNumber);
+  }
+  const bookingId = bridge && bridge.resolveManageBookingId ?
+    bridge.resolveManageBookingId(resolvedBooking) : "";
+  if (!bookingId || !bridge ||
+      typeof bridge.getBookingSalesRep !== "function") {
+    return {bookingId: bookingId || "", salesReps: []};
+  }
+  const salesReps = await bridge.getBookingSalesRep(bookingId);
+  return {bookingId, salesReps: Array.isArray(salesReps) ? salesReps : []};
+}
+
+/**
+ * @param {object} opts
+ * @param {string} opts.loadNumber
+ * @param {number} opts.margin
+ * @param {number} [opts.profit]
+ * @param {string} [opts.brokerName]
+ * @param {string} [opts.carrierName]
+ * @param {number} [opts.customerRate] Customer / shipment rate.
+ * @param {number} [opts.carrierCost] Carrier or shipment cost.
+ * @param {number} [opts.vendorCost] Vendor cost (may differ from carrierCost).
+ * @param {number} [opts.invoiceAmount] Invoice amount when known.
+ * @param {object} [opts.booking] Primus REST booking when already loaded.
+ * @param {string} [opts.trigger] Context label for logs (e.g. insurance).
+ * @return {Promise<object>}
+ */
+async function adjustBrokerCommissionForLowMargin(opts) {
+  const loadNumber = opts && opts.loadNumber ?
+    String(opts.loadNumber) : "";
+  const margin = Number(opts && opts.margin || 0);
+  const profit = Number(opts && opts.profit || 0);
+  const brokerName = opts && opts.brokerName ?
+    String(opts.brokerName).trim() : "";
+  const carrierName = opts && opts.carrierName || "";
+  const customerRate = opts && opts.customerRate != null ?
+    Number(opts.customerRate) : null;
+  const carrierCost = opts && opts.carrierCost != null ?
+    Number(opts.carrierCost) : null;
+  const vendorCost = opts && opts.vendorCost != null ?
+    Number(opts.vendorCost) : null;
+  const invoiceAmount = opts && opts.invoiceAmount != null ?
+    Number(opts.invoiceAmount) : null;
+  const trigger = opts && opts.trigger || "invoice_intake";
+
+  const log = deps.writeLog || (async () => {});
+
+  if (!loadNumber || margin >= 10) {
+    return {adjusted: false, notified: false, reason: "margin_ok"};
+  }
+
+  if (!deps.primusUiBridge ||
+      typeof deps.primusUiBridge.isManagePhpEnabled !== "function" ||
+      !deps.primusUiBridge.isManagePhpEnabled()) {
+    await log("info", "primus",
+        "Low margin — broker commission adjust skipped (manage.php off)", {
+          loadNumber, margin, profit, trigger,
+        });
+    return {adjusted: false, notified: false, reason: "manage_php_off"};
+  }
+
+  let catalog;
+  try {
+    catalog = await loadCatalog();
+  } catch (err) {
+    await log("warn", "primus", "Broker catalog load failed", {
+      loadNumber, error: err.message, trigger,
+    });
+    return {adjusted: false, notified: false, reason: "catalog_failed"};
+  }
+
+  const {bookingId, salesReps} = await resolveBookingSalesReps(
+      loadNumber, opts && opts.booking);
+  if (!salesReps.length) {
+    await log("info", "primus", "Low margin — no sales rep on load", {
+      loadNumber, margin, profit, bookingId: bookingId || null, trigger,
+    });
+    return {adjusted: false, notified: false, reason: "no_sales_rep"};
+  }
+
+  const primaryRep = salesReps[0];
+  const currentRepId = String(primaryRep.salesPersonId || "");
+  const currentCatalogRow = catalog.byId.get(currentRepId);
+  const resolvedBrokerName = brokerName ||
+    (primaryRep.display || "") ||
+    (currentCatalogRow && currentCatalogRow.display) ||
+    "Unknown broker";
+
+  if (isKarenAdams(currentCatalogRow || primaryRep)) {
+    await log("info", "primus",
+        "Low margin — Karen Adams exempt from commission swap", {
+          loadNumber, margin, profit, brokerName: resolvedBrokerName, trigger,
+        });
+    return {adjusted: false, notified: false, reason: "karen_exempt"};
+  }
+
+  if (isAlreadyTenPctRow(currentCatalogRow)) {
+    return {adjusted: false, notified: false, reason: "already_ten_pct"};
+  }
+
+  if (deps.isCarrierBillAlreadyEnteredInPrimus) {
+    try {
+      const alreadyBilled = await deps.isCarrierBillAlreadyEnteredInPrimus({
+        loadNumber,
+        proNumber: opts && opts.booking &&
+          opts.booking.vendor && opts.booking.vendor.PRO,
+      });
+      if (alreadyBilled) {
+        await log("info", "primus",
+            "Low margin — broker swap skipped (load already billed)", {
+              loadNumber,
+              margin,
+              profit,
+              brokerName: resolvedBrokerName,
+              trigger,
+            });
+        return {adjusted: false, notified: false, reason: "already_billed"};
+      }
+    } catch (lockErr) {
+      await log("warn", "primus",
+          "Could not verify billing lock before broker swap", {
+            loadNumber, error: lockErr.message, trigger,
+          });
+    }
+  }
+
+  const tenPctRow = findTenPctVariant(currentRepId, catalog);
+  if (!tenPctRow) {
+    await notifyLisaNoTenPct({
+      loadNumber,
+      margin,
+      profit,
+      brokerName: resolvedBrokerName,
+      carrierName,
+      trigger,
+    });
+    return {adjusted: false, notified: true, reason: "no_10pct_code"};
+  }
+
+  if (!bookingId) {
+    await log("warn", "primus",
+        "Low margin — cannot swap rep without manage booking id", {
+          loadNumber, margin, tenPctId: tenPctRow.id, trigger,
+        });
+    await notifyLisaNoTenPct({
+      loadNumber,
+      margin,
+      profit,
+      brokerName: resolvedBrokerName,
+      carrierName,
+      trigger,
+      note: "Could not resolve Primus booking id for sales-rep swap.",
+    });
+    return {adjusted: false, notified: true, reason: "no_booking_id"};
+  }
+
+  const swapResult = await deps.primusUiBridge.swapBookingSalesRep({
+    bookingId,
+    tenPctRow,
+    removedReps: salesReps,
+  });
+
+  if (swapResult.ok) {
+    await log("info", "primus", "Broker commission swapped to 10%", {
+      loadNumber,
+      margin,
+      profit,
+      fromRepId: currentRepId,
+      fromRepName: resolvedBrokerName,
+      toRepId: tenPctRow.id,
+      toRepName: tenPctRow.display,
+      trigger,
+      carrierName: carrierName || null,
+      customerRate: Number.isFinite(customerRate) ? customerRate : null,
+      carrierCost: Number.isFinite(carrierCost) ? carrierCost : null,
+      vendorCost: Number.isFinite(vendorCost) ? vendorCost : null,
+      invoiceAmount: Number.isFinite(invoiceAmount) ? invoiceAmount : null,
+    });
+    return {
+      adjusted: true,
+      notified: false,
+      reason: "swapped",
+      fromRepId: currentRepId,
+      toRepId: String(tenPctRow.id),
+    };
+  }
+
+  await log("warn", "primus", "Broker 10% swap failed", {
+    loadNumber,
+    margin,
+    profit,
+    brokerName: resolvedBrokerName,
+    tenPctId: tenPctRow.id,
+    tenPctName: tenPctRow.display || null,
+    error: swapResult.error || null,
+    primusResponse: swapResult.response || null,
+    afterReps: swapResult.after || null,
+    trigger,
+  });
+  await notifyLisaSwapFailed({
+    loadNumber,
+    margin,
+    profit,
+    brokerName: resolvedBrokerName,
+    carrierName,
+    tenPctName: tenPctRow.display || tenPctRow.id,
+    error: swapResult.error,
+    trigger,
+  });
+  return {adjusted: false, notified: true, reason: "swap_failed"};
+}
+exports.adjustBrokerCommissionForLowMargin = adjustBrokerCommissionForLowMargin;
+
+/**
+ * @param {object} opts Notification context.
+ * @return {Promise<void>}
+ */
+async function notifyLisaNoTenPct(opts) {
+  const workflowErrors = deps.workflowErrors;
+  const saveOutboundEmail = deps.saveOutboundEmail;
+  if (!workflowErrors || !saveOutboundEmail) return;
+
+  const alert = workflowErrors.buildWorkflowAlertEmail({
+    code: "BROKER_NO_10PCT_CODE",
+    context: {
+      loadNumber: opts.loadNumber,
+      marginPct: opts.margin,
+      profit: opts.profit,
+      brokerName: opts.brokerName || "Unknown broker",
+      carrierName: opts.carrierName,
+      note: opts.note || null,
+    },
+  });
+  await saveOutboundEmail({
+    type: "broker_no_10pct_code",
+    subject: alert.subject,
+    html: alert.html,
+    forceRecipient: true,
+    to: lisaEmail(),
+  });
+}
+
+/**
+ * @param {object} opts Notification context.
+ * @return {Promise<void>}
+ */
+async function notifyLisaSwapFailed(opts) {
+  const workflowErrors = deps.workflowErrors;
+  const saveOutboundEmail = deps.saveOutboundEmail;
+  if (!workflowErrors || !saveOutboundEmail) return;
+
+  const alert = workflowErrors.buildWorkflowAlertEmail({
+    code: "BROKER_SWAP_FAILED",
+    context: {
+      loadNumber: opts.loadNumber,
+      marginPct: opts.margin,
+      profit: opts.profit,
+      brokerName: opts.brokerName || "Unknown broker",
+      carrierName: opts.carrierName,
+      tenPctName: opts.tenPctName,
+      error: opts.error,
+    },
+  });
+  await saveOutboundEmail({
+    type: "broker_swap_failed",
+    subject: alert.subject,
+    html: alert.html,
+    forceRecipient: true,
+    to: lisaEmail(),
+  });
+}
+
+/**
+ * @return {string}
+ */
+function lisaEmail() {
+  return process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com";
+}
+
+/**
+ * Resolves Profit % for broker commission (Primus Summary, not GP%).
+ * Prefers issued invoice store; falls back to profit / vendor cost.
+ * @param {object} opts
+ * @param {string} opts.loadNumber
+ * @param {string} [opts.invoiceId]
+ * @param {number} opts.customerRate
+ * @param {number} opts.vendorCost Carrier bill (lumper-adjusted when
+ *   applicable).
+ * @return {Promise<object>}
+ */
+async function resolveBrokerProfitCheck(opts) {
+  const loadNumber = opts && opts.loadNumber ?
+    String(opts.loadNumber).trim() : "";
+  const customerRate = Number(opts && opts.customerRate || 0);
+  const vendorCost = Number(opts && opts.vendorCost || 0);
+  let invoiceId = opts && opts.invoiceId ?
+    String(opts.invoiceId).trim() : "";
+  const bridge = deps.primusUiBridge;
+  const log = deps.writeLog || (async () => {});
+
+  if (!invoiceId && loadNumber && bridge &&
+      typeof bridge.resolveIssuedInvoiceIdForLoad === "function") {
+    try {
+      invoiceId = await bridge.resolveIssuedInvoiceIdForLoad(loadNumber) || "";
+    } catch (err) {
+      await log("warn", "primus",
+          "Issued invoice lookup failed for broker Profit %", {
+            loadNumber, error: err.message,
+          });
+    }
+  }
+
+  if (invoiceId && bridge &&
+      typeof bridge.computeInvoiceMarginFromStore === "function") {
+    try {
+      const invMargin = await bridge.computeInvoiceMarginFromStore(invoiceId);
+      if (invMargin) {
+        return {
+          source: "primus_invoice",
+          invoiceId,
+          profit: invMargin.profit,
+          margin: invMargin.margin,
+          profitPct: invMargin.profitPct,
+          gpPct: invMargin.gpPct,
+          lowProfit: invMargin.profit < 10,
+          lowMargin: invMargin.margin < 10,
+          noRate: false,
+        };
+      }
+    } catch (err) {
+      await log("warn", "primus",
+          "Invoice Profit % lookup failed — using cost fallback", {
+            loadNumber, invoiceId, error: err.message,
+          });
+    }
+  }
+
+  if (!customerRate || customerRate <= 0) {
+    return {
+      source: "no_rate",
+      profit: 0,
+      margin: 0,
+      lowProfit: true,
+      lowMargin: true,
+      noRate: true,
+    };
+  }
+  if (vendorCost <= 0) {
+    return {
+      source: "no_vendor_cost",
+      profit: 0,
+      margin: 0,
+      lowProfit: true,
+      lowMargin: true,
+      noRate: false,
+    };
+  }
+
+  const profit = Math.round((customerRate - vendorCost) * 100) / 100;
+  const margin = Math.round((profit / vendorCost) * 10000) / 100;
+  return {
+    source: "cost_fallback",
+    profit,
+    margin,
+    profitPct: margin,
+    lowProfit: profit < 10,
+    lowMargin: margin < 10,
+    noRate: false,
+  };
+}
+exports.resolveBrokerProfitCheck = resolveBrokerProfitCheck;
+
+/**
+ * Recomputes margin after insurance premium posted; applies swap rules.
+ * @param {object} opts
+ * @param {string} opts.loadNumber
+ * @param {object} opts.booking Primus REST booking.
+ * @param {number} opts.premium Insurance premium posted to the load.
+ * @return {Promise<object|null>}
+ */
+async function maybeAdjustAfterInsurancePremium(opts) {
+  if (!opts || !opts.booking) return null;
+
+  const loadNumber = String(opts.loadNumber || "").trim();
+  const premium = Number(opts.premium || 0);
+  if (!loadNumber || premium <= 0) return null;
+
+  const log = deps.writeLog || (async () => {});
+  const trigger = "insurance_post";
+  const bridge = deps.primusUiBridge;
+  const invoiceId = opts.invoiceId ? String(opts.invoiceId) : "";
+
+  if (invoiceId && bridge &&
+      typeof bridge.computeInvoiceMarginFromStore === "function") {
+    try {
+      const invMargin = await bridge.computeInvoiceMarginFromStore(invoiceId);
+      if (invMargin) {
+        if (invMargin.margin >= 10) {
+          await log("info", "primus",
+              "Post-insurance Profit % OK on Primus invoice", {
+                loadNumber,
+                invoiceId,
+                profitPct: invMargin.profitPct,
+                gpPct: invMargin.gpPct,
+                profit: invMargin.profit,
+                chargesTotal: invMargin.chargesTotal,
+                actualTotal: invMargin.actualTotal,
+                trigger,
+              });
+          return {adjusted: false, notified: false,
+            reason: "margin_ok_invoice"};
+        }
+        const vendor = opts.booking.vendor || {};
+        return adjustBrokerCommissionForLowMargin({
+          loadNumber,
+          margin: invMargin.margin,
+          profit: invMargin.profit,
+          booking: opts.booking,
+          trigger,
+          carrierName: vendor.name || null,
+          customerRate: invMargin.chargesTotal ?? null,
+          carrierCost: invMargin.actualTotal ?? null,
+          vendorCost: invMargin.actualTotal ?? null,
+        });
+      }
+    } catch (err) {
+      await log("warn", "primus",
+          "Post-insurance invoice margin lookup failed — using REST fallback", {
+            loadNumber, invoiceId, error: err.message, trigger,
+          });
+    }
+  }
+
+  const acct = opts.booking.accountingInformation || {};
+  const rateInfo = deps.readCustomerRateFromAcct ?
+    deps.readCustomerRateFromAcct(acct) : {rate: null};
+  const customerRate = Number(rateInfo.rate || 0);
+  if (!customerRate) return null;
+
+  const vendorCost = Number(
+      (opts.booking.vendor && opts.booking.vendor.cost) || 0) + premium;
+  if (vendorCost <= 0) return null;
+  const profit = Math.round((customerRate - vendorCost) * 100) / 100;
+  const profitPct = Math.round((profit / vendorCost) * 10000) / 100;
+  if (profitPct >= 10 && profit >= 10) return null;
+
+  const vendor = opts.booking.vendor || {};
+  return adjustBrokerCommissionForLowMargin({
+    loadNumber,
+    margin: profitPct,
+    profit,
+    booking: opts.booking,
+    trigger,
+    carrierName: vendor.name || null,
+    customerRate,
+    carrierCost: Number(vendor.cost || 0) || null,
+    vendorCost,
+  });
+}
+exports.maybeAdjustAfterInsurancePremium = maybeAdjustAfterInsurancePremium;
+
+exports._internal = {
+  stripRateSuffix,
+  normalizeRepKey,
+  isKarenAdams,
+  buildCatalogIndex,
+  findTenPctVariant,
+};
