@@ -256,13 +256,43 @@ function reasonLabel(reason) {
   return "Past delivery date / ETA";
 }
 
+const ACTUAL_DELIVERED_REASONS = new Set([
+  "pod", "delivered_to_consignee", "tracking_delivered_date",
+]);
+
 /**
- * @param {object} opts Report options.
- * @param {Array<object>} opts.shipments Shipment rows.
- * @return {object} {subject, html}
+ * @param {object} row Normalized report row.
+ * @return {boolean}
  */
-function buildLisaReportEmail(opts) {
-  const shipments = opts.shipments || [];
+function isActualDelivered(row) {
+  return ACTUAL_DELIVERED_REASONS.has(row && row.reason);
+}
+exports.isActualDelivered = isActualDelivered;
+
+/**
+ * Split matches into Primus-delivered vs past-ETA-only.
+ * @param {Array<object>} shipments Normalized rows.
+ * @return {{actualDelivered: Array<object>, pastEta: Array<object>}}
+ */
+function splitDeliveredVsPastEta(shipments) {
+  const actualDelivered = [];
+  const pastEta = [];
+  for (const row of shipments || []) {
+    if (isActualDelivered(row)) actualDelivered.push(row);
+    else pastEta.push(row);
+  }
+  return {actualDelivered, pastEta};
+}
+exports.splitDeliveredVsPastEta = splitDeliveredVsPastEta;
+
+/**
+ * @param {Array<object>} shipments Normalized rows.
+ * @return {string} HTML table or empty-state paragraph.
+ */
+function shipmentTable(shipments) {
+  if (!shipments.length) {
+    return `<p>None in this group.</p>`;
+  }
   const rows = shipments.map((s) =>
     `<tr>` +
     `<td style="padding:6px 10px;border-bottom:1px solid #e5e7eb">` +
@@ -287,9 +317,7 @@ function buildLisaReportEmail(opts) {
     `${esc(s.origin)} → ${esc(s.destination)}</td>` +
     `</tr>`,
   ).join("");
-
-  const table = shipments.length ?
-    `<table style="border-collapse:collapse;font-size:13px;width:100%;` +
+  return `<table style="border-collapse:collapse;font-size:13px;width:100%;` +
     `max-width:1100px;margin:12px 0">` +
     `<thead><tr style="background:#f3f4f6">` +
     `<th style="padding:6px 10px;text-align:left">Load #</th>` +
@@ -302,27 +330,46 @@ function buildLisaReportEmail(opts) {
     `<th style="padding:6px 10px;text-align:left">Carrier</th>` +
     `<th style="padding:6px 10px;text-align:left">Customer</th>` +
     `<th style="padding:6px 10px;text-align:left">Lane</th>` +
-    `</tr></thead><tbody>${rows}</tbody></table>` :
-    `<p>No matching shipments in this window.</p>`;
+    `</tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+/**
+ * @param {object} opts Report options.
+ * @param {Array<object>} opts.shipments Shipment rows.
+ * @return {object} {subject, html}
+ */
+function buildLisaReportEmail(opts) {
+  const shipments = opts.shipments || [];
+  const {actualDelivered, pastEta} = splitDeliveredVsPastEta(shipments);
 
   const html =
     `<p>Hi Lisa,</p>` +
-    `<p>The following <strong>${shipments.length}</strong> shipment(s) are ` +
-    `supposed to be delivered in ShipPrimus (delivered status, tracking ` +
-    `delivered date, or a delivery date / ETA already in the past) but ` +
-    `<strong>have no customer invoice</strong>.</p>` +
-    table +
+    `<p>Jerry found <strong>${shipments.length}</strong> shipment(s) with ` +
+    `<strong>no customer invoice</strong> that are supposed to be ` +
+    `delivered:</p>` +
+    `<ul>` +
+    `<li><strong>${actualDelivered.length}</strong> actually delivered in ` +
+    `Primus (POD, delivered to consignee, or tracking delivered date)</li>` +
+    `<li><strong>${pastEta.length}</strong> not marked delivered, but the ` +
+    `scheduled delivery date / ETA is already past</li>` +
+    `</ul>` +
+    `<h3 style="margin:18px 0 8px">Actually delivered, not invoiced ` +
+    `(${actualDelivered.length})</h3>` +
+    shipmentTable(actualDelivered) +
+    `<h3 style="margin:18px 0 8px">Past delivery date / ETA, not yet ` +
+    `delivered (${pastEta.length})</h3>` +
+    shipmentTable(pastEta) +
     `<p style="color:#6b7280;font-size:12px">This is an automated report ` +
     `from Jerry (sent Monday and Thursday). It does not email customers ` +
     `or change extra-charge handling.</p>`;
 
-  return {
-    subject: shipments.length ?
-      `Jerry — ${shipments.length} shipment(s) delivered / past due, ` +
-        `not invoiced` :
-      "Jerry — no delivered/past-due shipments waiting on invoice",
-    html,
-  };
+  let subject = "Jerry — no delivered/past-due shipments waiting on invoice";
+  if (shipments.length) {
+    subject = `Jerry — ${actualDelivered.length} delivered + ` +
+      `${pastEta.length} past ETA, not invoiced`;
+  }
+
+  return {subject, html};
 }
 exports.buildLisaReportEmail = buildLisaReportEmail;
 
@@ -368,6 +415,7 @@ async function runDeliveredUninvoicedReport(opts) {
   }
   const deduped = dedupeTrackingRows(rawRows);
   const matches = filterDeliveredUninvoiced(deduped, now);
+  const split = splitDeliveredVsPastEta(matches);
   const mail = buildLisaReportEmail({shipments: matches});
 
   if (!dryRun && typeof saveOutboundEmail === "function") {
@@ -384,6 +432,8 @@ async function runDeliveredUninvoicedReport(opts) {
       "Delivered-uninvoiced shipment report completed", {
         scanned: deduped.length,
         matches: matches.length,
+        actualDelivered: split.actualDelivered.length,
+        pastEta: split.pastEta.length,
         lookbackDays,
         dryRun,
         to,
@@ -395,6 +445,8 @@ async function runDeliveredUninvoicedReport(opts) {
     scanned: deduped.length,
     rawRows: rawRows.length,
     matches: matches.length,
+    actualDelivered: split.actualDelivered.length,
+    pastEtaNotDelivered: split.pastEta.length,
     loads: matches.map((s) => s.loadNumber),
     emailedTo: dryRun ? null : to,
   };
