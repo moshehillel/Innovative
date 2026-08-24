@@ -29,6 +29,9 @@ const OUTCOME = Object.freeze({
   SPLIT: "split",
 });
 
+/** Firestore TTL for emailIntake / gmailQueue docs, from discovery time. */
+const INTAKE_TTL_DAYS = 60;
+
 /** Searchable outcomeReason values for system/workflow crashes. */
 const OUTCOME_REASON = Object.freeze({
   WORKFLOW_FAILED: "workflow_failed",
@@ -65,11 +68,11 @@ function col(tenant, collection) {
 }
 
 /**
- * @param {number} [days=30] TTL days for intake docs.
+ * @param {number} [days=INTAKE_TTL_DAYS] TTL days for intake docs.
  * @return {FirebaseFirestore.Timestamp}
  */
 function deleteAt(days) {
-  const ms = Date.now() + Number(days || 30) * 24 * 60 * 60 * 1000;
+  const ms = Date.now() + Number(days || INTAKE_TTL_DAYS) * 24 * 60 * 60 * 1000;
   return admin.firestore.Timestamp.fromDate(new Date(ms));
 }
 
@@ -259,7 +262,7 @@ async function enqueueDiscoveredEmail(opts) {
     createdAt: now,
     updatedAt: now,
     inboxFlowId: opts.inboxFlowId || null,
-    deleteAt: deleteAt(30),
+    deleteAt: deleteAt(INTAKE_TTL_DAYS),
   };
   if (receivedDateTime) {
     payload.receivedDateTime = receivedDateTime;
@@ -614,7 +617,7 @@ async function createInvoiceChildJobs(opts) {
       claimedAt: now,
       createdAt: now,
       updatedAt: now,
-      deleteAt: deleteAt(30),
+      deleteAt: deleteAt(INTAKE_TTL_DAYS),
     };
     batch.set(
         col(tenant, "gmailQueue").doc(childId), childPayload, {merge: true});
@@ -705,7 +708,9 @@ module.exports = {
   DOC_TYPE,
   QUEUE_STATUS,
   OUTCOME,
+  OUTCOME,
   OUTCOME_REASON,
+  INTAKE_TTL_DAYS,
   childQueueDocId,
   isChildQueueDocId,
   buildIntakeSummary,
