@@ -2281,16 +2281,6 @@ exports.continueWorkflow = onRequest(async (req, res) => {
     const invoice = snap.data();
     const paused = invoice.workflowPausedAtStep;
 
-    if (paused === "send_customer_email" &&
-        invoice.decisionStage === "awaiting_customer_email_approval" &&
-        invoice.customerEmailApproval !== "approved") {
-      return res.status(400).json({
-        ok: false,
-        error: "Customer email is awaiting reviewer approval. " +
-          "Use the Approve link in the approval email.",
-      });
-    }
-
     await invoiceRef.update({
       workflowPausedAtStep: null,
       workflowPausedAt: null,
@@ -2474,153 +2464,12 @@ exports.enterInvoiceLoadNumber = onRequest(async (req, res) => {
   }
 });
 
-// Reviewer approval gate for the final customer-facing email. The workflow
-// pauses at "send_customer_email" and emails a designated reviewer an
-// Approve/Reject link. Approving resumes the workflow (which sends); rejecting
-// resumes it into the "not sent" branch. This is the last line of defense
-// against a carrier bill / POD ever reaching the customer.
+// Kept as a stub so Cloud Functions overwrites the old Approve/Reject handler
+// instead of leaving it live. Customer invoice emails send automatically.
 exports.approveCustomerEmail = onRequest(async (req, res) => {
-  try {
-    const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
-    const decision = String(
-        (req.body && req.body.decision) || req.query.decision ||
-        (req.body && req.body.option) || req.query.option || "",
-    ).toLowerCase();
-    const tenantId = (req.body && req.body.tenantId) || req.query.tenantId ||
-      null;
-    const exp = (req.body && req.body.exp) || req.query.exp;
-    const sig = (req.body && req.body.sig) || req.query.sig;
-
-    if (!invoiceId || (decision !== "approve" && decision !== "reject")) {
-      return res.status(400).send(
-          "Missing invoiceId or a valid decision (approve|reject).");
-    }
-
-    const tokenOk = emailActionTokens.verify({
-      action: "customerEmailApproval",
-      invoiceId: String(invoiceId),
-      option: decision,
-      tenantId,
-      exp,
-      sig,
-    });
-    if (!tokenOk) {
-      return res.status(403).send(
-          "This approval link is invalid or expired. Ask Jerry to resend " +
-          "the approval email.");
-    }
-
-    if (req.method !== "POST") {
-      const tenant = await tenantFromRequest(req);
-      const snap = await tcol(tenant, "invoices").doc(String(invoiceId)).get();
-      const loadNumber = snap.exists ?
-        (snap.data().loadNumber || invoiceId) : invoiceId;
-      const prior = snap.exists ? snap.data().customerEmailApproval : null;
-      if (prior === "approved" || prior === "rejected") {
-        const title = prior === "approved" ? "Already approved" :
-          "Already rejected";
-        const color = prior === "approved" ? "#16a34a" : "#dc2626";
-        return res.status(200).send(
-            `<!doctype html><html><head><meta charset="utf-8">` +
-            `<meta name="viewport" content="width=device-width,` +
-            `initial-scale=1"><title>${title}</title></head>` +
-            `<body style="font-family:Arial,sans-serif;text-align:center;` +
-            `padding:48px;color:#111827">` +
-            `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
-            `<p style="font-size:16px;color:#374151">This customer email ` +
-            `was already ${prior}.</p>` +
-            `<p style="font-size:13px;color:#9ca3af">Load ` +
-            `${escapeHtml(String(loadNumber))}</p></body></html>`);
-      }
-      const label = decision === "approve" ?
-        "Approve and send the customer email" :
-        "Reject — do not send the customer email";
-      return res.status(200).send(buildEmailActionConfirmPage({
-        title: decision === "approve" ? "Approve customer email" :
-          "Reject customer email",
-        description: `Load ${loadNumber}: ${label}.`,
-        confirmLabel: decision === "approve" ?
-          "Approve & send" : "Reject email",
-        confirmColor: decision === "approve" ? "#16a34a" : "#dc2626",
-        actionPath: "approveCustomerEmail",
-        fields: {
-          invoiceId: String(invoiceId),
-          decision,
-          option: decision,
-          tenantId: tenantId || "",
-          exp: String(exp),
-          sig: String(sig),
-        },
-      }));
-    }
-
-    const tenant = await tenantFromRequest(req);
-    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
-    const approved = decision === "approve";
-    const claim = await claimCustomerEmailApproval(invoiceRef, approved);
-    if (!claim.ok) {
-      if (claim.reason === "not_found") {
-        return res.status(404).send("Invoice not found.");
-      }
-      if (claim.reason === "already") {
-        const title = claim.prior === "approved" ? "Already approved" :
-          "Already rejected";
-        const color = claim.prior === "approved" ? "#16a34a" : "#dc2626";
-        return res.status(200).send(
-            `<!doctype html><html><head><meta charset="utf-8">` +
-            `<meta name="viewport" content="width=device-width,` +
-            `initial-scale=1"><title>${title}</title></head>` +
-            `<body style="font-family:Arial,sans-serif;text-align:center;` +
-            `padding:48px;color:#111827">` +
-            `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
-            `<p style="font-size:16px;color:#374151">This customer email ` +
-            `was already ${claim.prior}.</p>` +
-            `<p style="font-size:13px;color:#9ca3af">Load ` +
-            `${escapeHtml(String(claim.loadNumber || invoiceId))}</p>` +
-            `</body></html>`);
-      }
-      return res.status(400).send("Could not process this approval.");
-    }
-
-    // Resume the invoice's own tenant workflow; the send/no-send decision is
-    // enforced by the approval gate inside the workflow itself.
-    const workflowUrl = workflowUrlForTenant(tenant);
-    if (workflowUrl) {
-      fetch(workflowUrl, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          invoiceId: invoiceId,
-          tenantId: tenant.tenantId,
-          resumeFrom: "send_customer_email",
-        }),
-      }).catch((e) =>
-        console.error("approveCustomerEmail: resume failed", e.message));
-    } else {
-      console.error("approveCustomerEmail: no workflow URL for tenant",
-          tenant.tenantId);
-    }
-
-    const title = approved ? "Approved" : "Rejected";
-    const color = approved ? "#16a34a" : "#dc2626";
-    const message = approved ?
-      "The customer email has been approved and is being sent now." :
-      "The customer email has been rejected and will not be sent.";
-    return res.status(200).send(
-        `<!doctype html><html><head><meta charset="utf-8">` +
-        `<meta name="viewport" content="width=device-width,initial-scale=1">` +
-        `<title>${title}</title></head>` +
-        `<body style="font-family:Arial,sans-serif;text-align:center;` +
-        `padding:48px;color:#111827">` +
-        `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
-        `<p style="font-size:16px;color:#374151">${message}</p>` +
-        `<p style="font-size:13px;color:#9ca3af">Load ` +
-        `${escapeHtml(String(claim.invoice.loadNumber || invoiceId))}</p>` +
-        `</body></html>`);
-  } catch (error) {
-    console.error("approveCustomerEmail error:", error);
-    return res.status(500).send("Internal server error.");
-  }
+  res.status(410).send(
+      "Customer-email approval is no longer used. Invoice emails send " +
+      "automatically.");
 });
 
 /**
@@ -2711,39 +2560,6 @@ async function resolveCurrentCustomerRate(invoice, booking) {
     baseRate = Number(customerRateFromBooking(booking) || 0);
   }
   return baseRate > 0 ? baseRate : 0;
-}
-
-/**
- * Atomically claims a customer-email approval (blocks double-execute).
- * @param {object} invoiceRef Firestore invoice document reference.
- * @param {boolean} approved True to approve send, false to reject.
- * @return {Promise<object>} Claim result with ok flag.
- */
-async function claimCustomerEmailApproval(invoiceRef, approved) {
-  const value = approved ? "approved" : "rejected";
-  return admin.firestore().runTransaction(async (tx) => {
-    const snap = await tx.get(invoiceRef);
-    if (!snap.exists) return {ok: false, reason: "not_found"};
-    const invoice = snap.data();
-    const prior = invoice.customerEmailApproval;
-    if (prior === "approved" || prior === "rejected") {
-      return {
-        ok: false,
-        reason: "already",
-        prior,
-        loadNumber: invoice.loadNumber,
-      };
-    }
-    tx.update(invoiceRef, {
-      customerEmailApproval: value,
-      customerEmailApprovalAt:
-        admin.firestore.FieldValue.serverTimestamp(),
-      workflowPausedAtStep: null,
-      workflowPausedAt: null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return {ok: true, invoice};
-  });
 }
 
 /**
@@ -5609,8 +5425,8 @@ async function saveOutboundEmail(email) {
   let sendResult = null;
   // Customer invoice emails go to the bill-to party; ops alerts use alertEmail.
   // System errors (automation failures) go to SYSTEM_ERROR_EMAIL only.
-  // `forceRecipient` pins delivery to an explicit address (e.g. a designated
-  // reviewer for the customer-email approval gate) regardless of type.
+  // `forceRecipient` pins delivery to an explicit address (e.g. additional
+  // charge A/B/C/D reviewers) regardless of type.
   const defaultRecipient = isSystemErrorOutboundEmail(email) ?
     resolveSystemErrorEmail() :
     resolveOpsAlertEmail(tenant);
@@ -7148,9 +6964,8 @@ async function handlePodOnlyDeliveryEmail(opts) {
     podStoragePath: storagePath,
   });
 
-  // Resume customer email only after reviewer approval.
   const workflowUrl = workflowUrlForTenant(tenant);
-  if (workflowUrl && invoice.customerEmailApproval === "approved") {
+  if (workflowUrl && invoice.customerEmailApproval !== "rejected") {
     fetch(workflowUrl, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -7161,13 +6976,6 @@ async function handlePodOnlyDeliveryEmail(opts) {
       }),
     }).catch((e) =>
       console.error("pod-only resume failed", e.message));
-  } else if (workflowUrl) {
-    await writeLog("info", "mail",
-        "POD applied — customer email still awaiting approval", {
-          messageId,
-          invoiceId,
-          loadNumber,
-        });
   }
 
   return {
@@ -10848,7 +10656,15 @@ exports.gmailOAuthCallback = onRequest(
               profileErr.message);
         }
 
-        await db.collection("settings").doc(tenantGmailDocId(tenant)).set({
+        const mailDocId = mailProvider.tenantMailDocId(tenant);
+        if (mailProvider.getProvider() === "outlook" &&
+            /^gmail(_|$)/i.test(String(mailDocId))) {
+          throw new Error(
+              "Refusing to save Gmail OAuth tokens while " +
+              "MAIL_PROVIDER=outlook");
+        }
+
+        await db.collection("settings").doc(mailDocId).set({
           tokens: tokens,
           provider: mailProvider.getProvider(),
           tenantId: tenant.tenantId,
@@ -11524,7 +11340,7 @@ exports.getDashboardStats = onRequest(async (req, res) => {
   try {
     const tenant = await resolveDashboardTenant(req);
     const dataset = tenant.bqDataset;
-    const range = String(req.query.range || "week").toLowerCase();
+    const range = String(req.query.range || "day").toLowerCase();
     const rangeConfig = DASHBOARD_RANGES[range];
     if (!rangeConfig) {
       return res.status(400).json({
@@ -11670,44 +11486,6 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
     });
   }
 });
-
-/**
- * To + Cc for customer-email approve/reject gate emails.
- * Primary: CUSTOMER_EMAIL_APPROVER_EMAIL or ALERT_EMAIL (Lisa by default).
- * Cc: CUSTOMER_EMAIL_APPROVER_CC only (optional extra recipients).
- * @return {object} to and cc recipient strings.
- */
-function resolveCustomerEmailApproverRecipients() {
-  const primaryRaw = process.env.CUSTOMER_EMAIL_APPROVER_EMAIL ||
-    process.env.ALERT_EMAIL || LISA_EMAIL_DEFAULT;
-  const ccRaw = process.env.CUSTOMER_EMAIL_APPROVER_CC || "";
-  const primary = [];
-  const cc = [];
-  const seen = new Set();
-  const addPrimary = (addr) => {
-    const a = String(addr || "").trim();
-    if (!a) return;
-    const key = a.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    primary.push(a);
-  };
-  const addCc = (addr) => {
-    const a = String(addr || "").trim();
-    if (!a) return;
-    const key = a.toLowerCase();
-    if (seen.has(key)) return;
-    seen.add(key);
-    cc.push(a);
-  };
-  primaryRaw.split(/[,;]/).forEach(addPrimary);
-  ccRaw.split(/[,;]/).forEach(addCc);
-  if (!primary.length) addPrimary(LISA_EMAIL_DEFAULT);
-  return {
-    to: primary.join(", "),
-    cc: cc.length ? cc.join(", ") : null,
-  };
-}
 
 /**
  * Recipients for support-chat issue reports
@@ -12628,6 +12406,22 @@ async function renewPrimusUiSessionIfDue() {
 
 /** Stale inbox lock expires so a crashed run cannot block forever. */
 const INBOX_CHECK_LOCK_MS = 15 * 60 * 1000;
+/** Queue drain skip timezone (matches ops: no Friday/Saturday processing). */
+const MAIL_QUEUE_DRAIN_TZ = "America/Jamaica";
+
+/**
+ * True on Friday or Saturday in America/Jamaica. Inbox polling can still
+ * run; queue drain (process + send) is skipped those days.
+ * @param {Date} [now] Clock to evaluate.
+ * @return {boolean}
+ */
+function isMailQueueDrainSkipDay(now = new Date()) {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: MAIL_QUEUE_DRAIN_TZ,
+    weekday: "short",
+  }).format(now);
+  return weekday === "Fri" || weekday === "Sat";
+}
 
 /**
  * @param {object} tenant Tenant config.
@@ -12803,7 +12597,21 @@ async function runMailInboxCheck(options = {}) {
       });
       let queueResult = {processed: 0, connected: false};
       if (r.connected) {
-        queueResult = await runMailQueueProcessForTenant(tenant, inboxFlowId);
+        if (isMailQueueDrainSkipDay()) {
+          await writeLog("info", "mail",
+              "Queue drain skipped — Friday/Saturday (America/Jamaica)", {
+                tenantId: tenant.tenantId,
+              });
+          queueResult = {
+            processed: 0,
+            connected: true,
+            skipped: true,
+            reason: "weekend_drain_skip",
+          };
+        } else {
+          queueResult = await runMailQueueProcessForTenant(
+              tenant, inboxFlowId);
+        }
       }
       results.push({
         tenantId: tenant.tenantId,
@@ -13288,6 +13096,17 @@ exports.processGmailQueue = onRequest(
 
         const reprocessMessageId = req.query.reprocessMessageId ?
           String(req.query.reprocessMessageId).trim() : "";
+        const forceDrain = req.query.force === "1" ||
+          req.query.force === "true";
+        if (!reprocessMessageId && !forceDrain && isMailQueueDrainSkipDay()) {
+          await writeLog("info", "mail",
+              "Mail queue drain skipped — Friday/Saturday (America/Jamaica)");
+          return res.json({
+            ok: true,
+            skipped: true,
+            reason: "weekend_drain_skip",
+          });
+        }
 
         const results = [];
         for (const tenant of tenants) {
@@ -14233,7 +14052,6 @@ const primusBundle = {
   getGmailOAuthClient,
   notifyDispatcherRateIssue,
   maybeNotifyLisaPodDiscrepancy,
-  resolveCustomerEmailApproverRecipients,
   isCarrierBillAlreadyEnteredInPrimus,
 };
 const primusUiBridge = require("./primus-ui-bridge");

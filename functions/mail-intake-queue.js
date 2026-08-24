@@ -68,81 +68,118 @@ function deleteAt(days) {
 }
 
 /**
+ * Formats an email receive timestamp for ops (ET, date + time + seconds).
+ * Prefers Graph receivedDateTime over discovered/process time.
+ * @param {object} data Intake / queue fields.
+ * @return {string|null}
+ */
+function formatReceivedAtEt(data) {
+  const d = data || {};
+  const raw = d.receivedDateTime || d.receivedAt || null;
+  let date = null;
+  if (raw && typeof raw.toDate === "function") {
+    date = raw.toDate();
+  } else if (typeof raw === "string" && raw.trim()) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) date = parsed;
+  } else if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    date = raw;
+  }
+  if (!date) return null;
+  return date.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  }) + " ET";
+}
+
+/**
  * Builds a one-line human summary from intake fields.
  * @param {object} data Intake / queue fields.
  * @return {string}
  */
 function buildIntakeSummary(data) {
   const d = data || {};
-  if (d.summary) return String(d.summary);
+  if (d.summary && !d._rebuildSummary) return String(d.summary);
 
   const finalStatus = d.finalStatus || d.outcomeReason || null;
   const itemSummaries = Array.isArray(d.itemSummaries) ? d.itemSummaries : [];
   const ignoreReason = d.ignoreReason || null;
   const childCount = Number(d.childCount || 0);
   const completedChildCount = Number(d.completedChildCount || 0);
+  const receivedLabel = formatReceivedAtEt(d);
+
+  let core = null;
 
   if (d.outcome === OUTCOME.SPLIT ||
       d.status === QUEUE_STATUS.WAITING_CHILDREN) {
-    return `Split into ${childCount} invoice job(s) for processing.`;
+    core = `Split into ${childCount} invoice job(s) for processing.`;
+  } else if (ignoreReason) {
+    core = `Ignored — ${ignoreReason}`;
+  } else {
+    const statusSummary = {
+      payment_notification_ignored:
+        "Ignored — payment notification (Zelle/bank)",
+      emodal_broadcast_ignored: "Ignored — eModal/terminal broadcast",
+      noa_ignored: "Ignored — notice of assignment, no invoice",
+      carrier_portal_notification_ignored:
+        "Ignored — carrier open-invoice portal (link only)",
+      credit_agency_notification_ignored:
+        "Ignored — credit-agency / trade-credit alert",
+      past_due_only: "Ignored — past-due statement already in Primus",
+      statement_ignored_abe_cc: "Ignored — carrier statement (Abe on CC)",
+      statement_forwarded: "Forwarded — carrier statement, no freight invoice",
+      hafstaff_forwarded_to_lisa: "Forwarded — Hafstaff to Lisa (ops rule)",
+      no_attachment: "Forwarded — no attachments",
+      no_invoice_pdf: "Forwarded — no processable invoice PDF",
+    };
+    if (finalStatus && statusSummary[finalStatus]) {
+      core = statusSummary[finalStatus];
+    } else if (itemSummaries.length > 0) {
+      const processed = itemSummaries.filter((s) =>
+        s && s.finalStatus === "processing" && s.invoiceId).length;
+      const skipped = itemSummaries.filter((s) =>
+        s && s.finalStatus === "already_billed_skipped").length;
+      const other = itemSummaries.length - processed - skipped;
+      const parts = [];
+      if (processed) parts.push(`processed ${processed} invoice(s)`);
+      if (skipped) parts.push(`${skipped} skipped (already in Primus)`);
+      if (other) parts.push(`${other} other outcome(s)`);
+      if (parts.length) core = `Processed email — ${parts.join("; ")}`;
+    }
   }
 
-  if (ignoreReason) {
-    return `Ignored — ${ignoreReason}`;
+  if (!core) {
+    if (childCount > 0 && completedChildCount >= childCount) {
+      core = `Completed ${completedChildCount} invoice job(s) from this email.`;
+    } else if (finalStatus === "processing") {
+      core = "Processed — invoice workflow started.";
+    } else if (finalStatus === "additional_charge_pending_approval") {
+      core = "Additional charge — awaiting A/B/C/D approval.";
+    } else if (finalStatus === "already_billed_skipped") {
+      core = "Skipped — load(s) already billed in Primus.";
+    } else if (d.outcome === OUTCOME.FORWARDED) {
+      core = d.forwardReason ?
+        `Forwarded — ${d.forwardReason}` : "Forwarded for human review.";
+    } else if (d.outcome === OUTCOME.FAILED) {
+      core = d.error ? `Failed — ${String(d.error).slice(0, 120)}` :
+        "Failed during processing.";
+    } else {
+      core = finalStatus ?
+        `Completed — ${String(finalStatus).replace(/_/g, " ")}` :
+        "Completed.";
+    }
   }
 
-  const statusSummary = {
-    payment_notification_ignored: "Ignored — payment notification (Zelle/bank)",
-    emodal_broadcast_ignored: "Ignored — eModal/terminal broadcast",
-    noa_ignored: "Ignored — notice of assignment, no invoice",
-    past_due_only: "Ignored — past-due statement already in Primus",
-    statement_ignored_abe_cc: "Ignored — carrier statement (Abe on CC)",
-    statement_forwarded: "Forwarded — carrier statement, no freight invoice",
-    no_attachment: "Forwarded — no attachments",
-    no_invoice_pdf: "Forwarded — no processable invoice PDF",
-  };
-  if (finalStatus && statusSummary[finalStatus]) {
-    return statusSummary[finalStatus];
+  if (receivedLabel && core && !/received /i.test(core)) {
+    return `${core} · received ${receivedLabel}`;
   }
-
-  if (itemSummaries.length > 0) {
-    const processed = itemSummaries.filter((s) =>
-      s && s.finalStatus === "processing" && s.invoiceId).length;
-    const skipped = itemSummaries.filter((s) =>
-      s && s.finalStatus === "already_billed_skipped").length;
-    const other = itemSummaries.length - processed - skipped;
-    const parts = [];
-    if (processed) parts.push(`processed ${processed} invoice(s)`);
-    if (skipped) parts.push(`${skipped} skipped (already in Primus)`);
-    if (other) parts.push(`${other} other outcome(s)`);
-    if (parts.length) return `Processed email — ${parts.join("; ")}`;
-  }
-
-  if (childCount > 0 && completedChildCount >= childCount) {
-    return `Completed ${completedChildCount} invoice job(s) from this email.`;
-  }
-
-  if (finalStatus === "processing") {
-    return "Processed — invoice workflow started.";
-  }
-  if (finalStatus === "additional_charge_pending_approval") {
-    return "Additional charge — awaiting A/B/C/D approval.";
-  }
-  if (finalStatus === "already_billed_skipped") {
-    return "Skipped — load(s) already billed in Primus.";
-  }
-  if (d.outcome === OUTCOME.FORWARDED) {
-    return d.forwardReason ?
-      `Forwarded — ${d.forwardReason}` : "Forwarded for human review.";
-  }
-  if (d.outcome === OUTCOME.FAILED) {
-    return d.error ? `Failed — ${String(d.error).slice(0, 120)}` :
-      "Failed during processing.";
-  }
-
-  return finalStatus ?
-    `Completed — ${String(finalStatus).replace(/_/g, " ")}` :
-    "Completed.";
+  return core;
 }
 
 /**
@@ -176,6 +213,7 @@ async function isAlreadyDiscovered(tenant, messageId) {
  * @param {string} opts.messageId Message id.
  * @param {string} [opts.subject] Subject line.
  * @param {string} [opts.from] Sender.
+ * @param {string} [opts.receivedDateTime] Graph receivedDateTime ISO string.
  * @param {string} [opts.inboxFlowId] Flow id.
  * @return {Promise<object>} Enqueue result with ok flag.
  */
@@ -189,6 +227,15 @@ async function enqueueDiscoveredEmail(opts) {
   }
 
   const now = admin.firestore.FieldValue.serverTimestamp();
+  const receivedRaw = opts.receivedDateTime || opts.receivedAt || null;
+  let receivedDateTime = null;
+  if (receivedRaw) {
+    const parsed = receivedRaw instanceof Date ?
+      receivedRaw : new Date(String(receivedRaw));
+    if (!Number.isNaN(parsed.getTime())) {
+      receivedDateTime = admin.firestore.Timestamp.fromDate(parsed);
+    }
+  }
   const payload = {
     gmailMessageId: messageId,
     tenantId: tenant.tenantId,
@@ -206,6 +253,9 @@ async function enqueueDiscoveredEmail(opts) {
     inboxFlowId: opts.inboxFlowId || null,
     deleteAt: deleteAt(30),
   };
+  if (receivedDateTime) {
+    payload.receivedDateTime = receivedDateTime;
+  }
 
   const intakeRef = col(tenant, "emailIntake").doc(messageId);
   const queueRef = col(tenant, "gmailQueue").doc(messageId);
@@ -223,6 +273,70 @@ async function enqueueDiscoveredEmail(opts) {
   });
 
   return {ok: true};
+}
+
+/**
+ * Parses Graph/ISO received timestamps into a Firestore Timestamp.
+ * @param {*} receivedRaw ISO string, Date, or Timestamp-like.
+ * @return {FirebaseFirestore.Timestamp|null}
+ */
+function toReceivedTimestamp(receivedRaw) {
+  if (!receivedRaw) return null;
+  if (typeof receivedRaw.toDate === "function") {
+    try {
+      const d = receivedRaw.toDate();
+      if (d && !Number.isNaN(d.getTime())) {
+        return admin.firestore.Timestamp.fromDate(d);
+      }
+    } catch (_e) {
+      return null;
+    }
+  }
+  const parsed = receivedRaw instanceof Date ?
+    receivedRaw : new Date(String(receivedRaw));
+  if (Number.isNaN(parsed.getTime())) return null;
+  return admin.firestore.Timestamp.fromDate(parsed);
+}
+
+/**
+ * Backfills receivedDateTime on parent intake + queue when missing.
+ * Does not overwrite an existing value. Safe to call for child queue docs
+ * (patches parent by messageId and optionally the child queue doc).
+ * @param {object} tenant Tenant config.
+ * @param {string} messageId Parent Graph/Gmail message id.
+ * @param {*} receivedRaw Graph receivedDateTime ISO string / Date.
+ * @param {object} [opts]
+ * @param {string} [opts.queueDocId] Queue doc id (parent or child).
+ * @return {Promise<FirebaseFirestore.Timestamp|null>} Persisted or existing ts.
+ */
+async function persistReceivedDateTimeIfMissing(
+    tenant, messageId, receivedRaw, opts = {}) {
+  const parentId = String(messageId || "");
+  if (!parentId) return null;
+  const ts = toReceivedTimestamp(receivedRaw);
+  if (!ts) return null;
+
+  const intakeRef = col(tenant, "emailIntake").doc(parentId);
+  const parentQueueRef = col(tenant, "gmailQueue").doc(parentId);
+  const intakeSnap = await intakeRef.get();
+  const existing = intakeSnap.exists ? (intakeSnap.data() || {}) : {};
+  if (existing.receivedDateTime || existing.receivedAt) {
+    return existing.receivedDateTime || existing.receivedAt;
+  }
+
+  const now = admin.firestore.FieldValue.serverTimestamp();
+  const patch = {receivedDateTime: ts, updatedAt: now};
+  const writes = [
+    intakeRef.set(patch, {merge: true}),
+    parentQueueRef.set(patch, {merge: true}),
+  ];
+  const queueDocId = opts.queueDocId ? String(opts.queueDocId) : "";
+  if (queueDocId && queueDocId !== parentId) {
+    writes.push(
+        col(tenant, "gmailQueue").doc(queueDocId).set(patch, {merge: true}));
+  }
+  await Promise.all(writes);
+  return ts;
 }
 
 /**
@@ -261,8 +375,11 @@ async function completeIntakeRecord(opts) {
   const parentMessageId = opts.parentMessageId ||
     (isChildQueueDocId(docId) ?
       docId.replace(/__item_\d+$/, "") : docId);
+  const existingSnap = await col(tenant, "emailIntake")
+      .doc(parentMessageId).get();
+  const existing = existingSnap.exists ? (existingSnap.data() || {}) : {};
   const summary = opts.summary ||
-    buildIntakeSummary(Object.assign({}, opts, opts.extra));
+    buildIntakeSummary(Object.assign({}, existing, opts, opts.extra));
   const now = admin.firestore.FieldValue.serverTimestamp();
   const patch = Object.assign({
     intakeStatus: QUEUE_STATUS.COMPLETED,
@@ -353,6 +470,7 @@ async function incrementParentChildCompletion(
         itemSummaries,
         childCount,
         completedChildCount,
+        receivedDateTime: data.receivedDateTime || data.receivedAt || null,
       });
       Object.assign(patch, {
         intakeStatus: QUEUE_STATUS.COMPLETED,
@@ -499,8 +617,11 @@ module.exports = {
   childQueueDocId,
   isChildQueueDocId,
   buildIntakeSummary,
+  formatReceivedAtEt,
+  toReceivedTimestamp,
   isAlreadyDiscovered,
   enqueueDiscoveredEmail,
+  persistReceivedDateTimeIfMissing,
   markIntakeProcessing,
   completeIntakeRecord,
   failIntakeRecord,

@@ -213,7 +213,7 @@ function aggregateDailyActivity(logs) {
         load,
         invoiceId: detail(d, "invoiceId") || null,
       };
-      if (type === "generated_bill" || type === "customer_email_approval") {
+      if (type === "generated_bill") {
         agg.customerEmailsSent.push(row);
       }
       if (type === "pod_followup" || type === "pod_request") {
@@ -749,19 +749,42 @@ function escapeHtml(str) {
 }
 
 /**
- * Formats a Firestore timestamp for display.
- * @param {*} ts Firestore timestamp.
+ * Formats a Firestore/Graph timestamp for display (ET, with seconds).
+ * Prefers email receivedDateTime when present.
+ * @param {*} ts Firestore timestamp, Date, or ISO string.
  * @return {string}
  */
 function fmtDiscoveredAt(ts) {
-  if (!ts || !ts.toDate) return "—";
-  return ts.toDate().toLocaleString("en-US", {
+  let date = null;
+  if (ts && typeof ts.toDate === "function") {
+    date = ts.toDate();
+  } else if (ts instanceof Date) {
+    date = ts;
+  } else if (typeof ts === "string" && ts.trim()) {
+    const parsed = new Date(ts);
+    if (!Number.isNaN(parsed.getTime())) date = parsed;
+  }
+  if (!date) return "—";
+  return date.toLocaleString("en-US", {
     timeZone: "America/New_York",
     month: "short",
     day: "numeric",
+    year: "numeric",
     hour: "numeric",
     minute: "2-digit",
-  });
+    second: "2-digit",
+    hour12: true,
+  }) + " ET";
+}
+
+/**
+ * Prefer Graph received time, then discovered/finished.
+ * @param {object} row emailIntake row.
+ * @return {*}
+ */
+function intakeDisplayTime(row) {
+  return (row && (row.receivedDateTime || row.receivedAt ||
+    row.discoveredAt || row.finishedAt)) || null;
 }
 
 /**
@@ -787,7 +810,7 @@ function buildInboxDigestHtml(rows, meta) {
       mailIntakeQueue.buildIntakeSummary(row);
     return `<tr>` +
       `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
-      `${escapeHtml(fmtDiscoveredAt(row.discoveredAt))}</td>` +
+      `${escapeHtml(fmtDiscoveredAt(intakeDisplayTime(row)))}</td>` +
       `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
       `${escapeHtml(row.from || "—")}</td>` +
       `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
@@ -809,7 +832,7 @@ function buildInboxDigestHtml(rows, meta) {
       `<table style="border-collapse:collapse;width:100%;font-size:13px">` +
       `<thead><tr style="background:#f9fafb">` +
       `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
-      `Discovered</th>` +
+      `Received (ET)</th>` +
       `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
       `From</th>` +
       `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
@@ -908,6 +931,8 @@ const IGNORE_CATEGORY_LABELS = {
   payment_notification_ignored: "Payment notification",
   emodal_broadcast_ignored: "eModal / terminal broadcast",
   noa_ignored: "Notice of assignment (NOA)",
+  carrier_portal_notification_ignored: "Carrier open-invoice portal",
+  credit_agency_notification_ignored: "Credit-agency / trade-credit alert",
   already_processed: "Already processed",
   statement_ignored_abe_cc: "Carrier statement (Abe on CC)",
   past_due_only: "Past-due / already in Primus",
@@ -992,7 +1017,8 @@ function groupIgnoredEmails(rows) {
  */
 function buildIgnoredEmailsReportHtml(groups, meta) {
   const rowHtml = (list) => list.map((row) => {
-    const finished = row.finishedAt || row.discoveredAt;
+    const finished = row.receivedDateTime || row.receivedAt ||
+      row.finishedAt || row.discoveredAt;
     const messageId = row.id || row.gmailMessageId || null;
     return `<tr>` +
       `<td style="padding:6px 10px;border:1px solid #e5e7eb">` +
@@ -1014,7 +1040,7 @@ function buildIgnoredEmailsReportHtml(groups, meta) {
   const tableHead = (
     `<thead><tr style="background:#f9fafb">` +
     `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
-    `Time (ET)</th>` +
+    `Received (ET)</th>` +
     `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
     `From</th>` +
     `<th style="padding:6px 10px;border:1px solid #e5e7eb;text-align:left">` +
@@ -1139,3 +1165,6 @@ exports.labelIgnoredCategory = labelIgnoredCategory;
 exports.describeIgnoredReason = describeIgnoredReason;
 exports.groupIgnoredEmails = groupIgnoredEmails;
 exports.buildIgnoredEmailsReportHtml = buildIgnoredEmailsReportHtml;
+exports.buildInboxDigestHtml = buildInboxDigestHtml;
+exports.fmtDiscoveredAt = fmtDiscoveredAt;
+exports.intakeDisplayTime = intakeDisplayTime;

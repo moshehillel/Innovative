@@ -3,6 +3,7 @@
   "description": "Cloud Functions for Firebase",
   "scripts": {
     "lint": "eslint .",
+    "lint:deploy": "eslint quote-password-reset.js quote-dashboard.js index.js static/quote-auth-client.js",
     "serve": "firebase emulators:start --only functions",
     "shell": "firebase functions:shell",
     "start": "npm run shell",
@@ -20,6 +21,7 @@
     "firebase-admin": "^13.6.0",
     "firebase-functions": "^7.0.0",
     "googleapis": "^171.4.0",
+    "nodemailer": "^9.0.5",
     "openai": "^4.104.0",
     "pdf-lib": "^1.17.1",
     "pdfjs-dist": "^4.2.67",

@@ -70,7 +70,12 @@ async function getTenantMailTokens(tenant) {
  */
 async function persistTenantMailTokens(tenant, tokens) {
   if (!dbRef) return;
-  await dbRef.collection("settings").doc(tenantMailDocId(tenant)).set({
+  const docId = tenantMailDocId(tenant);
+  if (getProvider() === "outlook" && /^gmail(_|$)/i.test(String(docId))) {
+    throw new Error(
+        "Refusing to persist Gmail OAuth tokens while MAIL_PROVIDER=outlook");
+  }
+  await dbRef.collection("settings").doc(docId).set({
     tokens,
     provider: getProvider(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),

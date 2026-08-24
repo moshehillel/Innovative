@@ -16,7 +16,6 @@ const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const loadResolution = require("./invoice-load-resolution");
 const workflowErrors = require("./workflow-error-messages");
-const emailActionTokens = require("./email-action-tokens");
 
 // Injected from index.js (see init). Declared at module scope so the moved
 // workflow code below can call them by their original bare names, unchanged.
@@ -26,7 +25,6 @@ let logWorkflowStep;
 let setWorkflowHeartbeat;
 let pauseWorkflow;
 let saveOutboundEmail;
-let escapeHtml;
 let maybeExtractPodOnlyPdf;
 let maybeBuildPodFromTrailerImages;
 let isAlreadyDoneResult;
@@ -56,7 +54,6 @@ let rePushCarrierBillToQuickBooks;
 let scheduleFlowSummary;
 let notifyDispatcherRateIssue;
 let maybeNotifyLisaPodDiscrepancy;
-let resolveCustomerEmailApproverRecipients;
 let isCarrierBillAlreadyEnteredInPrimus;
 
 /**
@@ -67,7 +64,7 @@ let isCarrierBillAlreadyEnteredInPrimus;
 function init(bundle) {
   ({
     db, writeLog, logWorkflowStep, setWorkflowHeartbeat, pauseWorkflow,
-    saveOutboundEmail, escapeHtml,
+    saveOutboundEmail,
     maybeExtractPodOnlyPdf,
     maybeBuildPodFromTrailerImages,
     isAlreadyDoneResult,
@@ -88,7 +85,6 @@ function init(bundle) {
     scheduleFlowSummary,
     notifyDispatcherRateIssue,
     maybeNotifyLisaPodDiscrepancy,
-    resolveCustomerEmailApproverRecipients,
     isCarrierBillAlreadyEnteredInPrimus,
   } = bundle);
 }
@@ -197,21 +193,17 @@ async function resolveBillingSkipAction(invoice, primusSteps, resumeFrom) {
     return {action: "continue"};
   }
 
-  const needsEmailSend = invoice.customerEmailApproval === "approved";
+  // Customer-email reviewer gate is gone: send unless explicitly rejected.
+  // Also resume loads still parked at the old awaiting-approval pause.
+  const parkedForCustomerEmail =
+    invoice.workflowPausedAtStep === "send_customer_email" &&
+    invoice.customerEmailApproval !== "rejected";
+  const needsEmailSend =
+    invoice.customerEmailApproval === "approved" || parkedForCustomerEmail;
   if (needsEmailSend) {
     return {
       action: "customer_email_only",
       source: inFirestore ? "firestore" : "primus",
-    };
-  }
-
-  const awaitingApproval =
-    invoice.workflowPausedAtStep === "send_customer_email" &&
-    invoice.decisionStage === "awaiting_customer_email_approval";
-  if (awaitingApproval) {
-    return {
-      action: "skip_entirely",
-      workflowStatus: "awaiting_customer_email_approval",
     };
   }
 
@@ -264,27 +256,6 @@ function formatPrimusQbError(err) {
     return JSON.stringify(err);
   }
   return String(err);
-}
-
-/**
- * @param {number|null|undefined} amount Money value.
- * @return {string}
- */
-function moneyFmt(amount) {
-  if (amount == null || amount === "" || !Number.isFinite(Number(amount))) {
-    return "—";
-  }
-  return `$${Number(amount).toFixed(2)}`;
-}
-
-/**
- * Miworld bill-to variants (spacing/case).
- * @param {string|null|undefined} name Customer name.
- * @return {boolean}
- */
-function isMiworldCustomer(name) {
-  const compact = String(name || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
-  return compact.includes("miworld");
 }
 
 /**
@@ -621,151 +592,6 @@ async function pushCarrierBillToQuickBooks(args) {
   } catch (qbErr) {
     return reportFailure(qbErr.message, {method: "rest_quickbooks_billing"});
   }
-}
-
-/**
- * Builds the reviewer approval email with a full summary of what the agent
- * did on this load before the customer-facing email is sent.
- * @param {object} opts Approval context from the workflow.
- * @return {string} HTML body (Jerry greeting added by saveOutboundEmail).
- */
-function buildCustomerEmailApprovalHtml(opts) {
-  const {
-    invoice, customerName, customerRate, profit, marginPct,
-    workingProNumber, amountValidation, baseAmount, approvedChargesTotal,
-    finalCustomerInvoiceId, issuedInvoiceNumber, customerEmail,
-    customerEmailSource, customerEmailFallback, billtoSource, billtoPartyName,
-    podStoragePath, podOnPrimusAlready,
-    primusSteps, approveUrl, rejectUrl, invoiceGenerationResult,
-  } = opts;
-
-  const row = (label, value) =>
-    `<tr><td style="padding:6px 16px 6px 0;font-weight:600;` +
-    `vertical-align:top;white-space:nowrap">${escapeHtml(label)}</td>` +
-    `<td style="padding:6px 0">${value}</td></tr>`;
-
-  const submitted = amountValidation && amountValidation.submittedAmount;
-  const primusAmt = amountValidation &&
-    (amountValidation.primusQuotedAmount || amountValidation.amount);
-  const enteredAmt = amountValidation &&
-    (amountValidation.enteredAmount || amountValidation.savedAmount ||
-      submitted);
-  const amtDiff = amountValidation && amountValidation.difference;
-  const steps = primusSteps || {};
-  const completedSteps = Object.entries(steps)
-      .filter(([, v]) => v === true)
-      .map(([k]) => k
-          .replace(/([A-Z])/g, " $1")
-          .replace(/^./, (c) => c.toUpperCase()))
-      .join(", ") || "—";
-
-  const genVia = invoiceGenerationResult && invoiceGenerationResult.reused ?
-    "Reused existing Primus invoice" :
-    (steps.uiInvoiceIssued ? "manage.php UI bridge" :
-      (invoiceGenerationResult && invoiceGenerationResult.generated ?
-        "Primus REST" : "—"));
-
-  const attachments =
-    "Customer invoice + BOL + POD" +
-    (isMiworldCustomer(customerName) ?
-      " + Quote Approval (Miworld)" : "") +
-    " (via Primus emailBOLDocs)";
-
-  const amtMatch = amtDiff != null && Number(amtDiff) <= 0.5 ?
-    `<span style="color:#16a34a">Matched</span>` :
-    (amtDiff != null ?
-      `<span style="color:#dc2626">${moneyFmt(amtDiff)} off</span>` : "—");
-
-  return (
-    `<h2>Approval needed before emailing the customer</h2>` +
-    `<p>I finished processing this load. Please review everything below ` +
-    `and confirm the outgoing package includes ` +
-    (isMiworldCustomer(customerName) ?
-      `<strong>the customer invoice, POD, and quote approval</strong>` :
-      `<strong>only the customer invoice and POD</strong>`) +
-    ` — never a carrier bill — before approving.</p>` +
-
-    `<h3 style="margin:18px 0 8px;font-size:15px">Load &amp; carrier</h3>` +
-    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
-    row("Load #", escapeHtml(invoice.loadNumber || "—")) +
-    row("PRO #", escapeHtml(
-        workingProNumber || invoice.proNumber || "—")) +
-    row("Carrier", escapeHtml(invoice.carrierName || "—")) +
-    row("Carrier invoice #", escapeHtml(invoice.invoiceNumber || "—")) +
-    row("Carrier bill date", escapeHtml(invoice.invoiceDate || "—")) +
-    row("Carrier due date", escapeHtml(invoice.dueDate || "—")) +
-    row("Email subject", escapeHtml(invoice.gmailSubject || "—")) +
-    `</table>` +
-
-    `<h3 style="margin:18px 0 8px;font-size:15px">Amount validation</h3>` +
-    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
-    row("Carrier bill amount (from email)", moneyFmt(invoice.invoiceAmount)) +
-    row("Validated base amount", moneyFmt(baseAmount)) +
-    row("Amount entered in Primus", moneyFmt(enteredAmt)) +
-    row("Primus quoted carrier cost", moneyFmt(primusAmt)) +
-    row("Amount check", amtMatch) +
-    row("Extra charges (held, not invoiced)", approvedChargesTotal > 0 ?
-      moneyFmt(approvedChargesTotal) : "None") +
-    `</table>` +
-
-    `<h3 style="margin:18px 0 8px;font-size:15px">Customer invoice</h3>` +
-    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
-    row("Customer", escapeHtml(customerName || "—")) +
-    row("Customer rate", moneyFmt(customerRate)) +
-    row("Profit", `${moneyFmt(profit)} (${Number(marginPct || 0)}% margin)`) +
-    row("Issued invoice #", escapeHtml(issuedInvoiceNumber || "—")) +
-    row("Primus invoice ID", escapeHtml(
-        String(finalCustomerInvoiceId || "—"))) +
-    row("Invoice generated via", escapeHtml(genVia)) +
-    row("Bill-to resolved via", escapeHtml(billtoSource || "—")) +
-    (billtoPartyName ?
-      row("Bill-to party", escapeHtml(billtoPartyName)) : "") +
-    `</table>` +
-
-    (!customerEmail ?
-      `<p style="background:#fef3c7;border:1px solid #f59e0b;` +
-      `padding:12px 14px;border-radius:8px;font-size:14px;color:#92400e">` +
-      `<strong>No customer accounting email found in Primus.</strong> ` +
-      (customerEmailFallback ?
-        `The booking party email (${escapeHtml(customerEmailFallback)}) ` +
-        `will <strong>NOT</strong> be used automatically. ` :
-        "") +
-      `Add the accounting contact on the customer location in Primus ` +
-      `before approving — fix the recipient manually if needed.</p>` :
-      "") +
-    `<h3 style="margin:18px 0 8px;font-size:15px">` +
-    `Outgoing customer email</h3>` +
-    `<table style="border-collapse:collapse;font-size:14px;margin:0 0 16px">` +
-    row("Recipient", escapeHtml(customerEmail || "—")) +
-    row("Email resolved from", escapeHtml(customerEmailSource || "—")) +
-    row("Send method", "Primus emailBOLDocs") +
-    row("Attachments to send", escapeHtml(attachments)) +
-    row("POD status", podStoragePath ?
-      "Sanitized POD ready" :
-      (podOnPrimusAlready ?
-        "POD already on Primus" : "No POD file on record")) +
-    `</table>` +
-
-    `<h3 style="margin:18px 0 8px;font-size:15px">` +
-    `Workflow steps completed</h3>` +
-    `<p style="font-size:13px;color:#374151;margin:0 0 16px;line-height:1.5">` +
-    escapeHtml(completedSteps) + `</p>` +
-
-    `<p style="margin-top:20px">` +
-    `<a href="${emailActionTokens.escapeHtmlAttr(approveUrl)}" ` +
-    `style="display:inline-block;` +
-    `padding:10px 20px;background:#16a34a;color:#fff;` +
-    `text-decoration:none;border-radius:8px;font-weight:700;` +
-    `margin-right:10px">Approve &amp; Send</a>` +
-    `<a href="${emailActionTokens.escapeHtmlAttr(rejectUrl)}" ` +
-    `style="display:inline-block;` +
-    `padding:10px 20px;background:#dc2626;color:#fff;` +
-    `text-decoration:none;border-radius:8px;font-weight:700">` +
-    `Reject</a></p>` +
-    `<p style="font-size:12px;color:#6b7280;margin-top:14px">` +
-    `Each button opens a confirmation page — nothing is sent until you ` +
-    `click Confirm.</p>`
-  );
 }
 
 exports.processPrimusWorkflow = onRequest(
@@ -1999,15 +1825,55 @@ exports.processPrimusWorkflow = onRequest(
                 // Treat "already delivered" as success, not error
                 const alreadyDelivered = isAlreadyDoneResult(deliveredRes);
                 if (!deliveredRes.ok && !alreadyDelivered) {
-                  await invoiceDoc.ref.update({
-                    decisionStage: "mark_delivered_failed",
-                    decisionReason: "Failed to mark shipment delivered",
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  const deliveredErr = (deliveredRes && deliveredRes.error) ||
+                    "Failed to mark shipment delivered";
+
+                  await logWorkflowStep({
+                    invoiceId,
+                    stepName: "shipment_mark_delivered_completed",
+                    stepStatus: "failed",
+                    reason: deliveredErr,
+                    error: "MARK_DELIVERED_FAILED",
+                    output: deliveredRes || null,
+                  });
+
+                  await writeLog(
+                      "error",
+                      "workflow",
+                      "Mark shipment delivered failed",
+                      {
+                        invoiceId,
+                        loadNumber: invoice.loadNumber,
+                        proNumber: workingProNumber || null,
+                        error: deliveredErr,
+                        details: deliveredRes || null,
+                      },
+                  );
+
+                  await pauseWorkflow(
+                      invoiceDoc.ref,
+                      "mark_delivered",
+                      "mark_delivered_failed",
+                      deliveredErr,
+                  );
+
+                  await sendWorkflowAlert({
+                    req,
+                    code: "MARK_DELIVERED_FAILED",
+                    invoiceId,
+                    type: "mark_delivered_failed",
+                    context: {
+                      loadNumber: invoice.loadNumber,
+                      carrierName: invoice.carrierName,
+                      proNumber: workingProNumber || invoice.proNumber || null,
+                      errorMessage: deliveredErr,
+                    },
                   });
 
                   return res.json({
                     ok: false,
                     error: "MARK_DELIVERED_FAILED",
+                    workflowStatus: "mark_delivered_failed",
                     details: deliveredRes,
                   });
                 }
@@ -2918,7 +2784,6 @@ exports.processPrimusWorkflow = onRequest(
 
           let customerEmail = null;
           let customerEmailSource = null;
-          let customerEmailFallback = null;
           let bookingForEmail = null;
           try {
             bookingForEmail = await fetchPrimusBooking(invoice.loadNumber);
@@ -2926,7 +2791,6 @@ exports.processPrimusWorkflow = onRequest(
               if (resolveCustomerAccountingEmails && managePhpActive) {
                 const resolved =
                   await resolveCustomerAccountingEmails(bookingForEmail);
-                customerEmailFallback = resolved.fallbackEmail || null;
                 if (resolved.emails && resolved.emails.length) {
                   customerEmail = resolved.emails.join(",");
                   customerEmailSource = resolved.source || null;
@@ -2976,134 +2840,61 @@ exports.processPrimusWorkflow = onRequest(
             });
           }
 
-          // --- Reviewer approval gate before any customer-facing send ---
-          // Final safeguard against a carrier bill / POD reaching the customer:
-          // a designated reviewer must approve the outgoing email. Only an
-          // explicit "approved" lets the send proceed. "rejected" completes the
-          // "rejected" completes without emailing; else pause for review.
+          // Customer invoice emails send directly. The reviewer Approve/Reject
+          // gate (and its approval emails) is removed. Still skip when a
+          // reviewer previously rejected, and pause when no recipient exists.
           const emailApproval = invoice.customerEmailApproval || null;
-          if (emailApproval !== "approved") {
-            if (emailApproval === "rejected") {
-              await logWorkflowStep({
-                invoiceId,
-                stepName: "final_email_sent",
-                stepStatus: "skipped",
-                reason: "Customer email rejected by reviewer",
-                output: {to: customerEmail},
-              });
-              await invoiceDoc.ref.update({
-                decisionStage: "customer_email_rejected",
-                decisionReason:
-                  "Reviewer rejected the customer email — not sent",
-                customerInvoiceId: finalCustomerInvoiceId,
-                issuedInvoiceNumber: issuedInvoiceNumber || null,
-                finalWorkflowStatus: "completed_no_customer_email",
-                processingLock: false,
-                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              });
-              await writeLog("warn", "workflow",
-                  "Customer email rejected by reviewer — nothing sent", {
-                    invoiceId,
-                    loadNumber: invoice.loadNumber,
-                    customerEmail,
-                  });
-              return res.json({
-                ok: true,
-                workflowStatus: "customer_email_rejected",
-              });
-            }
-
-            await pauseWorkflow(
-                invoiceDoc.ref,
-                "send_customer_email",
-                customerEmail ?
-                  "awaiting_customer_email_approval" :
-                  "missing_accounting_email",
-                customerEmail ?
-                  "Awaiting reviewer approval before emailing the customer" :
-                  "No accounting email found — reviewer must fix recipient",
-            );
-
-            const baseUrl = emailActionTokens.publicFunctionsBaseUrl();
-            const tenantId = (req.body && req.body.tenantId) || null;
-            const approveUrl = emailActionTokens.buildConfirmUrl({
-              baseUrl,
-              path: "approveCustomerEmail",
-              action: "customerEmailApproval",
-              invoiceId,
-              option: "approve",
-              tenantId,
-            });
-            const rejectUrl = emailActionTokens.buildConfirmUrl({
-              baseUrl,
-              path: "approveCustomerEmail",
-              action: "customerEmailApproval",
-              invoiceId,
-              option: "reject",
-              tenantId,
-            });
-            const {to: approverEmail, cc: approverCc} =
-            resolveCustomerEmailApproverRecipients();
-
-            await saveOutboundEmail({
-              type: "customer_email_approval",
-              forceRecipient: true,
-              to: approverEmail,
-              cc: approverCc,
-              invoiceId,
-              subject: `Approve customer email — Load ${invoice.loadNumber}`,
-              html: buildCustomerEmailApprovalHtml({
-                invoice,
-                customerName,
-                customerRate,
-                profit,
-                marginPct: marginPctCalc,
-                workingProNumber,
-                amountValidation,
-                baseAmount,
-                approvedChargesTotal,
-                finalCustomerInvoiceId,
-                issuedInvoiceNumber,
-                customerEmail,
-                customerEmailSource,
-                customerEmailFallback,
-                billtoSource: (invoiceGenerationResult &&
-                  invoiceGenerationResult.billtoSource) || null,
-                billtoPartyName: (invoiceGenerationResult &&
-                  invoiceGenerationResult.billtoPartyName) || null,
-                podStoragePath,
-                podOnPrimusAlready: Boolean(invoice.podOnPrimusAlready),
-                primusSteps,
-                approveUrl,
-                rejectUrl,
-                invoiceGenerationResult,
-              }),
-            });
-
+          if (emailApproval === "rejected") {
             await logWorkflowStep({
               invoiceId,
-              stepName: "customer_email_approval_requested",
-              stepStatus: "stopped",
-              reason: "Awaiting reviewer approval",
-              output: {
-                to: customerEmail,
-                approver: approverEmail,
-                approverCc: approverCc,
-              },
+              stepName: "final_email_sent",
+              stepStatus: "skipped",
+              reason: "Customer email rejected — not sent",
+              output: {to: customerEmail},
             });
-
-            await writeLog("info", "workflow",
-                "Customer email held for reviewer approval", {
+            await invoiceDoc.ref.update({
+              decisionStage: "customer_email_rejected",
+              decisionReason: "Customer email rejected — not sent",
+              customerInvoiceId: finalCustomerInvoiceId,
+              issuedInvoiceNumber: issuedInvoiceNumber || null,
+              finalWorkflowStatus: "completed_no_customer_email",
+              processingLock: false,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await writeLog("warn", "workflow",
+                "Customer email rejected — nothing sent", {
                   invoiceId,
                   loadNumber: invoice.loadNumber,
                   customerEmail,
-                  approver: approverEmail,
-                  approverCc: approverCc,
                 });
-
             return res.json({
               ok: true,
-              workflowStatus: "awaiting_customer_email_approval",
+              workflowStatus: "customer_email_rejected",
+            });
+          }
+
+          if (!customerEmail) {
+            await pauseWorkflow(
+                invoiceDoc.ref,
+                "send_customer_email",
+                "missing_accounting_email",
+                "No accounting email found — fix recipient before sending",
+            );
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "customer_email_missing_recipient",
+              stepStatus: "stopped",
+              reason: "Missing customer accounting email",
+              output: {to: null},
+            });
+            await writeLog("warn", "workflow",
+                "Customer email held — missing accounting email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                });
+            return res.json({
+              ok: true,
+              workflowStatus: "missing_accounting_email",
             });
           }
 
