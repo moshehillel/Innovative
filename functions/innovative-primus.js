@@ -368,20 +368,82 @@ async function uploadCarrierBillEarly(args) {
 }
 
 /**
+ * Loads prior cannot-email / missing-POD outbound rows for one invoice.
+ * @param {string} invoiceId Firestore invoice id.
+ * @param {string} code Alert catalog code.
+ * @param {string} [type] outboundEmails type override.
+ * @return {Promise<Array<object>>}
+ */
+async function loadExistingHoldAlerts(invoiceId, code, type) {
+  if (!db || !invoiceId) return [];
+  const wantCode = String(code || "").toUpperCase();
+  const wantType = String(type || code || "").toLowerCase();
+  const snap = await db.collection("outboundEmails")
+      .where("invoiceId", "==", invoiceId)
+      .limit(40)
+      .get();
+  return snap.docs.map((doc) => {
+    const data = doc.data() || {};
+    return {
+      id: doc.id,
+      type: data.type,
+      alertCode: data.alertCode,
+      alertContext: data.alertContext,
+      errorMessage: data.alertContext && data.alertContext.errorMessage,
+    };
+  }).filter((row) => {
+    const aCode = String(row.alertCode || "").toUpperCase();
+    const aType = String(row.type || "").toLowerCase();
+    return aCode === wantCode || aType === wantType;
+  });
+}
+
+/**
  * Sends a standardized workflow alert email (action button only when helpful).
+ * Dedupes Lisa "cannot email" / missing-POD holds when the invoice is already
+ * paused on that reason or a bulk/ops resume re-hits a known send hold.
+ * Extra-charge A/B/C/D and workflow-crash emails are unchanged.
  * @param {object} opts
  * @param {object} opts.req HTTP request (for base URL).
  * @param {string} opts.code workflow-error-messages catalog code.
  * @param {string} opts.invoiceId Firestore invoice id.
  * @param {string} [opts.type] outboundEmails type override.
  * @param {object} [opts.context] Template variables.
+ * @param {object} [opts.priorInvoice] Invoice fields before this fail update.
  * @return {Promise<void>}
  */
 async function sendWorkflowAlert(opts) {
-  const {req, code, invoiceId, type, context} = opts;
+  const {req, code, invoiceId, type, context, priorInvoice} = opts;
   const baseUrl = `https://${req.get("host")}`;
   const tenantId = (req.body && req.body.tenantId) || null;
   const alertContext = context || {};
+  const prior = priorInvoice || {};
+
+  if (workflowErrors.isCannotEmailHoldAlert(code)) {
+    let existingAlerts = [];
+    try {
+      existingAlerts = await loadExistingHoldAlerts(invoiceId, code, type);
+    } catch (lookupErr) {
+      console.warn("hold alert lookup failed:",
+          lookupErr && lookupErr.message);
+    }
+    if (workflowErrors.shouldSuppressRepeatHoldAlert({
+      code,
+      errorMessage: alertContext.errorMessage || prior.decisionReason,
+      priorInvoice: prior,
+      existingAlerts,
+    })) {
+      await writeLog("info", "workflow",
+          "Skipped duplicate cannot-email alert", {
+            invoiceId,
+            code,
+            loadNumber: alertContext.loadNumber || prior.loadNumber || null,
+            reason: alertContext.errorMessage || prior.decisionReason || null,
+          });
+      return;
+    }
+  }
+
   const alert = workflowErrors.buildWorkflowAlertEmail({
     code,
     context: alertContext,
@@ -398,6 +460,22 @@ async function sendWorkflowAlert(opts) {
     alertContext,
     systemError: workflowErrors.isSystemAlertCode(code, alertContext),
   });
+
+  if (workflowErrors.isCannotEmailHoldAlert(code) && invoiceId && db) {
+    try {
+      await db.collection("invoices").doc(invoiceId).update({
+        lastHoldAlertCode: code,
+        lastHoldAlertReason: String(
+            alertContext.errorMessage || prior.decisionReason || "")
+            .slice(0, 300),
+        lastHoldAlertAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (stampErr) {
+      console.warn("lastHoldAlert stamp failed:",
+          stampErr && stampErr.message);
+    }
+  }
 }
 
 /**
@@ -1185,11 +1263,14 @@ exports.processPrimusWorkflow = onRequest(
               code: "MISSING_POD",
               invoiceId,
               type: "missing_pod",
+              priorInvoice: invoice,
               context: {
                 loadNumber: invoice.loadNumber,
                 carrierName: invoice.carrierName,
                 proNumber: invoice.proNumber || null,
                 shipmentMode,
+                errorMessage:
+                  "Power Only — POD must be marked on the shipment",
               },
             });
             await writeLog("error", "workflow",
@@ -1310,11 +1391,14 @@ exports.processPrimusWorkflow = onRequest(
                 code: "MISSING_POD",
                 invoiceId,
                 type: "missing_pod",
+                priorInvoice: invoice,
                 context: {
                   loadNumber: invoice.loadNumber,
                   carrierName: invoice.carrierName,
                   proNumber: invoice.proNumber || null,
                   gmailSubject: invoice.gmailSubject || null,
+                  errorMessage:
+                    "Carrier invoice has no POD — cannot continue without one",
                 },
               });
 
@@ -3068,6 +3152,7 @@ exports.processPrimusWorkflow = onRequest(
               code: "CUSTOMER_EMAIL_FAILED",
               invoiceId,
               type: "customer_email_failed",
+              priorInvoice: invoice,
               context: {
                 loadNumber: invoice.loadNumber,
                 customerName,

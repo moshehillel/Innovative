@@ -525,6 +525,111 @@ function isTransientPrimusApiError(status, message) {
     /gateway timeout|too many requests/.test(m);
 }
 
+/** Ops "cannot email / missing POD" alerts that must not flood Lisa. */
+const CANNOT_EMAIL_ALERT_CODES = new Set([
+  "CUSTOMER_EMAIL_FAILED",
+  "MISSING_POD",
+]);
+
+/** Invoice stages that already mean customer email is on hold. */
+const KNOWN_SEND_HOLD_STAGES = new Set([
+  "customer_email_failed",
+  "missing_accounting_email",
+  "missing_pod",
+  "awaiting_tl_pod",
+]);
+
+const KNOWN_SEND_HOLD_REASONS = new Set([
+  "no_pod",
+  "missing_accounting_email",
+  "invalid_recipient",
+  "not_issued",
+]);
+
+/**
+ * True for Lisa "cannot email invoice" / missing-POD hold alerts.
+ * Extra-charge A/B/C/D and workflow-crash emails are not in this set.
+ * @param {string} code Catalog code.
+ * @return {boolean}
+ */
+function isCannotEmailHoldAlert(code) {
+  return CANNOT_EMAIL_ALERT_CODES.has(String(code || "").toUpperCase());
+}
+
+/**
+ * Collapse hold-reason text so repeat bulk resumes match the same pause.
+ * @param {string|null|undefined} reason Failure / decision reason.
+ * @return {string}
+ */
+function holdReasonKey(reason) {
+  const r = String(reason || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!r) return "";
+  if (/no pod|pod document|missing_pod|awaiting.?tl.?pod|pod must be marked/
+      .test(r)) {
+    return "no_pod";
+  }
+  if (/accounting email|no customer accounting/.test(r)) {
+    return "missing_accounting_email";
+  }
+  if (/invalid/.test(r) && /email|recipient/.test(r)) {
+    return "invalid_recipient";
+  }
+  if (/not issued via ui|missing primus customer invoice/.test(r)) {
+    return "not_issued";
+  }
+  return r.slice(0, 180);
+}
+
+/**
+ * Skip a new Lisa "cannot email" alert when this invoice is already paused
+ * on that hold, or a bulk/ops resume re-hits a known send hold.
+ * @param {object} opts Dedup inputs.
+ * @param {string} opts.code Alert catalog code.
+ * @param {string} [opts.errorMessage] New failure reason.
+ * @param {string} [opts.reason] Alias for errorMessage.
+ * @param {object} [opts.priorInvoice] Invoice state before this fail update.
+ * @param {Array<object>} [opts.existingAlerts] Prior outboundEmails rows.
+ * @return {boolean}
+ */
+function shouldSuppressRepeatHoldAlert(opts) {
+  const o = opts || {};
+  const code = String(o.code || "").toUpperCase();
+  if (!isCannotEmailHoldAlert(code)) return false;
+
+  const reasonKey = holdReasonKey(o.errorMessage || o.reason);
+  const prior = o.priorInvoice || {};
+  const priorStage = String(prior.decisionStage || "").toLowerCase();
+  const priorStatus = String(prior.finalWorkflowStatus || "").toLowerCase();
+  const priorReasonKey = holdReasonKey(prior.decisionReason);
+  const lastCode = String(prior.lastHoldAlertCode || "").toUpperCase();
+  const lastReasonKey = holdReasonKey(prior.lastHoldAlertReason);
+  const priorOnHold = KNOWN_SEND_HOLD_STAGES.has(priorStage) ||
+    KNOWN_SEND_HOLD_STAGES.has(priorStatus);
+
+  if (priorOnHold && priorReasonKey && priorReasonKey === reasonKey) {
+    return true;
+  }
+  if (priorOnHold && KNOWN_SEND_HOLD_REASONS.has(reasonKey)) {
+    return true;
+  }
+  if (lastCode === code && lastReasonKey && lastReasonKey === reasonKey) {
+    return true;
+  }
+
+  const existing = Array.isArray(o.existingAlerts) ? o.existingAlerts : [];
+  for (const alert of existing) {
+    const aCode = String(alert.alertCode || alert.code || "").toUpperCase();
+    const aType = String(alert.type || "").toLowerCase();
+    const codeMatch = aCode === code || aType === code.toLowerCase();
+    if (!codeMatch) continue;
+    const aReason = holdReasonKey(
+        (alert.alertContext && alert.alertContext.errorMessage) ||
+        alert.errorMessage || alert.reason);
+    if (!aReason || aReason === reasonKey) return true;
+  }
+  return false;
+}
+
 module.exports = {
   ACTION,
   buildWorkflowAlertEmail,
@@ -534,6 +639,9 @@ module.exports = {
   isSystemUiBillingStep,
   isTransientNetworkError,
   isTransientPrimusApiError,
+  isCannotEmailHoldAlert,
+  holdReasonKey,
+  shouldSuppressRepeatHoldAlert,
   TRANSIENT_NETWORK_RETRY_MS,
   PRIMUS_API_RETRY_ATTEMPTS,
 };
