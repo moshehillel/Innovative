@@ -1197,12 +1197,14 @@ function extractFlowFacts(logs) {
     facts.lastMessage = String(log.message || facts.lastMessage || "");
     const msg = String(log.message || "").toLowerCase();
     const message = log.message || "";
-    if (/workflow completed|invoice approved|emailed to customer|/i
+    if (/workflow completed|invoice approved|emailed to customer/i
         .test(message) ||
-        /issued via manage/i.test(message)) {
+        /issued via manage/i.test(message) ||
+        /documents emailed via primus/i.test(message)) {
       facts.outcomeHint = "completed";
-    } else if (/held for reviewer approval|awaiting.*approval/i.test(message)) {
-      facts.outcomeHint = "awaiting_email_approval";
+    } else if (/additional charge.*awaiting|awaiting a\/b\/c\/d/i
+        .test(message)) {
+      facts.outcomeHint = "awaiting_extra_charge_approval";
     } else if (/ui billing flow failed|workflow failed|/i.test(message) ||
         /invoice_generation_failed/i.test(message)) {
       facts.outcomeHint = "billing_failed";
@@ -1245,8 +1247,8 @@ function buildFallbackFlowSummary(facts, failureReason) {
       ` — Primus #${facts.issuedInvoiceNumber}` : "";
     return `${load}${carrier}${amt} billed and completed${inv}.`;
   }
-  if (facts.outcomeHint === "awaiting_email_approval") {
-    return `${load}${carrier}${amt} billed — awaiting customer email approval.`;
+  if (facts.outcomeHint === "awaiting_extra_charge_approval") {
+    return `${load}${carrier}${amt} matched — awaiting extra-charge approval.`;
   }
   if (facts.outcomeHint === "paused") {
     return `${load}${carrier}${amt} paused — needs dispatcher action.`;
@@ -1285,7 +1287,7 @@ async function callFlowSummaryModel(prompt) {
     "English. ALWAYS lead with 'Load ####' when loadNumber is in facts/logs " +
     "(never use internal invoiceId strings). Include carrier name and dollar " +
     "amount when known. State outcome: billed, paused, failed (brief why), " +
-    "forwarded for review, or awaiting email approval. " +
+    "forwarded for review, or awaiting extra-charge approval. " +
     "Do not contradict the facts block. No markdown, bullets, or timelines.";
 
   const userContent = JSON.stringify(prompt);
@@ -3426,7 +3428,7 @@ exports.checkInvoiceAgainstPrimus = onRequest(async (req, res) => {
     const fakePrimusAmount = invoiceAmount;
     const amountDifference = Math.abs(invoiceAmount - fakePrimusAmount);
 
-    let decisionStage = "ready_to_approve";
+    let decisionStage = "amount_matched";
     let reviewStatus = "not_needed";
     let decisionReason = "Invoice matches Primus amount.";
 
@@ -9983,7 +9985,7 @@ async function processGmailMessage(
           amountDifference = Math.abs(aiResult.invoiceAmount - primusAmount);
 
           if (amountDifference <= 5) {
-            decisionStage = "ready_to_approve";
+            decisionStage = "amount_matched";
             matchStatus = "matched";
             decisionReason = "Invoice matches Primus amount.";
           } else {
@@ -11690,18 +11692,24 @@ const SUPPORT_CHAT_PRODUCT_KNOWLEDGE =
   "mail queue, still processing, filtered by the selected time " +
   "range, sent to human review, or the source email never arrived. " +
   "Mail disconnected = no new processing until reconnected. " +
+  "A bare 6-digit number in chat is a Primus load number — treat it as " +
+  "the load under discussion. Do NOT ask whether it is a load vs an " +
+  "invoice id. Follow-ups like \"that load\", \"that load number\", " +
+  "\"was it processed\", or \"did it fail\" refer to the most recent " +
+  "load number already mentioned. " +
   "When a 6-digit load number appears in the conversation, processing " +
   "records are looked up automatically and attached below when found — " +
-  "use them to explain what happened. Never say you cannot see " +
-  "processing details, logs, or BigQuery when LOAD LOOKUP data is " +
-  "attached. Never mention BigQuery, databases, or internal systems " +
-  "by name — describe outcomes in plain language " +
+  "use them to explain what happened right away in 2–4 short sentences. " +
+  "Never say you cannot see processing details, logs, or BigQuery when " +
+  "LOAD LOOKUP data is attached. Never mention BigQuery, databases, or " +
+  "internal systems by name — describe outcomes in plain language " +
   "(e.g. \"matched in Primus\", \"waiting on POD\", " +
-  "\"forwarded for review\", \"workflow stopped\"). If no records are " +
-  "attached for a load, say you could not find processing activity " +
-  "for that load yet. For general issues without a specific load, " +
-  "escalate with status \"ready\" when an engineer should investigate. " +
-  "Never mention source code, codebase, repositories, or GitHub.";
+  "\"forwarded for review\", \"workflow completed\", \"workflow failed\"). " +
+  "If no records are attached for a load, say you could not find " +
+  "processing activity for that load yet. For general issues without a " +
+  "specific load, escalate with status \"ready\" when an engineer should " +
+  "investigate. Never mention source code, codebase, repositories, or " +
+  "GitHub.";
 
 /** Max log rows pulled into support-chat context per load lookup. */
 const SUPPORT_CHAT_LOG_LIMIT = 80;
@@ -11930,19 +11938,39 @@ async function fetchSupportChatLoadContext(tenant, opts) {
     }
   }
 
-  let logs = await querySupportChatLogs(tenant, {loadNumber, invoiceId});
-  if (!logs.length && invoice && invoice.id) {
-    logs = await querySupportChatLogs(tenant, {invoiceId: invoice.id});
+  // BQ is helpful but optional — never drop a Firestore invoice hit just
+  // because logs/summaries are missing or the query fails.
+  let logs = [];
+  try {
+    logs = await querySupportChatLogs(tenant, {loadNumber, invoiceId});
+    if (!logs.length && invoice && invoice.id) {
+      logs = await querySupportChatLogs(tenant, {invoiceId: invoice.id});
+    }
+  } catch (bqErr) {
+    console.error(
+        "[dashboardSupportChat] BQ log lookup failed:",
+        bqErr && bqErr.message ? bqErr.message : bqErr,
+    );
   }
 
   const lastLog = logs.length ? logs[logs.length - 1] : null;
-  const summary = await fetchFlowSummaryForSupportChat(tenant, {
-    invoiceId: invoiceId || (lastLog && lastLog.invoiceId) || null,
-    flowId: lastLog && lastLog.flowId || null,
-  });
+  let summary = null;
+  try {
+    summary = await fetchFlowSummaryForSupportChat(tenant, {
+      invoiceId: invoiceId || (lastLog && lastLog.invoiceId) || null,
+      flowId: lastLog && lastLog.flowId || null,
+    });
+  } catch (sumErr) {
+    console.error(
+        "[dashboardSupportChat] BQ summary lookup failed:",
+        sumErr && sumErr.message ? sumErr.message : sumErr,
+    );
+  }
 
   const facts = logs.length ? extractFlowFacts(logs) : null;
-  const compactLogs = logs.length ? compactLogsForSummary(logs) : [];
+  // Keep the prompt small so the model reliably returns JSON.
+  const compactLogs = logs.length ?
+    compactLogsForSummary(logs).slice(-20) : [];
 
   return {
     loadNumber: loadNumber || (invoice && invoice.loadNumber) || null,
@@ -11952,6 +11980,57 @@ async function fetchSupportChatLoadContext(tenant, opts) {
     facts,
     compactLogs,
     logCount: logs.length,
+  };
+}
+
+/**
+ * Parses the support-chat model output into {reply, status, summary}.
+ * gpt-5.6-luna sometimes ignores json_object mode and returns plain prose;
+ * treat that as a normal reply instead of failing the turn.
+ * @param {string} rawText Model content.
+ * @return {{reply: string, status: string, summary: string}}
+ */
+function parseSupportChatAiResponse(rawText) {
+  const text = String(rawText || "").trim();
+  if (!text) {
+    return {
+      reply: "Could you tell me a bit more about what you're seeing?",
+      status: "asking",
+      summary: "",
+    };
+  }
+
+  const candidates = [text];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) candidates.push(fenced[1].trim());
+  const firstBrace = text.indexOf("{");
+  const lastBrace = text.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(text.slice(firstBrace, lastBrace + 1));
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object") {
+        return {
+          reply: String(parsed.reply || "").trim(),
+          status: parsed.status === "ready" ? "ready" : "asking",
+          summary: String(parsed.summary || "").trim(),
+        };
+      }
+    } catch (_err) {
+      // try next candidate
+    }
+  }
+
+  console.warn(
+      "[dashboardSupportChat] AI returned non-JSON; using plain text reply",
+  );
+  return {
+    reply: text.replace(/\*\*/g, "").slice(0, SUPPORT_CHAT_MAX_MESSAGE_LENGTH),
+    status: "asking",
+    summary: "",
   };
 }
 
@@ -12010,6 +12089,19 @@ function formatSupportChatLoadContext(ctx) {
         `${ctx.loadNumber || ctx.invoiceId || "?"} in the last ` +
         `${SUPPORT_CHAT_LOG_HOURS} hours.`,
     );
+  }
+
+  if (ctx.priorLoadContext) {
+    const priorText = formatSupportChatLoadContext({
+      ...ctx.priorLoadContext,
+      priorLoadContext: null,
+    });
+    if (priorText) {
+      parts.push(
+          "ALSO previously discussed load (use if the user refers back " +
+          "to it): " + priorText,
+      );
+    }
   }
 
   return parts.join(" ") + " ";
@@ -12099,15 +12191,17 @@ async function runSupportChatTurn({
   const loadInstructions = loadSnapshot ?
     (hasLoadData ?
       "LOAD LOOKUP data is attached below. When the user asks what " +
-      "happened to a load, answer from that timeline in 2–4 short " +
-      "sentences: outcome, key steps, and why it stopped if it failed. " +
-      "Do NOT ask what they expected if the records already show the " +
-      "outcome. Do NOT claim you lack processing details. Stay in " +
-      "status \"asking\" unless they want human follow-up. " :
+      "happened to a load, answer from that data immediately in 2–4 " +
+      "short sentences: outcome/status, carrier/amount if known, and " +
+      "why it stopped if it failed. Do NOT ask whether the number is a " +
+      "load or invoice. Do NOT ask what they expected if the records " +
+      "already show the outcome. Do NOT claim you lack processing " +
+      "details. Stay in status \"asking\" unless they want human " +
+      "follow-up. " :
       "The customer asked about a load but no processing records were " +
       "found — say so plainly, suggest it may still be in the mail " +
       "queue or outside the search window, and ask if they have another " +
-      "load number or approximate date. ") :
+      "load number or approximate date. Do NOT ask load vs invoice. ") :
     "";
   const systemPrompt =
     `You are the support assistant on ${clientName}'s invoice-` +
@@ -12126,8 +12220,9 @@ async function runSupportChatTurn({
       "load number or enough to escalate. ") +
     "Answer product and how-it-works questions confidently from the " +
     "product knowledge above. Don't interrogate. " +
-    "Reply with ONLY valid JSON (no markdown fences) in this exact " +
-    "shape: {\"reply\": string, \"status\": \"asking\" | \"ready\", " +
+    "CRITICAL: Reply with ONLY valid JSON (no markdown, no prose " +
+    "outside JSON, no code fences) in this exact shape: " +
+    "{\"reply\": string, \"status\": \"asking\" | \"ready\", " +
     "\"summary\": string}. " +
     "\"reply\" is what you say to the customer next — for \"ready\" " +
     "turns, a short, friendly note that you've passed this along. " +
@@ -12226,22 +12321,48 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
       extracted.invoiceIds.add(String(dashCtx.selectedInvoiceId).trim());
     }
 
-    const loadNumber = extracted.loadNumbers.size ?
-      [...extracted.loadNumbers].slice(-1)[0] : null;
-    const invoiceId = extracted.invoiceIds.size ?
-      [...extracted.invoiceIds].slice(-1)[0] : null;
+    const loadNumbers = [...extracted.loadNumbers];
+    const invoiceIds = [...extracted.invoiceIds];
+    // Prefer the most recently mentioned load; also keep the prior one when
+    // the user switches mid-chat (e.g. 266372 then a dashboard row 266499).
+    const primaryLoad = loadNumbers.length ?
+      loadNumbers[loadNumbers.length - 1] : null;
+    const secondaryLoad = loadNumbers.length > 1 ?
+      loadNumbers[loadNumbers.length - 2] : null;
+    const invoiceId = invoiceIds.length ?
+      invoiceIds[invoiceIds.length - 1] : null;
 
     let loadContext = null;
-    if (loadNumber || invoiceId) {
+    if (primaryLoad || invoiceId) {
       try {
         loadContext = await fetchSupportChatLoadContext(tenant, {
-          loadNumber,
+          loadNumber: primaryLoad,
           invoiceId,
         });
       } catch (lookupErr) {
         console.error(
             "[dashboardSupportChat] Load lookup failed:",
             lookupErr,
+        );
+      }
+    }
+    if (secondaryLoad && secondaryLoad !== primaryLoad) {
+      try {
+        const prior = await fetchSupportChatLoadContext(tenant, {
+          loadNumber: secondaryLoad,
+        });
+        if (prior && (prior.invoice || prior.summary ||
+            (prior.compactLogs && prior.compactLogs.length))) {
+          if (loadContext) {
+            loadContext.priorLoadContext = prior;
+          } else {
+            loadContext = prior;
+          }
+        }
+      } catch (priorErr) {
+        console.error(
+            "[dashboardSupportChat] Prior load lookup failed:",
+            priorErr && priorErr.message ? priorErr.message : priorErr,
         );
       }
     }
@@ -12253,21 +12374,7 @@ exports.dashboardSupportChat = onRequest(async (req, res) => {
       loadContext,
     });
 
-    let parsed;
-    try {
-      parsed = JSON.parse(rawText);
-    } catch (parseErr) {
-      console.error(
-          "[dashboardSupportChat] Could not parse AI response as JSON:",
-          parseErr, rawText,
-      );
-      parsed = {
-        reply: "Sorry, I had trouble processing that — could you try " +
-          "rephrasing?",
-        status: "asking",
-        summary: "",
-      };
-    }
+    const parsed = parseSupportChatAiResponse(rawText);
 
     const reply = String(parsed.reply || "").trim() ||
       "Could you tell me a bit more about what you're seeing?";

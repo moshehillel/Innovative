@@ -162,6 +162,42 @@ async function hasIssuedCustomerInvoiceInPrimus(loadNumber) {
 }
 
 /**
+ * Issued manage.php customer invoice for a load, if one already exists.
+ * @param {string} loadNumber Load/BOL number.
+ * @return {Promise<{id:number, invoiceNumber:string}|null>}
+ */
+async function lookupIssuedUiCustomerInvoice(loadNumber) {
+  if (!loadNumber || !isManagePhpEnabled || !isManagePhpEnabled()) return null;
+  try {
+    const booking = await fetchPrimusBooking(loadNumber);
+    if (!booking) return null;
+    const bridge = require("./primus-ui-bridge");
+    const bookingId = bridge._internal &&
+      bridge._internal.resolveManageBookingId ?
+      bridge._internal.resolveManageBookingId(booking) : null;
+    if (!bookingId || !bridge.getBookingDocuments) return null;
+    const docs = await bridge.getBookingDocuments({
+      bookingId,
+      bookingBOL: String(loadNumber),
+    });
+    if (!docs.ok || !docs.data || !Array.isArray(docs.data.invoices)) {
+      return null;
+    }
+    const issued = docs.data.invoices.find((inv) => {
+      const num = inv.invoiceNumber;
+      return num != null && String(num) !== "" && String(num) !== "0";
+    });
+    if (!issued || issued.id == null) return null;
+    return {
+      id: Number(issued.id),
+      invoiceNumber: String(issued.invoiceNumber),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Confirms billing is already done in Primus (carrier bill + customer invoice).
  * @param {object} invoice Invoice document.
  * @param {object} primusSteps Completed-step flags.
@@ -194,26 +230,12 @@ async function resolveBillingSkipAction(invoice, primusSteps, resumeFrom) {
   }
 
   // Customer-email reviewer gate is gone: send unless explicitly rejected.
-  // Also resume loads still parked at the old awaiting-approval pause.
-  const parkedForCustomerEmail =
-    invoice.workflowPausedAtStep === "send_customer_email" &&
-    invoice.customerEmailApproval !== "rejected";
-  const needsEmailSend =
-    invoice.customerEmailApproval === "approved" || parkedForCustomerEmail;
-  if (needsEmailSend) {
-    return {
-      action: "customer_email_only",
-      source: inFirestore ? "firestore" : "primus",
-    };
-  }
-
   if (invoice.customerEmailApproval === "rejected") {
     return {action: "skip_entirely", workflowStatus: "customer_email_rejected"};
   }
-
   return {
-    action: "skip_entirely",
-    workflowStatus: invoice.finalWorkflowStatus || "waiting_manual",
+    action: "customer_email_only",
+    source: inFirestore ? "firestore" : "primus",
   };
 }
 
@@ -1766,6 +1788,25 @@ exports.processPrimusWorkflow = onRequest(
           Number(invoice.profit) : 0;
           let marginPctCalc = customerRate > 0 ?
           Math.round((profit / customerRate) * 100) : 0;
+          if (skipToCustomerEmail && !invoice.customerInvoiceId &&
+              invoice.loadNumber) {
+            const issuedUi =
+              await lookupIssuedUiCustomerInvoice(invoice.loadNumber);
+            if (issuedUi && issuedUi.id) {
+              invoice.customerInvoiceId = issuedUi.id;
+              invoice.issuedInvoiceNumber = issuedUi.invoiceNumber ||
+                invoice.issuedInvoiceNumber || null;
+              primusSteps.uiInvoiceIssued = true;
+              primusSteps.customerInvoiceGenerated = true;
+              await invoiceDoc.ref.update({
+                customerInvoiceId: issuedUi.id,
+                issuedInvoiceNumber: invoice.issuedInvoiceNumber || null,
+                primusSteps,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            }
+          }
+
           let invoiceGenerationResult = invoice.customerInvoiceId ? {
             ok: true,
             customerInvoiceId: invoice.customerInvoiceId,

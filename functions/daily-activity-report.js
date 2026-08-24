@@ -149,8 +149,11 @@ function aggregateDailyActivity(logs) {
         agg.billed.push({load, carrier, amount, invoiceNum: invNum});
       }
     }
+    // Customer-email reviewer gate is gone; do not list old hold logs
+    // as "waiting on customer email approval". Extra-charge A/B/C/D
+    // approvals are counted separately.
     if (msg === "Customer email held for reviewer approval") {
-      agg.awaitingEmailApproval.push({load, carrier, amount});
+      continue;
     }
     if (/Workflow skipped — carrier bill and invoice already in Primus/i
         .test(msg)) {
@@ -379,8 +382,10 @@ async function polishBulletsWithAi(agg, fallbackBullets) {
     "Return ONLY JSON: {\"lines\": [\"...\", ...]}. ",
     "CRITICAL: One bullet per event — NEVER combine multiple loads into a ",
     "single line (wrong: 'Invoiced 25 loads'; right: separate line per load). ",
-    "Include every item from aggregates.billed, awaitingEmailApproval, ",
-    "billingFailures, forwardedForReview, pastDueIgnored, etc. ",
+    "Include every item from aggregates.billed, ",
+    "additionalChargeApprovals, billingFailures, forwardedForReview, ",
+    "pastDueIgnored, etc. Do not say customer emails are waiting on ",
+    "reviewer approval — those send automatically. ",
     "Each line: past tense, plain English, max 140 chars, no markdown. ",
     "Keep load numbers, carriers, dollar amounts, and Primus invoice numbers. ",
     "You may keep summary lines for inboxChecks/emailsProcessed only.",
