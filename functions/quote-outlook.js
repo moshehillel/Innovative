@@ -256,7 +256,10 @@ function shouldRetryIntake(prev, opts) {
   if (opts.forceReprocess) return true;
   const status = String(prev.finalStatus || "");
   if (status === "quote_processed") return false;
-  if (status === "quote_queued") return false;
+  // quote_queued without quoteId is owned by drainQuoteQueue. Re-intake only
+  // when forced — otherwise drain would be starved of work while Luna
+  // reclassifies the same messages every sync.
+  if (status === "quote_queued") return Boolean(opts.forceReprocess);
   const reason = String(prev.skipReason || "");
   if (reason.startsWith("Parse failed") || reason === "empty model response") {
     return true;
@@ -270,6 +273,12 @@ function shouldRetryIntake(prev, opts) {
     }
     return false;
   }
+  // Failed / errored intakes: allow forceReprocess recovery (enqueue
+  // already supports forceReprocess for FAILED queue docs).
+  if (status === "failed" || status === "quote_failed" ||
+      status === "error" || status === "workflow_failed") {
+    return Boolean(opts.forceReprocess);
+  }
   return false;
 }
 
@@ -278,9 +287,12 @@ function shouldRetryIntake(prev, opts) {
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {Function} processQuoteEmail Handler.
+ * @param {object} [outlookClient] Optional Graph client; when set, mark
+ *   Outlook messages read only after a quoteRequest is created.
  * @return {Promise<object>} {processed, errors}
  */
-async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
+async function drainQuoteQueue(
+    tenant, dispatcher, processQuoteEmail, outlookClient) {
   const quoteMailQueue = require("./quote-mail-queue");
   const queued = await quoteMailQueue.listQueuedForDispatcher(
       tcolFn, tenant, dispatcher.id, 15);
@@ -333,6 +345,21 @@ async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
         } catch (_) {
           // non-fatal
         }
+        if (outlookClient && claimed.outlookMessageId) {
+          try {
+            await outlookClient.users.messages.modify({
+              id: claimed.outlookMessageId,
+              requestBody: {removeLabelIds: ["UNREAD"]},
+            });
+          } catch (markReadErr) {
+            writeLogFn("warn", "quote", "Outlook mark read failed", {
+              dispatcherId: dispatcher.id,
+              messageId: claimed.outlookMessageId,
+              quoteId: result.quoteId,
+              error: markReadErr.message,
+            });
+          }
+        }
       } else {
         errors += 1;
         const reason = result.reason || result.status || "not_a_quote";
@@ -363,7 +390,8 @@ async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
 
 /**
  * Sync recent quote RFQs from a dispatcher's connected Outlook inbox.
- * Luna classifies from email body; only quotes are marked read and queued.
+ * Luna classifies from email body; quotes are enqueued then drained.
+ * Outlook mark-read happens only after quoteRequest creation (in drain).
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {Function} processQuoteEmail quote-automation.processQuoteEmail.
@@ -388,7 +416,7 @@ async function syncDispatcherInbox(
   const client = outlookMail.createOutlookMailClient(tokens, onUpdate);
 
   const drainedFirst = await drainQuoteQueue(
-      tenant, dispatcher, processQuoteEmail);
+      tenant, dispatcher, processQuoteEmail, client);
 
   const after = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const q = `after:${after.getUTCFullYear()}/` +
@@ -546,19 +574,7 @@ async function syncDispatcherInbox(
           prev.createdAt : admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, {merge: true});
-
-      try {
-        await client.users.messages.modify({
-          id: messageId,
-          requestBody: {removeLabelIds: ["UNREAD"]},
-        });
-      } catch (markReadErr) {
-        writeLogFn("warn", "quote", "Outlook mark read failed", {
-          dispatcherId: dispatcher.id,
-          messageId,
-          error: markReadErr.message,
-        });
-      }
+      // Leave unread until drain creates quoteRequest (mark-read there).
     } catch (err) {
       processErrors += 1;
       writeLogFn("error", "quote", "Outlook sync quote enqueue failed", {
@@ -570,7 +586,7 @@ async function syncDispatcherInbox(
   }
 
   const drainedAfter = await drainQuoteQueue(
-      tenant, dispatcher, processQuoteEmail);
+      tenant, dispatcher, processQuoteEmail, client);
   const synced = drainedFirst.processed + drainedAfter.processed;
   processErrors += drainedFirst.errors + drainedAfter.errors;
 

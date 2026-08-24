@@ -105,6 +105,8 @@ async function enqueueQuoteEmail(opts) {
 
 /**
  * List queued jobs for a dispatcher (oldest first).
+ * Queries status==queued (not an arbitrary dispatcher slice) so large
+ * dispatcher queues cannot hide stuck jobs outside the first N docs.
  * @param {Function} tcol Tenant collection helper.
  * @param {object} tenant Tenant.
  * @param {string} dispatcherId Dispatcher id.
@@ -113,15 +115,28 @@ async function enqueueQuoteEmail(opts) {
  */
 async function listQueuedForDispatcher(tcol, tenant, dispatcherId, limit) {
   const max = Math.max(1, Math.min(Number(limit) || 10, 25));
-  // Single-field query avoids a composite index requirement.
-  const snap = await queueCol(tcol, tenant)
-      .where("dispatcherId", "==", String(dispatcherId))
-      .limit(Math.max(max * 5, 40))
-      .get();
-  return snap.docs
-      .map((d) => ({id: d.id, ...d.data()}))
-      .filter((d) => d.status === QUEUE_STATUS.QUEUED)
-      .slice(0, max);
+  const wantDispatcher = String(dispatcherId);
+  const out = [];
+  let lastDoc = null;
+  // Single-field status query needs no composite index. Page until we
+  // collect enough jobs for this dispatcher or exhaust queued docs.
+  for (let page = 0; page < 20 && out.length < max; page++) {
+    let q = queueCol(tcol, tenant)
+        .where("status", "==", QUEUE_STATUS.QUEUED)
+        .limit(50);
+    if (lastDoc) q = q.startAfter(lastDoc);
+    const snap = await q.get();
+    if (snap.empty) break;
+    lastDoc = snap.docs[snap.docs.length - 1];
+    for (const d of snap.docs) {
+      const data = d.data() || {};
+      if (String(data.dispatcherId || "") !== wantDispatcher) continue;
+      out.push({id: d.id, ...data});
+      if (out.length >= max) break;
+    }
+    if (snap.size < 50) break;
+  }
+  return out;
 }
 
 /**
