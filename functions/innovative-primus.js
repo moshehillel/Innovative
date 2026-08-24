@@ -1314,6 +1314,66 @@ exports.processPrimusWorkflow = onRequest(
           }
         } // end !skipToCustomerEmail (POD intake)
 
+        // Already billed: POD intake (including FedEx tracking pull) was
+        // skipped above. Still try to get a POD before customer email so a
+        // resume cannot send-fail with "No POD document on Primus".
+        if (skipToCustomerEmail && maybeExtractPodOnlyPdf &&
+            !(extractedPodOnlyFile && extractedPodOnlyFile.storagePath) &&
+            !(invoice.podOnlyFile && invoice.podOnlyFile.storagePath) &&
+            !invoice.podOnPrimusAlready) {
+          let primusAlreadyHasPod = false;
+          if (invoice.loadNumber && isManagePhpEnabled &&
+              isManagePhpEnabled() && checkBookingHasPod) {
+            try {
+              const bookingForPod =
+                await fetchPrimusBooking(invoice.loadNumber);
+              const podCheck = await checkBookingHasPod({
+                booking: bookingForPod,
+                loadNumber: invoice.loadNumber,
+              });
+              primusAlreadyHasPod = !!(podCheck && podCheck.found);
+              if (primusAlreadyHasPod) {
+                invoice.podOnPrimusAlready = true;
+                await invoiceDoc.ref.update({
+                  podOnPrimusAlready: true,
+                  podPrimusDriveIds: podCheck.driveIds || [],
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+              }
+            } catch (_) {
+              primusAlreadyHasPod = false;
+            }
+          }
+          if (!primusAlreadyHasPod) {
+            await writeLog("info", "workflow",
+                "Already billed — pulling missing POD before customer email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  carrierName: invoice.carrierName || null,
+                });
+            const extractedPodOnlyFileLocal =
+                await maybeExtractPodOnlyPdf(invoiceId, invoice);
+            extractedPodOnlyFile = extractedPodOnlyFileLocal;
+            if (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) {
+              await invoiceDoc.ref.update({
+                podOnlyFile: {
+                  storagePath: extractedPodOnlyFile.storagePath,
+                  source: extractedPodOnlyFile.source,
+                },
+                podOnlyFiles: extractedPodOnlyFile.files || [{
+                  storagePath: extractedPodOnlyFile.storagePath,
+                  source: extractedPodOnlyFile.source,
+                }],
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              invoice.podOnlyFile = {
+                storagePath: extractedPodOnlyFile.storagePath,
+                source: extractedPodOnlyFile.source,
+              };
+            }
+          }
+        }
+
         if (!skipToCustomerEmail) {
           if (maybeNotifyLisaPodDiscrepancy) {
             const podPathForReview =

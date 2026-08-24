@@ -5796,6 +5796,14 @@ async function maybeFetchXpoWeightCert(messageId, aiResult) {
  */
 async function maybeFetchFedExFreightPod(invoiceId, invoice) {
   if (!invoice || !fedexFreightPod.isFedExFreightCarrier(invoice.carrierName)) {
+    if (invoice && /fed\s*ex/i.test(String(invoice.carrierName || ""))) {
+      await writeLog("info", "workflow",
+          "FedEx Freight POD fetch skipped — carrier name did not match", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            carrierName: invoice.carrierName || null,
+          });
+    }
     return null;
   }
   const proNumber = fedexFreightPod.resolveFedExFreightPro({
@@ -5898,6 +5906,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
           "POD not detected in this invoice — no extraction attempted", {
             invoiceId,
             loadNumber: invoice && invoice.loadNumber,
+            carrierName: invoice && invoice.carrierName,
             podFound: podNormalized && podNormalized.found,
             podSource: podNormalized && podNormalized.source,
             podDocumentCount: documents.length,
