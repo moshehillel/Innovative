@@ -301,6 +301,32 @@ function buildWorkflowAlertEmail(opts) {
       }
       break;
 
+    case "MARK_DELIVERED_FAILED":
+      if (looksLikeSystemError(ctx.errorMessage, ctx.step)) {
+        subject = `System issue — Mark delivered failed — Load ${loadNumber}`;
+        title = "Could not mark shipment delivered";
+        summary = "Jerry could not mark this load delivered in ShipPrimus " +
+          "before customer invoicing.";
+        explanation = (ctx.errorMessage ?
+          `${esc(ctx.errorMessage)} ` : "") +
+          "This looks like an automation/API issue. Advanced Automations " +
+          "has been notified. Mark the load delivered in ShipPrimus " +
+          "manually if urgent, then contact Advanced Automations to resume.";
+        action = ACTION.NONE;
+      } else {
+        subject = `Action needed — Mark delivered failed — Load ${loadNumber}`;
+        title = "Could not mark shipment delivered";
+        summary = "Jerry could not mark this load delivered in ShipPrimus, " +
+          "so the customer invoice was not created.";
+        explanation = (ctx.errorMessage ?
+          `${esc(ctx.errorMessage)} ` : "") +
+          "Mark the shipment as delivered in ShipPrimus (or fix the vendor " +
+          "/ webservice issue on the load), then resume. Do not retry until " +
+          "Primus shows the load delivered or dispatchable.";
+        action = ACTION.RESUME;
+      }
+      break;
+
     case "CUSTOMER_EMAIL_FAILED":
       subject = `Action needed — Customer email failed — Load ${loadNumber}`;
       title = "Customer email could not be sent";
@@ -483,6 +509,7 @@ function isSystemAlertCode(code, context) {
     case "STUCK_FLOW":
       return true;
     case "UI_BILLING_FAILED":
+    case "MARK_DELIVERED_FAILED":
       return looksLikeSystemError(ctx.errorMessage, ctx.step);
     default:
       return false;
@@ -494,6 +521,43 @@ const TRANSIENT_NETWORK_RETRY_MS = 3000;
 
 /** Primus REST reads retried on transient 5xx / rate limits. */
 const PRIMUS_API_RETRY_ATTEMPTS = 3;
+
+/** Wait before re-invoking the whole workflow after in-request retries fail. */
+const WORKFLOW_DELAYED_RETRY_MS = 10 * 60 * 1000;
+
+/** Extra full-workflow retries after immediate Primus/network backoff. */
+const MAX_WORKFLOW_DELAYED_RETRIES = 1;
+
+/**
+ * Backoff before the next in-request Primus/network retry.
+ * @param {number} attempt 1-based attempt that just failed.
+ * @return {number} Milliseconds to wait.
+ */
+function transientRetryDelayMs(attempt) {
+  const n = Math.max(1, Number(attempt) || 1);
+  return TRANSIENT_NETWORK_RETRY_MS * Math.pow(2, n - 1);
+}
+
+/**
+ * True when a thrown workflow error should get a delayed full retry
+ * instead of an immediate ops/system-error email.
+ * @param {object} opts Retry decision inputs.
+ * @param {string} [opts.errorMessage]
+ * @param {number} [opts.delayedRetryCount]
+ * @param {boolean} [opts.extraChargePending]
+ * @param {boolean} [opts.podHold]
+ * @param {boolean} [opts.missingAccountingEmail]
+ * @return {boolean}
+ */
+function shouldDelayWorkflowRetry(opts) {
+  const o = opts || {};
+  if (!isTransientNetworkError(o.errorMessage)) return false;
+  if (o.extraChargePending || o.podHold || o.missingAccountingEmail) {
+    return false;
+  }
+  const used = Number(o.delayedRetryCount) || 0;
+  return used < MAX_WORKFLOW_DELAYED_RETRIES;
+}
 
 /**
  * True for timeouts / connection errors worth retrying once.
@@ -534,6 +598,10 @@ module.exports = {
   isSystemUiBillingStep,
   isTransientNetworkError,
   isTransientPrimusApiError,
+  shouldDelayWorkflowRetry,
+  transientRetryDelayMs,
   TRANSIENT_NETWORK_RETRY_MS,
+  WORKFLOW_DELAYED_RETRY_MS,
+  MAX_WORKFLOW_DELAYED_RETRIES,
   PRIMUS_API_RETRY_ATTEMPTS,
 };
