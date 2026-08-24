@@ -194,26 +194,12 @@ async function resolveBillingSkipAction(invoice, primusSteps, resumeFrom) {
   }
 
   // Customer-email reviewer gate is gone: send unless explicitly rejected.
-  // Also resume loads still parked at the old awaiting-approval pause.
-  const parkedForCustomerEmail =
-    invoice.workflowPausedAtStep === "send_customer_email" &&
-    invoice.customerEmailApproval !== "rejected";
-  const needsEmailSend =
-    invoice.customerEmailApproval === "approved" || parkedForCustomerEmail;
-  if (needsEmailSend) {
-    return {
-      action: "customer_email_only",
-      source: inFirestore ? "firestore" : "primus",
-    };
-  }
-
   if (invoice.customerEmailApproval === "rejected") {
     return {action: "skip_entirely", workflowStatus: "customer_email_rejected"};
   }
-
   return {
-    action: "skip_entirely",
-    workflowStatus: invoice.finalWorkflowStatus || "waiting_manual",
+    action: "customer_email_only",
+    source: inFirestore ? "firestore" : "primus",
   };
 }
 
