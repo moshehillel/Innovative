@@ -1,11 +1,16 @@
 "use strict";
 
-const additionalCharges = require("./additional-charges");
-
 /**
- * Weekly report: shipments with pickup > N days ago and no delivery date,
- * grouped by dispatcher and emailed to each dispatcher.
+ * Twice-weekly report (Mon & Thu): shipments with pickup > N days ago and no
+ * delivery date, grouped by dispatcher and emailed to each dispatcher.
+ * Dispatcher is To; Leo is CC'd (ops visibility — replaced Lisa).
  */
+
+/** Ops CC for undelivered reports (same address as drayage validator). */
+const UNDELIVERED_REPORT_CC_EMAIL =
+  process.env.UNDELIVERED_REPORT_CC_EMAIL ||
+  process.env.DRAYAGE_VALIDATOR_EMAIL ||
+  "leo@innovativecarriers.com";
 
 let deps = {};
 
@@ -299,11 +304,11 @@ function buildDispatcherReportEmail(opts) {
     `<th style="padding:6px 10px;text-align:left">Customer</th>` +
     `<th style="padding:6px 10px;text-align:left">Lane</th>` +
     `</tr></thead><tbody>${rows}</tbody></table>` +
-    `<p style="color:#6b7280;font-size:12px">This is an automated weekly ` +
-    `report from Jerry.</p>`;
+    `<p style="color:#6b7280;font-size:12px">This is an automated report ` +
+    `from Jerry (sent Monday and Thursday).</p>`;
 
   return {
-    subject: `Weekly report — ${shipments.length} shipment(s) missing ` +
+    subject: `Report — ${shipments.length} shipment(s) missing ` +
       `delivery date (${minDays}+ days since pickup)`,
     html,
   };
@@ -381,13 +386,19 @@ async function runUndeliveredShipmentReport(opts) {
     });
 
     if (!dryRun && typeof saveOutboundEmail === "function") {
-      await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc({
+      const payload = {
         type: "undelivered_shipment_report",
         subject: mail.subject,
         html: mail.html,
         forceRecipient: true,
         to: email,
-      }));
+      };
+      // Leo on CC (not Lisa). Skip duplicate when Leo is already To.
+      if (String(email).trim().toLowerCase() !==
+          UNDELIVERED_REPORT_CC_EMAIL.toLowerCase()) {
+        payload.cc = UNDELIVERED_REPORT_CC_EMAIL;
+      }
+      await saveOutboundEmail(payload);
     }
 
     sent.push({

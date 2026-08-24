@@ -1697,18 +1697,17 @@ exports.checkPodFollowUps = onRequest(
     {invoker: "public"}, handleCheckPodFollowUps);
 
 /**
- * Weekly undelivered shipment report — pickup > 14 days, no delivery date.
- * Wire Cloud Scheduler to POST weekly (e.g. Monday 8am ET).
- * Query: ?dryRun=1 to preview without sending email.
+ * Undelivered shipment report — pickup > N days, no delivery date.
+ * Dispatcher To; Leo CC'd. Query: ?dryRun=1 to preview without sending.
  */
 exports.reportUndeliveredShipments = onRequest(
     {invoker: "public", timeoutSeconds: 540, memory: "512MiB"},
     handleReportUndeliveredShipments);
 
-/** Weekly Mon 8:00 AM ET — stale pickup, no delivery date. */
+/** Mon & Thu 8:00 AM — stale pickup, no delivery date (America/Cayman). */
 exports.reportUndeliveredShipmentsWeekly = onSchedule({
-  schedule: "0 8 * * 1",
-  timeZone: "America/New_York",
+  schedule: "0 8 * * 1,4",
+  timeZone: "America/Cayman",
   timeoutSeconds: 540,
   memory: "512MiB",
 }, async () => {
@@ -1721,7 +1720,7 @@ exports.reportUndeliveredShipmentsWeekly = onSchedule({
       await saveOutboundEmail({
         type: "undelivered_shipment_report_failed",
         subject: "System issue — undelivered shipment report failed",
-        html: `<p>The weekly undelivered shipment lookup failed.</p>` +
+        html: `<p>The undelivered shipment lookup failed.</p>` +
           `<p>${escapeHtml(result.error || "Unknown error")}</p>`,
         systemError: true,
       });
@@ -1733,7 +1732,7 @@ exports.reportUndeliveredShipmentsWeekly = onSchedule({
     await saveOutboundEmail({
       type: "undelivered_shipment_report_failed",
       subject: "System issue — undelivered shipment report failed",
-      html: `<p>The weekly undelivered shipment lookup failed.</p>` +
+      html: `<p>The undelivered shipment lookup failed.</p>` +
         `<p>${escapeHtml(error.message)}</p>`,
       systemError: true,
     });
