@@ -1069,7 +1069,6 @@ async function processQuoteEmail(opts) {
     batchQuoteId,
     format: extracted.format,
     readyDate: extracted.readyDate,
-    shipper: extracted.shipper,
     originSiteType: (ratedLanes[0] && ratedLanes[0].originSiteType) || null,
     originEnrichmentMeta:
       (ratedLanes[0] && ratedLanes[0].originEnrichmentMeta) || null,
@@ -1086,6 +1085,9 @@ async function processQuoteEmail(opts) {
     extractionWarnings: collectQuoteWarnings(extracted, ratedLanes),
     rateSource: quoteRateSource(ratedLanes, shippingLocationId),
     lanes: ratedLanes,
+    // Prefer enriched lane shipper (ZIP fill) over raw extract.
+    shipper: (ratedLanes[0] && ratedLanes[0].shipper) ||
+      extracted.shipper || null,
     customerDraftText: "",
     status: "awaiting_dispatcher",
     extracted,

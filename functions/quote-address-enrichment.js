@@ -217,6 +217,31 @@ async function lookupUsZip(zip) {
 }
 
 /**
+ * Known warehouse / facility ZIPs (city|ST → zip). Used before external
+ * geocode so recurring RFQ origins (e.g. STG Santa Fe Springs) still rate
+ * when Google/Zippopotam are slow or the serving revision is stale.
+ */
+const KNOWN_CITY_STATE_ZIPS = Object.freeze({
+  "santa fe springs|ca": "90670",
+  "lakewood|nj": "08701",
+});
+
+/**
+ * Fast ZIP from known city/state map.
+ * @param {string} city City.
+ * @param {string} state State abbrev.
+ * @return {object|null}
+ */
+function lookupKnownCityStateZip(city, state) {
+  const c = String(city || "").trim().toLowerCase();
+  const st = String(state || "").trim().toLowerCase();
+  if (!c || !st) return null;
+  const zipCode = KNOWN_CITY_STATE_ZIPS[`${c}|${st}`];
+  if (!zipCode) return null;
+  return {city: String(city).trim(), state: String(state).trim(), zipCode};
+}
+
+/**
  * City/state (+ optional name/street) → ZIP via Google Geocoding / Places.
  * Locality-only queries often omit postal_code; include name when present.
  * Prefer space-joined queries (comma-joined "Name, City, ST" often geocodes
@@ -231,6 +256,9 @@ async function lookupZipFromCityState(party) {
   const city = String(party.city || "").trim();
   const state = String(party.state || "").trim();
   if (!city || !state) return null;
+
+  const known = lookupKnownCityStateZip(city, state);
+  if (known) return known;
 
   const apiKey = getGoogleApiKey();
   if (apiKey) {
@@ -433,7 +461,10 @@ async function fillPartyCityStateFromZip(party, lane) {
 async function fillPartyZipFromCityState(party, lane) {
   if (!partyNeedsZipFromCityState(party)) return party;
   const loc = await lookupZipFromCityState(party);
-  if (!loc) return party;
+  if (!loc) {
+    pushLaneZipWarning(lane, "zip fill failed");
+    return party;
+  }
   pushLaneZipWarning(lane, "zip filled");
   const existingStreet = String(party.address1 || "").trim();
   return {
@@ -1444,6 +1475,8 @@ module.exports = {
   lookupUsZip,
   lookupUsZipFromCityState,
   lookupZipFromCityState,
+  lookupKnownCityStateZip,
+  KNOWN_CITY_STATE_ZIPS,
   fillPartyCityStateFromZip,
   fillPartyZipFromCityState,
   fillPartyOdFromZipOrCityState,
