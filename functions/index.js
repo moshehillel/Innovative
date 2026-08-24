@@ -11279,22 +11279,91 @@ exports.getRecentSummaries = onRequest(async (req, res) => {
   }
 });
 
+/**
+ * Maps leftover customer-email-gate statuses to dashboard-facing labels.
+ * Extra-charge A/B/C/D approval is unchanged.
+ * @param {object} data Invoice document fields.
+ * @return {object}
+ */
+function invoiceDashboardStatus(data) {
+  const stage = String(data.decisionStage || "");
+  const wf = String(data.finalWorkflowStatus || "");
+  const reason = String(data.decisionReason || "");
+  const match = data.matchStatus || null;
+  const extraChargePending =
+    stage === "additional_charge_pending_approval" ||
+    wf === "additional_charge_pending_approval";
+  if (wf === "completed" || stage === "completed") {
+    return {matchStatus: match, displayStatus: "completed",
+      displayLabel: "Completed",
+      displayReason: data.decisionReason || null,
+      remapWorkflow: false};
+  }
+  if (extraChargePending) {
+    return {matchStatus: match,
+      displayStatus: "additional_charge_pending_approval",
+      displayLabel: "Awaiting extra-charge approval",
+      displayReason: data.decisionReason ||
+        "Additional charge awaiting A/B/C/D decision.",
+      remapWorkflow: false};
+  }
+  const staleEmailGate =
+    stage === "awaiting_customer_email_approval" ||
+    /awaiting reviewer approval before emailing/i.test(reason);
+  if (staleEmailGate) {
+    return {matchStatus: match, displayStatus: "running",
+      displayLabel: "Sending customer email",
+      displayReason: "Customer invoice email sends automatically.",
+      remapWorkflow: true};
+  }
+  if (stage === "ready_to_approve" || stage === "amount_matched") {
+    if (wf === "failed") {
+      return {matchStatus: match, displayStatus: "failed",
+        displayLabel: "Failed",
+        displayReason: data.decisionReason || null,
+        remapWorkflow: false};
+    }
+    if (wf === "created" || wf === "running" || !wf) {
+      return {matchStatus: match, displayStatus: "running",
+        displayLabel: "Processing",
+        displayReason: "Amount matched — processing automatically.",
+        remapWorkflow: true};
+    }
+    return {matchStatus: match, displayStatus: "amount_matched",
+      displayLabel: "Amount matched",
+      displayReason: data.decisionReason || null,
+      remapWorkflow: false};
+  }
+  const raw = stage || wf || null;
+  return {matchStatus: match, displayStatus: raw,
+    displayLabel: raw ? String(raw).replace(/_/g, " ") : null,
+    displayReason: data.decisionReason || null,
+    remapWorkflow: false};
+}
+
 exports.getRecentInvoices = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
     const tenant = await resolveDashboardTenant(req);
-    const limit = Math.min(Number(req.query.limit || 20), 50);
-    const offset = Math.max(Number(req.query.offset || 0), 0);
-    let query = tcol(tenant, "invoices")
-        .orderBy("createdAt", "desc");
-    if (offset > 0) {
-      query = query.offset(offset);
-    }
-    const snap = await query.limit(limit).get();
-    const invoices = snap.docs.map((doc) => {
+    const parsedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ?
+      Math.min(Math.floor(parsedLimit), 50) : 20;
+    const parsedOffset = Number(req.query.offset);
+    const offset = Number.isFinite(parsedOffset) && parsedOffset > 0 ?
+      Math.floor(parsedOffset) : 0;
+    // Fetch the window with limit+offset, then slice. Avoid Query.offset()
+    // so pagination cannot 400/500 on admin SDK versions that lack it.
+    const fetchCount = Math.min(offset + limit, 500);
+    const snap = await tcol(tenant, "invoices")
+        .orderBy("createdAt", "desc")
+        .limit(fetchCount)
+        .get();
+    const pageDocs = snap.docs.slice(offset);
+    const invoices = pageDocs.map((doc) => {
       const data = doc.data() || {};
       const createdAt = data.createdAt && data.createdAt.toDate ?
         data.createdAt.toDate().toISOString() : null;
+      const shown = invoiceDashboardStatus(data);
       return {
         id: doc.id,
         loadNumber: data.loadNumber || null,
@@ -11306,9 +11375,17 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
         profit: data.profit || null,
         tms: data.tms || tenant.tms,
         taiShipmentId: data.taiShipmentId || null,
-        finalWorkflowStatus: data.finalWorkflowStatus || null,
-        decisionStage: data.decisionStage || null,
-        decisionReason: data.decisionReason || null,
+        // Dashboard row uses finalWorkflowStatus, then decisionReason.
+        // Remap leftover customer-email-gate / ready_to_approve so those
+        // rows do not look like they are waiting for reviewer approval.
+        finalWorkflowStatus: shown.remapWorkflow ?
+          (shown.displayStatus || data.finalWorkflowStatus || null) :
+          (data.finalWorkflowStatus || null),
+        decisionStage: shown.displayStatus || data.decisionStage || null,
+        decisionReason: shown.displayReason,
+        matchStatus: shown.matchStatus,
+        displayStatus: shown.displayStatus,
+        displayLabel: shown.displayLabel,
         currentStep: data.currentStep || null,
         createdAt,
       };
@@ -11320,7 +11397,7 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
       invoices,
       limit,
       offset,
-      hasMore: invoices.length === limit,
+      hasMore: snap.docs.length === offset + limit,
     });
   } catch (error) {
     console.error("getRecentInvoices error:", error);
