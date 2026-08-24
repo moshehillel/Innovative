@@ -124,8 +124,14 @@ check("hit count", hits.length === 4);
 const mail = report.buildLisaReportEmail({shipments: hits});
 check("subject names Lisa report",
     mail.subject.includes("not invoiced"));
+check("subject splits delivered vs past ETA",
+    mail.subject.includes("3 delivered + 1 past ETA"));
 check("html greets Lisa", mail.html.includes("Hi Lisa"));
 check("html lists POD load", mail.html.includes("266781"));
+check("html has delivered section",
+    mail.html.includes("Actually delivered, not invoiced"));
+check("html has past ETA section",
+    mail.html.includes("Past delivery date / ETA, not yet"));
 check("html does not mention extra-charge letters as actions",
     !/approve option [ABCD]/i.test(mail.html));
 
