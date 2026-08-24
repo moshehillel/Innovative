@@ -28,6 +28,7 @@ const {
 const workflowErrors = require("./workflow-error-messages");
 const brokerCommission = require("./broker-commission");
 const undeliveredReport = require("./undelivered-shipment-report");
+const deliveredUninvoicedReport = require("./delivered-uninvoiced-report");
 const additionalCharges = require("./additional-charges");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
@@ -1788,6 +1789,78 @@ async function handleReportUndeliveredShipments(req, res) {
     return res.json(result);
   } catch (error) {
     console.error("reportUndeliveredShipments error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: error.message,
+    });
+  }
+}
+
+/**
+ * Delivered / past-due shipments with no customer invoice.
+ * Lisa To. Query: ?dryRun=1 to preview without sending.
+ */
+exports.reportDeliveredUninvoicedShipments = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "512MiB"},
+    handleReportDeliveredUninvoicedShipments);
+
+/** Mon & Thu 8:00 AM — delivered/past-due, not invoiced (America/Cayman). */
+exports.reportDeliveredUninvoicedShipmentsWeekly = onSchedule({
+  schedule: "0 8 * * 1,4",
+  timeZone: "America/Cayman",
+  timeoutSeconds: 540,
+  memory: "512MiB",
+}, async () => {
+  try {
+    const result =
+      await deliveredUninvoicedReport.runDeliveredUninvoicedReport({});
+    if (!result.ok) {
+      await writeLog("error", "report",
+          "Delivered-uninvoiced shipment report failed", {
+            error: result.error || "unknown",
+          });
+      await saveOutboundEmail({
+        type: "delivered_uninvoiced_report_failed",
+        subject: "System issue — delivered-uninvoiced report failed",
+        html: `<p>The delivered-uninvoiced shipment lookup failed.</p>` +
+          `<p>${escapeHtml(result.error || "Unknown error")}</p>`,
+        systemError: true,
+      });
+    }
+  } catch (error) {
+    await writeLog("error", "report",
+        "Delivered-uninvoiced shipment report threw", {
+          error: error.message,
+        });
+    await saveOutboundEmail({
+      type: "delivered_uninvoiced_report_failed",
+      subject: "System issue — delivered-uninvoiced report failed",
+      html: `<p>The delivered-uninvoiced shipment lookup failed.</p>` +
+        `<p>${escapeHtml(error.message)}</p>`,
+      systemError: true,
+    });
+    throw error;
+  }
+});
+
+/**
+ * @param {object} req HTTPS request.
+ * @param {object} res HTTPS response.
+ * @return {Promise<object>}
+ */
+async function handleReportDeliveredUninvoicedShipments(req, res) {
+  try {
+    if (req.method !== "POST" && req.method !== "GET") {
+      return res.status(405).json({ok: false, error: "Use GET or POST"});
+    }
+    const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true";
+    const result =
+      await deliveredUninvoicedReport.runDeliveredUninvoicedReport({
+        dryRun,
+      });
+    return res.json(result);
+  } catch (error) {
+    console.error("reportDeliveredUninvoicedShipments error:", error);
     return res.status(500).json({
       ok: false,
       error: error.message,
@@ -14318,6 +14391,12 @@ brokerCommission.init({
 });
 
 undeliveredReport.init({
+  writeLog,
+  saveOutboundEmail,
+  primusUiBridge,
+});
+
+deliveredUninvoicedReport.init({
   writeLog,
   saveOutboundEmail,
   primusUiBridge,
