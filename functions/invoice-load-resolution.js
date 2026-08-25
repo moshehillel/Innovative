@@ -67,10 +67,10 @@ function isPlausibleCarrierPro(value) {
   const compact = raw.toLowerCase().replace(/[\s._-]/g, "");
   if (PRO_GARBAGE_WORDS.has(compact)) return false;
   if (/^(notprovided|notavailable|seebelow|na)$/i.test(compact)) return false;
-  const digits = raw.replace(/\D/g, "");
-  if (!digits.length) return false;
-  if (digits.length >= 4) return true;
-  return /^[A-Z0-9-]{5,}$/i.test(raw) && /\d/.test(raw);
+  // PRO is digits-only; optional spaces/dashes/dots/underscores are stripped.
+  const stripped = raw.replace(/[\s._-]/g, "");
+  if (!/^\d+$/.test(stripped)) return false;
+  return stripped.length >= 4;
 }
 
 /**
@@ -225,10 +225,10 @@ function buildPrimusLookupKeys(refs) {
   };
   addDigits(refs.loadNumber, "broker_load");
   addLeadingTwoExpansion(refs.loadNumber, "broker_load_leading2");
-  addDigits(refs.proNumber, "pro");
   addDigits(refs.carrierBolNumber, "carrier_bol");
-  addLeadingTwoExpansion(refs.carrierOrderNumber, "broker_load_leading2");
   addLeadingTwoExpansion(refs.carrierBolNumber, "carrier_bol_leading2");
+  addDigits(refs.proNumber, "pro");
+  addLeadingTwoExpansion(refs.carrierOrderNumber, "broker_load_leading2");
   addText(refs.shipmentReference, "shipment_ref");
   addText(refs.carrierOrderNumber, "carrier_order");
   addDigits(refs.poNumber, "po");
@@ -287,10 +287,13 @@ function extractLoadHintsFromEmailText(subject, body, hints) {
     String(hints.proNumberHint).trim() : "";
   const text = `${subject || ""}\n${body || ""}`;
   const proLabeled = text.match(
-      /\b(?:pro|beyond\s*pro)\b\s*[#:]?\s*([A-Z0-9-]{5,})/i);
+      /\b(?:pro|beyond\s*pro)\b\s*[#:]?\s*([\d][\d\s._-]{2,}[\d]|\d{4,})/i);
+  const labeledPro = proLabeled ? proLabeled[1].trim() : "";
+  const proCandidate = hintPro || labeledPro;
   return {
     loadNumber: null,
-    proNumber: hintPro || (proLabeled ? proLabeled[1] : null),
+    proNumber: proCandidate && isPlausibleCarrierPro(proCandidate) ?
+      proCandidate : null,
   };
 }
 

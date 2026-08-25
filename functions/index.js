@@ -1029,6 +1029,12 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
         loadResolvedFrom: null,
       };
     }
+    // Valid 6-digit BOL/load wins over PRO remap even when Primus fetch failed.
+    return {
+      aiResult: {...refs, loadNumber: direct.loadNumber},
+      gateFailed: false,
+      loadResolvedFrom: null,
+    };
   }
   if (normalizedProNumber) {
     const proResolved = await resolveLoadNumberFromPrimusPro(
@@ -1054,13 +1060,6 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
         };
       }
     }
-  }
-  if (direct.ok) {
-    return {
-      aiResult: {...refs, loadNumber: direct.loadNumber},
-      gateFailed: false,
-      loadResolvedFrom: null,
-    };
   }
 
   const lookupKeys = loadResolution.buildPrimusLookupKeys(refs);
