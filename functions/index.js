@@ -9811,7 +9811,8 @@ async function processGmailMessage(
           const lumperValidation = additionalCharges.validateLumperAmount(
               aiResult, primusData.vendorCost,
           );
-          if (lumperValidation.totalLumper > 0) {
+          if (lumperValidation.totalLumper > 0 &&
+              !lumperValidation.totalMatchesPrimus) {
             primusValidationAmount = lumperValidation.baseAmount;
           }
           await writeLog("info", "ai", "Lumper validation result", {

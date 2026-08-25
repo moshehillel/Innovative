@@ -90,14 +90,30 @@ function validateLumperAmount(aiResult, primusCarrierCost) {
       .filter((c) => c && c.type === "lumper");
   const totalLumper = lumperCharges.reduce(
       (sum, c) => sum + (Number(c.amount) || 0), 0);
-  const baseAmount = Number(aiResult.invoiceAmount || 0) - totalLumper;
-  const difference = Math.abs(baseAmount - Number(primusCarrierCost || 0));
+  const invoiceAmount = Number(aiResult.invoiceAmount || 0);
+  const primusCost = Number(primusCarrierCost || 0);
+  const baseAmount = invoiceAmount - totalLumper;
+  // When the invoice total already matches Primus, the lumper is included in
+  // carrier cost — line items are a breakdown, not an overage.
+  const totalMatchesPrimus = primusCost > 0 &&
+      Math.abs(invoiceAmount - primusCost) <= RATE_MATCH_TOLERANCE;
+  if (totalMatchesPrimus) {
+    return {
+      valid: true,
+      baseAmount,
+      totalLumper,
+      difference: 0,
+      totalMatchesPrimus: true,
+    };
+  }
+  const difference = Math.abs(baseAmount - primusCost);
   // Flat band — pre-check only; full validation uses validateAmountWithPrimus.
   return {
     valid: difference <= LUMPER_BASE_TOLERANCE,
     baseAmount,
     totalLumper,
     difference,
+    totalMatchesPrimus: false,
   };
 }
 
