@@ -524,7 +524,7 @@
       <div class="chat-log" id="chat-log"></div>
       <div class="chat-quick-replies" id="chat-quick-replies" aria-label="Quick replies"></div>
       <div class="chat-input">
-        <textarea id="chat-input" placeholder="Example: For military facilities, add limited access and appointment delivery."></textarea>
+        <textarea id="chat-input" placeholder="Describe the rule you want…"></textarea>
         <button type="button" class="primary" id="chat-send">Send</button>
       </div>
       <div id="proposal-box" class="proposal hidden">
@@ -1059,12 +1059,7 @@
           document.getElementById("panel-" + t).classList.toggle("hidden", t !== btn.dataset.tab);
         });
         if (btn.dataset.tab === "chat" && !chatMessages.length) {
-          const welcome = "Hi — I can help you manage quote rules in plain English. " +
-            "Try things like:\n" +
-            "• \"Military bases need LAD and APD\"\n" +
-            "• \"Map jared@corehome.com to Brumis Imports\"\n" +
-            "• \"When pickup is La Mirada use zip 90670\"\n\n" +
-            "I'll propose a rule and you can say yes / sounds good / go ahead, or click Confirm.";
+          const welcome = "Ask me to set up a quote rule — I'll confirm before saving.";
           chatMessages.push({ role: "assistant", content: welcome });
           appendChat("assistant", welcome);
         }
