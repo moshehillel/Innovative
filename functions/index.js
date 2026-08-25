@@ -346,9 +346,6 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
           normalizeCarrierReference(vin)) {
         return true;
       }
-      if (inv && inv.status && inv.status.generated) {
-        return true;
-      }
     }
 
     const vendorCost = Number(booking.vendor && booking.vendor.cost || 0);
@@ -1024,11 +1021,25 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
 
   const direct = loadResolution.evaluateLoadCandidate(
       refs.loadNumber, normalizedProNumber, lastKnownLoadNumber);
-  if (direct.ok && normalizedProNumber) {
+  if (direct.ok) {
+    let directBooking = null;
+    try {
+      directBooking = await fetchPrimusBooking(direct.loadNumber);
+    } catch (_) {
+      directBooking = null;
+    }
+    if (directBooking) {
+      return {
+        aiResult: {...refs, loadNumber: direct.loadNumber},
+        gateFailed: false,
+        loadResolvedFrom: null,
+      };
+    }
+  }
+  if (normalizedProNumber) {
     const proResolved = await resolveLoadNumberFromPrimusPro(
         normalizedProNumber);
-    if (proResolved.loadNumber &&
-        normalizeLoadNumber(proResolved.loadNumber) !== direct.loadNumber) {
+    if (proResolved.loadNumber) {
       const proAccepted = loadResolution.evaluateLoadCandidate(
           proResolved.loadNumber, normalizedProNumber, lastKnownLoadNumber,
           {skipRange: true});
@@ -1051,19 +1062,11 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
     }
   }
   if (direct.ok) {
-    let directBooking = null;
-    try {
-      directBooking = await fetchPrimusBooking(direct.loadNumber);
-    } catch (_) {
-      directBooking = null;
-    }
-    if (directBooking) {
-      return {
-        aiResult: {...refs, loadNumber: direct.loadNumber},
-        gateFailed: false,
-        loadResolvedFrom: null,
-      };
-    }
+    return {
+      aiResult: {...refs, loadNumber: direct.loadNumber},
+      gateFailed: false,
+      loadResolvedFrom: null,
+    };
   }
 
   const lookupKeys = loadResolution.buildPrimusLookupKeys(refs);

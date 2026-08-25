@@ -53,6 +53,7 @@ const PRO_GARBAGE_WORDS = new Set([
   "vided", "provided", "provide", "none", "null", "na", "n/a",
   "not", "available", "pending", "attached", "invoice", "number",
   "ref", "reference", "see", "below", "tbd", "unknown",
+  "hibited", "prohibited", "ohibited",
 ]);
 
 /**
@@ -67,8 +68,9 @@ function isPlausibleCarrierPro(value) {
   if (PRO_GARBAGE_WORDS.has(compact)) return false;
   if (/^(notprovided|notavailable|seebelow|na)$/i.test(compact)) return false;
   const digits = raw.replace(/\D/g, "");
+  if (!digits.length) return false;
   if (digits.length >= 4) return true;
-  return /^[A-Z0-9-]{5,}$/i.test(raw);
+  return /^[A-Z0-9-]{5,}$/i.test(raw) && /\d/.test(raw);
 }
 
 /**
@@ -285,7 +287,7 @@ function extractLoadHintsFromEmailText(subject, body, hints) {
     String(hints.proNumberHint).trim() : "";
   const text = `${subject || ""}\n${body || ""}`;
   const proLabeled = text.match(
-      /(?:pro|beyond\s*pro)\s*[#:]?\s*([A-Z0-9-]{5,})/i);
+      /\b(?:pro|beyond\s*pro)\b\s*[#:]?\s*([A-Z0-9-]{5,})/i);
   return {
     loadNumber: null,
     proNumber: hintPro || (proLabeled ? proLabeled[1] : null),
