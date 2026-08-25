@@ -33,12 +33,32 @@ const checkNotHas = (name, arr, code) => {
 };
 
 let codes = emailAcc.extractRequestedAccessorialsFromText(
-    "Need liftgate and appointment delivery, residential.");
+    "Need liftgate and residential.");
 checkHas("liftgate unspecified → LFO", codes, "LFO");
 checkHas("liftgate unspecified → LFD", codes, "LFD");
-checkHas("appointment → APD", codes, "APD");
 checkHas("residential → RSD", codes, "RSD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Need appointment delivery.");
+checkHas("appointment → APD", codes, "APD");
 checkNotHas("appointment at dest does not add APO", codes, "APO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Lift gate needed for delivery.");
+checkHas("liftgate for delivery → LFD", codes, "LFD");
+checkNotHas("liftgate for delivery not LFO", codes, "LFO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "These need liftgates. Lift gate needed for delivery.");
+checkHas("these need liftgates + delivery → LFD", codes, "LFD");
+checkNotHas("these need liftgates + delivery not LFO", codes, "LFO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Need liftgate and appointment delivery, residential.");
+checkHas("liftgate near delivery word → LFD", codes, "LFD");
+checkNotHas("liftgate near delivery word not LFO", codes, "LFO");
+checkHas("appointment → APD (with liftgate)", codes, "APD");
+checkHas("residential with liftgate → RSD", codes, "RSD");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Dock 4. Mon-Fri 8:30am - 4:30pm. No Appointment necessary.");
@@ -49,6 +69,7 @@ codes = emailAcc.extractRequestedAccessorialsFromText(
     "no appt needed, liftgate at delivery");
 checkNotHas("no appt needed does not add APD", codes, "APD");
 checkHas("no appt needed still adds LFD", codes, "LFD");
+checkNotHas("liftgate at delivery not LFO", codes, "LFO");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "appointment not required");
@@ -115,6 +136,24 @@ const noNew = emailAcc.applyEmailRequestedAccessorials(
 check("no extra why when all already from rules",
     (noNew.appliedRules || []).some((r) => r.ruleId === "email_requested"),
     false);
+
+const refinedDelivery = emailAcc.applyEmailRequestedAccessorials(
+    {accessorials: ["LFO", "LFD"], appliedRules: []},
+    ["LFD"],
+    (c) => c.join(", "),
+    "Lift gate needed for delivery.");
+checkHas("refine delivery keeps LFD", refinedDelivery.accessorials, "LFD");
+checkNotHas("refine delivery strips LFO", refinedDelivery.accessorials, "LFO");
+
+const aiBothDelivery = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "Lift gate needed for delivery.",
+  customerRequest: {requestedAccessorials: ["LFO", "LFD"]},
+  lanes: [],
+}, {subject: "RFQ", body: "Lift gate needed for delivery."});
+checkHas("AI keeps LFD when delivery-only email",
+    aiBothDelivery.customerRequest.requestedAccessorials, "LFD");
+checkNotHas("AI LFO stripped when delivery-only",
+    aiBothDelivery.customerRequest.requestedAccessorials, "LFO");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "No liftgate needed. Dock available.");

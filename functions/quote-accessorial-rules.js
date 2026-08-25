@@ -10,6 +10,7 @@
 
 const admin = require("firebase-admin");
 const declinedAcc = require("./quote-declined-accessorials");
+const emailAcc = require("./quote-email-accessorials");
 
 const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both", "email"];
 const DEFAULT_IDENTIFY_VIA = "both";
@@ -40,6 +41,7 @@ const MANAGED_DEFAULT_RULE_IDS = new Set([
   "sender_jared_berman",
   "sender_lifeworks_picking",
   "sender_shaya_jacobowitz",
+  "liftgate_no_dock",
 ]);
 
 /**
@@ -146,9 +148,13 @@ const DEFAULT_RULES = [
         "no loading dock", "no dock",
       ],
     },
-    addAccessorials: ["LFO", "LFD"],
+    // Delivery/consignee is the default side. Pickup (LFO) only when
+    // email/instructions explicitly say liftgate at pickup/origin —
+    // see quote-email-accessorials refineLiftgateSides.
+    addAccessorials: ["LFD"],
     applyTo: "dest",
-    notes: "Special instructions mention liftgate or no dock.",
+    notes: "Special instructions mention liftgate or no dock " +
+      "(destination liftgate; pickup only if email says so).",
     autoApply: true,
     requiresConfirm: false,
   },
@@ -858,8 +864,13 @@ function applyRulesToLane(lane, rules, context = {}) {
     appliedRules: applied,
   }, declineText, context.customerDeclinedAccessorials);
 
+  // Delivery-only / pickup-only liftgate phrasing wins over a stale
+  // liftgate_no_dock that still seeds both LFO and LFD.
+  const refined = emailAcc.refineLiftgateSides(
+      stripped.accessorials, declineText);
+
   return {
-    accessorials: stripped.accessorials,
+    accessorials: refined,
     accessorialsWithData: stripped.accessorialsWithData,
     filterCarrierWarnings: filterWarnings,
     appliedRules: stripped.appliedRules,

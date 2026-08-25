@@ -791,7 +791,7 @@ async function rateLane(lane, ctx) {
     const requested = quoteEmailAcc.resolveRequestedAccessorials(
         extracted, {body: emailText, subject: extractCtx.subject});
     rulesOut = quoteEmailAcc.applyEmailRequestedAccessorials(
-        rulesOut, requested, quoteRules.formatAccessorialLabels);
+        rulesOut, requested, quoteRules.formatAccessorialLabels, emailText);
     rulesOut = quoteEmailAcc.applyDeclinedAccessorials(
         rulesOut, emailText, declinedCodes);
   }

@@ -17,16 +17,47 @@ const EXTRA_KNOWN_CODES = ["INS", "IND", "INO", "HAZ", "PFF"];
 /**
  * Origin/dest pairs: specific pickup/delivery phrasing wins over a bare
  * mention (bare "appointment" → APD, not APO+APD).
+ *
+ * Window (chars) around a liftgate mention used to detect side words like
+ * "delivery" / "pickup" when order is "needed for delivery".
  */
+const LIFTGATE_SIDE_WINDOW = 48;
+
+/**
+ * True when `sideWord` appears within LIFTGATE_SIDE_WINDOW of a liftgate /
+ * no-dock mention (either side of the match).
+ * @param {string} blob Email / instruction text.
+ * @param {RegExp} sideWordRe Side word (delivery|pickup|…).
+ * @return {boolean}
+ */
+function liftgateNearSideWord(blob, sideWordRe) {
+  const text = String(blob || "");
+  const gateRe = /\blift[\s-]*gates?\b|\bno\s+(loading\s+)?dock\b/gi;
+  let m;
+  while ((m = gateRe.exec(text)) !== null) {
+    const start = Math.max(0, m.index - LIFTGATE_SIDE_WINDOW);
+    const end = Math.min(
+        text.length, m.index + m[0].length + LIFTGATE_SIDE_WINDOW);
+    if (sideWordRe.test(text.slice(start, end))) return true;
+  }
+  return false;
+}
+
 const PAIR_PATTERNS = [
   {
     origin: "LFO",
     dest: "LFD",
+    // Bare "liftgate" with no side → both. Delivery-scoped phrasing
+    // ("needed for delivery", "liftgates" near "delivery") → LFD only.
     bothIfBare: true,
-    originRe: /\blift[\s-]*gates?\s+(at\s+)?(pickup|origin)\b/i,
     // eslint-disable-next-line max-len
-    destRe: /\blift[\s-]*gates?\s+(at\s+)?(delivery|dest(ination)?)\b/i,
+    originRe: /\blift[\s-]*gates?\s+(at\s+)?(pickup|origin)\b|\blift[\s-]*gates?\s+(needed\s+)?(for|at)\s+(pickup|origin)\b|\b(pickup|origin)\s+lift[\s-]*gates?\b/i,
+    // eslint-disable-next-line max-len
+    destRe: /\blift[\s-]*gates?\s+(at\s+)?(delivery|dest(ination)?)\b|\blift[\s-]*gates?\s+(needed\s+)?(for|at)\s+(delivery|dest(ination)?)\b|\b(delivery|dest(ination)?)\s+lift[\s-]*gates?\b/i,
     bareRe: /\blift[\s-]*gates?\b|\bno\s+(loading\s+)?dock\b/i,
+    nearOriginRe: /\b(pickup|origin)\b/i,
+    nearDestRe: /\b(delivery|dest(ination)?)\b/i,
+    useProximitySide: true,
   },
   {
     origin: "LAO",
@@ -128,9 +159,23 @@ function extractRequestedAccessorialsFromText(text) {
   const codes = [];
   const declined = new Set(declinedAcc.detectDeclinedAccessorials(blob).codes);
   for (const pair of PAIR_PATTERNS) {
-    const originHit = pair.originRe && pair.originRe.test(blob);
-    const destHit = pair.destRe && pair.destRe.test(blob);
+    let originHit = pair.originRe && pair.originRe.test(blob);
+    let destHit = pair.destRe && pair.destRe.test(blob);
     const bareHit = pair.bareRe && pair.bareRe.test(blob);
+    // "Lift gate needed for delivery" / "these need liftgates" near
+    // "delivery" → dest only (do not invent pickup liftgate).
+    if (pair.useProximitySide && bareHit && !originHit && !destHit) {
+      const nearDest = pair.nearDestRe &&
+        liftgateNearSideWord(blob, pair.nearDestRe);
+      const nearOrigin = pair.nearOriginRe &&
+        liftgateNearSideWord(blob, pair.nearOriginRe);
+      if (nearDest && !nearOrigin) destHit = true;
+      else if (nearOrigin && !nearDest) originHit = true;
+      else if (nearDest && nearOrigin) {
+        destHit = true;
+        originHit = true;
+      }
+    }
     if (originHit && !declined.has(pair.origin)) codes.push(pair.origin);
     if (destHit && !declined.has(pair.dest)) codes.push(pair.dest);
     if (!originHit && !destHit && bareHit) {
@@ -198,6 +243,43 @@ function extractedAccessorialText(extracted, opts = {}) {
 }
 
 /**
+ * Strip wrong-side liftgate codes when email/instructions scope the
+ * request to delivery-only or pickup-only.
+ * @param {Array<string>} codes Accessorial codes.
+ * @param {string} text Email / instructions blob.
+ * @return {Array<string>}
+ */
+function refineLiftgateSides(codes, text) {
+  const list = uniqueCodes(codes);
+  const blob = String(text || "");
+  if (!blob.trim()) return list;
+  const hasLfo = list.includes("LFO");
+  const hasLfd = list.includes("LFD");
+  if (!hasLfo && !hasLfd) return list;
+
+  const pair = PAIR_PATTERNS.find((p) => p.origin === "LFO");
+  let originHit = pair.originRe && pair.originRe.test(blob);
+  let destHit = pair.destRe && pair.destRe.test(blob);
+  if (!originHit && !destHit && pair.bareRe && pair.bareRe.test(blob)) {
+    const nearDest = liftgateNearSideWord(blob, pair.nearDestRe);
+    const nearOrigin = liftgateNearSideWord(blob, pair.nearOriginRe);
+    if (nearDest && !nearOrigin) destHit = true;
+    else if (nearOrigin && !nearDest) originHit = true;
+    else if (nearDest && nearOrigin) {
+      destHit = true;
+      originHit = true;
+    }
+  }
+  if (destHit && !originHit) {
+    return list.filter((c) => c !== "LFO");
+  }
+  if (originHit && !destHit) {
+    return list.filter((c) => c !== "LFD");
+  }
+  return list;
+}
+
+/**
  * Resolve requested Primus codes from AI extract + email text.
  * `wantsLimitedAccessInQuote` always maps to LAD.
  * @param {object} extracted Intake result.
@@ -219,7 +301,8 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
     ...declined.codes,
     ...persisted,
   ]));
-  const codes = uniqueCodes([...fromAi, ...fromText]);
+  const codes = refineLiftgateSides(
+      uniqueCodes([...fromAi, ...fromText]), scanText);
   if (cr.wantsLimitedAccessInQuote && !codes.includes("LAD") &&
       !ban.has("LAD")) {
     codes.push("LAD");
@@ -255,13 +338,17 @@ function attachRequestedAccessorials(extracted, opts = {}) {
  * Merge email-requested codes onto a rules result without duplicating
  * codes already added by quote rules. Adds an appliedRules row for
  * newly added codes so the dispatcher UI can show "requested in email".
+ * When `scanText` is provided, strips LFO/LFD that conflict with
+ * delivery-only or pickup-only liftgate phrasing (including stale
+ * liftgate_no_dock LFO+LFD).
  * @param {object} rulesOut applyRulesToLane result.
  * @param {Array<string>} requestedCodes From resolveRequestedAccessorials.
  * @param {function(Array<string>): string} formatLabels Label helper.
+ * @param {string} [scanText] Email / instructions for side refine.
  * @return {object}
  */
 function applyEmailRequestedAccessorials(
-    rulesOut, requestedCodes, formatLabels) {
+    rulesOut, requestedCodes, formatLabels, scanText) {
   const out = rulesOut && typeof rulesOut === "object" ? {...rulesOut} : {
     accessorials: [],
     accessorialsWithData: [],
@@ -270,7 +357,6 @@ function applyEmailRequestedAccessorials(
     requiresConfirm: false,
   };
   const requested = uniqueCodes(requestedCodes);
-  if (!requested.length) return out;
   const existing = new Set(
       (out.accessorials || []).map((c) => String(c).toUpperCase()));
   const added = [];
@@ -279,21 +365,26 @@ function applyEmailRequestedAccessorials(
     existing.add(code);
     added.push(code);
   }
-  out.accessorials = [...existing];
-  if (!added.length) return out;
-  const labels = typeof formatLabels === "function" ?
-    formatLabels(added) : added.join(", ");
-  const applied = Array.isArray(out.appliedRules) ?
-    [...out.appliedRules] : [];
-  applied.push({
-    ruleId: "email_requested",
-    name: "Requested in email",
-    notes: labels ?
-      labels + " requested in the RFQ email." :
-      "Accessorials requested in the RFQ email.",
-    matchVia: "email",
-  });
-  out.appliedRules = applied;
+  let accessorials = [...existing];
+  if (scanText) {
+    accessorials = refineLiftgateSides(accessorials, scanText);
+  }
+  out.accessorials = accessorials;
+  if (added.length) {
+    const labels = typeof formatLabels === "function" ?
+      formatLabels(added) : added.join(", ");
+    const applied = Array.isArray(out.appliedRules) ?
+      [...out.appliedRules] : [];
+    applied.push({
+      ruleId: "email_requested",
+      name: "Requested in email",
+      notes: labels ?
+        labels + " requested in the RFQ email." :
+        "Accessorials requested in the RFQ email.",
+      matchVia: "email",
+    });
+    out.appliedRules = applied;
+  }
   return out;
 }
 
@@ -310,5 +401,6 @@ module.exports = {
   resolveRequestedAccessorials,
   attachRequestedAccessorials,
   applyEmailRequestedAccessorials,
+  refineLiftgateSides,
   extractedAccessorialText,
 };
