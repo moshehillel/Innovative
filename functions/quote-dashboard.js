@@ -227,7 +227,8 @@ async function handleApplyQuoteRule(req, res) {
     const existingRules = await quoteRules.listAllRules(tenant);
     const existing = existingRules.find((r) => r.id === validated.ruleId);
     if (existing) {
-      const {id, ...existingRest} = existing;
+      const existingRest = {...existing};
+      delete existingRest.id;
       patch = {...existingRest, ...patch};
     }
     const rule = await quoteRules.upsertRule(
