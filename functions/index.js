@@ -10241,13 +10241,75 @@ async function processGmailMessage(
         });
 
         if (isPendingChargeApproval) {
-          // Do NOT start the workflow — hold for the A/B/C/D decision.
+          // Send A/B/C/D approval email, then still start Primus so carrier
+          // bill + POD upload before the workflow pauses at the charge gate.
           await sendAdditionalChargeApprovalEmail({
             invoiceId: invoiceDoc.id,
             tenant,
             aiResult,
             pending: pendingAdditionalCharge,
           });
+          await writeLog(
+              "info",
+              "workflow",
+              `Starting ${tenant.tms} workflow for paperwork upload ` +
+              `(additional charge pending approval)`,
+              {
+                messageId: messageId,
+                invoiceId: invoiceDoc.id,
+                tms: tenant.tms,
+                tenantId: tenant.tenantId,
+              },
+          );
+          try {
+            const workflowUrl = workflowUrlForTenant(tenant);
+            if (!workflowUrl) {
+              throw new Error(
+                  `No workflow endpoint for tenant ${tenant.tenantId} ` +
+                  `(tms=${tenant.tms || "none"}); refusing to default to ` +
+                  `Primus`);
+            }
+            const workflowRes = await fetch(
+                workflowUrl,
+                {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    invoiceId: invoiceDoc.id,
+                    tenantId: tenant.tenantId,
+                  }),
+                },
+            );
+            if (!workflowRes.ok) {
+              const text = await workflowRes.text();
+              await writeLog(
+                  "error",
+                  "workflow",
+                  `Failed to start ${tenant.tms} workflow ` +
+                  `(pending additional charge)`,
+                  {
+                    messageId: messageId,
+                    invoiceId: invoiceDoc.id,
+                    status: workflowRes.status,
+                    response: text,
+                  },
+              );
+            }
+          } catch (wfErr) {
+            await writeLog(
+                "error",
+                "workflow",
+                `Error starting ${tenant.tms} workflow ` +
+                `(pending additional charge)`,
+                {
+                  messageId: messageId,
+                  invoiceId: invoiceDoc.id,
+                  error: wfErr.message || String(wfErr),
+                },
+            );
+          }
         } else {
           await writeLog(
               "info",
