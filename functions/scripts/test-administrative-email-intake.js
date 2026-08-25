@@ -258,6 +258,23 @@ check("plain Zelle alert still ignored after Amfast fix",
         "You received a Zelle payment of $500",
         []));
 
+const compassSubject = "Purchase order number; Purchase Order #266265";
+const compassFrom = "notify@mg.compassfs.net <notify@mg.compassfs.net>";
+const compassPdf = [{
+  filename: "Purchase order number; Purchase Order #266265.pdf",
+  mimeType: "application/pdf",
+}];
+check("Compass FS PO subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent(compassSubject, ""));
+check("Compass FS PO filename looks like invoice",
+    adm.attachmentFilenameLooksLikeInvoice(compassPdf[0].filename));
+check("Compass FS PO email has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: compassSubject,
+      from: compassFrom,
+      attachments: compassPdf,
+    }));
+
 if (failures) {
   console.error(`\n${failures} test(s) failed`);
   process.exit(1);

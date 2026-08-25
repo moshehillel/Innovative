@@ -47,6 +47,20 @@ function looksLikeCarrierInvoiceMailbox(from) {
 }
 
 /**
+ * Compass FS factored freight invoices: subject like
+ * "Purchase order number; Purchase Order #266265" from notify@mg.compassfs.net.
+ * The PO number is the broker load; the PDF is a carrier freight bill to pay.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  if (!/compassfs\.(?:net|info)/i.test(fromL)) return false;
+  return /purchase\s+order\s*#\s*\d{5,9}/i.test(String(subject || ""));
+}
+
+/**
  * True when attachment metadata includes a PDF (not a nested .eml).
  * @param {Array<object>|null|undefined} attachments Gmail attachment meta.
  * @return {boolean}
@@ -74,6 +88,7 @@ function hasProcessablePdfAttachment(attachments) {
 function looksLikeCarrierInvoiceEmail(subject, from, body) {
   const sub = String(subject || "").trim();
   const hints = `${subject || ""} ${from || ""}`.toLowerCase();
+  if (looksLikeCompassFsPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeNumberedStatementSubject(sub)) return true;
   if (/^invoice\s+\d+\s+from\b/i.test(sub)) return true;
   if (/^(?:(?:fw|fwd):\s*)?invoice\s+#?\d+/i.test(sub)) return true;
@@ -101,6 +116,9 @@ function looksLikeStatementCoverInvoicePacketEmail(
       !hasProcessablePdfAttachment(attachments)) {
     return false;
   }
+  if (looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from)) {
+    return true;
+  }
   if (looksLikeNumberedStatementSubject(subject)) return true;
   if (looksLikeStatementInvoicePacketBody(body) &&
       /\b(?:stmt|stmd|statement)\b/i.test(
@@ -124,6 +142,11 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
   const label = sanitizePreCheckLabel(
       context.preCheckLabel || context.docType);
   if (label !== "STATEMENT" && label !== "OTHER") return false;
+
+  if (looksLikeCompassFsPurchaseOrderInvoiceEmail(
+      context.subject, context.from)) {
+    return true;
+  }
 
   const pageCount = Number(context.pageCount) || 0;
   const hints = [
@@ -227,15 +250,21 @@ function overrideStatementClassificationIfInvoicePacket(
     classification, subject, from, body, attachments) {
   const current = classification && typeof classification === "object" ?
     classification : {intent: "unknown"};
-  if (current.intent !== "statement") return current;
-  if (!looksLikeStatementCoverInvoicePacketEmail(
-      subject, from, body, attachments)) {
+  const isInvoicePacket = looksLikeStatementCoverInvoicePacketEmail(
+      subject, from, body, attachments);
+  if (!isInvoicePacket) return current;
+  if (current.intent === "carrier_invoice") return current;
+  if (current.intent !== "statement" && current.intent !== "unknown") {
     return current;
   }
+  const compass = looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from);
   return {
     ...current,
     intent: "carrier_invoice",
-    reasoning: "Numbered carrier statement packet — first page is a " +
+    confidence: current.confidence === "low" ? "medium" : current.confidence,
+    reasoning: compass ?
+      "Compass FS factored freight invoice — Purchase Order # is the load." :
+      "Numbered carrier statement packet — first page is a " +
       "statement cover; later pages are freight invoices to process.",
   };
 }
@@ -245,6 +274,7 @@ module.exports = {
   looksLikeNumberedStatementSubject,
   looksLikeStatementInvoicePacketBody,
   looksLikeCarrierInvoiceMailbox,
+  looksLikeCompassFsPurchaseOrderInvoiceEmail,
   hasProcessablePdfAttachment,
   looksLikeCarrierInvoiceEmail,
   looksLikeStatementCoverInvoicePacketEmail,

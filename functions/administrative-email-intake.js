@@ -149,6 +149,15 @@ function looksLikeInvoiceEmailContent(subject, body) {
   const content = `${subject || ""}\n${body || ""}`.toLowerCase();
   if (/^(?:fw:\s*)?invoice\s+#?\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
+  // Compass FS factored invoices: PO # in subject is the broker load.
+  if (/^purchase\s+order\s+number\s*[;:]\s*purchase\s+order\s*#\s*\d{5,9}/i
+      .test(sub)) {
+    return true;
+  }
+  if (/purchase\s+order\s*#\s*\d{5,9}/i.test(sub) &&
+      /compassfs/i.test(content)) {
+    return true;
+  }
   // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."
   if (/\be-?invoices?\b/.test(sub)) return true;
   // QuickBooks: "New payment request from X - invoice 173867"
@@ -279,7 +288,8 @@ function attachmentFilenameLooksLikeInvoice(filename) {
   if (!name) return false;
   if (/noa|notice.?of.?assignment/.test(name)) return false;
   return /invoice|inv[\s#._-]|freight[\s._-]?bill/.test(name) ||
-    /carrier[\s._-]?bill|bill[\s._-]?of[\s._-]?lading/.test(name);
+    /carrier[\s._-]?bill|bill[\s._-]?of[\s._-]?lading/.test(name) ||
+    /purchase\s+order\s*#\s*\d{5,9}/.test(name);
 }
 
 /**

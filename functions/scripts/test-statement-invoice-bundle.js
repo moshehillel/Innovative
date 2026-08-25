@@ -182,6 +182,37 @@ check("carrier_invoice intent does not short-circuit",
     }, "Statement 22568", jtsFrom, jtsBody("22568"), jtsPdf("22568")),
     false);
 
+const compassFrom = "notify@mg.compassfs.net <notify@mg.compassfs.net>";
+const compassSubject = "Purchase order number; Purchase Order #266265";
+const compassPdf = [{
+  filename: "Purchase order number; Purchase Order #266265.pdf",
+  mimeType: "application/pdf",
+}];
+check("Compass FS PO subject detected",
+    bundle.looksLikeCompassFsPurchaseOrderInvoiceEmail(
+        compassSubject, compassFrom), true);
+check("Compass FS packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        compassSubject, compassFrom, "", compassPdf), true);
+check("Compass FS 1-page STATEMENT cover → INVOICE",
+    bundle.normalizePreCheckDocType("STATEMENT", {
+      subject: compassSubject,
+      from: compassFrom,
+      filename: compassPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("Compass FS unknown classifier overridden",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "unknown", confidence: "medium",
+          reasoning: "lacks clear context"},
+        compassSubject, compassFrom, "", compassPdf).intent,
+    "carrier_invoice");
+check("Compass FS high-confidence statement not short-circuited",
+    bundle.shouldShortCircuitAsStatementOnly({
+      intent: "statement",
+      confidence: "high",
+    }, compassSubject, compassFrom, "", compassPdf), false);
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);
