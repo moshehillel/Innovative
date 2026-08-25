@@ -1584,6 +1584,10 @@ function looksLikeRuleRefinement(text) {
   if (/\b(also\s+)?(require|limit|restrict)\s+(it\s+)?to\b/.test(norm)) {
     return true;
   }
+  if (/\b(change|edit|update|modify|tweak|adjust)\s+(that|this|the)\s+rule\b/
+      .test(norm)) {
+    return true;
+  }
   return false;
 }
 
@@ -1599,6 +1603,77 @@ function findLastAppliedRuleId(messages) {
     const applied = String(m.content || "").trim()
         .match(/^\[APPLIED\]\s+(?:Saved|Deleted)\s+rule\s+"([^"]+)"/i);
     if (applied) return applied[1];
+  }
+  return null;
+}
+
+/**
+ * Rule id from a recent assistant proposal turn ([PROPOSED] or reply text).
+ * @param {Array<object>} messages Chat turns.
+ * @return {string|null}
+ */
+function findRecentProposedRuleId(messages) {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    const c = String(m.content || "").trim();
+    const proposed = c.match(/^\[PROPOSED\]\s+ruleId="([^"]+)"/i);
+    if (proposed) return proposed[1];
+    const updating = c.match(/\bUpdating\s+\*\*([a-z0-9_]+)\*\*/i);
+    if (updating) return updating[1];
+    const applied = c.match(/^\[APPLIED\]\s+Saved rule\s+"([^"]+)"/i);
+    if (applied) return applied[1];
+    const zipFill = c.match(/\b(zip_fill_[a-z0-9_]+)\b/i);
+    if (zipFill && /\b(rule|zip|update|set|saved|apply)\b/i.test(c)) {
+      return zipFill[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize lastAppliedRule / lastProposedRule payload from the UI.
+ * @param {object|null} obj Rule context from client.
+ * @return {object|null}
+ */
+function normalizeLastAppliedRule(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const ruleId = obj.ruleId || obj.id;
+  if (!ruleId) return null;
+  return {
+    ruleId: String(ruleId),
+    ruleKind: obj.ruleKind ? String(obj.ruleKind) : null,
+    summary: obj.summary ? String(obj.summary) : "",
+    action: obj.action ? String(obj.action) : null,
+    proposal: obj.proposal && typeof obj.proposal === "object" ?
+      obj.proposal : null,
+  };
+}
+
+/**
+ * Resolve which rule the user is referring to when refining.
+ * @param {object} ctx lastAppliedRule, lastProposedRule, referencedRuleId.
+ * @param {Array<object>} messages Full chat thread.
+ * @param {object|null} pending Pending proposal from UI.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {string|null}
+ */
+function resolveReferencedRuleId(ctx, messages, pending, existingRules) {
+  if (pending && pending.ruleId) return String(pending.ruleId);
+  const applied = normalizeLastAppliedRule(ctx && ctx.lastAppliedRule);
+  if (applied && applied.ruleId) return applied.ruleId;
+  const proposed = normalizeLastAppliedRule(ctx && ctx.lastProposedRule);
+  if (proposed && proposed.ruleId) return proposed.ruleId;
+  if (ctx && ctx.referencedRuleId) return String(ctx.referencedRuleId);
+  if (ctx && ctx.lastAppliedRuleId) return String(ctx.lastAppliedRuleId);
+  const fromChat = findLastAppliedRuleId(messages);
+  if (fromChat) return fromChat;
+  const recentProp = findRecentProposedRuleId(messages);
+  if (recentProp) return recentProp;
+  const topic = inferZipFillTopic(messages);
+  if (topic && topic.city) {
+    const live = findExistingZipFillRule(existingRules || [], topic);
+    if (live) return live.id;
   }
   return null;
 }
@@ -1749,23 +1824,36 @@ function mergeMatchFields(base, extra) {
 }
 
 /**
- * Rule id for a refinement turn (pending, [APPLIED], or zip-fill context).
+ * Rule id for a refinement turn (pending, lastAppliedRule, or chat context).
  * @param {Array<object>} messages Chat turns.
  * @param {Array<object>} existingRules Live rules.
  * @param {object|null} pending Pending proposal.
+ * @param {object} ruleContext Client rule pointers.
  * @return {string|null}
  */
-function findRuleIdForRefinement(messages, existingRules, pending, lastAppliedRuleId) {
-  if (pending && pending.ruleId) return String(pending.ruleId);
-  if (lastAppliedRuleId) return String(lastAppliedRuleId);
-  const applied = findLastAppliedRuleId(messages);
-  if (applied) return applied;
-  const topic = inferZipFillTopic(messages);
-  if (topic && topic.city) {
-    const live = findExistingZipFillRule(existingRules || [], topic);
-    if (live) return live.id;
-  }
-  return null;
+function findRuleIdForRefinement(messages, existingRules, pending, ruleContext) {
+  return resolveReferencedRuleId(
+      ruleContext || {}, messages, pending, existingRules);
+}
+
+/**
+ * Live rule doc for refinement — falls back to lastAppliedRule proposal.
+ * @param {string} ruleId Rule id.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object} ruleContext Client rule pointers.
+ * @return {object|null}
+ */
+function findRuleDocForRefinement(ruleId, existingRules, ruleContext) {
+  const live = (existingRules || []).find((r) => r.id === ruleId);
+  if (live) return live;
+  const applied = normalizeLastAppliedRule(
+      ruleContext && ruleContext.lastAppliedRule);
+  const proposed = normalizeLastAppliedRule(
+      ruleContext && ruleContext.lastProposedRule);
+  const snap = (applied && applied.ruleId === ruleId && applied) ||
+    (proposed && proposed.ruleId === ruleId && proposed) || null;
+  if (!snap || !snap.proposal || !snap.proposal.patch) return null;
+  return {id: ruleId, ...snap.proposal.patch};
 }
 
 /**
@@ -1877,13 +1965,13 @@ function buildZipFillRefinementProposal(live, conditions) {
  * @param {object|null} [pending] Pending proposal from UI.
  * @return {object|null}
  */
-function buildRuleRefinementProposal(messages, existingRules, pending, lastAppliedRuleId) {
+function buildRuleRefinementProposal(messages, existingRules, pending, ruleContext) {
   const last = lastUserTurn(messages);
   const lastText = last ? String(last.content || "") : "";
   if (!looksLikeRuleRefinement(lastText)) return null;
 
   const ruleId = findRuleIdForRefinement(
-      messages, existingRules || [], pending, lastAppliedRuleId);
+      messages, existingRules || [], pending, ruleContext);
   if (!ruleId) {
     return {
       reply: "Got it — which rule should I update? Repeat the rule " +
@@ -1895,7 +1983,8 @@ function buildRuleRefinementProposal(messages, existingRules, pending, lastAppli
     };
   }
 
-  const live = (existingRules || []).find((r) => r.id === ruleId);
+  const live = findRuleDocForRefinement(
+      ruleId, existingRules || [], ruleContext || {});
   if (!live) return null;
 
   let conditions = parseZipFillExtraConditions(lastText, existingRules || []);
@@ -2538,14 +2627,23 @@ async function runQuoteRulesChatTurn(opts) {
   const finish = (r) => polishChatResult(r, chatTurns);
   const pending = opts.pendingProposal && typeof opts.pendingProposal === "object" ?
     opts.pendingProposal : null;
-  const lastAppliedRuleId = opts.lastAppliedRuleId ?
-    String(opts.lastAppliedRuleId) : findLastAppliedRuleId(chatTurns);
+  const ruleContext = {
+    lastAppliedRule: normalizeLastAppliedRule(opts.lastAppliedRule),
+    lastProposedRule: normalizeLastAppliedRule(opts.lastProposedRule),
+    lastAppliedRuleId: opts.lastAppliedRuleId ?
+      String(opts.lastAppliedRuleId) : null,
+    referencedRuleId: opts.referencedRuleId ?
+      String(opts.referencedRuleId) :
+      (normalizeLastAppliedRule(opts.lastAppliedRule) || {}).ruleId ||
+      (normalizeLastAppliedRule(opts.lastProposedRule) || {}).ruleId ||
+      findLastAppliedRuleId(chatTurns),
+  };
   const last = lastUserTurn(chatTurns);
   const lastText = last ? String(last.content || "") : "";
 
   if (pending && lastText) {
     const refinePending = buildRuleRefinementProposal(
-        chatTurns, existingRules, pending, lastAppliedRuleId);
+        chatTurns, existingRules, pending, ruleContext);
     if (refinePending) return finish(refinePending);
     if (parseNaturalConfirmation(lastText, {pendingProposal: true})) {
       return finish({
@@ -2584,7 +2682,7 @@ async function runQuoteRulesChatTurn(opts) {
   }
 
   const refineOut = buildRuleRefinementProposal(
-      chatTurns, existingRules, null, lastAppliedRuleId);
+      chatTurns, existingRules, null, ruleContext);
   if (refineOut) return finish(refineOut);
 
   // Obvious delete / military APD+LAD updates skip the model so a leftover
@@ -3128,6 +3226,9 @@ function validateRuleProposal(proposal) {
 module.exports = {
   runQuoteRulesChatTurn,
   resolveChatTurns,
+  resolveReferencedRuleId,
+  findRecentProposedRuleId,
+  normalizeLastAppliedRule,
   validateRuleProposal,
   extractPatch,
   detectCreateIdentifyGate,

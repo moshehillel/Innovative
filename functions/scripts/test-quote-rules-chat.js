@@ -103,6 +103,45 @@ checkTrue("resolveChatTurns accepts history alias",
       history: [{role: "user", content: "hello"}],
     }).length === 1);
 
+check("lastAppliedRule resolves refinement target",
+    chat.resolveReferencedRuleId(
+        {lastAppliedRule: {ruleId: "zip_fill_la_mirada_stg", ruleKind: "zip_fill"}},
+        [],
+        null,
+        []),
+    "zip_fill_la_mirada_stg");
+
+check("lastProposedRule used when no applied yet",
+    chat.resolveReferencedRuleId(
+        {lastProposedRule: {ruleId: "zip_fill_la_mirada_origin"}},
+        [],
+        null,
+        []),
+    "zip_fill_la_mirada_origin");
+
+check("findRecentProposedRuleId from PROPOSED marker",
+    chat.findRecentProposedRuleId([
+      {role: "assistant", content: "[PROPOSED] ruleId=\"zip_fill_la_mirada_stg\" action=\"propose_create_rule\" kind=\"zip_fill\""},
+    ]),
+    "zip_fill_la_mirada_stg");
+
+const refineViaAppliedObj = chat.buildRuleRefinementProposal(
+    [{role: "user", content: "yes, but only when the customer is Brumis Imports Inc"}],
+    [{
+      id: "zip_fill_la_mirada_stg",
+      ruleKind: "zip_fill",
+      applyTo: "origin",
+      fillZipCode: "90670",
+      match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+    }],
+    null,
+    {lastAppliedRule: {ruleId: "zip_fill_la_mirada_stg", ruleKind: "zip_fill"}},
+);
+check("refine via lastAppliedRule object",
+    refineViaAppliedObj && refineViaAppliedObj.proposal &&
+    refineViaAppliedObj.proposal.ruleId,
+    "zip_fill_la_mirada_stg");
+
 checkTrue("delivery appointment → APD",
     chat.parseAccessorialsAnswer("also delivery appointment").includes("APD"));
 checkTrue("appointment delivery → APD",

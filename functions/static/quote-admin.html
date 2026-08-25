@@ -579,7 +579,8 @@
     const API = "https://us-central1-tai-invoice-automation.cloudfunctions.net";
     let chatMessages = [];
     let pendingProposal = null;
-    let lastAppliedRuleId = null;
+    let lastAppliedRule = null;
+    let lastProposedRule = null;
     let pendingQuickReplies = [];
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
@@ -1052,6 +1053,36 @@
       return parts.join("<br>");
     }
 
+    function summarizeProposalPlain(res) {
+      const html = summarizeProposal(res);
+      return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    function recordProposedRule(res) {
+      if (!res || !res.proposal) {
+        lastProposedRule = null;
+        return;
+      }
+      const proposal = res.proposal;
+      const ruleId = proposal.ruleId || proposal.deleteRuleId || null;
+      const patch = (proposal.patch && typeof proposal.patch === "object")
+        ? proposal.patch
+        : {};
+      lastProposedRule = {
+        ruleId,
+        ruleKind: patch.ruleKind || null,
+        summary: summarizeProposalPlain(res),
+        action: res.action || null,
+        proposal: pendingProposal,
+      };
+      if (ruleId) {
+        chatMessages.push({
+          role: "assistant",
+          content: `[PROPOSED] ruleId="${ruleId}" action="${String(res.action || "")}" kind="${String(patch.ruleKind || "")}"`,
+        });
+      }
+    }
+
     document.querySelectorAll(".tabs button").forEach(btn => {
       btn.addEventListener("click", () => {
         document.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
@@ -1243,12 +1274,19 @@
     }
 
     function buildRulesChatPayload() {
+      const referencedRuleId = (lastAppliedRule && lastAppliedRule.ruleId) ||
+        (lastProposedRule && lastProposedRule.ruleId) ||
+        (pendingProposal && pendingProposal.ruleId) ||
+        null;
       return {
         tenantId: TENANT_ID,
         messages: chatMessages,
         history: chatMessages,
         pendingProposal,
-        lastAppliedRuleId,
+        lastAppliedRule,
+        lastProposedRule,
+        referencedRuleId,
+        lastAppliedRuleId: lastAppliedRule && lastAppliedRule.ruleId,
       };
     }
 
@@ -1298,7 +1336,22 @@
           : `Applied: saved "${ruleId}". Refresh the Rules list to see the update.`;
         appendChat("assistant", okMsg);
         chatMessages.push({ role: "assistant", content: applied });
-        lastAppliedRuleId = wasDelete ? null : (ruleId || null);
+        if (!wasDelete && ruleId) {
+          const patch = pendingProposal.patch || {};
+          lastAppliedRule = {
+            ruleId,
+            ruleKind: patch.ruleKind || (res.rule && res.rule.ruleKind) || null,
+            summary: summarizeProposalPlain({
+              action: pendingProposal.action,
+              proposal: pendingProposal,
+            }),
+            action: pendingProposal.action,
+            proposal: pendingProposal,
+          };
+          lastProposedRule = null;
+        } else {
+          lastAppliedRule = null;
+        }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
         await loadRules();
@@ -1441,6 +1494,7 @@
               : (ruleId ? [ruleId] : []),
             patch,
           };
+          recordProposedRule(res);
           document.getElementById("proposal-summary").innerHTML = summarizeProposal(res);
           document.getElementById("proposal-json").textContent = JSON.stringify(res, null, 2);
           document.getElementById("proposal-box").classList.remove("hidden");
@@ -1476,6 +1530,7 @@
     document.getElementById("dismiss-proposal").addEventListener("click", () => {
       document.getElementById("proposal-box").classList.add("hidden");
       pendingProposal = null;
+      lastProposedRule = null;
       clearQuickReplies();
     });
 

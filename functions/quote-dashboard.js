@@ -322,7 +322,13 @@ async function handleQuoteRulesChat(req, res) {
       history: chatTurns,
       existingRules,
       pendingProposal: body.pendingProposal || null,
-      lastAppliedRuleId: body.lastAppliedRuleId || null,
+      lastAppliedRule: body.lastAppliedRule || null,
+      lastProposedRule: body.lastProposedRule || null,
+      lastAppliedRuleId: body.lastAppliedRuleId ||
+        (body.lastAppliedRule && body.lastAppliedRule.ruleId) || null,
+      referencedRuleId: body.referencedRuleId ||
+        (body.lastAppliedRule && body.lastAppliedRule.ruleId) ||
+        (body.lastProposedRule && body.lastProposedRule.ruleId) || null,
     });
     // Backfill name/match on update proposals so Confirm never fails
     // with "Proposal needs name or match criteria".
