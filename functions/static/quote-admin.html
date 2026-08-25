@@ -581,6 +581,45 @@
     let pendingProposal = null;
     let lastAppliedRule = null;
     let lastProposedRule = null;
+    const CHAT_STATE_KEY = "quoteAdminChat:" + TENANT_ID;
+
+    function isInternalChatMarker(text) {
+      const c = String(text || "").trim();
+      return /^\[(APPLIED|PROPOSED)\]/i.test(c);
+    }
+
+    function saveChatState() {
+      try {
+        sessionStorage.setItem(CHAT_STATE_KEY, JSON.stringify({
+          chatMessages,
+          lastAppliedRule,
+          lastProposedRule,
+        }));
+      } catch (e) { /* quota / private mode */ }
+    }
+
+    function renderChatLogFromState() {
+      const log = document.getElementById("chat-log");
+      if (!log) return;
+      log.innerHTML = "";
+      for (const m of chatMessages) {
+        if (!m || !m.content || isInternalChatMarker(m.content)) continue;
+        appendChat(m.role || "assistant", m.content);
+      }
+    }
+
+    function restoreChatState() {
+      try {
+        const raw = sessionStorage.getItem(CHAT_STATE_KEY);
+        if (!raw) return;
+        const st = JSON.parse(raw);
+        if (!Array.isArray(st.chatMessages) || !st.chatMessages.length) return;
+        chatMessages = st.chatMessages;
+        lastAppliedRule = st.lastAppliedRule || null;
+        lastProposedRule = st.lastProposedRule || null;
+        renderChatLogFromState();
+      } catch (e) { /* ignore corrupt storage */ }
+    }
     let pendingQuickReplies = [];
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
@@ -1081,6 +1120,7 @@
           content: `[PROPOSED] ruleId="${ruleId}" action="${String(res.action || "")}" kind="${String(patch.ruleKind || "")}"`,
         });
       }
+      saveChatState();
     }
 
     document.querySelectorAll(".tabs button").forEach(btn => {
@@ -1094,6 +1134,7 @@
           const welcome = "Ask me to set up a quote rule — I'll confirm before saving.";
           chatMessages.push({ role: "assistant", content: welcome });
           appendChat("assistant", welcome);
+          saveChatState();
         }
       });
     });
@@ -1355,12 +1396,14 @@
         }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
+        saveChatState();
         await loadRules();
       } catch (e) {
         showChatThinking(false);
         const errMsg = "Failed: " + e.message;
         appendChat("assistant", errMsg);
         chatMessages.push({ role: "assistant", content: errMsg });
+        saveChatState();
       } finally {
         showChatThinking(false);
         if (confirmBtn) confirmBtn.disabled = false;
@@ -1400,10 +1443,12 @@
           const msg = "Oh sorry — I'll drop that proposal. What should the rule do instead?";
           chatMessages.push({ role: "assistant", content: msg });
           appendChat("assistant", msg);
+          saveChatState();
           return;
         }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
+        saveChatState();
         // Fall through — send correction to the assistant to rework.
       }
       if (!pendingProposal && isNaturalConfirm(text, false)) {
@@ -1414,6 +1459,7 @@
         const tip = "Nothing pending right now — tell me what rule you'd like to add or change, and I'll propose it for you to confirm.";
         chatMessages.push({ role: "assistant", content: tip });
         appendChat("assistant", tip);
+        saveChatState();
         return;
       }
 
@@ -1504,9 +1550,11 @@
         if (Array.isArray(res.activeRuleIds)) {
           await loadRules();
         }
+        saveChatState();
       } catch (e) {
         showChatThinking(false);
         appendChat("assistant", "Error: " + e.message);
+        saveChatState();
       }
       showChatThinking(false);
       sendBtn.disabled = false;
@@ -1533,6 +1581,7 @@
       pendingProposal = null;
       lastProposedRule = null;
       clearQuickReplies();
+      saveChatState();
     });
 
     document.getElementById("run-test").addEventListener("click", async () => {
@@ -1564,6 +1613,7 @@
       }
     });
 
+    restoreChatState();
     loadRules();
   </script>
 </body>
