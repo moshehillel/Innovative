@@ -194,6 +194,23 @@ check("sell rate keeps whole billTo",
 check("customer rateSource ceils fractional",
     rateShop.computeSellRate(400.01, {rateSource: "customer"}), 401);
 
+const slim = rateShop.normalizeRateRow({
+  id: "Rabc123",
+  name: "Roadrunner J&I",
+  SCAC: "RDFS",
+  total: 3033.23,
+  transitDays: 5,
+  quoteNumber: "103785203",
+  billTo: {total: 3397.22, extra: "drop-me"},
+  rateRemarks: ["Charges Grocery fee for Walmart $9 per 100 lbs, min $60."],
+  hugeNested: {x: 1},
+});
+check("slim keeps id alias", slim.id, "Rabc123");
+check("slim keeps rateId", slim.rateId, "Rabc123");
+check("slim drops nested junk", slim.hugeNested, undefined);
+check("slim billTo total only",
+    JSON.stringify(slim.billTo), "{\"total\":3397.22}");
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

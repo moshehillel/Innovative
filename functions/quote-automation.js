@@ -281,7 +281,8 @@ function assertSelectedCustomerRates(lanes) {
     for (const opt of selected) {
       const rate = quoteOutput.effectiveCustomerRate(opt);
       if (!(Number(rate) > 0)) {
-        const name = opt.name || opt.SCAC || opt.id || "rate";
+        const name = opt.name || opt.SCAC ||
+          quoteOutput.optionRateId(opt) || "rate";
         throw new Error(
             `Customer rate required for ${name} ` +
             `(lane ${lane.label || lane.laneKey}). ` +
@@ -533,8 +534,8 @@ async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
 
   for (const lane of lanes) {
     for (const opt of lane.options) {
-      const rateId = String(opt.id);
-      if (!(lane.selectedRateIds || []).includes(rateId)) continue;
+      const rateId = quoteOutput.optionRateId(opt);
+      if (!rateId || !(lane.selectedRateIds || []).includes(rateId)) continue;
 
       // Reuse prior successful Primus save when present.
       if (opt.costQuoteId && (opt.quoteNumber || opt.savedQuoteNumber)) {
@@ -598,7 +599,7 @@ async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
         .filter((id) => okIds.has(String(id)));
     lane.selectedRateId = lane.selectedRateIds[0] || null;
     lane.selectedOptions = lane.options.filter((o) =>
-      lane.selectedRateIds.includes(String(o.id)));
+      lane.selectedRateIds.includes(quoteOutput.optionRateId(o)));
     lane.selectedOption = lane.selectedOptions[0] || null;
   }
 
@@ -1249,7 +1250,7 @@ function serializeInboxQuote(doc, data) {
         notes: r.notes || null,
       })),
       topOptions: (lane.options || []).slice(0, 5).map((o) => ({
-        rateId: o.id,
+        rateId: quoteOutput.optionRateId(o),
         name: o.name,
         SCAC: o.SCAC,
         sellRate: o.sellRate != null ? o.sellRate : o.total,
@@ -1401,12 +1402,12 @@ async function saveLaneSelections(tenant, quoteId, selections) {
     if (!byLane.has(lane.laneKey)) return lane;
     const {rateIds, customerPrices} = byLane.get(lane.laneKey);
     const options = (lane.options || []).map((o) => {
-      const key = String(o.id);
-      if (!customerPrices.has(key)) return o;
+      const key = quoteOutput.optionRateId(o);
+      if (!key || !customerPrices.has(key)) return o;
       return {...o, customerPrice: customerPrices.get(key)};
     });
     const selectedOptions = options.filter((o) =>
-      rateIds.includes(String(o.id)));
+      rateIds.includes(quoteOutput.optionRateId(o)));
     return {
       ...lane,
       options,
@@ -1734,7 +1735,7 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
     selectedRateIds: lane.selectedRateIds ||
       (lane.selectedRateId ? [lane.selectedRateId] : []),
     options: (lane.selectedOptions || []).map((o) => ({
-      rateId: o.id,
+      rateId: quoteOutput.optionRateId(o),
       name: o.name,
       sellRate: o.sellRate,
       customerPrice: quoteOutput.effectiveCustomerRate(o),

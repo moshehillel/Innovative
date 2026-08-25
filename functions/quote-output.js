@@ -274,24 +274,26 @@ function buildAccessorialsIncludedSection(lanes) {
 /**
  * Customer-facing sell amount: dispatcher override, else margin sellRate.
  * Always rounded UP to the next whole dollar.
+ * Rejects implausible overrides (e.g. sibling sellRate leaked via bad rateId).
  * @param {object} opt Rate option.
  * @return {number|null}
  */
 function effectiveCustomerRate(opt) {
   if (!opt || typeof opt !== "object") return null;
-  const candidates = [
-    opt.customerPrice,
-    opt.sellRate,
-    opt.total,
-    opt.cost,
-    opt.customerRate,
-  ];
-  for (const value of candidates) {
-    if (value == null || value === "") continue;
-    const whole = ceilWholeDollar(value);
-    if (whole != null) return whole;
+  const sell = ceilWholeDollar(opt.sellRate);
+  const cost = ceilWholeDollar(
+      opt.total != null ? opt.total : opt.cost);
+  const override = ceilWholeDollar(opt.customerPrice);
+  if (override != null) {
+    const anchor = sell != null ? sell : cost;
+    if (anchor == null ||
+        (override >= anchor * 0.5 && override <= anchor * 2.5)) {
+      return override;
+    }
   }
-  return null;
+  if (sell != null) return sell;
+  if (cost != null) return cost;
+  return ceilWholeDollar(opt.customerRate);
 }
 
 /**
@@ -420,6 +422,18 @@ function pricingFormatter(style) {
 }
 
 /**
+ * Primus rate id on a stored option (slim rows use rateId; legacy used id).
+ * @param {object} opt Rate option.
+ * @return {string|null}
+ */
+function optionRateId(opt) {
+  if (!opt || typeof opt !== "object") return null;
+  if (opt.id != null && opt.id !== "") return String(opt.id);
+  if (opt.rateId != null && opt.rateId !== "") return String(opt.rateId);
+  return null;
+}
+
+/**
  * Resolves selected options for a lane (multi-select).
  * @param {object} lane Lane.
  * @return {Array<object>}
@@ -432,7 +446,10 @@ function resolveSelectedOptions(lane) {
     lane.selectedRateIds.map(String) :
     (lane.selectedRateId ? [String(lane.selectedRateId)] : []);
   if (!ids.length) return [];
-  return (lane.options || []).filter((o) => ids.includes(String(o.id)));
+  return (lane.options || []).filter((o) => {
+    const id = optionRateId(o);
+    return id != null && ids.includes(id);
+  });
 }
 
 /**
@@ -637,7 +654,7 @@ function serializeForDispatcherPage(quote) {
           warningText.slice(0, 240) : null;
         const quoteNumber = o.quoteNumber || o.savedQuoteNumber || null;
         return {
-          rateId: o.id,
+          rateId: optionRateId(o),
           name: o.name,
           SCAC: o.SCAC,
           cost: o.total != null ? o.total : o.cost,
@@ -663,6 +680,7 @@ module.exports = {
   generateBatchQuoteId,
   cleanCarrierNote,
   ceilWholeDollar,
+  optionRateId,
   buildCustomerDraftText,
   buildCustomerDraftHtml,
   buildCustomerEmailFromSelections,

@@ -109,7 +109,11 @@ function normalizeRateRow(r) {
   const billTo = r.billTo && typeof r.billTo === "object" ? {
     total: r.billTo.total != null ? r.billTo.total : null,
   } : null;
+  // Keep both id and rateId — dispatcher serialize / selections key on o.id.
+  const rateId = r.rateId != null ? r.rateId :
+    (r.id != null ? r.id : null);
   return {
+    id: rateId,
     name: r.name || r.carrierName || null,
     SCAC: r.SCAC || r.scac || null,
     total: r.total != null ? r.total : null,
@@ -118,7 +122,7 @@ function normalizeRateRow(r) {
     mode: r.mode || null,
     serviceType: r.serviceType || null,
     quoteNumber: r.quoteNumber || r.accountNumber || null,
-    rateId: r.rateId || r.id || null,
+    rateId,
     vendorId: r.vendorId || null,
     billTo,
     warnings: String(warnings || "").slice(0, 500),

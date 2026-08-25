@@ -1129,19 +1129,37 @@
       el.classList.remove("hidden");
     }
 
+    function optionRateId(opt) {
+      if (!opt) return "";
+      const id = opt.rateId != null && opt.rateId !== "" ? opt.rateId :
+        (opt.id != null && opt.id !== "" ? opt.id : "");
+      const s = String(id);
+      return (!s || s === "undefined" || s === "null") ? "" : s;
+    }
+
     function defaultCustomerPrice(opt) {
       function ceilDollar(n) {
         const v = Number(n);
         if (!isFinite(v) || v <= 0) return "";
         return Math.ceil(v);
       }
+      // Prefer suggested sell. Only honor a stored override when it is
+      // near sell/cost — never a leaked sibling sellRate / ZIP / id.
+      const sell = ceilDollar(opt && opt.sellRate);
+      const cost = ceilDollar(opt && (opt.cost != null ? opt.cost : opt.total));
       if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
         const override = ceilDollar(opt.customerPrice);
-        if (override !== "") return override;
+        if (override !== "") {
+          const o = Number(override);
+          const anchor = sell !== "" ? Number(sell) :
+            (cost !== "" ? Number(cost) : null);
+          if (anchor == null || (o >= anchor * 0.5 && o <= anchor * 2.5)) {
+            return override;
+          }
+        }
       }
-      const sell = ceilDollar(opt && opt.sellRate);
       if (sell !== "") return sell;
-      return ceilDollar(opt && (opt.cost != null ? opt.cost : opt.total));
+      return cost;
     }
 
     function collectSelections() {
@@ -1151,7 +1169,8 @@
         const prices = {};
         const byLane = customerPrices[laneKey] || {};
         (lane.options || []).forEach((opt) => {
-          const rateId = String(opt.rateId);
+          const rateId = optionRateId(opt);
+          if (!rateId) return;
           const raw = byLane[rateId];
           const n = raw != null && raw !== "" ? Number(raw) :
             Number(defaultCustomerPrice(opt));
@@ -1172,7 +1191,7 @@
         const byLane = customerPrices[lane.laneKey] || {};
         rateIds.forEach((rateId) => {
           const opt = (lane.options || [])
-              .find((o) => String(o.rateId) === String(rateId));
+              .find((o) => optionRateId(o) === String(rateId));
           const raw = byLane[rateId];
           const n = raw != null && raw !== "" ? Number(raw) :
             Number(defaultCustomerPrice(opt));
@@ -1362,7 +1381,9 @@
         laneAccessorials[lane.laneKey] = (lane.accessorials || []).slice();
         const prices = {};
         (lane.options || []).forEach((opt) => {
-          prices[String(opt.rateId)] = defaultCustomerPrice(opt);
+          const rateId = optionRateId(opt);
+          if (!rateId) return;
+          prices[rateId] = defaultCustomerPrice(opt);
         });
         customerPrices[lane.laneKey] = prices;
       });
@@ -2271,9 +2292,9 @@
           optsHtml += "<div class='warn'>" + esc(w) + "</div>";
         });
         (lane.options || []).forEach((opt) => {
-          const isChecked = selected.has(String(opt.rateId));
-          const rateId = String(opt.rateId);
-          const custVal = customerPrices[lane.laneKey] &&
+          const rateId = optionRateId(opt);
+          const isChecked = rateId ? selected.has(rateId) : false;
+          const custVal = rateId && customerPrices[lane.laneKey] &&
             customerPrices[lane.laneKey][rateId] != null ?
             customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
           const custStr = custVal === "" || custVal == null ? "" :
@@ -2283,7 +2304,7 @@
           const showSuggested = isFinite(sellHint) &&
             Number(custVal) !== Math.ceil(sellHint);
           optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
-            <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(opt.rateId)}"${isChecked ? " checked" : ""}>
+            <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(rateId)}"${isChecked ? " checked" : ""}>
             <div>
               <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
               <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
@@ -2293,7 +2314,7 @@
                   <input type="number" min="1" step="1"
                     data-customer-rate="1"
                     data-lane="${esc(lane.laneKey)}"
-                    data-rate="${esc(opt.rateId)}"
+                    data-rate="${esc(rateId)}"
                     value="${esc(custStr)}">
                 </label>
                 ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
