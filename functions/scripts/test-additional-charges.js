@@ -133,8 +133,57 @@ for (const opt of ["a", "b", "c", "d"]) {
       true);
 }
 check("subject has load", email.subject.includes("264172"), true);
+check("subject uses ASCII hyphen (no em dash)",
+    !email.subject.includes("\u2014") && email.subject.includes(" - "), true);
+check("button A label mentions auto-email",
+    email.html.includes("auto-email customer"), true);
+check("button B label mentions updated rate / dispatcher",
+    email.html.includes("enter updated rate") &&
+    email.html.includes("dispatcher notifies customer"), true);
 
-// 4. Dispute draft
+// 3b. Option A amount parsing
+const badA = ac.parseCustomerChargeAmountFromRequest({});
+check("option A missing amount fails", badA.ok, false);
+const zeroA = ac.parseCustomerChargeAmountFromRequest({
+  customerChargeAmount: "0",
+});
+check("option A zero amount fails", zeroA.ok, false);
+const okA = ac.parseCustomerChargeAmountFromRequest({
+  customerChargeAmount: "125.5",
+});
+check("option A amount parses", okA.ok && okA.amount === 125.5, true);
+
+// 3c. Option B dispatcher ready template
+const reminder = ac.buildDispatcherNotifyReminderEmail({
+  dispatcherName: "Sam",
+  loadNumber: "264172",
+  carrierName: "Central Transport",
+  customerName: "Miworld",
+  charges: [{label: "Reweigh Fee", amount: 120}],
+  chargesTotal: 120,
+  customerRate: 545,
+  customerBillLines: [{name: "Reweigh Fee", amount: 120}],
+});
+check("dispatcher reminder has ready template",
+    reminder.html.includes("Ready-to-send customer email"), true);
+check("dispatcher reminder has updated rate",
+    reminder.html.includes("$665.00"), true);
+check("dispatcher reminder subject ASCII",
+    !reminder.subject.includes("\u2014") &&
+    reminder.subject.includes(" - "), true);
+const forward = ac.buildDispatcherCustomerNotifyTemplate({
+  loadNumber: "264172",
+  customerName: "Miworld",
+  carrierName: "Central Transport",
+  chargesTotal: 120,
+  customerRate: 545,
+  customerBillLines: [{name: "Reweigh Fee", amount: 120}],
+  newCustomerRate: 665,
+});
+check("forward template mentions load",
+    forward.html.includes("264172"), true);
+check("forward template mentions new rate",
+    forward.html.includes("$665.00"), true);
 const dispute = ac.buildDisputeEmailDraft({
   loadNumber: "264172",
   carrierName: "Central Transport",

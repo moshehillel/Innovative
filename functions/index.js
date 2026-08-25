@@ -2650,7 +2650,7 @@ function buildEmailActionConfirmPage(opts) {
     `${escapeHtml(opts.confirmLabel || "Confirm")}</button>` +
     `</form>` +
     `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
-    `If you did not request this, close this page — nothing has been ` +
+    `If you did not request this, close this page - nothing has been ` +
     `changed yet.</p></body></html>`;
 }
 
@@ -2713,9 +2713,10 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
 /**
  * Handles the A/B/C/D decision buttons from the additional-charge approval
  * email:
- *   a — pay carrier + bill customer; auto-email the customer contact.
- *   b — pay carrier + bill customer; dispatcher notifies the customer
- *       (reminder email / task sent to the dispatcher).
+ *   a — pay carrier + bill customer (enter customer charge amount;
+ *       auto-email the customer contact).
+ *   b — pay carrier + bill customer (enter accessorial amounts / updated
+ *       rate; dispatcher gets a ready customer-notification template).
  *   c — pay carrier only; customer rate unchanged.
  *   d — not approved; dispute draft generated for manual submission.
  */
@@ -2790,10 +2791,11 @@ async function handleAdditionalChargeAction(req, res) {
     }
 
     const optionLabels = {
-      a: "A — Pay carrier + bill customer (auto-email customer)",
-      b: "B — Pay carrier + bill customer (dispatcher notifies customer)",
-      c: "C — Pay carrier only (customer rate unchanged)",
-      d: "D — Not approved (dispute with carrier)",
+      a: "A - Pay carrier + bill customer (auto-email customer)",
+      b: "B - Pay carrier + bill customer (enter updated rate; " +
+        "dispatcher notifies customer)",
+      c: "C - Pay carrier only (customer rate unchanged)",
+      d: "D - Not approved (dispute with carrier)",
     };
 
     if (req.method !== "POST") {
@@ -2814,6 +2816,39 @@ async function handleAdditionalChargeAction(req, res) {
           sig: String(sig),
         },
       };
+      if (option === "a") {
+        let bookingForRate = null;
+        try {
+          bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
+        } catch (_) {
+          // Best-effort default for the amount field.
+        }
+        const currentRate = await resolveCurrentCustomerRate(
+            invoice, bookingForRate);
+        const defaultCharge = Number(charge.amount) || 0;
+        const rateNote = currentRate > 0 ?
+          ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
+        confirmOpts.title = "Confirm option A";
+        confirmOpts.description =
+          `Load ${invoice.loadNumber || invoiceId}: ` +
+          `${optionLabels[option]}. Enter how much to charge the customer ` +
+          `for this additional charge. The customer rate will be bumped by ` +
+          `that amount and the customer will be emailed.` + rateNote +
+          ` Nothing is sent until you click Confirm.`;
+        confirmOpts.confirmLabel = "Confirm option A";
+        confirmOpts.confirmColor = "#16a34a";
+        confirmOpts.inputFields = [{
+          name: "customerChargeAmount",
+          label: "Amount to charge the customer ($)",
+          type: "number",
+          required: true,
+          min: "0.01",
+          step: "0.01",
+          placeholder: "0.00",
+          value: defaultCharge > 0 ? defaultCharge.toFixed(2) : "",
+        }];
+        return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
+      }
       if (option === "b") {
         let bookingForRate = null;
         try {
@@ -2831,7 +2866,8 @@ async function handleAdditionalChargeAction(req, res) {
                 `${optionLabels[option]}. Enter each accessorial and the ` +
                 `amount to bill the customer. The base customer rate stays ` +
                 `the same; each accessorial is added as a separate invoice ` +
-                `line. The dispatcher will notify the customer.`,
+                `line. The dispatcher will get a ready customer-notification ` +
+                `template.`,
               confirmLabel: "Confirm option B",
               confirmColor: "#0d9488",
               actionPath: "additionalChargeAction",
@@ -2853,6 +2889,16 @@ async function handleAdditionalChargeAction(req, res) {
 
     const decision = option.toUpperCase();
     let optionBCustomerBillLines = null;
+    let optionACustomerChargeAmount = null;
+    if (option === "a") {
+      const parsedAmount =
+        additionalCharges.parseCustomerChargeAmountFromRequest(req.body || {});
+      if (!parsedAmount.ok) {
+        return res.status(400).send(parsedAmount.error ||
+            "Option A requires a customer charge amount greater than 0.");
+      }
+      optionACustomerChargeAmount = parsedAmount.amount;
+    }
     if (option === "b") {
       const parsedLines = additionalCharges.parseCustomerBillLinesFromRequest(
           req.body || {});
@@ -2938,8 +2984,8 @@ async function handleAdditionalChargeAction(req, res) {
     // Options a/b/c — the charge is approved for the carrier side.
     const billCustomer = option === "a" || option === "b";
 
-    // A: auto-bump customer sell rate by the approved charge amount.
-    // B: approver enters the updated customer rate on the confirm page.
+    // A: approver enters customer charge amount; bump sell rate by that amount.
+    // B: approver itemizes accessorials on the confirm page.
     let rateBumpNote = "";
     const approvalUpdate = {
       "additionalCharge.decision": decision,
@@ -2962,38 +3008,40 @@ async function handleAdditionalChargeAction(req, res) {
       "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (billCustomer && chargesTotal > 0) {
-      if (option === "b") {
-        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
-        const billLines = optionBCustomerBillLines || [];
-        const billExtra = additionalCharges.sumCustomerBillLines(billLines);
-        approvalUpdate["additionalCharge.customerBillLines"] = billLines;
-        approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
-          billExtra;
-        approvalUpdate["additionalCharge.originalCustomerRate"] =
-          baseRate > 0 ? baseRate : null;
-        rateBumpNote = baseRate > 0 ?
-          ` Base customer rate stays $${baseRate.toFixed(2)}.` :
-          " Base customer rate unchanged.";
-        rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
-          ` ($${billExtra.toFixed(2)}).`;
-      } else if (option === "a") {
-        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
-        if (baseRate > 0) {
-          const bumpedRate =
-            Math.round((baseRate + chargesTotal) * 100) / 100;
-          approvalUpdate.customerRate = bumpedRate;
-          approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
-          approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
-          approvalUpdate["additionalCharge.rateBumpAmount"] = chargesTotal;
-          rateBumpNote = ` Customer rate auto-bumped from ` +
-            `$${baseRate.toFixed(2)} to $${bumpedRate.toFixed(2)}.`;
-          invoice.customerRate = bumpedRate;
-        } else {
-          rateBumpNote = " Could not resolve the current customer rate — " +
-            "please bump it manually before invoicing.";
-        }
+    if (option === "a" && optionACustomerChargeAmount > 0) {
+      const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+      const billAmount = optionACustomerChargeAmount;
+      approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
+      approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
+      if (baseRate > 0) {
+        const bumpedRate =
+          Math.round((baseRate + billAmount) * 100) / 100;
+        approvalUpdate.customerRate = bumpedRate;
+        approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
+        approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
+        rateBumpNote = ` Customer charged $${billAmount.toFixed(2)}; ` +
+          `rate bumped from $${baseRate.toFixed(2)} to ` +
+          `$${bumpedRate.toFixed(2)}.`;
+        invoice.customerRate = bumpedRate;
+      } else {
+        rateBumpNote = ` Customer charge amount $${billAmount.toFixed(2)} ` +
+          `recorded, but the current customer rate could not be resolved - ` +
+          `please bump it manually before invoicing.`;
       }
+    } else if (billCustomer && chargesTotal > 0 && option === "b") {
+      const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+      const billLines = optionBCustomerBillLines || [];
+      const billExtra = additionalCharges.sumCustomerBillLines(billLines);
+      approvalUpdate["additionalCharge.customerBillLines"] = billLines;
+      approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
+        billExtra;
+      approvalUpdate["additionalCharge.originalCustomerRate"] =
+        baseRate > 0 ? baseRate : null;
+      rateBumpNote = baseRate > 0 ?
+        ` Base customer rate stays $${baseRate.toFixed(2)}.` :
+        " Base customer rate unchanged.";
+      rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
+        ` ($${billExtra.toFixed(2)}).`;
     }
 
     await invoiceRef.update(approvalUpdate);
@@ -3015,7 +3063,8 @@ async function handleAdditionalChargeAction(req, res) {
           customerName,
           loadNumber: invoice.loadNumber,
           charges: chargeRows,
-          chargesTotal,
+          chargesTotal: optionACustomerChargeAmount != null ?
+            optionACustomerChargeAmount : chargesTotal,
           category: charge.category,
           customerRate: invoice.customerRate ||
             customerRateFromBooking(booking),
@@ -3168,9 +3217,14 @@ async function handleAdditionalChargeAction(req, res) {
     const messages = {
       a: "The carrier bill will be paid in full and the charge billed " +
         "to the customer." + extraNote,
-      b: "The carrier bill will be paid in full. The base customer rate " +
+      b: skipDispatcherNotify ?
+        "The carrier bill will be paid in full. The base customer rate " +
         "stays the same and each approved accessorial is added as a " +
-        "separate customer invoice line." + extraNote,
+        "separate customer invoice line." + extraNote :
+        "The carrier bill will be paid in full. The base customer rate " +
+        "stays the same and each approved accessorial is added as a " +
+        "separate customer invoice line. The dispatcher was emailed a " +
+        "ready customer-notification template." + extraNote,
       c: "The carrier bill will be paid in full. The customer rate " +
         "stays the same.",
     };
