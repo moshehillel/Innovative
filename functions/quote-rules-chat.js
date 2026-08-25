@@ -74,6 +74,9 @@ function parseNaturalRejection(text) {
       .test(raw)) {
     return true;
   }
+  if (/^(no|nope|nah)[,.\s-]*(wait|stop|hold on)\b/i.test(raw)) {
+    return true;
+  }
   if (/\b(not quite|not right|that'?s wrong|wrong rule|change (it|that)|hold on|wait a sec)\b/
       .test(norm)) {
     return true;
@@ -2122,6 +2125,7 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
 async function runQuoteRulesChatTurn(opts) {
   const chatTurns = opts.messages || [];
   const existingRules = opts.existingRules || [];
+  const finish = (r) => polishChatResult(r, chatTurns);
   const pending = opts.pendingProposal && typeof opts.pendingProposal === "object" ?
     opts.pendingProposal : null;
   const last = lastUserTurn(chatTurns);
@@ -2129,7 +2133,7 @@ async function runQuoteRulesChatTurn(opts) {
 
   if (pending && lastText) {
     if (parseNaturalConfirmation(lastText, {pendingProposal: true})) {
-      return {
+      return finish({
         reply: "Perfect — applying that rule now.",
         action: pending.action || "propose_create_rule",
         proposal: {
@@ -2140,41 +2144,41 @@ async function runQuoteRulesChatTurn(opts) {
         },
         confirmApply: true,
         quickReplies: [],
-      };
+      });
     }
     const rej = parseRejectionWithCorrection(lastText);
     if (rej.rejected) {
-      return {
+      return finish({
         reply: rejectionReply(rej.correction),
         action: rej.correction ? "none" : "dismiss_pending",
         proposal: null,
         quickReplies: [],
         dismissedCorrection: rej.correction || null,
-      };
+      });
     }
   }
 
   if (isMetaFollowUpText(lastText)) {
-    return {
+    return finish({
       reply: "Sorry about that — tell me again what rule you want and " +
         "I'll propose it clearly for you to confirm.",
       action: "none",
       proposal: null,
       quickReplies: [],
-    };
+    });
   }
 
   // Obvious delete / military APD+LAD updates skip the model so a leftover
   // identify gate cannot steal the turn.
   const deleteOut = buildDeleteRuleProposal(chatTurns, existingRules);
-  if (deleteOut) return deleteOut;
+  if (deleteOut) return finish(deleteOut);
   const militaryOut = buildMilitaryAccessorialProposal(
       chatTurns, existingRules);
-  if (militaryOut) return militaryOut;
+  if (militaryOut) return finish(militaryOut);
   const senderOut = buildSenderCustomerProposal(chatTurns, existingRules);
-  if (senderOut) return senderOut;
+  if (senderOut) return finish(senderOut);
   const zipOut = buildZipFillProposal(chatTurns, existingRules);
-  if (zipOut) return zipOut;
+  if (zipOut) return finish(zipOut);
 
   const gateHint = detectCreateIdentifyGate(chatTurns);
   const lastTurn = lastUserTurn(chatTurns);
@@ -2185,11 +2189,11 @@ async function runQuoteRulesChatTurn(opts) {
   // or identify answer. Follow-ups go to gpt-5.6-luna.
   if (gateHint.status === "ready" && gateHint.source === "address_only" &&
       (lastIsAcc || lastIsChoice)) {
-    return enforceCreateIdentifyGate({
+    return finish(enforceCreateIdentifyGate({
       reply: "",
       action: "none",
       proposal: null,
-    }, chatTurns, existingRules);
+    }, chatTurns, existingRules));
   }
 
   const apiKey = process.env.QUOTE_RULES_CHAT_OPENAI_API_KEY ||
@@ -2208,12 +2212,16 @@ async function runQuoteRulesChatTurn(opts) {
   ).slice(0, 8000);
 
   const systemPrompt = [
-    "You are a sharp, conversational freight quote-rules assistant for",
-    "Innovative Carriers dispatchers. Talk like ChatGPT or Cursor — infer",
-    "messy natural-language intent, ask ONE smart clarifying question when",
-    "something is ambiguous, and propose a confirmable rule as soon as you",
-    "have enough facts. Never act like a rigid form or bot. Never invent",
-    "\"I could not process that\" / \"Try rephrasing\" dead-ends.",
+    "You are a sharp, conversational quote-rules assistant for Innovative",
+    "Carriers dispatchers. Talk like ChatGPT or Cursor — a general helpful",
+    "AI for ANY quote-automation rule request, not just a fixed menu.",
+    "Infer messy natural-language intent, ask ONE smart clarifying question",
+    "when something is ambiguous (\"Do you mean …?\" / \"You mean that …?\"),",
+    "and propose a confirmable rule as soon as you have enough facts.",
+    "Never act like a rigid form or bot. NEVER say \"I don't understand\",",
+    "\"I could not process that\", or \"Try rephrasing\".",
+    "If the user says no / wrong: \"Oh sorry — …\" and refine or ask again.",
+    "Accept any reply format — no required keywords or button-only confirm.",
     "",
     "You manage THREE rule kinds:",
     "1) Accessorial / site rules — site types or text → Primus codes",
@@ -2265,6 +2273,7 @@ async function runQuoteRulesChatTurn(opts) {
     "- \"can you add …\" is a REQUEST, not a Can-be identify answer.",
     "- Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
     "- If one fact is missing, ask ONE short question (action none).",
+    "- If unsure, guess and ask \"Do you mean …?\" — never dead-end.",
     "- Never claim you saved/updated/deleted — only Confirm applies.",
     "- When proposing a rule, summarize it plainly and invite natural",
     "  confirmation (yes, sounds good, go ahead, that's right).",
@@ -2403,10 +2412,7 @@ async function runQuoteRulesChatTurn(opts) {
 
   const gated = enforceCreateIdentifyGate(
       parsed, opts.messages || [], existingRules);
-  if (gated && typeof gated.reply === "string") {
-    gated.reply = sanitizeChatReply(gated.reply, opts.messages || []);
-  }
-  return gated;
+  return finish(gated);
 }
 
 /**
@@ -2694,6 +2700,10 @@ module.exports = {
   parseAccessorialsAnswer,
   parseNaturalConfirmation,
   parseNaturalRejection,
+  parseRejectionWithCorrection,
+  sanitizeChatReply,
+  polishChatResult,
+  rejectionReply,
   inferCreateTopic,
   looksLikeDeleteRuleIntent,
   looksLikeCreateRuleIntent,

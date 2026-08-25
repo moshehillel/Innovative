@@ -1303,6 +1303,12 @@
       }
     }
 
+    function rejectionHasCorrection(text) {
+      const raw = String(text || "").trim();
+      const stripped = raw.replace(/^(no|nope|nah|wait|hold on)[,.!\s-]+/i, "").trim();
+      return stripped.length >= 10 && stripped.toLowerCase() !== raw.toLowerCase();
+    }
+
     async function sendChatMessage() {
       const input = document.getElementById("chat-input");
       const sendBtn = document.getElementById("chat-send");
@@ -1319,16 +1325,22 @@
         return;
       }
       if (pendingProposal && isNaturalReject(text)) {
-        input.value = "";
-        clearQuickReplies();
-        chatMessages.push({ role: "user", content: text });
-        appendChat("user", text);
+        const correction = rejectionHasCorrection(text);
+        if (!correction) {
+          input.value = "";
+          clearQuickReplies();
+          chatMessages.push({ role: "user", content: text });
+          appendChat("user", text);
+          document.getElementById("proposal-box").classList.add("hidden");
+          pendingProposal = null;
+          const msg = "Oh sorry — I'll drop that proposal. What should the rule do instead?";
+          chatMessages.push({ role: "assistant", content: msg });
+          appendChat("assistant", msg);
+          return;
+        }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
-        const msg = "No problem — cancelled that proposal. What would you like instead?";
-        chatMessages.push({ role: "assistant", content: msg });
-        appendChat("assistant", msg);
-        return;
+        // Fall through — send correction to the assistant to rework.
       }
       if (!pendingProposal && isNaturalConfirm(text, false)) {
         input.value = "";
@@ -1359,6 +1371,10 @@
         showChatThinking(false);
         res = normalizeChatProposal(res) || res;
         if (res.action === "dismiss_pending") {
+          document.getElementById("proposal-box").classList.add("hidden");
+          pendingProposal = null;
+        }
+        if (res.dismissedCorrection) {
           document.getElementById("proposal-box").classList.add("hidden");
           pendingProposal = null;
         }
