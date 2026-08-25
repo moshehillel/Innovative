@@ -43,6 +43,12 @@ const {
   toOutboundEmailSafeText,
 } = require("./email-outbound-safe");
 const administrativeEmailIntake = require("./administrative-email-intake");
+const statementInvoiceBundle = require("./statement-invoice-bundle");
+const {
+  sanitizePreCheckLabel,
+  shouldTreatStatementCoverAsInvoiceBundle,
+  normalizePreCheckDocType,
+} = statementInvoiceBundle;
 const drayageIntake = require("./drayage-intake");
 const invoiceLoadEntry = require("./invoice-load-entry");
 const dashboardTasks = require("./dashboard-tasks");
@@ -3774,8 +3780,9 @@ async function preCheckDocumentType(pdfBuffer) {
             "INVOICE, STATEMENT, INSURANCE, POD, or OTHER. " +
             "Use INVOICE when the PDF contains carrier freight bill(s) " +
             "to pay, even if the first page is only a statement summary " +
-            "(common for Saia, AAA Cooper, and other LTL carriers — " +
-            "later pages are the actual invoices).",
+            "(common for Saia, AAA Cooper, JTS Express numbered " +
+            "Statement packets, and other LTL carriers — later pages " +
+            "are the actual invoices).",
         },
       ],
     }],
@@ -3791,15 +3798,6 @@ async function preCheckDocumentType(pdfBuffer) {
 }
 
 /**
- * Normalizes a first-page pre-check label (strip punctuation / whitespace).
- * @param {string} docType Raw label.
- * @return {string}
- */
-function sanitizePreCheckLabel(docType) {
-  return String(docType || "").trim().toUpperCase().replace(/[^A-Z]/g, "");
-}
-
-/**
  * @param {Buffer} pdfBuffer Full PDF buffer.
  * @return {Promise<number>} Page count, or 0 on failure.
  */
@@ -3810,26 +3808,6 @@ async function getPdfPageCount(pdfBuffer) {
   } catch (_) {
     return 0;
   }
-}
-
-/**
- * True when the email subject/sender looks like a carrier invoice packet
- * (possibly with a statement summary cover page before the bills).
- * @param {string} subject Email subject.
- * @param {string} from Email sender.
- * @return {boolean}
- */
-function looksLikeCarrierInvoiceEmail(subject, from) {
-  const sub = String(subject || "").trim();
-  const hints = `${subject || ""} ${from || ""}`.toLowerCase();
-  if (/^invoice\s+\d+\s+from\b/i.test(sub)) return true;
-  if (/^(?:fw:\s*)?invoice\s+#?\d+/i.test(sub)) return true;
-  const invoicePacket = new RegExp(
-      "invoice from|your invoice|is attached|acct no|account no|" +
-      "carrier invoice|ltl invoice", "i");
-  const carrierName = new RegExp(
-      "freight line|motor freight|freight system|freightways", "i");
-  return invoicePacket.test(hints) || carrierName.test(hints);
 }
 
 const STATEMENT_FORWARD_EMAIL_DEFAULT = "abe@innovativecarriers.com";
@@ -3874,73 +3852,6 @@ function isAbeCopiedOnEmail(headers) {
     if (addrs.includes(abeEmail)) return true;
   }
   return false;
-}
-
-/**
- * True when a first-page STATEMENT label should still run invoice extraction
- * (Saia-style multi-page packet with freight bills after the summary page).
- * @param {object} context Subject/filename hints and optional preCheckLabel.
- * @return {boolean}
- */
-function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
-  const label = sanitizePreCheckLabel(
-      context.preCheckLabel || context.docType);
-  if (label !== "STATEMENT" && label !== "OTHER") return false;
-
-  const pageCount = Number(context.pageCount) || 0;
-  const hints = [
-    context.subject,
-    context.filename,
-    context.from,
-  ].map((s) => String(s || "")).join(" ");
-
-  if (pageCount > 1 &&
-      looksLikeCarrierInvoiceEmail(context.subject, context.from)) {
-    return true;
-  }
-
-  if (/freight\s*inv|carrier\s*inv|transportation\s*inv/i.test(hints) &&
-      /stmt|stmd|statement/i.test(hints)) {
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Maps cheap first-page pre-check labels to attachment processing types.
- * Standalone carrier statements are ignored; multi-page Saia-style packets
- * that bundle freight bills still run full invoice extraction.
- * @param {string} docType Pre-check label.
- * @param {object} [context] Optional subject/filename hints.
- * @param {number} [context.pageCount] PDF page count when known.
- * @return {string} Attachment docType for intake.
- */
-function normalizePreCheckDocType(docType, context = {}) {
-  const label = sanitizePreCheckLabel(docType);
-  if (label === "INVOICE" || label === "POD") return label;
-
-  if (shouldTreatStatementCoverAsInvoiceBundle({
-    preCheckLabel: label,
-    ...context,
-  })) {
-    return "INVOICE";
-  }
-
-  const hints = [
-    context.subject,
-    context.filename,
-    context.from,
-  ].map((s) => String(s || "")).join(" ");
-  if (label === "OTHER") {
-    if (/freight\s*inv|carrier\s*inv|transportation/i.test(hints)) {
-      return "INVOICE";
-    }
-    if (looksLikeCarrierInvoiceEmail(context.subject, context.from)) {
-      return "INVOICE";
-    }
-  }
-  return label || "OTHER";
 }
 
 /**
@@ -7762,6 +7673,11 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  Saia and similar carriers often email 'Your Invoice From …' with",
       "  a PDF whose first page is a statement summary and later pages are",
       "  the freight bills — that is carrier_invoice, not statement.",
+      "  JTS Express and similar carriers email 'Statement 12345' (any",
+      "  statement number) from invoice@ with a PDF: page 1 is a statement",
+      "  of all invoices, later pages are the freight bills to pay. Body",
+      "  text like 'Attached is your invoices for statement#' is",
+      "  carrier_invoice, not statement.",
       "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",
       "  delivery photos — not asking us to send one.",
       "- pod_request: sender asks Innovative to SEND or provide a POD /",
@@ -8055,6 +7971,10 @@ async function processGmailMessage(
           emailClassification = await classifyIncomingEmail(
               subject, from, emailBody, attachments,
           );
+          emailClassification = statementInvoiceBundle
+              .overrideStatementClassificationIfInvoicePacket(
+                  emailClassification, subject, from, emailBody,
+                  attachments);
           await writeLog("info", "ai", "Incoming email classified", {
             messageId,
             subject,
@@ -8067,8 +7987,8 @@ async function processGmailMessage(
           });
         }
 
-        if (emailClassification.intent === "statement" &&
-          emailClassification.confidence !== "low") {
+        if (statementInvoiceBundle.shouldShortCircuitAsStatementOnly(
+            emailClassification, subject, from, emailBody, attachments)) {
           await handleStatementOnlyEmail({
             gmail, messageId, subject, from, emailBody, tenant, headers,
             emailClassification,
@@ -8685,6 +8605,7 @@ async function processGmailMessage(
         docType = normalizePreCheckDocType(docType, {
           subject, from, filename: attachment.filename,
           pageCount,
+          body: emailBody,
         });
         if (preCheckLabel !== docType && docType === "INVOICE") {
           await writeLog("info", "mail",
@@ -8699,6 +8620,7 @@ async function processGmailMessage(
             preCheckLabel,
             subject, from, filename: attachment.filename,
             pageCount,
+            body: emailBody,
           })) {
             docType = "INVOICE";
             await writeLog("info", "mail",
@@ -8794,6 +8716,7 @@ async function processGmailMessage(
             docType = normalizePreCheckDocType(docType, {
               subject, from, filename: attachment.filename,
               pageCount,
+              body: emailBody,
             });
             if (preCheckLabel !== docType && docType === "INVOICE") {
               await writeLog("info", "mail",
@@ -8808,6 +8731,7 @@ async function processGmailMessage(
                 preCheckLabel,
                 subject, from, filename: attachment.filename,
                 pageCount,
+                body: emailBody,
               })) {
                 docType = "INVOICE";
               } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
