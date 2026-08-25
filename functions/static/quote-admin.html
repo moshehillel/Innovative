@@ -1335,6 +1335,7 @@
           ? `Applied: removed "${ruleId}". It stays gone on refresh.`
           : `Applied: saved "${ruleId}". Refresh the Rules list to see the update.`;
         appendChat("assistant", okMsg);
+        chatMessages.push({ role: "assistant", content: okMsg });
         chatMessages.push({ role: "assistant", content: applied });
         if (!wasDelete && ruleId) {
           const patch = pendingProposal.patch || {};

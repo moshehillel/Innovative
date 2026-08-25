@@ -1588,7 +1588,41 @@ function looksLikeRuleRefinement(text) {
       .test(norm)) {
     return true;
   }
+  if (/\bfor\s+this\s+rule\b/i.test(raw)) return true;
+  if (/\bthis\s+rule\b/i.test(norm) &&
+      /\b(when|pickup|pick\s*up|delivery|zip|use)\b/.test(norm)) {
+    return true;
+  }
+  if (extractQuotedRuleText(raw)) return true;
   return false;
+}
+
+/**
+ * Quoted rule description from "for this rule, '…'" / bullet lines.
+ * @param {string} text User message.
+ * @return {string}
+ */
+function extractQuotedRuleText(text) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const quotePatterns = [
+    /['"“”‘']([^'"“”‘'\n]{8,240})['"“”‘']/,
+    /[•\-*]\s*['"“”‘']?([^'"“”‘'\n]{8,240})['"“”‘']?\s*$/,
+  ];
+  for (const re of quotePatterns) {
+    const m = raw.match(re);
+    if (m && m[1]) {
+      const s = m[1].trim();
+      if (s.length >= 8) return s;
+    }
+  }
+  const forThis = raw.match(
+      /\bfor\s+this\s+rule[,:\s•*-]+(.+?)$/i);
+  if (forThis && forThis[1]) {
+    const s = forThis[1].replace(/^['"“”‘']+|['"“”‘']+$/g, "").trim();
+    if (s.length >= 8) return s;
+  }
+  return "";
 }
 
 /**
@@ -1600,9 +1634,12 @@ function findLastAppliedRuleId(messages) {
   for (let i = (messages || []).length - 1; i >= 0; i--) {
     const m = messages[i];
     if (!m || m.role !== "assistant") continue;
-    const applied = String(m.content || "").trim()
+    const c = String(m.content || "").trim();
+    const applied = c
         .match(/^\[APPLIED\]\s+(?:Saved|Deleted)\s+rule\s+"([^"]+)"/i);
     if (applied) return applied[1];
+    const appliedHuman = c.match(/^Applied:\s+(?:saved|removed)\s+"([^"]+)"/i);
+    if (appliedHuman) return appliedHuman[1];
   }
   return null;
 }
@@ -1623,9 +1660,78 @@ function findRecentProposedRuleId(messages) {
     if (updating) return updating[1];
     const applied = c.match(/^\[APPLIED\]\s+Saved rule\s+"([^"]+)"/i);
     if (applied) return applied[1];
+    const appliedHuman = c.match(/^Applied:\s+saved\s+"([^"]+)"/i);
+    if (appliedHuman) return appliedHuman[1];
     const zipFill = c.match(/\b(zip_fill_[a-z0-9_]+)\b/i);
     if (zipFill && /\b(rule|zip|update|set|saved|apply)\b/i.test(c)) {
       return zipFill[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Match an existing Firestore rule from quoted / restated description text.
+ * @param {string} text User or quoted text.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {string|null} rule id
+ */
+function findRuleByDescriptionMatch(text, existingRules) {
+  const quoted = extractQuotedRuleText(text);
+  const probe = quoted || String(text || "").trim();
+  if (!probe) return null;
+
+  const explicitIds = probe.match(
+      /\b(zip_fill_[a-z0-9_]+|sender_[a-z0-9_]+|[a-z][a-z0-9_]{4,})\b/gi) || [];
+  for (const rawId of explicitIds) {
+    const id = String(rawId).trim();
+    const hit = (existingRules || []).find((r) =>
+      r && String(r.id).toLowerCase() === id.toLowerCase());
+    if (hit) return hit.id;
+  }
+
+  const topic = inferZipFillTopic([{role: "user", content: probe}]);
+  if (topic && topic.city) {
+    let live = findExistingZipFillRule(existingRules || [], topic);
+    if (!live && topic.zipCode) {
+      live = (existingRules || []).find((r) => {
+        if (!r || r.active === false || !isZipFillRuleDoc(r)) return false;
+        const zip = String(r.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+        if (zip !== topic.zipCode) return false;
+        const match = r.match && typeof r.match === "object" ? r.match : {};
+        const cities = [].concat(
+            match.shipperCityContains || [],
+            match.consigneeCityContains || [],
+            match.cityContains || []);
+        const wantCity = topic.city.trim().toLowerCase();
+        return cities.some((c) => {
+          const cc = String(c || "").trim().toLowerCase();
+          return cc && (wantCity.includes(cc) || cc.includes(wantCity));
+        });
+      }) || null;
+    }
+    if (live) return live.id;
+  }
+
+  const norm = probe.toLowerCase();
+  for (const r of existingRules || []) {
+    if (!r || !r.id) continue;
+    const hay = [r.id, r.name, r.notes, r.fillZipCode]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+    if (topic && topic.city) {
+      const city = topic.city.toLowerCase();
+      if (hay.includes(city)) {
+        if (!topic.zipCode ||
+            String(r.fillZipCode || "").includes(topic.zipCode)) {
+          return r.id;
+        }
+      }
+    }
+    const name = String(r.name || "").trim().toLowerCase();
+    if (name.length >= 6 && norm.includes(name.slice(0, Math.min(name.length, 24)))) {
+      return r.id;
     }
   }
   return null;
@@ -1670,6 +1776,20 @@ function resolveReferencedRuleId(ctx, messages, pending, existingRules) {
   if (fromChat) return fromChat;
   const recentProp = findRecentProposedRuleId(messages);
   if (recentProp) return recentProp;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (lastText) {
+    const fromQuote = findRuleByDescriptionMatch(lastText, existingRules);
+    if (fromQuote) return fromQuote;
+  }
+  const userBlob = (messages || [])
+      .filter((m) => m && m.role === "user")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (userBlob) {
+    const fromHistory = findRuleByDescriptionMatch(userBlob, existingRules);
+    if (fromHistory) return fromHistory;
+  }
   const topic = inferZipFillTopic(messages);
   if (topic && topic.city) {
     const live = findExistingZipFillRule(existingRules || [], topic);
@@ -2005,11 +2125,14 @@ function buildRuleRefinementProposal(messages, existingRules, pending, ruleConte
   if (!conditions.customerName && !conditions.fromEmails.length &&
       !conditions.fromNames.length) {
     return {
-      reply: "What should I add to that rule — customer name, sender email, " +
+      reply: `Got it — you mean rule **${live.id}**` +
+        (live.name ? ` (${live.name})` : "") +
+        ". What should I add — customer name, sender email, " +
         "or sender name (e.g. only when customer is Brumis Imports Inc)?",
       action: "none",
       proposal: null,
       quickReplies: [],
+      referencedRuleId: live.id,
     };
   }
 
@@ -2139,6 +2262,9 @@ function looksLikeZipFillIntent(messages) {
   const last = lastUserTurn(messages);
   const lastText = last ? String(last.content || "") : "";
   if (!lastText || /^\[applied\]/i.test(lastText.trim())) return false;
+  if (looksLikeRuleRefinement(lastText)) return false;
+  if (/\bfor\s+this\s+rule\b/i.test(lastText)) return false;
+  if (extractQuotedRuleText(lastText)) return false;
   const blob = isMetaFollowUpText(lastText) ?
     userTopicBlob(messages) : lastText.toLowerCase();
   const hasZip = !!parseZipCodeFromText(blob);
@@ -2219,6 +2345,12 @@ function isZipFillRuleDoc(rule) {
  */
 function buildZipFillProposal(messages, existingRules) {
   if (!looksLikeZipFillIntent(messages)) return null;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (looksLikeRuleRefinement(lastText) ||
+      /\bfor\s+this\s+rule\b/i.test(lastText)) {
+    return null;
+  }
   const topic = inferZipFillTopic(messages);
   if (!topic || !topic.city) {
     return {
@@ -3228,6 +3360,8 @@ module.exports = {
   resolveChatTurns,
   resolveReferencedRuleId,
   findRecentProposedRuleId,
+  findRuleByDescriptionMatch,
+  extractQuotedRuleText,
   normalizeLastAppliedRule,
   validateRuleProposal,
   extractPatch,

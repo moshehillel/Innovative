@@ -142,6 +142,56 @@ check("refine via lastAppliedRule object",
     refineViaAppliedObj.proposal.ruleId,
     "zip_fill_la_mirada_stg");
 
+const laMiradaStgRule = {
+  id: "zip_fill_la_mirada_stg",
+  ruleKind: "zip_fill",
+  applyTo: "origin",
+  fillZipCode: "90670",
+  name: "La Mirada CA pickup → ZIP 90670",
+  match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+};
+
+check("quoted rule matches zip_fill_la_mirada_stg",
+    chat.findRuleByDescriptionMatch(
+        "for this rule, • 'When pickup is La Mirada use zip 90670'",
+        [laMiradaStgRule]),
+    "zip_fill_la_mirada_stg");
+
+checkTrue("for this rule bullet is refinement",
+    chat.looksLikeRuleRefinement(
+        "for this rule, • 'When pickup is La Mirada use zip 90670'"));
+
+checkTrue("zip fill intent blocked on for-this-rule quote",
+    !chat.looksLikeZipFillIntent([{
+      role: "user",
+      content: "for this rule, • 'When pickup is La Mirada use zip 90670'",
+    }]));
+
+const screenshotFlow = [
+  {role: "user", content: "When pickup is La Mirada use zip 90670"},
+  {role: "assistant", content: "Applied: saved \"zip_fill_la_mirada_stg\"."},
+  {role: "assistant", content: "[APPLIED] Saved rule \"zip_fill_la_mirada_stg\" via Confirm (applyQuoteRule ok)."},
+  {role: "user", content: "yes, but only when the customer is Brumis Imports Inc"},
+  {role: "user", content: "for this rule, • 'When pickup is La Mirada use zip 90670'"},
+];
+const screenshotRefine = chat.buildRuleRefinementProposal(
+    screenshotFlow, [laMiradaStgRule], null,
+    {lastAppliedRule: {ruleId: "zip_fill_la_mirada_stg", ruleKind: "zip_fill"}});
+check("screenshot flow updates stg rule",
+    screenshotRefine && screenshotRefine.proposal &&
+    screenshotRefine.proposal.ruleId,
+    "zip_fill_la_mirada_stg");
+check("screenshot flow adds Brumis customer",
+    screenshotRefine && screenshotRefine.proposal &&
+    screenshotRefine.proposal.patch &&
+    screenshotRefine.proposal.patch.customerName,
+    "Brumis Imports Inc");
+check("screenshot flow is update not create",
+    screenshotRefine && screenshotRefine.action,
+    "propose_update_rule");
+checkTrue("screenshot flow not generic zip fill repropose",
+    !(chat.buildZipFillProposal(screenshotFlow, [laMiradaStgRule])));
+
 checkTrue("delivery appointment → APD",
     chat.parseAccessorialsAnswer("also delivery appointment").includes("APD"));
 checkTrue("appointment delivery → APD",
