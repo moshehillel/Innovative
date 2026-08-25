@@ -205,6 +205,34 @@ checkTrue("shaya from email",
 checkTrue("shaya not protocolOnly",
     shayaOut && shayaOut.proposal.patch.protocolOnly === false);
 
+const mosesPhrases = [
+  "mshglck@gmail.com should be registered as customer name moses",
+  "mshglck@gmail.com mapped to moses customer name",
+  "mshglck@gmail.com → moses",
+  "map mshglck@gmail.com to moses",
+];
+for (const phrase of mosesPhrases) {
+  const mosesMsg = [{role: "user", content: phrase}];
+  checkTrue(`moses intent: ${phrase.slice(0, 40)}`,
+      chat.looksLikeSenderCustomerIntent(mosesMsg));
+  const mosesOut = chat.buildSenderCustomerProposal(mosesMsg, []);
+  checkTrue(`moses propose: ${phrase.slice(0, 40)}`,
+      mosesOut && mosesOut.action === "propose_create_rule" &&
+      mosesOut.proposal && mosesOut.proposal.patch &&
+      mosesOut.proposal.patch.customerName === "moses" &&
+      mosesOut.proposal.patch.ruleKind === "sender_customer" &&
+      mosesOut.proposal.patch.identifyVia === "email" &&
+      Array.isArray(mosesOut.proposal.patch.match.fromEmails) &&
+      mosesOut.proposal.patch.match.fromEmails
+          .includes("mshglck@gmail.com") &&
+      !/please include the From|could not process/i
+          .test(mosesOut.reply || ""));
+  if (!(mosesOut && mosesOut.action === "propose_create_rule")) {
+    console.log("  phrase:", phrase);
+    console.log("  out:", mosesOut);
+  }
+}
+
 (async () => {
   const smokePhrases = [
     "add appointment delivery for military facilities",
@@ -250,6 +278,30 @@ checkTrue("shaya not protocolOnly",
     console.log("  reply:", senderSmoke && senderSmoke.reply);
     console.log("  patch:", senderSmoke && senderSmoke.proposal &&
       senderSmoke.proposal.patch);
+  }
+
+  for (const phrase of mosesPhrases) {
+    const mosesSmoke = await chat.runQuoteRulesChatTurn({
+      messages: [{role: "user", content: phrase}],
+      existingRules: [],
+    });
+    const mosesOk = mosesSmoke &&
+      mosesSmoke.action === "propose_create_rule" &&
+      mosesSmoke.proposal &&
+      mosesSmoke.proposal.patch &&
+      mosesSmoke.proposal.patch.customerName === "moses" &&
+      mosesSmoke.proposal.patch.match &&
+      Array.isArray(mosesSmoke.proposal.patch.match.fromEmails) &&
+      mosesSmoke.proposal.patch.match.fromEmails
+          .includes("mshglck@gmail.com") &&
+      !/please include the From|could not process/i
+          .test(mosesSmoke.reply || "");
+    checkTrue(`smoke moses: ${phrase.slice(0, 48)}`, mosesOk);
+    if (!mosesOk) {
+      console.log("  phrase:", phrase);
+      console.log("  action:", mosesSmoke && mosesSmoke.action);
+      console.log("  reply:", mosesSmoke && mosesSmoke.reply);
+    }
   }
 
   if (failures) {

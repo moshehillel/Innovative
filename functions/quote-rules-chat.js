@@ -319,6 +319,13 @@ function looksLikeMilitaryAccessorialIntent(messages) {
  */
 function fallbackUnclearReply(messages) {
   if (looksLikeSenderCustomerIntent(messages)) {
+    const topic = inferSenderCustomerTopic(messages);
+    if (topic && (topic.emails.length || topic.domains.length) &&
+        !topic.customerName) {
+      return "Got the sender email — which Primus customer name should " +
+        "we attach? You can also say protocol only or default dims " +
+        "(e.g. 40×48×62).";
+    }
     return "I can map a sender email to a Primus customer. " +
       "Tell me the From address and customer name " +
       "(and protocol only / default dims if needed).";
@@ -1033,6 +1040,8 @@ function parseCustomerNameFromSenderText(text, emails) {
         .replace(/\bdefault\s+dims?\b.*$/ig, "")
         .replace(/\b\d{2}\s*[x×*]\s*\d{2}\s*[x×*]\s*\d{2,3}\b.*$/ig, "")
         .replace(/\bwhen\s+missing\b.*$/ig, "")
+        .replace(/\s+customer\s+name\s*$/ig, "")
+        .replace(/\s+customer\s*$/ig, "")
         .replace(/[,;:\s]+$/g, "")
         .replace(/\s+/g, " ")
         .trim();
@@ -1041,12 +1050,24 @@ function parseCustomerNameFromSenderText(text, emails) {
   }
 
   const patterns = [
+    // "… registered as customer name moses" / "register as customer X"
     new RegExp(
-        "\\b(?:map|match)\\s+(?:this\\s+)?(?:email|sender|from)?\\s*" +
-        "(?:to|with)\\s+(?:customer\\s+)?(?:name\\s+)?(.+?)(?:\\.|$)",
+        "\\b(?:should\\s+be\\s+)?" +
+        "regist(?:er|ered|ration)\\s+as\\s+(?:a\\s+)?" +
+        "(?:customer\\s+)?(?:name\\s+)?(.+?)(?:\\.|$)",
+        "i"),
+    // "mapped to moses customer name" / "map … to customer name X"
+    new RegExp(
+        "\\b(?:map(?:ped)?|match(?:ed)?|link(?:ed)?|" +
+        "tie(?:d)?|assign(?:ed)?)\\s+" +
+        "(?:this\\s+)?(?:email|sender|from)?\\s*" +
+        "(?:to|with|as)\\s+(?:customer\\s+)?" +
+        "(?:name\\s+)?(.+?)(?:\\.|$)",
         "i"),
     /\b(?:use|to)\s+customer\s+(?:name\s+)?(.+?)(?:\.|$)/i,
     /\b(?:customer|account)\s*(?:name)?\s*[:=]\s*(.+?)(?:\.|$)/i,
+    // "… as customer name moses" (after email / other fluff)
+    /\bas\s+(?:a\s+)?customer\s+(?:name\s+)?(.+?)(?:\.|$)/i,
     /(?:^|[\s:])(?:to|→|->|=>)\s+([A-Z][\w .&'-]{2,80})(?:[,.]|$)/,
     /\bfor\s+customer\s+(.+?)(?:\.|$)/i,
   ];
@@ -1059,8 +1080,11 @@ function parseCustomerNameFromSenderText(text, emails) {
   }
 
   // "mike.oseback@… to Mike Oseback" / "Jared … → Brumis Imports Inc"
-  const arrow = String(text || "").match(
-      /@[\w.-]+\s+(?:to|→|->|as)\s+(.+?)(?:\.|$)/i);
+  // Also "…@… mapped to moses" / "…@… registered as …"
+  const arrow = String(text || "").match(new RegExp(
+      "@[\\w.-]+\\s+(?:(?:map(?:ped)?|match(?:ed)?|" +
+      "regist(?:er|ered))\\s+)?(?:to|→|->|as)\\s+(.+?)(?:\\.|$)",
+      "i"));
   if (arrow && arrow[1]) {
     const name = cleanName(arrow[1]);
     if (name.length >= 2 && !/@/.test(name)) return name;
@@ -1107,12 +1131,13 @@ function inferSenderCustomerTopic(messages) {
   const protocolOnly = parseProtocolOnlyFromText(blob);
   const matchCcTo = parseMatchCcToFromText(blob);
   const defaultDims = parseDefaultDimsFromText(blob);
+  // Keep email/domain hits even when the name is still missing so the
+  // proposal path can ask only for the customer name (not re-ask From).
   if (!emails.length && !domains.length) return null;
-  if (!customerName && !defaultDims) return null;
   return {
     emails,
     domains,
-    customerName,
+    customerName: customerName || "",
     protocolOnly,
     matchCcTo,
     defaultDims,
@@ -1142,7 +1167,9 @@ function looksLikeSenderCustomerIntent(messages) {
   const hasEmail = extractEmailsFromText(lastText).length > 0 ||
     extractSenderDomainsFromText(lastText).length > 0;
   const mappingVerb =
-    /\b(map|match|tie|link|route|assign)\b/.test(t) ||
+    /\b(map(?:ped)?|match(?:ed)?|tie(?:d)?|link(?:ed)?|route(?:d)?)\b/
+        .test(t) ||
+    /\b(assign(?:ed)?|regist(?:er|ered|ration))\b/.test(t) ||
     /\buse\s+customer\b/.test(t) ||
     /\bwhen\s+(email\s+)?from\b/.test(t) ||
     /\bfrom\s+emails?\b/.test(t) ||
@@ -1317,7 +1344,49 @@ function buildSenderCustomerProposal(messages, existingRules) {
 }
 
 /**
+ * True when a model/create proposal already has enough match info to
+ * skip the identify questionnaire.
+ * @param {object} result Chat result with action/proposal.
+ * @return {boolean}
+ */
+function proposalHasEnoughIdentifyInfo(result) {
+  if (!result || typeof result !== "object") return false;
+  const action = result.action || "none";
+  if (action !== "propose_create_rule" && action !== "propose_update_rule") {
+    return false;
+  }
+  const patch = result.proposal && result.proposal.patch &&
+    typeof result.proposal.patch === "object" ?
+    result.proposal.patch : null;
+  if (!patch || !String(patch.name || "").trim()) return false;
+  const match = patch.match && typeof patch.match === "object" ?
+    patch.match : null;
+  if (!match || !Object.keys(match).length) return false;
+  if (patch.identifyVia === "email" ||
+      patch.ruleKind === RULE_KIND_SENDER_CUSTOMER ||
+      String(patch.customerName || "").trim()) {
+    const emails = [].concat(match.fromEmails || [])
+        .concat(match.senderEmails || []);
+    const domains = [].concat(match.senderDomains || []);
+    return emails.length > 0 || domains.length > 0;
+  }
+  if (match.siteType || (Array.isArray(match.flags) && match.flags.length)) {
+    return true;
+  }
+  const textKeys = [
+    "consigneeNameContains", "consigneeAddressContains",
+    "instructionsContains", "referenceContains",
+  ];
+  return textKeys.some((k) => {
+    const v = match[k];
+    return Array.isArray(v) ? v.length > 0 : !!String(v || "").trim();
+  });
+}
+
+/**
  * Enforce identify questionnaire before create proposals.
+ * Soft gate: only ask when info is truly missing; never steal a complete
+ * sender/site/accessorial proposal or a clear delete/update.
  * @param {object} result Model JSON result.
  * @param {Array} messages Chat history including latest user turn.
  * @param {Array<object>=} existingRules Live rules.
@@ -1352,6 +1421,14 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       messages, existingRules || []);
   if (senderOut) return senderOut;
 
+  // Model already produced a complete Confirmable proposal — keep it.
+  if (proposalHasEnoughIdentifyInfo(out)) {
+    if (/could not process|try rephrasing/i.test(String(out.reply || ""))) {
+      out.reply = "Here's a rule proposal — click Confirm to apply it.";
+    }
+    return out;
+  }
+
   const gate = detectCreateIdentifyGate(messages);
   const extras = collectCreateFlowExtras(messages);
   const lastUser = lastUserTurn(messages);
@@ -1360,8 +1437,15 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       parseAccessorialsAnswer(lastUser.content).length);
   const lastIsIdentifyAnswer = !!parseIdentifyChoiceAnswer(lastText);
   const lastIsMeta = isMetaFollowUpText(lastText);
+  // Site + accessorials already in chat → propose without identify.
+  if ((isClearlySiteTypeTopic(messages) || extras.siteType) &&
+      (extras.accessorials || []).length) {
+    return finalizeAddressOnlyCreate(out, messages, extras) || out;
+  }
   // Only stay in the questionnaire for a real identify/accessorial
   // answer — leftover "ready" must not steal "i asked you something".
+  // Soft: "needed" alone does NOT force identify when the model said
+  // none / asked a clarifying question.
   const inIdentifyFlow =
     (gate.status === "awaiting_choice" && lastIsIdentifyAnswer) ||
     (gate.status === "awaiting_email_signals" &&
@@ -1370,7 +1454,9 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       (lastIsAccessorials || lastIsIdentifyAnswer)) ||
     (extras.askedAccessorials && lastIsAccessorials) ||
     (gate.status === "needed" && looksLikeCreateRuleIntent(messages) &&
-      !isClearlySiteTypeTopic(messages));
+      !isClearlySiteTypeTopic(messages) &&
+      !looksLikeSenderCustomerIntent(messages) &&
+      action !== "none");
   const creating = action === "propose_create_rule" ||
     looksLikeCreateRuleIntent(messages) ||
     inIdentifyFlow;
@@ -1513,7 +1599,28 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
     };
   }
 
+  // Soft: if model asked a clarifying question, keep it.
+  if (action === "none" && String(out.reply || "").trim()) {
+    if (/could not process|try rephrasing/i.test(String(out.reply))) {
+      out.reply = fallbackUnclearReply(messages);
+    }
+    return out;
+  }
+
   // needed or awaiting_choice — stop and ask with two clear options.
+  // Only when we truly need identify (create intent, not sender/site).
+  if (!looksLikeCreateRuleIntent(messages) &&
+      action !== "ask_identify_source") {
+    out.reply = out.reply || fallbackUnclearReply(messages);
+    if (/could not process|try rephrasing/i.test(String(out.reply))) {
+      out.reply = fallbackUnclearReply(messages);
+    }
+    out.action = "none";
+    out.proposal = null;
+    out.quickReplies = [];
+    return out;
+  }
+
   const reply = (out.action === "ask_identify_source" && out.reply) ?
     out.reply :
     "Before I propose that rule: how can this condition be identified?\n\n" +
@@ -1582,140 +1689,140 @@ async function runQuoteRulesChatTurn(opts) {
   ).slice(0, 8000);
 
   const systemPrompt = [
-    "You help freight dispatchers manage LTL quote accessorial rules",
-    "AND sender→customer mapping rules.",
-    "Accessorial rules map site types or instructions to Primus codes.",
-    "Sender rules map From emails (or @domains) to a Primus customerName,",
-    "optional protocolOnly, and optional defaultDims.",
-    "Common codes: LFO LFD (liftgate), APD (appointment dest),",
-    "LAD (limited access), NUD (nursing home), HOD (hotel),",
-    "RSD (residential), SCD (school), INS (insurance).",
+    "You are a sharp freight quote-rules admin assistant for Innovative",
+    "Carriers dispatchers. Infer messy natural-language intent like a",
+    "normal helpful AI — do NOT act like a brittle form. Prefer proposing",
+    "a Confirmable rule as soon as you have enough facts. Never invent",
+    "\"I could not process that\" / \"Try rephrasing\" dead-ends.",
+    "",
+    "You manage TWO rule kinds:",
+    "1) Accessorial / site rules — site types or text → Primus codes",
+    "   (LAD limited access, APD appointment dest, LFD/LFO liftgate,",
+    "   NUD nursing, HOD hotel, RSD residential, SCD school, INS).",
+    "2) Sender→customer rules — From email/@domain → Primus customerName,",
+    "   optional protocolOnly, optional defaultDims. No accessorials.",
     "",
     "Current active rules JSON:",
     rulesJson,
     "",
-    "When user asks to add, change, or remove a rule, respond JSON only:",
+    "Respond with JSON only:",
     "{",
-    "  \"reply\": \"friendly confirmation message for the user\",",
+    "  \"reply\": \"friendly message\",",
     "  \"action\": \"none\" | \"ask_identify_source\" |",
     "    \"ask_email_signals\" | \"propose_create_rule\" |",
     "    \"propose_update_rule\" | \"propose_delete_rule\",",
     "  \"proposal\": null | {",
     "    \"ruleId\": \"snake_case_id\",",
-    "    \"patch\": { rule fields for create/update },",
+    "    \"patch\": { rule fields },",
     "    \"deleteRuleId\": \"id for delete\"",
     "  },",
-    "  \"quickReplies\": [] | [\"Can be identified from the email\",",
-    "    \"Cannot be — address / site classification only\"]",
+    "  \"quickReplies\": [] | [\"" + QUICK_REPLY_CAN_BE + "\",",
+    "    \"" + QUICK_REPLY_CANNOT_BE + "\"]",
     "}",
     "",
-    "Rule patch fields: active, priority, name, match, addAccessorials,",
+    "Patch fields: active, priority, name, match, addAccessorials,",
     "filterCarrierWarnings, notes, autoApply, requiresConfirm, identifyVia,",
     "ruleKind, customerName, protocolOnly, defaultDims.",
-    "match may use: consigneeNameContains, consigneeAddressContains,",
+    "match: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType,",
     "fromEmails, senderEmails, senderDomains, ccEmails, toEmails.",
     "",
-    "=== Sender email → customer (IMPORTANT) ===",
-    "Phrases: map this email to customer X, when email from Y use",
-    "customer Z, protocol only, match customer name to that email,",
-    "default dims 40x48x62 when missing, also when CC'd / on Cc or To.",
-    "→ propose_create_rule (or update) immediately.",
-    "identifyVia MUST be \"email\"; ruleKind \"sender_customer\".",
-    "match.fromEmails: array of emails (one rule can list many).",
-    "Optional match.senderDomains: [\"ediexpressinc.com\"].",
-    "When they say CC'd / Cc / To / participant: also set",
-    "match.ccEmails and match.toEmails to the same addresses.",
-    "Set customerName; protocolOnly true when they say protocol only;",
-    "defaultDims {length,width,height} when they give missing dims.",
-    "addAccessorials: []. Do NOT ask site type, LAD, APD, or the",
-    "Can-be / Cannot-be questionnaire for these.",
-    "Example ids: sender_mike_oseback, sender_jared_berman,",
-    "sender_lifeworks_picking, sender_shaya_jacobowitz /",
-    "\"Sender → Mike Oseback\".",
-    "NEVER reply \"I could not process that\" for sender mapping.",
+    "=== CORE BEHAVIOR ===",
+    "- Infer intent from typos and casual English.",
+    "- If email + customer name are both present → propose_create_rule",
+    "  (or update) IMMEDIATELY. Never re-ask for From/customer.",
+    "- If site type + accessorials are both present → propose immediately",
+    "  (identifyVia ai for known sites). Do not restart questionnaires.",
+    "- Ask identify ONLY when creating a NEW ambiguous accessorial rule",
+    "  and you truly lack how to match it (not military/nursing/hotel,",
+    "  not sender→customer, and they have not already chosen).",
+    "- Updates and deletes never use the identify questionnaire.",
+    "- \"can you add …\" is a REQUEST, not a Can-be identify answer.",
+    "- Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
+    "- If one fact is missing, ask ONE short question (action none).",
+    "- Never claim you saved/updated/deleted — only Confirm applies.",
+    "- Typed Confirm/Yes/Done → remind them to click Confirm (action none).",
+    "- [APPLIED] messages are ground-truth Confirm results.",
+    "- Live rule truth = Current active rules JSON only.",
     "",
-    "=== Follow the user's LAST intent ===",
-    "Read the full conversation. Do not restart the identify",
-    "questionnaire if they already chose Cannot be, already named",
-    "accessorials, or asked to add APD/LAD for a known site type.",
-    "\"can you add …\" is a request, NOT the Can-be identify answer.",
-    "Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
-    "NEVER reply \"I could not process that\" or \"Try rephrasing\".",
-    "If unsure, ask one short question (action none) that advances",
-    "their last request — do not change the subject.",
+    "=== FEW-SHOT EXAMPLES (follow these patterns) ===",
+    "User: mshglck@gmail.com should be registered as customer name moses",
+    "→ propose_create_rule ruleId sender_moses, ruleKind sender_customer,",
+    "  identifyVia email, match.fromEmails [mshglck@gmail.com],",
+    "  customerName moses, addAccessorials [].",
     "",
-    "=== Military / AAFES / nursing home / hotel are site types ===",
-    "These are identified via AI address classification, not email.",
-    "Default identifyVia \"ai\" and match.siteType (aafes_military,",
-    "nursing_home, hotel). Do NOT ask email-signals for them.",
-    "\"add appointment delivery for military facilities\" (and typos)",
-    "→ update existing aafes_military or create it with LAD + APD.",
-    "Keep LAD if the prior military rule / intent already had it.",
-    "If aafes_military is missing from Current active rules JSON,",
-    "propose_create_rule to recreate it (tombstones must not block).",
+    "User: mshglck@gmail.com mapped to moses customer name",
+    "→ same as above (propose immediately).",
     "",
-    "=== Deletes ===",
-    "delete/remove/drop (typos militery / millitary, \"remove military\",",
-    "\"delete aafes\"): action MUST be propose_delete_rule. Do NOT ask",
-    "identify. Ask them to click Confirm; do not claim the rule is gone.",
+    "User: map jared@corehome.com to Brumis, dims 40x48x62",
+    "→ propose_create_rule Sender → Brumis, fromEmails [jared@corehome.com],",
+    "  customerName Brumis, defaultDims {40,48,62}.",
     "",
-    "=== Identify questionnaire (new accessorial rules only) ===",
-    "Ask identify ONLY when creating a NEW accessorial/site rule and",
-    "it is NOT a known site type and NOT a sender→customer mapping",
-    "and they have not already chosen Cannot be. Updates skip this.",
-    "Step 1 action ask_identify_source with exactly two quickReplies:",
-    "  \"" + QUICK_REPLY_CAN_BE + "\"",
-    "  \"" + QUICK_REPLY_CANNOT_BE + "\"",
-    "User may answer 1, 2, A, B, can, cannot, can be, cannot be, or the",
-    "button text. Those are definitive — do not re-ask.",
-    "CAN BE (email): ask_email_signals; only use signals they list;",
-    "identifyVia address_text or both.",
-    "CANNOT BE: identifyVia ai; match.siteType and/or flags; never",
-    "invent email keywords; never match: {}.",
+    "User: mike oseback cc → Mike Oseback protocol only",
+    "  (with email mike.oseback@ediexpressinc.com in context)",
+    "→ propose_update/create with fromEmails+ccEmails+toEmails,",
+    "  customerName Mike Oseback, protocolOnly true.",
+    "",
+    "User: Map lfwpicking@coreforce.com to Lifeworks Technology Group",
+    "→ propose_create_rule sender_lifeworks_picking.",
+    "",
+    "User: Shaya Jacobowitz shaya@primepackaging.com → Prime Packaging Inc",
+    "→ propose_create_rule with fromEmails + customerName.",
+    "",
+    "User: add appointment delivery for military facilities",
+    "→ propose create/update aafes_military identifyVia ai,",
+    "  match.siteType aafes_military, addAccessorials [LAD, APD].",
+    "",
+    "User: aadd for militery also delivery appointment",
+    "→ same military LAD+APD proposal (typos OK).",
+    "",
+    "User: delete nursing home rule / remove NUD nursing",
+    "→ propose_delete_rule for nursing_home (or matching id).",
+    "",
+    "User: delete all rules for militery bases",
+    "→ propose_delete_rule aafes_military. Do not ask identify.",
+    "",
+    "User: add liftgate whenever consignee says no dock",
+    "→ ask_identify_source (truly missing how to identify) OR if they",
+    "  already said Cannot-be / site type, propose with LFD/LFO.",
+    "",
+    "User: Cannot be — address / site classification only  then  LAD, APD",
+    "→ propose_create_rule identifyVia ai with those codes.",
+    "",
+    "=== Sender→customer details ===",
+    "ruleKind sender_customer; identifyVia email; addAccessorials [].",
+    "Set match.fromEmails (and ccEmails/toEmails when CC'd/To).",
+    "Optional match.senderDomains. protocolOnly / defaultDims when said.",
+    "Do NOT ask site type, LAD, APD, or Can-be/Cannot-be for these.",
+    "Ids like sender_mike_oseback / name \"Sender → Mike Oseback\".",
+    "",
+    "=== Site types (AI address classify) ===",
+    "military/AAFES/nursing/hotel → identifyVia ai + match.siteType",
+    "(aafes_military, nursing_home, hotel). No email-signals.",
     "Known siteType: nursing_home, hotel, amazon_fc, menards_dc,",
     "aafes_military, chain_store, residential, other.",
-    "Codes: LAD LFD APD RSD NUD LTD LFO HOD SCD INS; \"limited access\";",
-    "LOAD = LAD; \"delivery appointment\" = APD.",
+    "LOAD=LAD; delivery appointment=APD.",
     "",
-    "Current questionnaire state from chat history:",
+    "=== Identify questionnaire (rare) ===",
+    "Only for NEW ambiguous accessorial rules lacking match method.",
+    "ask_identify_source with exactly those two quickReplies.",
+    "Answers 1/2/A/B/can/cannot/button text are definitive.",
+    "CAN BE → ask_email_signals; only use signals they list.",
+    "CANNOT BE → identifyVia ai; siteType/flags; never invent keywords;",
+    "never match: {}.",
+    "",
+    "Current questionnaire state:",
     `  status=${gateHint.status}; source=${gateHint.source || "null"};`,
     `  emailSignalsListed=${gateHint.emailSignalsListed};`,
     `  askedAccessorials=${!!gateHint.askedAccessorials};`,
     `  accessorials=${(gateHint.accessorials || []).join(",") || "none"};`,
     `  siteType=${gateHint.siteType || "null"}`,
-    "If they already chose cannot-be (source=address_only) or the",
-    "topic is a site type, do NOT ask identify or email-signals.",
-    "If accessorials are listed, propose now.",
+    "If cannot-be / known site / accessorials listed → propose now.",
     "",
-    "identifyVia values:",
-    "  email — sender From address / domain → customer mapping.",
-    "  address_text — match from email/text fields only.",
-    "  ai — match only from AI address classification.",
-    "  both — either text OR AI signals (default when both apply).",
-    "",
-    "Include identifyVia in every create/update proposal patch.",
-    "",
-    "For propose_update_rule:",
-    "  - proposal.ruleId MUST be the existing rule id (e.g. amazon_fc).",
-    "  - patch may be partial (only changed fields), e.g. addAccessorials.",
-    "  - Always copy name and match from the current rule into patch",
-    "    so the proposal is self-contained even for partial edits.",
-    "For propose_create_rule: patch MUST include name and a NON-EMPTY",
-    "match (siteType and/or flags for address-only; text needles for email;",
-    "fromEmails/senderDomains for sender→customer).",
-    "Never use match: {}.",
-    "",
-    "Never claim you saved, updated, or deleted a rule.",
-    "Never say \"Confirmed\", \"rule removed\", \"deleted\", or \"it's gone\".",
-    "Only the Confirm button applies changes — chat text cannot apply them.",
-    "If the user types Confirm / Yes / Done without clicking the button,",
-    "reply that they must click the Confirm button (action none).",
-    "For propose_delete_rule: ask them to click Confirm; do not claim removal.",
-    "When asked if a rule is gone: answer ONLY from Current active rules JSON",
-    "above (fresh from Firestore this turn). Ignore prior chat claims.",
-    "Messages starting with [APPLIED] are ground-truth UI Confirm results.",
-    "If unclear, ask one short clarifying question with action none.",
+    "identifyVia: email | address_text | ai | both — include on every",
+    "create/update patch.",
+    "propose_update_rule: copy name+match from live rule; ruleId must",
+    "match an existing id. propose_create_rule: NON-EMPTY match.",
   ].join("\n");
 
   const messages = [
