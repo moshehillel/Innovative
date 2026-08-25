@@ -896,6 +896,24 @@ async function rateLane(lane, ctx) {
 }
 
 /**
+ * Drop bulky / non-essential extract fields before Firestore write.
+ * @param {object} extracted Intake extract.
+ * @return {object}
+ */
+function slimExtractedForStore(extracted) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const out = {...extracted};
+  delete out.raw;
+  if (out._sourceBody) {
+    out._sourceBody = String(out._sourceBody).slice(0, 12000);
+  }
+  if (out._sourceSubject) {
+    out._sourceSubject = String(out._sourceSubject).slice(0, 500);
+  }
+  return out;
+}
+
+/**
  * Prefer the Outlook queue body when the caller passed a stripped RFQ
  * (common on Innovative FW mailboxes missing embedded From: lines).
  * @param {object} opts processQuoteEmail options.
@@ -1090,7 +1108,8 @@ async function processQuoteEmail(opts) {
       extracted.shipper || null,
     customerDraftText: "",
     status: "awaiting_dispatcher",
-    extracted,
+    // Cap stored extract body; never keep model raw / megabyte blobs.
+    extracted: slimExtractedForStore(extracted),
     receivedMailboxEmail: opts.receivedMailboxEmail || null,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),

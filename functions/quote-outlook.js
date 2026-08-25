@@ -147,7 +147,12 @@ async function saveDispatcherTokens(tenant, dispatcherId, tokens, profile) {
 async function getOutlookStatus(tenant, dispatcherId) {
   const doc = await getDispatcherDoc(tenant, dispatcherId);
   if (!doc || !doc.outlookTokens) {
-    return {connected: false, email: null};
+    return {
+      connected: false,
+      email: doc && doc.outlookConnectedEmail || null,
+      needsReconnect: Boolean(doc && doc.outlookNeedsReconnect),
+      tokenError: doc && doc.outlookTokenError || null,
+    };
   }
   return {
     connected: true,
@@ -156,6 +161,8 @@ async function getOutlookStatus(tenant, dispatcherId) {
     mail: doc.outlookConnectedMail || null,
     displayName: doc.outlookConnectedDisplayName || null,
     connectedAt: doc.outlookConnectedAt || null,
+    needsReconnect: Boolean(doc.outlookNeedsReconnect),
+    tokenError: doc.outlookTokenError || null,
   };
 }
 
@@ -172,8 +179,45 @@ async function disconnectOutlook(tenant, dispatcherId) {
     outlookConnectedMail: admin.firestore.FieldValue.delete(),
     outlookConnectedDisplayName: admin.firestore.FieldValue.delete(),
     outlookConnectedAt: admin.firestore.FieldValue.delete(),
+    outlookNeedsReconnect: admin.firestore.FieldValue.delete(),
+    outlookTokenError: admin.firestore.FieldValue.delete(),
+    outlookTokenErrorAt: admin.firestore.FieldValue.delete(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   }, {merge: true});
+}
+
+/**
+ * Clear expired Outlook tokens and flag the dispatcher to re-connect OAuth.
+ * Does not affect other dispatchers (Leo stays connected).
+ * @param {object} tenant Tenant.
+ * @param {string} dispatcherId Dispatcher id.
+ * @param {string} [errorMessage] Refresh error text.
+ * @return {Promise<void>}
+ */
+async function flagOutlookNeedsReconnect(tenant, dispatcherId, errorMessage) {
+  await col(tenant, "quoteDispatchers").doc(String(dispatcherId)).set({
+    outlookTokens: admin.firestore.FieldValue.delete(),
+    outlookNeedsReconnect: true,
+    outlookTokenError: String(errorMessage || "invalid_grant").slice(0, 1000),
+    outlookTokenErrorAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
+  writeLogFn("warn", "quote",
+      "Outlook token invalid_grant — cleared; reconnect required", {
+        dispatcherId: String(dispatcherId),
+        error: String(errorMessage || "").slice(0, 300),
+      });
+}
+
+/**
+ * True when an error is an expired/revoked Outlook refresh grant.
+ * @param {Error|*} err Error.
+ * @return {boolean}
+ */
+function isOutlookInvalidGrant(err) {
+  if (!err) return false;
+  if (err.code === "outlook_invalid_grant") return true;
+  return /invalid_grant/i.test(String(err.message || err));
 }
 
 /**
@@ -233,6 +277,12 @@ async function handleOAuthCallback(parsed, code, getTenant, getDispatcher) {
     userPrincipalName: profile.userPrincipalName,
     displayName: profile.displayName,
   });
+  // Clear reconnect flags after a successful OAuth connect.
+  await col(tenant, "quoteDispatchers").doc(String(dispatcher.id)).set({
+    outlookNeedsReconnect: admin.firestore.FieldValue.delete(),
+    outlookTokenError: admin.firestore.FieldValue.delete(),
+    outlookTokenErrorAt: admin.firestore.FieldValue.delete(),
+  }, {merge: true});
 
   return {
     ok: true,
@@ -403,6 +453,10 @@ async function syncDispatcherInbox(
   const quoteMailQueue = require("./quote-mail-queue");
   const tokens = await getDispatcherTokens(tenant, dispatcher.id);
   if (!tokens) {
+    const doc = await getDispatcherDoc(tenant, dispatcher.id);
+    if (doc && doc.outlookNeedsReconnect) {
+      return {ok: true, synced: 0, skipped: "needs_reconnect"};
+    }
     return {ok: true, synced: 0, skipped: "not_connected"};
   }
 
@@ -413,19 +467,52 @@ async function syncDispatcherInbox(
       displayName: dispatcher.outlookConnectedDisplayName,
     });
   };
-  const client = outlookMail.createOutlookMailClient(tokens, onUpdate);
 
-  const drainedFirst = await drainQuoteQueue(
-      tenant, dispatcher, processQuoteEmail, client);
+  let client;
+  try {
+    client = outlookMail.createOutlookMailClient(tokens, onUpdate);
+  } catch (err) {
+    if (isOutlookInvalidGrant(err)) {
+      await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
+      return {ok: true, synced: 0, skipped: "needs_reconnect"};
+    }
+    throw err;
+  }
+
+  let drainedFirst;
+  try {
+    drainedFirst = await drainQuoteQueue(
+        tenant, dispatcher, processQuoteEmail, client);
+  } catch (err) {
+    if (isOutlookInvalidGrant(err)) {
+      await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
+      return {ok: true, synced: 0, skipped: "needs_reconnect"};
+    }
+    throw err;
+  }
 
   const after = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
   const q = `after:${after.getUTCFullYear()}/` +
     `${after.getUTCMonth() + 1}/${after.getUTCDate()}`;
-  const listResp = await client.users.messages.list({
-    maxResults: 40,
-    includeRead,
-    q,
-  });
+  let listResp;
+  try {
+    listResp = await client.users.messages.list({
+      maxResults: 40,
+      includeRead,
+      q,
+    });
+  } catch (err) {
+    if (isOutlookInvalidGrant(err)) {
+      await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
+      return {
+        ok: true,
+        synced: drainedFirst.processed || 0,
+        skipped: "needs_reconnect",
+        processErrors: drainedFirst.errors || 0,
+      };
+    }
+    throw err;
+  }
   const messages = (listResp.data && listResp.data.messages) || [];
   let enqueued = 0;
   let skippedExisting = 0;
@@ -461,8 +548,19 @@ async function syncDispatcherInbox(
       from = h("From");
       to = h("To");
       cc = h("Cc");
-      emailBody = quoteIntake.toPlainText(extractPlainBody(payload));
+      emailBody = quoteIntake.sanitizeEmailBodyForStore(
+          extractPlainBody(payload));
     } catch (err) {
+      if (isOutlookInvalidGrant(err)) {
+        await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
+        return {
+          ok: true,
+          synced: drainedFirst.processed || 0,
+          enqueued,
+          skipped: "needs_reconnect",
+          processErrors,
+        };
+      }
       processErrors += 1;
       writeLogFn("warn", "quote", "Outlook sync message read failed", {
         dispatcherId: dispatcher.id,
@@ -585,8 +683,23 @@ async function syncDispatcherInbox(
     }
   }
 
-  const drainedAfter = await drainQuoteQueue(
-      tenant, dispatcher, processQuoteEmail, client);
+  let drainedAfter = {processed: 0, errors: 0};
+  try {
+    drainedAfter = await drainQuoteQueue(
+        tenant, dispatcher, processQuoteEmail, client);
+  } catch (err) {
+    if (isOutlookInvalidGrant(err)) {
+      await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
+      return {
+        ok: true,
+        synced: drainedFirst.processed || 0,
+        enqueued,
+        skipped: "needs_reconnect",
+        processErrors,
+      };
+    }
+    throw err;
+  }
   const synced = drainedFirst.processed + drainedAfter.processed;
   processErrors += drainedFirst.errors + drainedAfter.errors;
 
@@ -612,17 +725,24 @@ function extractPlainBody(payload) {
     return decodeBase64Url(payload.body.data);
   }
   const parts = payload.parts || [];
-  for (const part of parts) {
-    const mime = String(part.mimeType || "").toLowerCase();
-    if (mime === "text/plain" && part.body && part.body.data) {
-      return decodeBase64Url(part.body.data);
+  const walk = (list, preferMime) => {
+    for (const part of list || []) {
+      if (part.filename) continue; // skip attachments
+      const mime = String(part.mimeType || "").toLowerCase();
+      if (preferMime && mime === preferMime && part.body && part.body.data) {
+        return decodeBase64Url(part.body.data);
+      }
+      if (part.parts && part.parts.length) {
+        const nested = walk(part.parts, preferMime);
+        if (nested) return nested;
+      }
     }
-  }
-  for (const part of parts) {
-    if (part.body && part.body.data) {
-      return decodeBase64Url(part.body.data);
-    }
-  }
+    return "";
+  };
+  const plain = walk(parts, "text/plain");
+  if (plain) return plain;
+  const html = walk(parts, "text/html");
+  if (html) return html;
   return "";
 }
 
@@ -688,6 +808,8 @@ module.exports = {
   getRedirectUri,
   getOutlookStatus,
   disconnectOutlook,
+  flagOutlookNeedsReconnect,
+  isOutlookInvalidGrant,
   handleOAuthCallback,
   syncDispatcherInbox,
   sendQuoteReply,

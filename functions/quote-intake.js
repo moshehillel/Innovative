@@ -16,17 +16,25 @@ const QUOTE_CLASSIFY_BODY_MAX = 12000;
 // all 17/17). Keep Haiku. Override with QUOTE_EXTRACT_MODEL (Claude or gpt-*).
 const DEFAULT_QUOTE_EXTRACT_MODEL = "claude-haiku-4-5";
 
+/** Max plain-text body kept for extract / queue persistence. */
+const QUOTE_BODY_STORE_MAX = 20000;
+
 /**
  * Flatten HTML / MIME bodies into plain text for heuristics + AI.
+ * Strips styles/scripts and data-URI blobs so huge HTML never reaches
+ * Firestore queue docs or the model prompt.
  * @param {string} input Raw body.
  * @return {string}
  */
 function toPlainText(input) {
   let text = String(input || "");
+  // Drop embedded base64 / data-URI blobs before tag stripping.
+  text = text.replace(/data:[a-z0-9.+/-]+;base64,[a-z0-9+/=\s]+/gi, " ");
   if (/<[a-z][\s\S]*>/i.test(text)) {
     text = text
         .replace(/<style[\s\S]*?<\/style>/gi, " ")
         .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<!--[\s\S]*?-->/g, " ")
         .replace(/<br\s*\/?>/gi, "\n")
         .replace(/<\/p>/gi, "\n")
         .replace(/<\/div>/gi, "\n")
@@ -46,6 +54,17 @@ function toPlainText(input) {
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]{2,}/g, " ")
       .trim();
+}
+
+/**
+ * Plain-text body capped for queue / extract storage.
+ * @param {string} input Raw or HTML body.
+ * @param {number} [max] Max chars (default QUOTE_BODY_STORE_MAX).
+ * @return {string}
+ */
+function sanitizeEmailBodyForStore(input, max) {
+  const cap = Math.max(1000, Number(max) || QUOTE_BODY_STORE_MAX);
+  return toPlainText(input).slice(0, cap);
 }
 
 /**
@@ -156,16 +175,105 @@ function finishExtract(extracted, opts) {
  * @return {string}
  */
 function extractJsonObject(raw) {
-  const cleaned = String(raw || "")
+  let cleaned = String(raw || "")
       .replace(/^```(?:json)?\s*/i, "")
-      .replace(/\s*```$/i, "")
+      .replace(/\s*```\s*$/i, "")
       .trim();
   if (!cleaned) return "";
-  if (cleaned.startsWith("{") && cleaned.endsWith("}")) return cleaned;
   const start = cleaned.indexOf("{");
   const end = cleaned.lastIndexOf("}");
-  if (start >= 0 && end > start) return cleaned.slice(start, end + 1);
+  if (start >= 0 && end > start) {
+    cleaned = cleaned.slice(start, end + 1);
+  }
+  // Trailing commas before } or ] break JSON.parse.
+  cleaned = cleaned.replace(/,\s*([}\]])/g, "$1");
   return cleaned;
+}
+
+/**
+ * Salvage complete lane objects from truncated/broken extract JSON.
+ * @param {string} raw Model text.
+ * @return {Array<object>}
+ */
+function salvageQuoteLanes(raw) {
+  const src = String(raw || "");
+  const out = [];
+  let i = 0;
+  while (i < src.length) {
+    if (src[i] !== "{") {
+      i += 1;
+      continue;
+    }
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    let end = -1;
+    for (let j = i; j < src.length; j++) {
+      const c = src[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === "\"") inStr = false;
+        continue;
+      }
+      if (c === "\"") {
+        inStr = true;
+        continue;
+      }
+      if (c === "{") depth += 1;
+      else if (c === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          end = j;
+          break;
+        }
+      }
+    }
+    if (end < 0) {
+      i += 1;
+      continue;
+    }
+    const chunk = src.slice(i, end + 1);
+    try {
+      const obj = JSON.parse(chunk.replace(/,\s*([}\]])/g, "$1"));
+      if (obj && typeof obj === "object" && !Array.isArray(obj) &&
+          (obj.consignee || obj.freightInfo || obj.laneKey || obj.label)) {
+        out.push(obj);
+      }
+    } catch (_) {
+      // skip non-lane objects
+    }
+    i = end + 1;
+  }
+  return out;
+}
+
+/**
+ * Parse model extract JSON with trailing-comma + truncated-lane salvage.
+ * @param {string} raw Model text.
+ * @return {object|null}
+ */
+function parseQuoteExtractJson(raw) {
+  const jsonText = extractJsonObject(raw);
+  if (!jsonText) return null;
+  try {
+    const parsed = JSON.parse(jsonText);
+    if (parsed && typeof parsed === "object") return parsed;
+  } catch (_) {
+    // fall through to salvage
+  }
+  const lanes = salvageQuoteLanes(raw);
+  if (!lanes.length) return null;
+  return {
+    format: "multi_lane_table",
+    customerRef: null,
+    readyDate: null,
+    shipper: null,
+    lanes,
+    specialInstructionsGlobal: "",
+    flags: {needsDispatcherReview: true},
+    extractionSource: "json_lane_salvage",
+  };
 }
 
 /**
@@ -328,6 +436,16 @@ function quoteExtractSystemPrompt() {
     "  from a known customer profile) — do NOT put the sole address on",
     "  shipper by default. Multi-address emails (Ship From + Ship To,",
     "  or clear origin + destination) still map normally.",
+    "- REPLY / thin follow-ups: when the latest message is short (e.g.",
+    "  \"it's floor loaded\", \"please check rates\", \"adding quoting",
+    "  team\") but the quoted thread still has origin + destination",
+    "  and/or freight, EXTRACT lanes from the thread history. Do not",
+    "  return empty lanes just because the newest reply is thin.",
+    "- Informal OD: \"Pick up at <addr>\", \"from X to Y\", \"from",
+    "  Newark airport/port to Staten Island\", \"Vancouver port to",
+    "  Toronto\" are valid origins/destinations.",
+    "- Informal freight: \"1 pallet: 48x68.5x40, 300 lbs\" or",
+    "  \"Each pallet is 48*40*90\" still fill freightInfo.",
   ].join("\n");
 }
 
@@ -340,7 +458,8 @@ async function callClaudeQuoteExtraction(payload, model) {
   const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
   const res = await client.messages.create({
     model,
-    max_tokens: 4000,
+    // Multi-lane Target/table RFQs need headroom; 4k truncates mid-JSON.
+    max_tokens: 16000,
     system: quoteExtractSystemPrompt(),
     messages: [{
       role: "user",
@@ -365,7 +484,7 @@ async function callOpenAiQuoteExtraction(payload, model) {
   const client = new OpenAI({apiKey});
   const completion = await client.chat.completions.create({
     model,
-    max_completion_tokens: 4000,
+    max_completion_tokens: 16000,
     response_format: {type: "json_object"},
     messages: [
       {role: "system", content: quoteExtractSystemPrompt()},
@@ -518,12 +637,14 @@ function extractCompactPalletBlocks(body) {
  * @return {number|null}
  */
 function parseInformalPalletCount(text) {
-  const re = /\b(\d+)\s*(?:pallets?|plts?|skids?)\b/gi;
+  // Do not span newlines — zip codes above a "pallet:" line (e.g. 91601)
+  // were being read as pallet counts.
+  const re = /\b(\d{1,3})\s+(?:pallets?|plts?|skids?)\b/gi;
   let max = null;
   let m;
   while ((m = re.exec(String(text || ""))) !== null) {
     const n = Number(m[1]);
-    if (!Number.isFinite(n) || n < 1) continue;
+    if (!Number.isFinite(n) || n < 1 || n > 200) continue;
     if (max == null || n > max) max = n;
   }
   return max;
@@ -882,75 +1003,80 @@ function correctCartonVsPalletFreight(extracted, body) {
 }
 
 /**
- * Deterministic fallback when AI returns empty/invalid JSON.
- * Handles Pickup Location + Shipping To quote emails.
- * @param {object} opts subject, from, body.
- * @return {object|null}
+ * Build a single-lane extract payload from shipper/consignee/freight.
+ * @param {object} opts subject, shipper, consignee, freightInfo, body, flags.
+ * @return {object}
  */
-function heuristicExtractQuote(opts) {
+function buildSingleLaneExtract(opts) {
   const subject = String(opts.subject || "");
+  const shipper = opts.shipper || null;
+  const consignee = opts.consignee || null;
   const body = String(opts.body || "");
-  const pickupMatch = body.match(
-      /Pickup Location:\s*([\s\S]*?)(?:Shipping To:|Ship To:|$)/i);
-  // eslint-disable-next-line max-len
-  const shipToMatch = body.match(/(?:Shipping To:|Ship To:)\s*([\s\S]*?)(?:Special Instructions:|Sales Order|Number of Pallets|Pallet Details|$)/i);
-  if (!pickupMatch || !shipToMatch) return null;
-
-  const shipper = parseAddressBlock(pickupMatch[1]);
-  const consignee = parseAddressBlock(shipToMatch[1]);
-  if (!shipper || !consignee) return null;
-
-  const soMatch = body.match(/Sales Order\s*#?:\s*([A-Z0-9-]+)/i) ||
-    body.match(/Please quote\s+([A-Z0-9-]+)/i);
-  const customerRef = (soMatch && soMatch[1]) || subject.slice(0, 120);
-  let freightInfo = extractPalletFreight(body);
+  let freightInfo = Array.isArray(opts.freightInfo) ? opts.freightInfo : [];
+  if (!freightInfo.length) {
+    freightInfo = extractInformalPalletFreight(body);
+  }
+  if (!freightInfo.length) {
+    freightInfo = extractPalletFreight(body);
+  }
   const labeled = parseLabeledFreightTotals(body);
-  const hasLabeledFreight = labeled.palletCount != null ||
-    labeled.cartonCount != null || labeled.weight != null ||
-    labeled.length != null;
-  if (hasLabeledFreight) {
+  if (labeled.palletCount != null || labeled.cartonCount != null ||
+      labeled.weight != null || labeled.length != null) {
     freightInfo = applyLabeledFreightTotals(freightInfo, labeled);
-  } else if (!freightInfo.length) {
-    const pallets = body.match(/Number of Pallets:\s*(\d+)/i);
+  }
+  if (!freightInfo.length) {
+    const cartonM = body.match(/(\d+)\s*cartons?\b/i);
+    const pltM = body.match(
+        /(?:^|\b)(?:1\s+pallet|one\s+pallet|\d+\s*pallets?)\b/i);
     freightInfo = [freightDims.normalizePalletDims({
-      qty: pallets ? Number(pallets[1]) : 1,
+      qty: pltM && /\d+/.test(pltM[0]) ?
+        Number(pltM[0].match(/\d+/)[0]) : (cartonM ? 1 : 1),
       weight: null,
       weightType: "total",
       class: null,
       length: null,
       width: null,
       height: null,
-      dimType: "PLT",
+      dimType: cartonM && !pltM ? "CTN" : "PLT",
     })];
+    if (cartonM) {
+      freightInfo[0].qty = Number(cartonM[1]) || 1;
+      freightInfo[0].dimType = "CTN";
+    }
   }
   freightInfo = freightInfo.map((r) => freightDims.normalizePalletDims({
     ...r,
     weightType: r.weightType || "total",
   }));
 
-  const special = [];
-  // eslint-disable-next-line max-len
-  const si = body.match(/Special Instructions:\s*([\s\S]*?)(?:LTLFlow|Shipment Data|Sales Order|$)/i);
-  if (si) special.push(si[1].replace(/\s+/g, " ").trim());
-  if (/lift\s*gate/i.test(body)) special.push("Liftgate required");
-  if (/no loading dock|no dock/i.test(body)) special.push("No loading dock");
-
-  const laneKey = `${consignee.city}_${consignee.state}`
+  const city = consignee && consignee.city || "destination";
+  const state = consignee && consignee.state || "";
+  const laneKey = `${city}_${state || "XX"}`
       .toUpperCase()
       .replace(/[^A-Z0-9]+/g, "_");
+  const special = [];
+  if (/lift\s*gate/i.test(body)) special.push("Liftgate required");
+  if (/residential/i.test(body)) special.push("Residential delivery");
+  if (/no loading dock|no dock/i.test(body)) special.push("No loading dock");
+  if (/floor\s*loaded/i.test(body)) special.push("Floor loaded");
+  if (/live\s*unload/i.test(body)) special.push("Live unload");
+  if (/drayage/i.test(body)) special.push("Drayage");
 
   return {
     format: "single_shipment",
-    customerRef,
+    customerRef: subject.slice(0, 120),
     readyDate: null,
     shipper,
     lanes: [{
       laneKey,
-      label: `TO ${consignee.city}, ${consignee.state}`,
-      consignee,
+      label: `TO ${city}${state ? `, ${state}` : ""}`.trim(),
+      consignee: consignee || {
+        name: "", address1: "", city: "", state: "", zipCode: "",
+        country: "US", phone: null,
+      },
       siteType: /furniture|residential/i.test(body) ? "residential" : "other",
       freightInfo,
-      referenceNumbers: customerRef ? [customerRef] : [],
+      referenceNumbers: [],
       specialInstructions: special.filter(Boolean).join("; "),
       flags: {
         missingClass: true,
@@ -967,8 +1093,409 @@ function heuristicExtractQuote(opts) {
           .test(body),
       requestedAccessorials: [],
     },
-    extractionSource: "heuristic_fallback",
+    extractionSource: opts.extractionSource || "heuristic_fallback",
   };
+}
+
+/**
+ * Informal "1 pallet: LxWxH, N lbs" / "Each pallet is L*W*H".
+ * @param {string} body Body text.
+ * @return {Array<object>}
+ */
+function extractInformalPalletFreight(body) {
+  const text = String(body || "");
+  const freight = [];
+  const seen = new Set();
+  const patterns = [
+    // eslint-disable-next-line max-len
+    /(\d+)\s*pallets?\s*:\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*,?\s*([\d.,]+)\s*lbs/gi,
+    // eslint-disable-next-line max-len
+    /(?:^|\b)(?:1|one)\s+pallet\s*:\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*,?\s*([\d.,]+)\s*lbs/gi,
+    // eslint-disable-next-line max-len
+    /each\s+pallet\s+is\s+([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/gi,
+    // eslint-disable-next-line max-len
+    /Order\s+\d+\s+Pallet\s+\d+\s*:\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+in\s+([\d.,]+)\s*lbs/gi,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      const key = m[0].slice(0, 80);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (m.length >= 6 && /\d+\s*pallets?\s*:/i.test(m[0])) {
+        freight.push(freightDims.normalizePalletDims({
+          qty: Number(m[1]) || 1,
+          length: Number(m[2]),
+          width: Number(m[3]),
+          height: Number(m[4]),
+          weight: Number(String(m[5]).replace(/,/g, "")),
+          weightType: "total",
+          dimType: "PLT",
+        }));
+      } else if (/^1\s+pallet|^one\s+pallet/i.test(m[0].trim()) ||
+          /(?:^|\b)(?:1|one)\s+pallet/i.test(m[0])) {
+        freight.push(freightDims.normalizePalletDims({
+          qty: 1,
+          length: Number(m[1]),
+          width: Number(m[2]),
+          height: Number(m[3]),
+          weight: Number(String(m[4]).replace(/,/g, "")),
+          weightType: "total",
+          dimType: "PLT",
+        }));
+      } else if (/each\s+pallet/i.test(m[0])) {
+        freight.push(freightDims.normalizePalletDims({
+          qty: 1,
+          length: Number(m[1]),
+          width: Number(m[2]),
+          height: Number(m[3]),
+          weight: null,
+          weightType: "total",
+          dimType: "PLT",
+        }));
+      } else if (/Order\s+\d+\s+Pallet/i.test(m[0])) {
+        freight.push(freightDims.normalizePalletDims({
+          qty: 1,
+          length: Number(m[1]),
+          width: Number(m[2]),
+          height: Number(m[3]),
+          weight: Number(String(m[4]).replace(/,/g, "")),
+          weightType: "total",
+          dimType: "PLT",
+        }));
+      }
+    }
+  }
+  return freight;
+}
+
+/**
+ * Parse a loose city / city+state / city+state+zip fragment.
+ * @param {string} text Address-ish text.
+ * @return {object|null}
+ */
+function parseLoosePlace(text) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return null;
+  // Street-number lines first (before city/state/zip eats the whole string).
+  // eslint-disable-next-line max-len
+  const streetCity = raw.match(
+      // eslint-disable-next-line max-len
+      /^(\d{1,6}\s+(?:[A-Za-z0-9.'#-]+\s+){0,6}(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|way|ln|lane|ct|court|pl|place|hwy|highway)\.?)\s*,?\s*([A-Za-z .'-]+?)(?:\s+([A-Z]{2}))?(?:\s+(\d{5}(?:-\d{4})?))?\s*$/i);
+  if (streetCity) {
+    return {
+      name: "",
+      address1: streetCity[1].trim(),
+      city: streetCity[2].replace(/,/g, "").trim(),
+      state: streetCity[3] ? streetCity[3].toUpperCase() : "",
+      zipCode: streetCity[4] || "",
+      country: "US",
+      phone: null,
+    };
+  }
+  // eslint-disable-next-line max-len
+  const streetLoose = raw.match(
+      // eslint-disable-next-line max-len
+      /^(\d{1,6}\s+[A-Za-z0-9 .'#-]+?)\s+([A-Za-z .'-]{2,40}?)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\s*$/i);
+  if (streetLoose) {
+    return {
+      name: "",
+      address1: streetLoose[1].trim(),
+      city: streetLoose[2].replace(/,/g, "").trim(),
+      state: streetLoose[3].toUpperCase(),
+      zipCode: streetLoose[4],
+      country: "US",
+      phone: null,
+    };
+  }
+  const block = parseAddressBlock(raw.replace(/,\s*/g, "\n"));
+  if (block) return block;
+  const csz = parseCityStateZip(raw);
+  if (csz) {
+    return {
+      name: "",
+      address1: "",
+      city: csz.city,
+      state: csz.state,
+      zipCode: csz.zipCode,
+      country: "US",
+      phone: null,
+    };
+  }
+  const citySt = raw.match(/^(.+?),?\s+([A-Z]{2})\s*$/i);
+  if (citySt) {
+    return {
+      name: "",
+      address1: "",
+      city: citySt[1].replace(/,/g, "").trim(),
+      state: citySt[2].toUpperCase(),
+      zipCode: "",
+      country: "US",
+      phone: null,
+    };
+  }
+  // City-only known metros / ports (ZIP fill later).
+  const cityOnly = raw.match(new RegExp(
+      "^(san francisco|los angeles|north hollywood|staten island|" +
+      "toronto|vancouver|newark|new york|brooklyn|chicago)\\b", "i"));
+  if (cityOnly) {
+    const city = cityOnly[1].replace(/\b\w/g, (c) => c.toUpperCase());
+    const stateMap = {
+      "san francisco": "CA", "los angeles": "CA", "north hollywood": "CA",
+      "staten island": "NY", "toronto": "ON", "vancouver": "BC",
+      "newark": "NJ", "new york": "NY", "brooklyn": "NY", "chicago": "IL",
+    };
+    return {
+      name: "",
+      address1: "",
+      city,
+      state: stateMap[cityOnly[1].toLowerCase()] || "",
+      zipCode: "",
+      country: /toronto|vancouver/i.test(city) ? "CA" : "US",
+      phone: null,
+    };
+  }
+  return null;
+}
+
+/**
+ * Heuristic: "Pick up at <origin>" + following destination lines.
+ * @param {object} opts subject, body.
+ * @return {object|null}
+ */
+function heuristicPickUpAt(opts) {
+  const subject = String(opts.subject || "");
+  const body = String(opts.body || "");
+  const pick = body.match(/Pick\s*up\s*at\s+([^\n]+)/i);
+  if (!pick) return null;
+  const shipper = parseLoosePlace(pick[1].trim()) ||
+    parseAddressBlock(pick[1].replace(/,\s*/g, "\n"));
+  if (!shipper || !(shipper.city || shipper.zipCode || shipper.address1)) {
+    return null;
+  }
+
+  const after = body.slice(pick.index + pick[0].length);
+  const destLines = after
+      .split(/\n/)
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .filter((l) => !/^(pallet|pallets|plt|skid)\b/i.test(l))
+      .filter((l) => !/^\d+\s*pallets?\s*:/i.test(l))
+      .filter((l) => !/^(please|thank|hi+|hello)\b/i.test(l))
+      .filter((l) => !/@/.test(l))
+      .filter((l) => !/^www\./i.test(l))
+      .slice(0, 6);
+
+  let consignee = null;
+  for (let i = 0; i < destLines.length; i++) {
+    const line = destLines[i];
+    // Prefer street-number lines; allow city-only after.
+    const joined = i + 1 < destLines.length ?
+      `${line}, ${destLines[i + 1]}` : line;
+    consignee = parseLoosePlace(joined) || parseLoosePlace(line);
+    if (consignee && (consignee.city || consignee.address1) &&
+        !/pallet|lbs|price/i.test(consignee.city || "")) {
+      // If city looks like freight noise, skip.
+      break;
+    }
+    consignee = null;
+  }
+  if (!consignee) {
+    // Fall back: known city name anywhere after pickup.
+    const cityHit = after.match(new RegExp(
+        "\\b(San Francisco|Los Angeles|Staten Island|New York|" +
+        "Toronto|Vancouver|Newark)\\b", "i"));
+    if (cityHit) consignee = parseLoosePlace(cityHit[1]);
+  }
+  if (!consignee) return null;
+
+  // Contact name/phone on a "pallet:Name (phone)" line → consignee name.
+  const contact = after.match(
+      /pallet\s*:\s*([^(\n]+?)\s*\(?(\d{3}[^)\n]{0,20}\d{4})\)?/i);
+  if (contact) {
+    consignee.name = contact[1].trim();
+    if (contact[2]) {
+      consignee.phone = contact[2].replace(/[^\d+()-]/g, "").trim();
+    }
+  }
+
+  return buildSingleLaneExtract({
+    subject,
+    body,
+    shipper,
+    consignee,
+    extractionSource: "heuristic_pickup_at",
+  });
+}
+
+/**
+ * Heuristic: "from X to Y" / "from X airport/port to Y".
+ * @param {object} opts subject, body.
+ * @return {object|null}
+ */
+function heuristicFromTo(opts) {
+  const subject = String(opts.subject || "");
+  const body = String(opts.body || "");
+  const blob = `${subject}\n${body}`;
+
+  // Prefer explicit warehouse / UP address blocks when present.
+  const upAddr = body.match(/UP\s+address\.?\s*([^\n]+)/i);
+  let whCity = null;
+  const whRe = /Warehouse\s+in\s+([^\n.]+)/gi;
+  let whM;
+  while ((whM = whRe.exec(body)) !== null) {
+    const cand = String(whM[1] || "").trim();
+    if (/los\s*angel/i.test(cand) || /^[A-Za-z .'-]{2,40}$/.test(cand)) {
+      whCity = cand;
+      if (/los\s*angel/i.test(cand)) break;
+    }
+  }
+  if (upAddr && whCity) {
+    let originText = whCity;
+    if (/los\s*angel/i.test(originText)) originText = "Los Angeles, CA";
+    const shipper = parseLoosePlace(originText);
+    const consignee = parseLoosePlace(upAddr[1].trim());
+    if (shipper && consignee &&
+        (consignee.address1 || consignee.city || consignee.zipCode)) {
+      return buildSingleLaneExtract({
+        subject,
+        body,
+        shipper,
+        consignee,
+        extractionSource: "heuristic_from_to",
+      });
+    }
+  }
+
+  const patterns = [
+    // eslint-disable-next-line max-len
+    /(?:transfer\s+)?from\s+((?:[^.\n]{0,40}?\b)?(?:port|airport|warehouse|van)\b[^.\n]{0,40}?)\s+to\s+([^.\n?]{3,80})/i,
+    /from\s+([^.\n]{3,60}?)\s+to\s+([^.\n?]{3,60})/i,
+    /drayage[^\n]{0,40}?from\s+([^.\n]{3,60}?)\s+to\s+([^.\n?]{3,60})/i,
+  ];
+  for (const re of patterns) {
+    const m = blob.match(re);
+    if (!m) continue;
+    let originText = m[1].trim()
+        .replace(/^(?:an?\s+)?(?:empty\s+)?/i, "")
+        .trim();
+    let destText = m[2].trim()
+        .replace(/\s+about\s+\d.*$/i, "")
+        .replace(/\s+and\s+also\b.*$/i, "")
+        .replace(/\s+to\s+load\b.*$/i, "")
+        .trim();
+    if (upAddr) destText = upAddr[1].trim();
+    if (whCity && /los\s*angel/i.test(whCity)) {
+      originText = "Los Angeles, CA";
+    }
+    // Normalize "Newark airport/port" / "Vancouver port".
+    originText = originText
+        .replace(/\b(airport|port)\b/ig, "")
+        .replace(/\s+/g, " ")
+        .trim() || originText;
+    destText = destText
+        .replace(/\b(airport|port)\b/ig, "")
+        .replace(/\s+/g, " ")
+        .trim() || destText;
+
+    const shipper = parseLoosePlace(originText);
+    const consignee = parseLoosePlace(destText);
+    const shipOk = shipper && (shipper.city || shipper.address1 ||
+      shipper.zipCode);
+    const consOk = consignee && (consignee.city || consignee.address1 ||
+      consignee.zipCode);
+    if (!shipOk || !consOk) continue;
+    return buildSingleLaneExtract({
+      subject,
+      body,
+      shipper,
+      consignee,
+      extractionSource: "heuristic_from_to",
+    });
+  }
+  return null;
+}
+
+/**
+ * Deterministic fallback when AI returns empty/invalid JSON.
+ * Handles Pickup Location + Shipping To, Pick up at, and from→to RFQs.
+ * @param {object} opts subject, from, body.
+ * @return {object|null}
+ */
+function heuristicExtractQuote(opts) {
+  const subject = String(opts.subject || "");
+  const body = String(opts.body || "");
+  const pickupMatch = body.match(
+      /Pickup Location:\s*([\s\S]*?)(?:Shipping To:|Ship To:|$)/i);
+  // eslint-disable-next-line max-len
+  const shipToMatch = body.match(/(?:Shipping To:|Ship To:)\s*([\s\S]*?)(?:Special Instructions:|Sales Order|Number of Pallets|Pallet Details|$)/i);
+  if (pickupMatch && shipToMatch) {
+    const shipper = parseAddressBlock(pickupMatch[1]);
+    const consignee = parseAddressBlock(shipToMatch[1]);
+    if (shipper && consignee) {
+      const soMatch = body.match(/Sales Order\s*#?:\s*([A-Z0-9-]+)/i) ||
+        body.match(/Please quote\s+([A-Z0-9-]+)/i);
+      const built = buildSingleLaneExtract({
+        subject: (soMatch && soMatch[1]) || subject,
+        body,
+        shipper,
+        consignee,
+        extractionSource: "heuristic_fallback",
+      });
+      built.customerRef = (soMatch && soMatch[1]) || subject.slice(0, 120);
+      return built;
+    }
+  }
+
+  const pickUpAt = heuristicPickUpAt(opts);
+  if (pickUpAt) return pickUpAt;
+
+  const fromTo = heuristicFromTo(opts);
+  if (fromTo) return fromTo;
+
+  // Thread has freight dims + any two address-like lines → review lane.
+  const freight = extractInformalPalletFreight(body);
+  const labeled = parseLabeledFreightTotals(body);
+  const hasFreight = freight.length > 0 ||
+    labeled.palletCount != null || labeled.weight != null ||
+    /\d+\s*cartons?\b/i.test(body);
+  if (!hasFreight) return null;
+
+  // Try to find two place-like lines with street numbers.
+  const lines = body.split(/\n/).map((l) => l.trim()).filter(Boolean);
+  const places = [];
+  for (const line of lines) {
+    if (places.length >= 2) break;
+    if (!/\d/.test(line)) continue;
+    if (/^[A-Z]{2}\s+\d{5}/i.test(line)) continue;
+    const place = parseLoosePlace(line);
+    if (place && (place.address1 || place.zipCode ||
+        (place.city && place.state))) {
+      places.push(place);
+    }
+  }
+  if (places.length < 2 && !fromTo) {
+    // Review skeleton when freight is clear (dispatcher fills OD).
+    if (freight.length || labeled.palletCount != null) {
+      return buildSingleLaneExtract({
+        subject,
+        body,
+        shipper: null,
+        consignee: places[0] || null,
+        freightInfo: freight,
+        extractionSource: "heuristic_freight_only",
+      });
+    }
+    return null;
+  }
+  return buildSingleLaneExtract({
+    subject,
+    body,
+    shipper: places[0] || null,
+    consignee: places[1] || places[0] || null,
+    freightInfo: freight,
+    extractionSource: "heuristic_thread_places",
+  });
 }
 
 /**
@@ -1093,8 +1620,10 @@ function parseStgRowForDest(block, dest) {
   if (!anchor) return null;
 
   const before = block.slice(0, anchor.index);
-  const tailRe =
-    /(\d[\d,]*(?:\.\d+)?)[\s\n]+(\d+)[\s\n]+(\d+)[\s\n]+\d{2}\/\d{2}\/\d{2,4}\b/gi;
+  const tailRe = new RegExp(
+      "(\\d[\\d,]*(?:\\.\\d+)?)[\\s\\n]+(\\d+)[\\s\\n]+(\\d+)" +
+      "[\\s\\n]+\\d{2}/\\d{2}/\\d{2,4}\\b",
+      "gi");
   let tail = null;
   let tailMatch;
   while ((tailMatch = tailRe.exec(before)) !== null) {
@@ -1163,7 +1692,9 @@ function applyStgShippingFromSections(extracted, body) {
       const row = parseStgRowForDest(block, dest);
       if (!row) continue;
       lanes.push({
+        // eslint-disable-next-line max-len
         laneKey: `STG_${originCity.replace(/\s+/g, "_").toUpperCase()}_${dest.key}`,
+        // eslint-disable-next-line max-len
         label: `TO ${dest.name}, ${dest.state} ${dest.zip} (STG ${originCity}, ${originState})`,
         shipper: {...shipper},
         consignee: {
@@ -1316,7 +1847,7 @@ function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
 async function extractQuoteRequest(opts) {
   const subject = String(opts.subject || "");
   const from = String(opts.from || "");
-  const body = toPlainText(opts.body).slice(0, 12000);
+  const body = sanitizeEmailBodyForStore(opts.body, 12000);
   const fallback = {
     format: "unknown",
     customerRef: subject.slice(0, 120),
@@ -1350,12 +1881,11 @@ async function extractQuoteRequest(opts) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       raw = await callQuoteExtractionModel({subject, from, body}, extractModel);
-      const jsonText = extractJsonObject(raw);
-      if (!jsonText) {
+      const parsed = parseQuoteExtractJson(raw);
+      if (!parsed) {
         lastErr = new Error("empty model response");
         continue;
       }
-      const parsed = JSON.parse(jsonText);
       if (!Array.isArray(parsed.lanes)) parsed.lanes = [];
       if (!parsed.flags) parsed.flags = {};
       parsed.extractModel = extractModel;
@@ -1371,6 +1901,10 @@ async function extractQuoteRequest(opts) {
   const heuristic = heuristicExtractQuote({subject, from, body});
   if (heuristic) {
     heuristic.extractModel = "heuristic";
+    if (lastErr) {
+      pushExtractWarning(heuristic,
+          `AI extract failed (${lastErr.message}); used heuristic`);
+    }
     return finishExtract(heuristic, {subject, body, from});
   }
 
@@ -1516,15 +2050,19 @@ async function classifyIsQuoteRequest(opts) {
 
 module.exports = {
   DEFAULT_QUOTE_EXTRACT_MODEL,
+  QUOTE_BODY_STORE_MAX,
   getQuoteExtractModel,
   isOpenAiExtractModel,
   quoteExtractSystemPrompt,
   callQuoteExtractionModel,
   extractJsonObject,
+  parseQuoteExtractJson,
+  salvageQuoteLanes,
   extractQuoteRequest,
   looksLikeQuoteRequest,
   classifyIsQuoteRequest,
   toPlainText,
+  sanitizeEmailBodyForStore,
   normalizeSoleAddressToConsignee,
   fillShipperFromLaneLabelOrigin,
   applyStgShippingFromSections,
@@ -1537,11 +2075,14 @@ module.exports = {
   correctCartonVsPalletFreight,
   extractCompactPalletBlocks,
   extractPalletFreight,
+  extractInformalPalletFreight,
   extractNumberedShipmentSections,
   applyNumberedShipmentPalletBlocks,
   applyEmailPalletBlocks,
   parseInformalPalletCount,
   heuristicExtractQuote,
+  heuristicPickUpAt,
+  heuristicFromTo,
   inferWeightTypeFromBody,
   normalizeFreightOnExtract,
 };

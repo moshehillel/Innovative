@@ -92,6 +92,8 @@ async function primusFetch(path, opts = {}) {
 
 /**
  * Normalizes one rate row from Primus API response.
+ * Keeps only dispatcher-facing fields — Primus returns large nested
+ * payloads that must not be written into quoteRequests docs.
  * @param {object} r Raw rate.
  * @return {object}
  */
@@ -104,11 +106,23 @@ function normalizeRateRow(r) {
   const guaranteed =
     r.guaranteed === true ||
     String(r.rateType || "").toUpperCase() === "GUARANTEED";
+  const billTo = r.billTo && typeof r.billTo === "object" ? {
+    total: r.billTo.total != null ? r.billTo.total : null,
+  } : null;
   return {
-    ...r,
-    warnings,
-    guaranteed,
+    name: r.name || r.carrierName || null,
+    SCAC: r.SCAC || r.scac || null,
+    total: r.total != null ? r.total : null,
+    transitDays: r.transitDays != null ? r.transitDays : null,
+    rateType: r.rateType || null,
+    mode: r.mode || null,
+    serviceType: r.serviceType || null,
     quoteNumber: r.quoteNumber || r.accountNumber || null,
+    rateId: r.rateId || r.id || null,
+    vendorId: r.vendorId || null,
+    billTo,
+    warnings: String(warnings || "").slice(0, 500),
+    guaranteed,
   };
 }
 
@@ -969,7 +983,8 @@ function buildRateMultipleQuery(lane, opts = {}) {
  * Market rates: cost + min(flat $ markup, percent of cost), default $55 / 10%.
  * All sell rates round UP to the next whole dollar (Math.ceil).
  * @param {number} cost Carrier cost.
- * @param {object} [opts] billToTotal, rateSource, marginPercent, marginMinDollars.
+ * @param {object} [opts] billToTotal, rateSource, marginPercent,
+ *   marginMinDollars.
  * @return {number|null}
  */
 function computeSellRate(cost, opts = {}) {
