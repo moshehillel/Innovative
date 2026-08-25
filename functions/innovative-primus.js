@@ -148,6 +148,19 @@ function isBillingCompleteInFirestore(invoice, primusSteps) {
  */
 async function hasIssuedCustomerInvoiceInPrimus(loadNumber) {
   if (!loadNumber) return false;
+  const flags = await readIssuedCustomerInvoiceFlags(loadNumber);
+  return !!(flags && flags.generated);
+}
+
+/**
+ * Paid / already-emailed flags for the issued Primus customer invoice.
+ * Used to block resends of invoices that accounting already collected.
+ * @param {string} loadNumber Load/BOL number.
+ * @return {Promise<{generated:boolean, paid:boolean, sent:boolean,
+ *   invoiceNumber: (string|number|null)}|null>}
+ */
+async function readIssuedCustomerInvoiceFlags(loadNumber) {
+  if (!loadNumber) return null;
   try {
     const invData = await primusRequest(
         "GET",
@@ -156,11 +169,20 @@ async function hasIssuedCustomerInvoiceInPrimus(loadNumber) {
     const results = invData && invData.data && invData.data.results;
     const list = Array.isArray(results) ?
       results : (results ? [results] : []);
-    return list.some((inv) =>
+    const issued = list.find((inv) =>
       inv && inv.status && inv.status.generated,
-    );
+    ) || null;
+    if (!issued) return null;
+    const status = issued.status || {};
+    return {
+      generated: true,
+      paid: !!status.paid,
+      sent: !!status.sent,
+      invoiceNumber: issued.invoiceNumber != null ?
+        issued.invoiceNumber : null,
+    };
   } catch (_) {
-    return false;
+    return null;
   }
 }
 
@@ -3233,6 +3255,57 @@ exports.processPrimusWorkflow = onRequest(
             });
           }
 
+          const restFlags = await readIssuedCustomerInvoiceFlags(
+              invoice.loadNumber);
+          const alreadyPaid = !!(restFlags && restFlags.paid);
+          const alreadySent = !!(restFlags && restFlags.sent);
+          if (alreadyPaid || (skipToCustomerEmail && alreadySent)) {
+            const skipReason = alreadyPaid ?
+              "Customer invoice already paid — not resent" :
+              "Customer invoice already emailed — not resent";
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "final_email_sent",
+              stepStatus: "skipped",
+              reason: skipReason,
+              output: {
+                to: customerEmail,
+                paid: alreadyPaid,
+                sent: alreadySent,
+                invoiceNumber: restFlags && restFlags.invoiceNumber,
+              },
+            });
+            await invoiceDoc.ref.update({
+              decisionStage: "completed",
+              decisionReason: skipReason,
+              customerName: customerName,
+              customerRate: customerRate,
+              profit: profit,
+              primusSteps: primusSteps,
+              finalWorkflowStatus: "completed_no_customer_email",
+              customerInvoiceId: finalCustomerInvoiceId,
+              issuedInvoiceNumber: issuedInvoiceNumber ||
+                (restFlags && restFlags.invoiceNumber) || null,
+              processingLock: false,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await writeLog("warn", "workflow",
+                "Customer email skipped — invoice already paid or sent", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerEmail,
+                  paid: alreadyPaid,
+                  sent: alreadySent,
+                  skipToCustomerEmail,
+                  invoiceNumber: restFlags && restFlags.invoiceNumber,
+                });
+            return res.json({
+              ok: true,
+              workflowStatus: "completed_no_customer_email",
+              skippedEmailReason: skipReason,
+            });
+          }
+
           if (!customerEmail) {
             await pauseWorkflow(
                 invoiceDoc.ref,
@@ -3458,9 +3531,12 @@ exports.processPrimusWorkflow = onRequest(
                 });
           }
 
-          // Backstop: push to QB if early sync was skipped (older invoices)
-          // or failed transiently. Idempotent via primusSteps.qbBillingSynced.
-          if (finalCustomerInvoiceId && !primusSteps.qbBillingSynced) {
+          // Backstop: push to QB if early sync was skipped or failed
+          // transiently on invoices THIS workflow billed. Do not re-push
+          // already-issued invoices we only emailed (rePushToQB can unmark
+          // paid in QuickBooks / Primus).
+          if (finalCustomerInvoiceId && !primusSteps.qbBillingSynced &&
+              !skipToCustomerEmail) {
             await pushCarrierBillToQuickBooks({
               req,
               invoiceDoc,
