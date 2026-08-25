@@ -10,7 +10,8 @@
 
 const admin = require("firebase-admin");
 const declinedAcc = require("./quote-declined-accessorials");
-const emailAcc = require("./quote-email-accessorials");
+// quote-email-accessorials is lazy-required in applyRulesToLane to avoid
+// a circular dependency with quote-output (via catalog → rate-shop).
 
 const IDENTIFY_VIA_VALUES = ["address_text", "ai", "both", "email"];
 const DEFAULT_IDENTIFY_VIA = "both";
@@ -35,6 +36,7 @@ const DEST_TO_ORIGIN_ACCESSORIAL = {
  * from DEFAULT_RULES on load (overrides stale Firestore seed values).
  */
 const MANAGED_DEFAULT_RULE_IDS = new Set([
+  "aafes_military",
   "amazon_fc",
   "chain_store_appointment",
   "sender_mike_oseback",
@@ -726,6 +728,26 @@ function ruleMatchViaAi(lane, context, rule, side = "dest") {
 }
 
 /**
+ * True when email siteType disagrees with enrichment classification.
+ * Used to avoid false chain_store (etc.) matches from email when Google /
+ * heuristics classified the address as a different specific type
+ * (e.g. NEX DC mislabeled chain_store → aafes_military).
+ * @param {object} lane Lane.
+ * @param {"dest"|"origin"} [side] Address side.
+ * @return {boolean}
+ */
+function enrichmentConflictsEmailSiteType(lane, side = "dest") {
+  const meta = side === "origin" ?
+    lane.originEnrichmentMeta : lane.enrichmentMeta;
+  if (!meta) return false;
+  const emailType = meta.emailSiteType || null;
+  const classified = meta.classifiedAs || null;
+  if (!emailType || emailType === "other") return false;
+  if (!classified || classified === "other") return false;
+  return emailType !== classified;
+}
+
+/**
  * @param {object} lane Lane with consignee, flags, specialInstructions.
  * @param {object} context Global context (specialInstructionsGlobal).
  * @param {object} rule Rule document.
@@ -734,8 +756,16 @@ function ruleMatchViaAi(lane, context, rule, side = "dest") {
  */
 function ruleMatchVia(lane, context, rule, side = "dest") {
   const identifyVia = normalizeIdentifyVia(rule);
-  const textVia = ruleMatchViaText(lane, context, rule, side);
+  let textVia = ruleMatchViaText(lane, context, rule, side);
   const aiVia = ruleMatchViaAi(lane, context, rule, side);
+
+  // Prefer enrichment site identity over a conflicting email siteType
+  // for text matches (keeps identifyVia "both" from applying the wrong
+  // chain/Amazon rule when enrichment already reclassified the site).
+  if (textVia === "siteType" &&
+    enrichmentConflictsEmailSiteType(lane, side)) {
+    textVia = null;
+  }
 
   if (identifyVia === "address_text") return textVia;
   if (identifyVia === "ai") return aiVia;
@@ -866,7 +896,11 @@ function applyRulesToLane(lane, rules, context = {}) {
 
   // Delivery-only / pickup-only liftgate phrasing wins over a stale
   // liftgate_no_dock that still seeds both LFO and LFD.
-  const refined = emailAcc.refineLiftgateSides(
+  // Lazy require: quote-email-accessorials ↔ catalog ↔ rate-shop ↔
+  // quote-output ↔ this module forms a cycle; top-level require can
+  // leave refineLiftgateSides undefined on the partial exports object.
+  const emailAccLazy = require("./quote-email-accessorials");
+  const refined = emailAccLazy.refineLiftgateSides(
       stripped.accessorials, declineText);
 
   return {

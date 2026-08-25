@@ -330,6 +330,52 @@ const aafes = addressEnrichment.classifyFromNameHeuristics({
 check("AAFES dest heuristic military", aafes && aafes.siteType,
     "aafes_military");
 
+const nexDc = addressEnrichment.classifyFromNameHeuristics({
+  name: "NEX NE DC Suffolk",
+  address1: "1000 Kenyon Court",
+  city: "Suffolk",
+  state: "VA",
+});
+check("NEX DC heuristic military", nexDc && nexDc.siteType, "aafes_military");
+
+const wcRetail = addressEnrichment.classifyFromNameHeuristics({
+  name: "WC Retail Dist Ctr",
+  address1: "4250 EUCALYPTUS AVE",
+  city: "CHINO",
+  state: "CA",
+});
+check("WC Retail Dist Ctr heuristic military",
+    wcRetail && wcRetail.siteType, "aafes_military");
+
+// Email mislabeled chain_store; enrichment says aafes — do not apply
+// chain_store_appointment from the conflicting email siteType.
+const conflictChainVsAafes = {
+  consignee: {
+    name: "WC Retail Dist Ctr",
+    city: "CHINO",
+    state: "CA",
+    zipCode: "91710",
+  },
+  shipper: {name: "Weida Freight System"},
+  flags: {},
+  siteType: "aafes_military",
+  enrichmentMeta: {
+    classifiedAs: "aafes_military",
+    emailSiteType: "chain_store",
+    source: "name_heuristic",
+    side: "dest",
+  },
+};
+const outConflict = quoteRules.applyRulesToLane(conflictChainVsAafes, rules, {});
+checkHas("conflict email chain vs aafes → APD", outConflict.accessorials, "APD");
+checkHas("conflict email chain vs aafes → LAD", outConflict.accessorials, "LAD");
+check("conflict skips chain_store rule",
+    !(outConflict.appliedRules || [])
+        .some((r) => r.ruleId === "chain_store_appointment"), true);
+check("conflict applies aafes rule",
+    (outConflict.appliedRules || [])
+        .some((r) => r.ruleId === "aafes_military"), true);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

@@ -588,6 +588,15 @@ function consigneeSearchText(consignee, extraName) {
 function isMilitarySiteText(text) {
   const t = String(text || "").toLowerCase();
   if (/aafes|military exchange|army (and )?air force/.test(t)) return true;
+  // Navy / Marine exchange DCs (NEXCOM RFQs often omit "navy exchange").
+  if (/\b(nex|nexcom|navy exchange|mcx|base exchange|bx|commissary)\b/
+      .test(t)) {
+    return true;
+  }
+  // NEXCOM West Coast retail DC is often labeled "WC Retail Dist Ctr".
+  if (/\bwc\s+retail\s+dist(\.|ribution)?\s*(ctr|center)?\b/.test(t)) {
+    return true;
+  }
   if (/\bmilitary(\s+(base|bases|post|installation|facility)s?)?\b/.test(t)) {
     return true;
   }
