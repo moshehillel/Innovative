@@ -1034,6 +1034,7 @@ async function processQuoteEmail(opts) {
     try {
       await addressEnrichment.enrichLaneAddresses(lane, tenant, {
         log: enrichLog,
+        quoteRules: rules,
       });
     } catch (err) {
       await deps.writeLog("warn", "quote", "Address enrichment failed", {
@@ -1608,6 +1609,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         await addressEnrichment.enrichLaneAddresses(laneForRate, tenant, {
           log: (level, category, message, logData) =>
             deps.writeLog(level, category, message, logData),
+          quoteRules: rules,
         });
       } catch (enrichErr) {
         await deps.writeLog("warn", "quote",

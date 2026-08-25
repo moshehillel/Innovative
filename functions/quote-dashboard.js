@@ -332,6 +332,7 @@ async function handleQuoteRulesChat(req, res) {
     const result = await quoteRulesChat.runQuoteRulesChatTurn({
       messages,
       existingRules,
+      pendingProposal: req.body && req.body.pendingProposal || null,
     });
     // Backfill name/match on update proposals so Confirm never fails
     // with "Proposal needs name or match criteria".

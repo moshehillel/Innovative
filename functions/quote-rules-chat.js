@@ -11,6 +11,7 @@ const {
   DEFAULT_IDENTIFY_VIA,
   ACCESSORIAL_LABELS,
   RULE_KIND_SENDER_CUSTOMER,
+  RULE_KIND_ZIP_FILL,
 } = require("./quote-accessorial-rules");
 
 // Default gpt-5.6-luna for freeform rule chat. Override via env.
@@ -32,6 +33,8 @@ const PATCH_FIELDS = [
   "customerName",
   "protocolOnly",
   "defaultDims",
+  "fillZipCode",
+  "applyTo",
 ];
 
 const QUICK_REPLY_CAN_BE =
@@ -43,6 +46,94 @@ const IDENTIFY_QUICK_REPLIES = [
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,
 ];
+
+/** Loose normalize for NL confirm/reject matching. */
+function normalizeChatAnswerText(text) {
+  return String(text || "")
+      .trim()
+      .replace(/^\*{1,3}\s*/, "")
+      .replace(/\s*\*{1,3}$/, "")
+      .replace(/^`+|`+$/g, "")
+      .toLowerCase()
+      .replace(/[\u2010-\u2015\u2212]/g, "-")
+      .replace(/[^\w\s'-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
+ * User declined or wants to change a pending proposal.
+ * @param {string} text User message.
+ * @return {boolean}
+ */
+function parseNaturalRejection(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const norm = normalizeChatAnswerText(raw);
+  if (/^(no|nope|nah|cancel|stop|wait|hold on|nevermind|never mind)\.?$/i
+      .test(raw)) {
+    return true;
+  }
+  if (/\b(not quite|not right|that'?s wrong|wrong rule|change (it|that)|hold on|wait a sec)\b/
+      .test(norm)) {
+    return true;
+  }
+  return /\b(don'?t|do not)\s+(apply|save|confirm|do that)\b/.test(norm) ||
+    (/\b(cancel|scratch that|forget it)\b/.test(norm) && norm.length <= 80);
+}
+
+/**
+ * Natural-language confirmation — like ChatGPT/Cursor, not exact "yes".
+ * @param {string} text User message.
+ * @param {{pendingProposal?: boolean}=} opts Context hints.
+ * @return {boolean}
+ */
+function parseNaturalConfirmation(text, opts) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (parseNaturalRejection(raw)) return false;
+  const norm = normalizeChatAnswerText(raw);
+
+  const exactAffirm = new RegExp(
+      "^(" +
+      "yes|yep|yeah|yea|yup|ok|okay|k|sure|correct|right|exactly|perfect|" +
+      "absolutely|definitely|confirmed|confirm|apply|proceed|go ahead|do it|" +
+      "save it|looks good|sounds good|that works|please do|please apply|" +
+      "go for it|make it so|do that|affirmative|" +
+      "that'?s it|that'?s right|that'?s correct|that'?s good|that'?s fine|" +
+      "that'?s perfect" +
+      ")\\.?$",
+      "i",
+  );
+  if (exactAffirm.test(raw)) return true;
+
+  const phraseAffirm = [
+    /\bthat('s| is) (right|correct|it|good|fine|perfect|what i want)\b/,
+    /\b(yes|yeah|yep|yup)[,.]?\s*(that('s| is) (right|correct|it)|go ahead|please|do it|apply|save)\b/,
+    /\b(go ahead|please apply|please save|please do|please confirm)\b/,
+    /\b(sounds|looks) good\b/,
+    /\b(i('m| am) good|we('re| are) good)\b/,
+    /\bgo for it\b/,
+    /\bdo (that|this)\b/,
+    /\bapply (that|this|it)\b/,
+    /\bsave (that|this|it)\b/,
+    /\blet'?s do (it|that)\b/,
+    /\bmake it (happen|so)\b/,
+    /\byou got it\b/,
+    /\bperfect[,.]?\s*(thanks|thank you)?\s*$/,
+  ];
+  if (phraseAffirm.some((re) => re.test(norm))) return true;
+
+  if (opts && opts.pendingProposal) {
+    if (/^(yes|yep|yeah|yup|ok|okay|sure|right|correct|perfect)\b/i
+        .test(norm)) {
+      return true;
+    }
+    if (/\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 56) return true;
+  }
+
+  return false;
+}
 
 /**
  * Normalize identify-choice text for robust matching.
@@ -312,8 +403,72 @@ function looksLikeMilitaryAccessorialIntent(messages) {
 }
 
 /**
- * Fallback when JSON is empty or the model is unclear. Never the old
- * "I could not process that" dead-end.
+ * Strip dead-end / robotic phrasing from model replies.
+ * @param {string} reply Raw reply text.
+ * @param {Array<object>} messages Chat turns for fallback context.
+ * @return {string}
+ */
+function sanitizeChatReply(reply, messages) {
+  let text = String(reply || "").trim();
+  if (!text) return fallbackUnclearReply(messages);
+  const bad = [
+    /\bi don'?t understand\b/i,
+    /\bi do not understand\b/i,
+    /\bi couldn'?t understand\b/i,
+    /\bi'?m not sure what you mean\b/i,
+    /\bi could not process\b/i,
+    /\btry rephrasing\b/i,
+    /\bplease rephrase\b/i,
+    /\bi'?m unable to (help|process)\b/i,
+    /\bi can'?t help with that\b/i,
+  ];
+  if (bad.some((re) => re.test(text))) {
+    return fallbackUnclearReply(messages);
+  }
+  return text;
+}
+
+/**
+ * Rejection may include a correction ("no, I meant delivery not pickup").
+ * @param {string} text User message.
+ * @return {{rejected: boolean, correction: string|null}}
+ */
+function parseRejectionWithCorrection(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return {rejected: false, correction: null};
+  if (!parseNaturalRejection(raw)) {
+    return {rejected: false, correction: null};
+  }
+  const norm = normalizeChatAnswerText(raw);
+  const stripped = raw.replace(/^(no|nope|nah|wait|hold on)[,.!\s-]+/i, "")
+      .trim();
+  if (stripped.length >= 10 && stripped.toLowerCase() !== raw.toLowerCase()) {
+    return {rejected: true, correction: stripped};
+  }
+  if (/\b(i meant|should be|instead|rather|not pickup|not delivery|wrong)\b/
+      .test(norm) && raw.length >= 12) {
+    return {rejected: true, correction: raw};
+  }
+  return {rejected: true, correction: null};
+}
+
+/**
+ * Friendly reply when user rejects a pending proposal.
+ * @param {string|null} correction Optional correction text.
+ * @return {string}
+ */
+function rejectionReply(correction) {
+  if (correction) {
+    return "Oh sorry — I'll adjust. You said: \"" +
+      correction.replace(/"/g, "'") +
+      "\". Let me rework that proposal.";
+  }
+  return "Oh sorry — I'll drop that proposal. What should the rule do instead?";
+}
+
+/**
+ * Fallback when JSON is empty or the model is unclear. Never "I don't
+ * understand" — always ask naturally or propose a guess.
  * @param {Array<object>} messages Chat turns.
  * @return {string}
  */
@@ -326,18 +481,39 @@ function fallbackUnclearReply(messages) {
         "we attach? You can also say protocol only or default dims " +
         "(e.g. 40×48×62).";
     }
-    return "I can map a sender email to a Primus customer. " +
-      "Tell me the From address and customer name " +
-      "(and protocol only / default dims if needed).";
+    return "Do you mean map a sender email to a Primus customer? " +
+      "Send the From address and customer name and I'll propose it.";
+  }
+  if (looksLikeZipFillIntent(messages)) {
+    const topic = inferZipFillTopic(messages);
+    if (topic && topic.city && !topic.zipCode) {
+      return `You mean when pickup/delivery is ${topic.city}` +
+        `${topic.state ? ", " + topic.state : ""} — which ZIP should ` +
+        "we use for rating?";
+    }
+    return "Do you mean a city→ZIP rating rule? Tell me the city and " +
+      "ZIP (e.g. La Mirada pickup → 90670) and I'll propose it.";
   }
   if (isMilitaryTopicBlob(userTopicBlob(messages))) {
-    return "I can add or update the military / AAFES site rule " +
-      "(limited access and appointment delivery). Tell me LAD, APD, " +
-      "or both and I'll propose it.";
+    return "Do you mean add or update accessorials for military / AAFES " +
+      "sites — like LAD and APD? Say which codes and I'll propose it.";
   }
-  return "Tell me the site (for example military bases) and which " +
-    "accessorials to add (LAD, APD, …), or map a sender email to a " +
-    "customer. I'll propose a rule to Confirm.";
+  if (looksLikeDeleteRuleIntent(messages)) {
+    return "Do you mean delete or turn off an existing rule? Tell me " +
+      "which one (name, site type, or sender email) and I'll propose it.";
+  }
+  const last = lastUserTurn(messages);
+  const snippet = last ?
+    String(last.content || "").trim().replace(/\s+/g, " ").slice(0, 140) :
+    "";
+  if (snippet && snippet.length >= 8) {
+    return "Do you mean you want a quote rule for: \"" + snippet + "\"? " +
+      "If I'm on the right track, add any details (site, email, " +
+      "accessorials, ZIP) and I'll propose something to confirm.";
+  }
+  return "What quote rule would you like? I handle site accessorials, " +
+    "sender→customer mapping, city→ZIP fixes, rule updates, deletes — " +
+    "describe it however you like and I'll propose it for you to confirm.";
 }
 
 /**
@@ -507,10 +683,9 @@ function buildAddressOnlyCreateProposal(messages, accessorials) {
   const name = formatCreateRuleName(topic, codes);
   const labels = codes.map((c) => ACCESSORIAL_LABELS[c] || c).join(", ");
   return {
-    reply: `Here's a proposed rule for ${topic.name} that adds ` +
-      `${labels} (identified via AI site classification, ` +
-      `match.siteType ${match.siteType || "flags"}). ` +
-      `Click Confirm to apply it.`,
+    reply: `For **${topic.name}**, I'll add ${labels} when AI classifies ` +
+      `the site as ${match.siteType || "matching flags"}. ` +
+      "Does that look right? Say yes / sounds good / go ahead, or click Confirm.",
     action: "propose_create_rule",
     proposal: {
       ruleId: topic.ruleId,
@@ -607,8 +782,7 @@ function detectCreateIdentifyGate(messages) {
     if (source === "email" && askedEmailSignals) {
       // Any substantive follow-up after we asked for signals counts.
       if (text.trim().length >= 8 &&
-          !/^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
-              .test(text.trim()) &&
+          !parseNaturalConfirmation(text) &&
           !looksLikeMilitaryAccessorialIntent(messages) &&
           !isMetaFollowUpText(text)) {
         emailSignalsListed = true;
@@ -883,9 +1057,9 @@ function buildMilitaryAccessorialProposal(messages, existingRules) {
       Object.keys(live.match).length ?
       live.match : {siteType: "aafes_military"};
     return {
-      reply: `I'll update "${live.name}" (${live.id}) so it adds ` +
-        `${labels} (match.siteType aafes_military, identified via ` +
-        `AI / address). Click Confirm to apply it.`,
+      reply: `I'll update **${live.name}** to add ${labels} for military / ` +
+        `AAFES sites (AI address classification). Look good? Say yes or ` +
+        "click Confirm to save.",
       action: "propose_update_rule",
       proposal: {
         ruleId: String(live.id),
@@ -1332,11 +1506,293 @@ function buildSenderCustomerProposal(messages, existingRules) {
   if (defaultDims) patch.defaultDims = defaultDims;
 
   return {
-    reply: `Here's a sender→customer rule: ${bits.join("; ")}. ` +
+    reply: `Sender→customer mapping: ${bits.join("; ")}. ` +
       (matchCcTo ?
-        "Identified via From/Cc/To email (no site-type / accessorials). " :
-        "Identified via From email (no site-type / accessorials). ") +
-      "Click Confirm to apply it.",
+        "Matched via From/Cc/To email — no accessorials involved. " :
+        "Matched via From email — no accessorials involved. ") +
+      "Does that look right? Say yes / sounds good / go ahead, or click Confirm.",
+    action: live ? "propose_update_rule" : "propose_create_rule",
+    proposal: {ruleId, patch},
+    quickReplies: [],
+  };
+}
+
+/**
+ * Parse a 5-digit US ZIP from freeform text.
+ * @param {string} text User text.
+ * @return {string}
+ */
+function parseZipCodeFromText(text) {
+  const t = String(text || "");
+  const labeled = t.match(
+      /\b(?:zip|zipcode|postal)\s*(?:code)?\s*[:=]?\s*(\d{5})\b/i);
+  if (labeled) return labeled[1];
+  const useZip = t.match(/\buse\s+(?:zip\s+)?(\d{5})\b/i);
+  if (useZip) return useZip[1];
+  const toZip = t.match(/\b(?:to|as)\s+(?:zip\s+)?(\d{5})\b/i);
+  if (toZip) return toZip[1];
+  const all = t.match(/\b(\d{5})\b/g) || [];
+  return all.length ? all[all.length - 1] : "";
+}
+
+/**
+ * Parse city + optional state from zip-fill phrasing.
+ * @param {string} text User text.
+ * @return {{city: string, state: string, side: "origin"|"dest"}}
+ */
+function parseCityStateFromZipFillText(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  let side = "origin";
+  if (/\b(delivery|deliver|consignee|ship\s*to|destination)\b/i.test(t)) {
+    side = "dest";
+  }
+  if (/\b(pickup|pick\s*up|ship\s*from|origin)\b/i.test(t)) {
+    side = "origin";
+  }
+
+  const known = [
+    {re: /\bla\s*mirada\b/i, city: "La Mirada", state: "CA"},
+    {re: /\bsanta\s*fe\s*springs\b/i, city: "Santa Fe Springs", state: "CA"},
+    {re: /\brialto\b/i, city: "Rialto", state: "CA"},
+    {re: /\blakewood\b/i, city: "Lakewood", state: "NJ"},
+  ];
+  for (const row of known) {
+    if (row.re.test(t)) {
+      return {city: row.city, state: row.state, side};
+    }
+  }
+
+  const pickupFrom = t.match(
+      /\b(?:pickup|pick\s*up|ship\s*from|ship\s*from)\s+(?:from|at|in|is)\s+(.+?)(?:\s+(?:use|with|zip|zipcode)\b|$)/i);
+  if (pickupFrom && pickupFrom[1]) {
+    const chunk = pickupFrom[1].replace(/,\s*$/, "").trim();
+    for (const row of known) {
+      if (row.re.test(chunk)) {
+        return {city: row.city, state: row.state, side: "origin"};
+      }
+    }
+    const cs = chunk.match(/^([A-Za-z .'-]+?)(?:\s*,?\s*([A-Z]{2}))?$/);
+    if (cs && cs[1] && cs[1].trim().length >= 2) {
+      return {
+        city: cs[1].replace(/,/g, "").trim(),
+        state: cs[2] ? cs[2].toUpperCase() : "",
+        side: "origin",
+      };
+    }
+  }
+
+  const whenCity = t.match(
+      /\b(?:when|if|for)\s+(?:pickup\s+(?:is|from|at)\s+)?(?:delivery\s+(?:is|to)\s+)?(.+?)\s+(?:use\s+)?(?:zip|zipcode)\b/i);
+  if (whenCity && whenCity[1]) {
+    const chunk = whenCity[1].replace(/,\s*$/, "").trim();
+    const cs = chunk.match(/^([A-Za-z .'-]+?)(?:\s*,?\s*([A-Z]{2}))?$/);
+    if (cs && cs[1]) {
+      return {
+        city: cs[1].replace(/,/g, "").trim(),
+        state: cs[2] ? cs[2].toUpperCase() : "",
+        side,
+      };
+    }
+  }
+
+  const cityStateZip = t.match(
+      /\b([A-Za-z .'-]{2,40}?)\s*,?\s*([A-Z]{2})\b(?:\s+\d{5})?/);
+  if (cityStateZip) {
+    return {
+      city: cityStateZip[1].replace(/,/g, "").trim(),
+      state: cityStateZip[2].toUpperCase(),
+      side,
+    };
+  }
+
+  return {city: "", state: "", side};
+}
+
+/**
+ * Infer zip-fill rule fields from chat history.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object|null}
+ */
+function inferZipFillTopic(messages) {
+  const blob = (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (!blob.trim()) return null;
+  const zipCode = parseZipCodeFromText(blob);
+  const place = parseCityStateFromZipFillText(blob);
+  if (!zipCode || !place.city) return null;
+  return {
+    city: place.city,
+    state: place.state,
+    side: place.side,
+    zipCode,
+  };
+}
+
+/**
+ * Stable rule id from city/state/side.
+ * @param {object} topic Inferred topic.
+ * @return {string}
+ */
+function zipFillRuleIdFromTopic(topic) {
+  const slug = String(topic.city || "custom")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "")
+      .slice(0, 40);
+  const side = topic.side === "dest" ? "dest" : "origin";
+  return `zip_fill_${slug}_${side}`;
+}
+
+/**
+ * User wants a city/state → ZIP correction rule.
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function looksLikeZipFillIntent(messages) {
+  if (looksLikeDeleteRuleIntent(messages)) return false;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (!lastText || /^\[applied\]/i.test(lastText.trim())) return false;
+  const blob = isMetaFollowUpText(lastText) ?
+    userTopicBlob(messages) : lastText.toLowerCase();
+  const hasZip = !!parseZipCodeFromText(blob);
+  const place = parseCityStateFromZipFillText(blob);
+  const zipCue = /\b(zip|zipcode|postal)\b/.test(blob) ||
+    /\buse\s+(?:zip\s+)?\d{5}\b/.test(blob) ||
+    hasZip;
+  const cityCue = !!place.city ||
+    /\b(pickup|pick\s*up|ship\s*from|origin|delivery|city)\b/.test(blob);
+  if (zipCue && (place.city || /\bla\s*mirada\b|\bsanta\s*fe\b/.test(blob))) {
+    return true;
+  }
+  if (/\bwhen\b.{0,40}\b(pickup|pick\s*up|ship\s*from)\b/.test(blob) &&
+      hasZip) {
+    return true;
+  }
+  if (/\b(fill|correct|fix|override)\b.{0,40}\bzip\b/.test(blob) &&
+      (place.city || hasZip)) {
+    return true;
+  }
+  if (place.city &&
+      /\b(pickup|pick\s*up|ship\s*from|origin|delivery|consignee)\b/.test(blob)) {
+    return true;
+  }
+  const topic = inferZipFillTopic(messages);
+  return !!(topic && topic.city && topic.zipCode && cityCue);
+}
+
+/**
+ * Find an existing zip-fill rule for the same city/side.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object} topic Inferred topic.
+ * @return {object|null}
+ */
+function findExistingZipFillRule(existingRules, topic) {
+  const wantCity = String(topic.city || "").trim().toLowerCase();
+  const wantState = String(topic.state || "").trim().toUpperCase();
+  const wantSide = topic.side === "dest" ? "dest" : "origin";
+  for (const r of existingRules || []) {
+    if (!r || r.active === false || !isZipFillRuleDoc(r)) continue;
+    const side = r.applyTo === "dest" || r.applyTo === "origin" ?
+      r.applyTo : "origin";
+    if (side !== wantSide) continue;
+    const match = r.match && typeof r.match === "object" ? r.match : {};
+    const cities = side === "origin" ?
+      [].concat(match.shipperCityContains || match.cityContains || []) :
+      [].concat(match.consigneeCityContains || match.cityContains || []);
+    const cityHit = cities.some((c) =>
+      wantCity.includes(String(c || "").trim().toLowerCase()) ||
+      String(c || "").trim().toLowerCase().includes(wantCity));
+    const stateRaw = side === "origin" ?
+      match.shipperState || match.state : match.consigneeState || match.state;
+    const stateHit = !wantState || !stateRaw ||
+      String(stateRaw).trim().toUpperCase() === wantState;
+    if (cityHit && stateHit) return r;
+  }
+  return null;
+}
+
+/**
+ * @param {object} rule Rule doc.
+ * @return {boolean}
+ */
+function isZipFillRuleDoc(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  if (rule.ruleKind === RULE_KIND_ZIP_FILL) return true;
+  const zip = String(rule.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+  if (!/^\d{5}$/.test(zip)) return false;
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  return !!(match.shipperCityContains || match.consigneeCityContains);
+}
+
+/**
+ * Deterministic create/update proposal for city/state → ZIP fill.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {object|null}
+ */
+function buildZipFillProposal(messages, existingRules) {
+  if (!looksLikeZipFillIntent(messages)) return null;
+  const topic = inferZipFillTopic(messages);
+  if (!topic || !topic.city) {
+    return {
+      reply: "I can add a ZIP fill rule for pickup or delivery cities. " +
+        "Tell me the city, state, and ZIP (e.g. La Mirada CA → 90670).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+  if (!topic.zipCode) {
+    return {
+      reply: `Got ${topic.city}${topic.state ? ", " + topic.state : ""} — ` +
+        "which 5-digit ZIP should we use for rating?",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
+  const live = findExistingZipFillRule(existingRules || [], topic);
+  const side = topic.side === "dest" ? "dest" : "origin";
+  const cityNeedle = topic.city.trim().toLowerCase();
+  const match = {};
+  if (side === "origin") {
+    match.shipperCityContains = [cityNeedle];
+    if (topic.state) match.shipperState = topic.state.toUpperCase();
+  } else {
+    match.consigneeCityContains = [cityNeedle];
+    if (topic.state) match.consigneeState = topic.state.toUpperCase();
+  }
+
+  const ruleId = live ? String(live.id) : zipFillRuleIdFromTopic(topic);
+  const sideLabel = side === "origin" ? "pickup" : "delivery";
+  const name = `${topic.city}${topic.state ? ", " + topic.state : ""} ` +
+    `${sideLabel} → ZIP ${topic.zipCode}`;
+
+  const patch = {
+    active: true,
+    priority: (live && live.priority) || 3,
+    name,
+    ruleKind: RULE_KIND_ZIP_FILL,
+    identifyVia: "ai",
+    applyTo: side,
+    match,
+    fillZipCode: topic.zipCode,
+    addAccessorials: [],
+    notes: `When ${sideLabel} city matches ${topic.city}` +
+      `${topic.state ? " " + topic.state : ""}, use ZIP ${topic.zipCode}.`,
+    autoApply: true,
+    requiresConfirm: false,
+  };
+
+  return {
+    reply: `I'll set pickup/delivery ZIP for ${topic.city}` +
+      `${topic.state ? ", " + topic.state : ""} to **${topic.zipCode}** ` +
+      `when the ${sideLabel} city matches. Does that look right? ` +
+      "Say yes / sounds good / go ahead, or click Confirm to save it.",
     action: live ? "propose_update_rule" : "propose_create_rule",
     proposal: {ruleId, patch},
     quickReplies: [],
@@ -1369,6 +1825,13 @@ function proposalHasEnoughIdentifyInfo(result) {
         .concat(match.senderEmails || []);
     const domains = [].concat(match.senderDomains || []);
     return emails.length > 0 || domains.length > 0;
+  }
+  if (patch.ruleKind === RULE_KIND_ZIP_FILL ||
+      String(patch.fillZipCode || "").replace(/\D/g, "").length === 5) {
+    const cities = [].concat(match.shipperCityContains || [])
+        .concat(match.consigneeCityContains || [])
+        .concat(match.cityContains || []);
+    return cities.length > 0;
   }
   if (match.siteType || (Array.isArray(match.flags) && match.flags.length)) {
     return true;
@@ -1420,11 +1883,14 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
   const senderOut = buildSenderCustomerProposal(
       messages, existingRules || []);
   if (senderOut) return senderOut;
+  const zipOut = buildZipFillProposal(messages, existingRules || []);
+  if (zipOut) return zipOut;
 
   // Model already produced a complete Confirmable proposal — keep it.
   if (proposalHasEnoughIdentifyInfo(out)) {
     if (/could not process|try rephrasing/i.test(String(out.reply || ""))) {
-      out.reply = "Here's a rule proposal — click Confirm to apply it.";
+      out.reply = "Here's what I'd change — review the summary below. " +
+        "Say yes / sounds good / go ahead, or click Confirm to save it.";
     }
     return out;
   }
@@ -1456,6 +1922,7 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
     (gate.status === "needed" && looksLikeCreateRuleIntent(messages) &&
       !isClearlySiteTypeTopic(messages) &&
       !looksLikeSenderCustomerIntent(messages) &&
+      !looksLikeZipFillIntent(messages) &&
       action !== "none");
   const creating = action === "propose_create_rule" ||
     looksLikeCreateRuleIntent(messages) ||
@@ -1468,6 +1935,11 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
     const forced = buildSenderCustomerProposal(
         messages, existingRules || []);
     if (forced) return forced;
+  }
+  if (looksLikeZipFillIntent(messages)) {
+    const forcedZip = buildZipFillProposal(
+        messages, existingRules || []);
+    if (forcedZip) return forcedZip;
   }
 
   const addressOnlyReady = gate.status === "ready" &&
@@ -1488,6 +1960,9 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
   // Never ask LAD/APD / site-type for sender email mapping.
   if (looksLikeSenderCustomerIntent(messages)) {
     return buildSenderCustomerProposal(messages, existingRules || []) || out;
+  }
+  if (looksLikeZipFillIntent(messages)) {
+    return buildZipFillProposal(messages, existingRules || []) || out;
   }
 
   if (gate.status === "ready") {
@@ -1542,9 +2017,9 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       out.quickReplies = [];
       if (extras.askedAccessorials && lastIsAccessorials === false &&
           lastUser && !parseIdentifyChoiceAnswer(lastUser.content)) {
-        out.reply = "I didn't catch an accessorial code. Send codes like " +
-          "LAD, LFD, APD (any case), or a name like \"limited access\". " +
-          "LOAD is treated as LAD.";
+        out.reply = "Do you mean accessorial codes like LAD, LFD, or APD? " +
+          "You can use the code or a name like \"limited access\" " +
+          "(LOAD counts as LAD).";
       } else {
         out.reply = "Got it — address / site classification only " +
           "(AI enrichment). I'll match via siteType / flags " +
@@ -1647,6 +2122,48 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
 async function runQuoteRulesChatTurn(opts) {
   const chatTurns = opts.messages || [];
   const existingRules = opts.existingRules || [];
+  const pending = opts.pendingProposal && typeof opts.pendingProposal === "object" ?
+    opts.pendingProposal : null;
+  const last = lastUserTurn(chatTurns);
+  const lastText = last ? String(last.content || "") : "";
+
+  if (pending && lastText) {
+    if (parseNaturalConfirmation(lastText, {pendingProposal: true})) {
+      return {
+        reply: "Perfect — applying that rule now.",
+        action: pending.action || "propose_create_rule",
+        proposal: {
+          ruleId: pending.ruleId || pending.deleteRuleId,
+          patch: pending.patch || {},
+          deleteRuleId: pending.deleteRuleId || pending.ruleId,
+          deleteRuleIds: pending.deleteRuleIds,
+        },
+        confirmApply: true,
+        quickReplies: [],
+      };
+    }
+    const rej = parseRejectionWithCorrection(lastText);
+    if (rej.rejected) {
+      return {
+        reply: rejectionReply(rej.correction),
+        action: rej.correction ? "none" : "dismiss_pending",
+        proposal: null,
+        quickReplies: [],
+        dismissedCorrection: rej.correction || null,
+      };
+    }
+  }
+
+  if (isMetaFollowUpText(lastText)) {
+    return {
+      reply: "Sorry about that — tell me again what rule you want and " +
+        "I'll propose it clearly for you to confirm.",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
   // Obvious delete / military APD+LAD updates skip the model so a leftover
   // identify gate cannot steal the turn.
   const deleteOut = buildDeleteRuleProposal(chatTurns, existingRules);
@@ -1656,12 +2173,14 @@ async function runQuoteRulesChatTurn(opts) {
   if (militaryOut) return militaryOut;
   const senderOut = buildSenderCustomerProposal(chatTurns, existingRules);
   if (senderOut) return senderOut;
+  const zipOut = buildZipFillProposal(chatTurns, existingRules);
+  if (zipOut) return zipOut;
 
   const gateHint = detectCreateIdentifyGate(chatTurns);
-  const last = lastUserTurn(chatTurns);
-  const lastText = last ? String(last.content || "") : "";
-  const lastIsAcc = parseAccessorialsAnswer(lastText).length > 0;
-  const lastIsChoice = !!parseIdentifyChoiceAnswer(lastText);
+  const lastTurn = lastUserTurn(chatTurns);
+  const lastTurnText = lastTurn ? String(lastTurn.content || "") : "";
+  const lastIsAcc = parseAccessorialsAnswer(lastTurnText).length > 0;
+  const lastIsChoice = !!parseIdentifyChoiceAnswer(lastTurnText);
   // After Cannot-be, only skip the model for a structured accessorial
   // or identify answer. Follow-ups go to gpt-5.6-luna.
   if (gateHint.status === "ready" && gateHint.source === "address_only" &&
@@ -1689,18 +2208,23 @@ async function runQuoteRulesChatTurn(opts) {
   ).slice(0, 8000);
 
   const systemPrompt = [
-    "You are a sharp freight quote-rules admin assistant for Innovative",
-    "Carriers dispatchers. Infer messy natural-language intent like a",
-    "normal helpful AI — do NOT act like a brittle form. Prefer proposing",
-    "a Confirmable rule as soon as you have enough facts. Never invent",
+    "You are a sharp, conversational freight quote-rules assistant for",
+    "Innovative Carriers dispatchers. Talk like ChatGPT or Cursor — infer",
+    "messy natural-language intent, ask ONE smart clarifying question when",
+    "something is ambiguous, and propose a confirmable rule as soon as you",
+    "have enough facts. Never act like a rigid form or bot. Never invent",
     "\"I could not process that\" / \"Try rephrasing\" dead-ends.",
     "",
-    "You manage TWO rule kinds:",
+    "You manage THREE rule kinds:",
     "1) Accessorial / site rules — site types or text → Primus codes",
     "   (LAD limited access, APD appointment dest, LFD/LFO liftgate,",
     "   NUD nursing, HOD hotel, RSD residential, SCD school, INS).",
     "2) Sender→customer rules — From email/@domain → Primus customerName,",
     "   optional protocolOnly, optional defaultDims. No accessorials.",
+    "3) ZIP fill rules — city/state pickup or delivery → rating ZIP.",
+    "   ruleKind zip_fill; fillZipCode 5 digits; applyTo origin|dest;",
+    "   match shipperCityContains+shipperState (pickup) or",
+    "   consigneeCityContains+consigneeState (delivery). No accessorials.",
     "",
     "Current active rules JSON:",
     rulesJson,
@@ -1722,10 +2246,11 @@ async function runQuoteRulesChatTurn(opts) {
     "",
     "Patch fields: active, priority, name, match, addAccessorials,",
     "filterCarrierWarnings, notes, autoApply, requiresConfirm, identifyVia,",
-    "ruleKind, customerName, protocolOnly, defaultDims.",
+    "ruleKind, customerName, protocolOnly, defaultDims, fillZipCode, applyTo.",
     "match: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType,",
-    "fromEmails, senderEmails, senderDomains, ccEmails, toEmails.",
+    "fromEmails, senderEmails, senderDomains, ccEmails, toEmails,",
+    "shipperCityContains, shipperState, consigneeCityContains, consigneeState.",
     "",
     "=== CORE BEHAVIOR ===",
     "- Infer intent from typos and casual English.",
@@ -1741,7 +2266,10 @@ async function runQuoteRulesChatTurn(opts) {
     "- Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
     "- If one fact is missing, ask ONE short question (action none).",
     "- Never claim you saved/updated/deleted — only Confirm applies.",
-    "- Typed Confirm/Yes/Done → remind them to click Confirm (action none).",
+    "- When proposing a rule, summarize it plainly and invite natural",
+    "  confirmation (yes, sounds good, go ahead, that's right).",
+    "- If user confirms naturally but action is still propose_*, keep the",
+    "  proposal — the UI applies on confirm.",
     "- [APPLIED] messages are ground-truth Confirm results.",
     "- Live rule truth = Current active rules JSON only.",
     "",
@@ -1782,6 +2310,15 @@ async function runQuoteRulesChatTurn(opts) {
     "User: delete all rules for militery bases",
     "→ propose_delete_rule aafes_military. Do not ask identify.",
     "",
+    "User: when jared quotes pickup from la mirada use zip 90670",
+    "→ propose_create_rule zip_fill_la_mirada_origin (same as La Mirada).",
+    "",
+    "User: when pickup is La Mirada use zip 90670",
+    "→ propose_create_rule zip_fill, applyTo origin, fillZipCode 90670.",
+    "",
+    "User: military bases need LAD and APD",
+    "→ propose create/update aafes_military, addAccessorials [LAD, APD].",
+    "",
     "User: add liftgate whenever consignee says no dock",
     "→ ask_identify_source (truly missing how to identify) OR if they",
     "  already said Cannot-be / site type, propose with LFD/LFO.",
@@ -1795,6 +2332,12 @@ async function runQuoteRulesChatTurn(opts) {
     "Optional match.senderDomains. protocolOnly / defaultDims when said.",
     "Do NOT ask site type, LAD, APD, or Can-be/Cannot-be for these.",
     "Ids like sender_mike_oseback / name \"Sender → Mike Oseback\".",
+    "",
+    "=== ZIP fill details ===",
+    "ruleKind zip_fill; identifyVia ai; addAccessorials [].",
+    "applyTo origin for pickup/Ship From; dest for delivery/Ship To.",
+    "fillZipCode must be 5 digits. Overrides wrong geocoded ZIPs.",
+    "Do NOT ask identify questionnaire for zip-fill rules.",
     "",
     "=== Site types (AI address classify) ===",
     "military/AAFES/nursing/hotel → identifyVia ai + match.siteType",
@@ -1858,8 +2401,27 @@ async function runQuoteRulesChatTurn(opts) {
     };
   }
 
-  return enforceCreateIdentifyGate(
+  const gated = enforceCreateIdentifyGate(
       parsed, opts.messages || [], existingRules);
+  if (gated && typeof gated.reply === "string") {
+    gated.reply = sanitizeChatReply(gated.reply, opts.messages || []);
+  }
+  return gated;
+}
+
+/**
+ * Sanitize any deterministic chat result before returning to UI.
+ * @param {object|null} result Chat turn result.
+ * @param {Array<object>} messages Chat history.
+ * @return {object|null}
+ */
+function polishChatResult(result, messages) {
+  if (!result || typeof result !== "object") return result;
+  const out = {...result};
+  if (typeof out.reply === "string") {
+    out.reply = sanitizeChatReply(out.reply, messages);
+  }
+  return out;
 }
 
 /**
@@ -1961,6 +2523,16 @@ function normalizePartialPatch(patch) {
   if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
     normalized.protocolOnly = !!patch.protocolOnly;
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "fillZipCode")) {
+    normalized.fillZipCode = String(patch.fillZipCode || "")
+        .replace(/\D/g, "")
+        .slice(0, 5);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "applyTo")) {
+    const v = String(patch.applyTo || "");
+    normalized.applyTo = ["dest", "origin", "both"].includes(v) ?
+      v : "origin";
+  }
   if (Object.prototype.hasOwnProperty.call(patch, "defaultDims") &&
       patch.defaultDims && typeof patch.defaultDims === "object") {
     normalized.defaultDims = {
@@ -2006,6 +2578,16 @@ function normalizeCreatePatch(patch, ruleId) {
   }
   if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
     normalized.protocolOnly = !!patch.protocolOnly;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "fillZipCode")) {
+    normalized.fillZipCode = String(patch.fillZipCode || "")
+        .replace(/\D/g, "")
+        .slice(0, 5);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "applyTo")) {
+    const v = String(patch.applyTo || "");
+    normalized.applyTo = ["dest", "origin", "both"].includes(v) ?
+      v : "origin";
   }
   if (patch.defaultDims && typeof patch.defaultDims === "object") {
     normalized.defaultDims = {
@@ -2084,6 +2666,15 @@ function validateRuleProposal(proposal) {
       return {ok: false, error: "Rule match cannot be empty"};
     }
   }
+  if (normalized.ruleKind === RULE_KIND_ZIP_FILL ||
+      Object.prototype.hasOwnProperty.call(normalized, "fillZipCode")) {
+    const zip = String(normalized.fillZipCode || "")
+        .replace(/\D/g, "")
+        .slice(0, 5);
+    if (!/^\d{5}$/.test(zip)) {
+      return {ok: false, error: "ZIP fill rule needs fillZipCode (5 digits)"};
+    }
+  }
 
   return {
     ok: true,
@@ -2101,6 +2692,8 @@ module.exports = {
   enforceCreateIdentifyGate,
   parseIdentifyChoiceAnswer,
   parseAccessorialsAnswer,
+  parseNaturalConfirmation,
+  parseNaturalRejection,
   inferCreateTopic,
   looksLikeDeleteRuleIntent,
   looksLikeCreateRuleIntent,
@@ -2109,7 +2702,10 @@ module.exports = {
   buildDeleteRuleProposal,
   buildMilitaryAccessorialProposal,
   buildSenderCustomerProposal,
+  buildZipFillProposal,
   inferSenderCustomerTopic,
+  inferZipFillTopic,
+  looksLikeZipFillIntent,
   isMilitaryTopicBlob,
   RULES_CHAT_MODEL,
   IDENTIFY_QUICK_REPLIES,

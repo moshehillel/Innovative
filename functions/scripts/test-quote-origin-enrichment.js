@@ -376,6 +376,29 @@ check("conflict applies aafes rule",
     (outConflict.appliedRules || [])
         .some((r) => r.ruleId === "aafes_military"), true);
 
+const laMiradaShipper = {
+  name: "STG",
+  city: "La Mirada",
+  state: "CA",
+  zipCode: "90638",
+};
+const laMiradaFixed = addressEnrichment.applyKnownWarehouseZipOverride(
+    laMiradaShipper, {});
+check("La Mirada warehouse override → 90670",
+    laMiradaFixed && laMiradaFixed.zipCode, "90670");
+
+const laMiradaRule = quoteRules.DEFAULT_RULES.find(
+    (r) => r.id === "zip_fill_la_mirada_stg");
+const laMiradaLane = {
+  shipper: {name: "STG", city: "La Mirada", state: "CA", zipCode: "90638"},
+  consignee: {name: "Lidl US", city: "Mebane", state: "NC", zipCode: "27302"},
+};
+if (laMiradaRule) {
+  quoteRules.applyZipFillRules(laMiradaLane, [laMiradaRule], laMiradaLane);
+  check("zip fill rule overrides La Mirada 90638",
+      laMiradaLane.shipper.zipCode, "90670");
+}
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

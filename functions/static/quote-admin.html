@@ -514,9 +514,11 @@
     <section class="panel hidden chat-panel" id="panel-chat">
       <h2>Change rules in plain English</h2>
       <p class="panel-intro">
-        Describe what you want changed — for example, add appointment delivery
-        for military facilities, or update accessorials for nursing homes.
-        The assistant will propose a change; click <strong>Confirm</strong> to apply it.
+        Describe what you want in plain English — like any AI chat.
+        I'll ask a quick clarifying question if needed, propose a rule,
+        and save it when you say <strong>yes</strong>, <strong>sounds good</strong>,
+        <strong>go ahead</strong>, <strong>that's right</strong>, or click
+        <strong>Confirm</strong>.
         Press Enter to send (Shift+Enter for a new line).
       </p>
       <div class="chat-log" id="chat-log"></div>
@@ -526,7 +528,8 @@
         <button type="button" class="primary" id="chat-send">Send</button>
       </div>
       <div id="proposal-box" class="proposal hidden">
-        <strong>Proposed rule change — click Confirm to apply</strong>
+        <strong>Proposed rule — review below</strong>
+        <p class="hint" style="margin:6px 0 10px">Reply naturally (yes, sounds good, go ahead, that's right) or click Confirm to save.</p>
         <div id="proposal-summary" class="proposal-summary"></div>
         <details class="rule-advanced">
           <summary>Technical details (for IT)</summary>
@@ -705,6 +708,18 @@
       if (match.senderDomains && match.senderDomains.length) {
         lines.push(`Sender domain is ${quoteList(match.senderDomains.map((d) => String(d).startsWith("@") ? d : "@" + d))}`);
       }
+      if (match.shipperCityContains && match.shipperCityContains.length) {
+        lines.push(`Pickup city includes ${quoteList(match.shipperCityContains)}`);
+      }
+      if (match.shipperState) {
+        lines.push(`Pickup state is ${match.shipperState}`);
+      }
+      if (match.consigneeCityContains && match.consigneeCityContains.length) {
+        lines.push(`Delivery city includes ${quoteList(match.consigneeCityContains)}`);
+      }
+      if (match.consigneeState) {
+        lines.push(`Delivery state is ${match.consigneeState}`);
+      }
       if (!lines.length) {
         lines.push("Custom match conditions (see Advanced for details).");
       }
@@ -725,6 +740,12 @@
         const W = d.width != null ? d.width : "?";
         const H = d.height != null ? d.height : "?";
         lines.push(`Default missing pallet dims to ${L}×${W}×${H}`);
+      }
+      const fillZip = String(rule.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+      if (/^\d{5}$/.test(fillZip)) {
+        const side = rule.applyTo === "origin" ? "pickup" :
+          rule.applyTo === "dest" ? "delivery" : "pickup or delivery";
+        lines.push(`Use rating ZIP ${fillZip} for ${side} when city matches`);
       }
       const acc = rule.addAccessorials || [];
       if (acc.length) {
@@ -1018,6 +1039,12 @@
         const d = patch.defaultDims;
         parts.push(`Default dims: ${esc([d.length, d.width, d.height].filter((n) => n != null).join("×"))}`);
       }
+      const fillZip = String(patch.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+      if (/^\d{5}$/.test(fillZip)) {
+        const side = patch.applyTo === "origin" ? "pickup" :
+          patch.applyTo === "dest" ? "delivery" : "pickup/delivery";
+        parts.push(`Rating ZIP: ${esc(fillZip)} (${esc(side)})`);
+      }
       if (patch.active === false) parts.push("This rule will be turned off.");
       if (patch.active === true) parts.push("This rule will be turned on.");
 
@@ -1031,6 +1058,16 @@
         ["rules", "chat", "test"].forEach(t => {
           document.getElementById("panel-" + t).classList.toggle("hidden", t !== btn.dataset.tab);
         });
+        if (btn.dataset.tab === "chat" && !chatMessages.length) {
+          const welcome = "Hi — I can help you manage quote rules in plain English. " +
+            "Try things like:\n" +
+            "• \"Military bases need LAD and APD\"\n" +
+            "• \"Map jared@corehome.com to Brumis Imports\"\n" +
+            "• \"When pickup is La Mirada use zip 90670\"\n\n" +
+            "I'll propose a rule and you can say yes / sounds good / go ahead, or click Confirm.";
+          chatMessages.push({ role: "assistant", content: welcome });
+          appendChat("assistant", welcome);
+        }
       });
     });
 
@@ -1164,9 +1201,46 @@
       }
     }
 
-    function isTypedConfirm(text) {
-      return /^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
-        .test(String(text || "").trim());
+    function normalizeConfirmText(text) {
+      return String(text || "").trim().toLowerCase()
+        .replace(/[^\w\s'-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    function isNaturalReject(text) {
+      const raw = String(text || "").trim();
+      if (!raw) return false;
+      const norm = normalizeConfirmText(raw);
+      if (/^(no|nope|nah|cancel|stop|wait|hold on|nevermind|never mind)\.?$/i.test(raw)) return true;
+      return /\b(not quite|not right|that'?s wrong|change (it|that)|hold on|wait a sec)\b/.test(norm) ||
+        /\b(don'?t|do not)\s+(apply|save|confirm)\b/.test(norm) ||
+        (/\b(cancel|scratch that|forget it)\b/.test(norm) && norm.length <= 80);
+    }
+
+    function isNaturalConfirm(text, hasPending) {
+      const raw = String(text || "").trim();
+      if (!raw || isNaturalReject(raw)) return false;
+      const norm = normalizeConfirmText(raw);
+      if (/^(yes|yep|yeah|yea|yup|ok|okay|k|sure|correct|right|exactly|perfect|absolutely|definitely|confirmed|confirm|apply|proceed|go ahead|do it|save it|looks good|sounds good|that works|please do|please apply|go for it|make it so|do that|that'?s it|that'?s right|that'?s correct|that'?s good|that'?s fine|that'?s perfect)\.?$/i.test(raw)) {
+        return true;
+      }
+      const phrases = [
+        /\bthat('s| is) (right|correct|it|good|fine|perfect|what i want)\b/,
+        /\b(yes|yeah|yep|yup)[,.]?\s*(that('s| is) (right|correct|it)|go ahead|please|do it|apply|save)\b/,
+        /\b(go ahead|please apply|please save|please do|please confirm)\b/,
+        /\b(sounds|looks) good\b/,
+        /\bgo for it\b/,
+        /\bdo (that|this)\b/,
+        /\bapply (that|this|it)\b/,
+        /\bsave (that|this|it)\b/,
+        /\blet'?s do (it|that)\b/,
+        /\byou got it\b/,
+      ];
+      if (phrases.some((re) => re.test(norm))) return true;
+      if (hasPending && /^(yes|yep|yeah|yup|ok|okay|sure|right|correct|perfect)\b/i.test(norm)) return true;
+      if (hasPending && /\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 56) return true;
+      return false;
     }
 
     async function applyPendingProposal() {
@@ -1235,8 +1309,8 @@
       const text = input.value.trim();
       if (!text || sendBtn.disabled) return;
 
-      // Typing Confirm with a pending proposal uses applyQuoteRule — never the model.
-      if (pendingProposal && isTypedConfirm(text)) {
+      // Natural confirm/reject with a pending proposal — apply locally, not via model.
+      if (pendingProposal && isNaturalConfirm(text, true)) {
         input.value = "";
         clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
@@ -1244,12 +1318,24 @@
         await applyPendingProposal();
         return;
       }
-      if (!pendingProposal && isTypedConfirm(text)) {
+      if (pendingProposal && isNaturalReject(text)) {
         input.value = "";
         clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
         appendChat("user", text);
-        const tip = "There is no pending proposal. Ask me to remove or change a rule first, then click the Confirm button (typing Confirm alone does nothing).";
+        document.getElementById("proposal-box").classList.add("hidden");
+        pendingProposal = null;
+        const msg = "No problem — cancelled that proposal. What would you like instead?";
+        chatMessages.push({ role: "assistant", content: msg });
+        appendChat("assistant", msg);
+        return;
+      }
+      if (!pendingProposal && isNaturalConfirm(text, false)) {
+        input.value = "";
+        clearQuickReplies();
+        chatMessages.push({ role: "user", content: text });
+        appendChat("user", text);
+        const tip = "Nothing pending right now — tell me what rule you'd like to add or change, and I'll propose it for you to confirm.";
         chatMessages.push({ role: "assistant", content: tip });
         appendChat("assistant", tip);
         return;
@@ -1264,13 +1350,32 @@
       try {
         let res = await api("/quoteRulesChat", {
           method: "POST",
-          body: JSON.stringify({ tenantId: TENANT_ID, messages: chatMessages }),
+          body: JSON.stringify({
+            tenantId: TENANT_ID,
+            messages: chatMessages,
+            pendingProposal,
+          }),
         });
         showChatThinking(false);
         res = normalizeChatProposal(res) || res;
+        if (res.action === "dismiss_pending") {
+          document.getElementById("proposal-box").classList.add("hidden");
+          pendingProposal = null;
+        }
         if (res.reply) {
           chatMessages.push({ role: "assistant", content: res.reply });
           appendChat("assistant", res.reply);
+        }
+        if (res.confirmApply && res.proposal && res.proposal.ruleId) {
+          pendingProposal = {
+            action: res.action,
+            ruleId: res.proposal.ruleId,
+            deleteRuleId: res.proposal.deleteRuleId || res.proposal.ruleId,
+            deleteRuleIds: res.proposal.deleteRuleIds,
+            patch: res.proposal.patch || {},
+          };
+          await applyPendingProposal();
+          return;
         }
         if (res.action === "ask_identify_source" &&
             (!Array.isArray(res.quickReplies) || !res.quickReplies.length)) {

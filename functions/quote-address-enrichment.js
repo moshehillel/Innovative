@@ -223,6 +223,8 @@ async function lookupUsZip(zip) {
  */
 const KNOWN_CITY_STATE_ZIPS = Object.freeze({
   "santa fe springs|ca": "90670",
+  // STG La Mirada warehouse — same rating ZIP as Santa Fe Springs.
+  "la mirada|ca": "90670",
   "lakewood|nj": "08701",
 });
 
@@ -431,6 +433,33 @@ async function placesFindZip(query, apiKey, fallbackCity, fallbackState) {
 }
 
 /**
+ * Force known warehouse city|state → ZIP even when geocode returned a
+ * different local ZIP (e.g. La Mirada 90638 → STG 90670).
+ * @param {object|null|undefined} party Address.
+ * @param {object} [lane] Optional lane to stamp "zip filled" warning.
+ * @return {object|null|undefined}
+ */
+function applyKnownWarehouseZipOverride(party, lane) {
+  if (!party || typeof party !== "object") return party;
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim();
+  const known = lookupKnownCityStateZip(city, state);
+  if (!known) return party;
+  const existing = String(party.zipCode || party.zipcode || party.zip || "")
+      .replace(/\D/g, "")
+      .slice(0, 5);
+  if (existing === known.zipCode) return party;
+  pushLaneZipWarning(lane, "zip filled");
+  return {
+    ...party,
+    city: city || known.city,
+    state: state || known.state,
+    zipCode: known.zipCode,
+    country: String(party.country || "US").trim() || "US",
+  };
+}
+
+/**
  * Fill missing city/state from ZIP so Primus can rate zip-only RFQs.
  * @param {object|null|undefined} party Address.
  * @param {object} [lane] Optional lane to stamp "zip filled" warning.
@@ -484,8 +513,10 @@ async function fillPartyZipFromCityState(party, lane) {
  * @return {Promise<object|null|undefined>}
  */
 async function fillPartyOdFromZipOrCityState(party, lane) {
-  let next = await fillPartyCityStateFromZip(party, lane);
+  let next = applyKnownWarehouseZipOverride(party, lane);
+  next = await fillPartyCityStateFromZip(next, lane);
   next = await fillPartyZipFromCityState(next, lane);
+  next = applyKnownWarehouseZipOverride(next, lane);
   return next;
 }
 
@@ -1448,6 +1479,11 @@ async function enrichLaneAddresses(lane, tenant, opts = {}) {
       lane.consignee = await fillPartyOdFromZipOrCityState(
           lane.consignee, lane);
     }
+    const quoteRules = opts.quoteRules;
+    if (Array.isArray(quoteRules) && quoteRules.length) {
+      const quoteAccessorialRules = require("./quote-accessorial-rules");
+      quoteAccessorialRules.applyZipFillRules(lane, quoteRules, lane);
+    }
   }
   await enrichLaneShipper(lane, tenant, opts);
   await enrichLaneConsignee(lane, tenant, opts);
@@ -1489,6 +1525,7 @@ module.exports = {
   fillPartyCityStateFromZip,
   fillPartyZipFromCityState,
   fillPartyOdFromZipOrCityState,
+  applyKnownWarehouseZipOverride,
   partyNeedsCityStateFromZip,
   partyNeedsZipFromCityState,
 };

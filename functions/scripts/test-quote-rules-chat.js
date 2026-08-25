@@ -19,7 +19,7 @@ const checkTrue = (name, cond) => {
   console.log(`${cond ? "PASS" : "FAIL"} ${name}`);
 };
 
-check("model is gpt-5.6-sol", chat.RULES_CHAT_MODEL, "gpt-5.6-sol");
+check("model is gpt-5.6-luna", chat.RULES_CHAT_MODEL, "gpt-5.6-luna");
 
 check("can you add is not email-identify",
     chat.parseIdentifyChoiceAnswer(
@@ -30,6 +30,23 @@ check("cannot-be button is address",
     chat.parseIdentifyChoiceAnswer(
         "Cannot be — address / site classification only"),
     "address_only");
+
+checkTrue("yeah that's it confirms",
+    chat.parseNaturalConfirmation("yeah that's it", {pendingProposal: true}));
+checkTrue("sounds good confirms",
+    chat.parseNaturalConfirmation("sounds good", {pendingProposal: true}));
+checkTrue("go ahead confirms",
+    chat.parseNaturalConfirmation("go ahead", {pendingProposal: true}));
+checkTrue("that's right confirms",
+    chat.parseNaturalConfirmation("that's right", {pendingProposal: true}));
+checkTrue("yep confirms",
+    chat.parseNaturalConfirmation("yep", {pendingProposal: true}));
+checkTrue("no wait rejects",
+    chat.parseNaturalRejection("no wait"));
+checkTrue("confirm without pending",
+    chat.parseNaturalConfirmation("confirm"));
+checkTrue("yes please is not reject",
+    !chat.parseNaturalRejection("yes please"));
 
 checkTrue("delivery appointment → APD",
     chat.parseAccessorialsAnswer("also delivery appointment").includes("APD"));
@@ -205,6 +222,27 @@ checkTrue("shaya from email",
 checkTrue("shaya not protocolOnly",
     shayaOut && shayaOut.proposal.patch.protocolOnly === false);
 
+const laMiradaMsg = [{
+  role: "user",
+  content: "when pickup is La Mirada use zip 90670",
+}];
+checkTrue("la mirada is zip fill intent",
+    chat.looksLikeZipFillIntent(laMiradaMsg));
+const laMiradaOut = chat.buildZipFillProposal(laMiradaMsg, []);
+check("la mirada action create",
+    laMiradaOut && laMiradaOut.action, "propose_create_rule");
+check("la mirada fill zip",
+    laMiradaOut && laMiradaOut.proposal.patch.fillZipCode, "90670");
+check("la mirada apply origin",
+    laMiradaOut && laMiradaOut.proposal.patch.applyTo, "origin");
+checkTrue("la mirada shipper city",
+    laMiradaOut &&
+    laMiradaOut.proposal.patch.match.shipperCityContains
+        .includes("la mirada"));
+checkTrue("la mirada never asks identify",
+    laMiradaOut && !/choose one|which accessorial|\bLAD\b|\bAPD\b/i
+        .test(laMiradaOut.reply));
+
 const mosesPhrases = [
   "mshglck@gmail.com should be registered as customer name moses",
   "mshglck@gmail.com mapped to moses customer name",
@@ -302,6 +340,25 @@ for (const phrase of mosesPhrases) {
       console.log("  action:", mosesSmoke && mosesSmoke.action);
       console.log("  reply:", mosesSmoke && mosesSmoke.reply);
     }
+  }
+
+  const laMiradaSmoke = await chat.runQuoteRulesChatTurn({
+    messages: laMiradaMsg,
+    existingRules: [],
+  });
+  const laMiradaOk = laMiradaSmoke &&
+    laMiradaSmoke.action === "propose_create_rule" &&
+    laMiradaSmoke.proposal &&
+    laMiradaSmoke.proposal.patch &&
+    laMiradaSmoke.proposal.patch.fillZipCode === "90670" &&
+    laMiradaSmoke.proposal.patch.ruleKind === "zip_fill" &&
+    !/choose one|could not process/i.test(laMiradaSmoke.reply || "");
+  checkTrue("smoke: la mirada zip fill", laMiradaOk);
+  if (!laMiradaOk) {
+    console.log("  action:", laMiradaSmoke && laMiradaSmoke.action);
+    console.log("  reply:", laMiradaSmoke && laMiradaSmoke.reply);
+    console.log("  patch:", laMiradaSmoke && laMiradaSmoke.proposal &&
+      laMiradaSmoke.proposal.patch);
   }
 
   if (failures) {

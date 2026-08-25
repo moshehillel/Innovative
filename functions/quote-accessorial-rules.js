@@ -18,6 +18,7 @@ const DEFAULT_IDENTIFY_VIA = "both";
 const APPLY_TO_VALUES = ["dest", "origin", "both"];
 const DEFAULT_APPLY_TO = "dest";
 const RULE_KIND_SENDER_CUSTOMER = "sender_customer";
+const RULE_KIND_ZIP_FILL = "zip_fill";
 
 /** Dest accessorial → pickup equivalent when a rule applies to origin. */
 const DEST_TO_ORIGIN_ACCESSORIAL = {
@@ -43,6 +44,7 @@ const MANAGED_DEFAULT_RULE_IDS = new Set([
   "sender_jared_berman",
   "sender_lifeworks_picking",
   "sender_shaya_jacobowitz",
+  "zip_fill_la_mirada_stg",
   "liftgate_no_dock",
 ]);
 
@@ -135,6 +137,24 @@ const DEFAULT_RULES = [
     fromNames: ["shaya jacobowitz"],
     notes: "Map Shaya Jacobowitz / Prime Packaging to " +
       "Prime Packaging Inc; FW body From resolved like Jared.",
+    autoApply: true,
+    requiresConfirm: false,
+  },
+  {
+    id: "zip_fill_la_mirada_stg",
+    active: true,
+    priority: 3,
+    name: "La Mirada CA pickup → ZIP 90670",
+    ruleKind: RULE_KIND_ZIP_FILL,
+    identifyVia: "ai",
+    applyTo: "origin",
+    match: {
+      shipperCityContains: ["la mirada"],
+      shipperState: "CA",
+    },
+    fillZipCode: "90670",
+    addAccessorials: [],
+    notes: "STG La Mirada warehouse — rate pickup as Santa Fe Springs 90670.",
     autoApply: true,
     requiresConfirm: false,
   },
@@ -380,6 +400,7 @@ function normalizeIdentifyVia(rule) {
 function isSenderCustomerRule(rule) {
   if (!rule || typeof rule !== "object") return false;
   if (rule.ruleKind === RULE_KIND_SENDER_CUSTOMER) return true;
+  if (rule.ruleKind === RULE_KIND_ZIP_FILL) return false;
   if (normalizeIdentifyVia(rule) === "email" && rule.customerName) return true;
   const match = rule.match && typeof rule.match === "object" ? rule.match : {};
   const emails = []
@@ -390,6 +411,135 @@ function isSenderCustomerRule(rule) {
   const domains = [].concat(match.senderDomains || []);
   return emails.some((e) => String(e || "").includes("@")) ||
     domains.some((d) => !!String(d || "").trim());
+}
+
+/**
+ * True when a quoteRules doc fills or corrects city/state → ZIP.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isZipFillRule(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  if (rule.ruleKind === RULE_KIND_ZIP_FILL) return true;
+  const zip = String(rule.fillZipCode || rule.zipCode || "").replace(/\D/g, "")
+      .slice(0, 5);
+  if (!/^\d{5}$/.test(zip)) return false;
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  return !!(match.shipperCityContains || match.consigneeCityContains ||
+    match.shipperState || match.consigneeState);
+}
+
+/**
+ * Normalize a 5-digit US ZIP from rule fields.
+ * @param {object} rule Rule document.
+ * @return {string}
+ */
+function zipFillCodeFromRule(rule) {
+  return String(rule && (rule.fillZipCode || rule.zipCode) || "")
+      .replace(/\D/g, "")
+      .slice(0, 5);
+}
+
+/**
+ * @param {string} haystack Text to search.
+ * @param {Array<string>|string} needles Substrings (case insensitive).
+ * @return {boolean}
+ */
+function containsAnyNeedle(haystack, needles) {
+  const list = Array.isArray(needles) ? needles :
+    (needles ? [needles] : []);
+  return containsAny(haystack, list);
+}
+
+/**
+ * Whether a zip-fill rule matches one lane side.
+ * @param {object} party Shipper or consignee.
+ * @param {object} match Rule match object.
+ * @param {"origin"|"dest"} side Lane side.
+ * @return {boolean}
+ */
+function zipFillRuleMatchesParty(party, match, side) {
+  const m = match && typeof match === "object" ? match : {};
+  const p = party && typeof party === "object" ? party : {};
+  const city = String(p.city || "").trim();
+  const state = String(p.state || "").trim().toUpperCase();
+  const name = String(p.name || "").trim();
+  if (side === "origin") {
+    const cities = m.shipperCityContains || m.cityContains || [];
+    if (cities.length &&
+        !containsAnyNeedle(city, cities) &&
+        !containsAnyNeedle(name, cities)) {
+      return false;
+    }
+    const wantState = String(m.shipperState || m.state || "").trim()
+        .toUpperCase();
+    if (wantState && state && wantState !== state) return false;
+    const names = m.shipperNameContains || [];
+    if (names.length && !containsAnyNeedle(name, names)) return false;
+    return cities.length > 0 || !!wantState || names.length > 0;
+  }
+  const cities = m.consigneeCityContains || m.cityContains || [];
+  if (cities.length &&
+      !containsAnyNeedle(city, cities) &&
+      !containsAnyNeedle(name, cities)) {
+    return false;
+  }
+  const wantState = String(m.consigneeState || m.state || "").trim()
+      .toUpperCase();
+  if (wantState && state && wantState !== state) return false;
+  const names = m.consigneeNameContains || [];
+  if (names.length && !containsAnyNeedle(name, names)) return false;
+  return cities.length > 0 || !!wantState || names.length > 0;
+}
+
+/**
+ * Apply Firestore zip-fill rules to lane shipper/consignee (overrides wrong
+ * geocoded ZIPs for known warehouse cities).
+ * @param {object} lane Lane (mutated).
+ * @param {Array<object>} rules Active quote rules.
+ * @param {object} [laneRef] Lane for extractionWarnings.
+ * @return {Array<object>} Applied zip-fill rule summaries.
+ */
+function applyZipFillRules(lane, rules, laneRef) {
+  const targetLane = laneRef || lane;
+  const applied = [];
+  const list = (rules || [])
+      .filter((r) => r && r.active !== false && isZipFillRule(r))
+      .slice()
+      .sort((a, b) =>
+        (Number(a.priority) || 100) - (Number(b.priority) || 100));
+  for (const rule of list) {
+    const zipCode = zipFillCodeFromRule(rule);
+    if (!/^\d{5}$/.test(zipCode)) continue;
+    const match = rule.match && typeof rule.match === "object" ?
+      rule.match : {};
+    for (const side of ruleSides(rule)) {
+      const key = side === "origin" ? "shipper" : "consignee";
+      const party = lane[key];
+      if (!party || typeof party !== "object") continue;
+      if (!zipFillRuleMatchesParty(party, match, side)) continue;
+      const existing = String(party.zipCode || party.zipcode || party.zip || "")
+          .replace(/\D/g, "")
+          .slice(0, 5);
+      if (existing === zipCode) continue;
+      lane[key] = {
+        ...party,
+        zipCode,
+        country: String(party.country || "US").trim() || "US",
+      };
+      const warnings = Array.isArray(targetLane.extractionWarnings) ?
+        targetLane.extractionWarnings : [];
+      if (!warnings.includes("zip filled")) warnings.push("zip filled");
+      targetLane.extractionWarnings = warnings;
+      applied.push({
+        ruleId: rule.id,
+        name: rule.name,
+        applyTo: side,
+        fillZipCode: zipCode,
+      });
+    }
+  }
+  return applied;
 }
 
 /**
@@ -504,10 +654,13 @@ function queueManagedDefaultSync(batch, ref, existing) {
     const codesSame = wantCodes.length === haveCodes.length &&
       wantCodes.every((c, i) => c === haveCodes[i]);
     const senderSync = isSenderCustomerRule(rule);
+    const zipSync = isZipFillRule(rule);
     const wantMatch = JSON.stringify(rule.match || {});
     const haveMatch = JSON.stringify(data.match || {});
     const wantDims = JSON.stringify(rule.defaultDims || null);
     const haveDims = JSON.stringify(data.defaultDims || null);
+    const wantZip = String(rule.fillZipCode || "");
+    const haveZip = String(data.fillZipCode || "");
     const sameCore = codesSame &&
       data.name === rule.name &&
       data.notes === rule.notes;
@@ -519,7 +672,13 @@ function queueManagedDefaultSync(batch, ref, existing) {
       wantMatch === haveMatch &&
       wantDims === haveDims
     );
-    if (sameCore && sameSender) continue;
+    const sameZip = !zipSync || (
+      data.ruleKind === rule.ruleKind &&
+      data.applyTo === rule.applyTo &&
+      wantMatch === haveMatch &&
+      wantZip === haveZip
+    );
+    if (sameCore && sameSender && sameZip) continue;
     const patch = {
       addAccessorials: wantCodes,
       name: rule.name,
@@ -534,6 +693,13 @@ function queueManagedDefaultSync(batch, ref, existing) {
       patch.customerName = rule.customerName || "";
       patch.protocolOnly = !!rule.protocolOnly;
       if (rule.defaultDims) patch.defaultDims = rule.defaultDims;
+    }
+    if (zipSync) {
+      patch.ruleKind = rule.ruleKind;
+      patch.identifyVia = rule.identifyVia;
+      patch.applyTo = rule.applyTo || DEFAULT_APPLY_TO;
+      patch.match = rule.match || {};
+      patch.fillZipCode = rule.fillZipCode || "";
     }
     batch.set(ref.doc(rule.id), patch, {merge: true});
     writes++;
@@ -858,6 +1024,7 @@ function applyRulesToLane(lane, rules, context = {}) {
     // Sender→customer rules attach Primus customer / dims at intake —
     // they must not invent site accessorials here.
     if (isSenderCustomerRule(rule)) continue;
+    if (isZipFillRule(rule)) continue;
     for (const side of ruleSides(rule)) {
       const via = ruleMatchVia(lane, context, rule, side);
       if (!via) continue;
@@ -1009,6 +1176,7 @@ module.exports = {
   DEFAULT_APPLY_TO,
   DEST_TO_ORIGIN_ACCESSORIAL,
   RULE_KIND_SENDER_CUSTOMER,
+  RULE_KIND_ZIP_FILL,
   MANAGED_DEFAULT_RULE_IDS,
   RETIRED_DEFAULT_RULE_IDS,
   loadActiveRules,
@@ -1032,4 +1200,7 @@ module.exports = {
   formatAccessorialLabels,
   ACCESSORIAL_LABELS,
   isSenderCustomerRule,
+  isZipFillRule,
+  applyZipFillRules,
+  zipFillRuleMatchesParty,
 };
