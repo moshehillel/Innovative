@@ -34,9 +34,14 @@ const checkNotHas = (name, arr, code) => {
 
 let codes = emailAcc.extractRequestedAccessorialsFromText(
     "Need liftgate and residential.");
-checkHas("liftgate unspecified → LFO", codes, "LFO");
+checkNotHas("liftgate unspecified not LFO", codes, "LFO");
 checkHas("liftgate unspecified → LFD", codes, "LFD");
 checkHas("residential → RSD", codes, "RSD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "LIFTGATE NEEDED");
+checkHas("bare LIFTGATE NEEDED → LFD", codes, "LFD");
+checkNotHas("bare LIFTGATE NEEDED not LFO", codes, "LFO");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Need appointment delivery.");
@@ -96,8 +101,68 @@ checkNotHas("liftgate pickup not LFD", codes, "LFD");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Please include limited access charges in the quote.");
-checkHas("limited access → LAD", codes, "LAD");
-checkNotHas("limited access not LAO", codes, "LAO");
+checkNotHas("disclose limited access charges does not add LAD",
+    codes, "LAD");
+checkNotHas("disclose limited access charges does not add LAO",
+    codes, "LAO");
+check("disclose-only detect",
+    emailAcc.isLimitedAccessDiscloseOnly(
+        "Please include limited access charges in the quote."), true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please include any additional charges applicable for " +
+    "restricted or limited delivery directly in the quote email.");
+checkNotHas("restricted/limited delivery disclose does not add LAD",
+    codes, "LAD");
+check("core home disclose-only",
+    emailAcc.isLimitedAccessDiscloseOnly(
+        "Please include any additional charges applicable for " +
+        "restricted or limited delivery directly in the quote email."),
+    true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "any applicable limited access charges");
+checkNotHas("any applicable LAD charges does not add LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "if limited access applies, include in quote");
+checkNotHas("if limited access applies does not add LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Needs limited access.");
+checkHas("needs limited access → LAD", codes, "LAD");
+checkNotHas("needs limited access not LAO", codes, "LAO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "limited access delivery required");
+checkHas("limited access delivery required → LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "restricted access");
+checkHas("bare restricted access → LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "LAD please");
+checkHas("LAD please → LAD", codes, "LAD");
+
+const discloseAi = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal:
+    "Please include any additional charges applicable for " +
+    "restricted or limited delivery directly in the quote email.",
+  customerRequest: {
+    wantsLimitedAccessInQuote: true,
+    requestedAccessorials: ["LAD"],
+  },
+  lanes: [],
+}, {
+  subject: "RFQ",
+  body: "Please include any additional charges applicable for " +
+    "restricted or limited delivery directly in the quote email.",
+});
+checkNotHas("AI LAD stripped for disclose-only boilerplate",
+    discloseAi.customerRequest.requestedAccessorials, "LAD");
+check("wantsLimitedAccess cleared for disclose-only",
+    discloseAi.customerRequest.wantsLimitedAccessInQuote, false);
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Inside delivery required. Also insurance.");
@@ -154,6 +219,24 @@ checkHas("AI keeps LFD when delivery-only email",
     aiBothDelivery.customerRequest.requestedAccessorials, "LFD");
 checkNotHas("AI LFO stripped when delivery-only",
     aiBothDelivery.customerRequest.requestedAccessorials, "LFO");
+
+const aiBothBare = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "LIFTGATE NEEDED",
+  customerRequest: {requestedAccessorials: ["LFO", "LFD"]},
+  lanes: [],
+}, {subject: "RFQ", body: "LIFTGATE NEEDED"});
+checkHas("AI keeps LFD on bare liftgate",
+    aiBothBare.customerRequest.requestedAccessorials, "LFD");
+checkNotHas("AI LFO stripped on bare liftgate",
+    aiBothBare.customerRequest.requestedAccessorials, "LFO");
+
+const refinedBare = emailAcc.applyEmailRequestedAccessorials(
+    {accessorials: ["LFO", "LFD"], appliedRules: []},
+    ["LFO", "LFD"],
+    (c) => c.join(", "),
+    "LIFTGATE NEEDED");
+checkHas("refine bare keeps LFD", refinedBare.accessorials, "LFD");
+checkNotHas("refine bare strips LFO", refinedBare.accessorials, "LFO");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "No liftgate needed. Dock available.");

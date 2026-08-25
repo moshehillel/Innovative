@@ -47,9 +47,11 @@ const PAIR_PATTERNS = [
   {
     origin: "LFO",
     dest: "LFD",
-    // Bare "liftgate" with no side → both. Delivery-scoped phrasing
-    // ("needed for delivery", "liftgates" near "delivery") → LFD only.
-    bothIfBare: true,
+    // Bare "liftgate needed" (no pickup/delivery word) → LFD only.
+    // Warehouse / STG / company docks almost never need origin liftgate;
+    // add LFO only when email explicitly says pickup/origin liftgate.
+    // Delivery-scoped phrasing also → LFD only.
+    bothIfBare: false,
     // eslint-disable-next-line max-len
     originRe: /\blift[\s-]*gates?\s+(at\s+)?(pickup|origin)\b|\blift[\s-]*gates?\s+(needed\s+)?(for|at)\s+(pickup|origin)\b|\b(pickup|origin)\s+lift[\s-]*gates?\b/i,
     // eslint-disable-next-line max-len
@@ -100,11 +102,90 @@ const SINGLE_PATTERNS = [
   {code: "INS", re: /\binsurance\b/i},
   {code: "HAZ", re: /\b(hazmat|hazardous\s+materials?)\b/i},
   {code: "PFF", re: /\bprotect(ed)?\s+from\s+freez/i},
+  {code: "LAD", re: /\bLAD\s+please\b/i},
   {code: "NUD", re: /\bnursing(\s+home)?(\s+delivery)?\b/i},
   {code: "HOD", re: /\bhotel(\s+delivery)?\b/i},
   {code: "SCD", re: /\bschool(\s+delivery)?\b/i},
   {code: "NTD", re: /\bnotif(y|ication)(\s+(before\s+)?delivery)?\b/i},
 ];
+
+/**
+ * Clear request to apply limited/restricted access (LAD/LAO).
+ * @param {string} text Email / instruction text.
+ * @return {boolean}
+ */
+function isLimitedAccessClearRequest(text) {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  // When disclose boilerplate is present, only strong verbs / LAD please
+  // / gated site count — not bare "limited access delivery" substrings
+  // that appear inside charge-disclose sentences.
+  if (isLimitedAccessDiscloseBoilerplate(t)) {
+    return (
+      // eslint-disable-next-line max-len
+      /\b(?:needs?|require[sd]?|must\s+have|please\s+add|add)\s+(?:limited|restricted)\s+access\b/i.test(t) ||
+      // eslint-disable-next-line max-len
+      /\b(?:limited|restricted)\s+access\s+(?:delivery\s+)?(?:required|needed|please)\b/i.test(t) ||
+      // eslint-disable-next-line max-len
+      /\b(?:site|location|destination|consignee|facility)\s+(?:is|has)\s+(?:limited|restricted)\s+access\b/i.test(t) ||
+      /\bLAD\s+please\b/i.test(t) ||
+      /\bgated\s+(?:community|facility|complex)\b/i.test(t)
+    );
+  }
+  return (
+    // eslint-disable-next-line max-len
+    /\b(?:needs?|require[sd]?|must\s+have|please\s+add|add)\s+(?:limited|restricted)\s+access\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:limited|restricted)\s+access\s+(?:delivery\s+)?(?:required|needed|please)\b/i.test(t) ||
+    /\b(?:limited|restricted)\s+access\s+delivery\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:site|location|destination|consignee|facility)\s+(?:is|has)\s+(?:limited|restricted)\s+access\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:limited|restricted)\s+access\s+(?:facility|location|site|warehouse|building)\b/i.test(t) ||
+    /\bLAD\s+please\b/i.test(t) ||
+    /\bgated\s+(?:community|facility|complex)\b/i.test(t) ||
+    /\b(?:limited|restricted)\s+access\b/i.test(t)
+  );
+}
+
+/**
+ * Core Home / RFQ boilerplate: "disclose limited-access charges if
+ * applicable" — NOT a request to apply LAD.
+ * @param {string} text Email / instruction text.
+ * @return {boolean}
+ */
+function isLimitedAccessDiscloseBoilerplate(text) {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  return (
+    // eslint-disable-next-line max-len
+    /\binclude\s+(?:any\s+)?(?:additional\s+)?charges?\s+(?:applicable\s+)?(?:for\s+)?(?:restricted|limited)(?:\s+or\s+(?:restricted|limited))?\s+(?:access|delivery)\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:please\s+)?include\s+(?:any\s+)?(?:applicable\s+)?(?:limited|restricted)\s+access(?:\s+delivery)?\s+charges?\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:any\s+)?(?:applicable\s+)?(?:limited|restricted)\s+access(?:\s+delivery)?\s+charges?\b/i.test(t) ||
+    /\bif\s+(?:limited|restricted)\s+access\s+applies\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:limited|restricted)\s+(?:access|delivery)\s+charges?\s+(?:if\s+)?(?:applicable|needed)\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\bcharges?\s+(?:applicable\s+)?for\s+(?:restricted|limited)(?:\s+or\s+(?:restricted|limited))?\s+(?:access|delivery)\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:show|disclose|list)\s+(?:any\s+)?(?:additional\s+)?(?:limited|restricted)\s+access(?:\s+delivery)?\s+charges?\b/i.test(t)
+  );
+}
+
+/**
+ * True when limited-access wording is only "disclose if applicable"
+ * boilerplate (no clear request to apply LAD).
+ * @param {string} text Email / instruction text.
+ * @return {boolean}
+ */
+function isLimitedAccessDiscloseOnly(text) {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  if (!isLimitedAccessDiscloseBoilerplate(t)) return false;
+  return !isLimitedAccessClearRequest(t);
+}
 
 /**
  * @return {Set<string>} Primus codes we will apply from email text.
@@ -158,6 +239,8 @@ function extractRequestedAccessorialsFromText(text) {
   const known = knownAccessorialCodes();
   const codes = [];
   const declined = new Set(declinedAcc.detectDeclinedAccessorials(blob).codes);
+  const skipLimitedAccess =
+    isLimitedAccessDiscloseOnly(blob);
   for (const pair of PAIR_PATTERNS) {
     let originHit = pair.originRe && pair.originRe.test(blob);
     let destHit = pair.destRe && pair.destRe.test(blob);
@@ -176,9 +259,16 @@ function extractRequestedAccessorialsFromText(text) {
         originHit = true;
       }
     }
-    if (originHit && !declined.has(pair.origin)) codes.push(pair.origin);
-    if (destHit && !declined.has(pair.dest)) codes.push(pair.dest);
-    if (!originHit && !destHit && bareHit) {
+    // Disclose-only limited-access boilerplate must not add LAD/LAO.
+    const skipLadPair = skipLimitedAccess &&
+      (pair.origin === "LAO" || pair.dest === "LAD");
+    if (originHit && !declined.has(pair.origin) && !skipLadPair) {
+      codes.push(pair.origin);
+    }
+    if (destHit && !declined.has(pair.dest) && !skipLadPair) {
+      codes.push(pair.dest);
+    }
+    if (!originHit && !destHit && bareHit && !skipLadPair) {
       if (pair.bothIfBare) {
         if (!declined.has(pair.origin)) codes.push(pair.origin);
         if (!declined.has(pair.dest)) codes.push(pair.dest);
@@ -189,6 +279,11 @@ function extractRequestedAccessorialsFromText(text) {
   }
   for (const row of SINGLE_PATTERNS) {
     if (row.re.test(blob) && !declined.has(row.code)) codes.push(row.code);
+  }
+  // "LAD please" and other clear requests that may not hit bareRe.
+  if (isLimitedAccessClearRequest(blob) && !skipLimitedAccess &&
+      !declined.has("LAD") && !codes.includes("LAD")) {
+    codes.push("LAD");
   }
   return uniqueCodes(codes).filter((c) => isKnownCode(c, known) &&
     !declined.has(c));
@@ -268,6 +363,9 @@ function refineLiftgateSides(codes, text) {
     else if (nearDest && nearOrigin) {
       destHit = true;
       originHit = true;
+    } else {
+      // Ambiguous "LIFTGATE NEEDED" → delivery only (strip invented LFO).
+      destHit = true;
     }
   }
   if (destHit && !originHit) {
@@ -281,7 +379,8 @@ function refineLiftgateSides(codes, text) {
 
 /**
  * Resolve requested Primus codes from AI extract + email text.
- * `wantsLimitedAccessInQuote` always maps to LAD.
+ * `wantsLimitedAccessInQuote` maps to LAD only when the email is not
+ * disclose-only limited-access boilerplate.
  * @param {object} extracted Intake result.
  * @param {object} [opts] subject, body.
  * @return {Array<string>}
@@ -301,11 +400,17 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
     ...declined.codes,
     ...persisted,
   ]));
-  const codes = refineLiftgateSides(
+  let codes = refineLiftgateSides(
       uniqueCodes([...fromAi, ...fromText]), scanText);
+  const discloseOnly = isLimitedAccessDiscloseOnly(scanText);
+  // Soften flag: disclose-only RFQ boilerplate must not force LAD.
   if (cr.wantsLimitedAccessInQuote && !codes.includes("LAD") &&
-      !ban.has("LAD")) {
+      !ban.has("LAD") && !discloseOnly) {
     codes.push("LAD");
+  }
+  // Strip AI/heuristic LAD false positives from disclose-only emails.
+  if (discloseOnly) {
+    codes = codes.filter((c) => c !== "LAD" && c !== "LAO");
   }
   return codes.filter((c) => !ban.has(c));
 }
@@ -324,7 +429,13 @@ function attachRequestedAccessorials(extracted, opts = {}) {
   const declined = declinedAcc.detectDeclinedAccessorials(
       extractedAccessorialText(ex, opts));
   cr.requestedAccessorials = codes;
-  if (codes.includes("LAD")) cr.wantsLimitedAccessInQuote = true;
+  if (codes.includes("LAD")) {
+    cr.wantsLimitedAccessInQuote = true;
+  } else if (isLimitedAccessDiscloseOnly(
+      extractedAccessorialText(ex, opts))) {
+    // Disclose-only boilerplate is not a limited-access request.
+    cr.wantsLimitedAccessInQuote = false;
+  }
   ex.customerRequest = cr;
   ex.customerDeclinedAccessorials = declinedAcc.uniqueCodes([
     ...(Array.isArray(ex.customerDeclinedAccessorials) ?
@@ -396,6 +507,9 @@ module.exports = {
   detectDeclinedAccessorials: declinedAcc.detectDeclinedAccessorials,
   stripDeclinedCodes: declinedAcc.stripDeclinedCodes,
   applyDeclinedAccessorials: declinedAcc.applyDeclinedAccessorials,
+  isLimitedAccessClearRequest,
+  isLimitedAccessDiscloseBoilerplate,
+  isLimitedAccessDiscloseOnly,
   extractRequestedAccessorialsFromText,
   normalizeRequestedCodeList,
   resolveRequestedAccessorials,
