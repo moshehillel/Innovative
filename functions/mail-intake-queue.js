@@ -135,6 +135,8 @@ function buildIntakeSummary(data) {
       payment_notification_ignored:
         "Ignored — payment notification (Zelle/bank)",
       emodal_broadcast_ignored: "Ignored — eModal/terminal broadcast",
+      cardknox_batch_report_ignored:
+        "Ignored — Cardknox daily batch report",
       noa_ignored: "Ignored — notice of assignment, no invoice",
       carrier_portal_notification_ignored:
         "Ignored — carrier open-invoice portal (link only)",

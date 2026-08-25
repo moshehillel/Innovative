@@ -21,6 +21,22 @@ function isEmodalBroadcast(subject, from, body) {
 }
 
 /**
+ * Cardknox daily batch settlement reports — informational only (Lisa: ignore).
+ * Example: From noreply@cardknox.com, Subject "Innovative Carriers Batch 52094836".
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isCardknoxBatchReport(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  if (!fromL.includes("cardknox.com")) return false;
+  const sub = String(subject || "");
+  // "Innovative Carriers Batch 52094836" or any Cardknox "… Batch …" notice.
+  if (/\bbatch\b/i.test(sub)) return true;
+  return false;
+}
+
+/**
  * True when the From header is Hafstaff (ops: always forward to Lisa).
  * Matches display name or domain; tolerates Halfstaff / spacing variants.
  * @param {string} from From header.
@@ -420,6 +436,13 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
       status: "emodal_broadcast_ignored",
     };
   }
+  if (isCardknoxBatchReport(subject, from)) {
+    return {
+      ignore: true,
+      reason: "Cardknox batch report — no action needed",
+      status: "cardknox_batch_report_ignored",
+    };
+  }
   // Before PDF classification: only ignore when filenames clearly NOA-only.
   if (rtsNoaAttachmentsLookNoaOnly(attachments) &&
       looksLikeNoaEmailContent(subject, body, from) &&
@@ -436,6 +459,7 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
 module.exports = {
   PAYMENT_INQUIRY_EMAIL_DEFAULT,
   isEmodalBroadcast,
+  isCardknoxBatchReport,
   isHafstaffSender,
   isPaymentNotificationEmail,
   shouldIgnoreAsPaymentNotification,

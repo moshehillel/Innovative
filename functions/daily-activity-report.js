@@ -968,6 +968,7 @@ async function runDailyInboxDigestReport(opts = {}) {
 const IGNORE_CATEGORY_LABELS = {
   payment_notification_ignored: "Payment notification",
   emodal_broadcast_ignored: "eModal / terminal broadcast",
+  cardknox_batch_report_ignored: "Cardknox batch report",
   noa_ignored: "Notice of assignment (NOA)",
   carrier_portal_notification_ignored: "Carrier open-invoice portal",
   credit_agency_notification_ignored: "Credit-agency / trade-credit alert",

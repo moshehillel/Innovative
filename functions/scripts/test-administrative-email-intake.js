@@ -47,6 +47,22 @@ check("evaluate RTS NOA with NOA filename",
         [{filename: "NOA.pdf", mimeType: "application/pdf"}]).status ===
     "noa_ignored");
 
+const cardknoxSubject = "Innovative Carriers Batch 52094836";
+const cardknoxFrom = "Cardknox <noreply@cardknox.com>";
+check("Cardknox batch report detected",
+    adm.isCardknoxBatchReport(cardknoxSubject, cardknoxFrom));
+check("Cardknox batch report evaluate quiet-ignore",
+    adm.evaluateAdministrativeIgnore(
+        cardknoxSubject, cardknoxFrom, "", []).status ===
+    "cardknox_batch_report_ignored");
+check("Cardknox non-batch subject not ignored",
+    !adm.isCardknoxBatchReport(
+        "Cardknox payment receipt", cardknoxFrom));
+check("non-Cardknox Batch subject not ignored",
+    !adm.isCardknoxBatchReport(
+        "Innovative Carriers Batch 52094836",
+        "alerts@otherprocessor.com"));
+
 const ithriveSubject =
   "iThrive Funding - Notice of Assignment for First Family Trucking LLC " +
   "(MC 1115353) - Please Confirm Receipt";
