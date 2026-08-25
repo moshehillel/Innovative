@@ -131,11 +131,16 @@ function parseNaturalConfirmation(text, opts) {
   if (phraseAffirm.some((re) => re.test(norm))) return true;
 
   if (opts && opts.pendingProposal) {
+    // Affirm + correction ("yes but only when…") is a refinement, not apply.
+    if (/\bbut\b/.test(norm) &&
+        /\b(only|when|except|unless|customer|sender|from)\b/.test(norm)) {
+      return false;
+    }
     if (/^(yes|yep|yeah|yup|ok|okay|sure|right|correct|perfect)\b/i
         .test(norm)) {
       return true;
     }
-    if (/\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 56) return true;
+    if (/\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 40) return true;
   }
 
   return false;
@@ -1957,23 +1962,53 @@ function findRuleIdForRefinement(messages, existingRules, pending, ruleContext) 
 }
 
 /**
- * Live rule doc for refinement — falls back to lastAppliedRule proposal.
+ * Patch object from a pending / lastProposed / lastApplied envelope.
+ * @param {object|null} envelope Pending proposal or nested proposal.
+ * @return {object|null}
+ */
+function extractRefinementBasePatch(envelope) {
+  if (!envelope || typeof envelope !== "object") return null;
+  if (envelope.patch && typeof envelope.patch === "object") {
+    return envelope.patch;
+  }
+  if (envelope.proposal && typeof envelope.proposal === "object" &&
+      envelope.proposal.patch && typeof envelope.proposal.patch === "object") {
+    return envelope.proposal.patch;
+  }
+  return null;
+}
+
+/**
+ * Live rule doc for refinement — prefers pending patch, then applied /
+ * proposed snapshots (so mid-confirm "yes, but only when…" can refine
+ * without saving the incomplete rule first).
  * @param {string} ruleId Rule id.
  * @param {Array<object>} existingRules Live rules.
  * @param {object} ruleContext Client rule pointers.
+ * @param {object|null} [pending] Pending proposal from UI.
  * @return {object|null}
  */
-function findRuleDocForRefinement(ruleId, existingRules, ruleContext) {
+function findRuleDocForRefinement(ruleId, existingRules, ruleContext, pending) {
   const live = (existingRules || []).find((r) => r.id === ruleId);
   if (live) return live;
+
+  if (pending && String(pending.ruleId || pending.deleteRuleId || "") ===
+      String(ruleId)) {
+    const pendingPatch = extractRefinementBasePatch(pending);
+    if (pendingPatch) return {id: ruleId, ...pendingPatch};
+  }
+
   const applied = normalizeLastAppliedRule(
       ruleContext && ruleContext.lastAppliedRule);
   const proposed = normalizeLastAppliedRule(
       ruleContext && ruleContext.lastProposedRule);
   const snap = (applied && applied.ruleId === ruleId && applied) ||
     (proposed && proposed.ruleId === ruleId && proposed) || null;
-  if (!snap || !snap.proposal || !snap.proposal.patch) return null;
-  return {id: ruleId, ...snap.proposal.patch};
+  if (!snap) return null;
+  const snapPatch = extractRefinementBasePatch(snap) ||
+    extractRefinementBasePatch(snap.proposal);
+  if (!snapPatch) return null;
+  return {id: ruleId, ...snapPatch};
 }
 
 /**
@@ -2020,12 +2055,25 @@ function applyZipFillExtraConditionsToPatch(patch, match, conditions) {
 
 /**
  * Update proposal for a zip-fill rule after apply or mid-confirm refine.
- * @param {object} live Existing rule doc.
+ * @param {object} live Existing rule doc (or pending patch as doc).
  * @param {object} conditions New filters.
- * @param {string} lastText Latest user message.
+ * @param {{pendingAction?: string, ruleExists?: boolean}=} opts
+ *   pendingAction: keep create when refining an unsaved proposal.
  * @return {object}
  */
-function buildZipFillRefinementProposal(live, conditions) {
+function buildZipFillRefinementProposal(live, conditions, opts) {
+  const options = opts && typeof opts === "object" ? opts : {};
+  const ruleExists = options.ruleExists === true;
+  const pendingAction = options.pendingAction ?
+    String(options.pendingAction) : "";
+  // Mid-confirm refine of an unsaved create → still one create Confirm.
+  const keepCreate = !ruleExists &&
+    (pendingAction === "propose_create_rule" || !pendingAction);
+  const action = keepCreate ? "propose_create_rule" : "propose_update_rule";
+  const confirmHint = keepCreate ?
+    "Confirm to save this rule" :
+    "Confirm to save this update";
+
   const match = mergeMatchFields(live.match || {}, {
     fromEmails: conditions.fromEmails || [],
     senderEmails: conditions.fromEmails || [],
@@ -2058,7 +2106,10 @@ function buildZipFillRefinementProposal(live, conditions) {
   if (customerName) patch.customerName = customerName;
   if (fromNames.length) patch.fromNames = fromNames;
   if (bits.length) {
-    patch.name = `${live.name || "ZIP fill"} — ${bits.join(", ")}`;
+    const baseName = String(live.name || `${sideLabel} ZIP fill`)
+        .replace(/\s*—\s*customer\b.*$/i, "")
+        .trim();
+    patch.name = `${baseName} — ${bits.join(", ").replace(/\*\*/g, "")}`;
     patch.notes = `When ${sideLabel} city matches and ` +
       bits.map((b) => b.replace(/\*\*/g, "")).join(" + ") +
       `, use ZIP ${zip}.`;
@@ -2068,13 +2119,17 @@ function buildZipFillRefinementProposal(live, conditions) {
   const condText = bits.length ?
     `but only when ${bits.join(" and ")}` :
     "with your added condition";
+  const lead = keepCreate ?
+    `Got it — same ${sideLabel} ZIP **${zip}**, ${condText}` :
+    `Got it — updating **${live.id}**: same ${sideLabel} ZIP **${zip}**, ` +
+      `${condText}`;
   return {
-    reply: `Got it — updating **${live.id}**: same ${sideLabel} ZIP **${zip}**, ` +
-      `${condText}. Does that look right? Say yes / sounds good / go ahead, ` +
-      "or click Confirm.",
-    action: "propose_update_rule",
+    reply: `${lead}. Does that look right? Say yes / sounds good / go ahead, ` +
+      `or click ${confirmHint}.`,
+    action,
     proposal: {ruleId: live.id, patch},
     quickReplies: [],
+    replacedPending: keepCreate,
   };
 }
 
@@ -2104,7 +2159,7 @@ function buildRuleRefinementProposal(messages, existingRules, pending, ruleConte
   }
 
   const live = findRuleDocForRefinement(
-      ruleId, existingRules || [], ruleContext || {});
+      ruleId, existingRules || [], ruleContext || {}, pending || null);
   if (!live) return null;
 
   let conditions = parseZipFillExtraConditions(lastText, existingRules || []);
@@ -2137,7 +2192,11 @@ function buildRuleRefinementProposal(messages, existingRules, pending, ruleConte
   }
 
   if (isZipFillRuleDoc(live)) {
-    return buildZipFillRefinementProposal(live, conditions);
+    const ruleExists = !!(existingRules || []).find((r) => r && r.id === ruleId);
+    return buildZipFillRefinementProposal(live, conditions, {
+      pendingAction: pending && pending.action ? pending.action : "",
+      ruleExists,
+    });
   }
   return null;
 }
@@ -2426,7 +2485,7 @@ function buildZipFillProposal(messages, existingRules) {
     reply: `I'll set pickup/delivery ZIP for ${topic.city}` +
       `${topic.state ? ", " + topic.state : ""} to **${topic.zipCode}** ` +
       `when the ${sideLabel} city matches${condReply}. Does that look right? ` +
-      "Say yes / sounds good / go ahead, or click Confirm to save it.",
+      "Say yes / sounds good / go ahead, or click Confirm to save this rule.",
     action: live ? "propose_update_rule" : "propose_create_rule",
     proposal: {ruleId, patch},
     quickReplies: [],
@@ -2976,6 +3035,13 @@ async function runQuoteRulesChatTurn(opts) {
     "",
     "User: when pickup is La Mirada use zip 90670",
     "→ propose_create_rule zip_fill, applyTo origin, fillZipCode 90670.",
+    "",
+    "User: yes, but only when the customer is Brumis Imports Inc",
+    "  (while that create proposal is STILL PENDING — not saved yet)",
+    "→ REPLACE the pending create with the refined create (same rule id,",
+    "  add customerName Brumis Imports Inc, identifyVia both).",
+    "  Do NOT apply/save the bare city-only rule first. One Confirm saves",
+    "  the complete rule.",
     "",
     "User: yes, but only when the customer is Brumis Imports Inc",
     "  (after applying La Mirada zip fill)",

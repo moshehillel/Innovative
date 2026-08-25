@@ -97,6 +97,48 @@ check("refine after apply customer",
     refineOut.proposal.patch.customerName, "Brumis Imports Inc");
 checkTrue("refine not vague guess",
     refineOut && !/Do you mean you want a quote rule/i.test(refineOut.reply || ""));
+checkTrue("refine after apply asks Confirm to save this update",
+    refineOut && /Confirm to save this update/i.test(refineOut.reply || ""));
+
+const pendingLaMirada = {
+  action: "propose_create_rule",
+  ruleId: "zip_fill_la_mirada_origin",
+  patch: {
+    active: true,
+    priority: 3,
+    name: "La Mirada, CA pickup → ZIP 90670",
+    ruleKind: "zip_fill",
+    identifyVia: "ai",
+    applyTo: "origin",
+    match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+    fillZipCode: "90670",
+    addAccessorials: [],
+    autoApply: true,
+    requiresConfirm: false,
+  },
+};
+const pendingRefineMsgs = [
+  {role: "user", content: "When pickup is La Mirada use zip 90670"},
+  {role: "assistant", content: "Proposed La Mirada pickup ZIP 90670."},
+  {role: "user", content: "yes, but only when the customer is Brumis Imports Inc"},
+];
+const pendingRefineOut = chat.buildRuleRefinementProposal(
+    pendingRefineMsgs, [], pendingLaMirada, {});
+check("pending refine keeps create action",
+    pendingRefineOut && pendingRefineOut.action, "propose_create_rule");
+check("pending refine adds Brumis",
+    pendingRefineOut && pendingRefineOut.proposal &&
+    pendingRefineOut.proposal.patch &&
+    pendingRefineOut.proposal.patch.customerName,
+    "Brumis Imports Inc");
+checkTrue("pending refine does not auto-apply",
+    !(pendingRefineOut && pendingRefineOut.confirmApply));
+checkTrue("pending refine Confirm to save this rule",
+    pendingRefineOut &&
+    /Confirm to save this rule/i.test(pendingRefineOut.reply || ""));
+checkTrue("pending refine not update wording spam",
+    pendingRefineOut &&
+    !/Confirm to save this update/i.test(pendingRefineOut.reply || ""));
 
 checkTrue("resolveChatTurns accepts history alias",
     chat.resolveChatTurns({
@@ -503,6 +545,53 @@ for (const phrase of mosesPhrases) {
     console.log("  reply:", laMiradaSmoke && laMiradaSmoke.reply);
     console.log("  patch:", laMiradaSmoke && laMiradaSmoke.proposal &&
       laMiradaSmoke.proposal.patch);
+  }
+
+  const pendingCreate = {
+    action: "propose_create_rule",
+    ruleId: "zip_fill_la_mirada_origin",
+    patch: {
+      active: true,
+      priority: 3,
+      name: "La Mirada, CA pickup → ZIP 90670",
+      ruleKind: "zip_fill",
+      identifyVia: "ai",
+      applyTo: "origin",
+      match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+      fillZipCode: "90670",
+      addAccessorials: [],
+      autoApply: true,
+      requiresConfirm: false,
+    },
+  };
+  const pendingRefineTurn = await chat.runQuoteRulesChatTurn({
+    messages: [
+      {role: "user", content: "When pickup is La Mirada use zip 90670"},
+      {role: "assistant", content: "Proposed La Mirada pickup ZIP 90670."},
+      {
+        role: "user",
+        content: "yes, but only when the customer is Brumis Imports Inc",
+      },
+    ],
+    existingRules: [],
+    pendingProposal: pendingCreate,
+  });
+  const pendingRefineOk = pendingRefineTurn &&
+    pendingRefineTurn.action === "propose_create_rule" &&
+    !pendingRefineTurn.confirmApply &&
+    pendingRefineTurn.proposal &&
+    pendingRefineTurn.proposal.patch &&
+    pendingRefineTurn.proposal.patch.customerName === "Brumis Imports Inc" &&
+    pendingRefineTurn.proposal.patch.fillZipCode === "90670" &&
+    /Confirm to save this rule/i.test(pendingRefineTurn.reply || "");
+  checkTrue("smoke: pending yes-but-Brumis merges create", pendingRefineOk);
+  if (!pendingRefineOk) {
+    console.log("  action:", pendingRefineTurn && pendingRefineTurn.action);
+    console.log("  confirmApply:", pendingRefineTurn &&
+      pendingRefineTurn.confirmApply);
+    console.log("  reply:", pendingRefineTurn && pendingRefineTurn.reply);
+    console.log("  patch:", pendingRefineTurn && pendingRefineTurn.proposal &&
+      pendingRefineTurn.proposal.patch);
   }
 
   if (failures) {
