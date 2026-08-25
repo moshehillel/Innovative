@@ -292,7 +292,8 @@ function normalizeCarrierReference(value) {
 
 /**
  * True when the carrier bill for this load appears already entered in
- * Primus (vendor ref / PRO match, carrier-bill document, or REST invoice).
+ * Primus (vendor ref match, carrier-bill document, or REST invoice row).
+ * Booking PRO alone does not count as carrier bill entered.
  * @param {object} item AI invoice item.
  * @return {Promise<boolean>}
  */
@@ -317,17 +318,10 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
     const carrierRef = String(
         (booking.vendor && booking.vendor.carrierRef) ||
         booking.carrierRef || "").trim();
-    const bookingPro = String(
-        (booking.vendor && booking.vendor.PRO) || "").trim();
 
     if (carrierInvNum && carrierRef &&
         normalizeCarrierReference(carrierInvNum) ===
         normalizeCarrierReference(carrierRef)) {
-      return true;
-    }
-    if (proNumber && bookingPro &&
-        normalizeCarrierReference(proNumber) ===
-        normalizeCarrierReference(bookingPro)) {
       return true;
     }
 
@@ -349,7 +343,7 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
     }
 
     const vendorCost = Number(booking.vendor && booking.vendor.cost || 0);
-    if (vendorCost > 0 && invoiceAmount > 0 && (carrierRef || bookingPro)) {
+    if (vendorCost > 0 && invoiceAmount > 0 && carrierRef) {
       const diff = Math.abs(vendorCost - invoiceAmount);
       const tolerance = Math.max(0.50, vendorCost * 0.02);
       if (diff <= tolerance) return true;
