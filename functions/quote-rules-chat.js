@@ -13,8 +13,8 @@ const {
   RULE_KIND_SENDER_CUSTOMER,
 } = require("./quote-accessorial-rules");
 
-// Stronger than gpt-5.6-luna for freeform rule chat. Override via env.
-const RULES_CHAT_MODEL = process.env.QUOTE_RULES_CHAT_MODEL || "gpt-5.6-sol";
+// Default gpt-5.6-luna for freeform rule chat. Override via env.
+const RULES_CHAT_MODEL = process.env.QUOTE_RULES_CHAT_MODEL || "gpt-5.6-luna";
 
 const PATCH_FIELDS = [
   "active",
@@ -1663,7 +1663,7 @@ async function runQuoteRulesChatTurn(opts) {
   const lastIsAcc = parseAccessorialsAnswer(lastText).length > 0;
   const lastIsChoice = !!parseIdentifyChoiceAnswer(lastText);
   // After Cannot-be, only skip the model for a structured accessorial
-  // or identify answer. Follow-ups go to gpt-5.6-sol.
+  // or identify answer. Follow-ups go to gpt-5.6-luna.
   if (gateHint.status === "ready" && gateHint.source === "address_only" &&
       (lastIsAcc || lastIsChoice)) {
     return enforceCreateIdentifyGate({
