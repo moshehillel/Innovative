@@ -16,6 +16,8 @@ const {
 
 // Default gpt-5.6-luna for freeform rule chat. Override via env.
 const RULES_CHAT_MODEL = process.env.QUOTE_RULES_CHAT_MODEL || "gpt-5.6-luna";
+/** Max turns sent to the model (full session when shorter). */
+const RULES_CHAT_MAX_TURNS = 50;
 
 const PATCH_FIELDS = [
   "active",
@@ -94,6 +96,7 @@ function parseNaturalRejection(text) {
 function parseNaturalConfirmation(text, opts) {
   const raw = String(text || "").trim();
   if (!raw) return false;
+  if (looksLikeRuleRefinement(raw)) return false;
   if (parseNaturalRejection(raw)) return false;
   const norm = normalizeChatAnswerText(raw);
 
@@ -322,6 +325,22 @@ function userTopicBlob(messages) {
 }
 
 /**
+ * Normalize chat payload — accepts messages and/or history (full thread).
+ * @param {object} opts Request options.
+ * @return {Array<object>}
+ */
+function resolveChatTurns(opts) {
+  const raw = (opts && (opts.messages || opts.history)) || [];
+  if (!Array.isArray(raw)) return [];
+  return raw
+      .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+      .map((m) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: String(m.content || ""),
+      }));
+}
+
+/**
  * Military / AAFES phrasing, including common typos (militery, millitary).
  * @param {string} blob Lowercased user text.
  * @return {boolean}
@@ -439,6 +458,9 @@ function sanitizeChatReply(reply, messages) {
 function parseRejectionWithCorrection(text) {
   const raw = String(text || "").trim();
   if (!raw) return {rejected: false, correction: null};
+  if (looksLikeRuleRefinement(raw)) {
+    return {rejected: false, correction: null};
+  }
   if (!parseNaturalRejection(raw)) {
     return {rejected: false, correction: null};
   }
@@ -1539,6 +1561,376 @@ function parseZipCodeFromText(text) {
 }
 
 /**
+ * User is refining a just-proposed or just-applied rule ("yes, but only
+ * when…", "for this rule…"), not starting a new vague request.
+ * @param {string} text User message.
+ * @return {boolean}
+ */
+function looksLikeRuleRefinement(text) {
+  const raw = String(text || "").trim();
+  if (!raw || /^\[applied\]/i.test(raw)) return false;
+  const norm = normalizeChatAnswerText(raw);
+  if (/\b(for|on|to)\s+this\s+rule\b/.test(norm)) return true;
+  if (/\b(that|the)\s+rule\b/.test(norm) &&
+      /\b(only|when|add|also|limit|restrict|customer|sender)\b/.test(norm)) {
+    return true;
+  }
+  if (/\b(yes|yeah|yep|ok|okay),?\s+but\b/.test(norm)) return true;
+  if (/\bbut\s+only\s+when\b/.test(norm)) return true;
+  if (/\bonly\s+when\s+(the\s+)?(customer|sender|from|it\s+comes)\b/
+      .test(norm)) {
+    return true;
+  }
+  if (/\b(also\s+)?(require|limit|restrict)\s+(it\s+)?to\b/.test(norm)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Rule id from the most recent [APPLIED] assistant turn.
+ * @param {Array<object>} messages Chat turns.
+ * @return {string|null}
+ */
+function findLastAppliedRuleId(messages) {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    const applied = String(m.content || "").trim()
+        .match(/^\[APPLIED\]\s+(?:Saved|Deleted)\s+rule\s+"([^"]+)"/i);
+    if (applied) return applied[1];
+  }
+  return null;
+}
+
+/**
+ * Customer name from refinement phrasing.
+ * @param {string} text User text.
+ * @return {string}
+ */
+function parseRefinementCustomerName(text) {
+  const emails = extractEmailsFromText(text);
+  let name = parseCustomerNameFromSenderText(text, emails);
+  if (name) return name;
+  const onlyWhen = text.match(
+      /\bonly\s+when\s+(?:the\s+)?customer\s+(?:is\s+)?(.+?)(?:\.|$)/i);
+  if (onlyWhen && onlyWhen[1]) {
+    name = onlyWhen[1].replace(/\s+customer\s*$/i, "").trim();
+    if (name.length >= 2) return name;
+  }
+  const customerIs = text.match(
+      /\bcustomer\s+(?:is\s+|name\s+is\s+)(.+?)(?:\.|$)/i);
+  if (customerIs && customerIs[1]) {
+    name = customerIs[1].trim();
+    if (name.length >= 2 && !/@/.test(name)) return name;
+  }
+  return "";
+}
+
+/**
+ * Sender display name from zip-fill / refinement phrasing.
+ * @param {string} text User text.
+ * @return {string}
+ */
+function parseRefinementSenderName(text) {
+  const patterns = [
+    /\b(?:comes\s+from|when\s+it\s+comes\s+from)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:and|use|with|zip|when|only)|[,.]|$)/i,
+    /\b(?:from|sender)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:and|use|with|when|only)|[,.]|$)/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m && m[1]) {
+      const name = m[1].replace(/[,.\s]+$/g, "").trim();
+      if (name.length >= 2 &&
+          !/^(pickup|delivery|la|the|a|when|only)$/i.test(name)) {
+        return name;
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * Resolve sender name to known sender→customer rules (email / customer).
+ * @param {string} name Sender display name.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {{fromEmails: Array<string>, fromNames: Array<string>, customerName: string}}
+ */
+function resolveSenderHintsFromRules(name, existingRules) {
+  const want = String(name || "").trim().toLowerCase();
+  const out = {fromEmails: [], fromNames: [], customerName: ""};
+  if (!want) return out;
+  for (const r of existingRules || []) {
+    if (!r || r.ruleKind !== RULE_KIND_SENDER_CUSTOMER) continue;
+    const fromNames = [].concat(r.fromNames || []);
+    const match = r.match && typeof r.match === "object" ? r.match : {};
+    const emails = [].concat(match.fromEmails || []);
+    const nameHit = fromNames.some((n) => {
+      const nn = String(n || "").trim().toLowerCase();
+      return nn && (want.includes(nn) || nn.includes(want));
+    });
+    const cust = String(r.customerName || "").trim();
+    const custHit = cust &&
+      (cust.toLowerCase().includes(want) || want.includes(cust.toLowerCase()));
+    if (nameHit || custHit) {
+      out.fromEmails.push(...emails);
+      out.fromNames.push(...(fromNames.length ? fromNames : [name]));
+      if (cust) out.customerName = cust;
+      break;
+    }
+  }
+  if (!out.fromNames.length && name) out.fromNames.push(name);
+  out.fromEmails = [...new Set(out.fromEmails.map((e) => e.toLowerCase()))];
+  return out;
+}
+
+/**
+ * Optional customer / sender filters for zip-fill rules.
+ * @param {string} text User text (may span several turns).
+ * @param {Array<object>} existingRules Live rules.
+ * @return {{customerName: string, fromEmails: Array<string>, fromNames: Array<string>}}
+ */
+function parseZipFillExtraConditions(text, existingRules) {
+  const emails = extractEmailsFromText(text);
+  let customerName = parseRefinementCustomerName(text);
+  const senderName = parseRefinementSenderName(text);
+  const senderHints = senderName ?
+    resolveSenderHintsFromRules(senderName, existingRules) :
+    {fromEmails: [], fromNames: [], customerName: ""};
+  if (!customerName && senderHints.customerName) {
+    customerName = senderHints.customerName;
+  }
+  customerName = resolveCustomerNameFromRules(customerName, existingRules);
+  return {
+    customerName: customerName || "",
+    fromEmails: emails.length ? emails : senderHints.fromEmails,
+    fromNames: senderHints.fromNames,
+  };
+}
+
+/**
+ * Canonical Primus customer name from live rules when possible.
+ * @param {string} name Parsed customer name.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {string}
+ */
+function resolveCustomerNameFromRules(name, existingRules) {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  const want = raw.toLowerCase();
+  for (const r of existingRules || []) {
+    const cust = String(r.customerName || "").trim();
+    if (!cust) continue;
+    const lower = cust.toLowerCase();
+    if (lower === want || lower.includes(want) || want.includes(lower)) {
+      return cust;
+    }
+  }
+  return raw;
+}
+
+/**
+ * Merge array-valued match fields without dropping prior needles.
+ * @param {object} base Existing match.
+ * @param {object} extra New match fields.
+ * @return {object}
+ */
+function mergeMatchFields(base, extra) {
+  const out = {...(base && typeof base === "object" ? base : {})};
+  for (const [k, v] of Object.entries(extra || {})) {
+    if (Array.isArray(v)) {
+      const prev = Array.isArray(out[k]) ? out[k] : [];
+      out[k] = [...new Set([...prev, ...v].map(String))];
+    } else if (v != null && String(v).trim()) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Rule id for a refinement turn (pending, [APPLIED], or zip-fill context).
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object|null} pending Pending proposal.
+ * @return {string|null}
+ */
+function findRuleIdForRefinement(messages, existingRules, pending, lastAppliedRuleId) {
+  if (pending && pending.ruleId) return String(pending.ruleId);
+  if (lastAppliedRuleId) return String(lastAppliedRuleId);
+  const applied = findLastAppliedRuleId(messages);
+  if (applied) return applied;
+  const topic = inferZipFillTopic(messages);
+  if (topic && topic.city) {
+    const live = findExistingZipFillRule(existingRules || [], topic);
+    if (live) return live.id;
+  }
+  return null;
+}
+
+/**
+ * Human summary of zip-fill extra conditions.
+ * @param {object} conditions Parsed conditions.
+ * @param {object} match Rule match object.
+ * @param {Array<string>} fromNames Rule fromNames.
+ * @return {Array<string>}
+ */
+function zipFillConditionBits(conditions, match, fromNames) {
+  const bits = [];
+  if (conditions.customerName) bits.push(`customer **${conditions.customerName}**`);
+  const emails = [].concat(match.fromEmails || match.senderEmails || []);
+  if (emails.length) bits.push(`sender ${emails.join(", ")}`);
+  else if ((fromNames || []).length) bits.push(`sender ${fromNames.join(", ")}`);
+  return bits;
+}
+
+/**
+ * Apply optional customer/sender filters onto a zip-fill patch.
+ * @param {object} patch Outgoing patch (mutated).
+ * @param {object} match Outgoing match (mutated).
+ * @param {object} conditions Parsed conditions.
+ */
+function applyZipFillExtraConditionsToPatch(patch, match, conditions) {
+  if (!conditions) return;
+  if (conditions.customerName) {
+    patch.customerName = conditions.customerName;
+  }
+  if (conditions.fromEmails && conditions.fromEmails.length) {
+    match.fromEmails = conditions.fromEmails;
+  }
+  if (conditions.fromNames && conditions.fromNames.length) {
+    patch.fromNames = conditions.fromNames
+        .map((n) => String(n).trim().toLowerCase())
+        .filter(Boolean);
+  }
+  const hasEmailCond = (match.fromEmails || []).length > 0 ||
+    (patch.fromNames || []).length > 0;
+  if (hasEmailCond || conditions.customerName) {
+    patch.identifyVia = "both";
+  }
+}
+
+/**
+ * Update proposal for a zip-fill rule after apply or mid-confirm refine.
+ * @param {object} live Existing rule doc.
+ * @param {object} conditions New filters.
+ * @param {string} lastText Latest user message.
+ * @return {object}
+ */
+function buildZipFillRefinementProposal(live, conditions) {
+  const match = mergeMatchFields(live.match || {}, {
+    fromEmails: conditions.fromEmails || [],
+    senderEmails: conditions.fromEmails || [],
+  });
+  const fromNames = [...new Set([]
+      .concat(live.fromNames || [])
+      .concat(conditions.fromNames || [])
+      .map((n) => String(n).trim().toLowerCase())
+      .filter(Boolean))];
+  const customerName = conditions.customerName ||
+    live.customerName || "";
+  const sideLabel = live.applyTo === "dest" ? "delivery" : "pickup";
+  const zip = String(live.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+  const bits = zipFillConditionBits(
+      {customerName}, match, fromNames);
+  const patch = {
+    active: live.active !== false,
+    priority: live.priority || 3,
+    name: live.name || `${sideLabel} ZIP fill`,
+    ruleKind: RULE_KIND_ZIP_FILL,
+    identifyVia: (match.fromEmails || []).length || fromNames.length ||
+      customerName ? "both" : (live.identifyVia || "ai"),
+    applyTo: live.applyTo || "origin",
+    match,
+    fillZipCode: zip,
+    addAccessorials: live.addAccessorials || [],
+    autoApply: live.autoApply !== false,
+    requiresConfirm: !!live.requiresConfirm,
+  };
+  if (customerName) patch.customerName = customerName;
+  if (fromNames.length) patch.fromNames = fromNames;
+  if (bits.length) {
+    patch.name = `${live.name || "ZIP fill"} — ${bits.join(", ")}`;
+    patch.notes = `When ${sideLabel} city matches and ` +
+      bits.map((b) => b.replace(/\*\*/g, "")).join(" + ") +
+      `, use ZIP ${zip}.`;
+  } else {
+    patch.notes = live.notes || "";
+  }
+  const condText = bits.length ?
+    `but only when ${bits.join(" and ")}` :
+    "with your added condition";
+  return {
+    reply: `Got it — updating **${live.id}**: same ${sideLabel} ZIP **${zip}**, ` +
+      `${condText}. Does that look right? Say yes / sounds good / go ahead, ` +
+      "or click Confirm.",
+    action: "propose_update_rule",
+    proposal: {ruleId: live.id, patch},
+    quickReplies: [],
+  };
+}
+
+/**
+ * Refine a recently applied / pending rule with additive conditions.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object|null} [pending] Pending proposal from UI.
+ * @return {object|null}
+ */
+function buildRuleRefinementProposal(messages, existingRules, pending, lastAppliedRuleId) {
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (!looksLikeRuleRefinement(lastText)) return null;
+
+  const ruleId = findRuleIdForRefinement(
+      messages, existingRules || [], pending, lastAppliedRuleId);
+  if (!ruleId) {
+    return {
+      reply: "Got it — which rule should I update? Repeat the rule " +
+        "(e.g. La Mirada pickup → ZIP 90670) and the extra condition " +
+        "(customer or sender).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
+  const live = (existingRules || []).find((r) => r.id === ruleId);
+  if (!live) return null;
+
+  let conditions = parseZipFillExtraConditions(lastText, existingRules || []);
+  const priorUserText = (messages || [])
+      .filter((m) => m && m.role === "user" && m !== last)
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (priorUserText) {
+    const prior = parseZipFillExtraConditions(
+        priorUserText, existingRules || []);
+    if (!conditions.fromEmails.length) {
+      conditions.fromEmails = prior.fromEmails;
+    }
+    if (!conditions.fromNames.length) conditions.fromNames = prior.fromNames;
+    if (!conditions.customerName) conditions.customerName = prior.customerName;
+  }
+
+  if (!conditions.customerName && !conditions.fromEmails.length &&
+      !conditions.fromNames.length) {
+    return {
+      reply: "What should I add to that rule — customer name, sender email, " +
+        "or sender name (e.g. only when customer is Brumis Imports Inc)?",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
+  if (isZipFillRuleDoc(live)) {
+    return buildZipFillRefinementProposal(live, conditions);
+  }
+  return null;
+}
+
+/**
  * Parse city + optional state from zip-fill phrasing.
  * @param {string} text User text.
  * @return {{city: string, state: string, side: "origin"|"dest"}}
@@ -1791,10 +2183,28 @@ function buildZipFillProposal(messages, existingRules) {
     requiresConfirm: false,
   };
 
+  const userBlob = (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  const extra = parseZipFillExtraConditions(userBlob, existingRules || []);
+  applyZipFillExtraConditionsToPatch(patch, match, extra);
+  const condBits = zipFillConditionBits(extra, match, patch.fromNames || []);
+  if (condBits.length) {
+    patch.name = `${name} — ${condBits.join(", ").replace(/\*\*/g, "")}`;
+    patch.notes = `When ${sideLabel} city matches ${topic.city}` +
+      `${topic.state ? " " + topic.state : ""} and ` +
+      condBits.map((b) => b.replace(/\*\*/g, "")).join(" + ") +
+      `, use ZIP ${topic.zipCode}.`;
+  }
+
+  const condReply = condBits.length ?
+    ` (only when ${condBits.join(" and ")})` : "";
+
   return {
     reply: `I'll set pickup/delivery ZIP for ${topic.city}` +
       `${topic.state ? ", " + topic.state : ""} to **${topic.zipCode}** ` +
-      `when the ${sideLabel} city matches. Does that look right? ` +
+      `when the ${sideLabel} city matches${condReply}. Does that look right? ` +
       "Say yes / sounds good / go ahead, or click Confirm to save it.",
     action: live ? "propose_update_rule" : "propose_create_rule",
     proposal: {ruleId, patch},
@@ -2123,15 +2533,20 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
  * @return {Promise<object>} {reply, action, proposal}
  */
 async function runQuoteRulesChatTurn(opts) {
-  const chatTurns = opts.messages || [];
+  const chatTurns = resolveChatTurns(opts || {});
   const existingRules = opts.existingRules || [];
   const finish = (r) => polishChatResult(r, chatTurns);
   const pending = opts.pendingProposal && typeof opts.pendingProposal === "object" ?
     opts.pendingProposal : null;
+  const lastAppliedRuleId = opts.lastAppliedRuleId ?
+    String(opts.lastAppliedRuleId) : findLastAppliedRuleId(chatTurns);
   const last = lastUserTurn(chatTurns);
   const lastText = last ? String(last.content || "") : "";
 
   if (pending && lastText) {
+    const refinePending = buildRuleRefinementProposal(
+        chatTurns, existingRules, pending, lastAppliedRuleId);
+    if (refinePending) return finish(refinePending);
     if (parseNaturalConfirmation(lastText, {pendingProposal: true})) {
       return finish({
         reply: "Perfect — applying that rule now.",
@@ -2167,6 +2582,10 @@ async function runQuoteRulesChatTurn(opts) {
       quickReplies: [],
     });
   }
+
+  const refineOut = buildRuleRefinementProposal(
+      chatTurns, existingRules, null, lastAppliedRuleId);
+  if (refineOut) return finish(refineOut);
 
   // Obvious delete / military APD+LAD updates skip the model so a leftover
   // identify gate cannot steal the turn.
@@ -2279,7 +2698,10 @@ async function runQuoteRulesChatTurn(opts) {
     "  confirmation (yes, sounds good, go ahead, that's right).",
     "- If user confirms naturally but action is still propose_*, keep the",
     "  proposal — the UI applies on confirm.",
+    "- Full conversation thread is in messages — use ALL prior turns.",
     "- [APPLIED] messages are ground-truth Confirm results.",
+    "- \"yes, but only when…\" / \"for this rule…\" = refine the last",
+    "  applied or pending rule — propose_update_rule, not a new guess.",
     "- Live rule truth = Current active rules JSON only.",
     "",
     "=== FEW-SHOT EXAMPLES (follow these patterns) ===",
@@ -2325,6 +2747,14 @@ async function runQuoteRulesChatTurn(opts) {
     "User: when pickup is La Mirada use zip 90670",
     "→ propose_create_rule zip_fill, applyTo origin, fillZipCode 90670.",
     "",
+    "User: yes, but only when the customer is Brumis Imports Inc",
+    "  (after applying La Mirada zip fill)",
+    "→ propose_update_rule same rule id; add customerName Brumis Imports Inc;",
+    "  identifyVia both. Do NOT create a new bare city-only rule.",
+    "",
+    "User: for this rule, when pickup is La Mirada use zip 90670 — only Jared",
+    "→ propose_update_rule zip_fill_la_mirada_* with fromNames/emails for Jared.",
+    "",
     "User: military bases need LAD and APD",
     "→ propose create/update aafes_military, addAccessorials [LAD, APD].",
     "",
@@ -2343,7 +2773,8 @@ async function runQuoteRulesChatTurn(opts) {
     "Ids like sender_mike_oseback / name \"Sender → Mike Oseback\".",
     "",
     "=== ZIP fill details ===",
-    "ruleKind zip_fill; identifyVia ai; addAccessorials [].",
+    "ruleKind zip_fill; identifyVia ai|both when sender/customer filters;",
+    "addAccessorials []. Optional customerName, fromNames, match.fromEmails.",
     "applyTo origin for pickup/Ship From; dest for delivery/Ship To.",
     "fillZipCode must be 5 digits. Overrides wrong geocoded ZIPs.",
     "Do NOT ask identify questionnaire for zip-fill rules.",
@@ -2379,7 +2810,7 @@ async function runQuoteRulesChatTurn(opts) {
 
   const messages = [
     {role: "system", content: systemPrompt},
-    ...(opts.messages || []).slice(-30).map((m) => ({
+    ...chatTurns.slice(-RULES_CHAT_MAX_TURNS).map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
       content: String(m.content || "").slice(0, 4000),
     })),
@@ -2404,14 +2835,14 @@ async function runQuoteRulesChatTurn(opts) {
     parsed = JSON.parse(raw);
   } catch (_) {
     parsed = {
-      reply: raw || fallbackUnclearReply(opts.messages || []),
+      reply: raw || fallbackUnclearReply(chatTurns),
       action: "none",
       proposal: null,
     };
   }
 
   const gated = enforceCreateIdentifyGate(
-      parsed, opts.messages || [], existingRules);
+      parsed, chatTurns, existingRules);
   return finish(gated);
 }
 
@@ -2525,6 +2956,10 @@ function normalizePartialPatch(patch) {
   }
   if (Object.prototype.hasOwnProperty.call(patch, "customerName")) {
     normalized.customerName = String(patch.customerName || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "fromNames") &&
+      Array.isArray(patch.fromNames)) {
+    normalized.fromNames = patch.fromNames.map(String);
   }
   if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
     normalized.protocolOnly = !!patch.protocolOnly;
@@ -2692,6 +3127,7 @@ function validateRuleProposal(proposal) {
 
 module.exports = {
   runQuoteRulesChatTurn,
+  resolveChatTurns,
   validateRuleProposal,
   extractPatch,
   detectCreateIdentifyGate,
@@ -2713,6 +3149,10 @@ module.exports = {
   buildMilitaryAccessorialProposal,
   buildSenderCustomerProposal,
   buildZipFillProposal,
+  buildRuleRefinementProposal,
+  looksLikeRuleRefinement,
+  findLastAppliedRuleId,
+  parseZipFillExtraConditions,
   inferSenderCustomerTopic,
   inferZipFillTopic,
   looksLikeZipFillIntent,

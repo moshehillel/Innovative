@@ -493,15 +493,57 @@ function zipFillRuleMatchesParty(party, match, side) {
 }
 
 /**
+ * Optional customer / sender filters on zip-fill rules.
+ * @param {object} rule Rule document.
+ * @param {object} context {fromEmail, fromName, customerName}.
+ * @return {boolean}
+ */
+function zipFillRuleMatchesContext(rule, context) {
+  if (!rule || typeof rule !== "object") return true;
+  const ctx = context && typeof context === "object" ? context : {};
+  const cust = String(rule.customerName || "").trim();
+  if (cust) {
+    const have = String(ctx.customerName || ctx.shippingLocationName || "")
+        .trim()
+        .toLowerCase();
+    const want = cust.toLowerCase();
+    if (!have) return false;
+    if (!(have.includes(want) || want.includes(have))) return false;
+  }
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  const emails = [].concat(match.fromEmails || match.senderEmails || []);
+  const from = String(ctx.fromEmail || ctx.from || "").trim().toLowerCase();
+  if (emails.length) {
+    if (!from || !emails.some((e) => from === String(e).toLowerCase())) {
+      return false;
+    }
+  }
+  const fromNames = [].concat(rule.fromNames || match.fromNames || []);
+  if (fromNames.length) {
+    const fromName = String(ctx.fromName || "").trim().toLowerCase();
+    if (!fromName || !containsAnyNeedle(fromName, fromNames)) return false;
+  }
+  return true;
+}
+
+/**
  * Apply Firestore zip-fill rules to lane shipper/consignee (overrides wrong
  * geocoded ZIPs for known warehouse cities).
  * @param {object} lane Lane (mutated).
  * @param {Array<object>} rules Active quote rules.
  * @param {object} [laneRef] Lane for extractionWarnings.
+ * @param {object} [context] Optional {fromEmail, fromName, customerName}.
  * @return {Array<object>} Applied zip-fill rule summaries.
  */
-function applyZipFillRules(lane, rules, laneRef) {
+function applyZipFillRules(lane, rules, laneRef, context) {
   const targetLane = laneRef || lane;
+  const ctx = {
+    fromEmail: (context && context.fromEmail) ||
+      lane.fromEmail || lane.from || "",
+    fromName: (context && context.fromName) || lane.fromName || "",
+    customerName: (context && context.customerName) ||
+      lane.customerName || lane.shippingLocationName || "",
+  };
   const applied = [];
   const list = (rules || [])
       .filter((r) => r && r.active !== false && isZipFillRule(r))
@@ -511,6 +553,7 @@ function applyZipFillRules(lane, rules, laneRef) {
   for (const rule of list) {
     const zipCode = zipFillCodeFromRule(rule);
     if (!/^\d{5}$/.test(zipCode)) continue;
+    if (!zipFillRuleMatchesContext(rule, ctx)) continue;
     const match = rule.match && typeof rule.match === "object" ?
       rule.match : {};
     for (const side of ruleSides(rule)) {
@@ -1203,4 +1246,5 @@ module.exports = {
   isZipFillRule,
   applyZipFillRules,
   zipFillRuleMatchesParty,
+  zipFillRuleMatchesContext,
 };

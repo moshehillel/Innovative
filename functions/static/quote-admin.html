@@ -579,6 +579,7 @@
     const API = "https://us-central1-tai-invoice-automation.cloudfunctions.net";
     let chatMessages = [];
     let pendingProposal = null;
+    let lastAppliedRuleId = null;
     let pendingQuickReplies = [];
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
@@ -1216,6 +1217,9 @@
     function isNaturalConfirm(text, hasPending) {
       const raw = String(text || "").trim();
       if (!raw || isNaturalReject(raw)) return false;
+      if (/^(yes|yeah|yep|ok|okay),?\s+but\b/i.test(raw)) return false;
+      if (/\bbut\s+only\s+when\b/i.test(raw)) return false;
+      if (/\bfor\s+this\s+rule\b/i.test(raw)) return false;
       const norm = normalizeConfirmText(raw);
       if (/^(yes|yep|yeah|yea|yup|ok|okay|k|sure|correct|right|exactly|perfect|absolutely|definitely|confirmed|confirm|apply|proceed|go ahead|do it|save it|looks good|sounds good|that works|please do|please apply|go for it|make it so|do that|that'?s it|that'?s right|that'?s correct|that'?s good|that'?s fine|that'?s perfect)\.?$/i.test(raw)) {
         return true;
@@ -1236,6 +1240,16 @@
       if (hasPending && /^(yes|yep|yeah|yup|ok|okay|sure|right|correct|perfect)\b/i.test(norm)) return true;
       if (hasPending && /\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 56) return true;
       return false;
+    }
+
+    function buildRulesChatPayload() {
+      return {
+        tenantId: TENANT_ID,
+        messages: chatMessages,
+        history: chatMessages,
+        pendingProposal,
+        lastAppliedRuleId,
+      };
     }
 
     async function applyPendingProposal() {
@@ -1284,6 +1298,7 @@
           : `Applied: saved "${ruleId}". Refresh the Rules list to see the update.`;
         appendChat("assistant", okMsg);
         chatMessages.push({ role: "assistant", content: applied });
+        lastAppliedRuleId = wasDelete ? null : (ruleId || null);
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
         await loadRules();
@@ -1357,11 +1372,7 @@
       try {
         let res = await api("/quoteRulesChat", {
           method: "POST",
-          body: JSON.stringify({
-            tenantId: TENANT_ID,
-            messages: chatMessages,
-            pendingProposal,
-          }),
+          body: JSON.stringify(buildRulesChatPayload()),
         });
         showChatThinking(false);
         res = normalizeChatProposal(res) || res;

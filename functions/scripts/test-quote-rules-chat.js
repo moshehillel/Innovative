@@ -47,6 +47,61 @@ checkTrue("confirm without pending",
     chat.parseNaturalConfirmation("confirm"));
 checkTrue("yes please is not reject",
     !chat.parseNaturalRejection("yes please"));
+checkTrue("yes but only when is not confirm",
+    !chat.parseNaturalConfirmation(
+        "yes, but only when the customer is Brumis Imports Inc",
+        {pendingProposal: true}));
+checkTrue("for this rule is refinement",
+    chat.looksLikeRuleRefinement(
+        "for this rule, when pickup is La Mirada use zip 90670"));
+
+const jaredLaMiradaMsg = [{
+  role: "user",
+  content: "When pickup is La Mirada and it comes from Jared berman, use zip 90670",
+}];
+const jaredZipOut = chat.buildZipFillProposal(jaredLaMiradaMsg, [
+  {
+    id: "sender_jared_berman",
+    ruleKind: "sender_customer",
+    customerName: "Brumis Imports Inc",
+    fromNames: ["jared berman"],
+    match: {fromEmails: ["jared.berman@corehome.com"]},
+  },
+]);
+checkTrue("jared la mirada zip fill intent",
+    chat.looksLikeZipFillIntent(jaredLaMiradaMsg));
+checkTrue("jared la mirada includes sender email",
+    jaredZipOut && jaredZipOut.proposal && jaredZipOut.proposal.patch &&
+    jaredZipOut.proposal.patch.match &&
+    Array.isArray(jaredZipOut.proposal.patch.match.fromEmails) &&
+    jaredZipOut.proposal.patch.match.fromEmails
+        .includes("jared.berman@corehome.com"));
+
+const refineAfterApply = [
+  {role: "user", content: "when pickup is La Mirada use zip 90670"},
+  {role: "assistant", content: "Applied: saved \"zip_fill_la_mirada_origin\"."},
+  {role: "assistant", content: "[APPLIED] Saved rule \"zip_fill_la_mirada_origin\" via Confirm (applyQuoteRule ok)."},
+  {role: "user", content: "yes, but only when the customer is Brumis Imports Inc"},
+];
+const refineOut = chat.buildRuleRefinementProposal(refineAfterApply, [{
+  id: "zip_fill_la_mirada_origin",
+  ruleKind: "zip_fill",
+  applyTo: "origin",
+  fillZipCode: "90670",
+  match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+}]);
+check("refine after apply action",
+    refineOut && refineOut.action, "propose_update_rule");
+check("refine after apply customer",
+    refineOut && refineOut.proposal && refineOut.proposal.patch &&
+    refineOut.proposal.patch.customerName, "Brumis Imports Inc");
+checkTrue("refine not vague guess",
+    refineOut && !/Do you mean you want a quote rule/i.test(refineOut.reply || ""));
+
+checkTrue("resolveChatTurns accepts history alias",
+    chat.resolveChatTurns({
+      history: [{role: "user", content: "hello"}],
+    }).length === 1);
 
 checkTrue("delivery appointment → APD",
     chat.parseAccessorialsAnswer("also delivery appointment").includes("APD"));

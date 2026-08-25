@@ -1482,7 +1482,12 @@ async function enrichLaneAddresses(lane, tenant, opts = {}) {
     const quoteRules = opts.quoteRules;
     if (Array.isArray(quoteRules) && quoteRules.length) {
       const quoteAccessorialRules = require("./quote-accessorial-rules");
-      quoteAccessorialRules.applyZipFillRules(lane, quoteRules, lane);
+      quoteAccessorialRules.applyZipFillRules(lane, quoteRules, lane, {
+        fromEmail: opts.fromEmail || lane.fromEmail || lane.from || "",
+        fromName: opts.fromName || lane.fromName || "",
+        customerName: opts.customerName ||
+          lane.customerName || lane.shippingLocationName || "",
+      });
     }
   }
   await enrichLaneShipper(lane, tenant, opts);

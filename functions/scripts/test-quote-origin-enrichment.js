@@ -399,6 +399,32 @@ if (laMiradaRule) {
       laMiradaLane.shipper.zipCode, "90670");
 }
 
+const brumisScopedRule = {
+  ...laMiradaRule,
+  customerName: "Brumis Imports Inc",
+  identifyVia: "both",
+};
+const brumisLane = {
+  shipper: {name: "STG", city: "La Mirada", state: "CA", zipCode: "90638"},
+  consignee: {name: "Lidl US", city: "Mebane", state: "NC", zipCode: "27302"},
+};
+if (brumisScopedRule) {
+  quoteRules.applyZipFillRules(
+      brumisLane, [brumisScopedRule], brumisLane,
+      {customerName: "Brumis Imports Inc"});
+  check("zip fill with Brumis customer applies",
+      brumisLane.shipper.zipCode, "90670");
+  const otherCustLane = {
+    shipper: {name: "STG", city: "La Mirada", state: "CA", zipCode: "90638"},
+    consignee: {name: "Other", city: "Mebane", state: "NC", zipCode: "27302"},
+  };
+  quoteRules.applyZipFillRules(
+      otherCustLane, [brumisScopedRule], otherCustLane,
+      {customerName: "Other Customer LLC"});
+  check("zip fill with Brumis customer skips other customer",
+      otherCustLane.shipper.zipCode, "90638");
+}
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

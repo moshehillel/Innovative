@@ -1035,6 +1035,8 @@ async function processQuoteEmail(opts) {
       await addressEnrichment.enrichLaneAddresses(lane, tenant, {
         log: enrichLog,
         quoteRules: rules,
+        fromEmail: senderFrom,
+        customerName: shippingLocationName || extractedCustomerName,
       });
     } catch (err) {
       await deps.writeLog("warn", "quote", "Address enrichment failed", {
@@ -1610,6 +1612,8 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
           log: (level, category, message, logData) =>
             deps.writeLog(level, category, message, logData),
           quoteRules: rules,
+          fromEmail: senderFrom || data.from || "",
+          customerName: shippingLocationName || "",
         });
       } catch (enrichErr) {
         await deps.writeLog("warn", "quote",
