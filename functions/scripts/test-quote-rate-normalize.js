@@ -120,6 +120,28 @@ check("keep email class without dims", keepEmail.freightInfo[0].class, 70);
 check("keep email classSource", keepEmail.freightInfo[0].classSource, "email");
 check("keep email unresolved", keepEmail.unresolved.length, 0);
 
+const preferEmail = rateShop.ensureFreightClasses([{
+  qty: 1, weight: 137, weightType: "total",
+  length: 40, width: 48, height: 60, dimType: "PLT", class: 250,
+}], {preferEmailClass: true});
+check("preferEmail keeps 250", preferEmail.freightInfo[0].class, 250);
+check("preferEmail classSource email", preferEmail.freightInfo[0].classSource,
+    "email");
+check("preferEmail densityClass 300", preferEmail.freightInfo[0].densityClass,
+    300);
+check("preferEmail not overwritten", preferEmail.overwritten, 0);
+
+const preferEmailQuery = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "CA", zipCode: "90670", country: "US"},
+  consignee: {city: "B", state: "VA", zipCode: "22407", country: "US"},
+  freightInfo: [{
+    qty: 1, weight: 137, weightType: "total",
+    length: 40, width: 48, height: 60, dimType: "PLT", class: 250,
+  }],
+}, {UOM: "US", preferEmailClass: true});
+const preferEmailPayload = JSON.parse(preferEmailQuery.freightInfo);
+check("preferEmail API class 250", preferEmailPayload[0].class, 250);
+
 const qFilled = rateShop.buildRateMultipleQuery({
   shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},
   consignee: {city: "B", state: "MA", zipCode: "01040", country: "US"},
