@@ -91,6 +91,11 @@ check("137 lb 40x48x60 → 250", rateShop.ensureFreightClasses([{
   qty: 1, weight: 137, weightType: "total",
   length: 40, width: 48, height: 60, dimType: "PLT",
 }]).freightInfo[0].class, 250);
+check("density 6.576 → 125", rateShop.classFromDensity(6.576), 125);
+check("453 lb 40x48x62 → 125", rateShop.ensureFreightClasses([{
+  qty: 1, weight: 453, weightType: "total",
+  length: 40, width: 48, height: 62, dimType: "PLT", class: 175,
+}]).freightInfo[0].class, 125);
 check("valid class 70", rateShop.isValidFreightClass(70), true);
 check("invalid class null", rateShop.isValidFreightClass(null), false);
 check("invalid class 0", rateShop.isValidFreightClass(0), false);

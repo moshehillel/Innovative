@@ -667,6 +667,8 @@ const VALID_NMFC_CLASSES = new Set([
  * Primus-compatible NMFC density → class table (pcf / lbs per cu ft).
  * Matches Primus UI/booking samples (density + class on pieces).
  * Primus assigns class 250 from 2 pcf (not standard NMFC 3 pcf).
+ * Primus company rules use 6–8 pcf → 125 (no class 150 tier); see sandbox
+ * GET /tools/companydensityrules. Production endpoint 404; local table fallback.
  * Tenant /tools/densityrules is empty, so we use this local table.
  */
 const DENSITY_CLASS_TABLE = [
@@ -680,8 +682,7 @@ const DENSITY_CLASS_TABLE = [
   {minPcf: 10.5, freightClass: 92.5},
   {minPcf: 9, freightClass: 100},
   {minPcf: 8, freightClass: 110},
-  {minPcf: 7, freightClass: 125},
-  {minPcf: 6, freightClass: 150},
+  {minPcf: 6, freightClass: 125},
   {minPcf: 5, freightClass: 175},
   {minPcf: 4, freightClass: 200},
   {minPcf: 2, freightClass: 250},
