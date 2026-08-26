@@ -726,6 +726,7 @@ async function rateLane(lane, ctx) {
       ctx.from || "",
       ctx.emailBody || "",
       ctx.rules || []);
+  await rateShop.ensureDensityRulesLoaded();
   const freightNormalized = freightDims.normalizePalletFreightRows(
       lane.freightInfo || [], dimOpts);
   const classFix = rateShop.ensureFreightClasses(freightNormalized, {
