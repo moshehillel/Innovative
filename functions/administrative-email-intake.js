@@ -340,6 +340,7 @@ function isCarrierOrFactorSender(from) {
     "rtsinc.com",
     "rtsfinancial.com",
     "cjfinancing.com",
+    "vtflog.com",
     "abf.com",
     "arcb.com",
     "notification.intuit.com",
@@ -365,6 +366,28 @@ function subjectLooksLikeCustomerPaymentDate(subject) {
 }
 
 /**
+ * Subject like "CK 6706" or "Check #6706" — customer sending check remittance.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeCustomerCheckNumber(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  return /^(?:ck|check)(?:\s*#|\s+no\.?\s*)?\s*\d{3,8}\s*$/i.test(stripped);
+}
+
+/**
+ * Bare MC# subject — factor NOA notices (e.g. "MC#856665", "MC #856665").
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeMcNumberNoa(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  return /^mc\s*#\s*\d{5,7}\s*$/i.test(stripped);
+}
+
+/**
  * Customer payment remittance — sender notifying Innovative of payment sent.
  * Not a carrier freight invoice or factor remittance notice.
  * @param {string} subject Email subject.
@@ -384,9 +407,10 @@ function isCustomerPaymentRemittanceEmail(subject, from, body) {
   const sub = String(subject || "").trim();
   const hay = `${sub}\n${body || ""}`.toLowerCase();
 
-  // "Payment MM/DD/YY" from a customer — before payment-inquiry guards
-  // (body may mention "outstanding invoices" like carrier AR follow-ups).
+  // "Payment MM/DD/YY" or "CK 6706" from a customer — before payment-inquiry
+  // guards (body may mention "outstanding invoices" like carrier AR follow-ups).
   if (subjectLooksLikeCustomerPaymentDate(subject)) return true;
+  if (subjectLooksLikeCustomerCheckNumber(subject)) return true;
 
   if (isPaymentInquiryEmail(subject, from, body)) return false;
 
@@ -605,6 +629,7 @@ function senderDomainLooksLikeFactor(from) {
 function isPaymentInquiryEmail(subject, from, body) {
   if (isPaymentNotificationEmail(subject, from, body)) return false;
   const sub = String(subject || "").trim();
+  const subStripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
   const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase();
   if (!hay.trim()) return false;
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
@@ -626,6 +651,7 @@ function isPaymentInquiryEmail(subject, from, body) {
     /\b(?:provide|send|share)\s+(?:an?\s+)?expected\s+payment\s+date\b/,
     /\bfollow(?:ing)?\s+up\s+(?:on\s+)?(?:\d+\s+)?outstanding\s+invoices?\b/,
     /\b(?:requesting|need)\s+(?:an?\s+)?expected\s+payment\s+date\b/,
+    /\b(?:requesting|need|provide)\s+(?:an?\s+)?scheduled\s+payment\s+date\b/,
     /\b(?:requesting|provide|send|need)\s+(?:the\s+)?payment\s+details\b/,
     /\bpayment\s+(?:details|update)\b/,
     /\bpayment\s+for\s+load\s+#?\s*\d{5,9}\b/,
@@ -651,17 +677,17 @@ function isPaymentInquiryEmail(subject, from, body) {
     /\b(?:unpaid|outstanding)\b.*\bload\s+(?:numbers?|#)\b/,
   ];
   if (patterns.some((re) => re.test(hay))) return true;
-  if (/quick\s*pay\s+invoice/i.test(sub)) return true;
-  if (/payment\s+inquir/i.test(sub)) return true;
-  if (/pending\s+payment\s+for\s+load/i.test(sub)) return true;
-  if (/payment\s+update\s+load\s+#?\s*\d{5,9}/i.test(sub)) return true;
-  if (/payment\s+update\s+for\s+load/i.test(sub)) return true;
-  if (/payment\s+status\s+update/i.test(sub)) return true;
-  if (/outstanding\s+payment\s+reminder/i.test(sub)) return true;
-  if (/outstanding\s+invoices?/i.test(sub)) return true;
-  if (/expected\s+payment\s+date/i.test(sub)) return true;
-  if (/payment\s+reminder/i.test(sub) &&
-      /outstanding|overdue|past\s+due/i.test(sub)) return true;
+  if (/quick\s*pay\s+invoice/i.test(subStripped)) return true;
+  if (/payment\s+inquir/i.test(subStripped)) return true;
+  if (/pending\s+payment\s+for\s+load/i.test(subStripped)) return true;
+  if (/payment\s+update\s+load\s+#?\s*\d{5,9}/i.test(subStripped)) return true;
+  if (/payment\s+update\s+for\s+load/i.test(subStripped)) return true;
+  if (/payment\s+status\s+update/i.test(subStripped)) return true;
+  if (/outstanding\s+payment\s+reminder/i.test(subStripped)) return true;
+  if (/outstanding\s+invoices?/i.test(subStripped)) return true;
+  if (/expected\s+payment\s+date/i.test(subStripped)) return true;
+  if (/payment\s+reminder/i.test(subStripped) &&
+      /outstanding|overdue|past\s+due/i.test(subStripped)) return true;
   if (subjectLooksLikeLoadNumberReply(sub) &&
       bodyLooksLikeLoadPaymentFollowUp(body)) {
     return true;
@@ -920,6 +946,8 @@ function looksLikeNoaEmailContent(subject, body, from) {
   const content = `${sub}\n${body || ""}`.toLowerCase();
   if (!content.trim()) return false;
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  // Factor NOA packages often use bare MC# as the entire subject.
+  if (subjectLooksLikeMcNumberNoa(subject)) return true;
   // FactorView / Surety-style remittance notices (not freight invoices).
   if (/^\s*(?:(?:fw|fwd|re):\s*)*remit\s+for\s+payment\b/i.test(sub)) {
     return true;
@@ -950,7 +978,11 @@ function looksLikeNoaEmailContent(subject, body, from) {
     return true;
   }
   const fromL = String(from || "").toLowerCase();
-  const factorDomains = ["factorview.com", "phoenixcapitalgroup.com"];
+  const factorDomains = [
+    "factorview.com",
+    "phoenixcapitalgroup.com",
+    "vtflog.com",
+  ];
   if (factorDomains.some((d) => fromL.includes(d)) &&
       /remit|assignment|factor(?:ing)?|funding|surety|letter\s+of\s+release/i
           .test(content)) {
@@ -1217,6 +1249,8 @@ module.exports = {
   isHafstaffSender,
   isCarrierOrFactorSender,
   subjectLooksLikeCustomerPaymentDate,
+  subjectLooksLikeCustomerCheckNumber,
+  subjectLooksLikeMcNumberNoa,
   isCustomerPaymentRemittanceEmail,
   shouldHandleCustomerPaymentRemittance,
   isPaymentNotificationEmail,

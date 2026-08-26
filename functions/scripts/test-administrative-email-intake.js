@@ -107,6 +107,38 @@ check("non-Coface sender not matched",
         "Coface lookalike <news@notcoface.com>",
         "Coface Briefs", ""));
 
+const oooSubject = "Out of Office";
+const oooFrom = "Jane Smith <jane.smith@carrier.com>";
+const oooBody =
+  "Thank you for your email. I am currently out of the office with " +
+  "limited access to email. I will returning on September 5, 2026.";
+check("OOO subject detected",
+    adm.isOutOfOfficeAutoReply(oooSubject, oooFrom, oooBody));
+check("Automatic reply subject detected",
+    adm.isOutOfOfficeAutoReply(
+        "Automatic reply: Re: Payment question",
+        oooFrom,
+        "I am currently out of the office until Monday."));
+check("OOO body vacation message detected",
+    adm.isOutOfOfficeAutoReply(
+        "Re: Load status",
+        oooFrom,
+        "I am on vacation and will respond when I return."));
+check("OOO evaluate ignored",
+    adm.evaluateAdministrativeIgnore(
+        oooSubject, oooFrom, oooBody, []).status ===
+    "out_of_office_ignored");
+check("third-party out of office mention not ignored",
+    !adm.isOutOfOfficeAutoReply(
+        "Invoice follow-up",
+        "ops@carrier.com",
+        "John is out of the office until Monday. Please contact Jane."));
+check("invoice email with OOO mention not ignored",
+    !adm.isOutOfOfficeAutoReply(
+        "Invoice # 28415 for BOL #264557",
+        oooFrom,
+        "I am out of the office next week but your invoice is attached."));
+
 const dnbPromoSubject =
   "No Hidden Fees. No Overdrafts. Smarter Business Banking Starts Here";
 const dnbPromoFrom = "Dun & Bradstreet <e.email@dnb.com>";
@@ -237,6 +269,113 @@ check("Invoice for Load subject is not payment inquiry",
         "Carrier <billing@carrier.com>",
         "Please see attached invoice for load #265721"));
 
+const fleetexSubject = "Outstanding Payment Reminder";
+const fleetexFrom =
+  "Fleetex Transport Accounts <accounts@fleetextransport.com>";
+const fleetexBody =
+  "I am following up on nine outstanding invoices totaling $6,550. " +
+  "Please provide an expected payment date at your earliest convenience.";
+check("Fleetex outstanding payment reminder subject only (no body)",
+    adm.isPaymentInquiryEmail(fleetexSubject, fleetexFrom, ""));
+check("Fleetex outstanding payment reminder with body",
+    adm.isPaymentInquiryEmail(fleetexSubject, fleetexFrom, fleetexBody));
+check("Fleetex outstanding payment reminder handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        fleetexSubject, fleetexFrom, fleetexBody, 0));
+check("Fleetex outstanding payment reminder skipped when invoice PDF present",
+    !adm.shouldHandlePaymentInquiry(
+        fleetexSubject, fleetexFrom, fleetexBody, 1));
+check("Fleetex body-only outstanding invoices + expected payment date",
+    adm.isPaymentInquiryEmail(
+        "Re: Accounts receivable follow-up",
+        fleetexFrom,
+        fleetexBody));
+
+const fleetexReSubject = "RE: Outstanding Payment Reminder";
+const fleetexLisaBody =
+  "following up on outstanding invoices totaling $7,225, " +
+  "requesting scheduled payment date";
+check("Fleetex RE: outstanding payment reminder subject only (no body)",
+    adm.isPaymentInquiryEmail(fleetexReSubject, fleetexFrom, ""));
+check("Fleetex RE: outstanding payment reminder with Lisa body",
+    adm.isPaymentInquiryEmail(fleetexReSubject, fleetexFrom, fleetexLisaBody));
+check("Fleetex RE: outstanding payment reminder handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        fleetexReSubject, fleetexFrom, fleetexLisaBody, 0));
+check("Fleetex RE: body-only scheduled payment date with generic subject",
+    adm.isPaymentInquiryEmail(
+        "RE: Accounts receivable follow-up",
+        fleetexFrom,
+        fleetexLisaBody));
+
+const eastonSubject = "Re: 264617";
+const eastonFrom =
+  "Easton Star Trucking LLC <eastonstartruckingllc@gmail.com>";
+const eastonBody =
+  "Good day,\n\nPayment has not been received for load numbers " +
+  "264617, 264618, and 264732. Please provide an update on payment " +
+  "status at your earliest convenience.\n\nThank you.";
+check("Easton Star load-number subject with unpaid loads body",
+    adm.isPaymentInquiryEmail(eastonSubject, eastonFrom, eastonBody));
+check("Easton Star payment inquiry handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        eastonSubject, eastonFrom, eastonBody, 0));
+check("Easton Star bare load subject alone is not payment inquiry",
+    !adm.isPaymentInquiryEmail(eastonSubject, eastonFrom, ""));
+check("Re load# delivery thread is not payment inquiry",
+    !adm.isPaymentInquiryEmail(
+        "Re: 264617",
+        "dispatch@carrier.com",
+        "Can you confirm the delivery appointment for load 264617?"));
+check("Easton Star payment not received shorthand",
+    adm.isPaymentInquiryEmail(
+        "Re: 264732",
+        eastonFrom,
+        "Payment not received for load numbers 264732 and 264617. " +
+        "Please send a payment status update."));
+check("Easton Star multi-load follow-up body pattern",
+    adm.isPaymentInquiryEmail(
+        "264618",
+        eastonFrom,
+        "Following up on unpaid load numbers 264617, 264618, 264732. " +
+        "When will payment be sent?"));
+
+const cjSubject = "Payment Update Load 263966";
+const cjSubjectHash = "Payment Update Load #263966";
+const cjFrom = "Katelyn Wright <kwright@cjfinancing.com>";
+const cjBody =
+  "CJ Financing requesting payment status update for load 263966, " +
+  "carrier KCN Logistics";
+check("CJ Financing payment update load subject",
+    adm.isPaymentInquiryEmail(cjSubject, cjFrom, ""));
+check("CJ Financing payment update load # subject",
+    adm.isPaymentInquiryEmail(cjSubjectHash, cjFrom, ""));
+check("CJ Financing payment status update body",
+    adm.isPaymentInquiryEmail(cjSubject, cjFrom, cjBody));
+check("CJ Financing should handle when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(cjSubject, cjFrom, cjBody, 0));
+check("CJ Financing factor domain recognized",
+    adm.isCarrierOrFactorSender(cjFrom));
+check("CJ Financing misclassified carrier_invoice does not veto",
+    !adm.hasInvoiceVeto({
+      subject: cjSubject,
+      body: cjBody,
+      from: cjFrom,
+      attachments: [],
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+check("CJ Financing full path would handle with carrier_invoice class",
+    adm.shouldHandlePaymentInquiry(cjSubject, cjFrom, cjBody, 0) &&
+    !adm.hasInvoiceVeto({
+      subject: cjSubject,
+      body: cjBody,
+      from: cjFrom,
+      attachments: [],
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+
 check("FW invoice BOL subject recognized",
     adm.looksLikeInvoiceEmailContent(
         "FW: Invoice #28415 for BOL #264557", ""));
@@ -343,6 +482,45 @@ check("cargo release subject not treated as NOA",
         "Your container has been released at terminal.",
         "terminal@emodal.com"));
 
+const sliverShadowSubject = "MC#856665";
+const sliverShadowFrom =
+  "SLIVER SHADOW TRANSPORTATION INC <business@vtflog.com>";
+const sliverShadowBody = "";
+const sliverShadowAtt = [
+  {filename: "856665.pdf", mimeType: "application/pdf"},
+];
+check("MC#856665 bare subject detected as NOA",
+    adm.subjectLooksLikeMcNumberNoa(sliverShadowSubject));
+check("MC #856665 subject variant detected as NOA",
+    adm.subjectLooksLikeMcNumberNoa("MC #856665"));
+check("Re: MC#856665 subject variant detected as NOA",
+    adm.subjectLooksLikeMcNumberNoa("Re: MC#856665"));
+check("SLIVER SHADOW vtflog.com is factor sender",
+    adm.isCarrierOrFactorSender(sliverShadowFrom));
+check("SLIVER SHADOW MC# content detected as NOA",
+    adm.looksLikeNoaEmailContent(
+        sliverShadowSubject, sliverShadowBody, sliverShadowFrom));
+check("SLIVER SHADOW generic PDF ignored after scan (no invoice)",
+    adm.shouldIgnoreNoaOnlyPackage(
+        sliverShadowSubject, sliverShadowBody, sliverShadowAtt, 0,
+        sliverShadowFrom));
+check("SLIVER SHADOW misclassified carrier_invoice does not veto",
+    !adm.hasInvoiceVeto({
+      subject: sliverShadowSubject,
+      body: sliverShadowBody,
+      from: sliverShadowFrom,
+      attachments: sliverShadowAtt,
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+check("SLIVER SHADOW invoice filename blocks NOA ignore",
+    !adm.shouldIgnoreNoaOnlyPackage(
+        sliverShadowSubject, sliverShadowBody,
+        [{filename: "carrier_invoice_856665.pdf", mimeType: "application/pdf"}],
+        0, sliverShadowFrom));
+check("load number subject alone is not MC# NOA",
+    !adm.subjectLooksLikeMcNumberNoa("264617"));
+
 const arcBestSubject =
   "ArcBest eInvoice(s) - 760981 INNOVATIVE CARRIERS - 8/11/2026";
 const arcBestBody =
@@ -411,6 +589,44 @@ check("plain Zelle alert still ignored after Amfast fix",
         "You received a Zelle payment of $500",
         []));
 
+const amfastReceiptSubject =
+  "Payment Receipt from Amfast Freight, Inc.";
+const amfastReceiptFrom =
+  "Amfast Freight, Inc. <quickbooks@notification.intuit.com>";
+const amfastReceiptBody =
+  "Thank you for your payment.\nInvoice Amount $305.55\n" +
+  "This email confirms your payment was received.";
+check("Amfast QB payment receipt detected",
+    adm.isPaymentReceiptEmail(
+        amfastReceiptSubject, amfastReceiptFrom, amfastReceiptBody));
+check("Amfast QB payment receipt evaluate ignored",
+    adm.evaluateAdministrativeIgnore(
+        amfastReceiptSubject, amfastReceiptFrom, amfastReceiptBody,
+        []).status === "payment_receipt_ignored");
+check("Amfast QB payment receipt shouldIgnore",
+    adm.shouldIgnoreAsPaymentReceipt(
+        amfastReceiptSubject, amfastReceiptFrom, amfastReceiptBody, []));
+check("Amfast QB payment receipt not blocked by carrier_invoice veto",
+    !adm.hasInvoiceVeto({
+      subject: amfastReceiptSubject,
+      body: amfastReceiptBody,
+      from: amfastReceiptFrom,
+      attachments: [],
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+check("QuickBooks invoice subject is NOT payment receipt",
+    !adm.isPaymentReceiptEmail(
+        "Invoice 66670 from FAST AND SECURE TRANSPORT INC.",
+        "FAST AND SECURE <quickbooks@notification.intuit.com>",
+        "Your invoice is ready! Balance due $500."));
+check("Amfast QB payment-request is NOT payment receipt",
+    !adm.isPaymentReceiptEmail(amfastSubject, amfastFrom, amfastBody));
+check("payment receipt with invoice filename not ignored",
+    !adm.shouldIgnoreAsPaymentReceipt(
+        amfastReceiptSubject, amfastReceiptFrom, amfastReceiptBody,
+        [{filename: "carrier_invoice_123.pdf", mimeType: "application/pdf"}]));
+
 const compassSubject = "Purchase order number; Purchase Order #266265";
 const compassFrom = "notify@mg.compassfs.net <notify@mg.compassfs.net>";
 const compassPdf = [{
@@ -450,6 +666,196 @@ check("FactorView Invoice# space has invoice veto",
       body: "Attached invoice for Toor Transline",
       attachments: fvPdf,
     }));
+
+const tfSubject =
+  "Invoice for processing; Invoice #299 - Purchase Order #266504";
+const tfFrom = "Billing@Thunderfunding.com";
+const tfBody =
+  "Thunder Funding submitted invoice #299 associated with PO #266504. " +
+  "Please confirm receipt. Updated payment/banking info attached.";
+const tfPdf = [{filename: "299.pdf", mimeType: "application/pdf"}];
+check("Thunder Funding Invoice for processing subject recognized",
+    adm.looksLikeInvoiceEmailContent(tfSubject, tfBody));
+check("Thunder Funding Purchase Order # (not PO #) recognized",
+    adm.looksLikeInvoiceEmailContent(
+        "Invoice #299 - Purchase Order #266504", ""));
+check("Thunder Funding factor domain recognized",
+    adm.isCarrierOrFactorSender(tfFrom));
+check("Thunder Funding not NOA",
+    !adm.isNoticeOfAssignmentEmail(tfSubject, tfFrom, tfBody));
+check("Thunder Funding not payment inquiry",
+    !adm.isPaymentInquiryEmail(tfSubject, tfFrom, tfBody));
+check("Thunder Funding has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: tfSubject,
+      body: tfBody,
+      from: tfFrom,
+      attachments: tfPdf,
+      invoicePdfCount: 0,
+    }));
+check("Thunder Funding carrier_invoice classification triggers veto",
+    adm.hasInvoiceVeto({
+      subject: tfSubject,
+      body: tfBody,
+      from: tfFrom,
+      attachments: tfPdf,
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+
+const hstileSubject = "Payment 08/25/26";
+const hstileFrom = "Michel Schwartz <michel@hstile.com>";
+const hstileBody =
+  "Please find attached our payment remittance for outstanding invoices.";
+const hstileAtt = [
+  {filename: "remittance.pdf", mimeType: "application/pdf"},
+];
+check("Lisa hstile Payment date subject detected",
+    adm.subjectLooksLikeCustomerPaymentDate(hstileSubject));
+check("Lisa hstile customer payment remittance detected",
+    adm.isCustomerPaymentRemittanceEmail(
+        hstileSubject, hstileFrom, hstileBody));
+check("Lisa hstile should handle customer remittance",
+    adm.shouldHandleCustomerPaymentRemittance(
+        hstileSubject, hstileFrom, hstileBody));
+check("Lisa hstile misclassified carrier_invoice does not veto",
+    !adm.hasInvoiceVeto({
+      subject: hstileSubject,
+      body: hstileBody,
+      from: hstileFrom,
+      attachments: hstileAtt,
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 1,
+    }));
+check("Re: Payment date subject still detected",
+    adm.subjectLooksLikeCustomerPaymentDate("Re: Payment 08/25/26"));
+check("Fw: Payment date subject still detected",
+    adm.subjectLooksLikeCustomerPaymentDate("Fw: Payment 3/15/2026"));
+check("Payment date subject not matched for load inquiry",
+    !adm.subjectLooksLikeCustomerPaymentDate(
+        "Pending Payment for Load # 265721"));
+check("Factor remit for payment is not customer remittance",
+    !adm.isCustomerPaymentRemittanceEmail(
+        suretyRemitSubject, suretyRemitFrom, suretyRemitBody));
+check("Carrier Quick Pay is not customer remittance",
+    !adm.isCustomerPaymentRemittanceEmail(
+        quickPaySubject, "steve@x.com", quickPayBody));
+check("FactorView invoice is not customer remittance",
+    !adm.isCustomerPaymentRemittanceEmail(fvSubject, fvFrom, ""));
+check("factorview sender excluded from customer remittance",
+    adm.isCarrierOrFactorSender(
+        "Surety Financial LLC <notification@factorview.com>"));
+check("remittance advice from customer detected",
+    adm.isCustomerPaymentRemittanceEmail(
+        "Remittance advice",
+        "accounts@customer.com",
+        "Please find attached remittance advice for payment."));
+check("remittance with load number is not customer remittance",
+    !adm.isCustomerPaymentRemittanceEmail(
+        "Payment update",
+        "dispatch@carrier.com",
+        "Please find remittance for load #265721"));
+
+const sandersSubject = "CK 6706";
+const sandersFrom = "Accounts Payable <ap@sanderscollection.com>";
+const sandersBody =
+  "Please find attached remittance advice. Payment enclosed for $1,405.00.";
+const sandersAtt = [
+  {filename: "6706_remittance.pdf", mimeType: "application/pdf"},
+];
+check("Lisa Sanders CK subject detected",
+    adm.subjectLooksLikeCustomerCheckNumber(sandersSubject));
+check("Lisa Sanders customer payment remittance detected",
+    adm.isCustomerPaymentRemittanceEmail(
+        sandersSubject, sandersFrom, sandersBody));
+check("Lisa Sanders should handle customer remittance",
+    adm.shouldHandleCustomerPaymentRemittance(
+        sandersSubject, sandersFrom, sandersBody));
+check("Lisa Sanders misclassified carrier_invoice does not veto",
+    !adm.hasInvoiceVeto({
+      subject: sandersSubject,
+      body: sandersBody,
+      from: sandersFrom,
+      attachments: sandersAtt,
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 1,
+    }));
+check("Check #6706 subject detected",
+    adm.subjectLooksLikeCustomerCheckNumber("Check #6706"));
+check("Check 6706 subject detected",
+    adm.subjectLooksLikeCustomerCheckNumber("Check 6706"));
+check("Check No. 6706 subject detected",
+    adm.subjectLooksLikeCustomerCheckNumber("Check No. 6706"));
+check("Re: CK 6706 subject still detected",
+    adm.subjectLooksLikeCustomerCheckNumber("Re: CK 6706"));
+check("CK subject from AP with minimal body detected",
+    adm.isCustomerPaymentRemittanceEmail(
+        sandersSubject, sandersFrom, ""));
+check("CK subject not matched for Quick Pay load inquiry",
+    !adm.subjectLooksLikeCustomerCheckNumber(
+        "Re: Quick Pay Invoice - Load #: 265620"));
+check("factor sender excluded even with Check subject",
+    !adm.isCustomerPaymentRemittanceEmail(
+        "Check 1234",
+        "Surety Financial LLC <notification@factorview.com>",
+        "Remit for payment"));
+
+const averittSubject = "1467163 INNOVATIVE CARRIERS INC";
+const averittFrom = "Amanda Tate <atate@averitt.com>";
+const averittBody =
+  "Good morning,\n\nWe are following up on overdue invoices totaling " +
+  "$1,388.72. Please provide payment information or an explanation.\n\n" +
+  "Thank you,\nAmanda Tate";
+const averittAtt = [
+  {
+    filename: "overdue_invoices.xls",
+    mimeType: "application/vnd.ms-excel",
+  },
+];
+check("Lisa Averitt account-number subject recognized",
+    adm.subjectLooksLikeCarrierAccountStatement(averittSubject));
+check("Lisa Averitt overdue body recognized",
+    adm.bodyLooksLikeOverdueInvoiceFollowUp(averittBody));
+check("Lisa Averitt XLS list filename recognized",
+    adm.attachmentFilenameLooksLikeStatementList("overdue_invoices.xls"));
+check("Lisa Averitt carrier statement follow-up detected",
+    adm.isCarrierStatementFollowUpEmail(
+        averittSubject, averittFrom, averittBody, averittAtt));
+check("Lisa Averitt should handle when no invoice PDF",
+    adm.shouldHandleCarrierStatementFollowUp(
+        averittSubject, averittFrom, averittBody, averittAtt, 0));
+check("Lisa Averitt skipped when invoice PDF present",
+    !adm.shouldHandleCarrierStatementFollowUp(
+        averittSubject, averittFrom, averittBody, averittAtt, 1));
+check("Lisa Averitt XLS invoice-list filename triggers invoice veto",
+    adm.hasInvoiceVeto({
+      subject: averittSubject,
+      body: averittBody,
+      attachments: averittAtt,
+      invoicePdfCount: 0,
+    }));
+check("Lisa Averitt not customer remittance",
+    !adm.isCustomerPaymentRemittanceEmail(
+        averittSubject, averittFrom, averittBody));
+check("Lisa Averitt not a freight invoice subject",
+    !adm.looksLikeInvoiceEmailContent(averittSubject, averittBody));
+check("Lisa Averitt Abe on CC detected",
+    adm.isAbeCopiedOnEmailHeaders([
+      {name: "From", value: averittFrom},
+      {name: "To", value: "billing@innovativecarriers.com"},
+      {name: "Cc", value: "Abe Goldberger <abe@innovativecarriers.com>"},
+    ]));
+check("Lisa Averitt Abe not on CC",
+    !adm.isAbeCopiedOnEmailHeaders([
+      {name: "From", value: averittFrom},
+      {name: "To", value: "billing@innovativecarriers.com"},
+    ]));
+check("ArcBest eInvoice is not carrier statement follow-up",
+    !adm.isCarrierStatementFollowUpEmail(
+        arcBestSubject,
+        "brooklyncustomerservice@abf.com",
+        arcBestBody,
+        arcBestAttachments));
 
 if (failures) {
   console.error(`\n${failures} test(s) failed`);

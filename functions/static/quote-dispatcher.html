@@ -960,7 +960,7 @@
       <div style="margin-bottom:12px">
         <a class="home-link" id="home-link" href="#">← Back to dashboard</a>
       </div>
-      <h1 id="title">Quote review</h1>
+  <h1 id="title">Quote review</h1>
       <div class="meta">
         <span id="meta"></span>
         <span id="status-badge" class="badge" style="margin-left:8px"></span>
@@ -975,10 +975,10 @@
       </div>
       <div id="action-msg" class="msg hidden"></div>
       <div id="quote-details" class="details-panel"></div>
-      <div id="lanes"></div>
-      <div class="draft">
+  <div id="lanes"></div>
+  <div class="draft">
         <div class="draft-head">
-          <h3>Customer email draft</h3>
+    <h3>Customer email draft</h3>
           <div class="draft-actions">
             <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
           </div>
@@ -990,7 +990,7 @@
         </p>
         <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
       </div>
-    </div>
+  </div>
   </div>
 
   <script src="__API_BASE__/quoteAuthClient?v=__AUTH_CLIENT_VERSION__"></script>
@@ -2346,8 +2346,8 @@
           optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
             <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(rateId)}"${isChecked ? " checked" : ""}>
             <div>
-              <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
-              <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
+            <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
+            <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
               <div class="rate-row">
                 <span class="rate-cost">Cost $${num(opt.cost)}</span>
                 <label class="customer-rate-field">Customer rate $
@@ -2500,16 +2500,16 @@
           try {
             const codes = laneAccessorials[laneKey] || [];
             const res = await apiFetch("/rerunQuoteRates", {
-              method: "POST",
-              body: JSON.stringify({
-                tenantId: TENANT_ID,
-                quoteId: QUOTE_ID,
-                laneKey,
+        method: "POST",
+        body: JSON.stringify({
+          tenantId: TENANT_ID,
+          quoteId: QUOTE_ID,
+          laneKey,
                 accessorials: codes.map((code) => ({code})),
                 accessorialsWithData: codes.map((code) => ({code})),
-                dispatcherId: DISPATCHER_ID || undefined,
-                token: TOKEN || undefined,
-              }),
+          dispatcherId: DISPATCHER_ID || undefined,
+          token: TOKEN || undefined,
+        }),
             });
             if (!res.ok) throw new Error(res.error || "Rerun failed");
             applyQuote(res.quote);

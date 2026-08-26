@@ -277,5 +277,30 @@ const emailExcluded = ac.buildAdditionalChargeApprovalEmail({
 check("email notes excluded Primus charges",
     emailExcluded.html.includes("2 charge(s) already on file"), true);
 
+// 6. Lumper validation — invoice total matches Primus (lumper included)
+const westhill = ac.validateLumperAmount({
+  invoiceAmount: 2901.20,
+  recognizedCharges: [{type: "lumper", amount: 401.20}],
+}, 2901.20);
+check("265880: total matches Primus => valid", westhill.valid, true);
+check("265880: totalMatchesPrimus flag", westhill.totalMatchesPrimus, true);
+check("265880: base still computed", westhill.baseAmount, 2500);
+
+// Base freight matches Primus when lumper is separate line item
+const baseMatch = ac.validateLumperAmount({
+  invoiceAmount: 2600,
+  recognizedCharges: [{type: "lumper", amount: 100}],
+}, 2500);
+check("base matches Primus within tolerance", baseMatch.valid, true);
+check("base match: totalMatchesPrimus false", baseMatch.totalMatchesPrimus, false);
+
+// True mismatch — neither total nor base agrees with Primus
+const realMismatch = ac.validateLumperAmount({
+  invoiceAmount: 3000,
+  recognizedCharges: [{type: "lumper", amount: 401.20}],
+}, 2500);
+check("real mismatch => invalid", realMismatch.valid, false);
+check("real mismatch difference", Math.round(realMismatch.difference), 99);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

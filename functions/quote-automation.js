@@ -707,7 +707,7 @@ async function rateLane(lane, ctx) {
   const odCheck = validateLaneForRating(lane);
   if (!odCheck.ok) {
     return {
-      ...lane,
+    ...lane,
       options: [],
       rateError: odCheck.reason,
       appliedRules: Array.isArray(lane.freightRulesApplied) ?
@@ -1346,8 +1346,8 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
       dispatcher.email || "");
   const [snap, counts] = await Promise.all([
     col(tenant, "quoteRequests")
-        .orderBy("createdAt", "desc")
-        .limit(limit * 5)
+      .orderBy("createdAt", "desc")
+      .limit(limit * 5)
         .get(),
     countQuotesForDispatcher(tenant, dispatcher),
   ]);
@@ -1567,7 +1567,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         const queuedBody = String(qsnap.docs[0].data().emailBody || "");
         if (queuedBody.trim()) emailBody = queuedBody;
       }
-    } catch (_) {
+      } catch (_) {
       // keep extract body
     }
   }
