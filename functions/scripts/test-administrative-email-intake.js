@@ -703,6 +703,36 @@ check("Thunder Funding carrier_invoice classification triggers veto",
       invoicePdfCount: 0,
     }));
 
+const spcSubject = "Single Point Capital; Invoice #265914";
+const spcFrom = "reports@singlepointgroup.com";
+const spcBody =
+  "Single Point Capital is forwarding an attached invoice (#265914) " +
+  "for carrier processing. Please confirm receipt.";
+const spcPdf = [{filename: "265914.pdf", mimeType: "application/pdf"}];
+check("Single Point Capital subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent(spcSubject, spcBody));
+check("Single Point Capital factor domain recognized",
+    adm.isCarrierOrFactorSender(spcFrom));
+check("Single Point Capital not NOA",
+    !adm.isNoticeOfAssignmentEmail(spcSubject, spcFrom, spcBody));
+check("Single Point Capital not payment inquiry",
+    !adm.isPaymentInquiryEmail(spcSubject, spcFrom, spcBody));
+check("Single Point Capital has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: spcSubject,
+      body: spcBody,
+      from: spcFrom,
+      attachments: spcPdf,
+      invoicePdfCount: 0,
+    }));
+check("Single Point Capital OTHER attachment would veto (not forward)",
+    adm.hasInvoiceVeto({
+      subject: "Single Point Capital; Invoice #266477",
+      from: spcFrom,
+      attachments: [{filename: "266477.pdf", mimeType: "application/pdf"}],
+      invoicePdfCount: 0,
+    }));
+
 const hstileSubject = "Payment 08/25/26";
 const hstileFrom = "Michel Schwartz <michel@hstile.com>";
 const hstileBody =

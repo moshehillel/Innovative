@@ -104,6 +104,19 @@ function looksLikeThunderFundingInvoiceEmail(subject, from) {
 }
 
 /**
+ * Single Point Capital factored freight invoices:
+ * "Single Point Capital; Invoice #265914" from reports@singlepointgroup.com.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeSinglePointCapitalInvoiceEmail(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  if (!fromL.includes("singlepointgroup.com")) return false;
+  return /\binvoice\s+#?\s*\d+/i.test(String(subject || ""));
+}
+
+/**
  * True when attachment metadata includes a PDF (not a nested .eml).
  * @param {Array<object>|null|undefined} attachments Gmail attachment meta.
  * @return {boolean}
@@ -134,7 +147,10 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeFactorViewPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeThunderFundingInvoiceEmail(sub, from)) return true;
+  if (looksLikeSinglePointCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(sub)) return true;
+  // Factor-name prefix: "Single Point Capital; Invoice #265914"
+  if (/;\s*invoice\s+#?\s*\d+/i.test(sub)) return true;
   if (looksLikeNumberedStatementSubject(sub)) return true;
   if (/^invoice\s+\d+\s+from\b/i.test(sub)) return true;
   // Allow optional whitespace after "#": "Invoice # 981 …"
@@ -170,7 +186,13 @@ function looksLikeStatementCoverInvoicePacketEmail(
   if (looksLikeThunderFundingInvoiceEmail(subject, from)) {
     return true;
   }
+  if (looksLikeSinglePointCapitalInvoiceEmail(subject, from)) {
+    return true;
+  }
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(subject)) {
+    return true;
+  }
+  if (/;\s*invoice\s+#?\s*\d+/i.test(String(subject || ""))) {
     return true;
   }
   if (looksLikeNumberedStatementSubject(subject)) return true;
@@ -213,7 +235,14 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
       context.subject, context.from)) {
     return true;
   }
+  if (looksLikeSinglePointCapitalInvoiceEmail(
+      context.subject, context.from)) {
+    return true;
+  }
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(context.subject)) {
+    return true;
+  }
+  if (/;\s*invoice\s+#?\s*\d+/i.test(String(context.subject || ""))) {
     return true;
   }
 
@@ -459,6 +488,7 @@ module.exports = {
   looksLikeFactoredPurchaseOrderInvoiceEmail,
   looksLikeFactorViewPurchaseOrderInvoiceEmail,
   looksLikeThunderFundingInvoiceEmail,
+  looksLikeSinglePointCapitalInvoiceEmail,
   hasProcessablePdfAttachment,
   looksLikeCarrierInvoiceEmail,
   looksLikeStatementCoverInvoicePacketEmail,

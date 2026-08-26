@@ -337,6 +337,7 @@ function isCarrierOrFactorSender(from) {
     "phoenixcapitalgroup.com",
     "compassfs.net",
     "thunderfunding.com",
+    "singlepointgroup.com",
     "rtsinc.com",
     "rtsfinancial.com",
     "cjfinancing.com",
@@ -877,6 +878,19 @@ function looksLikeInvoiceEmailContent(subject, body) {
   // Thunder Funding and similar factors: "Invoice for processing; Invoice #299 …"
   if (/invoice\s+for\s+processing/i.test(sub) &&
       /\binvoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
+  // Single Point Capital: "Single Point Capital; Invoice #265914"
+  if (/singlepointgroup\.com/i.test(content) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
+  if (/single\s+point\s+capital/i.test(content) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
+  // Factor-name prefix subjects: "Factor Name; Invoice #123"
+  if (/;\s*invoice\s+#?\s*\d+/i.test(sub)) {
     return true;
   }
   // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."

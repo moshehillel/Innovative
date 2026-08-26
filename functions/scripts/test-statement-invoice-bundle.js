@@ -289,6 +289,31 @@ check("Purchase Order # (not PO #) matches factored PO subject",
     bundle.looksLikeFactoredPurchaseOrderInvoiceEmail(
         "Invoice #299 - Purchase Order #266504"), true);
 
+const spcSubject = "Single Point Capital; Invoice #265914";
+const spcFrom = "reports@singlepointgroup.com";
+const spcPdf = [{
+  filename: "265914.pdf",
+  mimeType: "application/pdf",
+}];
+check("Single Point Capital subject detected",
+    bundle.looksLikeSinglePointCapitalInvoiceEmail(spcSubject, spcFrom), true);
+check("Single Point Capital looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(spcSubject, spcFrom, ""), true);
+check("Single Point Capital semicolon-invoice subject (generic)",
+    bundle.looksLikeCarrierInvoiceEmail(
+        "Single Point Capital; Invoice #266477",
+        "reports@singlepointgroup.com", ""), true);
+check("Single Point Capital 1-page OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: spcSubject,
+      from: spcFrom,
+      filename: spcPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("Single Point Capital packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        spcSubject, spcFrom, "", spcPdf), true);
+
 check("parseStatementIndexLoadNumbers dedupes and sorts",
     JSON.stringify(bundle.parseStatementIndexLoadNumbers(
         "Load 265379 266088 265379 266219 265630")),
