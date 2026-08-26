@@ -421,6 +421,70 @@ async function isInvoiceFullyBilledAndInvoicedInPrimus(item) {
 }
 
 /**
+ * True when this email already created a Firestore invoice for the load.
+ * Used on reprocess to skip loads handled in a prior run of the same message.
+ * @param {object} tenant Tenant config.
+ * @param {string} loadNumber Broker load number.
+ * @param {string} messageId Parent Gmail message id.
+ * @return {Promise<object|null>} Existing invoice summary or null.
+ */
+async function findInvoiceForLoadFromEmail(tenant, loadNumber, messageId) {
+  const normalized = normalizeLoadNumber(loadNumber);
+  if (!normalized || !messageId) return null;
+  const snap = await tcol(tenant, "invoices")
+      .where("loadNumber", "==", normalized)
+      .where("gmailMessageId", "==", messageId)
+      .limit(1)
+      .get();
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  const data = doc.data() || {};
+  return {
+    invoiceId: doc.id,
+    finalWorkflowStatus: data.finalWorkflowStatus || null,
+    status: data.status || null,
+  };
+}
+
+/**
+ * Drops invoice items whose load was already processed from this email.
+ * @param {object} tenant Tenant config.
+ * @param {string} messageId Parent Gmail message id.
+ * @param {Array<object>} invoiceItems Classifier items.
+ * @return {Promise<object>} {items, skippedSummaries}
+ */
+async function filterAlreadyProcessedInvoiceItems(
+    tenant, messageId, invoiceItems) {
+  const items = [];
+  const skippedSummaries = [];
+  for (const item of invoiceItems) {
+    const loadNumber = String(item && item.loadNumber || "").trim();
+    if (!loadNumber) {
+      items.push(item);
+      continue;
+    }
+    const existing = await findInvoiceForLoadFromEmail(
+        tenant, loadNumber, messageId);
+    if (existing) {
+      await writeLog("info", "mail", "Already processed — skipped", {
+        messageId,
+        loadNumber,
+        invoiceId: existing.invoiceId,
+      });
+      skippedSummaries.push({
+        loadNumber,
+        status: item.status || null,
+        finalStatus: "already_processed_skipped",
+        invoiceId: existing.invoiceId,
+      });
+    } else {
+      items.push(item);
+    }
+  }
+  return {items, skippedSummaries};
+}
+
+/**
  * Reads customer sell rate from a Primus booking when available.
  * @param {object|null} booking Primus booking.
  * @return {number|null}
@@ -5471,6 +5535,136 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
   }
 }
 
+/**
+ * Re-classifies page chunks of a multi-load statement PDF to recover
+ * loads the first full-PDF pass missed.
+ * @param {Array<object>} pdfAttachments Saved PDF attachments.
+ * @param {Array<object>} invoiceItems Items from the first classification.
+ * @param {object} gap analyzeStatementExtractionGap result.
+ * @param {number|null} lastKnownLoadNumber Last known valid load number.
+ * @return {Promise<Array<object>>} Merged invoice items.
+ */
+async function supplementStatementInvoiceExtraction(
+    pdfAttachments, invoiceItems, gap, lastKnownLoadNumber) {
+  if (!gap || !gap.underExtracted) return invoiceItems;
+  const primaryAtt = pdfAttachments.find((a) => a.docType !== "POD") ||
+    pdfAttachments[0];
+  if (!primaryAtt || !primaryAtt.buffer) return invoiceItems;
+
+  const pageCount = gap.pageCount ||
+    await getPdfPageCount(primaryAtt.buffer);
+  if (pageCount < 3) return invoiceItems;
+
+  const existingLoads = new Set(
+      invoiceItems.map((i) => String(i.loadNumber || "").trim())
+          .filter(Boolean));
+  const merged = invoiceItems.slice();
+  const chunkSize = 12;
+
+  for (let start = 2; start <= pageCount; start += chunkSize - 1) {
+    const end = Math.min(start + chunkSize - 1, pageCount);
+    const pages = [];
+    for (let p = start; p <= end; p++) pages.push(p);
+    const chunkBuf = await slicePdfByPages(primaryAtt.buffer, pages);
+    if (!chunkBuf) continue;
+
+    const chunkAtt = {
+      filename: `${primaryAtt.filename || "statement.pdf"}-p${start}-${end}.pdf`,
+      mimeType: "application/pdf",
+      buffer: chunkBuf,
+      docType: "INVOICE",
+    };
+    try {
+      const chunkResult = await classifyInvoiceData(
+          [chunkAtt], lastKnownLoadNumber);
+      const chunkItems = normalizeClassificationToInvoices(chunkResult);
+      for (const item of chunkItems) {
+        const ln = String(item.loadNumber || "").trim();
+        if (!ln || existingLoads.has(ln)) continue;
+        existingLoads.add(ln);
+        item.attachmentFilename = primaryAtt.filename;
+        merged.push(item);
+      }
+    } catch (chunkErr) {
+      await writeLog("warn", "ai",
+          "Statement chunk classification failed", {
+            pages: `${start}-${end}`,
+            error: chunkErr.message,
+          });
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Reads statement index loads and runs under-extraction recovery when needed.
+ * @param {object} opts messageId, subject, pdfAttachments, invoiceItems, etc.
+ * @return {Promise<object>} {invoiceItems, gap}
+ */
+async function recoverStatementInvoiceItems(opts) {
+  const {
+    messageId,
+    subject,
+    pdfAttachments,
+    invoiceItems,
+    lastKnownLoadNumber,
+  } = opts;
+  if (!statementInvoiceBundle.looksLikeNumberedStatementSubject(subject)) {
+    return {invoiceItems, gap: null};
+  }
+
+  const primaryPdf = pdfAttachments.find((a) => a.docType !== "POD") ||
+    pdfAttachments[0];
+  let indexLoadNumbers = [];
+  let pageCount = 0;
+  if (primaryPdf && primaryPdf.buffer) {
+    pageCount = await getPdfPageCount(primaryPdf.buffer);
+    const pageTexts = await extractPdfPageTexts(primaryPdf.buffer);
+    if (pageTexts && pageTexts[0]) {
+      indexLoadNumbers = statementInvoiceBundle.parseStatementIndexLoadNumbers(
+          pageTexts[0]);
+    }
+  }
+
+  let gap = statementInvoiceBundle.analyzeStatementExtractionGap({
+    indexLoadNumbers,
+    extractedLoadNumbers: invoiceItems.map((i) => i && i.loadNumber),
+    pageCount,
+  });
+  if (!gap.underExtracted) {
+    return {invoiceItems, gap};
+  }
+
+  await writeLog("warn", "ai", "Statement PDF under-extraction detected", {
+    messageId,
+    subject,
+    expectedCount: gap.expectedCount,
+    extractedCount: gap.extractedCount,
+    missingLoads: gap.missingLoads,
+    indexLoadCount: gap.indexLoads.length,
+    pageCount: gap.pageCount,
+  });
+
+  let recovered = await supplementStatementInvoiceExtraction(
+      pdfAttachments, invoiceItems, gap, lastKnownLoadNumber);
+  gap = statementInvoiceBundle.analyzeStatementExtractionGap({
+    indexLoadNumbers,
+    extractedLoadNumbers: recovered.map((i) => i && i.loadNumber),
+    pageCount,
+  });
+  if (gap.underExtracted && gap.missingLoads.length > 0) {
+    await writeLog("warn", "ai",
+        "Statement still missing loads after chunk supplement", {
+          messageId,
+          missingLoads: gap.missingLoads,
+          extractedCount: gap.extractedCount,
+          expectedCount: gap.expectedCount,
+        });
+  }
+  return {invoiceItems: recovered, gap};
+}
+
 // Identity the AI agent uses to sign the emails it composes. Override with
 // AI_AGENT_NAME. Applied to internal/ops/error notifications, not customer
 // invoice emails (type "generated_bill").
@@ -7851,6 +8045,8 @@ async function processGmailMessage(
   let storedAttachments = [];
   let rawClassification = null;
   let invoiceItems = [];
+  let preSkippedItemSummaries = [];
+  let statementExtractionGap = null;
   let aiResult = null;
 
   try {
@@ -7983,6 +8179,27 @@ async function processGmailMessage(
               messageId,
               error: expandErr.message,
             });
+      }
+
+      if (attachments.length === 0) {
+        try {
+          const rawPdfs = await extractPdfsFromRawMessage(gmail, messageId);
+          if (rawPdfs.length > 0) {
+            await writeLog("info", "mail",
+                "No MIME parts listed; recovered PDF(s) from raw MIME", {
+                  messageId,
+                  count: rawPdfs.length,
+                  filenames: rawPdfs.map((a) => a.filename),
+                });
+            attachments = rawPdfs;
+          }
+        } catch (rawErr) {
+          await writeLog("warn", "mail",
+              "Raw MIME recovery failed while looking for attachments", {
+                messageId,
+                error: rawErr.message,
+              });
+        }
       }
 
       if (!options.fromQueue) {
@@ -8283,27 +8500,6 @@ async function processGmailMessage(
           reason: "Payment notification (Zelle/bank) — ignored",
         });
         return;
-      }
-
-      if (attachments.length === 0) {
-        try {
-          const rawPdfs = await extractPdfsFromRawMessage(gmail, messageId);
-          if (rawPdfs.length > 0) {
-            await writeLog("info", "mail",
-                "No MIME parts listed; recovered PDF(s) from raw MIME", {
-                  messageId,
-                  count: rawPdfs.length,
-                  filenames: rawPdfs.map((a) => a.filename),
-                });
-            attachments = rawPdfs;
-          }
-        } catch (rawErr) {
-          await writeLog("warn", "mail",
-              "Raw MIME recovery failed while looking for attachments", {
-                messageId,
-                error: rawErr.message,
-              });
-        }
       }
 
       if (!isTai && isQuoteInboxProcessingEnabled()) {
@@ -8982,7 +9178,9 @@ async function processGmailMessage(
         const hasStatementOnly =
         skippedDocTypes.some((t) => String(t).toUpperCase() === "STATEMENT") &&
         invoicePdfCount === 0;
-        if (hasStatementOnly) {
+        if (hasStatementOnly &&
+            !statementInvoiceBundle.looksLikeStatementCoverInvoicePacketEmail(
+                subject, from, emailBody, attachments)) {
           await handleStatementOnlyEmail({
             gmail, messageId, subject, from, emailBody, tenant, headers,
             emailClassification,
@@ -9005,10 +9203,11 @@ async function processGmailMessage(
           return;
         }
         if (administrativeEmailIntake.shouldIgnoreNoaOnlyPackage(
-            subject, emailBody, attachments, invoicePdfCount) &&
+            subject, emailBody, attachments, invoicePdfCount, from) &&
           !administrativeEmailIntake.hasInvoiceVeto({
             subject,
             body: emailBody,
+            from,
             attachments,
             emailClassification,
             invoicePdfCount,
@@ -9241,6 +9440,37 @@ async function processGmailMessage(
             });
       }
 
+      try {
+        const recovered = await recoverStatementInvoiceItems({
+          messageId,
+          subject,
+          pdfAttachments,
+          invoiceItems,
+          lastKnownLoadNumber,
+        });
+        invoiceItems = recovered.invoiceItems;
+        statementExtractionGap = recovered.gap;
+      } catch (stmtErr) {
+        await writeLog("warn", "ai",
+            "Statement under-extraction recovery failed", {
+              messageId,
+              error: stmtErr.message,
+            });
+      }
+
+      try {
+        const filtered = await filterAlreadyProcessedInvoiceItems(
+            tenant, messageId, invoiceItems);
+        preSkippedItemSummaries = filtered.skippedSummaries;
+        invoiceItems = filtered.items;
+      } catch (skipErr) {
+        await writeLog("warn", "mail",
+            "Already-processed load filter failed; continuing", {
+              messageId,
+              error: skipErr.message,
+            });
+      }
+
       if (!isTai) {
         if (drayageIntake.isDrayageValidatorEmail(from)) {
           const leoApply = await applyLeoDrayageReturnIfPresent({
@@ -9272,6 +9502,25 @@ async function processGmailMessage(
       }
     } // end !isChildSplitJob — classification / attachment pipeline
 
+    if (!isChildSplitJob && invoiceItems.length === 0 &&
+        preSkippedItemSummaries.length > 0) {
+      await mailIntakeQueue.completeIntakeRecord({
+        tenant,
+        docId: queueDocId,
+        parentMessageId: messageId,
+        outcome: mailIntakeQueue.OUTCOME.PROCESSED,
+        finalStatus: "already_processed_skipped",
+        itemSummaries: preSkippedItemSummaries,
+        extra: {
+          gmailMessageId: messageId,
+          subject,
+          from,
+          deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
+        },
+      });
+      return;
+    }
+
     if (!isChildSplitJob && invoiceItems.length > 1) {
       await tcol(tenant, "emailIntake").doc(messageId).set({
         parsedAttachments: storedAttachments,
@@ -9284,6 +9533,7 @@ async function processGmailMessage(
         subject,
         from,
         invoiceItems,
+        preSkippedSummaries: preSkippedItemSummaries,
       });
       await writeLog("info", "mail",
           "Split multi-invoice email into child jobs", {
@@ -9324,7 +9574,7 @@ async function processGmailMessage(
     const manualLoadItemIndex = Number(intakeDataForLoad.manualLoadItemIndex);
 
     const createdInvoiceIds = [];
-    const itemSummaries = [];
+    const itemSummaries = preSkippedItemSummaries.slice();
     let overallFinalStatus = "error";
     let lastPrimusResult = null;
 

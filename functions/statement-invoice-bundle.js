@@ -159,10 +159,8 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
  */
 function looksLikeStatementCoverInvoicePacketEmail(
     subject, from, body, attachments) {
-  if (attachments != null &&
-      !hasProcessablePdfAttachment(attachments)) {
-    return false;
-  }
+  // Strong subject/body signals first — JTS "Statement 22568" must not
+  // depend on Gmail exposing a top-level PDF (often only a nested .eml).
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from)) {
     return true;
   }
@@ -180,6 +178,10 @@ function looksLikeStatementCoverInvoicePacketEmail(
       /\b(?:stmt|stmd|statement)\b/i.test(
           `${subject || ""} ${body || ""}`)) {
     return true;
+  }
+  if (attachments != null &&
+      !hasProcessablePdfAttachment(attachments)) {
+    return false;
   }
   if (looksLikeCarrierInvoiceMailbox(from) &&
       /\b(?:stmt|stmd|statement)\b/i.test(String(subject || ""))) {
@@ -212,6 +214,12 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
     return true;
   }
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(context.subject)) {
+    return true;
+  }
+
+  // JTS Express numbered statements: page 1 is a cover; later pages are bills.
+  // Do not require pageCount — it may be 0 when PDF metadata fails to load.
+  if (looksLikeNumberedStatementSubject(context.subject)) {
     return true;
   }
 
@@ -345,6 +353,73 @@ function overrideStatementClassificationIfInvoicePacket(
   };
 }
 
+/**
+ * Broker load numbers listed on a numbered statement index/cover page.
+ * JTS Express page 1 lists 6-digit Primus loads (265xxx–266xxx).
+ * @param {string} text Extracted text from page 1.
+ * @return {string[]} Sorted unique load numbers.
+ */
+function parseStatementIndexLoadNumbers(text) {
+  const matches = String(text || "").match(/\b(26[0-9]{4})\b/g) || [];
+  const seen = new Set();
+  const loads = [];
+  for (const m of matches) {
+    if (!seen.has(m)) {
+      seen.add(m);
+      loads.push(m);
+    }
+  }
+  return loads.sort();
+}
+
+/**
+ * Expected invoice count for a numbered statement packet.
+ * Prefers index-page load list; falls back to page-count heuristic.
+ * @param {object} context indexLoadNumbers, pageCount.
+ * @return {number}
+ */
+function estimateStatementInvoiceCount(context = {}) {
+  const indexLoads = Array.isArray(context.indexLoadNumbers) ?
+    context.indexLoadNumbers : [];
+  if (indexLoads.length > 0) return indexLoads.length;
+
+  const pageCount = Number(context.pageCount) || 0;
+  if (pageCount > 1) {
+    // Page 1 is the statement index; remaining pages are ~2 per load.
+    return Math.max(1, Math.floor((pageCount - 1) / 2));
+  }
+  return 0;
+}
+
+/**
+ * Compares statement index expectations vs AI-extracted load numbers.
+ * @param {object} context indexLoadNumbers, extractedLoadNumbers, pageCount.
+ * @return {object} Gap analysis with missingLoads when under-extracted.
+ */
+function analyzeStatementExtractionGap(context = {}) {
+  const indexLoads = Array.isArray(context.indexLoadNumbers) ?
+    context.indexLoadNumbers.slice() : [];
+  const extractedLoads = (Array.isArray(context.extractedLoadNumbers) ?
+    context.extractedLoadNumbers : [])
+      .map((l) => String(l || "").trim())
+      .filter(Boolean);
+  const extractedSet = new Set(extractedLoads);
+  const missingLoads = indexLoads.filter((l) => !extractedSet.has(l));
+  const expectedCount = estimateStatementInvoiceCount(context);
+  const extractedCount = extractedLoads.length;
+  const underExtracted = indexLoads.length > 0 ?
+    missingLoads.length > 0 :
+    (expectedCount > 0 && extractedCount < expectedCount);
+  return {
+    underExtracted,
+    expectedCount,
+    extractedCount,
+    indexLoads,
+    missingLoads,
+    pageCount: Number(context.pageCount) || 0,
+  };
+}
+
 module.exports = {
   sanitizePreCheckLabel,
   looksLikeNumberedStatementSubject,
@@ -361,4 +436,7 @@ module.exports = {
   normalizePreCheckDocType,
   shouldShortCircuitAsStatementOnly,
   overrideStatementClassificationIfInvoicePacket,
+  parseStatementIndexLoadNumbers,
+  estimateStatementInvoiceCount,
+  analyzeStatementExtractionGap,
 };

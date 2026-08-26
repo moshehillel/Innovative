@@ -72,14 +72,22 @@ for (const c of cases) {
         filename: `${c.n}.pdf`,
         pageCount: 12,
       }), "INVOICE");
-  check(`${c.label} 1-page STATEMENT stays STATEMENT`,
+  check(`${c.label} 1-page STATEMENT still INVOICE (numbered packet)`,
       bundle.normalizePreCheckDocType("STATEMENT", {
         subject: p.subject,
         from: p.from,
         body: p.body,
         filename: `${c.n}.pdf`,
         pageCount: 1,
-      }), "STATEMENT");
+      }), "INVOICE");
+  check(`${c.label} pageCount 0 STATEMENT → INVOICE`,
+      bundle.normalizePreCheckDocType("STATEMENT", {
+        subject: p.subject,
+        from: p.from,
+        body: p.body,
+        filename: `${c.n}.pdf`,
+        pageCount: 0,
+      }), "INVOICE");
 }
 
 check("FW from Lisa still a packet (accounting resend)",
@@ -150,13 +158,23 @@ check("Saia-style STATEMENT cover becomes INVOICE",
       pageCount: 4,
     }), "INVOICE");
 
-check("no PDF on Statement 22568 is not a packet",
+check("no PDF metadata on Statement 22568 is still a packet",
     bundle.looksLikeStatementCoverInvoicePacketEmail(
         "Statement 22568",
         jtsFrom,
         jtsBody("22568"),
         []),
-    false);
+    true);
+check("nested eml only metadata is still a numbered packet",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        "Statement 22568",
+        jtsFrom,
+        jtsBody("22568"),
+        [{
+          filename: "Statement 22568.eml",
+          mimeType: "message/rfc822",
+        }]),
+    true);
 check("nested eml only is not a processable PDF",
     bundle.hasProcessablePdfAttachment([{
       filename: "Statement 22568.eml",
@@ -246,6 +264,49 @@ check("FactorView unknown classifier overridden",
 check("FactorView Remit subject is not PO invoice",
     bundle.looksLikeFactorViewPurchaseOrderInvoiceEmail(
         "Remit for Payment - Toor Transline", fvFrom), false);
+
+const tfSubject =
+  "Invoice for processing; Invoice #299 - Purchase Order #266504";
+const tfFrom = "Billing@Thunderfunding.com";
+const tfPdf = [{filename: "299.pdf", mimeType: "application/pdf"}];
+check("Thunder Funding PO invoice subject detected",
+    bundle.looksLikeThunderFundingInvoiceEmail(tfSubject, tfFrom), true);
+check("Thunder Funding looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(tfSubject, tfFrom, ""), true);
+check("Thunder Funding factored PO subject (generic)",
+    bundle.looksLikeFactoredPurchaseOrderInvoiceEmail(tfSubject), true);
+check("Thunder Funding 1-page OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: tfSubject,
+      from: tfFrom,
+      filename: tfPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("Thunder Funding packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        tfSubject, tfFrom, "", tfPdf), true);
+check("Purchase Order # (not PO #) matches factored PO subject",
+    bundle.looksLikeFactoredPurchaseOrderInvoiceEmail(
+        "Invoice #299 - Purchase Order #266504"), true);
+
+check("parseStatementIndexLoadNumbers dedupes and sorts",
+    JSON.stringify(bundle.parseStatementIndexLoadNumbers(
+        "Load 265379 266088 265379 266219 265630")),
+    JSON.stringify(["265379", "265630", "266088", "266219"]));
+check("analyzeStatementExtractionGap finds missing loads",
+    bundle.analyzeStatementExtractionGap({
+      indexLoadNumbers: ["265379", "265630", "266088", "266134", "266219"],
+      extractedLoadNumbers: ["266213", "266214"],
+      pageCount: 54,
+    }).missingLoads.join(","),
+    "265379,265630,266088,266134,266219");
+check("estimateStatementInvoiceCount prefers index list",
+    bundle.estimateStatementInvoiceCount({
+      indexLoadNumbers: ["265379", "265630"],
+      pageCount: 54,
+    }), 2);
+check("estimateStatementInvoiceCount uses page heuristic",
+    bundle.estimateStatementInvoiceCount({pageCount: 11}), 5);
 
 if (failures) {
   console.error(`\n${failures} failure(s)`);
