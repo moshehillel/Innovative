@@ -61,6 +61,17 @@ function looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from) {
 }
 
 /**
+ * Factored freight invoice subject: Invoice # plus PO / Purchase Order #.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function looksLikeFactoredPurchaseOrderInvoiceEmail(subject) {
+  const sub = String(subject || "");
+  if (!/invoice\s+#?\s*\d+/i.test(sub)) return false;
+  return /(?:your\s+)?(?:po|purchase\s+order)\s*#?\s*\d{5,9}/i.test(sub);
+}
+
+/**
  * FactorView / BP Financing (and similar) factored freight invoices:
  * subject like "Invoice # 981 Your PO # 265543" from notification@factorview.com.
  * The PO number is the broker load; the PDF is a carrier freight bill to pay.
@@ -71,10 +82,25 @@ function looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from) {
 function looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from) {
   const fromL = String(from || "").toLowerCase();
   if (!fromL.includes("factorview.com")) return false;
+  return looksLikeFactoredPurchaseOrderInvoiceEmail(subject);
+}
+
+/**
+ * Thunder Funding factored freight invoices:
+ * "Invoice for processing; Invoice #299 - Purchase Order #266504".
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeThunderFundingInvoiceEmail(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  if (!fromL.includes("thunderfunding.com")) return false;
   const sub = String(subject || "");
-  // Space after "#" is common: "Invoice # 981 Your PO # 265543"
-  return /invoice\s+#?\s*\d+/i.test(sub) &&
-    /(?:your\s+)?po\s*#?\s*\d{5,9}/i.test(sub);
+  if (/invoice\s+for\s+processing/i.test(sub) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
+  return looksLikeFactoredPurchaseOrderInvoiceEmail(sub);
 }
 
 /**
@@ -107,6 +133,8 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
   const hints = `${subject || ""} ${from || ""}`.toLowerCase();
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeFactorViewPurchaseOrderInvoiceEmail(sub, from)) return true;
+  if (looksLikeThunderFundingInvoiceEmail(sub, from)) return true;
+  if (looksLikeFactoredPurchaseOrderInvoiceEmail(sub)) return true;
   if (looksLikeNumberedStatementSubject(sub)) return true;
   if (/^invoice\s+\d+\s+from\b/i.test(sub)) return true;
   // Allow optional whitespace after "#": "Invoice # 981 …"
@@ -141,6 +169,12 @@ function looksLikeStatementCoverInvoicePacketEmail(
   if (looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from)) {
     return true;
   }
+  if (looksLikeThunderFundingInvoiceEmail(subject, from)) {
+    return true;
+  }
+  if (looksLikeFactoredPurchaseOrderInvoiceEmail(subject)) {
+    return true;
+  }
   if (looksLikeNumberedStatementSubject(subject)) return true;
   if (looksLikeStatementInvoicePacketBody(body) &&
       /\b(?:stmt|stmd|statement)\b/i.test(
@@ -171,6 +205,13 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
   }
   if (looksLikeFactorViewPurchaseOrderInvoiceEmail(
       context.subject, context.from)) {
+    return true;
+  }
+  if (looksLikeThunderFundingInvoiceEmail(
+      context.subject, context.from)) {
+    return true;
+  }
+  if (looksLikeFactoredPurchaseOrderInvoiceEmail(context.subject)) {
     return true;
   }
 
@@ -310,7 +351,9 @@ module.exports = {
   looksLikeStatementInvoicePacketBody,
   looksLikeCarrierInvoiceMailbox,
   looksLikeCompassFsPurchaseOrderInvoiceEmail,
+  looksLikeFactoredPurchaseOrderInvoiceEmail,
   looksLikeFactorViewPurchaseOrderInvoiceEmail,
+  looksLikeThunderFundingInvoiceEmail,
   hasProcessablePdfAttachment,
   looksLikeCarrierInvoiceEmail,
   looksLikeStatementCoverInvoicePacketEmail,

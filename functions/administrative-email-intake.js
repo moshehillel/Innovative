@@ -129,6 +129,46 @@ function emailAddressFromHeader(from) {
 }
 
 /**
+ * Parses email addresses from a RFC822 To/Cc header value.
+ * @param {string} headerValue Raw header value.
+ * @return {string[]} Lowercase email addresses.
+ */
+function parseEmailAddressesFromHeaderValue(headerValue) {
+  const raw = String(headerValue || "");
+  const matches = raw.match(
+      /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+  return matches ? matches.map((addr) => addr.toLowerCase()) : [];
+}
+
+/**
+ * Accounting contact for carrier statements / payment follow-ups.
+ * @return {string}
+ */
+function resolveStatementAbeEmail() {
+  return String(
+      process.env.REVIEW_EMAIL_STATEMENT ||
+      PAYMENT_INQUIRY_EMAIL_DEFAULT,
+  ).trim().toLowerCase();
+}
+
+/**
+ * True when Abe is already on the original email (To or Cc).
+ * @param {Array<object>} headers Gmail payload headers.
+ * @return {boolean}
+ */
+function isAbeCopiedOnEmailHeaders(headers) {
+  const abeEmail = resolveStatementAbeEmail();
+  const list = Array.isArray(headers) ? headers : [];
+  for (const header of list) {
+    const name = String(header && header.name || "").toLowerCase();
+    if (name !== "to" && name !== "cc") continue;
+    const addrs = parseEmailAddressesFromHeaderValue(header.value);
+    if (addrs.includes(abeEmail)) return true;
+  }
+  return false;
+}
+
+/**
  * True when the sender domain is coface.com (Lisa: ignore all Coface mail).
  * @param {string} from From header.
  * @return {boolean}
@@ -152,6 +192,69 @@ function isCofaceEmail(from, subject, body) {
   void subject;
   void body;
   return isCofaceDomain(from);
+}
+
+/**
+ * Out-of-office / vacation automatic reply emails (Lisa: ignore).
+ * Uses subject and first-person auto-reply body phrasing; avoids casual
+ * third-party mentions of someone being away.
+ * @param {string} subject Email subject.
+ * @param {string} from From header (unused; kept for API symmetry).
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isOutOfOfficeAutoReply(subject, from, body) {
+  void from;
+  const sub = String(subject || "").trim();
+  const subL = sub.toLowerCase();
+  const bodyL = String(body || "").toLowerCase();
+  if (!subL && !bodyL.trim()) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+
+  const subjectPatterns = [
+    /^out of office\b/i,
+    /^automatic reply\b/i,
+    /^auto-?reply\b/i,
+    /^away from (?:the )?office\b/i,
+    /^ooo\s*:/i,
+    /^i am out of (?:the )?office\b/i,
+    /\bautomatic reply\s*:/i,
+    /\bout of office auto/i,
+    /\bauto reply\s*:/i,
+    /\b(?:away|out)\s+message\b/i,
+  ];
+  if (subjectPatterns.some((re) => re.test(sub))) return true;
+
+  const strongBodyPatterns = [
+    /\bi am currently out of (?:the )?office\b/,
+    /\bi will be out of (?:the )?office\b/,
+    /\bi am away from (?:the )?office\b/,
+    /\bi am currently away\b/,
+    /\blimited access to (?:my )?email\b/,
+    /\bthis is an automatic (?:reply|response)\b/,
+    /\bthis is an automated (?:reply|response)\b/,
+    /\bi am on (?:vacation|holiday|leave)\b/,
+    /\bi will be on (?:vacation|holiday|leave)\b/,
+    /\breturning on\b.*\bout of (?:the )?office\b/,
+    /\bout of (?:the )?office\b.*\breturning on\b/,
+    /\bthank you for (?:your )?(?:email|message)\b.*\bout of (?:the )?office\b/,
+    /\bout of (?:the )?office\b.*\bthank you for (?:your )?(?:email|message)\b/,
+  ];
+  if (strongBodyPatterns.some((re) => re.test(bodyL))) return true;
+
+  const hasAutoReplySubjectHint =
+    /\b(?:automatic|auto)[- ]?reply\b/i.test(subL) ||
+    /\booo\b/i.test(subL);
+  const weakBodyPatterns = [
+    /\bi am out of (?:the )?office\b/,
+    /\bi will be out until\b/,
+    /\bwill respond when i return\b/,
+  ];
+  if (hasAutoReplySubjectHint &&
+      weakBodyPatterns.some((re) => re.test(bodyL))) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -215,6 +318,103 @@ function isHafstaffSender(from) {
 /** Default accounting contact for carrier payment questions. */
 const PAYMENT_INQUIRY_EMAIL_DEFAULT = "abe@innovativecarriers.com";
 
+/** Default accounting contact for customer payment remittances. */
+const CUSTOMER_PAYMENT_REMITTANCE_EMAIL_DEFAULT =
+  "abe@innovativecarriers.com";
+
+/**
+ * Known carrier / factor sender domains — not customer payment remittance.
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isCarrierOrFactorSender(from) {
+  const addr = emailAddressFromHeader(from);
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1);
+  const carrierFactorDomains = [
+    "factorview.com",
+    "phoenixcapitalgroup.com",
+    "compassfs.net",
+    "thunderfunding.com",
+    "rtsinc.com",
+    "rtsfinancial.com",
+    "cjfinancing.com",
+    "abf.com",
+    "arcb.com",
+    "notification.intuit.com",
+  ];
+  if (carrierFactorDomains.some((d) =>
+    domain === d || domain.endsWith("." + d))) {
+    return true;
+  }
+  const raw = String(from || "").toLowerCase();
+  if (/\bmc\s*#?\s*\d{5,7}\b/.test(raw)) return true;
+  return false;
+}
+
+/**
+ * Subject like "Payment 08/25/26" — customer sending remittance info.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeCustomerPaymentDate(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  return /^payment\s+\d{1,2}\/\d{1,2}\/\d{2,4}\s*$/i.test(stripped);
+}
+
+/**
+ * Customer payment remittance — sender notifying Innovative of payment sent.
+ * Not a carrier freight invoice or factor remittance notice.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isCustomerPaymentRemittanceEmail(subject, from, body) {
+  if (isCarrierOrFactorSender(from)) return false;
+  if (isPaymentNotificationEmail(subject, from, body)) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  if (looksLikeNoaEmailContent(subject, body, from)) return false;
+
+  const addr = emailAddressFromHeader(from);
+  if (addr.endsWith("@innovativecarriers.com")) return false;
+
+  const sub = String(subject || "").trim();
+  const hay = `${sub}\n${body || ""}`.toLowerCase();
+
+  // "Payment MM/DD/YY" from a customer — before payment-inquiry guards
+  // (body may mention "outstanding invoices" like carrier AR follow-ups).
+  if (subjectLooksLikeCustomerPaymentDate(subject)) return true;
+
+  if (isPaymentInquiryEmail(subject, from, body)) return false;
+
+  const remittancePatterns = [
+    /\bremittance\s+advice\b/,
+    /\bpayment\s+remittance\b/,
+    /\bcheck\s+remittance\b/,
+    /\bplease\s+find\s+(?:attached\s+)?(?:the\s+)?remittance\b/,
+    /\benclosed\s+(?:is\s+)?(?:our\s+)?payment\b/,
+    /\battached\s+(?:is\s+)?(?:our\s+)?(?:payment|check|remittance)\b/,
+  ];
+  if (!remittancePatterns.some((re) => re.test(hay))) return false;
+  if (/\bload\s*#?\s*\d{5,9}\b/.test(hay)) return false;
+  if (/\bquick\s*pay\b/.test(hay)) return false;
+  return true;
+}
+
+/**
+ * Customer remittance handler — intercept before carrier invoice processing.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function shouldHandleCustomerPaymentRemittance(subject, from, body) {
+  return isCustomerPaymentRemittanceEmail(subject, from, body);
+}
+
 /**
  * Bank / Zelle payment alerts — not carrier freight invoices.
  * @param {string} subject Email subject.
@@ -258,6 +458,143 @@ function isPaymentNotificationEmail(subject, from, body) {
 }
 
 /**
+ * QuickBooks / vendor payment receipt confirmations — not freight invoices.
+ * Example: Subject "Payment Receipt from Amfast Freight, Inc.",
+ * From quickbooks@notification.intuit.com (Lisa: ignore).
+ * Distinct from "payment request" / "Invoice N from …" which must still process.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isPaymentReceiptEmail(subject, from, body) {
+  const sub = String(subject || "").trim();
+  const subL = sub.toLowerCase();
+  const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase();
+  if (!subL && !String(body || "").trim()) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+
+  if (/\bpayment\s+receipt\b/i.test(sub)) return true;
+  if (/\bpayment\s+receipt\s+from\b/i.test(hay)) return true;
+  if (/\byour\s+payment\s+receipt\b/i.test(hay)) return true;
+  if (/\breceipt\s+for\s+(?:your\s+)?payment\b/i.test(hay)) return true;
+
+  const fromL = String(from || "").toLowerCase();
+  if ((fromL.includes("notification.intuit.com") ||
+       fromL.includes("quickbooks@")) &&
+      /\bpayment\s+receipt\b/i.test(hay)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Ignore payment receipts unless the package includes a freight invoice file.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function shouldIgnoreAsPaymentReceipt(
+    subject, from, body, attachments) {
+  if (!isPaymentReceiptEmail(subject, from, body)) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Subject is only a load-number thread title, e.g. "Re: 264617".
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeLoadNumberReply(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  return /^\d{5,6}\.?\s*$/.test(stripped);
+}
+
+/**
+ * Body asks about missing or delayed payment (optionally for load numbers).
+ * Used with bare load-number subjects so non-payment Re: threads do not match.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeLoadPaymentFollowUp(body) {
+  const bodyL = String(body || "").toLowerCase();
+  if (!bodyL.trim()) return false;
+  const paymentSignals = [
+    /\bpayment\s+has\s+not\s+been\s+received\b/,
+    /\bpayment\s+not\s+received\b/,
+    /\b(?:have\s+not|has\s+not|haven't)\s+received\s+(?:our\s+)?payment\b/,
+    /\b(?:update|status)\s+(?:on\s+)?payment\s+status\b/,
+    /\bpayment\s+status\s+update\b/,
+    /\bunpaid\b/,
+    /\boutstanding\s+payment\b/,
+    /\bpending\s+payment\b/,
+    /\bwhen\s+(?:will|can)\s+(?:we|i|our)\s+(?:get\s+)?paid\b/,
+    /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\bpayment\s+status\b/,
+    /\b(?:still\s+)?awaiting\s+payment\b/,
+  ];
+  return paymentSignals.some((re) => re.test(bodyL));
+}
+
+/**
+ * Subject is a bare load-number thread title (e.g. "Re: 264617", "264618").
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeLoadNumberReply(subject) {
+  const sub = String(subject || "").trim();
+  if (!sub) return false;
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  return /^(?:load\s+#?\s*)?\d{5,9}\s*$/i.test(stripped);
+}
+
+/**
+ * Body asks about payment timing/status for one or more loads.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeLoadPaymentFollowUp(body) {
+  const bodyL = String(body || "").toLowerCase();
+  if (!bodyL.trim()) return false;
+  const hasLoadRef =
+    /\bload\s+(?:numbers?|nos?\.?|#)\b/.test(bodyL) ||
+    /\b\d{5,9}\b/.test(bodyL);
+  if (!hasLoadRef) return false;
+  const paymentSignals = [
+    /\bpayment\s+(?:has\s+not\s+been\s+received|not\s+received)\b/,
+    /\bpayment\s+status(?:\s+update)?\b/,
+    /\b(?:unpaid|outstanding)\s+(?:load|payment|invoice)/,
+    /\bfollow(?:ing)?\s+up\s+on\s+(?:unpaid|outstanding)/,
+    /\bwhen\s+will\s+payment\b/,
+    /\bprovide\s+(?:an?\s+)?(?:update\s+on\s+)?payment\b/,
+    /\brequesting\s+.*payment\s+status\b/,
+  ];
+  return paymentSignals.some((re) => re.test(bodyL));
+}
+
+/**
+ * Sender domain looks like a freight factor / financing company.
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function senderDomainLooksLikeFactor(from) {
+  if (isCarrierOrFactorSender(from)) return true;
+  const addr = emailAddressFromHeader(from);
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1).toLowerCase();
+  return /(?:financ|factor)/.test(domain);
+}
+
+/**
  * Carrier / factor follow-ups about payment timing, Quick Pay, or remittance
  * — not a freight invoice to enter.
  * @param {string} subject Email subject.
@@ -281,7 +618,14 @@ function isPaymentInquiryEmail(subject, from, body) {
     /\bstatus\s+of\s+(?:my\s+)?payment\b/,
     /\bpending\s+payment\b/,
     /\bunpaid\s+payment\b/,
-    /\b(?:outstanding|overdue|awaiting)\s+payment\b/,
+    /\b(?:outstanding|overdue|awaiting)\s+payment(?:\s+(?:reminder|follow[- ]?up))?\b/,
+    /\boutstanding\s+payment\s+reminder\b/,
+    /\boutstanding\s+invoices?\b/,
+    /\boverdue\s+invoices?\b/,
+    /\bexpected\s+payment\s+date\b/,
+    /\b(?:provide|send|share)\s+(?:an?\s+)?expected\s+payment\s+date\b/,
+    /\bfollow(?:ing)?\s+up\s+(?:on\s+)?(?:\d+\s+)?outstanding\s+invoices?\b/,
+    /\b(?:requesting|need)\s+(?:an?\s+)?expected\s+payment\s+date\b/,
     /\b(?:requesting|provide|send|need)\s+(?:the\s+)?payment\s+details\b/,
     /\bpayment\s+(?:details|update)\b/,
     /\bpayment\s+for\s+load\s+#?\s*\d{5,9}\b/,
@@ -296,11 +640,38 @@ function isPaymentInquiryEmail(subject, from, body) {
     /\bremittance\s+(?:status|inquiry|request)\b/,
     /\bhas\s+(?:this|the)\s+invoice\s+been\s+paid\b/,
     /\bcheck\s+(?:on|regarding)\s+(?:my\s+)?payment\b/,
+    /\bpayment\s+has\s+not\s+been\s+received\b/,
+    /\bpayment\s+not\s+received\b/,
+    /\b(?:have\s+not|has\s+not|haven't)\s+received\s+(?:our\s+)?payment\b/,
+    /\b(?:update|status)\s+(?:on\s+)?payment\s+status\b/,
+    /\bpayment\s+status\s+update\b/,
+    /\bpayment\s+(?:has\s+not\s+been\s+received|not\s+received|status)\b.*\bload\b/,
+    /\bload\s+(?:numbers?|nos?\.?|#)\b.*\bpayment\b/,
+    /\bfollow(?:ing)?\s+up\b.*\b(?:unpaid|outstanding|payment)\b.*\bload\b/,
+    /\b(?:unpaid|outstanding)\b.*\bload\s+(?:numbers?|#)\b/,
   ];
   if (patterns.some((re) => re.test(hay))) return true;
   if (/quick\s*pay\s+invoice/i.test(sub)) return true;
   if (/payment\s+inquir/i.test(sub)) return true;
   if (/pending\s+payment\s+for\s+load/i.test(sub)) return true;
+  if (/payment\s+update\s+load\s+#?\s*\d{5,9}/i.test(sub)) return true;
+  if (/payment\s+update\s+for\s+load/i.test(sub)) return true;
+  if (/payment\s+status\s+update/i.test(sub)) return true;
+  if (/outstanding\s+payment\s+reminder/i.test(sub)) return true;
+  if (/outstanding\s+invoices?/i.test(sub)) return true;
+  if (/expected\s+payment\s+date/i.test(sub)) return true;
+  if (/payment\s+reminder/i.test(sub) &&
+      /outstanding|overdue|past\s+due/i.test(sub)) return true;
+  if (subjectLooksLikeLoadNumberReply(sub) &&
+      bodyLooksLikeLoadPaymentFollowUp(body)) {
+    return true;
+  }
+  if (senderDomainLooksLikeFactor(from) &&
+      /\b(?:payment|paid|pay)\b/.test(hay) &&
+      (/\bload\b/.test(hay) || /\bstatus\b/.test(hay) ||
+       /\bupdate\b/.test(hay))) {
+    return true;
+  }
   return false;
 }
 
@@ -317,6 +688,133 @@ function shouldHandlePaymentInquiry(
   if (Number(invoicePdfCount) > 0) return false;
   if (!isPaymentInquiryEmail(subject, from, body)) return false;
   return true;
+}
+
+/**
+ * @param {string} filename Attachment filename.
+ * @return {boolean}
+ */
+function attachmentLooksLikeStatementSpreadsheet(filename, mimeType) {
+  const name = String(filename || "").toLowerCase();
+  const mime = String(mimeType || "").toLowerCase();
+  if (/premium|redkik|insurance/i.test(name)) return false;
+  if (/\.(?:xlsx?|xlsm|csv)$/i.test(name)) return true;
+  if (/spreadsheet|excel|ms-excel|csv/i.test(mime)) return true;
+  return false;
+}
+
+/**
+ * Spreadsheet filename for an overdue/statement list (not a freight bill).
+ * @param {string} filename Attachment filename.
+ * @return {boolean}
+ */
+function attachmentFilenameLooksLikeStatementList(filename) {
+  const name = String(filename || "").toLowerCase();
+  if (!attachmentLooksLikeStatementSpreadsheet(name, "")) return false;
+  if (/statement|stmt|aging|past.?due|overdue|open.?invoice|account/i
+      .test(name)) {
+    return true;
+  }
+  // e.g. overdue_invoices.xls — list workbook, not a carrier freight bill.
+  if (/invoices?\.(?:xlsx?|xlsm|csv)$/i.test(name)) return true;
+  return false;
+}
+
+/**
+ * Subject like "1467163 INNOVATIVE CARRIERS INC" (account # + company).
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeCarrierAccountStatement(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  if (/^\d{5,10}\s+[A-Z0-9][A-Z0-9\s&.,'-]{3,}(?:INC|LLC|CORP|CO\.?|LTD|L\.?L\.?C\.?)\.?\s*$/i
+      .test(stripped)) {
+    return true;
+  }
+  if (/\bstatement\s+of\s+account\b/i.test(stripped)) return true;
+  if (/\baccount\s+statement\b/i.test(stripped)) return true;
+  if (/\boverdue\s+(?:invoice|account|balance)\b/i.test(stripped)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Body text for carrier overdue-invoice / statement follow-up.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeOverdueInvoiceFollowUp(body) {
+  const hay = String(body || "").toLowerCase();
+  const patterns = [
+    /\boverdue\s+invoices?\b/,
+    /\boutstanding\s+invoices?\b/,
+    /\bunpaid\s+invoices?\b/,
+    /\bpast[\s-]due\s+invoices?\b/,
+    /\bfollow(?:ing)?\s+up\s+on\s+(?:overdue|outstanding|unpaid|past[\s-]due)\b/,
+    /\bstatement\s+of\s+account\b/,
+    /\baccount\s+statement\b/,
+    /\battached\s+(?:is\s+)?(?:your\s+)?statement\b/,
+    /\bplease\s+(?:provide|send)\s+(?:payment\s+)?(?:information|details|status)\b/,
+    /\bpayment\s+information\s+or\s+(?:an?\s+)?explanation\b/,
+    /\btotal(?:ing)?\s+\$[\d,]+(?:\.\d{2})?\s+(?:in\s+)?overdue\b/,
+    /\bamount\s+(?:due|overdue|outstanding)\b/,
+  ];
+  return patterns.some((re) => re.test(hay));
+}
+
+/**
+ * Carrier account statement or overdue-invoice follow-up — not a freight
+ * invoice to enter (Lisa: ignore when Abe is on CC, else forward to Abe).
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function isCarrierStatementFollowUpEmail(subject, from, body, attachments) {
+  if (isCustomerPaymentRemittanceEmail(subject, from, body)) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  if (looksLikeNoaEmailContent(subject, body, from)) return false;
+
+  const hay = `${subject || ""}\n${from || ""}\n${body || ""}`.toLowerCase();
+  if (/redkik|insurance premium|premium breakdown|cargo insurance billing/i
+      .test(hay)) {
+    return false;
+  }
+
+  const list = Array.isArray(attachments) ? attachments : [];
+  const hasSpreadsheet = list.some((a) =>
+    attachmentLooksLikeStatementSpreadsheet(a.filename, a.mimeType));
+  const hasStatementListFile = list.some((a) =>
+    attachmentFilenameLooksLikeStatementList(a.filename));
+  const subMatch = subjectLooksLikeCarrierAccountStatement(subject);
+  const bodyMatch = bodyLooksLikeOverdueInvoiceFollowUp(body);
+
+  if (hasSpreadsheet && (subMatch || bodyMatch || hasStatementListFile)) {
+    return true;
+  }
+  if (bodyMatch && (subMatch || hasSpreadsheet || hasStatementListFile)) {
+    return true;
+  }
+  if (subMatch && bodyMatch) return true;
+  return false;
+}
+
+/**
+ * Statement follow-up handler — only when no freight invoice PDF to process.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @param {number} [invoicePdfCount] Invoice PDFs after doc classification.
+ * @return {boolean}
+ */
+function shouldHandleCarrierStatementFollowUp(
+    subject, from, body, attachments, invoicePdfCount) {
+  if (Number(invoicePdfCount) > 0) return false;
+  return isCarrierStatementFollowUpEmail(subject, from, body, attachments);
 }
 
 /**
@@ -347,7 +845,12 @@ function looksLikeInvoiceEmailContent(subject, body) {
     return true;
   }
   if (/invoice\s+#?\s*\d+/i.test(sub) &&
-      /(?:your\s+)?po\s*#?\s*\d{5,9}/i.test(sub)) {
+      /(?:your\s+)?(?:po|purchase\s+order)\s*#?\s*\d{5,9}/i.test(sub)) {
+    return true;
+  }
+  // Thunder Funding and similar factors: "Invoice for processing; Invoice #299 …"
+  if (/invoice\s+for\s+processing/i.test(sub) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub)) {
     return true;
   }
   // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."
@@ -584,7 +1087,24 @@ function hasInvoiceVeto(signals = {}) {
 
   if (looksLikeInvoiceEmailContent(subject, body)) return true;
 
+  if (shouldIgnoreAsPaymentReceipt(subject, from, body, attachments)) {
+    return false;
+  }
+
+  if (isCustomerPaymentRemittanceEmail(subject, from, body)) {
+    return false;
+  }
+
   const list = Array.isArray(attachments) ? attachments : [];
+  if (list.some((a) =>
+    attachmentFilenameLooksLikeStatementList(a.filename))) {
+    return true;
+  }
+
+  if (isPaymentInquiryEmail(subject, from, body)) {
+    return false;
+  }
+
   if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
     return true;
   }
@@ -598,6 +1118,9 @@ function hasInvoiceVeto(signals = {}) {
     // NOA ignore when there is no invoice PDF evidence.
     if (looksLikeNoaEmailContent(subject, body, from) &&
         Number(invoicePdfCount || 0) === 0) {
+      return false;
+    }
+    if (isPaymentInquiryEmail(subject, from, body)) {
       return false;
     }
     return true;
@@ -649,6 +1172,20 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
       status: "coface_ignored",
     };
   }
+  if (isOutOfOfficeAutoReply(subject, from, body)) {
+    return {
+      ignore: true,
+      reason: "Out of office auto-reply — no action needed",
+      status: "out_of_office_ignored",
+    };
+  }
+  if (shouldIgnoreAsPaymentReceipt(subject, from, body, attachments)) {
+    return {
+      ignore: true,
+      reason: "Payment receipt — not a carrier freight invoice",
+      status: "payment_receipt_ignored",
+    };
+  }
   // Before PDF classification: only ignore when filenames clearly NOA-only.
   if (rtsNoaAttachmentsLookNoaOnly(attachments) &&
       looksLikeNoaEmailContent(subject, body, from) &&
@@ -664,6 +1201,10 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
 
 module.exports = {
   PAYMENT_INQUIRY_EMAIL_DEFAULT,
+  CUSTOMER_PAYMENT_REMITTANCE_EMAIL_DEFAULT,
+  parseEmailAddressesFromHeaderValue,
+  resolveStatementAbeEmail,
+  isAbeCopiedOnEmailHeaders,
   isEmodalBroadcast,
   isCardknoxBatchReport,
   looksLikeDnbCreditAlert,
@@ -671,12 +1212,25 @@ module.exports = {
   isPromotionalMarketingEmail,
   isCofaceEmail,
   isCofaceDomain,
+  isOutOfOfficeAutoReply,
   isAmexMerchantSurveyEmail,
   isHafstaffSender,
+  isCarrierOrFactorSender,
+  subjectLooksLikeCustomerPaymentDate,
+  isCustomerPaymentRemittanceEmail,
+  shouldHandleCustomerPaymentRemittance,
   isPaymentNotificationEmail,
+  isPaymentReceiptEmail,
   shouldIgnoreAsPaymentNotification,
+  shouldIgnoreAsPaymentReceipt,
   isPaymentInquiryEmail,
   shouldHandlePaymentInquiry,
+  attachmentLooksLikeStatementSpreadsheet,
+  attachmentFilenameLooksLikeStatementList,
+  subjectLooksLikeCarrierAccountStatement,
+  bodyLooksLikeOverdueInvoiceFollowUp,
+  isCarrierStatementFollowUpEmail,
+  shouldHandleCarrierStatementFollowUp,
   looksLikeInvoiceEmailContent,
   looksLikeNoaEmailContent,
   isNoticeOfAssignmentEmail,

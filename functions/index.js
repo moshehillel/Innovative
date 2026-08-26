@@ -3836,18 +3836,7 @@ function extractSenderEmailFromHeader(from) {
  * @return {boolean}
  */
 function isAbeCopiedOnEmail(headers) {
-  const abeEmail = String(
-      process.env.REVIEW_EMAIL_STATEMENT ||
-      STATEMENT_FORWARD_EMAIL_DEFAULT,
-  ).trim().toLowerCase();
-  const list = Array.isArray(headers) ? headers : [];
-  for (const header of list) {
-    const name = String(header && header.name || "").toLowerCase();
-    if (name !== "to" && name !== "cc") continue;
-    const addrs = parseEmailAddressesFromHeaderValue(header.value);
-    if (addrs.includes(abeEmail)) return true;
-  }
-  return false;
+  return administrativeEmailIntake.isAbeCopiedOnEmailHeaders(headers);
 }
 
 /**
@@ -4261,6 +4250,67 @@ async function handlePaymentInquiryEmail(args) {
       directedTo: abeEmail,
       reason: reason || "Carrier payment inquiry",
     },
+  });
+}
+
+/**
+ * Forwards customer payment remittance emails to Abe (Lisa's rule).
+ * If Abe is already on the thread, quietly ignore.
+ * @param {object} args Handler arguments.
+ * @return {Promise<void>}
+ */
+async function handleCustomerPaymentRemittanceEmail(args) {
+  const {
+    gmail, messageId, subject, from, emailBody, tenant, headers,
+    emailClassification, reason, queueDocId,
+  } = args;
+  const docId = queueDocId || messageId;
+  const intakeExtra = {
+    gmailMessageId: messageId,
+    subject,
+    from,
+    emailClassification: emailClassification || null,
+    deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
+  };
+
+  if (isAbeCopiedOnEmail(headers)) {
+    await writeLog("info", "mail",
+        "Customer payment remittance — Abe already copied, ignoring", {
+          messageId,
+          subject,
+          from,
+        });
+    await mailIntakeQueue.completeIntakeRecord({
+      tenant,
+      docId,
+      parentMessageId: messageId,
+      outcome: mailIntakeQueue.OUTCOME.IGNORED,
+      finalStatus: "customer_payment_remittance_ignored_abe_cc",
+      ignoreReason: "Customer payment remittance — Abe already on thread",
+      extra: intakeExtra,
+    });
+    return;
+  }
+
+  const forwardReason =
+    reason || "Customer payment remittance — forward to accounting";
+  await forwardToHumanReview(
+      gmail, messageId, subject, from,
+      forwardReason,
+      `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
+      `This email appears to be a customer payment remittance (not a ` +
+      `carrier freight invoice). I'm forwarding it to accounting for ` +
+      `payment posting.\n\nThank you,\n${AI_AGENT_NAME}`,
+      {department: "statement", emailBody},
+  );
+  await mailIntakeQueue.completeIntakeRecord({
+    tenant,
+    docId,
+    parentMessageId: messageId,
+    outcome: mailIntakeQueue.OUTCOME.FORWARDED,
+    finalStatus: "customer_payment_remittance_forwarded",
+    forwardReason,
+    extra: intakeExtra,
   });
 }
 
@@ -7684,6 +7734,11 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  invoice — Your PO # is the broker load. Classify as",
       "  carrier_invoice, not statement or unknown. Do not confuse with",
       "  FactorView Notice of Assignment / Remit notices.",
+      "- Thunder Funding (billing@thunderfunding.com): subject",
+      "  'Invoice for processing; Invoice #299 - Purchase Order #266504'",
+      "  with a PDF is a factored carrier freight invoice — Purchase Order",
+      "  # is the broker load. Classify as carrier_invoice, not statement",
+      "  or unknown.",
       "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",
       "  delivery photos — not asking us to send one.",
       "- pod_request: sender asks Innovative to SEND or provide a POD /",
@@ -7999,6 +8054,17 @@ async function processGmailMessage(
             gmail, messageId, subject, from, emailBody, tenant, headers,
             emailClassification,
             queueDocId,
+          });
+          return;
+        }
+
+        if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
+            subject, from, emailBody)) {
+          await handleCustomerPaymentRemittanceEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason: "Customer payment remittance — not a carrier invoice",
           });
           return;
         }
@@ -8444,6 +8510,16 @@ async function processGmailMessage(
             emailClassification,
             queueDocId,
             reason: "Payment inquiry email with no attachments",
+          });
+          return;
+        }
+        if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
+            subject, from, emailBody)) {
+          await handleCustomerPaymentRemittanceEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason: "Customer payment remittance with no attachments",
           });
           return;
         }
@@ -8916,6 +8992,18 @@ async function processGmailMessage(
           });
           return;
         }
+        if (administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
+            subject, from, emailBody, attachments, invoicePdfCount)) {
+          await handleStatementOnlyEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason:
+              "Carrier statement / overdue invoice follow-up — " +
+              "no freight invoice to enter",
+          });
+          return;
+        }
         if (administrativeEmailIntake.shouldIgnoreNoaOnlyPackage(
             subject, emailBody, attachments, invoicePdfCount) &&
           !administrativeEmailIntake.hasInvoiceVeto({
@@ -8979,6 +9067,16 @@ async function processGmailMessage(
             invoicePdfCount,
           })) {
           await handlePaymentInquiryEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason: noInvoiceReason,
+          });
+          return;
+        }
+        if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
+            subject, from, emailBody)) {
+          await handleCustomerPaymentRemittanceEmail({
             gmail, messageId, subject, from, emailBody, tenant, headers,
             emailClassification,
             queueDocId,
@@ -9062,6 +9160,18 @@ async function processGmailMessage(
         messageId: messageId,
         attachmentCount: pdfAttachments.length,
       });
+
+      if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
+          subject, from, emailBody)) {
+        await handleCustomerPaymentRemittanceEmail({
+          gmail, messageId, subject, from, emailBody, tenant, headers,
+          emailClassification,
+          queueDocId,
+          reason:
+            "Customer payment remittance — attachments are not carrier invoices",
+        });
+        return;
+      }
 
       try {
         await logWorkflowStep({
