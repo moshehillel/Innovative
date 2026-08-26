@@ -85,6 +85,12 @@ check("density 24.375 → 65", rateShop.classFromDensity(24.375), 65);
 check("density 12.36 → 85", rateShop.classFromDensity(12.36), 85);
 check("density 8.34 → 110", rateShop.classFromDensity(8.342), 110);
 check("density 5.69 → 175", rateShop.classFromDensity(5.6889), 175);
+check("density 2.05 → 250", rateShop.classFromDensity(2.05), 250);
+check("density 3.5 → 250", rateShop.classFromDensity(3.5), 250);
+check("137 lb 40x48x60 → 250", rateShop.ensureFreightClasses([{
+  qty: 1, weight: 137, weightType: "total",
+  length: 40, width: 48, height: 60, dimType: "PLT",
+}]).freightInfo[0].class, 250);
 check("valid class 70", rateShop.isValidFreightClass(70), true);
 check("invalid class null", rateShop.isValidFreightClass(null), false);
 check("invalid class 0", rateShop.isValidFreightClass(0), false);
