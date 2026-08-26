@@ -2003,6 +2003,7 @@
       return lines.join("");
     }
 
+    function renderLaneSummaryBody(lane) {
       if (!detailsEditMode) {
         let html = renderAddressReadonly(
             lane.shipper || (quote && quote.shipper) || null,
