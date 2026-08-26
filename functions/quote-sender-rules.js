@@ -36,8 +36,6 @@ const SENDER_RULES = {
   "jared.berman@corehome.com": {
     customerName: "Brumis Imports Inc",
     defaultDims: {length: 40, width: 48, height: 62},
-    // Primus customer profile uses Manual class — honor RFQ class, not density.
-    preferEmailClass: true,
     ruleId: "sender_jared_berman",
     name: "Sender → Brumis Imports Inc",
     fromNames: ["jared berman"],
@@ -263,8 +261,6 @@ function senderPayloadFromQuoteRule(rule) {
     customerName: customerName || undefined,
     protocolOnly: !!rule.protocolOnly,
     defaultDims: dims || undefined,
-    preferEmailClass: rule.preferEmailClass === true ||
-      rule.match && rule.match.preferEmailClass === true,
     ruleId: rule.id ? String(rule.id) : undefined,
     name: rule.name ? String(rule.name) : undefined,
   };
@@ -431,21 +427,6 @@ function dimOptsForSender(from, quoteRules, opts) {
 }
 
 /**
- * Class opts for ensureFreightClasses / rate payload.
- * Manual-class Primus customers (e.g. Brumis) keep RFQ class instead of
- * density-derived NMFC.
- * @param {string} from Raw From.
- * @param {Array<object>} [quoteRules] Optional Firestore rules.
- * @param {object} [opts] {cc?, to?}.
- * @return {{preferEmailClass?: boolean}}
- */
-function classOptsForSender(from, quoteRules, opts) {
-  const rule = resolveSenderRule(from, quoteRules, opts);
-  if (!rule || !rule.preferEmailClass) return {};
-  return {preferEmailClass: true};
-}
-
-/**
  * Replace AI-invented global 40×48×60 with sender defaults when the body
  * never stated a height. Explicit body heights / dims are left alone.
  * @param {object} extracted Intake payload.
@@ -529,7 +510,6 @@ module.exports = {
   resolveSenderRule,
   bodyHasExplicitPalletHeight,
   dimOptsForSender,
-  classOptsForSender,
   applySenderDefaultedDimOverrides,
   applySenderCustomerOverride,
 };

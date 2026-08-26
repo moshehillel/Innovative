@@ -845,8 +845,7 @@ function densityFromFreightRow(row, uom = "US") {
 }
 
 /**
- * Prefer Primus density class (weight + L×W×H) over email class unless
- * opts.preferEmailClass (Manual-class Primus customers, e.g. Brumis).
+ * Always prefer Primus density class (weight + L×W×H) over email class.
  * When dims/weight are insufficient, keep a valid previous class.
  * Primus /tools/densityrules is empty for this tenant; table matches
  * Primus booking density/class pairs.
@@ -857,7 +856,6 @@ function densityFromFreightRow(row, uom = "US") {
  */
 function ensureFreightClasses(freightInfo, opts = {}) {
   const uom = opts.UOM || opts.uom || "US";
-  const preferEmailClass = opts.preferEmailClass === true;
   const rows = Array.isArray(freightInfo) ? freightInfo : [];
   const unresolved = [];
   let filled = 0;
@@ -867,18 +865,6 @@ function ensureFreightClasses(freightInfo, opts = {}) {
     const prevClass = isValidFreightClass(r.class) ? Number(r.class) : null;
     const dens = densityFromFreightRow(r, uom);
     const cls = dens ? classFromDensity(dens.density) : null;
-    if (preferEmailClass && prevClass != null) {
-      r.class = prevClass;
-      r.classSource = "email";
-      if (dens && dens.density > 0) {
-        r.density = Math.round(dens.density * 1000) / 1000;
-        if (cls != null && cls !== prevClass) {
-          r.densityClass = cls;
-        }
-      }
-      filled += 1;
-      return r;
-    }
     if (cls != null) {
       if (prevClass != null && prevClass !== cls) {
         r.emailClass = prevClass;
@@ -931,7 +917,6 @@ function normalizeFreightInfoForRate(freightInfo, opts = {}) {
       "each" : "total";
     // Drop density helper fields from rate payload (UI may keep on quote).
     delete r.density;
-    delete r.densityClass;
     delete r.classSource;
     delete r.emailClass;
     // Still omit blank/invalid class so market rating can density-calc.
@@ -953,7 +938,6 @@ function buildRateMultipleQuery(lane, opts = {}) {
   const uom = String(opts.UOM || lane.UOM || "US").trim() || "US";
   const freightInfo = normalizeFreightInfoForRate(lane.freightInfo || [], {
     UOM: uom,
-    preferEmailClass: opts.preferEmailClass === true,
   });
   const params = {
     originCity: String(ship.city || "").trim(),

@@ -715,26 +715,21 @@ async function rateLane(lane, ctx) {
     };
   }
 
-  // Prefer Primus density class when weight + L×W×H are present, except
-  // Manual-class customers (e.g. Brumis) where RFQ class wins. Pallet
-  // missing dims → sender or global 40×48×60 first. Also replace invented
-  // 40×48×60 with sender defaults (e.g. Brumis 40×48×62) when the RFQ
-  // never stated a height.
+  // Always overwrite email class with Primus density class when
+  // weight + L×W×H are present. Pallet missing dims → sender or
+  // global 40×48×60 first. Also replace invented 40×48×60 with sender
+  // defaults (e.g. Brumis 40×48×62) when the RFQ never stated a height.
   const dimOpts = senderRules.dimOptsForSender(
-      ctx.from || "", ctx.rules || [], {cc: ctx.cc, to: ctx.to});
-  const classOpts = senderRules.classOptsForSender(
-      ctx.from || "", ctx.rules || [], {cc: ctx.cc, to: ctx.to});
+      ctx.from || "", ctx.rules || []);
   senderRules.applySenderDefaultedDimOverrides(
       {lanes: [lane]},
       ctx.from || "",
       ctx.emailBody || "",
-      ctx.rules || [],
-      {cc: ctx.cc, to: ctx.to});
+      ctx.rules || []);
   const freightNormalized = freightDims.normalizePalletFreightRows(
       lane.freightInfo || [], dimOpts);
   const classFix = rateShop.ensureFreightClasses(freightNormalized, {
     UOM: "US",
-    ...classOpts,
   });
   const freightWithClass = classFix.freightInfo;
   const hasRateableClass = freightWithClass.some((r) =>
@@ -824,7 +819,6 @@ async function rateLane(lane, ctx) {
     includeGuaranteed: wantsGuaranteed,
     returnValidAccsOnly: process.env.QUOTE_RETURN_VALID_ACCS_ONLY === "true",
     timeout: process.env.QUOTE_RATE_TIMEOUT || undefined,
-    ...classOpts,
   });
 
   let fetched = await rateShop.fetchMultipleRates(query);
