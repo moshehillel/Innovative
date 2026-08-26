@@ -163,7 +163,8 @@ function shouldHandlePaymentInquiry(
 function looksLikeInvoiceEmailContent(subject, body) {
   const sub = String(subject || "").trim().toLowerCase();
   const content = `${subject || ""}\n${body || ""}`.toLowerCase();
-  if (/^(?:fw:\s*)?invoice\s+#?\d+/.test(sub)) return true;
+  // Allow optional whitespace after "#": "Invoice # 981 …"
+  if (/^(?:fw:\s*)?invoice\s+#?\s*\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
   // Compass FS factored invoices: PO # in subject is the broker load.
   if (/^purchase\s+order\s+number\s*[;:]\s*purchase\s+order\s*#\s*\d{5,9}/i
@@ -174,27 +175,37 @@ function looksLikeInvoiceEmailContent(subject, body) {
       /compassfs/i.test(content)) {
     return true;
   }
+  // FactorView / BP Financing: "Invoice # 981 Your PO # 265543"
+  if (/invoice\s+#?\s*\d+/i.test(sub) &&
+      /(?:your\s+)?po\s*#?\s*\d{5,9}/i.test(sub) &&
+      /factorview/i.test(content)) {
+    return true;
+  }
+  if (/invoice\s+#?\s*\d+/i.test(sub) &&
+      /(?:your\s+)?po\s*#?\s*\d{5,9}/i.test(sub)) {
+    return true;
+  }
   // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."
   if (/\be-?invoices?\b/.test(sub)) return true;
   // QuickBooks: "New payment request from X - invoice 173867"
   // (body often has Zelle/ACH remittance tips — not a bank payment alert)
   if (/\bpayment\s+request\b/.test(sub) &&
-      /\binvoice\s+#?\d+\b/.test(sub)) {
+      /\binvoice\s+#?\s*\d+\b/.test(sub)) {
     return true;
   }
   if (/your invoice is ready/i.test(content) &&
-      /\binvoice\s+#?\d+\b/.test(sub)) {
+      /\binvoice\s+#?\s*\d+\b/.test(sub)) {
     return true;
   }
   if (/your invoice is attached/i.test(content) &&
-      /\binvoice\s+#?\d+\b/.test(sub)) {
+      /\binvoice\s+#?\s*\d+\b/.test(sub)) {
     return true;
   }
-  if (/\binvoice\s+#?\d+[\s-]+(?:for\s+)?(?:bol|load)\s+#?\d{5,9}/i
+  if (/\binvoice\s+#?\s*\d+[\s-]+(?:for\s+)?(?:bol|load)\s+#?\s*\d{5,9}/i
       .test(content)) {
     return true;
   }
-  if (/\binvoice\s+#?\d+[\s-]+load\s+\d{5,9}/i.test(content)) {
+  if (/\binvoice\s+#?\s*\d+[\s-]+load\s+\d{5,9}/i.test(content)) {
     return true;
   }
   if (/\bfreight invoice\b/.test(content) &&

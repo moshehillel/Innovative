@@ -291,6 +291,29 @@ check("Compass FS PO email has invoice veto",
       attachments: compassPdf,
     }));
 
+const fvSubject = "Invoice # 981 Your PO # 265543";
+const fvFrom = "BP Financing LLC <notification@factorview.com>";
+const fvPdf = [{filename: "Invoice_981.pdf", mimeType: "application/pdf"}];
+check("FactorView Invoice# space subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent(fvSubject, ""));
+check("FactorView Invoice# space is NOT NOA",
+    !adm.isNoticeOfAssignmentEmail(
+        fvSubject, fvFrom,
+        "BP Financing LLC is forwarding an attached invoice (#981) " +
+        "for Toor Transline Inc., associated with PO #265543"));
+check("FactorView Invoice# space evaluate not ignored",
+    !adm.evaluateAdministrativeIgnore(
+        fvSubject, fvFrom,
+        "Please see attached invoice for PO 265543",
+        fvPdf).ignore);
+check("FactorView Invoice# space has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: fvSubject,
+      from: fvFrom,
+      body: "Attached invoice for Toor Transline",
+      attachments: fvPdf,
+    }));
+
 if (failures) {
   console.error(`\n${failures} test(s) failed`);
   process.exit(1);

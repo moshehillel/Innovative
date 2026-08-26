@@ -61,6 +61,23 @@ function looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from) {
 }
 
 /**
+ * FactorView / BP Financing (and similar) factored freight invoices:
+ * subject like "Invoice # 981 Your PO # 265543" from notification@factorview.com.
+ * The PO number is the broker load; the PDF is a carrier freight bill to pay.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  if (!fromL.includes("factorview.com")) return false;
+  const sub = String(subject || "");
+  // Space after "#" is common: "Invoice # 981 Your PO # 265543"
+  return /invoice\s+#?\s*\d+/i.test(sub) &&
+    /(?:your\s+)?po\s*#?\s*\d{5,9}/i.test(sub);
+}
+
+/**
  * True when attachment metadata includes a PDF (not a nested .eml).
  * @param {Array<object>|null|undefined} attachments Gmail attachment meta.
  * @return {boolean}
@@ -89,9 +106,11 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
   const sub = String(subject || "").trim();
   const hints = `${subject || ""} ${from || ""}`.toLowerCase();
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(sub, from)) return true;
+  if (looksLikeFactorViewPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeNumberedStatementSubject(sub)) return true;
   if (/^invoice\s+\d+\s+from\b/i.test(sub)) return true;
-  if (/^(?:(?:fw|fwd):\s*)?invoice\s+#?\d+/i.test(sub)) return true;
+  // Allow optional whitespace after "#": "Invoice # 981 …"
+  if (/^(?:(?:fw|fwd|re):\s*)?invoice\s+#?\s*\d+/i.test(sub)) return true;
   if (looksLikeStatementInvoicePacketBody(body)) return true;
   const invoicePacket = new RegExp(
       "invoice from|your invoice|is attached|acct no|account no|" +
@@ -119,6 +138,9 @@ function looksLikeStatementCoverInvoicePacketEmail(
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from)) {
     return true;
   }
+  if (looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from)) {
+    return true;
+  }
   if (looksLikeNumberedStatementSubject(subject)) return true;
   if (looksLikeStatementInvoicePacketBody(body) &&
       /\b(?:stmt|stmd|statement)\b/i.test(
@@ -144,6 +166,10 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
   if (label !== "STATEMENT" && label !== "OTHER") return false;
 
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(
+      context.subject, context.from)) {
+    return true;
+  }
+  if (looksLikeFactorViewPurchaseOrderInvoiceEmail(
       context.subject, context.from)) {
     return true;
   }
@@ -258,14 +284,23 @@ function overrideStatementClassificationIfInvoicePacket(
     return current;
   }
   const compass = looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from);
+  const factorView =
+    looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from);
+  let reasoning =
+    "Numbered carrier statement packet — first page is a " +
+    "statement cover; later pages are freight invoices to process.";
+  if (compass) {
+    reasoning =
+      "Compass FS factored freight invoice — Purchase Order # is the load.";
+  } else if (factorView) {
+    reasoning =
+      "FactorView factored freight invoice — Your PO # is the load.";
+  }
   return {
     ...current,
     intent: "carrier_invoice",
     confidence: current.confidence === "low" ? "medium" : current.confidence,
-    reasoning: compass ?
-      "Compass FS factored freight invoice — Purchase Order # is the load." :
-      "Numbered carrier statement packet — first page is a " +
-      "statement cover; later pages are freight invoices to process.",
+    reasoning,
   };
 }
 
@@ -275,6 +310,7 @@ module.exports = {
   looksLikeStatementInvoicePacketBody,
   looksLikeCarrierInvoiceMailbox,
   looksLikeCompassFsPurchaseOrderInvoiceEmail,
+  looksLikeFactorViewPurchaseOrderInvoiceEmail,
   hasProcessablePdfAttachment,
   looksLikeCarrierInvoiceEmail,
   looksLikeStatementCoverInvoicePacketEmail,

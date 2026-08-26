@@ -213,6 +213,40 @@ check("Compass FS high-confidence statement not short-circuited",
       confidence: "high",
     }, compassSubject, compassFrom, "", compassPdf), false);
 
+const fvFrom = "BP Financing LLC <notification@factorview.com>";
+const fvSubject = "Invoice # 981 Your PO # 265543";
+const fvPdf = [{
+  filename: "Invoice_981.pdf",
+  mimeType: "application/pdf",
+}];
+check("FactorView Invoice# space subject detected",
+    bundle.looksLikeFactorViewPurchaseOrderInvoiceEmail(
+        fvSubject, fvFrom), true);
+check("FactorView looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(fvSubject, fvFrom, ""), true);
+check("FactorView space-after-# subject alone matches invoice regex",
+    bundle.looksLikeCarrierInvoiceEmail(
+        fvSubject, "carrier@truckco.com", ""), true);
+check("FactorView packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        fvSubject, fvFrom, "", fvPdf), true);
+check("FactorView 1-page OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: fvSubject,
+      from: fvFrom,
+      filename: fvPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("FactorView unknown classifier overridden",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "unknown", confidence: "medium",
+          reasoning: "factoring notification"},
+        fvSubject, fvFrom, "", fvPdf).intent,
+    "carrier_invoice");
+check("FactorView Remit subject is not PO invoice",
+    bundle.looksLikeFactorViewPurchaseOrderInvoiceEmail(
+        "Remit for Payment - Toor Transline", fvFrom), false);
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);
