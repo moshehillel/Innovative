@@ -712,11 +712,11 @@ function classifyFromNameHeuristics(consignee, extraName) {
         {residentialDelivery: false},
     );
   }
-  if (/\bhotel\b|\bmarriott\b|\bhilton\b|\bhyatt\b|\binn\b|\bsuites\b/
+  if (/\bhotel\b|\bcasino\b|\bresort\b|\bmarriott\b|\bhilton\b|\bhyatt\b|\binn\b|\bsuites\b/
       .test(text) || /\blodging\b/.test(text)) {
     return heuristicResult(
         "hotel",
-        (consignee && consignee.name) || extraName || "Hotel",
+        (consignee && consignee.name) || extraName || "Hotel / resort",
         0.9,
     );
   }
@@ -793,7 +793,7 @@ function mapGoogleTypesToSiteType(types, placeName) {
     return "nursing_home";
   }
   if (t.has("lodging") || t.has("hotel") ||
-    /hotel|marriott|hilton|hyatt|inn|suites/.test(name)) {
+    /hotel|casino|resort|marriott|hilton|hyatt|inn|suites/.test(name)) {
     return "hotel";
   }
   if ((t.has("storage") || t.has("warehouse")) &&

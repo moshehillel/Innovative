@@ -63,6 +63,81 @@ check("non-Cardknox Batch subject not ignored",
         "Innovative Carriers Batch 52094836",
         "alerts@otherprocessor.com"));
 
+const amexSurveySubject =
+  "INNOVATIVE CARRIERS, We want to hear from you on September 9";
+const amexSurveyFrom =
+  "American Express Merchant Services " +
+  "<AmericanExpress@email.americanexpress.com>";
+const amexSurveyBody =
+  "We value your feedback. Please take a moment to share your experience.";
+check("AmEx merchant satisfaction survey detected",
+    adm.isAmexMerchantSurveyEmail(
+        amexSurveySubject, amexSurveyFrom, amexSurveyBody));
+check("AmEx merchant survey evaluate quiet-ignore",
+    adm.evaluateAdministrativeIgnore(
+        amexSurveySubject, amexSurveyFrom, amexSurveyBody, []).status ===
+    "amex_merchant_survey_ignored");
+check("AmEx chargeback not ignored as survey",
+    !adm.isAmexMerchantSurveyEmail(
+        "Chargeback notice — case #12345",
+        amexSurveyFrom,
+        "A chargeback has been filed against your merchant account."));
+check("non-AmEx we want to hear from you not ignored",
+    !adm.isAmexMerchantSurveyEmail(
+        "We want to hear from you about your shipment",
+        "support@othercarrier.com",
+        "Please reply with feedback on our freight service."));
+
+const cofaceBriefsSubject =
+  "Coface Briefs: The Latest News from around the World";
+const cofaceBriefsFrom =
+  "Coface North America <northamerica.communications@coface.com>";
+check("Coface Briefs newsletter detected",
+    adm.isCofaceEmail(cofaceBriefsFrom, cofaceBriefsSubject, ""));
+check("Coface Briefs evaluate ignored",
+    adm.evaluateAdministrativeIgnore(
+        cofaceBriefsSubject, cofaceBriefsFrom, "", []).status ===
+    "coface_ignored");
+check("Coface subdomain sender detected",
+    adm.isCofaceEmail(
+        "Coface US <alerts@us.coface.com>",
+        "Trade credit update", ""));
+check("non-Coface sender not matched",
+    !adm.isCofaceEmail(
+        "Coface lookalike <news@notcoface.com>",
+        "Coface Briefs", ""));
+
+const dnbPromoSubject =
+  "No Hidden Fees. No Overdrafts. Smarter Business Banking Starts Here";
+const dnbPromoFrom = "Dun & Bradstreet <e.email@dnb.com>";
+const dnbPromoBody =
+  "Discover Lili business banking with no hidden fees and smarter tools.";
+check("D&B Lili banking promo detected",
+    adm.isDnbPromotionalEmail(
+        dnbPromoSubject, dnbPromoFrom, dnbPromoBody));
+check("D&B promo via shared promotional helper",
+    adm.isPromotionalMarketingEmail(
+        dnbPromoSubject, dnbPromoFrom, dnbPromoBody));
+check("D&B promo evaluate ignored",
+    adm.evaluateAdministrativeIgnore(
+        dnbPromoSubject, dnbPromoFrom, dnbPromoBody, []).status ===
+    "dnb_promotional_ignored");
+check("D&B credit alert not treated as promo",
+    !adm.isDnbPromotionalEmail(
+        "Business credit alert for Innovative Carriers",
+        "alerts@dnb.com",
+        "Your business credit score changed. View your credit report."));
+check("D&B trade credit alert not treated as promo",
+    !adm.isPromotionalMarketingEmail(
+        "Trade credit monitoring update",
+        "Dun & Bradstreet <notifications@dnb.com>",
+        "A trade credit inquiry was reported on your DUNS number."));
+check("non-D&B banking promo not ignored",
+    !adm.isDnbPromotionalEmail(
+        "Smarter Business Banking Starts Here",
+        "marketing@chase.com",
+        "Open a business checking account today."));
+
 const ithriveSubject =
   "iThrive Funding - Notice of Assignment for First Family Trucking LLC " +
   "(MC 1115353) - Please Confirm Receipt";
@@ -129,6 +204,38 @@ check("Zelle alert is not payment inquiry",
 check("payment inquiry subject",
     adm.isPaymentInquiryEmail(
         "Payment inquiry - load 265620", "", "When will we be paid?"));
+
+const logisticoreSubject = "Pending Payment for Load # 265721";
+const logisticoreFrom = "Paul Rogers <dispatch@logisticore.co>";
+const logisticoreBody =
+  "I am following up on unpaid payment for load #265721. " +
+  "The trailer was picked up. Please provide payment details or an update. " +
+  "I have sent several prior emails with no response.";
+const logisticoreAtt = [
+  {filename: "265721_BOL.pdf", mimeType: "application/pdf"},
+  {filename: "265721_POD.pdf", mimeType: "application/pdf"},
+];
+check("LogistiCore pending payment subject only (no body)",
+    adm.isPaymentInquiryEmail(logisticoreSubject, logisticoreFrom, ""));
+check("LogistiCore pending payment with body",
+    adm.isPaymentInquiryEmail(
+        logisticoreSubject, logisticoreFrom, logisticoreBody));
+check("LogistiCore pending payment handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        logisticoreSubject, logisticoreFrom, logisticoreBody, 0));
+check("LogistiCore pending payment not vetoed by supporting docs",
+    !adm.hasInvoiceVeto({
+      subject: logisticoreSubject,
+      body: logisticoreBody,
+      from: logisticoreFrom,
+      attachments: logisticoreAtt,
+      invoicePdfCount: 0,
+    }));
+check("Invoice for Load subject is not payment inquiry",
+    !adm.isPaymentInquiryEmail(
+        "Invoice for Load # 265721",
+        "Carrier <billing@carrier.com>",
+        "Please see attached invoice for load #265721"));
 
 check("FW invoice BOL subject recognized",
     adm.looksLikeInvoiceEmailContent(
@@ -205,6 +312,36 @@ check("FactorView real invoice still vetoes",
       emailClassification: {intent: "carrier_invoice"},
       invoicePdfCount: 1,
     }));
+
+const phoenixReleaseSubject =
+  "Letter of Release for Mamba Mentality Truckin";
+const phoenixReleaseFrom =
+  "Jeff Foil <JeffFoil@phoenixcapitalgroup.com>";
+const phoenixReleaseBody = "";
+const phoenixReleaseAtt = [
+  {filename: "Letter_of_Release.pdf", mimeType: "application/pdf"},
+];
+const phoenixGenericAtt = [
+  {filename: "document.pdf", mimeType: "application/pdf"},
+];
+check("Phoenix Capital Letter of Release detected as NOA",
+    adm.looksLikeNoaEmailContent(
+        phoenixReleaseSubject, phoenixReleaseBody, phoenixReleaseFrom));
+check("Phoenix Letter of Release filename looks like NOA",
+    adm.attachmentFilenameLooksLikeNoa("Letter_of_Release.pdf"));
+check("Phoenix Letter of Release ignored with generic PDF (no invoice)",
+    adm.shouldIgnoreNoaOnlyPackage(
+        phoenixReleaseSubject, phoenixReleaseBody, phoenixGenericAtt, 0,
+        phoenixReleaseFrom));
+check("Phoenix Letter of Release evaluate ignored early with NOA filename",
+    adm.evaluateAdministrativeIgnore(
+        phoenixReleaseSubject, phoenixReleaseFrom, phoenixReleaseBody,
+        phoenixReleaseAtt).status === "noa_ignored");
+check("cargo release subject not treated as NOA",
+    !adm.looksLikeNoaEmailContent(
+        "Container release status for PRO 12345",
+        "Your container has been released at terminal.",
+        "terminal@emodal.com"));
 
 const arcBestSubject =
   "ArcBest eInvoice(s) - 760981 INNOVATIVE CARRIERS - 8/11/2026";

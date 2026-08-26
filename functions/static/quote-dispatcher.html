@@ -560,6 +560,16 @@
       margin: -6px 0 14px;
     }
     .quote-warnings .warn { margin-top: 6px; }
+    .carrier-note {
+      margin-top: 6px;
+      font-size: 0.8125rem;
+      color: var(--warning, #b45309);
+      line-height: 1.35;
+    }
+    .carrier-note strong {
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
     .badge.market {
       background: var(--warning-bg);
       color: var(--warning);
@@ -1967,7 +1977,32 @@
           .addEventListener("click", () => save(true));
     }
 
-    function renderLaneSummaryBody(lane) {
+    function formatCarrierNote(input) {
+      const note = cleanNote(input);
+      if (!note) return "";
+      return "<div class='carrier-note'><strong>Carrier note:</strong> " +
+        esc(note.slice(0, 400)) + "</div>";
+    }
+
+    function selectedCarrierNotesHtml(lane) {
+      const selected = new Set(
+          (lane.selectedRateIds || []).map(String));
+      if (!selected.size && lane.selectedRateId) {
+        selected.add(String(lane.selectedRateId));
+      }
+      const lines = [];
+      (lane.options || []).forEach((opt) => {
+        const rateId = optionRateId(opt);
+        if (!rateId || !selected.has(String(rateId))) return;
+        const note = cleanNote(opt.warnings);
+        if (!note) return;
+        const label = opt.name || opt.SCAC || "Carrier";
+        lines.push("<div class='carrier-note'><strong>" + esc(label) +
+          ":</strong> " + esc(note.slice(0, 400)) + "</div>");
+      });
+      return lines.join("");
+    }
+
       if (!detailsEditMode) {
         let html = renderAddressReadonly(
             lane.shipper || (quote && quote.shipper) || null,
@@ -1993,6 +2028,11 @@
           html += "<div class='dispatcher-note span-2' style='grid-column:1/-1'>" +
             "<strong>Dispatcher note (not emailed)</strong>" +
             esc(lane.notesForCustomer) + "</div>";
+        }
+        const carrierNotes = selectedCarrierNotesHtml(lane);
+        if (carrierNotes) {
+          html += "<div class='span-2' style='grid-column:1/-1'>" +
+            carrierNotes + "</div>";
         }
         return html;
       }
@@ -2322,7 +2362,7 @@
               </div>
               ${(() => {
                 const note = cleanNote(opt.warnings);
-                return note ? '<div class="warn">'+esc(note.slice(0,200))+'</div>' : "";
+                return note ? formatCarrierNote(note) : "";
               })()}
             </div>
           </div>`;

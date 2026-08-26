@@ -40,6 +40,7 @@ const MANAGED_DEFAULT_RULE_IDS = new Set([
   "aafes_military",
   "amazon_fc",
   "chain_store_appointment",
+  "hotel_limited_access",
   "sender_mike_oseback",
   "sender_jared_berman",
   "sender_lifeworks_picking",
@@ -197,7 +198,23 @@ const DEFAULT_RULES = [
     requiresConfirm: false,
   },
   // Retired defaults (kept out of seed; tombstoned on delete):
-  // nursing_home, hotel
+  // nursing_home, hotel (old rule used HOD — use hotel_limited_access + LAD)
+  {
+    id: "hotel_limited_access",
+    active: true,
+    priority: 45,
+    name: "Hotels / casinos / resorts — limited access delivery",
+    identifyVia: "both",
+    match: {
+      siteType: "hotel",
+    },
+    addAccessorials: ["LAD"],
+    applyTo: "dest",
+    notes: "Hotel, casino, or resort destination — limited access delivery " +
+      "(LAD). Do not use hotel delivery fee (HOD).",
+    autoApply: true,
+    requiresConfirm: false,
+  },
   {
     id: "menards_dc",
     active: true,
@@ -1114,7 +1131,7 @@ function applyRulesToLane(lane, rules, context = {}) {
       stripped.accessorials, declineText);
 
   return {
-    accessorials: refined,
+    accessorials: emailAccLazy.normalizeHotelCasinoAccessorials(refined),
     accessorialsWithData: stripped.accessorialsWithData,
     filterCarrierWarnings: filterWarnings,
     appliedRules: stripped.appliedRules,

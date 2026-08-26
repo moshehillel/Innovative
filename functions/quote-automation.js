@@ -792,6 +792,8 @@ async function rateLane(lane, ctx) {
         extracted, {body: emailText, subject: extractCtx.subject});
     rulesOut = quoteEmailAcc.applyEmailRequestedAccessorials(
         rulesOut, requested, quoteRules.formatAccessorialLabels, emailText);
+    rulesOut.accessorials = quoteEmailAcc.normalizeHotelCasinoAccessorials(
+        rulesOut.accessorials || []);
     rulesOut = quoteEmailAcc.applyDeclinedAccessorials(
         rulesOut, emailText, declinedCodes);
   }

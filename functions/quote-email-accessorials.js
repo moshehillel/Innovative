@@ -104,7 +104,9 @@ const SINGLE_PATTERNS = [
   {code: "PFF", re: /\bprotect(ed)?\s+from\s+freez/i},
   {code: "LAD", re: /\bLAD\s+please\b/i},
   {code: "NUD", re: /\bnursing(\s+home)?(\s+delivery)?\b/i},
-  {code: "HOD", re: /\bhotel(\s+delivery)?\b/i},
+  // Hotel/casino/resort names in RFQ text must not add HOD — siteType hotel
+  // rule applies LAD. Explicit "hotel delivery" → LAD via pattern below.
+  {code: "LAD", re: /\b(?:hotel|casino|resort)\s+delivery\b/i},
   {code: "SCD", re: /\bschool(\s+delivery)?\b/i},
   {code: "NTD", re: /\bnotif(y|ication)(\s+(before\s+)?delivery)?\b/i},
 ];
@@ -213,6 +215,19 @@ function isKnownCode(code, known) {
 }
 
 /**
+ * Hotel/casino/resort destinations use limited access (LAD), not HOD.
+ * @param {Array<string>} codes Accessorial codes.
+ * @return {Array<string>}
+ */
+function normalizeHotelCasinoAccessorials(codes) {
+  const list = uniqueCodes(codes);
+  if (!list.includes("HOD")) return list;
+  const out = list.filter((c) => c !== "HOD");
+  if (!out.includes("LAD")) out.push("LAD");
+  return uniqueCodes(out);
+}
+
+/**
  * @param {Array<string>} codes Codes.
  * @return {Array<string>} Unique uppercase.
  */
@@ -305,6 +320,8 @@ function normalizeRequestedCodeList(raw) {
     if (/^[A-Za-z]{2,6}$/.test(s)) {
       const u = s.toUpperCase();
       if (u === "LOAD") {
+        codes.push("LAD");
+      } else if (u === "HOD") {
         codes.push("LAD");
       } else {
         codes.push(u);
@@ -412,7 +429,8 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
   if (discloseOnly) {
     codes = codes.filter((c) => c !== "LAD" && c !== "LAO");
   }
-  return codes.filter((c) => !ban.has(c));
+  return normalizeHotelCasinoAccessorials(
+      codes.filter((c) => !ban.has(c)));
 }
 
 /**
@@ -480,7 +498,7 @@ function applyEmailRequestedAccessorials(
   if (scanText) {
     accessorials = refineLiftgateSides(accessorials, scanText);
   }
-  out.accessorials = accessorials;
+  out.accessorials = normalizeHotelCasinoAccessorials(accessorials);
   if (added.length) {
     const labels = typeof formatLabels === "function" ?
       formatLabels(added) : added.join(", ");
@@ -515,6 +533,7 @@ module.exports = {
   resolveRequestedAccessorials,
   attachRequestedAccessorials,
   applyEmailRequestedAccessorials,
+  normalizeHotelCasinoAccessorials,
   refineLiftgateSides,
   extractedAccessorialText,
 };

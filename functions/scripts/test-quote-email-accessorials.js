@@ -254,6 +254,20 @@ checkNotHas("no limited access does not add LAO", codes, "LAO");
 check("declines limited access",
     emailAcc.declinesLimitedAccess("no limited access"), true);
 
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Deliver to Golden Moon Hotel and Casino, Choctaw MS.");
+checkNotHas("facility name hotel does not add HOD", codes, "HOD");
+checkNotHas("facility name hotel does not add LAD from name alone", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please quote hotel delivery to the consignee.");
+checkHas("explicit hotel delivery → LAD", codes, "LAD");
+checkNotHas("explicit hotel delivery not HOD", codes, "HOD");
+
+check("HOD normalizes to LAD",
+    emailAcc.normalizeHotelCasinoAccessorials(["HOD", "LFD"]).sort(),
+    ["LAD", "LFD"].sort());
+
 const declinedLift = emailAcc.attachRequestedAccessorials({
   specialInstructionsGlobal: "No liftgate needed",
   customerRequest: {requestedAccessorials: ["LFD", "LFO"]},

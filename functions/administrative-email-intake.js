@@ -37,6 +37,163 @@ function isCardknoxBatchReport(subject, from) {
 }
 
 /**
+ * Legitimate D&B credit / trade-credit alert content — not marketing.
+ * @param {string} hay Lowercased subject + body haystack.
+ * @return {boolean}
+ */
+function looksLikeDnbCreditAlert(hay) {
+  const patterns = [
+    /\bcredit (?:alert|report|score|monitoring|change|inquiry|inquiries)\b/,
+    /\btrade credit\b/,
+    /\bbusiness credit (?:report|alert|update|monitoring)\b/,
+    /\bpayment (?:due|past due|overdue|reminder)\b/,
+    /\bcollection\b/,
+    /\bdelinquen/,
+    /\bduns (?:number|#)\b/,
+    /\brisk (?:alert|score|monitoring)\b/,
+    /\bcredit (?:limit|line) (?:change|update|alert)\b/,
+    /\baccount (?:past due|delinquent)\b/,
+  ];
+  return patterns.some((re) => re.test(hay));
+}
+
+/**
+ * Dun & Bradstreet promotional/marketing (e.g. Lili business banking ads).
+ * Does not ignore legitimate D&B credit or trade-credit alerts.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isDnbPromotionalEmail(subject, from, body) {
+  const fromL = String(from || "").toLowerCase();
+  if (!fromL.includes("dnb.com") &&
+      !fromL.includes("dunandbradstreet")) {
+    return false;
+  }
+  const hay = `${subject || ""}\n${body || ""}`.toLowerCase();
+  if (looksLikeDnbCreditAlert(hay)) return false;
+
+  const addrMatch =
+    fromL.match(/<([^>]+)>/) || fromL.match(/([\w.+-]+@[\w.-]+)/);
+  const addr = String(addrMatch && addrMatch[1] || fromL).toLowerCase();
+  const isMarketingSender =
+    addr.startsWith("e.email@dnb.com") ||
+    addr.includes("marketing@") ||
+    addr.includes("@e.email.dnb.com");
+
+  const promotionalPatterns = [
+    /\blili\b/,
+    /\bbusiness banking\b/,
+    /\bno hidden fees\b/,
+    /\bno overdrafts?\b/,
+    /\bsmarter business banking\b/,
+    /\bopen (?:a|your) (?:business )?(?:checking|bank) account\b/,
+    /\b(?:earn|get) \$\d+.*(?:bonus|cash back)\b/,
+    /\blimited[- ]time offer\b/,
+    /\bstart(?:ing)? (?:your|a) business (?:bank|banking)\b/,
+  ];
+  const looksPromotional = promotionalPatterns.some((re) => re.test(hay));
+  if (looksPromotional) return true;
+
+  // e.email@dnb.com is D&B's marketing sender — banking-ad subjects only.
+  if (isMarketingSender &&
+      /\b(?:banking|bank account|checking|overdraft|fees)\b/i
+          .test(String(subject || ""))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Vendor promotional/marketing emails safe to auto-ignore.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isPromotionalMarketingEmail(subject, from, body) {
+  return isDnbPromotionalEmail(subject, from, body) ||
+    isAmexMerchantSurveyEmail(subject, from, body);
+}
+
+/**
+ * Extract bare email address from a From header.
+ * @param {string} from From header.
+ * @return {string}
+ */
+function emailAddressFromHeader(from) {
+  const raw = String(from || "").toLowerCase();
+  const emailMatch = raw.match(/<([^>]+)>/) || raw.match(/([\w.+-]+@[\w.-]+)/);
+  return String(emailMatch && emailMatch[1] || raw).trim();
+}
+
+/**
+ * True when the sender domain is coface.com (Lisa: ignore all Coface mail).
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isCofaceDomain(from) {
+  const addr = emailAddressFromHeader(from);
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1).replace(/[^a-z0-9.-]/g, "");
+  return domain === "coface.com" || domain.endsWith(".coface.com");
+}
+
+/**
+ * Coface newsletters / marketing — no action needed (Lisa: all Coface).
+ * @param {string} from From header.
+ * @param {string} [subject] Email subject (unused; domain match only).
+ * @param {string} [body] Plain body (unused; domain match only).
+ * @return {boolean}
+ */
+function isCofaceEmail(from, subject, body) {
+  void subject;
+  void body;
+  return isCofaceDomain(from);
+}
+
+/**
+ * AmEx Merchant Services satisfaction / feedback surveys — promotional only
+ * (Lisa: ignore). Not chargebacks, disputes, or payment notices.
+ * Example: From American Express Merchant Services
+ * <AmericanExpress@email.americanexpress.com>,
+ * Subject "INNOVATIVE CARRIERS, We want to hear from you on September 9".
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isAmexMerchantSurveyEmail(subject, from, body) {
+  const fromL = String(from || "").toLowerCase();
+  const emailMatch =
+    fromL.match(/<([^>]+)>/) || fromL.match(/([\w.+-]+@[\w.-]+)/);
+  const addr = String(emailMatch && emailMatch[1] || fromL).toLowerCase();
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1);
+  if (!domain.endsWith("americanexpress.com")) return false;
+
+  const sub = String(subject || "");
+  const hay = `${sub}\n${body || ""}`.toLowerCase();
+
+  // Operational AmEx mail — do not auto-ignore.
+  if (/\b(?:chargeback|dispute|case\s*(?:#|number)|authorization\s+declin)/i
+      .test(hay)) {
+    return false;
+  }
+
+  if (/we want to hear from you/i.test(hay)) return true;
+  if (/(?:customer\s+)?satisfaction\s+survey/i.test(hay)) return true;
+  if (/share your (?:feedback|experience)/i.test(hay) &&
+      /merchant\s+services/i.test(fromL)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * True when the From header is Hafstaff (ops: always forward to Lisa).
  * Matches display name or domain; tolerates Halfstaff / spacing variants.
  * @param {string} from From header.
@@ -113,6 +270,7 @@ function isPaymentInquiryEmail(subject, from, body) {
   const sub = String(subject || "").trim();
   const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase();
   if (!hay.trim()) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
 
   const patterns = [
     /\bquick\s*pay\b/,
@@ -121,6 +279,12 @@ function isPaymentInquiryEmail(subject, from, body) {
     /\bpayment\s+request\b/,
     /\bpayment\s+status\b/,
     /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\bpending\s+payment\b/,
+    /\bunpaid\s+payment\b/,
+    /\b(?:outstanding|overdue|awaiting)\s+payment\b/,
+    /\b(?:requesting|provide|send|need)\s+(?:the\s+)?payment\s+details\b/,
+    /\bpayment\s+(?:details|update)\b/,
+    /\bpayment\s+for\s+load\s+#?\s*\d{5,9}\b/,
     /\bwhen\s+(?:will|can)\s+(?:we|i|our)\s+(?:get\s+)?paid\b/,
     /\bwhen\s+will\s+.*\s+be\s+paid\b/,
     /\bconfirm(?:ation)?\s+(?:that\s+)?(?:all\s+)?required\s+documents\b/,
@@ -136,6 +300,7 @@ function isPaymentInquiryEmail(subject, from, body) {
   if (patterns.some((re) => re.test(hay))) return true;
   if (/quick\s*pay\s+invoice/i.test(sub)) return true;
   if (/payment\s+inquir/i.test(sub)) return true;
+  if (/pending\s+payment\s+for\s+load/i.test(sub)) return true;
   return false;
 }
 
@@ -259,6 +424,10 @@ function looksLikeNoaEmailContent(subject, body, from) {
   if (/\bnoa\b/.test(content) || content.includes("notice of assignment")) {
     return true;
   }
+  // Factoring release letters (e.g. Phoenix Capital "Letter of Release").
+  if (/letter\s+of\s+release\b/i.test(content)) {
+    return true;
+  }
   if (/notice of assignment for .+ please confirm receipt/i.test(content)) {
     return true;
   }
@@ -278,8 +447,10 @@ function looksLikeNoaEmailContent(subject, body, from) {
     return true;
   }
   const fromL = String(from || "").toLowerCase();
-  if (fromL.includes("factorview.com") &&
-      /remit|assignment|factor(?:ing)?|funding|surety/i.test(content)) {
+  const factorDomains = ["factorview.com", "phoenixcapitalgroup.com"];
+  if (factorDomains.some((d) => fromL.includes(d)) &&
+      /remit|assignment|factor(?:ing)?|funding|surety|letter\s+of\s+release/i
+          .test(content)) {
     return true;
   }
   return false;
@@ -313,7 +484,9 @@ function isRtsNoaEmail(subject, from, body) {
 function attachmentFilenameLooksLikeInvoice(filename) {
   const name = String(filename || "").toLowerCase();
   if (!name) return false;
-  if (/noa|notice.?of.?assignment/.test(name)) return false;
+  if (/noa|notice.?of.?assignment|letter.?of.?release/.test(name)) {
+    return false;
+  }
   return /invoice|inv[\s#._-]|freight[\s._-]?bill/.test(name) ||
     /carrier[\s._-]?bill|bill[\s._-]?of[\s._-]?lading/.test(name) ||
     /purchase\s+order\s*#\s*\d{5,9}/.test(name);
@@ -326,7 +499,8 @@ function attachmentFilenameLooksLikeInvoice(filename) {
 function attachmentFilenameLooksLikeNoa(filename) {
   const name = String(filename || "").toLowerCase();
   if (!name) return false;
-  return /noa|notice.?of.?assignment|assignment|remit.?to/.test(name);
+  return /noa|notice.?of.?assignment|letter.?of.?release|assignment|remit.?to/
+      .test(name);
 }
 
 /**
@@ -454,6 +628,27 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
       status: "cardknox_batch_report_ignored",
     };
   }
+  if (isAmexMerchantSurveyEmail(subject, from, body)) {
+    return {
+      ignore: true,
+      reason: "AmEx merchant satisfaction survey — no action needed",
+      status: "amex_merchant_survey_ignored",
+    };
+  }
+  if (isDnbPromotionalEmail(subject, from, body)) {
+    return {
+      ignore: true,
+      reason: "D&B promotional / marketing email — no action needed",
+      status: "dnb_promotional_ignored",
+    };
+  }
+  if (isCofaceEmail(from, subject, body)) {
+    return {
+      ignore: true,
+      reason: "Coface newsletter/marketing — no action needed",
+      status: "coface_ignored",
+    };
+  }
   // Before PDF classification: only ignore when filenames clearly NOA-only.
   if (rtsNoaAttachmentsLookNoaOnly(attachments) &&
       looksLikeNoaEmailContent(subject, body, from) &&
@@ -471,6 +666,12 @@ module.exports = {
   PAYMENT_INQUIRY_EMAIL_DEFAULT,
   isEmodalBroadcast,
   isCardknoxBatchReport,
+  looksLikeDnbCreditAlert,
+  isDnbPromotionalEmail,
+  isPromotionalMarketingEmail,
+  isCofaceEmail,
+  isCofaceDomain,
+  isAmexMerchantSurveyEmail,
   isHafstaffSender,
   isPaymentNotificationEmail,
   shouldIgnoreAsPaymentNotification,

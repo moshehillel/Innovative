@@ -649,9 +649,9 @@ function serializeForDispatcherPage(quote) {
       extractionWarnings: lane.extractionWarnings || [],
       options: (lane.options || []).map((o) => {
         const warningText = cleanCarrierNote(o.warnings || o.rateRemarks);
-        // UI truncates notes to ~200 chars; trim payload for multi-rate lanes.
+        // UI truncates notes to ~400 chars; trim payload for multi-rate lanes.
         const warnings = warningText ?
-          warningText.slice(0, 240) : null;
+          warningText.slice(0, 500) : null;
         const quoteNumber = o.quoteNumber || o.savedQuoteNumber || null;
         return {
           rateId: optionRateId(o),

@@ -101,7 +101,13 @@ function normalizeRateRow(r) {
   const remarks = Array.isArray(r.rateRemarks) ?
     r.rateRemarks.join(" ") :
     (r.rateRemarks || "");
-  const rawWarnings = r.warnings || remarks || "";
+  const extraNotes = [
+    r.notes,
+    r.notesExternal,
+    r.carrierNote,
+    r.carrierNotes,
+  ].filter(Boolean).join(" ");
+  const rawWarnings = r.warnings || remarks || extraNotes || "";
   const warnings = quoteOutput.cleanCarrierNote(rawWarnings);
   const guaranteed =
     r.guaranteed === true ||
