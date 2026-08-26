@@ -6,6 +6,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const statementInvoiceBundle = require("./statement-invoice-bundle");
 
 const DOC_TYPE = Object.freeze({
   EMAIL: "email",
@@ -123,6 +124,33 @@ function buildIntakeSummary(data) {
   const completedChildCount = Number(d.completedChildCount || 0);
   const receivedLabel = formatReceivedAtEt(d);
 
+  const stmtGap = d.statementExtractionGap;
+  if (stmtGap && stmtGap.underExtracted) {
+    const gapSuffix = statementInvoiceBundle
+        .buildStatementGapSummarySuffix(stmtGap);
+    let core = gapSuffix ?
+      `Partial — ${gapSuffix}` :
+      "Partial — statement PDF missing invoice(s)";
+    if (itemSummaries.length > 0) {
+      const counts = computeIntakeOutcomeCounts({
+        attachmentCount: Number(d.attachmentCount) || 0,
+        itemSummaries,
+      });
+      const parts = [];
+      if (counts.processedCount) {
+        parts.push(`${counts.processedCount} processed`);
+      }
+      if (counts.skippedCount) {
+        parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+      }
+      if (parts.length) core += `; ${parts.join("; ")}`;
+    }
+    if (receivedLabel && !/received /i.test(core)) {
+      return `${core} · received ${receivedLabel}`;
+    }
+    return core;
+  }
+
   let core = null;
 
   if (d.outcome === OUTCOME.SPLIT ||
@@ -162,6 +190,8 @@ function buildIntakeSummary(data) {
       no_invoice_pdf: "Forwarded — no processable invoice PDF",
       workflow_failed: "Failed — invoice workflow system error",
       system_error: "Failed — invoice workflow system error",
+      statement_under_extracted:
+        "Partial — statement PDF missing invoice(s)",
     };
     if (finalStatus && statusSummary[finalStatus]) {
       core = statusSummary[finalStatus];
@@ -596,16 +626,25 @@ async function incrementParentChildCompletion(
         data.preSkippedItemSummaries : [];
       const mergedSummaries = preSkipped.concat(
           itemSummaries.filter(Boolean));
+      const stmtGap = data.statementExtractionGap;
+      const stmtUnderExtracted = stmtGap && stmtGap.underExtracted;
       const rollup = buildIntakeSummary({
         itemSummaries: mergedSummaries,
         childCount,
         completedChildCount,
         receivedDateTime: data.receivedDateTime || data.receivedAt || null,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" : null,
+        statementExtractionGap: stmtGap || null,
+        _rebuildSummary: !!stmtUnderExtracted,
       });
       Object.assign(patch, {
         intakeStatus: QUEUE_STATUS.COMPLETED,
         status: QUEUE_STATUS.COMPLETED,
-        outcome: OUTCOME.PROCESSED,
+        outcome: stmtUnderExtracted ? OUTCOME.PARTIAL : OUTCOME.PROCESSED,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" :
+          (data.finalStatus || null),
         summary: rollup,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -633,6 +672,9 @@ async function createInvoiceChildJobs(opts) {
 
   const preSkippedSummaries = Array.isArray(opts.preSkippedSummaries) ?
     opts.preSkippedSummaries : [];
+  const stmtGap = opts.statementExtractionGap &&
+    opts.statementExtractionGap.underExtracted ?
+    opts.statementExtractionGap : null;
 
   const now = admin.firestore.FieldValue.serverTimestamp();
   const batch = admin.firestore().batch();
@@ -662,6 +704,16 @@ async function createInvoiceChildJobs(opts) {
         col(tenant, "gmailQueue").doc(childId), childPayload, {merge: true});
   }
 
+  let splitSummary = preSkippedSummaries.length > 0 ?
+    `Split into ${invoiceItems.length} invoice job(s); ` +
+    `${preSkippedSummaries.length} already processed — skipped.` :
+    `Split into ${invoiceItems.length} invoice job(s) for processing.`;
+  if (stmtGap) {
+    const gapSuffix = statementInvoiceBundle
+        .buildStatementGapSummarySuffix(stmtGap);
+    if (gapSuffix) splitSummary += ` WARNING: ${gapSuffix}`;
+  }
+
   const parentPatch = {
     docType: DOC_TYPE.EMAIL,
     intakeStatus: QUEUE_STATUS.WAITING_CHILDREN,
@@ -670,12 +722,11 @@ async function createInvoiceChildJobs(opts) {
     childCount: invoiceItems.length,
     completedChildCount: 0,
     preSkippedItemSummaries: preSkippedSummaries,
+    statementExtractionGap: stmtGap,
+    finalStatus: stmtGap ? "statement_under_extracted" : null,
     invoiceItemsPending: invoiceItems.map((item, itemIndex) =>
       Object.assign({itemIndex}, item)),
-    summary: preSkippedSummaries.length > 0 ?
-      `Split into ${invoiceItems.length} invoice job(s); ` +
-      `${preSkippedSummaries.length} already processed — skipped.` :
-      `Split into ${invoiceItems.length} invoice job(s) for processing.`,
+    summary: splitSummary,
     updatedAt: now,
   };
   batch.set(parentQueueRef, parentPatch, {merge: true});

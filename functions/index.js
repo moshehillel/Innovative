@@ -5665,6 +5665,70 @@ async function recoverStatementInvoiceItems(opts) {
   return {invoiceItems: recovered, gap};
 }
 
+/**
+ * Forwards a numbered statement/JTS packet to ops when invoice extraction
+ * missed loads from the index or page-count expectation.
+ * @param {object} args gmail, messageId, subject, from, gap, emailBody.
+ * @return {Promise<void>}
+ */
+async function handleStatementUnderExtractionAlert(args) {
+  const {
+    gmail, messageId, subject, from, gap, emailBody,
+  } = args;
+  if (!statementInvoiceBundle.shouldAlertStatementUnderExtraction(gap)) {
+    return;
+  }
+
+  const missingList = Array.isArray(gap.missingLoads) ?
+    gap.missingLoads : [];
+  const missingLabel = missingList.length > 0 ?
+    missingList.join(", ") :
+    `expected ~${gap.expectedCount}, extracted ${gap.extractedCount}`;
+
+  const reason =
+    "Statement PDF missing freight invoices — manual review required";
+  const notes =
+    `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
+    `I received a numbered carrier statement packet ` +
+    `(subject: ${subject || "—"}) that contains multiple freight ` +
+    `invoices in one PDF.\n\n` +
+    `I extracted ${gap.extractedCount} invoice(s) but ` +
+    (missingList.length > 0 ?
+      `${missingList.length} load(s) from the statement index were NOT ` +
+      `extracted and were not queued for processing:\n` +
+      `${missingList.join("\n")}\n\n` :
+      `the PDF appears to contain more invoices than I extracted ` +
+      `(expected ~${gap.expectedCount}, got ${gap.extractedCount}).\n\n`) +
+    `I processed the invoice(s) I could identify. Please review the ` +
+    `attached PDF and enter any missing loads manually, or reprocess ` +
+    `after correcting.\n\nThank you,\n${AI_AGENT_NAME}`;
+
+  await forwardToHumanReview(
+      gmail, messageId, subject, from, reason, notes,
+      {
+        department: "operations",
+        emailBody,
+        extractedData: {
+          "Subject": subject || "—",
+          "Expected invoices": String(gap.expectedCount || "—"),
+          "Extracted invoices": String(gap.extractedCount || "—"),
+          "Missing load numbers": missingLabel,
+          "PDF pages": gap.pageCount ? String(gap.pageCount) : "—",
+        },
+      },
+  );
+
+  await writeLog("warn", "mail",
+      "Statement PDF under-extraction — forwarded to ops", {
+        messageId,
+        subject,
+        expectedCount: gap.expectedCount,
+        extractedCount: gap.extractedCount,
+        missingLoads: missingList,
+        pageCount: gap.pageCount,
+      });
+}
+
 // Identity the AI agent uses to sign the emails it composes. Override with
 // AI_AGENT_NAME. Applied to internal/ops/error notifications, not customer
 // invoice emails (type "generated_bill").
@@ -9471,6 +9535,27 @@ async function processGmailMessage(
             });
       }
 
+      if (!isChildSplitJob &&
+          statementInvoiceBundle.shouldAlertStatementUnderExtraction(
+              statementExtractionGap)) {
+        try {
+          await handleStatementUnderExtractionAlert({
+            gmail,
+            messageId,
+            subject,
+            from,
+            gap: statementExtractionGap,
+            emailBody,
+          });
+        } catch (alertErr) {
+          await writeLog("warn", "mail",
+              "Statement under-extraction alert failed", {
+                messageId,
+                error: alertErr.message,
+              });
+        }
+      }
+
       if (!isTai) {
         if (drayageIntake.isDrayageValidatorEmail(from)) {
           const leoApply = await applyLeoDrayageReturnIfPresent({
@@ -9504,17 +9589,26 @@ async function processGmailMessage(
 
     if (!isChildSplitJob && invoiceItems.length === 0 &&
         preSkippedItemSummaries.length > 0) {
+      const stmtUnderExtracted =
+          statementInvoiceBundle.shouldAlertStatementUnderExtraction(
+              statementExtractionGap);
       await mailIntakeQueue.completeIntakeRecord({
         tenant,
         docId: queueDocId,
         parentMessageId: messageId,
-        outcome: mailIntakeQueue.OUTCOME.PROCESSED,
-        finalStatus: "already_processed_skipped",
+        outcome: stmtUnderExtracted ?
+          mailIntakeQueue.OUTCOME.PARTIAL :
+          mailIntakeQueue.OUTCOME.PROCESSED,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" :
+          "already_processed_skipped",
         itemSummaries: preSkippedItemSummaries,
         extra: {
           gmailMessageId: messageId,
           subject,
           from,
+          statementExtractionGap: stmtUnderExtracted ?
+            statementExtractionGap : null,
           deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
         },
       });
@@ -9534,6 +9628,10 @@ async function processGmailMessage(
         from,
         invoiceItems,
         preSkippedSummaries: preSkippedItemSummaries,
+        statementExtractionGap:
+          statementInvoiceBundle.shouldAlertStatementUnderExtraction(
+              statementExtractionGap) ?
+            statementExtractionGap : null,
       });
       await writeLog("info", "mail",
           "Split multi-invoice email into child jobs", {
@@ -10778,16 +10876,25 @@ async function processGmailMessage(
       overallFinalStatus = "already_billed_skipped";
     }
 
+    const stmtUnderExtracted =
+        !isChildSplitJob &&
+        statementInvoiceBundle.shouldAlertStatementUnderExtraction(
+            statementExtractionGap);
+
     await emailIntakeRef.set({
       primusResult: lastPrimusResult,
-      finalStatus: overallFinalStatus,
+      finalStatus: stmtUnderExtracted ?
+        "statement_under_extracted" : overallFinalStatus,
       invoiceIds: createdInvoiceIds,
       itemSummaries: itemSummaries,
+      statementExtractionGap: stmtUnderExtracted ?
+        statementExtractionGap : null,
       status: "processed",
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, {merge: true});
 
-    const finalStatus = overallFinalStatus;
+    const finalStatus = stmtUnderExtracted ?
+      "statement_under_extracted" : overallFinalStatus;
 
     await writeLog("info", "mail", `Email processing completed`, {
       messageId: messageId,
@@ -10800,9 +10907,12 @@ async function processGmailMessage(
 
     const completionExtra = {
       primusResult: lastPrimusResult,
-      finalStatus: overallFinalStatus,
+      finalStatus: stmtUnderExtracted ?
+        "statement_under_extracted" : overallFinalStatus,
       invoiceIds: createdInvoiceIds,
       itemSummaries,
+      statementExtractionGap: stmtUnderExtracted ?
+        statementExtractionGap : null,
     };
     if (isChildSplitJob && itemSummaries.length > 0) {
       await mailIntakeQueue.completeIntakeRecord({
@@ -10822,8 +10932,12 @@ async function processGmailMessage(
         tenant,
         docId: queueDocId,
         parentMessageId,
-        outcome: mailIntakeQueue.OUTCOME.PROCESSED,
-        finalStatus: overallFinalStatus,
+        outcome: stmtUnderExtracted ?
+          mailIntakeQueue.OUTCOME.PARTIAL :
+          mailIntakeQueue.OUTCOME.PROCESSED,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" :
+          overallFinalStatus,
         itemSummaries,
         extra: completionExtra,
       });

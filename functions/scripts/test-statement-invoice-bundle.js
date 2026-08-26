@@ -308,6 +308,51 @@ check("estimateStatementInvoiceCount prefers index list",
 check("estimateStatementInvoiceCount uses page heuristic",
     bundle.estimateStatementInvoiceCount({pageCount: 11}), 5);
 
+const jts22568IndexLoads = [
+  "265379", "265630", "266088", "266134", "266219",
+  "266213", "266214", "265501", "265502", "265503", "265504",
+];
+const jts22568Extracted = [
+  "266213", "266214", "265379", "265630", "266088", "266134",
+];
+const jts22568Gap = bundle.analyzeStatementExtractionGap({
+  indexLoadNumbers: jts22568IndexLoads,
+  extractedLoadNumbers: jts22568Extracted,
+  pageCount: 54,
+});
+check("JTS 22568 54-page packet under-extracted",
+    jts22568Gap.underExtracted, true);
+check("JTS 22568 expects 11 invoices from index",
+    jts22568Gap.expectedCount, 11);
+check("JTS 22568 extracted only 6",
+    jts22568Gap.extractedCount, 6);
+check("JTS 22568 missing 5 loads",
+    jts22568Gap.missingLoads.join(","),
+    "266219,265501,265502,265503,265504");
+check("JTS 22568 should alert ops",
+    bundle.shouldAlertStatementUnderExtraction(jts22568Gap), true);
+check("JTS 22568 alert summary lists missing loads",
+    bundle.buildStatementGapSummarySuffix(jts22568Gap),
+    "5 load(s) not extracted: 266219, 265501, 265502, 265503, 265504");
+
+const pageOnlyGap = bundle.analyzeStatementExtractionGap({
+  indexLoadNumbers: [],
+  extractedLoadNumbers: jts22568Extracted,
+  pageCount: 54,
+});
+check("54-page no-index heuristic still under-extracted at 6",
+    pageOnlyGap.underExtracted, true);
+check("page-only gap should alert",
+    bundle.shouldAlertStatementUnderExtraction(pageOnlyGap), true);
+
+check("fully extracted index does not alert",
+    bundle.shouldAlertStatementUnderExtraction(
+        bundle.analyzeStatementExtractionGap({
+          indexLoadNumbers: jts22568IndexLoads,
+          extractedLoadNumbers: jts22568IndexLoads,
+          pageCount: 54,
+        })), false);
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);

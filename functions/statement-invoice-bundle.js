@@ -420,6 +420,36 @@ function analyzeStatementExtractionGap(context = {}) {
   };
 }
 
+/**
+ * True when ops should be alerted about missing statement invoices.
+ * @param {object|null|undefined} gap analyzeStatementExtractionGap result.
+ * @return {boolean}
+ */
+function shouldAlertStatementUnderExtraction(gap) {
+  return !!(gap && gap.underExtracted);
+}
+
+/**
+ * One-line suffix for intake summaries when a statement PDF is under-extracted.
+ * @param {object|null|undefined} gap analyzeStatementExtractionGap result.
+ * @return {string}
+ */
+function buildStatementGapSummarySuffix(gap) {
+  if (!gap || !gap.underExtracted) return "";
+  const missing = Array.isArray(gap.missingLoads) ? gap.missingLoads : [];
+  if (missing.length > 0) {
+    const list = missing.slice(0, 8).join(", ");
+    const extra = missing.length > 8 ?
+      ` (+${missing.length - 8} more)` : "";
+    return `${missing.length} load(s) not extracted: ${list}${extra}`;
+  }
+  if (Number(gap.expectedCount) > Number(gap.extractedCount)) {
+    return `expected ~${gap.expectedCount} invoice(s), ` +
+      `extracted ${gap.extractedCount}`;
+  }
+  return "statement PDF may be under-extracted";
+}
+
 module.exports = {
   sanitizePreCheckLabel,
   looksLikeNumberedStatementSubject,
@@ -439,4 +469,6 @@ module.exports = {
   parseStatementIndexLoadNumbers,
   estimateStatementInvoiceCount,
   analyzeStatementExtractionGap,
+  shouldAlertStatementUnderExtraction,
+  buildStatementGapSummarySuffix,
 };
