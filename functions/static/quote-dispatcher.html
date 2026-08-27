@@ -560,6 +560,16 @@
       margin: -6px 0 14px;
     }
     .quote-warnings .warn { margin-top: 6px; }
+    .carrier-note {
+      margin-top: 6px;
+      font-size: 0.8125rem;
+      color: var(--warning, #b45309);
+      line-height: 1.35;
+    }
+    .carrier-note strong {
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
     .badge.market {
       background: var(--warning-bg);
       color: var(--warning);
@@ -950,7 +960,7 @@
       <div style="margin-bottom:12px">
         <a class="home-link" id="home-link" href="#">← Back to dashboard</a>
       </div>
-      <h1 id="title">Quote review</h1>
+  <h1 id="title">Quote review</h1>
       <div class="meta">
         <span id="meta"></span>
         <span id="status-badge" class="badge" style="margin-left:8px"></span>
@@ -965,10 +975,10 @@
       </div>
       <div id="action-msg" class="msg hidden"></div>
       <div id="quote-details" class="details-panel"></div>
-      <div id="lanes"></div>
-      <div class="draft">
+  <div id="lanes"></div>
+  <div class="draft">
         <div class="draft-head">
-          <h3>Customer email draft</h3>
+    <h3>Customer email draft</h3>
           <div class="draft-actions">
             <button type="button" class="success" id="btn-approve" disabled>Approve email</button>
           </div>
@@ -980,7 +990,7 @@
         </p>
         <textarea id="draft-text" placeholder="Generated email will appear here…"></textarea>
       </div>
-    </div>
+  </div>
   </div>
 
   <script src="__API_BASE__/quoteAuthClient?v=__AUTH_CLIENT_VERSION__"></script>
@@ -1129,19 +1139,37 @@
       el.classList.remove("hidden");
     }
 
+    function optionRateId(opt) {
+      if (!opt) return "";
+      const id = opt.rateId != null && opt.rateId !== "" ? opt.rateId :
+        (opt.id != null && opt.id !== "" ? opt.id : "");
+      const s = String(id);
+      return (!s || s === "undefined" || s === "null") ? "" : s;
+    }
+
     function defaultCustomerPrice(opt) {
       function ceilDollar(n) {
         const v = Number(n);
         if (!isFinite(v) || v <= 0) return "";
         return Math.ceil(v);
       }
+      // Prefer suggested sell. Only honor a stored override when it is
+      // near sell/cost — never a leaked sibling sellRate / ZIP / id.
+      const sell = ceilDollar(opt && opt.sellRate);
+      const cost = ceilDollar(opt && (opt.cost != null ? opt.cost : opt.total));
       if (opt && opt.customerPrice != null && opt.customerPrice !== "") {
         const override = ceilDollar(opt.customerPrice);
-        if (override !== "") return override;
+        if (override !== "") {
+          const o = Number(override);
+          const anchor = sell !== "" ? Number(sell) :
+            (cost !== "" ? Number(cost) : null);
+          if (anchor == null || (o >= anchor * 0.5 && o <= anchor * 2.5)) {
+            return override;
+          }
+        }
       }
-      const sell = ceilDollar(opt && opt.sellRate);
       if (sell !== "") return sell;
-      return ceilDollar(opt && (opt.cost != null ? opt.cost : opt.total));
+      return cost;
     }
 
     function collectSelections() {
@@ -1151,7 +1179,8 @@
         const prices = {};
         const byLane = customerPrices[laneKey] || {};
         (lane.options || []).forEach((opt) => {
-          const rateId = String(opt.rateId);
+          const rateId = optionRateId(opt);
+          if (!rateId) return;
           const raw = byLane[rateId];
           const n = raw != null && raw !== "" ? Number(raw) :
             Number(defaultCustomerPrice(opt));
@@ -1172,7 +1201,7 @@
         const byLane = customerPrices[lane.laneKey] || {};
         rateIds.forEach((rateId) => {
           const opt = (lane.options || [])
-              .find((o) => String(o.rateId) === String(rateId));
+              .find((o) => optionRateId(o) === String(rateId));
           const raw = byLane[rateId];
           const n = raw != null && raw !== "" ? Number(raw) :
             Number(defaultCustomerPrice(opt));
@@ -1362,7 +1391,9 @@
         laneAccessorials[lane.laneKey] = (lane.accessorials || []).slice();
         const prices = {};
         (lane.options || []).forEach((opt) => {
-          prices[String(opt.rateId)] = defaultCustomerPrice(opt);
+          const rateId = optionRateId(opt);
+          if (!rateId) return;
+          prices[rateId] = defaultCustomerPrice(opt);
         });
         customerPrices[lane.laneKey] = prices;
       });
@@ -1946,6 +1977,32 @@
           .addEventListener("click", () => save(true));
     }
 
+    function formatCarrierNote(input) {
+      const note = cleanNote(input);
+      if (!note) return "";
+      return "<div class='carrier-note'><strong>Carrier note:</strong> " +
+        esc(note.slice(0, 400)) + "</div>";
+    }
+
+    function selectedCarrierNotesHtml(lane) {
+      const selected = new Set(
+          (lane.selectedRateIds || []).map(String));
+      if (!selected.size && lane.selectedRateId) {
+        selected.add(String(lane.selectedRateId));
+      }
+      const lines = [];
+      (lane.options || []).forEach((opt) => {
+        const rateId = optionRateId(opt);
+        if (!rateId || !selected.has(String(rateId))) return;
+        const note = cleanNote(opt.warnings);
+        if (!note) return;
+        const label = opt.name || opt.SCAC || "Carrier";
+        lines.push("<div class='carrier-note'><strong>" + esc(label) +
+          ":</strong> " + esc(note.slice(0, 400)) + "</div>");
+      });
+      return lines.join("");
+    }
+
     function renderLaneSummaryBody(lane) {
       if (!detailsEditMode) {
         let html = renderAddressReadonly(
@@ -1972,6 +2029,11 @@
           html += "<div class='dispatcher-note span-2' style='grid-column:1/-1'>" +
             "<strong>Dispatcher note (not emailed)</strong>" +
             esc(lane.notesForCustomer) + "</div>";
+        }
+        const carrierNotes = selectedCarrierNotesHtml(lane);
+        if (carrierNotes) {
+          html += "<div class='span-2' style='grid-column:1/-1'>" +
+            carrierNotes + "</div>";
         }
         return html;
       }
@@ -2271,9 +2333,9 @@
           optsHtml += "<div class='warn'>" + esc(w) + "</div>";
         });
         (lane.options || []).forEach((opt) => {
-          const isChecked = selected.has(String(opt.rateId));
-          const rateId = String(opt.rateId);
-          const custVal = customerPrices[lane.laneKey] &&
+          const rateId = optionRateId(opt);
+          const isChecked = rateId ? selected.has(rateId) : false;
+          const custVal = rateId && customerPrices[lane.laneKey] &&
             customerPrices[lane.laneKey][rateId] != null ?
             customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
           const custStr = custVal === "" || custVal == null ? "" :
@@ -2283,17 +2345,17 @@
           const showSuggested = isFinite(sellHint) &&
             Number(custVal) !== Math.ceil(sellHint);
           optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
-            <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(opt.rateId)}"${isChecked ? " checked" : ""}>
+            <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(rateId)}"${isChecked ? " checked" : ""}>
             <div>
-              <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
-              <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
+            <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
+            <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
               <div class="rate-row">
                 <span class="rate-cost">Cost $${num(opt.cost)}</span>
                 <label class="customer-rate-field">Customer rate $
                   <input type="number" min="1" step="1"
                     data-customer-rate="1"
                     data-lane="${esc(lane.laneKey)}"
-                    data-rate="${esc(opt.rateId)}"
+                    data-rate="${esc(rateId)}"
                     value="${esc(custStr)}">
                 </label>
                 ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
@@ -2301,7 +2363,7 @@
               </div>
               ${(() => {
                 const note = cleanNote(opt.warnings);
-                return note ? '<div class="warn">'+esc(note.slice(0,200))+'</div>' : "";
+                return note ? formatCarrierNote(note) : "";
               })()}
             </div>
           </div>`;
@@ -2439,16 +2501,16 @@
           try {
             const codes = laneAccessorials[laneKey] || [];
             const res = await apiFetch("/rerunQuoteRates", {
-              method: "POST",
-              body: JSON.stringify({
-                tenantId: TENANT_ID,
-                quoteId: QUOTE_ID,
-                laneKey,
+        method: "POST",
+        body: JSON.stringify({
+          tenantId: TENANT_ID,
+          quoteId: QUOTE_ID,
+          laneKey,
                 accessorials: codes.map((code) => ({code})),
                 accessorialsWithData: codes.map((code) => ({code})),
-                dispatcherId: DISPATCHER_ID || undefined,
-                token: TOKEN || undefined,
-              }),
+          dispatcherId: DISPATCHER_ID || undefined,
+          token: TOKEN || undefined,
+        }),
             });
             if (!res.ok) throw new Error(res.error || "Rerun failed");
             applyQuote(res.quote);

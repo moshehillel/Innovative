@@ -514,19 +514,22 @@
     <section class="panel hidden chat-panel" id="panel-chat">
       <h2>Change rules in plain English</h2>
       <p class="panel-intro">
-        Describe what you want changed — for example, add appointment delivery
-        for military facilities, or update accessorials for nursing homes.
-        The assistant will propose a change; click <strong>Confirm</strong> to apply it.
+        Describe what you want in plain English — like any AI chat.
+        I'll ask a quick clarifying question if needed, propose a rule,
+        and save it when you say <strong>yes</strong>, <strong>sounds good</strong>,
+        <strong>go ahead</strong>, <strong>that's right</strong>, or click
+        <strong>Confirm</strong>.
         Press Enter to send (Shift+Enter for a new line).
       </p>
       <div class="chat-log" id="chat-log"></div>
       <div class="chat-quick-replies" id="chat-quick-replies" aria-label="Quick replies"></div>
       <div class="chat-input">
-        <textarea id="chat-input" placeholder="Example: For military facilities, add limited access and appointment delivery."></textarea>
+        <textarea id="chat-input" placeholder="Describe the rule you want…"></textarea>
         <button type="button" class="primary" id="chat-send">Send</button>
       </div>
       <div id="proposal-box" class="proposal hidden">
-        <strong>Proposed rule change — click Confirm to apply</strong>
+        <strong id="proposal-box-title">Proposed rule — review below</strong>
+        <p class="hint" id="proposal-box-hint" style="margin:6px 0 10px">Reply naturally (yes, sounds good, go ahead, that's right) or click Confirm to save this rule.</p>
         <div id="proposal-summary" class="proposal-summary"></div>
         <details class="rule-advanced">
           <summary>Technical details (for IT)</summary>
@@ -576,6 +579,47 @@
     const API = "https://us-central1-tai-invoice-automation.cloudfunctions.net";
     let chatMessages = [];
     let pendingProposal = null;
+    let lastAppliedRule = null;
+    let lastProposedRule = null;
+    const CHAT_STATE_KEY = "quoteAdminChat:" + TENANT_ID;
+
+    function isInternalChatMarker(text) {
+      const c = String(text || "").trim();
+      return /^\[(APPLIED|PROPOSED)\]/i.test(c);
+    }
+
+    function saveChatState() {
+      try {
+        sessionStorage.setItem(CHAT_STATE_KEY, JSON.stringify({
+          chatMessages,
+          lastAppliedRule,
+          lastProposedRule,
+        }));
+      } catch (e) { /* quota / private mode */ }
+    }
+
+    function renderChatLogFromState() {
+      const log = document.getElementById("chat-log");
+      if (!log) return;
+      log.innerHTML = "";
+      for (const m of chatMessages) {
+        if (!m || !m.content || isInternalChatMarker(m.content)) continue;
+        appendChat(m.role || "assistant", m.content);
+      }
+    }
+
+    function restoreChatState() {
+      try {
+        const raw = sessionStorage.getItem(CHAT_STATE_KEY);
+        if (!raw) return;
+        const st = JSON.parse(raw);
+        if (!Array.isArray(st.chatMessages) || !st.chatMessages.length) return;
+        chatMessages = st.chatMessages;
+        lastAppliedRule = st.lastAppliedRule || null;
+        lastProposedRule = st.lastProposedRule || null;
+        renderChatLogFromState();
+      } catch (e) { /* ignore corrupt storage */ }
+    }
     let pendingQuickReplies = [];
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
@@ -705,6 +749,18 @@
       if (match.senderDomains && match.senderDomains.length) {
         lines.push(`Sender domain is ${quoteList(match.senderDomains.map((d) => String(d).startsWith("@") ? d : "@" + d))}`);
       }
+      if (match.shipperCityContains && match.shipperCityContains.length) {
+        lines.push(`Pickup city includes ${quoteList(match.shipperCityContains)}`);
+      }
+      if (match.shipperState) {
+        lines.push(`Pickup state is ${match.shipperState}`);
+      }
+      if (match.consigneeCityContains && match.consigneeCityContains.length) {
+        lines.push(`Delivery city includes ${quoteList(match.consigneeCityContains)}`);
+      }
+      if (match.consigneeState) {
+        lines.push(`Delivery state is ${match.consigneeState}`);
+      }
       if (!lines.length) {
         lines.push("Custom match conditions (see Advanced for details).");
       }
@@ -725,6 +781,12 @@
         const W = d.width != null ? d.width : "?";
         const H = d.height != null ? d.height : "?";
         lines.push(`Default missing pallet dims to ${L}×${W}×${H}`);
+      }
+      const fillZip = String(rule.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+      if (/^\d{5}$/.test(fillZip)) {
+        const side = rule.applyTo === "origin" ? "pickup" :
+          rule.applyTo === "dest" ? "delivery" : "pickup or delivery";
+        lines.push(`Use rating ZIP ${fillZip} for ${side} when city matches`);
       }
       const acc = rule.addAccessorials || [];
       if (acc.length) {
@@ -1018,10 +1080,47 @@
         const d = patch.defaultDims;
         parts.push(`Default dims: ${esc([d.length, d.width, d.height].filter((n) => n != null).join("×"))}`);
       }
+      const fillZip = String(patch.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+      if (/^\d{5}$/.test(fillZip)) {
+        const side = patch.applyTo === "origin" ? "pickup" :
+          patch.applyTo === "dest" ? "delivery" : "pickup/delivery";
+        parts.push(`Rating ZIP: ${esc(fillZip)} (${esc(side)})`);
+      }
       if (patch.active === false) parts.push("This rule will be turned off.");
       if (patch.active === true) parts.push("This rule will be turned on.");
 
       return parts.join("<br>");
+    }
+
+    function summarizeProposalPlain(res) {
+      const html = summarizeProposal(res);
+      return html.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    function recordProposedRule(res) {
+      if (!res || !res.proposal) {
+        lastProposedRule = null;
+        return;
+      }
+      const proposal = res.proposal;
+      const ruleId = proposal.ruleId || proposal.deleteRuleId || null;
+      const patch = (proposal.patch && typeof proposal.patch === "object")
+        ? proposal.patch
+        : {};
+      lastProposedRule = {
+        ruleId,
+        ruleKind: patch.ruleKind || null,
+        summary: summarizeProposalPlain(res),
+        action: res.action || null,
+        proposal: pendingProposal,
+      };
+      if (ruleId) {
+        chatMessages.push({
+          role: "assistant",
+          content: `[PROPOSED] ruleId="${ruleId}" action="${String(res.action || "")}" kind="${String(patch.ruleKind || "")}"`,
+        });
+      }
+      saveChatState();
     }
 
     document.querySelectorAll(".tabs button").forEach(btn => {
@@ -1031,6 +1130,12 @@
         ["rules", "chat", "test"].forEach(t => {
           document.getElementById("panel-" + t).classList.toggle("hidden", t !== btn.dataset.tab);
         });
+        if (btn.dataset.tab === "chat" && !chatMessages.length) {
+          const welcome = "Ask me to set up a quote rule — I'll confirm before saving.";
+          chatMessages.push({ role: "assistant", content: welcome });
+          appendChat("assistant", welcome);
+          saveChatState();
+        }
       });
     });
 
@@ -1164,9 +1269,94 @@
       }
     }
 
-    function isTypedConfirm(text) {
-      return /^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
-        .test(String(text || "").trim());
+    function normalizeConfirmText(text) {
+      return String(text || "").trim().toLowerCase()
+        .replace(/[^\w\s'-]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+
+    function isNaturalReject(text) {
+      const raw = String(text || "").trim();
+      if (!raw) return false;
+      const norm = normalizeConfirmText(raw);
+      if (/^(no|nope|nah|cancel|stop|wait|hold on|nevermind|never mind)\.?$/i.test(raw)) return true;
+      return /\b(not quite|not right|that'?s wrong|change (it|that)|hold on|wait a sec)\b/.test(norm) ||
+        /\b(don'?t|do not)\s+(apply|save|confirm)\b/.test(norm) ||
+        (/\b(cancel|scratch that|forget it)\b/.test(norm) && norm.length <= 80);
+    }
+
+    function isNaturalConfirm(text, hasPending) {
+      const raw = String(text || "").trim();
+      if (!raw || isNaturalReject(raw)) return false;
+      // Confirm + refine in one utterance — send to chat, do not apply yet.
+      if (/^(yes|yeah|yep|ok|okay),?\s+but\b/i.test(raw)) return false;
+      if (/\bbut\s+only\s+when\b/i.test(raw)) return false;
+      if (/\bonly\s+when\s+(the\s+)?(customer|sender|from)\b/i.test(raw)) return false;
+      if (/\bfor\s+this\s+rule\b/i.test(raw)) return false;
+      if (/\bbut\b/i.test(raw) &&
+          /\b(only|when|except|unless|customer|sender|from)\b/i.test(raw)) {
+        return false;
+      }
+      const norm = normalizeConfirmText(raw);
+      if (/^(yes|yep|yeah|yea|yup|ok|okay|k|sure|correct|right|exactly|perfect|absolutely|definitely|confirmed|confirm|apply|proceed|go ahead|do it|save it|looks good|sounds good|that works|please do|please apply|go for it|make it so|do that|that'?s it|that'?s right|that'?s correct|that'?s good|that'?s fine|that'?s perfect)\.?$/i.test(raw)) {
+        return true;
+      }
+      const phrases = [
+        /\bthat('s| is) (right|correct|it|good|fine|perfect|what i want)\b/,
+        /\b(yes|yeah|yep|yup)[,.]?\s*(that('s| is) (right|correct|it)|go ahead|please|do it|apply|save)\b/,
+        /\b(go ahead|please apply|please save|please do|please confirm)\b/,
+        /\b(sounds|looks) good\b/,
+        /\bgo for it\b/,
+        /\bdo (that|this)\b/,
+        /\bapply (that|this|it)\b/,
+        /\bsave (that|this|it)\b/,
+        /\blet'?s do (it|that)\b/,
+        /\byou got it\b/,
+      ];
+      if (phrases.some((re) => re.test(norm))) return true;
+      if (hasPending && /^(yes|yep|yeah|yup|ok|okay|sure|right|correct|perfect)\b/i.test(norm) &&
+          !/\bbut\b/.test(norm)) {
+        return true;
+      }
+      if (hasPending && /\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 40 &&
+          !/\bbut\b/.test(norm)) {
+        return true;
+      }
+      return false;
+    }
+
+    function setProposalBoxCopy(action) {
+      const titleEl = document.getElementById("proposal-box-title");
+      const hintEl = document.getElementById("proposal-box-hint");
+      const isUpdate = action === "propose_update_rule";
+      if (titleEl) {
+        titleEl.textContent = isUpdate
+          ? "Proposed update — review below"
+          : "Proposed rule — review below";
+      }
+      if (hintEl) {
+        hintEl.textContent = isUpdate
+          ? "Reply naturally (yes, sounds good, go ahead, that's right) or click Confirm to save this update."
+          : "Reply naturally (yes, sounds good, go ahead, that's right) or click Confirm to save this rule.";
+      }
+    }
+
+    function buildRulesChatPayload() {
+      const referencedRuleId = (lastAppliedRule && lastAppliedRule.ruleId) ||
+        (lastProposedRule && lastProposedRule.ruleId) ||
+        (pendingProposal && pendingProposal.ruleId) ||
+        null;
+      return {
+        tenantId: TENANT_ID,
+        messages: chatMessages,
+        history: chatMessages,
+        pendingProposal,
+        lastAppliedRule,
+        lastProposedRule,
+        referencedRuleId,
+        lastAppliedRuleId: lastAppliedRule && lastAppliedRule.ruleId,
+      };
     }
 
     async function applyPendingProposal() {
@@ -1214,19 +1404,44 @@
           ? `Applied: removed "${ruleId}". It stays gone on refresh.`
           : `Applied: saved "${ruleId}". Refresh the Rules list to see the update.`;
         appendChat("assistant", okMsg);
+        chatMessages.push({ role: "assistant", content: okMsg });
         chatMessages.push({ role: "assistant", content: applied });
+        if (!wasDelete && ruleId) {
+          const patch = pendingProposal.patch || {};
+          lastAppliedRule = {
+            ruleId,
+            ruleKind: patch.ruleKind || (res.rule && res.rule.ruleKind) || null,
+            summary: summarizeProposalPlain({
+              action: pendingProposal.action,
+              proposal: pendingProposal,
+            }),
+            action: pendingProposal.action,
+            proposal: pendingProposal,
+          };
+          lastProposedRule = null;
+        } else {
+          lastAppliedRule = null;
+        }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
+        saveChatState();
         await loadRules();
       } catch (e) {
         showChatThinking(false);
         const errMsg = "Failed: " + e.message;
         appendChat("assistant", errMsg);
         chatMessages.push({ role: "assistant", content: errMsg });
+        saveChatState();
       } finally {
         showChatThinking(false);
         if (confirmBtn) confirmBtn.disabled = false;
       }
+    }
+
+    function rejectionHasCorrection(text) {
+      const raw = String(text || "").trim();
+      const stripped = raw.replace(/^(no|nope|nah|wait|hold on)[,.!\s-]+/i, "").trim();
+      return stripped.length >= 10 && stripped.toLowerCase() !== raw.toLowerCase();
     }
 
     async function sendChatMessage() {
@@ -1235,8 +1450,8 @@
       const text = input.value.trim();
       if (!text || sendBtn.disabled) return;
 
-      // Typing Confirm with a pending proposal uses applyQuoteRule — never the model.
-      if (pendingProposal && isTypedConfirm(text)) {
+      // Natural confirm/reject with a pending proposal — apply locally, not via model.
+      if (pendingProposal && isNaturalConfirm(text, true)) {
         input.value = "";
         clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
@@ -1244,14 +1459,35 @@
         await applyPendingProposal();
         return;
       }
-      if (!pendingProposal && isTypedConfirm(text)) {
+      if (pendingProposal && isNaturalReject(text)) {
+        const correction = rejectionHasCorrection(text);
+        if (!correction) {
+          input.value = "";
+          clearQuickReplies();
+          chatMessages.push({ role: "user", content: text });
+          appendChat("user", text);
+          document.getElementById("proposal-box").classList.add("hidden");
+          pendingProposal = null;
+          const msg = "Oh sorry — I'll drop that proposal. What should the rule do instead?";
+          chatMessages.push({ role: "assistant", content: msg });
+          appendChat("assistant", msg);
+          saveChatState();
+          return;
+        }
+        document.getElementById("proposal-box").classList.add("hidden");
+        pendingProposal = null;
+        saveChatState();
+        // Fall through — send correction to the assistant to rework.
+      }
+      if (!pendingProposal && isNaturalConfirm(text, false)) {
         input.value = "";
         clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
         appendChat("user", text);
-        const tip = "There is no pending proposal. Ask me to remove or change a rule first, then click the Confirm button (typing Confirm alone does nothing).";
+        const tip = "Nothing pending right now — tell me what rule you'd like to add or change, and I'll propose it for you to confirm.";
         chatMessages.push({ role: "assistant", content: tip });
         appendChat("assistant", tip);
+        saveChatState();
         return;
       }
 
@@ -1264,13 +1500,32 @@
       try {
         let res = await api("/quoteRulesChat", {
           method: "POST",
-          body: JSON.stringify({ tenantId: TENANT_ID, messages: chatMessages }),
+          body: JSON.stringify(buildRulesChatPayload()),
         });
         showChatThinking(false);
         res = normalizeChatProposal(res) || res;
+        if (res.action === "dismiss_pending") {
+          document.getElementById("proposal-box").classList.add("hidden");
+          pendingProposal = null;
+        }
+        if (res.dismissedCorrection) {
+          document.getElementById("proposal-box").classList.add("hidden");
+          pendingProposal = null;
+        }
         if (res.reply) {
           chatMessages.push({ role: "assistant", content: res.reply });
           appendChat("assistant", res.reply);
+        }
+        if (res.confirmApply && res.proposal && res.proposal.ruleId) {
+          pendingProposal = {
+            action: res.action,
+            ruleId: res.proposal.ruleId,
+            deleteRuleId: res.proposal.deleteRuleId || res.proposal.ruleId,
+            deleteRuleIds: res.proposal.deleteRuleIds,
+            patch: res.proposal.patch || {},
+          };
+          await applyPendingProposal();
+          return;
         }
         if (res.action === "ask_identify_source" &&
             (!Array.isArray(res.quickReplies) || !res.quickReplies.length)) {
@@ -1314,6 +1569,8 @@
               : (ruleId ? [ruleId] : []),
             patch,
           };
+          recordProposedRule(res);
+          setProposalBoxCopy(res.action);
           document.getElementById("proposal-summary").innerHTML = summarizeProposal(res);
           document.getElementById("proposal-json").textContent = JSON.stringify(res, null, 2);
           document.getElementById("proposal-box").classList.remove("hidden");
@@ -1322,9 +1579,11 @@
         if (Array.isArray(res.activeRuleIds)) {
           await loadRules();
         }
+        saveChatState();
       } catch (e) {
         showChatThinking(false);
         appendChat("assistant", "Error: " + e.message);
+        saveChatState();
       }
       showChatThinking(false);
       sendBtn.disabled = false;
@@ -1349,7 +1608,9 @@
     document.getElementById("dismiss-proposal").addEventListener("click", () => {
       document.getElementById("proposal-box").classList.add("hidden");
       pendingProposal = null;
+      lastProposedRule = null;
       clearQuickReplies();
+      saveChatState();
     });
 
     document.getElementById("run-test").addEventListener("click", async () => {
@@ -1381,6 +1642,7 @@
       }
     });
 
+    restoreChatState();
     loadRules();
   </script>
 </body>

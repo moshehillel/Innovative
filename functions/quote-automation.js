@@ -281,7 +281,8 @@ function assertSelectedCustomerRates(lanes) {
     for (const opt of selected) {
       const rate = quoteOutput.effectiveCustomerRate(opt);
       if (!(Number(rate) > 0)) {
-        const name = opt.name || opt.SCAC || opt.id || "rate";
+        const name = opt.name || opt.SCAC ||
+          quoteOutput.optionRateId(opt) || "rate";
         throw new Error(
             `Customer rate required for ${name} ` +
             `(lane ${lane.label || lane.laneKey}). ` +
@@ -533,8 +534,8 @@ async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
 
   for (const lane of lanes) {
     for (const opt of lane.options) {
-      const rateId = String(opt.id);
-      if (!(lane.selectedRateIds || []).includes(rateId)) continue;
+      const rateId = quoteOutput.optionRateId(opt);
+      if (!rateId || !(lane.selectedRateIds || []).includes(rateId)) continue;
 
       // Reuse prior successful Primus save when present.
       if (opt.costQuoteId && (opt.quoteNumber || opt.savedQuoteNumber)) {
@@ -598,7 +599,7 @@ async function saveSelectedRatesToPrimus(tenant, quoteId, quote) {
         .filter((id) => okIds.has(String(id)));
     lane.selectedRateId = lane.selectedRateIds[0] || null;
     lane.selectedOptions = lane.options.filter((o) =>
-      lane.selectedRateIds.includes(String(o.id)));
+      lane.selectedRateIds.includes(quoteOutput.optionRateId(o)));
     lane.selectedOption = lane.selectedOptions[0] || null;
   }
 
@@ -706,7 +707,7 @@ async function rateLane(lane, ctx) {
   const odCheck = validateLaneForRating(lane);
   if (!odCheck.ok) {
     return {
-      ...lane,
+    ...lane,
       options: [],
       rateError: odCheck.reason,
       appliedRules: Array.isArray(lane.freightRulesApplied) ?
@@ -725,6 +726,7 @@ async function rateLane(lane, ctx) {
       ctx.from || "",
       ctx.emailBody || "",
       ctx.rules || []);
+  await rateShop.ensureDensityRulesLoaded();
   const freightNormalized = freightDims.normalizePalletFreightRows(
       lane.freightInfo || [], dimOpts);
   const classFix = rateShop.ensureFreightClasses(freightNormalized, {
@@ -790,7 +792,9 @@ async function rateLane(lane, ctx) {
     const requested = quoteEmailAcc.resolveRequestedAccessorials(
         extracted, {body: emailText, subject: extractCtx.subject});
     rulesOut = quoteEmailAcc.applyEmailRequestedAccessorials(
-        rulesOut, requested, quoteRules.formatAccessorialLabels);
+        rulesOut, requested, quoteRules.formatAccessorialLabels, emailText);
+    rulesOut.accessorials = quoteEmailAcc.normalizeHotelCasinoAccessorials(
+        rulesOut.accessorials || []);
     rulesOut = quoteEmailAcc.applyDeclinedAccessorials(
         rulesOut, emailText, declinedCodes);
   }
@@ -893,6 +897,24 @@ async function rateLane(lane, ctx) {
     rateSource,
     extractionWarnings,
   };
+}
+
+/**
+ * Drop bulky / non-essential extract fields before Firestore write.
+ * @param {object} extracted Intake extract.
+ * @return {object}
+ */
+function slimExtractedForStore(extracted) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const out = {...extracted};
+  delete out.raw;
+  if (out._sourceBody) {
+    out._sourceBody = String(out._sourceBody).slice(0, 12000);
+  }
+  if (out._sourceSubject) {
+    out._sourceSubject = String(out._sourceSubject).slice(0, 500);
+  }
+  return out;
 }
 
 /**
@@ -1015,6 +1037,9 @@ async function processQuoteEmail(opts) {
     try {
       await addressEnrichment.enrichLaneAddresses(lane, tenant, {
         log: enrichLog,
+        quoteRules: rules,
+        fromEmail: senderFrom,
+        customerName: shippingLocationName || extractedCustomerName,
       });
     } catch (err) {
       await deps.writeLog("warn", "quote", "Address enrichment failed", {
@@ -1069,7 +1094,6 @@ async function processQuoteEmail(opts) {
     batchQuoteId,
     format: extracted.format,
     readyDate: extracted.readyDate,
-    shipper: extracted.shipper,
     originSiteType: (ratedLanes[0] && ratedLanes[0].originSiteType) || null,
     originEnrichmentMeta:
       (ratedLanes[0] && ratedLanes[0].originEnrichmentMeta) || null,
@@ -1086,9 +1110,13 @@ async function processQuoteEmail(opts) {
     extractionWarnings: collectQuoteWarnings(extracted, ratedLanes),
     rateSource: quoteRateSource(ratedLanes, shippingLocationId),
     lanes: ratedLanes,
+    // Prefer enriched lane shipper (ZIP fill) over raw extract.
+    shipper: (ratedLanes[0] && ratedLanes[0].shipper) ||
+      extracted.shipper || null,
     customerDraftText: "",
     status: "awaiting_dispatcher",
-    extracted,
+    // Cap stored extract body; never keep model raw / megabyte blobs.
+    extracted: slimExtractedForStore(extracted),
     receivedMailboxEmail: opts.receivedMailboxEmail || null,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1228,7 +1256,7 @@ function serializeInboxQuote(doc, data) {
         notes: r.notes || null,
       })),
       topOptions: (lane.options || []).slice(0, 5).map((o) => ({
-        rateId: o.id,
+        rateId: quoteOutput.optionRateId(o),
         name: o.name,
         SCAC: o.SCAC,
         sellRate: o.sellRate != null ? o.sellRate : o.total,
@@ -1319,8 +1347,8 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
       dispatcher.email || "");
   const [snap, counts] = await Promise.all([
     col(tenant, "quoteRequests")
-        .orderBy("createdAt", "desc")
-        .limit(limit * 5)
+      .orderBy("createdAt", "desc")
+      .limit(limit * 5)
         .get(),
     countQuotesForDispatcher(tenant, dispatcher),
   ]);
@@ -1380,12 +1408,12 @@ async function saveLaneSelections(tenant, quoteId, selections) {
     if (!byLane.has(lane.laneKey)) return lane;
     const {rateIds, customerPrices} = byLane.get(lane.laneKey);
     const options = (lane.options || []).map((o) => {
-      const key = String(o.id);
-      if (!customerPrices.has(key)) return o;
+      const key = quoteOutput.optionRateId(o);
+      if (!key || !customerPrices.has(key)) return o;
       return {...o, customerPrice: customerPrices.get(key)};
     });
     const selectedOptions = options.filter((o) =>
-      rateIds.includes(String(o.id)));
+      rateIds.includes(quoteOutput.optionRateId(o)));
     return {
       ...lane,
       options,
@@ -1540,7 +1568,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         const queuedBody = String(qsnap.docs[0].data().emailBody || "");
         if (queuedBody.trim()) emailBody = queuedBody;
       }
-    } catch (_) {
+      } catch (_) {
       // keep extract body
     }
   }
@@ -1586,6 +1614,9 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
         await addressEnrichment.enrichLaneAddresses(laneForRate, tenant, {
           log: (level, category, message, logData) =>
             deps.writeLog(level, category, message, logData),
+          quoteRules: rules,
+          fromEmail: senderFrom || data.from || "",
+          customerName: shippingLocationName || "",
         });
       } catch (enrichErr) {
         await deps.writeLog("warn", "quote",
@@ -1713,7 +1744,7 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
     selectedRateIds: lane.selectedRateIds ||
       (lane.selectedRateId ? [lane.selectedRateId] : []),
     options: (lane.selectedOptions || []).map((o) => ({
-      rateId: o.id,
+      rateId: quoteOutput.optionRateId(o),
       name: o.name,
       sellRate: o.sellRate,
       customerPrice: quoteOutput.effectiveCustomerRate(o),

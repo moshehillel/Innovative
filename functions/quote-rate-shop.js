@@ -20,6 +20,7 @@ const ACCESSORIAL_PARAM_STYLE =
  */
 function init(deps) {
   getPrimusToken = deps.getPrimusToken;
+  ensureDensityRulesLoaded().catch(() => {});
 }
 
 /**
@@ -92,6 +93,8 @@ async function primusFetch(path, opts = {}) {
 
 /**
  * Normalizes one rate row from Primus API response.
+ * Keeps only dispatcher-facing fields — Primus returns large nested
+ * payloads that must not be written into quoteRequests docs.
  * @param {object} r Raw rate.
  * @return {object}
  */
@@ -99,16 +102,38 @@ function normalizeRateRow(r) {
   const remarks = Array.isArray(r.rateRemarks) ?
     r.rateRemarks.join(" ") :
     (r.rateRemarks || "");
-  const rawWarnings = r.warnings || remarks || "";
+  const extraNotes = [
+    r.notes,
+    r.notesExternal,
+    r.carrierNote,
+    r.carrierNotes,
+  ].filter(Boolean).join(" ");
+  const rawWarnings = r.warnings || remarks || extraNotes || "";
   const warnings = quoteOutput.cleanCarrierNote(rawWarnings);
   const guaranteed =
     r.guaranteed === true ||
     String(r.rateType || "").toUpperCase() === "GUARANTEED";
+  const billTo = r.billTo && typeof r.billTo === "object" ? {
+    total: r.billTo.total != null ? r.billTo.total : null,
+  } : null;
+  // Keep both id and rateId — dispatcher serialize / selections key on o.id.
+  const rateId = r.rateId != null ? r.rateId :
+    (r.id != null ? r.id : null);
   return {
-    ...r,
-    warnings,
-    guaranteed,
+    id: rateId,
+    name: r.name || r.carrierName || null,
+    SCAC: r.SCAC || r.scac || null,
+    total: r.total != null ? r.total : null,
+    transitDays: r.transitDays != null ? r.transitDays : null,
+    rateType: r.rateType || null,
+    mode: r.mode || null,
+    serviceType: r.serviceType || null,
     quoteNumber: r.quoteNumber || r.accountNumber || null,
+    rateId,
+    vendorId: r.vendorId || null,
+    billTo,
+    warnings: String(warnings || "").slice(0, 500),
+    guaranteed,
   };
 }
 
@@ -184,6 +209,7 @@ function shouldRetryRatesWithoutCustomer(_noRates) {
  * @return {Promise<object>} {ok, rates, noRates, raw}
  */
 async function fetchMultipleRates(params) {
+  await ensureDensityRulesLoaded();
   const {query, queryArrays} = splitRateQueryParams(params);
   const json = await primusFetch("/rate/multiple", {query, queryArrays});
   return {
@@ -639,31 +665,42 @@ const VALID_NMFC_CLASSES = new Set([
   200, 250, 300, 400, 500,
 ]);
 
+/** TTL for cached GET /tools/companydensityrules (ms). */
+const COMPANY_DENSITY_RULES_TTL_MS = 60 * 60 * 1000;
+
 /**
- * Primus-compatible NMFC density → class table (pcf / lbs per cu ft).
- * Matches Primus booking samples (density + class on pieces).
- * Tenant /tools/densityrules is empty, so we use this local table.
+ * Primus company density rules fallback when GET /tools/companydensityrules
+ * fails (production REST currently 404). Matches sandbox company defaults.
  */
-const DENSITY_CLASS_TABLE = [
-  {minPcf: 50, freightClass: 50},
-  {minPcf: 35, freightClass: 55},
-  {minPcf: 30, freightClass: 60},
-  {minPcf: 22.5, freightClass: 65},
-  {minPcf: 15, freightClass: 70},
-  {minPcf: 13.5, freightClass: 77.5},
-  {minPcf: 12, freightClass: 85},
-  {minPcf: 10.5, freightClass: 92.5},
-  {minPcf: 9, freightClass: 100},
-  {minPcf: 8, freightClass: 110},
-  {minPcf: 7, freightClass: 125},
-  {minPcf: 6, freightClass: 150},
-  {minPcf: 5, freightClass: 175},
-  {minPcf: 4, freightClass: 200},
-  {minPcf: 3, freightClass: 250},
-  {minPcf: 2, freightClass: 300},
-  {minPcf: 1, freightClass: 400},
-  {minPcf: 0, freightClass: 500},
+const FALLBACK_DENSITY_RULES = [
+  {densityFrom: 50, densityTo: -1, class: 50},
+  {densityFrom: 35, densityTo: 50, class: 55},
+  {densityFrom: 30, densityTo: 35, class: 60},
+  {densityFrom: 22.5, densityTo: 30, class: 65},
+  {densityFrom: 15, densityTo: 22.5, class: 70},
+  {densityFrom: 12, densityTo: 15, class: 85},
+  {densityFrom: 10, densityTo: 12, class: 92.5},
+  {densityFrom: 8, densityTo: 10, class: 100},
+  {densityFrom: 6, densityTo: 8, class: 125},
+  {densityFrom: 4, densityTo: 6, class: 175},
+  {densityFrom: 2, densityTo: 4, class: 250},
+  {densityFrom: 1, densityTo: 2, class: 300},
+  {densityFrom: 0, densityTo: 1, class: 400},
 ];
+
+/** @type {{rules: Array<object>, fetchedAt: number, source: string}|null} */
+let densityRulesCache = null;
+/** @type {Promise<void>|null} */
+let densityRulesLoadPromise = null;
+
+/**
+ * Legacy minPcf table derived from {@link FALLBACK_DENSITY_RULES} for tests.
+ * @type {Array<{minPcf: number, freightClass: number}>}
+ */
+const DENSITY_CLASS_TABLE = FALLBACK_DENSITY_RULES.map((row) => ({
+  minPcf: row.densityFrom,
+  freightClass: Number(row.class),
+}));
 
 /**
  * Normalize country to ISO 3166-1 alpha-2 for Primus rate APIs.
@@ -762,17 +799,130 @@ function isValidFreightClass(value) {
 }
 
 /**
+ * Drop zero-width / placeholder rows from Primus companydensityrules payload.
+ * @param {Array<object>} raw Raw API results.
+ * @return {Array<{densityFrom: number, densityTo: number, class: number}>}
+ */
+function normalizeCompanyDensityRules(raw) {
+  const rows = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const row of rows) {
+    const from = Number(row && row.densityFrom);
+    const to = Number(row && row.densityTo);
+    const cls = Number(row && row.class);
+    if (!Number.isFinite(from) || !Number.isFinite(cls)) continue;
+    if (from === to && to === 0) continue;
+    out.push({densityFrom: from, densityTo: to, class: cls});
+  }
+  out.sort((a, b) => b.densityFrom - a.densityFrom);
+  return out.length ? out : FALLBACK_DENSITY_RULES.slice();
+}
+
+/**
+ * Active density rules (API cache or fallback).
+ * @return {Array<{densityFrom: number, densityTo: number, class: number}>}
+ */
+function activeDensityRules() {
+  if (densityRulesCache && densityRulesCache.rules.length) {
+    return densityRulesCache.rules;
+  }
+  return FALLBACK_DENSITY_RULES;
+}
+
+/**
+ * Map density (pcf) to NMFC class using Primus densityFrom/densityTo bands.
+ * @param {number} densityPcf Pounds per cubic foot.
+ * @param {Array<object>} [rules] Optional rule set; defaults to active cache.
+ * @return {number|null}
+ */
+function classFromDensityWithRules(densityPcf, rules) {
+  const d = Number(densityPcf);
+  if (!Number.isFinite(d) || d < 0) return null;
+  const bands = Array.isArray(rules) && rules.length ?
+    rules : activeDensityRules();
+  for (const row of bands) {
+    const from = Number(row.densityFrom);
+    const to = Number(row.densityTo);
+    const cls = Number(row.class);
+    if (!Number.isFinite(from) || !Number.isFinite(cls)) continue;
+    if (d < from) continue;
+    if (to === -1) return cls;
+    if (Number.isFinite(to) && d < to) return cls;
+  }
+  return 500;
+}
+
+/**
  * Map density (lbs per cubic foot) to NMFC class.
  * @param {number} densityPcf Pounds per cubic foot.
  * @return {number|null}
  */
 function classFromDensity(densityPcf) {
-  const d = Number(densityPcf);
-  if (!Number.isFinite(d) || d < 0) return null;
-  for (const row of DENSITY_CLASS_TABLE) {
-    if (d >= row.minPcf) return row.freightClass;
+  return classFromDensityWithRules(densityPcf);
+}
+
+/**
+ * GET /tools/companydensityrules — company default density → class bands.
+ * @return {Promise<Array<object>>}
+ */
+async function fetchCompanyDensityRulesFromApi() {
+  const json = await primusFetch("/tools/companydensityrules");
+  const results = json && json.data && Array.isArray(json.data.results) ?
+    json.data.results : [];
+  return normalizeCompanyDensityRules(results);
+}
+
+/**
+ * Load and cache Primus company density rules (1h TTL). Read-only GET.
+ * Falls back to {@link FALLBACK_DENSITY_RULES} when the API is unavailable.
+ * @param {object} [opts] force refresh.
+ * @return {Promise<Array<object>>}
+ */
+async function ensureDensityRulesLoaded(opts = {}) {
+  const force = !!opts.force;
+  const now = Date.now();
+  if (!force && densityRulesCache &&
+      (now - densityRulesCache.fetchedAt) < COMPANY_DENSITY_RULES_TTL_MS) {
+    return densityRulesCache.rules;
   }
-  return 500;
+  if (!force && densityRulesLoadPromise) {
+    await densityRulesLoadPromise;
+    return activeDensityRules();
+  }
+  densityRulesLoadPromise = (async () => {
+    try {
+      const rules = await fetchCompanyDensityRulesFromApi();
+      densityRulesCache = {rules, fetchedAt: Date.now(), source: "api"};
+    } catch (_) {
+      densityRulesCache = {
+        rules: FALLBACK_DENSITY_RULES.slice(),
+        fetchedAt: Date.now(),
+        source: "fallback",
+      };
+    } finally {
+      densityRulesLoadPromise = null;
+    }
+  })();
+  await densityRulesLoadPromise;
+  return activeDensityRules();
+}
+
+/**
+ * Test helper — seed density rule cache without calling Primus.
+ * @param {Array<object>|null} rules Rule bands or null to reset.
+ * @return {void}
+ */
+function setDensityRulesCacheForTest(rules) {
+  densityRulesLoadPromise = null;
+  if (!rules) {
+    densityRulesCache = null;
+    return;
+  }
+  densityRulesCache = {
+    rules: normalizeCompanyDensityRules(rules),
+    fetchedAt: Date.now(),
+    source: "test",
+  };
 }
 
 /**
@@ -969,7 +1119,8 @@ function buildRateMultipleQuery(lane, opts = {}) {
  * Market rates: cost + min(flat $ markup, percent of cost), default $55 / 10%.
  * All sell rates round UP to the next whole dollar (Math.ceil).
  * @param {number} cost Carrier cost.
- * @param {object} [opts] billToTotal, rateSource, marginPercent, marginMinDollars.
+ * @param {object} [opts] billToTotal, rateSource, marginPercent,
+ *   marginMinDollars.
  * @return {number|null}
  */
 function computeSellRate(cost, opts = {}) {
@@ -1134,10 +1285,17 @@ module.exports = {
   normalizeFreightInfoForRate,
   isValidFreightClass,
   classFromDensity,
+  classFromDensityWithRules,
   cubicFeetPerPiece,
   densityFromFreightRow,
   ensureFreightClasses,
+  ensureDensityRulesLoaded,
+  fetchCompanyDensityRulesFromApi,
+  normalizeCompanyDensityRules,
+  activeDensityRules,
+  setDensityRulesCacheForTest,
   VALID_NMFC_CLASSES,
   DENSITY_CLASS_TABLE,
+  FALLBACK_DENSITY_RULES,
   freightDims,
 };

@@ -9,13 +9,15 @@
  *      from what is on the Primus booking. For W&I we re-rate via Primus
  *      GET /rate with the invoice's updated weight/class and compare the
  *      returned total to the carrier invoice (default $10 tolerance).
- *   C. Approval email offers FOUR decisions:
+ *   C. Approval email offers FIVE decisions:
  *        A — pay carrier + bill customer; auto-email the customer contact.
  *        B — pay carrier + bill customer; dispatcher notifies the customer
  *            (system reminds the dispatcher / adds to their task list).
  *        C — pay carrier only; customer rate stays the same (not itemized).
  *        D — not approved; generate a carrier dispute draft for manual
  *            submission (LTL portals) or email (TL).
+ *        E — pay carrier + bill customer; enter amount and bump rate; no
+ *            separate customer notification (invoice carries the charge).
  *   D. Every case is tracked on an Additional Charges Follow-Up list until
  *      resolved.
  *
@@ -27,6 +29,10 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const {
+  toOutboundEmailSafeSubject,
+  toOutboundEmailSafeText,
+} = require("./email-outbound-safe");
 
 const FOLLOW_UP_COLLECTION = "additionalCharges";
 
@@ -86,14 +92,30 @@ function validateLumperAmount(aiResult, primusCarrierCost) {
       .filter((c) => c && c.type === "lumper");
   const totalLumper = lumperCharges.reduce(
       (sum, c) => sum + (Number(c.amount) || 0), 0);
-  const baseAmount = Number(aiResult.invoiceAmount || 0) - totalLumper;
-  const difference = Math.abs(baseAmount - Number(primusCarrierCost || 0));
+  const invoiceAmount = Number(aiResult.invoiceAmount || 0);
+  const primusCost = Number(primusCarrierCost || 0);
+  const baseAmount = invoiceAmount - totalLumper;
+  // When the invoice total already matches Primus, the lumper is included in
+  // carrier cost — line items are a breakdown, not an overage.
+  const totalMatchesPrimus = primusCost > 0 &&
+      Math.abs(invoiceAmount - primusCost) <= RATE_MATCH_TOLERANCE;
+  if (totalMatchesPrimus) {
+    return {
+      valid: true,
+      baseAmount,
+      totalLumper,
+      difference: 0,
+      totalMatchesPrimus: true,
+    };
+  }
+  const difference = Math.abs(baseAmount - primusCost);
   // Flat band — pre-check only; full validation uses validateAmountWithPrimus.
   return {
     valid: difference <= LUMPER_BASE_TOLERANCE,
     baseAmount,
     totalLumper,
     difference,
+    totalMatchesPrimus: false,
   };
 }
 
@@ -616,7 +638,39 @@ function chargesHtml(charges) {
 }
 
 /**
- * Builds the 4-option approval email for Sarah + the dispatcher.
+ * Picks the carrier invoice PDF from an invoice doc's attachments list
+ * (GCS storagePath). Skips weight-cert / POD image docs so approval emails
+ * get the bill PDF, not a certificate sidecar.
+ * @param {Array<object>|null|undefined} attachments Invoice attachments.
+ * @return {{filename: string, storagePath: string, mimeType: string}|null}
+ */
+function pickCarrierInvoiceAttachment(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  const withPath = list.filter((a) => a && a.storagePath);
+  if (!withPath.length) return null;
+
+  const skipDocType =
+      /WEIGHT_INSPECTION_CERT|POD_IMAGE|TRAILER_IMAGE|^POD$/i;
+  const notSidecar = withPath.filter((a) => {
+    const dt = String(a.docType || "");
+    return !dt || !skipDocType.test(dt);
+  });
+  const pool = notSidecar.length ? notSidecar : withPath;
+
+  const pdfLike = pool.find((a) =>
+    /\.pdf$/i.test(String(a.filename || "")) ||
+    /pdf/i.test(String(a.mimeType || "")));
+  const chosen = pdfLike || pool[0];
+  if (!chosen || !chosen.storagePath) return null;
+  return {
+    filename: String(chosen.filename || "carrier-invoice.pdf"),
+    storagePath: String(chosen.storagePath),
+    mimeType: String(chosen.mimeType || "application/pdf"),
+  };
+}
+
+/**
+ * Builds the 5-option approval email for Sarah + the dispatcher.
  * @param {object} opts baseUrl, invoiceId, tenantId, loadNumber, carrierName,
  *   customerName, invoiceAmount, primusAmount, charges, chargesTotal,
  *   category, freightMismatch, hasCertificate, dispatcherName,
@@ -653,7 +707,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `border-radius:6px;text-decoration:none;font-weight:600;` +
     `display:inline-block">${label}</a></p>` +
     `<p style="font-size:11px;color:#9ca3af;margin:0 0 8px">` +
-    `Opens a confirmation page — nothing happens until you click ` +
+    `Opens a confirmation page - nothing happens until you click ` +
     `Confirm.</p>`;
 
   const mm = freightMismatch || {};
@@ -732,7 +786,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Additional charges", money(chargesTotal)) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
-      row("W&amp;I certificate", "Attached / referenced on invoice") : "") +
+      row("W&I certificate", "Attached / referenced on invoice") : "") +
     (dispatcherName ? row("Dispatcher", esc(dispatcherName)) : "") +
     `</table>` +
     accessorialConfirmHtml +
@@ -747,27 +801,34 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `<hr style="border:none;border-top:1px solid #e5e7eb;margin:18px 0">` +
     `<p><strong>Choose one:</strong></p>` +
     btn("a", "#16a34a",
-        "A — Approve: pay carrier + bill customer (auto-email customer)") +
+        "A - Approve: pay carrier + bill customer (auto-email customer)") +
     btn("b", "#0d9488",
-        "B — Approve: pay carrier + bill customer " +
-        "(itemize accessorials; dispatcher notifies customer)") +
+        "B - Approve: pay carrier + bill customer " +
+        "(enter updated rate; dispatcher notifies customer)") +
     btn("c", "#2563eb",
-        "C — Approve: pay carrier only (customer rate unchanged)") +
+        "C - Approve: pay carrier only (customer rate unchanged)") +
     btn("d", "#dc2626",
-        "D — Not approved: dispute with carrier") +
-    `<p style="font-size:12px;color:#6b7280">A: customer rate is auto-bumped ` +
-    `by the charge amount and the customer is emailed. B: the base customer ` +
-    `rate stays the same — enter each accessorial and the amount to bill the ` +
-    `customer on separate lines; the dispatcher notifies the customer. C: ` +
-    `the carrier bill is entered at the full carrier amount and the customer ` +
-    `rate stays the same (no itemization needed). D: Jerry will draft the ` +
-    `wording for manual submission.` +
+        "D - Not approved: dispute with carrier") +
+    btn("e", "#7c3aed",
+        "E - Approve: pay carrier + bill customer " +
+        "(enter amount; apply rate; no separate customer notification)") +
+    `<p style="font-size:12px;color:#6b7280">A: enter how much to charge the ` +
+    `customer on the confirm page; the customer rate is bumped by that ` +
+    `amount and the customer is emailed. B: the base customer rate stays ` +
+    `the same - enter each accessorial and the amount to bill the customer ` +
+    `on separate lines; the dispatcher gets a ready customer-notification ` +
+    `template. C: the carrier bill is entered at the full carrier amount ` +
+    `and the customer rate stays the same (no itemization needed). D: Jerry ` +
+    `will draft the wording for manual submission. E: like A (enter amount ` +
+    `and bump the customer rate) but no separate customer notification - ` +
+    `the charge is included when the customer invoice is sent.` +
     `</p>`;
 
   return {
-    subject: `Approval needed — additional charge on Load ${loadNumber} ` +
-      `(${categoryLabel(category)})`,
-    html,
+    subject: toOutboundEmailSafeSubject(
+        `Approval needed - additional charge on Load ${loadNumber} ` +
+        `(${categoryLabel(category)})`),
+    html: toOutboundEmailSafeText(html),
   };
 }
 
@@ -873,9 +934,10 @@ function buildDisputeEmailDraft(opts) {
     `Charges Follow-Up list until resolved.</p>`;
 
   return {
-    subject: `Dispute draft — ${carrierName || "carrier"} invoice on ` +
-      `Load ${loadNumber}`,
-    html,
+    subject: toOutboundEmailSafeSubject(
+        `Dispute draft - ${carrierName || "carrier"} invoice on ` +
+        `Load ${loadNumber}`),
+    html: toOutboundEmailSafeText(html),
   };
 }
 
@@ -902,13 +964,59 @@ function buildCustomerChargeNotificationEmail(opts) {
     `will be reflected on your invoice for this shipment.</p>` +
     `<p>Please reach out if you have any questions.</p>`;
   return {
-    subject: `Additional charge on shipment ${loadNumber}`,
-    html,
+    subject: toOutboundEmailSafeSubject(
+        `Additional charge on shipment ${loadNumber}`),
+    html: toOutboundEmailSafeText(html),
+  };
+}
+
+/**
+ * Ready-to-forward customer email body for option B (dispatcher sends it).
+ * @param {object} opts loadNumber, customerName, carrierName, chargesTotal,
+ *   customerRate, customerBillLines, newCustomerRate.
+ * @return {{subject: string, html: string}}
+ */
+function buildDispatcherCustomerNotifyTemplate(opts) {
+  const {
+    loadNumber, customerName, carrierName, chargesTotal,
+    customerRate, customerBillLines, newCustomerRate,
+  } = opts;
+  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
+  const baseRate = Number(customerRate) || 0;
+  const accessorialTotal = sumCustomerBillLines(billLines);
+  const updatedRate = Number(newCustomerRate) > 0 ?
+    Number(newCustomerRate) :
+    (baseRate > 0 ? baseRate + accessorialTotal : accessorialTotal);
+  const chargeDetail = billLines.length ?
+    customerBillLinesHtml(billLines) :
+    `<p>Additional charge total: <strong>${money(chargesTotal)}</strong></p>`;
+  const html =
+    `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
+    `<p>This note is about your shipment ` +
+    `<strong>${esc(String(loadNumber || ""))}</strong>` +
+    (carrierName ? ` with ${esc(carrierName)}` : "") + `.</p>` +
+    `<p>The carrier billed an additional charge on this load` +
+    (Number(chargesTotal) > 0 ?
+      ` of <strong>${money(chargesTotal)}</strong>` : "") +
+    `. Your updated customer rate for this shipment is ` +
+    `<strong>${money(updatedRate)}</strong>` +
+    (baseRate > 0 && billLines.length ?
+      ` (base freight ${formatCustomerRate(baseRate)} plus the ` +
+      `accessorial(s) below)` : "") +
+    `.</p>` +
+    chargeDetail +
+    `<p>Please let us know if you have any questions.</p>` +
+    `<p>Thank you,<br>Innovative Carriers</p>`;
+  return {
+    subject: toOutboundEmailSafeSubject(
+        `Updated rate on shipment ${loadNumber}`),
+    html: toOutboundEmailSafeText(html),
   };
 }
 
 /**
  * Dispatcher reminder for decision B (dispatcher must notify the customer).
+ * Includes a ready-to-send customer notification template.
  * @param {object} opts dispatcherName, loadNumber, carrierName, customerName,
  *   charges, chargesTotal.
  * @return {{subject: string, html: string}}
@@ -921,34 +1029,55 @@ function buildDispatcherNotifyReminderEmail(opts) {
   const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
   const baseRate = Number(customerRate) || 0;
   const accessorialTotal = sumCustomerBillLines(billLines);
+  const newCustomerRate = baseRate > 0 ?
+    baseRate + accessorialTotal : accessorialTotal;
   const billingBlock = billLines.length ?
     ((baseRate > 0 ?
       `<p><strong>Base customer rate (unchanged): ` +
       `${formatCustomerRate(baseRate)}</strong></p>` : "") +
       `<p><strong>Accessorials to bill the customer:</strong></p>` +
       customerBillLinesHtml(billLines) +
-      `<p><strong>Total to bill (base + accessorials): ` +
-      `${money(baseRate + accessorialTotal)}</strong></p>` +
-      `<p>Please notify the customer of the accessorial charge(s) above. ` +
-      `The base freight rate is not changed.</p>`) :
+      `<p><strong>New customer total (base + accessorials): ` +
+      `${money(newCustomerRate)}</strong></p>` +
+      `<p><strong>Carrier additional charge:</strong> ` +
+      `${money(chargesTotal)}</p>`) :
     (chargesHtml(charges) +
       `<p>Total additional: <strong>${money(chargesTotal)}</strong></p>` +
-      `<p><strong>Action needed:</strong> please email the customer about ` +
-      `this charge. This item stays on your task list (Additional Charges ` +
-      `Follow-Up) until done.</p>`);
+      (baseRate > 0 ?
+        `<p><strong>Current customer rate:</strong> ` +
+        `${formatCustomerRate(baseRate)}</p>` : ""));
+  const forward = buildDispatcherCustomerNotifyTemplate({
+    loadNumber,
+    customerName,
+    carrierName,
+    chargesTotal,
+    customerRate: baseRate,
+    customerBillLines: billLines,
+    newCustomerRate,
+  });
   const html =
     `<p>Hi${dispatcherName ? ` ${esc(dispatcherName)}` : ""},</p>` +
     `<p>An additional carrier charge on load ` +
     `<strong>${esc(String(loadNumber || ""))}</strong> ` +
     `(${esc(carrierName || "carrier")}) was approved to be billed to the ` +
-    `customer, and it was decided that <strong>you will notify the ` +
-    `customer</strong>${customerName ? ` (${esc(customerName)})` : ""} ` +
-    `about it yourself.</p>` +
-    billingBlock;
+    `customer. <strong>Please notify the customer</strong>` +
+    `${customerName ? ` (${esc(customerName)})` : ""} ` +
+    `about the updated rate.</p>` +
+    billingBlock +
+    `<hr style="border:none;border-top:1px solid #e5e7eb;margin:18px 0">` +
+    `<p><strong>Ready-to-send customer email</strong> - copy or forward ` +
+    `this to the customer:</p>` +
+    `<p style="font-size:13px;color:#6b7280"><strong>Subject:</strong> ` +
+    `${esc(forward.subject)}</p>` +
+    `<div style="border:1px solid #bfdbfe;border-radius:8px;padding:16px;` +
+    `background:#eff6ff;font-size:14px">${forward.html}</div>` +
+    `<p style="font-size:12px;color:#6b7280;margin-top:14px">This item ` +
+    `stays on your task list (Additional Charges Follow-Up) until the ` +
+    `customer is notified.</p>`;
   return {
-    subject: `Task — notify customer of additional charge on ` +
-      `Load ${loadNumber}`,
-    html,
+    subject: toOutboundEmailSafeSubject(
+        `Task - notify customer of additional charge on Load ${loadNumber}`),
+    html: toOutboundEmailSafeText(html),
   };
 }
 
@@ -984,7 +1113,7 @@ async function createFollowUp(db, data) {
     await dashboardTasks.createDashboardTask(db, {
       tenantId: data.tenantId || "default",
       type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
-      title: `Additional charge — Load ${data.loadNumber || "—"}`,
+      title: `Additional charge - Load ${data.loadNumber || "-"}`,
       description: data.notes || null,
       loadNumber: data.loadNumber || null,
       carrierName: data.carrierName || null,
@@ -1084,6 +1213,23 @@ function normalizeCustomerBillLines(lines) {
 
 /**
  * @param {object} body POST body from the confirm form.
+ * @return {object} Parsed customer charge amount payload.
+ */
+function parseCustomerChargeAmountFromRequest(body) {
+  const raw = body && (body.customerChargeAmount != null ?
+    body.customerChargeAmount : body.customer_charge_amount);
+  const amount = Math.round(Number(raw) * 100) / 100;
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return {
+      ok: false,
+      error: "Enter a customer charge amount greater than 0.",
+    };
+  }
+  return {ok: true, amount};
+}
+
+/**
+ * @param {object} body POST body from the confirm form.
  * @return {object} Parsed customer bill lines payload.
  */
 function parseCustomerBillLinesFromRequest(body) {
@@ -1179,7 +1325,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `${esc(opts.confirmLabel || "Confirm option B")}</button>` +
     `</div></form>` +
     `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
-    `If you did not request this, close this page — nothing has been ` +
+    `If you did not request this, close this page - nothing has been ` +
     `changed yet.</p>` +
     `<script>` +
     `const seedRows = ${seedJson};` +
@@ -1244,14 +1390,17 @@ module.exports = {
   LUMPER_BASE_TOLERANCE,
   resolveEffectiveChargeCategory,
   categoryLabel,
+  pickCarrierInvoiceAttachment,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
   buildCustomerChargeNotificationEmail,
+  buildDispatcherCustomerNotifyTemplate,
   buildDispatcherNotifyReminderEmail,
   buildOptionBAccessorialConfirmPage,
   customerBillLinesHtml,
   sumCustomerBillLines,
   normalizeCustomerBillLines,
+  parseCustomerChargeAmountFromRequest,
   parseCustomerBillLinesFromRequest,
   seedCustomerBillLinesFromCharges,
   createFollowUp,

@@ -967,12 +967,22 @@ async function runDailyInboxDigestReport(opts = {}) {
 /** Human-readable labels for ignore categories (by finalStatus). */
 const IGNORE_CATEGORY_LABELS = {
   payment_notification_ignored: "Payment notification",
+  payment_receipt_ignored: "Payment receipt",
   emodal_broadcast_ignored: "eModal / terminal broadcast",
+  cardknox_batch_report_ignored: "Cardknox batch report",
+  amex_merchant_survey_ignored: "AmEx merchant satisfaction survey",
+  dnb_promotional_ignored: "D&B promotional / marketing",
+  coface_ignored: "Coface newsletter/marketing",
+  out_of_office_ignored: "Out of office auto-reply",
   noa_ignored: "Notice of assignment (NOA)",
   carrier_portal_notification_ignored: "Carrier open-invoice portal",
   credit_agency_notification_ignored: "Credit-agency / trade-credit alert",
   already_processed: "Already processed",
   statement_ignored_abe_cc: "Carrier statement (Abe on CC)",
+  customer_payment_remittance_ignored_abe_cc:
+    "Customer payment remittance (Abe on thread)",
+  customer_payment_remittance_forwarded:
+    "Customer payment remittance forwarded to Abe",
   past_due_only: "Past-due / already in Primus",
   administrative_ignored: "Administrative",
   payment_inquiry_ignored_abe_cc: "Payment inquiry (Abe on thread)",

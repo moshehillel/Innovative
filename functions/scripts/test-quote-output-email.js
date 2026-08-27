@@ -194,6 +194,36 @@ check(
     "Non-direct point. Please double check charges.",
 );
 
+const slimPage = quoteOutput.serializeForDispatcherPage({
+  id: "q2",
+  lanes: [{
+    laneKey: "L1",
+    options: [
+      {
+        rateId: "R-cheap",
+        name: "Roadrunner J&I",
+        total: 3033.23,
+        sellRate: 3398,
+        quoteNumber: "103785203",
+      },
+      {
+        rateId: "R-od",
+        name: "OLD DOMINION",
+        total: 11352.28,
+        sellRate: 12715,
+      },
+    ],
+  }],
+});
+check("serialize prefers rateId when id missing (cheap)",
+    slimPage.lanes[0].options[0].rateId, "R-cheap");
+check("serialize prefers rateId when id missing (OD)",
+    slimPage.lanes[0].options[1].rateId, "R-od");
+check("optionRateId reads rateId",
+    quoteOutput.optionRateId({rateId: "R-cheap"}), "R-cheap");
+check("optionRateId prefers id",
+    quoteOutput.optionRateId({id: "A", rateId: "B"}), "A");
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

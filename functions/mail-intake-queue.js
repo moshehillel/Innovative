@@ -6,6 +6,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const statementInvoiceBundle = require("./statement-invoice-bundle");
 
 const DOC_TYPE = Object.freeze({
   EMAIL: "email",
@@ -123,6 +124,33 @@ function buildIntakeSummary(data) {
   const completedChildCount = Number(d.completedChildCount || 0);
   const receivedLabel = formatReceivedAtEt(d);
 
+  const stmtGap = d.statementExtractionGap;
+  if (stmtGap && stmtGap.underExtracted) {
+    const gapSuffix = statementInvoiceBundle
+        .buildStatementGapSummarySuffix(stmtGap);
+    let core = gapSuffix ?
+      `Partial — ${gapSuffix}` :
+      "Partial — statement PDF missing invoice(s)";
+    if (itemSummaries.length > 0) {
+      const counts = computeIntakeOutcomeCounts({
+        attachmentCount: Number(d.attachmentCount) || 0,
+        itemSummaries,
+      });
+      const parts = [];
+      if (counts.processedCount) {
+        parts.push(`${counts.processedCount} processed`);
+      }
+      if (counts.skippedCount) {
+        parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+      }
+      if (parts.length) core += `; ${parts.join("; ")}`;
+    }
+    if (receivedLabel && !/received /i.test(core)) {
+      return `${core} · received ${receivedLabel}`;
+    }
+    return core;
+  }
+
   let core = null;
 
   if (d.outcome === OUTCOME.SPLIT ||
@@ -134,7 +162,17 @@ function buildIntakeSummary(data) {
     const statusSummary = {
       payment_notification_ignored:
         "Ignored — payment notification (Zelle/bank)",
+      payment_receipt_ignored:
+        "Ignored — payment receipt (not a freight invoice)",
       emodal_broadcast_ignored: "Ignored — eModal/terminal broadcast",
+      cardknox_batch_report_ignored:
+        "Ignored — Cardknox daily batch report",
+      amex_merchant_survey_ignored:
+        "Ignored — AmEx merchant satisfaction survey",
+      dnb_promotional_ignored:
+        "Ignored — D&B promotional / marketing email",
+      coface_ignored: "Ignored — Coface newsletter/marketing",
+      out_of_office_ignored: "Ignored — out of office auto-reply",
       noa_ignored: "Ignored — notice of assignment, no invoice",
       carrier_portal_notification_ignored:
         "Ignored — carrier open-invoice portal (link only)",
@@ -143,24 +181,48 @@ function buildIntakeSummary(data) {
       past_due_only: "Ignored — past-due statement already in Primus",
       statement_ignored_abe_cc: "Ignored — carrier statement (Abe on CC)",
       statement_forwarded: "Forwarded — carrier statement, no freight invoice",
+      customer_payment_remittance_ignored_abe_cc:
+        "Ignored — customer payment remittance (Abe on thread)",
+      customer_payment_remittance_forwarded:
+        "Forwarded — customer payment remittance to accounting",
       hafstaff_forwarded_to_lisa: "Forwarded — Hafstaff to Lisa (ops rule)",
       no_attachment: "Forwarded — no attachments",
       no_invoice_pdf: "Forwarded — no processable invoice PDF",
       workflow_failed: "Failed — invoice workflow system error",
       system_error: "Failed — invoice workflow system error",
+      statement_under_extracted:
+        "Partial — statement PDF missing invoice(s)",
     };
     if (finalStatus && statusSummary[finalStatus]) {
       core = statusSummary[finalStatus];
     } else if (itemSummaries.length > 0) {
-      const processed = itemSummaries.filter((s) =>
-        s && s.finalStatus === "processing" && s.invoiceId).length;
-      const skipped = itemSummaries.filter((s) =>
-        s && s.finalStatus === "already_billed_skipped").length;
-      const other = itemSummaries.length - processed - skipped;
+      const attachmentCount = Number(d.attachmentCount) || 0;
+      const counts = computeIntakeOutcomeCounts({attachmentCount, itemSummaries});
+      const other = itemSummaries.length - counts.processedCount -
+        counts.skippedCount;
       const parts = [];
-      if (processed) parts.push(`processed ${processed} invoice(s)`);
-      if (skipped) parts.push(`${skipped} skipped (already in Primus)`);
-      if (other) parts.push(`${other} other outcome(s)`);
+      if (attachmentCount > 1) {
+        if (counts.processedCount) {
+          parts.push(`${counts.processedCount} processed`);
+        }
+        if (counts.skippedCount) {
+          parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+        }
+        if (counts.unaccountedCount > 0) {
+          parts.push(
+              `${counts.unaccountedCount} unaccounted ` +
+              `(of ${counts.attachmentCount} attachments)`);
+        }
+        if (other) parts.push(`${other} other outcome(s)`);
+      } else {
+        if (counts.processedCount) {
+          parts.push(`processed ${counts.processedCount} invoice(s)`);
+        }
+        if (counts.skippedCount) {
+          parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+        }
+        if (other) parts.push(`${other} other outcome(s)`);
+      }
       if (parts.length) core = `Processed email — ${parts.join("; ")}`;
     }
   }
@@ -560,16 +622,29 @@ async function incrementParentChildCompletion(
     };
 
     if (completedChildCount >= childCount && childCount > 0) {
+      const preSkipped = Array.isArray(data.preSkippedItemSummaries) ?
+        data.preSkippedItemSummaries : [];
+      const mergedSummaries = preSkipped.concat(
+          itemSummaries.filter(Boolean));
+      const stmtGap = data.statementExtractionGap;
+      const stmtUnderExtracted = stmtGap && stmtGap.underExtracted;
       const rollup = buildIntakeSummary({
-        itemSummaries,
+        itemSummaries: mergedSummaries,
         childCount,
         completedChildCount,
         receivedDateTime: data.receivedDateTime || data.receivedAt || null,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" : null,
+        statementExtractionGap: stmtGap || null,
+        _rebuildSummary: !!stmtUnderExtracted,
       });
       Object.assign(patch, {
         intakeStatus: QUEUE_STATUS.COMPLETED,
         status: QUEUE_STATUS.COMPLETED,
-        outcome: OUTCOME.PROCESSED,
+        outcome: stmtUnderExtracted ? OUTCOME.PARTIAL : OUTCOME.PROCESSED,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" :
+          (data.finalStatus || null),
         summary: rollup,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -594,6 +669,12 @@ async function createInvoiceChildJobs(opts) {
   const invoiceItems = Array.isArray(opts.invoiceItems) ?
     opts.invoiceItems : [];
   if (!parentMessageId || invoiceItems.length <= 1) return 0;
+
+  const preSkippedSummaries = Array.isArray(opts.preSkippedSummaries) ?
+    opts.preSkippedSummaries : [];
+  const stmtGap = opts.statementExtractionGap &&
+    opts.statementExtractionGap.underExtracted ?
+    opts.statementExtractionGap : null;
 
   const now = admin.firestore.FieldValue.serverTimestamp();
   const batch = admin.firestore().batch();
@@ -623,6 +704,16 @@ async function createInvoiceChildJobs(opts) {
         col(tenant, "gmailQueue").doc(childId), childPayload, {merge: true});
   }
 
+  let splitSummary = preSkippedSummaries.length > 0 ?
+    `Split into ${invoiceItems.length} invoice job(s); ` +
+    `${preSkippedSummaries.length} already processed — skipped.` :
+    `Split into ${invoiceItems.length} invoice job(s) for processing.`;
+  if (stmtGap) {
+    const gapSuffix = statementInvoiceBundle
+        .buildStatementGapSummarySuffix(stmtGap);
+    if (gapSuffix) splitSummary += ` WARNING: ${gapSuffix}`;
+  }
+
   const parentPatch = {
     docType: DOC_TYPE.EMAIL,
     intakeStatus: QUEUE_STATUS.WAITING_CHILDREN,
@@ -630,9 +721,12 @@ async function createInvoiceChildJobs(opts) {
     outcome: OUTCOME.SPLIT,
     childCount: invoiceItems.length,
     completedChildCount: 0,
+    preSkippedItemSummaries: preSkippedSummaries,
+    statementExtractionGap: stmtGap,
+    finalStatus: stmtGap ? "statement_under_extracted" : null,
     invoiceItemsPending: invoiceItems.map((item, itemIndex) =>
       Object.assign({itemIndex}, item)),
-    summary: `Split into ${invoiceItems.length} invoice job(s) for processing.`,
+    summary: splitSummary,
     updatedAt: now,
   };
   batch.set(parentQueueRef, parentPatch, {merge: true});
@@ -704,6 +798,36 @@ async function listIgnoredIntakeForReport(tenant, since, until) {
       });
 }
 
+/**
+ * Counts processed/skipped/unaccounted items for intake summaries.
+ * Single-PDF multi-invoice emails do not invent unaccounted gaps.
+ * @param {object} data attachmentCount, itemSummaries.
+ * @return {object}
+ */
+function computeIntakeOutcomeCounts(data) {
+  const d = data || {};
+  const attachmentCount = Number(d.attachmentCount) || 0;
+  const itemSummaries = Array.isArray(d.itemSummaries) ?
+    d.itemSummaries : [];
+  const processedCount = itemSummaries.filter((s) =>
+    s && s.finalStatus === "processing" && s.invoiceId).length;
+  const skippedCount = itemSummaries.filter((s) =>
+    s && (s.finalStatus === "already_billed_skipped" ||
+      s.finalStatus === "already_processed_skipped")).length;
+  let unaccountedCount = 0;
+  if (attachmentCount > 1) {
+    unaccountedCount = Math.max(0,
+        attachmentCount - processedCount - skippedCount);
+  }
+  return {
+    attachmentCount,
+    processedCount,
+    skippedCount,
+    unaccountedCount,
+    itemSummaries,
+  };
+}
+
 module.exports = {
   DOC_TYPE,
   QUEUE_STATUS,
@@ -714,6 +838,7 @@ module.exports = {
   childQueueDocId,
   isChildQueueDocId,
   buildIntakeSummary,
+  computeIntakeOutcomeCounts,
   formatReceivedAtEt,
   toReceivedTimestamp,
   isAlreadyDiscovered,

@@ -303,70 +303,166 @@ async function loadCarrierBillPdfFromInvoice(invoice) {
 }
 
 /**
- * Uploads carrier bill PDF to Primus immediately after amount validation.
- * Non-fatal: billing can retry upload later if this fails.
+ * Uploads carrier bill PDF + POD to Primus as soon as the load is known.
+ * Runs before amount validation / additional-charge / rate review holds so
+ * paperwork is on Primus even when the workflow pauses. Non-fatal and
+ * idempotent (primusSteps + Primus "already uploaded" checks).
  * @param {object} args Workflow context.
  * @return {Promise<void>}
  */
-async function uploadCarrierBillEarly(args) {
-  const {invoice, invoiceDoc, invoiceId, primusSteps} = args;
-  if (!isManagePhpEnabled || !isManagePhpEnabled() ||
-      !ensureCarrierBillUploadedToPrimus ||
-      primusSteps.carrierBillUploaded) {
-    return;
-  }
-  try {
-    const carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
-    if (!carrierBillPdf) return;
-    const booking = await fetchPrimusBooking(invoice.loadNumber);
-    if (!booking) return;
-    const result = await ensureCarrierBillUploadedToPrimus({
-      booking,
-      loadNumber: invoice.loadNumber,
-      carrierBillPdf,
-    });
-    const alreadyOnPrimus = result.skipped &&
-      result.reason === "already uploaded";
-    if (result.uploaded || alreadyOnPrimus) {
-      primusSteps.carrierBillUploaded = true;
-      await invoiceDoc.ref.update({
-        primusSteps,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      await logWorkflowStep({
-        invoiceId,
-        stepName: "carrier_bill_upload_completed",
-        stepStatus: "success",
-        output: {
-          uploaded: !!result.uploaded,
-          skipped: !!result.skipped,
-          reason: result.reason || null,
-        },
-      });
-      await writeLog("info", "workflow",
-          result.uploaded ?
-            "Carrier bill PDF uploaded to Primus (early)" :
-            "Carrier bill PDF already on Primus — skipped", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            uploaded: !!result.uploaded,
-            skipped: !!result.skipped,
-          });
-    } else if (!result.ok && result.error) {
-      await writeLog("warn", "workflow",
-          "Early carrier bill upload failed — will retry at invoice step", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            error: result.error,
-          });
+async function uploadPaperworkEarly(args) {
+  const {
+    invoice, invoiceDoc, invoiceId, primusSteps,
+    booking: bookingArg,
+    podStoragePath: podPathArg,
+  } = args;
+  if (!invoice || !invoice.loadNumber) return;
+  if (!isManagePhpEnabled || !isManagePhpEnabled()) return;
+
+  const needCarrierBill = !primusSteps.carrierBillUploaded &&
+    !!ensureCarrierBillUploadedToPrimus;
+  const needPod = !primusSteps.podUploaded && !!ensurePodMarkedOnPrimus;
+  if (!needCarrierBill && !needPod) return;
+
+  let booking = bookingArg || null;
+  if (!booking) {
+    try {
+      booking = await fetchPrimusBooking(invoice.loadNumber);
+    } catch (_) {
+      booking = null;
     }
-  } catch (err) {
+  }
+  if (!booking) {
     await writeLog("warn", "workflow",
-        "Early carrier bill upload error — will retry at invoice step", {
+        "Early paperwork upload skipped — Primus booking not found", {
           invoiceId,
           loadNumber: invoice.loadNumber,
-          error: err.message || String(err),
         });
+    return;
+  }
+
+  if (needCarrierBill) {
+    try {
+      const carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
+      if (carrierBillPdf) {
+        const result = await ensureCarrierBillUploadedToPrimus({
+          booking,
+          loadNumber: invoice.loadNumber,
+          carrierBillPdf,
+        });
+        const alreadyOnPrimus = result.skipped &&
+          result.reason === "already uploaded";
+        if (result.uploaded || alreadyOnPrimus) {
+          primusSteps.carrierBillUploaded = true;
+          invoice.primusSteps = primusSteps;
+          await invoiceDoc.ref.update({
+            primusSteps,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "carrier_bill_upload_completed",
+            stepStatus: "success",
+            output: {
+              uploaded: !!result.uploaded,
+              skipped: !!result.skipped,
+              reason: result.reason || null,
+            },
+          });
+          await writeLog("info", "workflow",
+              result.uploaded ?
+                "Carrier bill PDF uploaded to Primus (early)" :
+                "Carrier bill PDF already on Primus — skipped", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                uploaded: !!result.uploaded,
+                skipped: !!result.skipped,
+              });
+        } else if (!result.ok && result.error) {
+          await writeLog("warn", "workflow",
+              "Early carrier bill upload failed — will retry at invoice step", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                error: result.error,
+              });
+        }
+      }
+    } catch (err) {
+      await writeLog("warn", "workflow",
+          "Early carrier bill upload error — will retry at invoice step", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            error: err.message || String(err),
+          });
+    }
+  }
+
+  if (needPod && !primusSteps.podUploaded) {
+    const podStoragePath = podPathArg ||
+      (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+      null;
+    if (!podStoragePath) return;
+    try {
+      const podB64 = await downloadStorageFileBase64(podStoragePath);
+      if (!podB64) return;
+      const marked = await ensurePodMarkedOnPrimus({
+        booking,
+        loadNumber: invoice.loadNumber,
+        podPdf: {
+          buffer: Buffer.from(podB64, "base64"),
+          filename: `pod-${invoice.loadNumber}.pdf`,
+        },
+      });
+      if (marked.hasPod || marked.uploaded) {
+        primusSteps.podUploaded = true;
+        invoice.primusSteps = primusSteps;
+        const update = {
+          primusSteps,
+          podOnPrimusAlready: true,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+        if (Array.isArray(marked.driveIds) && marked.driveIds.length) {
+          update.podPrimusDriveIds = marked.driveIds;
+        }
+        await invoiceDoc.ref.update(update);
+        invoice.podOnPrimusAlready = true;
+        if (update.podPrimusDriveIds) {
+          invoice.podPrimusDriveIds = update.podPrimusDriveIds;
+        }
+        await logWorkflowStep({
+          invoiceId,
+          stepName: "pod_upload_completed",
+          stepStatus: "success",
+          output: {
+            uploaded: !!marked.uploaded,
+            hasPod: !!marked.hasPod,
+            reason: marked.reason || null,
+          },
+        });
+        await writeLog("info", "workflow",
+            marked.uploaded ?
+              "POD PDF uploaded to Primus (early)" :
+              "POD already on Primus — skipped", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              uploaded: !!marked.uploaded,
+            });
+      } else if (!marked.ok && marked.error) {
+        await writeLog("warn", "workflow",
+            "Early POD upload failed — will retry at invoice step", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              error: marked.error,
+            });
+      }
+    } catch (err) {
+      await writeLog("warn", "workflow",
+          "Early POD upload error — will retry at invoice step", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            error: err.message || String(err),
+          });
+    }
   }
 }
 
@@ -980,78 +1076,9 @@ exports.processPrimusWorkflow = onRequest(
 
         const currentStep = resumeFrom || null;
 
-        // An invoice awaiting the A/B/C/D additional-charge decision must
-        // not be failed — the decision buttons clear the charge arrays and
-        // restart the workflow.
-        if (invoice.additionalCharge &&
-            !invoice.additionalCharge.decision) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "additional_charge_gate",
-            stepStatus: "skipped",
-            reason: "Awaiting A/B/C/D additional-charge decision",
-          });
-          await invoiceDoc.ref.update({
-            processingLock: false,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          return res.json({
-            ok: false,
-            error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
-          });
-        }
-
-        if (
-          Array.isArray(invoice.unrecognizedCharges) &&
-      invoice.unrecognizedCharges.length > 0
-        ) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "unrecognized_charges_check",
-            stepStatus: "failed",
-            reason: "Unrecognized charges detected",
-            input: {unrecognizedCharges: invoice.unrecognizedCharges},
-            error: "UNRECOGNIZED_CHARGES",
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "unrecognized_charges",
-            decisionReason: "Unrecognized charges detected",
-            processingLock: false,
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "UNRECOGNIZED_CHARGES",
-          });
-        }
-
-        if (Array.isArray(invoice.chargesNeedProof) &&
-        invoice.chargesNeedProof.length > 0) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "charges_proof_check",
-            stepStatus: "failed",
-            reason: "Extra charges present with no proof",
-            input: {chargesNeedProof: invoice.chargesNeedProof},
-            error: "CHARGES_NO_PROOF",
-          });
-
-          await invoiceDoc.ref.update({
-            decisionStage: "charges_no_proof",
-            decisionReason: "Extra charges present with no proof",
-            processingLock: false,
-            finalWorkflowStatus: "failed",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-
-          return res.json({
-            ok: false,
-            error: "CHARGES_NO_PROOF",
-          });
-        }
+        // Review holds (additional charge / unrecognized / need-proof) run
+        // AFTER early paperwork upload so carrier bill + POD land on Primus
+        // even when the workflow pauses for ops review.
 
         const proofRefs = Array.isArray(invoice.chargeProofRefs) ?
       invoice.chargeProofRefs : [];
@@ -1320,85 +1347,66 @@ exports.processPrimusWorkflow = onRequest(
             (invoice.podOnlyFile && invoice.podOnlyFile.storagePath),
           );
           let hasPrimusPod = Boolean(invoice.podOnPrimusAlready ||
-            (invoice.primusSteps && invoice.primusSteps.podUploaded));
+            (invoice.primusSteps && invoice.primusSteps.podUploaded) ||
+            primusSteps.podUploaded);
 
           const isPowerOnly = bookingForMode && isPowerOnlyShipment &&
           isPowerOnlyShipment(bookingForMode);
 
-          // Power Only — upload POD to Primus when missing so the load is
-          // marked POD before any billing steps run.
-          if (isPowerOnly && !hasPrimusPod && ensurePodMarkedOnPrimus) {
-            let podStoragePath =
+          // Power Only — build POD from trailer images when extraction missed.
+          if (isPowerOnly && !hasPrimusPod && !hasLocalPod &&
+              maybeBuildPodFromTrailerImages) {
+            const imgPod = await maybeBuildPodFromTrailerImages(
+                invoiceId, invoice);
+            if (imgPod && imgPod.storagePath) {
+              extractedPodOnlyFile = imgPod;
+              hasLocalPod = true;
+              await invoiceDoc.ref.update({
+                podOnlyFile: {
+                  storagePath: imgPod.storagePath,
+                  source: imgPod.source || "trailer_images",
+                },
+                podOnlyFiles: [{
+                  storagePath: imgPod.storagePath,
+                  source: imgPod.source || "trailer_images",
+                }],
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              invoice.podOnlyFile = {
+                storagePath: imgPod.storagePath,
+                source: imgPod.source || "trailer_images",
+              };
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "power_only_trailer_pod",
+                stepStatus: "success",
+                output: {
+                  storagePath: imgPod.storagePath,
+                  pageCount: imgPod.pageCount || null,
+                },
+              });
+            }
+          }
+
+          // First Primus action after load resolution: upload carrier bill +
+          // POD (when available) before amount / additional-charge / rate
+          // holds.
+          const podPathForUpload =
             (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
             (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
             null;
-            if (!podStoragePath && maybeBuildPodFromTrailerImages) {
-              const imgPod = await maybeBuildPodFromTrailerImages(
-                  invoiceId, invoice);
-              if (imgPod && imgPod.storagePath) {
-                podStoragePath = imgPod.storagePath;
-                extractedPodOnlyFile = imgPod;
-                hasLocalPod = true;
-                await invoiceDoc.ref.update({
-                  podOnlyFile: {
-                    storagePath: imgPod.storagePath,
-                    source: imgPod.source || "trailer_images",
-                  },
-                  podOnlyFiles: [{
-                    storagePath: imgPod.storagePath,
-                    source: imgPod.source || "trailer_images",
-                  }],
-                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                });
-                await logWorkflowStep({
-                  invoiceId,
-                  stepName: "power_only_trailer_pod",
-                  stepStatus: "success",
-                  output: {
-                    storagePath: imgPod.storagePath,
-                    pageCount: imgPod.pageCount || null,
-                  },
-                });
-              }
-            }
-            if (podStoragePath) {
-              const podB64 = await downloadStorageFileBase64(podStoragePath);
-              if (podB64) {
-                const marked = await ensurePodMarkedOnPrimus({
-                  booking: bookingForMode,
-                  loadNumber: invoice.loadNumber,
-                  podPdf: {
-                    buffer: Buffer.from(podB64, "base64"),
-                    filename: `pod-${invoice.loadNumber}.pdf`,
-                  },
-                });
-                if (marked.hasPod) {
-                  hasPrimusPod = true;
-                  const steps = Object.assign({}, invoice.primusSteps || {}, {
-                    podUploaded: true,
-                  });
-                  await invoiceDoc.ref.update({
-                    podOnPrimusAlready: true,
-                    podPrimusDriveIds: marked.driveIds || [],
-                    primusSteps: steps,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                  });
-                  invoice.podOnPrimusAlready = true;
-                  invoice.primusSteps = steps;
-                }
-                await logWorkflowStep({
-                  invoiceId,
-                  stepName: "power_only_pod_marked",
-                  stepStatus: marked.hasPod ? "success" : "failed",
-                  output: {
-                    uploaded: marked.uploaded || false,
-                    hasPod: marked.hasPod || false,
-                    reason: marked.reason || marked.error || null,
-                  },
-                });
-              }
-            }
-          }
+          await uploadPaperworkEarly({
+            invoice,
+            invoiceDoc,
+            invoiceId,
+            primusSteps,
+            booking: bookingForMode,
+            podStoragePath: podPathForUpload,
+          });
+          hasPrimusPod = Boolean(
+              hasPrimusPod ||
+            primusSteps.podUploaded ||
+            invoice.podOnPrimusAlready);
 
           // Power Only without POD marked on Primus — do not process invoice.
           if (isPowerOnly && !hasPrimusPod) {
@@ -1648,6 +1656,81 @@ exports.processPrimusWorkflow = onRequest(
           }
         }
 
+        // Pause / fail review holds only AFTER carrier bill + POD upload.
+        // An invoice awaiting the A/B/C/D additional-charge decision must
+        // not be failed — the decision buttons clear the charge arrays and
+        // restart the workflow.
+        if (invoice.additionalCharge &&
+            !invoice.additionalCharge.decision) {
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "additional_charge_gate",
+            stepStatus: "skipped",
+            reason: "Awaiting A/B/C/D additional-charge decision",
+          });
+          await invoiceDoc.ref.update({
+            processingLock: false,
+            finalWorkflowStatus: "additional_charge_pending_approval",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          return res.json({
+            ok: false,
+            error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
+          });
+        }
+
+        if (
+          Array.isArray(invoice.unrecognizedCharges) &&
+      invoice.unrecognizedCharges.length > 0
+        ) {
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "unrecognized_charges_check",
+            stepStatus: "failed",
+            reason: "Unrecognized charges detected",
+            input: {unrecognizedCharges: invoice.unrecognizedCharges},
+            error: "UNRECOGNIZED_CHARGES",
+          });
+
+          await invoiceDoc.ref.update({
+            decisionStage: "unrecognized_charges",
+            decisionReason: "Unrecognized charges detected",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          return res.json({
+            ok: false,
+            error: "UNRECOGNIZED_CHARGES",
+          });
+        }
+
+        if (Array.isArray(invoice.chargesNeedProof) &&
+        invoice.chargesNeedProof.length > 0) {
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "charges_proof_check",
+            stepStatus: "failed",
+            reason: "Extra charges present with no proof",
+            input: {chargesNeedProof: invoice.chargesNeedProof},
+            error: "CHARGES_NO_PROOF",
+          });
+
+          await invoiceDoc.ref.update({
+            decisionStage: "charges_no_proof",
+            decisionReason: "Extra charges present with no proof",
+            processingLock: false,
+            finalWorkflowStatus: "failed",
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+
+          return res.json({
+            ok: false,
+            error: "CHARGES_NO_PROOF",
+          });
+        }
+
         if (!skipToCustomerEmail) {
           if (maybeNotifyLisaPodDiscrepancy) {
             const podPathForReview =
@@ -1829,13 +1912,6 @@ exports.processPrimusWorkflow = onRequest(
           });
 
           await setWorkflowHeartbeat(invoiceDoc.ref, "amount_validated");
-
-          await uploadCarrierBillEarly({
-            invoice,
-            invoiceDoc,
-            invoiceId,
-            primusSteps,
-          });
 
           // Extra charges (e.g. lumper) are never auto-added to the customer
           // invoice, even when their proof checks out — a human must decide
@@ -2091,11 +2167,7 @@ exports.processPrimusWorkflow = onRequest(
         // PRO is optional for FTL; workflow proceeds on load number alone.
 
         const runBillingPipeline = !skipToCustomerEmail &&
-            (!currentStep || currentStep === "mark_delivered" ||
-        currentStep === "check_customer" ||
-        currentStep === "approve_bill" ||
-        currentStep === "get_rate" ||
-        currentStep === "generate_invoice");
+            workflowErrors.shouldRunBillingPipelineOnResume(currentStep);
         const runCustomerEmailStep =
             skipToCustomerEmail || runBillingPipeline ||
             currentStep === "send_customer_email";
@@ -2152,11 +2224,7 @@ exports.processPrimusWorkflow = onRequest(
               primusSteps.amountValidated = primusSteps.amountValidated || true;
             }
           } else if (runBillingPipeline) {
-            if (!currentStep || currentStep === "mark_delivered" ||
-        currentStep === "check_customer" ||
-        currentStep === "approve_bill" ||
-        currentStep === "get_rate" ||
-        currentStep === "generate_invoice") {
+            if (workflowErrors.shouldRunBillingPipelineOnResume(currentStep)) {
               // Skip if already marked delivered (from primusSteps or
               // Primus duplicate)
               if (primusSteps.shipmentDelivered) {
@@ -3499,6 +3567,23 @@ exports.processPrimusWorkflow = onRequest(
             qbBillingSynced: !!primusSteps.qbBillingSynced,
           });
         } // end runCustomerEmailStep
+
+        await writeLog("warn", "workflow",
+            "Workflow ended without billing or customer email step", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              currentStep,
+              skipToCustomerEmail,
+            });
+        await invoiceDoc.ref.update({
+          processingLock: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return res.status(500).json({
+          ok: false,
+          error: "WORKFLOW_STEP_NOT_RUN",
+          currentStep,
+        });
       } catch (error) {
         const invoiceId = (req.body && req.body.invoiceId) || null;
         try {

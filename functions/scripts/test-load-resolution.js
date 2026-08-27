@@ -147,6 +147,34 @@ check("labeled PRO extracted from body",
 check("body without load label has no load",
     labeledPro.loadNumber, null);
 
+const prohibitedBody = lr.extractLoadHintsFromEmailText(
+    "New Open Invoices",
+    "Accessorial charges may be Prohibited per tariff rules.");
+check("Prohibited body does not extract hibited PRO",
+    prohibitedBody.proNumber, null);
+check("hibited is not a plausible PRO",
+    lr.isPlausibleCarrierPro("hibited"), false);
+check("letter-only token is not plausible PRO",
+    lr.isPlausibleCarrierPro("ABCDEF"), false);
+check("numeric PRO still plausible",
+    lr.isPlausibleCarrierPro("696469179"), true);
+check("PRO with dashes still plausible",
+    lr.isPlausibleCarrierPro("422-025-965"), true);
+check("alphanumeric OTR PRO rejected",
+    lr.isPlausibleCarrierPro("OTR-24633649"), false);
+check("OTR PRO cleared during normalization",
+    lr.normalizeCarrierReferenceFields({
+      loadNumber: "265644",
+      proNumber: "OTR-24633649",
+    }).proNumber, "");
+check("BOL before PRO in lookup keys",
+    lr.buildPrimusLookupKeys({
+      loadNumber: "",
+      proNumber: "696469179",
+      carrierBolNumber: "263645",
+    }).map((k) => k.label),
+    ["carrier_bol", "pro"]);
+
 const emptyInvoice = lr.applyEmailLoadHintsToInvoice({
   loadNumber: "",
   proNumber: "",
