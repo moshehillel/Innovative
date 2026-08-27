@@ -56,6 +56,19 @@ check("labels L:40 x H:57 x W:48",
 check("unlabeled 48*40*28 written order",
     lwhOnly(freightDims.parseDimTripleString("48*40*28")),
     {length: 48, width: 40, height: 28});
+check("legend 40 x 20 x 96 in (W x H x L)",
+    lwhOnly(freightDims.parseDimTripleString("40 x 20 x 96 in (W x H x L)")),
+    {length: 96, width: 40, height: 20});
+check("legend 40x20x96 (W x H x L)",
+    lwhOnly(freightDims.parseDimTripleString("40x20x96 (W x H x L)")),
+    {length: 96, width: 40, height: 20});
+check("unlabeled 40x20x96 stays written order",
+    lwh(plt(40, 20, 96)), [40, 20, 96]);
+check("email legend remaps AI 40x20x96",
+    lwh(freightDims.applyEmailDimOrderLegend(
+        {qty: 1, dimType: "PLT", length: 40, width: 20, height: 96},
+        "Dimensions: 40 x 20 x 96 in (W x H x L)")),
+    [96, 40, 20]);
 check("scattered H: 57 L: 40 W: 48",
     freightDims.parseAxisLabeledDims("H: 57 in\nL: 40 in\nW: 48 in"),
     {length: 40, width: 48, height: 57});

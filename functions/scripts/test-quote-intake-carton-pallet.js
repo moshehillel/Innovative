@@ -432,6 +432,22 @@ check("LTLFlow L/W/H any order", [
   ltlHFirst[0] && ltlHFirst[0].height,
 ], [40, 48, 57]);
 
+const comfortel = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 231, dimType: "PLT",
+      length: 40, width: 20, height: 96,
+    }],
+  }],
+}, {
+  body: "Dimensions: 40 x 20 x 96 in (W x H x L)\nWeight: 231 lbs",
+});
+check("Comfortel (W x H x L) → 96x40x20", [
+  comfortel.lanes[0].freightInfo[0].length,
+  comfortel.lanes[0].freightInfo[0].width,
+  comfortel.lanes[0].freightInfo[0].height,
+], [96, 40, 20]);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

@@ -89,21 +89,128 @@ const DIM_TOKEN_RE =
 
 /**
  * Parse "40x57x48", "40L x 57H x 48W", "L 40 x H 57 x W 48",
- * "L:40 x H:57 x W:48" into L/W/H.
+ * "40 x 20 x 96 in (W x H x L)" into L/W/H.
  * @param {string} text Dim triple.
  * @return {{length: number, width: number, height: number, labeled: boolean}|null}
  */
 function parseDimTripleString(text) {
+  const raw = String(text || "");
+  const order = parseAxisOrderLegend(raw);
+  const stripped = raw
+      .replace(AXIS_ORDER_RE, " ")
+      .replace(/\b(?:in(?:ches)?|cm|cms)\b/gi, " ")
+      .replace(/[()]/g, " ");
   const re = new RegExp(
-      "^\\s*" + DIM_TOKEN_RE + "\\s*[x×*]\\s*" + DIM_TOKEN_RE +
-      "\\s*[x×*]\\s*" + DIM_TOKEN_RE + "\\s*$",
+      DIM_TOKEN_RE + "\\s*[x×*]\\s*" + DIM_TOKEN_RE +
+      "\\s*[x×*]\\s*" + DIM_TOKEN_RE,
       "i");
-  const m = String(text || "").match(re);
+  const m = stripped.match(re);
   if (!m) return null;
   const dims = dimsFromOptionalLabels(
       m[2], m[1] || m[3], m[5], m[4] || m[6], m[8], m[7] || m[9]);
   if (!(dims.length > 0 && dims.width > 0 && dims.height > 0)) return null;
+  if (dims.labeled) return dims;
+  if (order) {
+    const mapped = dimsFromAxisOrder(
+        dims.length, dims.width, dims.height, order);
+    if (mapped) return mapped;
+  }
   return dims;
+}
+
+/** W x H x L / length x width x height, optional parentheses. */
+const AXIS_ORDER_RE = new RegExp(
+    "\\(?\\s*" + AXIS_TOKEN + "\\s*[x×*]\\s*" + AXIS_TOKEN +
+    "\\s*[x×*]\\s*" + AXIS_TOKEN + "\\s*\\)?",
+    "i");
+
+/**
+ * Parse an axis-order legend like (W x H x L) or LxWxH.
+ * @param {string} text Nearby text.
+ * @return {Array<"l"|"w"|"h">|null}
+ */
+function parseAxisOrderLegend(text) {
+  const m = String(text || "").match(AXIS_ORDER_RE);
+  if (!m) return null;
+  const axes = [
+    dimAxisFromToken(m[1]),
+    dimAxisFromToken(m[2]),
+    dimAxisFromToken(m[3]),
+  ];
+  if (!axes[0] || !axes[1] || !axes[2]) return null;
+  if (new Set(axes).size !== 3) return null;
+  return axes;
+}
+
+/**
+ * @param {*} n1 First number (in legend order).
+ * @param {*} n2 Second number.
+ * @param {*} n3 Third number.
+ * @param {Array<"l"|"w"|"h">} axes Legend axes.
+ * @return {{length: number, width: number, height: number, labeled: boolean}|null}
+ */
+function dimsFromAxisOrder(n1, n2, n3, axes) {
+  if (!axes || axes.length !== 3) return null;
+  const nums = [Number(n1), Number(n2), Number(n3)];
+  const map = {l: null, w: null, h: null};
+  for (let i = 0; i < 3; i++) {
+    if (!(nums[i] > 0) || !axes[i]) return null;
+    map[axes[i]] = nums[i];
+  }
+  if (map.l > 0 && map.w > 0 && map.h > 0) {
+    return {length: map.l, width: map.w, height: map.h, labeled: true};
+  }
+  return null;
+}
+
+/**
+ * If the email has "40 x 20 x 96 in (W x H x L)" and the row holds those
+ * three numbers in any slots, remap to L×W×H from the legend.
+ * @param {object} row Freight row.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyEmailDimOrderLegend(row, body) {
+  if (!row || typeof row !== "object") return row;
+  if (!isPalletPackaging(row)) return row;
+  const L = Number(row.length);
+  const W = Number(row.width);
+  const H = Number(row.height);
+  if (!(L > 0 && W > 0 && H > 0)) return row;
+  const parsed = findLegendDimInText(body);
+  if (!parsed) return row;
+  const a = [L, W, H].slice().sort((x, y) => x - y);
+  const b = [parsed.length, parsed.width, parsed.height].slice()
+      .sort((x, y) => x - y);
+  if (a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2]) return row;
+  return {
+    ...row,
+    length: parsed.length,
+    width: parsed.width,
+    height: parsed.height,
+    dimAxesLabeled: true,
+  };
+}
+
+/**
+ * First "N x N x N in (W x H x L)" (parens optional) in the email.
+ * @param {string} text Body.
+ * @return {{length: number, width: number, height: number, labeled: boolean}|null}
+ */
+function findLegendDimInText(text) {
+  const re = new RegExp(
+      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)" +
+      "\\s*(?:in(?:ches)?|cm|cms)?\\s*" +
+      "\\(?\\s*" + AXIS_TOKEN + "\\s*[x×*]\\s*" + AXIS_TOKEN +
+      "\\s*[x×*]\\s*" + AXIS_TOKEN + "\\s*\\)?",
+      "gi");
+  const m = re.exec(String(text || ""));
+  if (!m) return null;
+  return dimsFromAxisOrder(m[1], m[2], m[3], [
+    dimAxisFromToken(m[4]),
+    dimAxisFromToken(m[5]),
+    dimAxisFromToken(m[6]),
+  ]);
 }
 
 /**
@@ -340,6 +447,9 @@ module.exports = {
   dimsFromOptionalLabels,
   parseDimTripleString,
   parseAxisLabeledDims,
+  parseAxisOrderLegend,
+  applyEmailDimOrderLegend,
+  findLegendDimInText,
   dimAxisFromToken,
   reorderMisplacedPalletDims,
   normalizePalletDims,

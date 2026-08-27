@@ -402,7 +402,9 @@ function quoteExtractSystemPrompt() {
     "  Store L×W×H. If dims are labeled — Length/Width/Height OR just",
     "  L/W/H (L: 40, W 57, H 48, 40L x 57H x 48W, L 40 x H 57 x W 48)",
     "  — map by label, not written order. L/W/H means the same as",
-    "  length/width/height.",
+    "  length/width/height. If they put the order in parentheses after",
+    "  the numbers — e.g. 40 x 20 x 96 in (W x H x L) — that is the",
+    "  order of the three numbers (store length 96, width 40, height 20).",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
     "  If unlabeled numbers include 40 and 48 anywhere (e.g. 40x57x48",
     "  or 57x40x48), those are L and W (store 40x48); the other number",
@@ -1880,7 +1882,8 @@ function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     lane.freightInfo = rows.map((row) => {
       const base = row && typeof row === "object" ? {...row} : {};
-      const next = freightDims.normalizePalletDims(base, dimOpts);
+      const withLegend = freightDims.applyEmailDimOrderLegend(base, body);
+      const next = freightDims.normalizePalletDims(withLegend, dimOpts);
       if (freightDims.palletDimsWereDefaulted(base, next)) {
         defaultedDims = true;
       }
