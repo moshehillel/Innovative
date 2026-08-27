@@ -19,7 +19,7 @@ const checkTrue = (name, cond) => {
   console.log(`${cond ? "PASS" : "FAIL"} ${name}`);
 };
 
-check("model is gpt-5.6-sol", chat.RULES_CHAT_MODEL, "gpt-5.6-sol");
+check("model is gpt-5.6-luna", chat.RULES_CHAT_MODEL, "gpt-5.6-luna");
 
 check("can you add is not email-identify",
     chat.parseIdentifyChoiceAnswer(
@@ -30,6 +30,209 @@ check("cannot-be button is address",
     chat.parseIdentifyChoiceAnswer(
         "Cannot be — address / site classification only"),
     "address_only");
+
+checkTrue("yeah that's it confirms",
+    chat.parseNaturalConfirmation("yeah that's it", {pendingProposal: true}));
+checkTrue("sounds good confirms",
+    chat.parseNaturalConfirmation("sounds good", {pendingProposal: true}));
+checkTrue("go ahead confirms",
+    chat.parseNaturalConfirmation("go ahead", {pendingProposal: true}));
+checkTrue("that's right confirms",
+    chat.parseNaturalConfirmation("that's right", {pendingProposal: true}));
+checkTrue("yep confirms",
+    chat.parseNaturalConfirmation("yep", {pendingProposal: true}));
+checkTrue("no wait rejects",
+    chat.parseNaturalRejection("no wait"));
+checkTrue("confirm without pending",
+    chat.parseNaturalConfirmation("confirm"));
+checkTrue("yes please is not reject",
+    !chat.parseNaturalRejection("yes please"));
+checkTrue("yes but only when is not confirm",
+    !chat.parseNaturalConfirmation(
+        "yes, but only when the customer is Brumis Imports Inc",
+        {pendingProposal: true}));
+checkTrue("for this rule is refinement",
+    chat.looksLikeRuleRefinement(
+        "for this rule, when pickup is La Mirada use zip 90670"));
+
+const jaredLaMiradaMsg = [{
+  role: "user",
+  content: "When pickup is La Mirada and it comes from Jared berman, use zip 90670",
+}];
+const jaredZipOut = chat.buildZipFillProposal(jaredLaMiradaMsg, [
+  {
+    id: "sender_jared_berman",
+    ruleKind: "sender_customer",
+    customerName: "Brumis Imports Inc",
+    fromNames: ["jared berman"],
+    match: {fromEmails: ["jared.berman@corehome.com"]},
+  },
+]);
+checkTrue("jared la mirada zip fill intent",
+    chat.looksLikeZipFillIntent(jaredLaMiradaMsg));
+checkTrue("jared la mirada includes sender email",
+    jaredZipOut && jaredZipOut.proposal && jaredZipOut.proposal.patch &&
+    jaredZipOut.proposal.patch.match &&
+    Array.isArray(jaredZipOut.proposal.patch.match.fromEmails) &&
+    jaredZipOut.proposal.patch.match.fromEmails
+        .includes("jared.berman@corehome.com"));
+
+const refineAfterApply = [
+  {role: "user", content: "when pickup is La Mirada use zip 90670"},
+  {role: "assistant", content: "Applied: saved \"zip_fill_la_mirada_origin\"."},
+  {role: "assistant", content: "[APPLIED] Saved rule \"zip_fill_la_mirada_origin\" via Confirm (applyQuoteRule ok)."},
+  {role: "user", content: "yes, but only when the customer is Brumis Imports Inc"},
+];
+const refineOut = chat.buildRuleRefinementProposal(refineAfterApply, [{
+  id: "zip_fill_la_mirada_origin",
+  ruleKind: "zip_fill",
+  applyTo: "origin",
+  fillZipCode: "90670",
+  match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+}]);
+check("refine after apply action",
+    refineOut && refineOut.action, "propose_update_rule");
+check("refine after apply customer",
+    refineOut && refineOut.proposal && refineOut.proposal.patch &&
+    refineOut.proposal.patch.customerName, "Brumis Imports Inc");
+checkTrue("refine not vague guess",
+    refineOut && !/Do you mean you want a quote rule/i.test(refineOut.reply || ""));
+checkTrue("refine after apply asks Confirm to save this update",
+    refineOut && /Confirm to save this update/i.test(refineOut.reply || ""));
+
+const pendingLaMirada = {
+  action: "propose_create_rule",
+  ruleId: "zip_fill_la_mirada_origin",
+  patch: {
+    active: true,
+    priority: 3,
+    name: "La Mirada, CA pickup → ZIP 90670",
+    ruleKind: "zip_fill",
+    identifyVia: "ai",
+    applyTo: "origin",
+    match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+    fillZipCode: "90670",
+    addAccessorials: [],
+    autoApply: true,
+    requiresConfirm: false,
+  },
+};
+const pendingRefineMsgs = [
+  {role: "user", content: "When pickup is La Mirada use zip 90670"},
+  {role: "assistant", content: "Proposed La Mirada pickup ZIP 90670."},
+  {role: "user", content: "yes, but only when the customer is Brumis Imports Inc"},
+];
+const pendingRefineOut = chat.buildRuleRefinementProposal(
+    pendingRefineMsgs, [], pendingLaMirada, {});
+check("pending refine keeps create action",
+    pendingRefineOut && pendingRefineOut.action, "propose_create_rule");
+check("pending refine adds Brumis",
+    pendingRefineOut && pendingRefineOut.proposal &&
+    pendingRefineOut.proposal.patch &&
+    pendingRefineOut.proposal.patch.customerName,
+    "Brumis Imports Inc");
+checkTrue("pending refine does not auto-apply",
+    !(pendingRefineOut && pendingRefineOut.confirmApply));
+checkTrue("pending refine Confirm to save this rule",
+    pendingRefineOut &&
+    /Confirm to save this rule/i.test(pendingRefineOut.reply || ""));
+checkTrue("pending refine not update wording spam",
+    pendingRefineOut &&
+    !/Confirm to save this update/i.test(pendingRefineOut.reply || ""));
+
+checkTrue("resolveChatTurns accepts history alias",
+    chat.resolveChatTurns({
+      history: [{role: "user", content: "hello"}],
+    }).length === 1);
+
+check("lastAppliedRule resolves refinement target",
+    chat.resolveReferencedRuleId(
+        {lastAppliedRule: {ruleId: "zip_fill_la_mirada_stg", ruleKind: "zip_fill"}},
+        [],
+        null,
+        []),
+    "zip_fill_la_mirada_stg");
+
+check("lastProposedRule used when no applied yet",
+    chat.resolveReferencedRuleId(
+        {lastProposedRule: {ruleId: "zip_fill_la_mirada_origin"}},
+        [],
+        null,
+        []),
+    "zip_fill_la_mirada_origin");
+
+check("findRecentProposedRuleId from PROPOSED marker",
+    chat.findRecentProposedRuleId([
+      {role: "assistant", content: "[PROPOSED] ruleId=\"zip_fill_la_mirada_stg\" action=\"propose_create_rule\" kind=\"zip_fill\""},
+    ]),
+    "zip_fill_la_mirada_stg");
+
+const refineViaAppliedObj = chat.buildRuleRefinementProposal(
+    [{role: "user", content: "yes, but only when the customer is Brumis Imports Inc"}],
+    [{
+      id: "zip_fill_la_mirada_stg",
+      ruleKind: "zip_fill",
+      applyTo: "origin",
+      fillZipCode: "90670",
+      match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+    }],
+    null,
+    {lastAppliedRule: {ruleId: "zip_fill_la_mirada_stg", ruleKind: "zip_fill"}},
+);
+check("refine via lastAppliedRule object",
+    refineViaAppliedObj && refineViaAppliedObj.proposal &&
+    refineViaAppliedObj.proposal.ruleId,
+    "zip_fill_la_mirada_stg");
+
+const laMiradaStgRule = {
+  id: "zip_fill_la_mirada_stg",
+  ruleKind: "zip_fill",
+  applyTo: "origin",
+  fillZipCode: "90670",
+  name: "La Mirada CA pickup → ZIP 90670",
+  match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+};
+
+check("quoted rule matches zip_fill_la_mirada_stg",
+    chat.findRuleByDescriptionMatch(
+        "for this rule, • 'When pickup is La Mirada use zip 90670'",
+        [laMiradaStgRule]),
+    "zip_fill_la_mirada_stg");
+
+checkTrue("for this rule bullet is refinement",
+    chat.looksLikeRuleRefinement(
+        "for this rule, • 'When pickup is La Mirada use zip 90670'"));
+
+checkTrue("zip fill intent blocked on for-this-rule quote",
+    !chat.looksLikeZipFillIntent([{
+      role: "user",
+      content: "for this rule, • 'When pickup is La Mirada use zip 90670'",
+    }]));
+
+const screenshotFlow = [
+  {role: "user", content: "When pickup is La Mirada use zip 90670"},
+  {role: "assistant", content: "Applied: saved \"zip_fill_la_mirada_stg\"."},
+  {role: "assistant", content: "[APPLIED] Saved rule \"zip_fill_la_mirada_stg\" via Confirm (applyQuoteRule ok)."},
+  {role: "user", content: "yes, but only when the customer is Brumis Imports Inc"},
+  {role: "user", content: "for this rule, • 'When pickup is La Mirada use zip 90670'"},
+];
+const screenshotRefine = chat.buildRuleRefinementProposal(
+    screenshotFlow, [laMiradaStgRule], null,
+    {lastAppliedRule: {ruleId: "zip_fill_la_mirada_stg", ruleKind: "zip_fill"}});
+check("screenshot flow updates stg rule",
+    screenshotRefine && screenshotRefine.proposal &&
+    screenshotRefine.proposal.ruleId,
+    "zip_fill_la_mirada_stg");
+check("screenshot flow adds Brumis customer",
+    screenshotRefine && screenshotRefine.proposal &&
+    screenshotRefine.proposal.patch &&
+    screenshotRefine.proposal.patch.customerName,
+    "Brumis Imports Inc");
+check("screenshot flow is update not create",
+    screenshotRefine && screenshotRefine.action,
+    "propose_update_rule");
+checkTrue("screenshot flow not generic zip fill repropose",
+    !(chat.buildZipFillProposal(screenshotFlow, [laMiradaStgRule])));
 
 checkTrue("delivery appointment → APD",
     chat.parseAccessorialsAnswer("also delivery appointment").includes("APD"));
@@ -205,6 +408,55 @@ checkTrue("shaya from email",
 checkTrue("shaya not protocolOnly",
     shayaOut && shayaOut.proposal.patch.protocolOnly === false);
 
+const laMiradaMsg = [{
+  role: "user",
+  content: "when pickup is La Mirada use zip 90670",
+}];
+checkTrue("la mirada is zip fill intent",
+    chat.looksLikeZipFillIntent(laMiradaMsg));
+const laMiradaOut = chat.buildZipFillProposal(laMiradaMsg, []);
+check("la mirada action create",
+    laMiradaOut && laMiradaOut.action, "propose_create_rule");
+check("la mirada fill zip",
+    laMiradaOut && laMiradaOut.proposal.patch.fillZipCode, "90670");
+check("la mirada apply origin",
+    laMiradaOut && laMiradaOut.proposal.patch.applyTo, "origin");
+checkTrue("la mirada shipper city",
+    laMiradaOut &&
+    laMiradaOut.proposal.patch.match.shipperCityContains
+        .includes("la mirada"));
+checkTrue("la mirada never asks identify",
+    laMiradaOut && !/choose one|which accessorial|\bLAD\b|\bAPD\b/i
+        .test(laMiradaOut.reply));
+
+const mosesPhrases = [
+  "mshglck@gmail.com should be registered as customer name moses",
+  "mshglck@gmail.com mapped to moses customer name",
+  "mshglck@gmail.com → moses",
+  "map mshglck@gmail.com to moses",
+];
+for (const phrase of mosesPhrases) {
+  const mosesMsg = [{role: "user", content: phrase}];
+  checkTrue(`moses intent: ${phrase.slice(0, 40)}`,
+      chat.looksLikeSenderCustomerIntent(mosesMsg));
+  const mosesOut = chat.buildSenderCustomerProposal(mosesMsg, []);
+  checkTrue(`moses propose: ${phrase.slice(0, 40)}`,
+      mosesOut && mosesOut.action === "propose_create_rule" &&
+      mosesOut.proposal && mosesOut.proposal.patch &&
+      mosesOut.proposal.patch.customerName === "moses" &&
+      mosesOut.proposal.patch.ruleKind === "sender_customer" &&
+      mosesOut.proposal.patch.identifyVia === "email" &&
+      Array.isArray(mosesOut.proposal.patch.match.fromEmails) &&
+      mosesOut.proposal.patch.match.fromEmails
+          .includes("mshglck@gmail.com") &&
+      !/please include the From|could not process/i
+          .test(mosesOut.reply || ""));
+  if (!(mosesOut && mosesOut.action === "propose_create_rule")) {
+    console.log("  phrase:", phrase);
+    console.log("  out:", mosesOut);
+  }
+}
+
 (async () => {
   const smokePhrases = [
     "add appointment delivery for military facilities",
@@ -250,6 +502,96 @@ checkTrue("shaya not protocolOnly",
     console.log("  reply:", senderSmoke && senderSmoke.reply);
     console.log("  patch:", senderSmoke && senderSmoke.proposal &&
       senderSmoke.proposal.patch);
+  }
+
+  for (const phrase of mosesPhrases) {
+    const mosesSmoke = await chat.runQuoteRulesChatTurn({
+      messages: [{role: "user", content: phrase}],
+      existingRules: [],
+    });
+    const mosesOk = mosesSmoke &&
+      mosesSmoke.action === "propose_create_rule" &&
+      mosesSmoke.proposal &&
+      mosesSmoke.proposal.patch &&
+      mosesSmoke.proposal.patch.customerName === "moses" &&
+      mosesSmoke.proposal.patch.match &&
+      Array.isArray(mosesSmoke.proposal.patch.match.fromEmails) &&
+      mosesSmoke.proposal.patch.match.fromEmails
+          .includes("mshglck@gmail.com") &&
+      !/please include the From|could not process/i
+          .test(mosesSmoke.reply || "");
+    checkTrue(`smoke moses: ${phrase.slice(0, 48)}`, mosesOk);
+    if (!mosesOk) {
+      console.log("  phrase:", phrase);
+      console.log("  action:", mosesSmoke && mosesSmoke.action);
+      console.log("  reply:", mosesSmoke && mosesSmoke.reply);
+    }
+  }
+
+  const laMiradaSmoke = await chat.runQuoteRulesChatTurn({
+    messages: laMiradaMsg,
+    existingRules: [],
+  });
+  const laMiradaOk = laMiradaSmoke &&
+    laMiradaSmoke.action === "propose_create_rule" &&
+    laMiradaSmoke.proposal &&
+    laMiradaSmoke.proposal.patch &&
+    laMiradaSmoke.proposal.patch.fillZipCode === "90670" &&
+    laMiradaSmoke.proposal.patch.ruleKind === "zip_fill" &&
+    !/choose one|could not process/i.test(laMiradaSmoke.reply || "");
+  checkTrue("smoke: la mirada zip fill", laMiradaOk);
+  if (!laMiradaOk) {
+    console.log("  action:", laMiradaSmoke && laMiradaSmoke.action);
+    console.log("  reply:", laMiradaSmoke && laMiradaSmoke.reply);
+    console.log("  patch:", laMiradaSmoke && laMiradaSmoke.proposal &&
+      laMiradaSmoke.proposal.patch);
+  }
+
+  const pendingCreate = {
+    action: "propose_create_rule",
+    ruleId: "zip_fill_la_mirada_origin",
+    patch: {
+      active: true,
+      priority: 3,
+      name: "La Mirada, CA pickup → ZIP 90670",
+      ruleKind: "zip_fill",
+      identifyVia: "ai",
+      applyTo: "origin",
+      match: {shipperCityContains: ["la mirada"], shipperState: "CA"},
+      fillZipCode: "90670",
+      addAccessorials: [],
+      autoApply: true,
+      requiresConfirm: false,
+    },
+  };
+  const pendingRefineTurn = await chat.runQuoteRulesChatTurn({
+    messages: [
+      {role: "user", content: "When pickup is La Mirada use zip 90670"},
+      {role: "assistant", content: "Proposed La Mirada pickup ZIP 90670."},
+      {
+        role: "user",
+        content: "yes, but only when the customer is Brumis Imports Inc",
+      },
+    ],
+    existingRules: [],
+    pendingProposal: pendingCreate,
+  });
+  const pendingRefineOk = pendingRefineTurn &&
+    pendingRefineTurn.action === "propose_create_rule" &&
+    !pendingRefineTurn.confirmApply &&
+    pendingRefineTurn.proposal &&
+    pendingRefineTurn.proposal.patch &&
+    pendingRefineTurn.proposal.patch.customerName === "Brumis Imports Inc" &&
+    pendingRefineTurn.proposal.patch.fillZipCode === "90670" &&
+    /Confirm to save this rule/i.test(pendingRefineTurn.reply || "");
+  checkTrue("smoke: pending yes-but-Brumis merges create", pendingRefineOk);
+  if (!pendingRefineOk) {
+    console.log("  action:", pendingRefineTurn && pendingRefineTurn.action);
+    console.log("  confirmApply:", pendingRefineTurn &&
+      pendingRefineTurn.confirmApply);
+    console.log("  reply:", pendingRefineTurn && pendingRefineTurn.reply);
+    console.log("  patch:", pendingRefineTurn && pendingRefineTurn.proposal &&
+      pendingRefineTurn.proposal.patch);
   }
 
   if (failures) {

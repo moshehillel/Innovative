@@ -93,7 +93,7 @@ const noMatch = ac.evaluateRequoteMatch({
 });
 check("rate mismatch over $10", noMatch.matched, false);
 
-// 3. Approval email contains all four buttons (signed confirm links)
+// 3. Approval email contains all five buttons (signed confirm links)
 const email = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
   invoiceId: "inv123",
@@ -123,7 +123,7 @@ check("email shows quote number",
 check("email shows customer rate", email.html.includes("$545.00"), true);
 check("email shows customer rate label",
     email.html.includes("Customer rate (Primus)"), true);
-for (const opt of ["a", "b", "c", "d"]) {
+for (const opt of ["a", "b", "c", "d", "e"]) {
   check(`button ${opt} has action`,
       email.html.includes("additionalChargeAction") &&
       email.html.includes(`invoiceId=inv123`) &&
@@ -133,8 +133,65 @@ for (const opt of ["a", "b", "c", "d"]) {
       true);
 }
 check("subject has load", email.subject.includes("264172"), true);
+check("subject uses ASCII hyphen (no em dash)",
+    !email.subject.includes("\u2014") && email.subject.includes(" - "), true);
+check("button A label mentions auto-email",
+    email.html.includes("auto-email customer"), true);
+check("button B label mentions updated rate / dispatcher",
+    email.html.includes("enter updated rate") &&
+    email.html.includes("dispatcher notifies customer"), true);
+check("button E label mentions no separate notification",
+    email.html.includes("no separate customer notification"), true);
+check("footer explains E vs A",
+    email.html.includes("like A") &&
+    email.html.includes("no separate customer notification") &&
+    email.html.includes("included when the customer invoice is sent"), true);
+check("email HTML has no raw em dash",
+    !email.html.includes("\u2014") && !email.html.includes("â€"), true);
 
-// 4. Dispute draft
+// 3b. Option A amount parsing
+const badA = ac.parseCustomerChargeAmountFromRequest({});
+check("option A missing amount fails", badA.ok, false);
+const zeroA = ac.parseCustomerChargeAmountFromRequest({
+  customerChargeAmount: "0",
+});
+check("option A zero amount fails", zeroA.ok, false);
+const okA = ac.parseCustomerChargeAmountFromRequest({
+  customerChargeAmount: "125.5",
+});
+check("option A amount parses", okA.ok && okA.amount === 125.5, true);
+
+// 3c. Option B dispatcher ready template
+const reminder = ac.buildDispatcherNotifyReminderEmail({
+  dispatcherName: "Sam",
+  loadNumber: "264172",
+  carrierName: "Central Transport",
+  customerName: "Miworld",
+  charges: [{label: "Reweigh Fee", amount: 120}],
+  chargesTotal: 120,
+  customerRate: 545,
+  customerBillLines: [{name: "Reweigh Fee", amount: 120}],
+});
+check("dispatcher reminder has ready template",
+    reminder.html.includes("Ready-to-send customer email"), true);
+check("dispatcher reminder has updated rate",
+    reminder.html.includes("$665.00"), true);
+check("dispatcher reminder subject ASCII",
+    !reminder.subject.includes("\u2014") &&
+    reminder.subject.includes(" - "), true);
+const forward = ac.buildDispatcherCustomerNotifyTemplate({
+  loadNumber: "264172",
+  customerName: "Miworld",
+  carrierName: "Central Transport",
+  chargesTotal: 120,
+  customerRate: 545,
+  customerBillLines: [{name: "Reweigh Fee", amount: 120}],
+  newCustomerRate: 665,
+});
+check("forward template mentions load",
+    forward.html.includes("264172"), true);
+check("forward template mentions new rate",
+    forward.html.includes("$665.00"), true);
 const dispute = ac.buildDisputeEmailDraft({
   loadNumber: "264172",
   carrierName: "Central Transport",
@@ -227,6 +284,78 @@ const emailExcluded = ac.buildAdditionalChargeApprovalEmail({
 });
 check("email notes excluded Primus charges",
     emailExcluded.html.includes("2 charge(s) already on file"), true);
+
+// 3d. W&I certificate label is single-escaped (not W&amp;amp;I)
+const emailCert = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv123",
+  loadNumber: "266614",
+  carrierName: "Central",
+  invoiceAmount: 550,
+  primusAmount: 430,
+  charges: [{label: "Reweigh Fee", amount: 120}],
+  chargesTotal: 120,
+  category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  hasCertificate: true,
+});
+check("W&I label single-escaped",
+    emailCert.html.includes("W&amp;I certificate") &&
+    !emailCert.html.includes("W&amp;amp;I"), true);
+check("subject matches Lisa example shape",
+    emailCert.subject.includes("Approval needed - additional charge on Load") &&
+    emailCert.subject.includes("266614") &&
+    emailCert.subject.includes("Weight / Reweigh / Inspection"), true);
+
+// 3e. Carrier invoice PDF attachment picker
+check("pick null when empty",
+    ac.pickCarrierInvoiceAttachment([]), null);
+check("pick null when no storagePath",
+    ac.pickCarrierInvoiceAttachment([{filename: "a.pdf"}]), null);
+const picked = ac.pickCarrierInvoiceAttachment([
+  {filename: "invoice-266614.pdf", storagePath: "invoices/a.pdf",
+    mimeType: "application/pdf"},
+  {filename: "weight-cert.pdf", storagePath: "weightCert/b.pdf",
+    mimeType: "application/pdf", docType: "WEIGHT_INSPECTION_CERT"},
+]);
+check("pick prefers invoice over weight cert",
+    picked && picked.storagePath === "invoices/a.pdf", true);
+check("pick skips cert-only list falls back",
+    ac.pickCarrierInvoiceAttachment([{
+      filename: "cert.pdf", storagePath: "weightCert/c.pdf",
+      docType: "WEIGHT_INSPECTION_CERT",
+    }]).storagePath, "weightCert/c.pdf");
+const preferredFirst = ac.pickCarrierInvoiceAttachment([
+  {filename: "carrier_invoice.pdf", storagePath: "invoices/inv.pdf"},
+  {filename: "pod-photo.jpg", storagePath: "pods/p.jpg",
+    mimeType: "image/jpeg", docType: "POD_IMAGE"},
+]);
+check("pick skips POD image",
+    preferredFirst && preferredFirst.filename === "carrier_invoice.pdf", true);
+
+// 6. Lumper validation — invoice total matches Primus (lumper included)
+const westhill = ac.validateLumperAmount({
+  invoiceAmount: 2901.20,
+  recognizedCharges: [{type: "lumper", amount: 401.20}],
+}, 2901.20);
+check("265880: total matches Primus => valid", westhill.valid, true);
+check("265880: totalMatchesPrimus flag", westhill.totalMatchesPrimus, true);
+check("265880: base still computed", westhill.baseAmount, 2500);
+
+// Base freight matches Primus when lumper is separate line item
+const baseMatch = ac.validateLumperAmount({
+  invoiceAmount: 2600,
+  recognizedCharges: [{type: "lumper", amount: 100}],
+}, 2500);
+check("base matches Primus within tolerance", baseMatch.valid, true);
+check("base match: totalMatchesPrimus false", baseMatch.totalMatchesPrimus, false);
+
+// True mismatch — neither total nor base agrees with Primus
+const realMismatch = ac.validateLumperAmount({
+  invoiceAmount: 3000,
+  recognizedCharges: [{type: "lumper", amount: 401.20}],
+}, 2500);
+check("real mismatch => invalid", realMismatch.valid, false);
+check("real mismatch difference", Math.round(realMismatch.difference), 99);
 
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

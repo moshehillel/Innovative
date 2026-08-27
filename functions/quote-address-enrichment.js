@@ -217,6 +217,33 @@ async function lookupUsZip(zip) {
 }
 
 /**
+ * Known warehouse / facility ZIPs (city|ST → zip). Used before external
+ * geocode so recurring RFQ origins (e.g. STG Santa Fe Springs) still rate
+ * when Google/Zippopotam are slow or the serving revision is stale.
+ */
+const KNOWN_CITY_STATE_ZIPS = Object.freeze({
+  "santa fe springs|ca": "90670",
+  // STG La Mirada warehouse — same rating ZIP as Santa Fe Springs.
+  "la mirada|ca": "90670",
+  "lakewood|nj": "08701",
+});
+
+/**
+ * Fast ZIP from known city/state map.
+ * @param {string} city City.
+ * @param {string} state State abbrev.
+ * @return {object|null}
+ */
+function lookupKnownCityStateZip(city, state) {
+  const c = String(city || "").trim().toLowerCase();
+  const st = String(state || "").trim().toLowerCase();
+  if (!c || !st) return null;
+  const zipCode = KNOWN_CITY_STATE_ZIPS[`${c}|${st}`];
+  if (!zipCode) return null;
+  return {city: String(city).trim(), state: String(state).trim(), zipCode};
+}
+
+/**
  * City/state (+ optional name/street) → ZIP via Google Geocoding / Places.
  * Locality-only queries often omit postal_code; include name when present.
  * Prefer space-joined queries (comma-joined "Name, City, ST" often geocodes
@@ -231,6 +258,9 @@ async function lookupZipFromCityState(party) {
   const city = String(party.city || "").trim();
   const state = String(party.state || "").trim();
   if (!city || !state) return null;
+
+  const known = lookupKnownCityStateZip(city, state);
+  if (known) return known;
 
   const apiKey = getGoogleApiKey();
   if (apiKey) {
@@ -403,6 +433,33 @@ async function placesFindZip(query, apiKey, fallbackCity, fallbackState) {
 }
 
 /**
+ * Force known warehouse city|state → ZIP even when geocode returned a
+ * different local ZIP (e.g. La Mirada 90638 → STG 90670).
+ * @param {object|null|undefined} party Address.
+ * @param {object} [lane] Optional lane to stamp "zip filled" warning.
+ * @return {object|null|undefined}
+ */
+function applyKnownWarehouseZipOverride(party, lane) {
+  if (!party || typeof party !== "object") return party;
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim();
+  const known = lookupKnownCityStateZip(city, state);
+  if (!known) return party;
+  const existing = String(party.zipCode || party.zipcode || party.zip || "")
+      .replace(/\D/g, "")
+      .slice(0, 5);
+  if (existing === known.zipCode) return party;
+  pushLaneZipWarning(lane, "zip filled");
+  return {
+    ...party,
+    city: city || known.city,
+    state: state || known.state,
+    zipCode: known.zipCode,
+    country: String(party.country || "US").trim() || "US",
+  };
+}
+
+/**
  * Fill missing city/state from ZIP so Primus can rate zip-only RFQs.
  * @param {object|null|undefined} party Address.
  * @param {object} [lane] Optional lane to stamp "zip filled" warning.
@@ -433,7 +490,10 @@ async function fillPartyCityStateFromZip(party, lane) {
 async function fillPartyZipFromCityState(party, lane) {
   if (!partyNeedsZipFromCityState(party)) return party;
   const loc = await lookupZipFromCityState(party);
-  if (!loc) return party;
+  if (!loc) {
+    pushLaneZipWarning(lane, "zip fill failed");
+    return party;
+  }
   pushLaneZipWarning(lane, "zip filled");
   const existingStreet = String(party.address1 || "").trim();
   return {
@@ -453,8 +513,10 @@ async function fillPartyZipFromCityState(party, lane) {
  * @return {Promise<object|null|undefined>}
  */
 async function fillPartyOdFromZipOrCityState(party, lane) {
-  let next = await fillPartyCityStateFromZip(party, lane);
+  let next = applyKnownWarehouseZipOverride(party, lane);
+  next = await fillPartyCityStateFromZip(next, lane);
   next = await fillPartyZipFromCityState(next, lane);
+  next = applyKnownWarehouseZipOverride(next, lane);
   return next;
 }
 
@@ -557,6 +619,15 @@ function consigneeSearchText(consignee, extraName) {
 function isMilitarySiteText(text) {
   const t = String(text || "").toLowerCase();
   if (/aafes|military exchange|army (and )?air force/.test(t)) return true;
+  // Navy / Marine exchange DCs (NEXCOM RFQs often omit "navy exchange").
+  if (/\b(nex|nexcom|navy exchange|mcx|base exchange|bx|commissary)\b/
+      .test(t)) {
+    return true;
+  }
+  // NEXCOM West Coast retail DC is often labeled "WC Retail Dist Ctr".
+  if (/\bwc\s+retail\s+dist(\.|ribution)?\s*(ctr|center)?\b/.test(t)) {
+    return true;
+  }
   if (/\bmilitary(\s+(base|bases|post|installation|facility)s?)?\b/.test(t)) {
     return true;
   }
@@ -641,11 +712,11 @@ function classifyFromNameHeuristics(consignee, extraName) {
         {residentialDelivery: false},
     );
   }
-  if (/\bhotel\b|\bmarriott\b|\bhilton\b|\bhyatt\b|\binn\b|\bsuites\b/
+  if (/\bhotel\b|\bcasino\b|\bresort\b|\bmarriott\b|\bhilton\b|\bhyatt\b|\binn\b|\bsuites\b/
       .test(text) || /\blodging\b/.test(text)) {
     return heuristicResult(
         "hotel",
-        (consignee && consignee.name) || extraName || "Hotel",
+        (consignee && consignee.name) || extraName || "Hotel / resort",
         0.9,
     );
   }
@@ -722,7 +793,7 @@ function mapGoogleTypesToSiteType(types, placeName) {
     return "nursing_home";
   }
   if (t.has("lodging") || t.has("hotel") ||
-    /hotel|marriott|hilton|hyatt|inn|suites/.test(name)) {
+    /hotel|casino|resort|marriott|hilton|hyatt|inn|suites/.test(name)) {
     return "hotel";
   }
   if ((t.has("storage") || t.has("warehouse")) &&
@@ -1408,6 +1479,16 @@ async function enrichLaneAddresses(lane, tenant, opts = {}) {
       lane.consignee = await fillPartyOdFromZipOrCityState(
           lane.consignee, lane);
     }
+    const quoteRules = opts.quoteRules;
+    if (Array.isArray(quoteRules) && quoteRules.length) {
+      const quoteAccessorialRules = require("./quote-accessorial-rules");
+      quoteAccessorialRules.applyZipFillRules(lane, quoteRules, lane, {
+        fromEmail: opts.fromEmail || lane.fromEmail || lane.from || "",
+        fromName: opts.fromName || lane.fromName || "",
+        customerName: opts.customerName ||
+          lane.customerName || lane.shippingLocationName || "",
+      });
+    }
   }
   await enrichLaneShipper(lane, tenant, opts);
   await enrichLaneConsignee(lane, tenant, opts);
@@ -1444,9 +1525,12 @@ module.exports = {
   lookupUsZip,
   lookupUsZipFromCityState,
   lookupZipFromCityState,
+  lookupKnownCityStateZip,
+  KNOWN_CITY_STATE_ZIPS,
   fillPartyCityStateFromZip,
   fillPartyZipFromCityState,
   fillPartyOdFromZipOrCityState,
+  applyKnownWarehouseZipOverride,
   partyNeedsCityStateFromZip,
   partyNeedsZipFromCityState,
 };

@@ -49,7 +49,7 @@ function secret() {
 /**
  * @param {string} action Action namespace (e.g. additionalCharge).
  * @param {string} invoiceId Firestore invoice id.
- * @param {string} option Decision option (a|b|c|d, approve|reject, …).
+ * @param {string} option Decision option (a|b|c|d|e, approve|reject, …).
  * @param {string|null} tenantId Tenant id.
  * @param {number} [expMs] Expiry epoch ms.
  * @return {string} Hex HMAC signature.

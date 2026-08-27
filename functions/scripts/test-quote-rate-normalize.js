@@ -3,6 +3,9 @@
 
 const rateShop = require("../quote-rate-shop");
 
+// Use Primus company density bands for all class lookups in this suite.
+rateShop.setDensityRulesCacheForTest(rateShop.FALLBACK_DENSITY_RULES);
+
 let failures = 0;
 const check = (name, got, exp) => {
   const pass = got === exp;
@@ -80,11 +83,30 @@ check("missing dims default W 48", missingFreight[0].width, 48);
 check("missing dims default H 60", missingFreight[0].height, 60);
 check("missing dims weightType total", missingFreight[0].weightType, "total");
 
-// Density → class (Primus-compatible NMFC table)
+// Density → class (Primus companydensityrules bands)
 check("density 24.375 → 65", rateShop.classFromDensity(24.375), 65);
 check("density 12.36 → 85", rateShop.classFromDensity(12.36), 85);
-check("density 8.34 → 110", rateShop.classFromDensity(8.342), 110);
+check("density 8.34 → 100", rateShop.classFromDensity(8.342), 100);
 check("density 5.69 → 175", rateShop.classFromDensity(5.6889), 175);
+check("density 2.05 → 250", rateShop.classFromDensity(2.05), 250);
+check("density 3.5 → 250", rateShop.classFromDensity(3.5), 250);
+check("137 lb 40x48x60 → 250", rateShop.ensureFreightClasses([{
+  qty: 1, weight: 137, weightType: "total",
+  length: 40, width: 48, height: 60, dimType: "PLT",
+}]).freightInfo[0].class, 250);
+check("density 6.576 → 125", rateShop.classFromDensity(6.576), 125);
+check("453 lb 40x48x62 → 125", rateShop.ensureFreightClasses([{
+  qty: 1, weight: 453, weightType: "total",
+  length: 40, width: 48, height: 62, dimType: "PLT", class: 175,
+}]).freightInfo[0].class, 125);
+check("503 lb 40x48x62 → 125", rateShop.ensureFreightClasses([{
+  qty: 1, weight: 503, weightType: "total",
+  length: 40, width: 48, height: 62, dimType: "PLT", class: 150,
+}]).freightInfo[0].class, 125);
+check("549 lb 40x48x62 → 125", rateShop.ensureFreightClasses([{
+  qty: 1, weight: 549, weightType: "total",
+  length: 40, width: 48, height: 62, dimType: "PLT", class: 250,
+}]).freightInfo[0].class, 125);
 check("valid class 70", rateShop.isValidFreightClass(70), true);
 check("invalid class null", rateShop.isValidFreightClass(null), false);
 check("invalid class 0", rateShop.isValidFreightClass(0), false);
@@ -93,7 +115,7 @@ const ruelily = rateShop.ensureFreightClasses([{
   qty: 2, weight: 1205, weightType: "total",
   length: 48, width: 40, height: 65, dimType: "PLT", class: null,
 }]);
-check("ruelily filled class 110", ruelily.freightInfo[0].class, 110);
+check("ruelily filled class 100", ruelily.freightInfo[0].class, 100);
 check("ruelily filled count", ruelily.filled, 1);
 check("ruelily unresolved", ruelily.unresolved.length, 0);
 check("ruelily classSource density", ruelily.freightInfo[0].classSource,
@@ -109,7 +131,7 @@ const emailClass = rateShop.ensureFreightClasses([{
   qty: 2, weight: 1205, weightType: "total",
   length: 48, width: 40, height: 65, dimType: "PLT", class: 70,
 }]);
-check("email class overwritten to 110", emailClass.freightInfo[0].class, 110);
+check("email class overwritten to 100", emailClass.freightInfo[0].class, 100);
 check("email class preserved", emailClass.freightInfo[0].emailClass, 70);
 check("email class overwritten count", emailClass.overwritten, 1);
 
@@ -129,7 +151,7 @@ const qFilled = rateShop.buildRateMultipleQuery({
   }],
 }, {UOM: "US"});
 const freightFilled = JSON.parse(qFilled.freightInfo);
-check("query auto class 110", freightFilled[0].class, 110);
+check("query auto class 100", freightFilled[0].class, 100);
 
 const kadraHits = [{
   id: 1410005738, name: "Kadra Kitchenware", customer: true,
@@ -193,6 +215,23 @@ check("sell rate keeps whole billTo",
     rateShop.computeSellRate(300, {billToTotal: 754}), 754);
 check("customer rateSource ceils fractional",
     rateShop.computeSellRate(400.01, {rateSource: "customer"}), 401);
+
+const slim = rateShop.normalizeRateRow({
+  id: "Rabc123",
+  name: "Roadrunner J&I",
+  SCAC: "RDFS",
+  total: 3033.23,
+  transitDays: 5,
+  quoteNumber: "103785203",
+  billTo: {total: 3397.22, extra: "drop-me"},
+  rateRemarks: ["Charges Grocery fee for Walmart $9 per 100 lbs, min $60."],
+  hugeNested: {x: 1},
+});
+check("slim keeps id alias", slim.id, "Rabc123");
+check("slim keeps rateId", slim.rateId, "Rabc123");
+check("slim drops nested junk", slim.hugeNested, undefined);
+check("slim billTo total only",
+    JSON.stringify(slim.billTo), "{\"total\":3397.22}");
 
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);

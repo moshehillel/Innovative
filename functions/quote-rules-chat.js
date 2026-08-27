@@ -11,10 +11,13 @@ const {
   DEFAULT_IDENTIFY_VIA,
   ACCESSORIAL_LABELS,
   RULE_KIND_SENDER_CUSTOMER,
+  RULE_KIND_ZIP_FILL,
 } = require("./quote-accessorial-rules");
 
-// Stronger than gpt-5.6-luna for freeform rule chat. Override via env.
-const RULES_CHAT_MODEL = process.env.QUOTE_RULES_CHAT_MODEL || "gpt-5.6-sol";
+// Default gpt-5.6-luna for freeform rule chat. Override via env.
+const RULES_CHAT_MODEL = process.env.QUOTE_RULES_CHAT_MODEL || "gpt-5.6-luna";
+/** Max turns sent to the model (full session when shorter). */
+const RULES_CHAT_MAX_TURNS = 50;
 
 const PATCH_FIELDS = [
   "active",
@@ -32,6 +35,8 @@ const PATCH_FIELDS = [
   "customerName",
   "protocolOnly",
   "defaultDims",
+  "fillZipCode",
+  "applyTo",
 ];
 
 const QUICK_REPLY_CAN_BE =
@@ -43,6 +48,103 @@ const IDENTIFY_QUICK_REPLIES = [
   QUICK_REPLY_CAN_BE,
   QUICK_REPLY_CANNOT_BE,
 ];
+
+/** Loose normalize for NL confirm/reject matching. */
+function normalizeChatAnswerText(text) {
+  return String(text || "")
+      .trim()
+      .replace(/^\*{1,3}\s*/, "")
+      .replace(/\s*\*{1,3}$/, "")
+      .replace(/^`+|`+$/g, "")
+      .toLowerCase()
+      .replace(/[\u2010-\u2015\u2212]/g, "-")
+      .replace(/[^\w\s'-]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
+ * User declined or wants to change a pending proposal.
+ * @param {string} text User message.
+ * @return {boolean}
+ */
+function parseNaturalRejection(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  const norm = normalizeChatAnswerText(raw);
+  if (/^(no|nope|nah|cancel|stop|wait|hold on|nevermind|never mind)\.?$/i
+      .test(raw)) {
+    return true;
+  }
+  if (/^(no|nope|nah)[,.\s-]*(wait|stop|hold on)\b/i.test(raw)) {
+    return true;
+  }
+  if (/\b(not quite|not right|that'?s wrong|wrong rule|change (it|that)|hold on|wait a sec)\b/
+      .test(norm)) {
+    return true;
+  }
+  return /\b(don'?t|do not)\s+(apply|save|confirm|do that)\b/.test(norm) ||
+    (/\b(cancel|scratch that|forget it)\b/.test(norm) && norm.length <= 80);
+}
+
+/**
+ * Natural-language confirmation — like ChatGPT/Cursor, not exact "yes".
+ * @param {string} text User message.
+ * @param {{pendingProposal?: boolean}=} opts Context hints.
+ * @return {boolean}
+ */
+function parseNaturalConfirmation(text, opts) {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+  if (looksLikeRuleRefinement(raw)) return false;
+  if (parseNaturalRejection(raw)) return false;
+  const norm = normalizeChatAnswerText(raw);
+
+  const exactAffirm = new RegExp(
+      "^(" +
+      "yes|yep|yeah|yea|yup|ok|okay|k|sure|correct|right|exactly|perfect|" +
+      "absolutely|definitely|confirmed|confirm|apply|proceed|go ahead|do it|" +
+      "save it|looks good|sounds good|that works|please do|please apply|" +
+      "go for it|make it so|do that|affirmative|" +
+      "that'?s it|that'?s right|that'?s correct|that'?s good|that'?s fine|" +
+      "that'?s perfect" +
+      ")\\.?$",
+      "i",
+  );
+  if (exactAffirm.test(raw)) return true;
+
+  const phraseAffirm = [
+    /\bthat('s| is) (right|correct|it|good|fine|perfect|what i want)\b/,
+    /\b(yes|yeah|yep|yup)[,.]?\s*(that('s| is) (right|correct|it)|go ahead|please|do it|apply|save)\b/,
+    /\b(go ahead|please apply|please save|please do|please confirm)\b/,
+    /\b(sounds|looks) good\b/,
+    /\b(i('m| am) good|we('re| are) good)\b/,
+    /\bgo for it\b/,
+    /\bdo (that|this)\b/,
+    /\bapply (that|this|it)\b/,
+    /\bsave (that|this|it)\b/,
+    /\blet'?s do (it|that)\b/,
+    /\bmake it (happen|so)\b/,
+    /\byou got it\b/,
+    /\bperfect[,.]?\s*(thanks|thank you)?\s*$/,
+  ];
+  if (phraseAffirm.some((re) => re.test(norm))) return true;
+
+  if (opts && opts.pendingProposal) {
+    // Affirm + correction ("yes but only when…") is a refinement, not apply.
+    if (/\bbut\b/.test(norm) &&
+        /\b(only|when|except|unless|customer|sender|from)\b/.test(norm)) {
+      return false;
+    }
+    if (/^(yes|yep|yeah|yup|ok|okay|sure|right|correct|perfect)\b/i
+        .test(norm)) {
+      return true;
+    }
+    if (/\b(yes|yeah|yep)\b/.test(norm) && norm.length <= 40) return true;
+  }
+
+  return false;
+}
 
 /**
  * Normalize identify-choice text for robust matching.
@@ -228,6 +330,22 @@ function userTopicBlob(messages) {
 }
 
 /**
+ * Normalize chat payload — accepts messages and/or history (full thread).
+ * @param {object} opts Request options.
+ * @return {Array<object>}
+ */
+function resolveChatTurns(opts) {
+  const raw = (opts && (opts.messages || opts.history)) || [];
+  if (!Array.isArray(raw)) return [];
+  return raw
+      .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+      .map((m) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: String(m.content || ""),
+      }));
+}
+
+/**
  * Military / AAFES phrasing, including common typos (militery, millitary).
  * @param {string} blob Lowercased user text.
  * @return {boolean}
@@ -312,25 +430,120 @@ function looksLikeMilitaryAccessorialIntent(messages) {
 }
 
 /**
- * Fallback when JSON is empty or the model is unclear. Never the old
- * "I could not process that" dead-end.
+ * Strip dead-end / robotic phrasing from model replies.
+ * @param {string} reply Raw reply text.
+ * @param {Array<object>} messages Chat turns for fallback context.
+ * @return {string}
+ */
+function sanitizeChatReply(reply, messages) {
+  let text = String(reply || "").trim();
+  if (!text) return fallbackUnclearReply(messages);
+  const bad = [
+    /\bi don'?t understand\b/i,
+    /\bi do not understand\b/i,
+    /\bi couldn'?t understand\b/i,
+    /\bi'?m not sure what you mean\b/i,
+    /\bi could not process\b/i,
+    /\btry rephrasing\b/i,
+    /\bplease rephrase\b/i,
+    /\bi'?m unable to (help|process)\b/i,
+    /\bi can'?t help with that\b/i,
+  ];
+  if (bad.some((re) => re.test(text))) {
+    return fallbackUnclearReply(messages);
+  }
+  return text;
+}
+
+/**
+ * Rejection may include a correction ("no, I meant delivery not pickup").
+ * @param {string} text User message.
+ * @return {{rejected: boolean, correction: string|null}}
+ */
+function parseRejectionWithCorrection(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return {rejected: false, correction: null};
+  if (looksLikeRuleRefinement(raw)) {
+    return {rejected: false, correction: null};
+  }
+  if (!parseNaturalRejection(raw)) {
+    return {rejected: false, correction: null};
+  }
+  const norm = normalizeChatAnswerText(raw);
+  const stripped = raw.replace(/^(no|nope|nah|wait|hold on)[,.!\s-]+/i, "")
+      .trim();
+  if (stripped.length >= 10 && stripped.toLowerCase() !== raw.toLowerCase()) {
+    return {rejected: true, correction: stripped};
+  }
+  if (/\b(i meant|should be|instead|rather|not pickup|not delivery|wrong)\b/
+      .test(norm) && raw.length >= 12) {
+    return {rejected: true, correction: raw};
+  }
+  return {rejected: true, correction: null};
+}
+
+/**
+ * Friendly reply when user rejects a pending proposal.
+ * @param {string|null} correction Optional correction text.
+ * @return {string}
+ */
+function rejectionReply(correction) {
+  if (correction) {
+    return "Oh sorry — I'll adjust. You said: \"" +
+      correction.replace(/"/g, "'") +
+      "\". Let me rework that proposal.";
+  }
+  return "Oh sorry — I'll drop that proposal. What should the rule do instead?";
+}
+
+/**
+ * Fallback when JSON is empty or the model is unclear. Never "I don't
+ * understand" — always ask naturally or propose a guess.
  * @param {Array<object>} messages Chat turns.
  * @return {string}
  */
 function fallbackUnclearReply(messages) {
   if (looksLikeSenderCustomerIntent(messages)) {
-    return "I can map a sender email to a Primus customer. " +
-      "Tell me the From address and customer name " +
-      "(and protocol only / default dims if needed).";
+    const topic = inferSenderCustomerTopic(messages);
+    if (topic && (topic.emails.length || topic.domains.length) &&
+        !topic.customerName) {
+      return "Got the sender email — which Primus customer name should " +
+        "we attach? You can also say protocol only or default dims " +
+        "(e.g. 40×48×62).";
+    }
+    return "Do you mean map a sender email to a Primus customer? " +
+      "Send the From address and customer name and I'll propose it.";
+  }
+  if (looksLikeZipFillIntent(messages)) {
+    const topic = inferZipFillTopic(messages);
+    if (topic && topic.city && !topic.zipCode) {
+      return `You mean when pickup/delivery is ${topic.city}` +
+        `${topic.state ? ", " + topic.state : ""} — which ZIP should ` +
+        "we use for rating?";
+    }
+    return "Do you mean a city→ZIP rating rule? Tell me the city and " +
+      "ZIP (e.g. La Mirada pickup → 90670) and I'll propose it.";
   }
   if (isMilitaryTopicBlob(userTopicBlob(messages))) {
-    return "I can add or update the military / AAFES site rule " +
-      "(limited access and appointment delivery). Tell me LAD, APD, " +
-      "or both and I'll propose it.";
+    return "Do you mean add or update accessorials for military / AAFES " +
+      "sites — like LAD and APD? Say which codes and I'll propose it.";
   }
-  return "Tell me the site (for example military bases) and which " +
-    "accessorials to add (LAD, APD, …), or map a sender email to a " +
-    "customer. I'll propose a rule to Confirm.";
+  if (looksLikeDeleteRuleIntent(messages)) {
+    return "Do you mean delete or turn off an existing rule? Tell me " +
+      "which one (name, site type, or sender email) and I'll propose it.";
+  }
+  const last = lastUserTurn(messages);
+  const snippet = last ?
+    String(last.content || "").trim().replace(/\s+/g, " ").slice(0, 140) :
+    "";
+  if (snippet && snippet.length >= 8) {
+    return "Do you mean you want a quote rule for: \"" + snippet + "\"? " +
+      "If I'm on the right track, add any details (site, email, " +
+      "accessorials, ZIP) and I'll propose something to confirm.";
+  }
+  return "What quote rule would you like? I handle site accessorials, " +
+    "sender→customer mapping, city→ZIP fixes, rule updates, deletes — " +
+    "describe it however you like and I'll propose it for you to confirm.";
 }
 
 /**
@@ -500,10 +713,9 @@ function buildAddressOnlyCreateProposal(messages, accessorials) {
   const name = formatCreateRuleName(topic, codes);
   const labels = codes.map((c) => ACCESSORIAL_LABELS[c] || c).join(", ");
   return {
-    reply: `Here's a proposed rule for ${topic.name} that adds ` +
-      `${labels} (identified via AI site classification, ` +
-      `match.siteType ${match.siteType || "flags"}). ` +
-      `Click Confirm to apply it.`,
+    reply: `For **${topic.name}**, I'll add ${labels} when AI classifies ` +
+      `the site as ${match.siteType || "matching flags"}. ` +
+      "Does that look right? Say yes / sounds good / go ahead, or click Confirm.",
     action: "propose_create_rule",
     proposal: {
       ruleId: topic.ruleId,
@@ -600,8 +812,7 @@ function detectCreateIdentifyGate(messages) {
     if (source === "email" && askedEmailSignals) {
       // Any substantive follow-up after we asked for signals counts.
       if (text.trim().length >= 8 &&
-          !/^(confirm(ed)?|yes|y|ok|okay|do it|apply|proceed)\.?$/i
-              .test(text.trim()) &&
+          !parseNaturalConfirmation(text) &&
           !looksLikeMilitaryAccessorialIntent(messages) &&
           !isMetaFollowUpText(text)) {
         emailSignalsListed = true;
@@ -876,9 +1087,9 @@ function buildMilitaryAccessorialProposal(messages, existingRules) {
       Object.keys(live.match).length ?
       live.match : {siteType: "aafes_military"};
     return {
-      reply: `I'll update "${live.name}" (${live.id}) so it adds ` +
-        `${labels} (match.siteType aafes_military, identified via ` +
-        `AI / address). Click Confirm to apply it.`,
+      reply: `I'll update **${live.name}** to add ${labels} for military / ` +
+        `AAFES sites (AI address classification). Look good? Say yes or ` +
+        "click Confirm to save.",
       action: "propose_update_rule",
       proposal: {
         ruleId: String(live.id),
@@ -1033,6 +1244,8 @@ function parseCustomerNameFromSenderText(text, emails) {
         .replace(/\bdefault\s+dims?\b.*$/ig, "")
         .replace(/\b\d{2}\s*[x×*]\s*\d{2}\s*[x×*]\s*\d{2,3}\b.*$/ig, "")
         .replace(/\bwhen\s+missing\b.*$/ig, "")
+        .replace(/\s+customer\s+name\s*$/ig, "")
+        .replace(/\s+customer\s*$/ig, "")
         .replace(/[,;:\s]+$/g, "")
         .replace(/\s+/g, " ")
         .trim();
@@ -1041,12 +1254,24 @@ function parseCustomerNameFromSenderText(text, emails) {
   }
 
   const patterns = [
+    // "… registered as customer name moses" / "register as customer X"
     new RegExp(
-        "\\b(?:map|match)\\s+(?:this\\s+)?(?:email|sender|from)?\\s*" +
-        "(?:to|with)\\s+(?:customer\\s+)?(?:name\\s+)?(.+?)(?:\\.|$)",
+        "\\b(?:should\\s+be\\s+)?" +
+        "regist(?:er|ered|ration)\\s+as\\s+(?:a\\s+)?" +
+        "(?:customer\\s+)?(?:name\\s+)?(.+?)(?:\\.|$)",
+        "i"),
+    // "mapped to moses customer name" / "map … to customer name X"
+    new RegExp(
+        "\\b(?:map(?:ped)?|match(?:ed)?|link(?:ed)?|" +
+        "tie(?:d)?|assign(?:ed)?)\\s+" +
+        "(?:this\\s+)?(?:email|sender|from)?\\s*" +
+        "(?:to|with|as)\\s+(?:customer\\s+)?" +
+        "(?:name\\s+)?(.+?)(?:\\.|$)",
         "i"),
     /\b(?:use|to)\s+customer\s+(?:name\s+)?(.+?)(?:\.|$)/i,
     /\b(?:customer|account)\s*(?:name)?\s*[:=]\s*(.+?)(?:\.|$)/i,
+    // "… as customer name moses" (after email / other fluff)
+    /\bas\s+(?:a\s+)?customer\s+(?:name\s+)?(.+?)(?:\.|$)/i,
     /(?:^|[\s:])(?:to|→|->|=>)\s+([A-Z][\w .&'-]{2,80})(?:[,.]|$)/,
     /\bfor\s+customer\s+(.+?)(?:\.|$)/i,
   ];
@@ -1059,8 +1284,11 @@ function parseCustomerNameFromSenderText(text, emails) {
   }
 
   // "mike.oseback@… to Mike Oseback" / "Jared … → Brumis Imports Inc"
-  const arrow = String(text || "").match(
-      /@[\w.-]+\s+(?:to|→|->|as)\s+(.+?)(?:\.|$)/i);
+  // Also "…@… mapped to moses" / "…@… registered as …"
+  const arrow = String(text || "").match(new RegExp(
+      "@[\\w.-]+\\s+(?:(?:map(?:ped)?|match(?:ed)?|" +
+      "regist(?:er|ered))\\s+)?(?:to|→|->|as)\\s+(.+?)(?:\\.|$)",
+      "i"));
   if (arrow && arrow[1]) {
     const name = cleanName(arrow[1]);
     if (name.length >= 2 && !/@/.test(name)) return name;
@@ -1107,12 +1335,13 @@ function inferSenderCustomerTopic(messages) {
   const protocolOnly = parseProtocolOnlyFromText(blob);
   const matchCcTo = parseMatchCcToFromText(blob);
   const defaultDims = parseDefaultDimsFromText(blob);
+  // Keep email/domain hits even when the name is still missing so the
+  // proposal path can ask only for the customer name (not re-ask From).
   if (!emails.length && !domains.length) return null;
-  if (!customerName && !defaultDims) return null;
   return {
     emails,
     domains,
-    customerName,
+    customerName: customerName || "",
     protocolOnly,
     matchCcTo,
     defaultDims,
@@ -1142,7 +1371,9 @@ function looksLikeSenderCustomerIntent(messages) {
   const hasEmail = extractEmailsFromText(lastText).length > 0 ||
     extractSenderDomainsFromText(lastText).length > 0;
   const mappingVerb =
-    /\b(map|match|tie|link|route|assign)\b/.test(t) ||
+    /\b(map(?:ped)?|match(?:ed)?|tie(?:d)?|link(?:ed)?|route(?:d)?)\b/
+        .test(t) ||
+    /\b(assign(?:ed)?|regist(?:er|ered|ration))\b/.test(t) ||
     /\buse\s+customer\b/.test(t) ||
     /\bwhen\s+(email\s+)?from\b/.test(t) ||
     /\bfrom\s+emails?\b/.test(t) ||
@@ -1305,11 +1536,11 @@ function buildSenderCustomerProposal(messages, existingRules) {
   if (defaultDims) patch.defaultDims = defaultDims;
 
   return {
-    reply: `Here's a sender→customer rule: ${bits.join("; ")}. ` +
+    reply: `Sender→customer mapping: ${bits.join("; ")}. ` +
       (matchCcTo ?
-        "Identified via From/Cc/To email (no site-type / accessorials). " :
-        "Identified via From email (no site-type / accessorials). ") +
-      "Click Confirm to apply it.",
+        "Matched via From/Cc/To email — no accessorials involved. " :
+        "Matched via From email — no accessorials involved. ") +
+      "Does that look right? Say yes / sounds good / go ahead, or click Confirm.",
     action: live ? "propose_update_rule" : "propose_create_rule",
     proposal: {ruleId, patch},
     quickReplies: [],
@@ -1317,7 +1548,1001 @@ function buildSenderCustomerProposal(messages, existingRules) {
 }
 
 /**
+ * Parse a 5-digit US ZIP from freeform text.
+ * @param {string} text User text.
+ * @return {string}
+ */
+function parseZipCodeFromText(text) {
+  const t = String(text || "");
+  const labeled = t.match(
+      /\b(?:zip|zipcode|postal)\s*(?:code)?\s*[:=]?\s*(\d{5})\b/i);
+  if (labeled) return labeled[1];
+  const useZip = t.match(/\buse\s+(?:zip\s+)?(\d{5})\b/i);
+  if (useZip) return useZip[1];
+  const toZip = t.match(/\b(?:to|as)\s+(?:zip\s+)?(\d{5})\b/i);
+  if (toZip) return toZip[1];
+  const all = t.match(/\b(\d{5})\b/g) || [];
+  return all.length ? all[all.length - 1] : "";
+}
+
+/**
+ * User is refining a just-proposed or just-applied rule ("yes, but only
+ * when…", "for this rule…"), not starting a new vague request.
+ * @param {string} text User message.
+ * @return {boolean}
+ */
+function looksLikeRuleRefinement(text) {
+  const raw = String(text || "").trim();
+  if (!raw || /^\[applied\]/i.test(raw)) return false;
+  const norm = normalizeChatAnswerText(raw);
+  if (/\b(for|on|to)\s+this\s+rule\b/.test(norm)) return true;
+  if (/\b(that|the)\s+rule\b/.test(norm) &&
+      /\b(only|when|add|also|limit|restrict|customer|sender)\b/.test(norm)) {
+    return true;
+  }
+  if (/\b(yes|yeah|yep|ok|okay),?\s+but\b/.test(norm)) return true;
+  if (/\bbut\s+only\s+when\b/.test(norm)) return true;
+  if (/\bonly\s+when\s+(the\s+)?(customer|sender|from|it\s+comes)\b/
+      .test(norm)) {
+    return true;
+  }
+  if (/\b(also\s+)?(require|limit|restrict)\s+(it\s+)?to\b/.test(norm)) {
+    return true;
+  }
+  if (/\b(change|edit|update|modify|tweak|adjust)\s+(that|this|the)\s+rule\b/
+      .test(norm)) {
+    return true;
+  }
+  if (/\bfor\s+this\s+rule\b/i.test(raw)) return true;
+  if (/\bthis\s+rule\b/i.test(norm) &&
+      /\b(when|pickup|pick\s*up|delivery|zip|use)\b/.test(norm)) {
+    return true;
+  }
+  if (extractQuotedRuleText(raw)) return true;
+  return false;
+}
+
+/**
+ * Quoted rule description from "for this rule, '…'" / bullet lines.
+ * @param {string} text User message.
+ * @return {string}
+ */
+function extractQuotedRuleText(text) {
+  const raw = String(text || "").replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+  const quotePatterns = [
+    /['"“”‘']([^'"“”‘'\n]{8,240})['"“”‘']/,
+    /[•\-*]\s*['"“”‘']?([^'"“”‘'\n]{8,240})['"“”‘']?\s*$/,
+  ];
+  for (const re of quotePatterns) {
+    const m = raw.match(re);
+    if (m && m[1]) {
+      const s = m[1].trim();
+      if (s.length >= 8) return s;
+    }
+  }
+  const forThis = raw.match(
+      /\bfor\s+this\s+rule[,:\s•*-]+(.+?)$/i);
+  if (forThis && forThis[1]) {
+    const s = forThis[1].replace(/^['"“”‘']+|['"“”‘']+$/g, "").trim();
+    if (s.length >= 8) return s;
+  }
+  return "";
+}
+
+/**
+ * Rule id from the most recent [APPLIED] assistant turn.
+ * @param {Array<object>} messages Chat turns.
+ * @return {string|null}
+ */
+function findLastAppliedRuleId(messages) {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    const c = String(m.content || "").trim();
+    const applied = c
+        .match(/^\[APPLIED\]\s+(?:Saved|Deleted)\s+rule\s+"([^"]+)"/i);
+    if (applied) return applied[1];
+    const appliedHuman = c.match(/^Applied:\s+(?:saved|removed)\s+"([^"]+)"/i);
+    if (appliedHuman) return appliedHuman[1];
+  }
+  return null;
+}
+
+/**
+ * Rule id from a recent assistant proposal turn ([PROPOSED] or reply text).
+ * @param {Array<object>} messages Chat turns.
+ * @return {string|null}
+ */
+function findRecentProposedRuleId(messages) {
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    const c = String(m.content || "").trim();
+    const proposed = c.match(/^\[PROPOSED\]\s+ruleId="([^"]+)"/i);
+    if (proposed) return proposed[1];
+    const updating = c.match(/\bUpdating\s+\*\*([a-z0-9_]+)\*\*/i);
+    if (updating) return updating[1];
+    const applied = c.match(/^\[APPLIED\]\s+Saved rule\s+"([^"]+)"/i);
+    if (applied) return applied[1];
+    const appliedHuman = c.match(/^Applied:\s+saved\s+"([^"]+)"/i);
+    if (appliedHuman) return appliedHuman[1];
+    const zipFill = c.match(/\b(zip_fill_[a-z0-9_]+)\b/i);
+    if (zipFill && /\b(rule|zip|update|set|saved|apply)\b/i.test(c)) {
+      return zipFill[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Match an existing Firestore rule from quoted / restated description text.
+ * @param {string} text User or quoted text.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {string|null} rule id
+ */
+function findRuleByDescriptionMatch(text, existingRules) {
+  const quoted = extractQuotedRuleText(text);
+  const probe = quoted || String(text || "").trim();
+  if (!probe) return null;
+
+  const explicitIds = probe.match(
+      /\b(zip_fill_[a-z0-9_]+|sender_[a-z0-9_]+|[a-z][a-z0-9_]{4,})\b/gi) || [];
+  for (const rawId of explicitIds) {
+    const id = String(rawId).trim();
+    const hit = (existingRules || []).find((r) =>
+      r && String(r.id).toLowerCase() === id.toLowerCase());
+    if (hit) return hit.id;
+  }
+
+  const topic = inferZipFillTopic([{role: "user", content: probe}]);
+  if (topic && topic.city) {
+    let live = findExistingZipFillRule(existingRules || [], topic);
+    if (!live && topic.zipCode) {
+      live = (existingRules || []).find((r) => {
+        if (!r || r.active === false || !isZipFillRuleDoc(r)) return false;
+        const zip = String(r.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+        if (zip !== topic.zipCode) return false;
+        const match = r.match && typeof r.match === "object" ? r.match : {};
+        const cities = [].concat(
+            match.shipperCityContains || [],
+            match.consigneeCityContains || [],
+            match.cityContains || []);
+        const wantCity = topic.city.trim().toLowerCase();
+        return cities.some((c) => {
+          const cc = String(c || "").trim().toLowerCase();
+          return cc && (wantCity.includes(cc) || cc.includes(wantCity));
+        });
+      }) || null;
+    }
+    if (live) return live.id;
+  }
+
+  const norm = probe.toLowerCase();
+  for (const r of existingRules || []) {
+    if (!r || !r.id) continue;
+    const hay = [r.id, r.name, r.notes, r.fillZipCode]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+    if (topic && topic.city) {
+      const city = topic.city.toLowerCase();
+      if (hay.includes(city)) {
+        if (!topic.zipCode ||
+            String(r.fillZipCode || "").includes(topic.zipCode)) {
+          return r.id;
+        }
+      }
+    }
+    const name = String(r.name || "").trim().toLowerCase();
+    if (name.length >= 6 && norm.includes(name.slice(0, Math.min(name.length, 24)))) {
+      return r.id;
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize lastAppliedRule / lastProposedRule payload from the UI.
+ * @param {object|null} obj Rule context from client.
+ * @return {object|null}
+ */
+function normalizeLastAppliedRule(obj) {
+  if (!obj || typeof obj !== "object") return null;
+  const ruleId = obj.ruleId || obj.id;
+  if (!ruleId) return null;
+  return {
+    ruleId: String(ruleId),
+    ruleKind: obj.ruleKind ? String(obj.ruleKind) : null,
+    summary: obj.summary ? String(obj.summary) : "",
+    action: obj.action ? String(obj.action) : null,
+    proposal: obj.proposal && typeof obj.proposal === "object" ?
+      obj.proposal : null,
+  };
+}
+
+/**
+ * Resolve which rule the user is referring to when refining.
+ * @param {object} ctx lastAppliedRule, lastProposedRule, referencedRuleId.
+ * @param {Array<object>} messages Full chat thread.
+ * @param {object|null} pending Pending proposal from UI.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {string|null}
+ */
+function resolveReferencedRuleId(ctx, messages, pending, existingRules) {
+  if (pending && pending.ruleId) return String(pending.ruleId);
+  const applied = normalizeLastAppliedRule(ctx && ctx.lastAppliedRule);
+  if (applied && applied.ruleId) return applied.ruleId;
+  const proposed = normalizeLastAppliedRule(ctx && ctx.lastProposedRule);
+  if (proposed && proposed.ruleId) return proposed.ruleId;
+  if (ctx && ctx.referencedRuleId) return String(ctx.referencedRuleId);
+  if (ctx && ctx.lastAppliedRuleId) return String(ctx.lastAppliedRuleId);
+  const fromChat = findLastAppliedRuleId(messages);
+  if (fromChat) return fromChat;
+  const recentProp = findRecentProposedRuleId(messages);
+  if (recentProp) return recentProp;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (lastText) {
+    const fromQuote = findRuleByDescriptionMatch(lastText, existingRules);
+    if (fromQuote) return fromQuote;
+  }
+  const userBlob = (messages || [])
+      .filter((m) => m && m.role === "user")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (userBlob) {
+    const fromHistory = findRuleByDescriptionMatch(userBlob, existingRules);
+    if (fromHistory) return fromHistory;
+  }
+  const topic = inferZipFillTopic(messages);
+  if (topic && topic.city) {
+    const live = findExistingZipFillRule(existingRules || [], topic);
+    if (live) return live.id;
+  }
+  return null;
+}
+
+/**
+ * Customer name from refinement phrasing.
+ * @param {string} text User text.
+ * @return {string}
+ */
+function parseRefinementCustomerName(text) {
+  const emails = extractEmailsFromText(text);
+  let name = parseCustomerNameFromSenderText(text, emails);
+  if (name) return name;
+  const onlyWhen = text.match(
+      /\bonly\s+when\s+(?:the\s+)?customer\s+(?:is\s+)?(.+?)(?:\.|$)/i);
+  if (onlyWhen && onlyWhen[1]) {
+    name = onlyWhen[1].replace(/\s+customer\s*$/i, "").trim();
+    if (name.length >= 2) return name;
+  }
+  const customerIs = text.match(
+      /\bcustomer\s+(?:is\s+|name\s+is\s+)(.+?)(?:\.|$)/i);
+  if (customerIs && customerIs[1]) {
+    name = customerIs[1].trim();
+    if (name.length >= 2 && !/@/.test(name)) return name;
+  }
+  return "";
+}
+
+/**
+ * Sender display name from zip-fill / refinement phrasing.
+ * @param {string} text User text.
+ * @return {string}
+ */
+function parseRefinementSenderName(text) {
+  const patterns = [
+    /\b(?:comes\s+from|when\s+it\s+comes\s+from)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:and|use|with|zip|when|only)|[,.]|$)/i,
+    /\b(?:from|sender)\s+([A-Za-z][A-Za-z .'-]{1,60}?)(?:\s+(?:and|use|with|when|only)|[,.]|$)/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m && m[1]) {
+      const name = m[1].replace(/[,.\s]+$/g, "").trim();
+      if (name.length >= 2 &&
+          !/^(pickup|delivery|la|the|a|when|only)$/i.test(name)) {
+        return name;
+      }
+    }
+  }
+  return "";
+}
+
+/**
+ * Resolve sender name to known sender→customer rules (email / customer).
+ * @param {string} name Sender display name.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {{fromEmails: Array<string>, fromNames: Array<string>, customerName: string}}
+ */
+function resolveSenderHintsFromRules(name, existingRules) {
+  const want = String(name || "").trim().toLowerCase();
+  const out = {fromEmails: [], fromNames: [], customerName: ""};
+  if (!want) return out;
+  for (const r of existingRules || []) {
+    if (!r || r.ruleKind !== RULE_KIND_SENDER_CUSTOMER) continue;
+    const fromNames = [].concat(r.fromNames || []);
+    const match = r.match && typeof r.match === "object" ? r.match : {};
+    const emails = [].concat(match.fromEmails || []);
+    const nameHit = fromNames.some((n) => {
+      const nn = String(n || "").trim().toLowerCase();
+      return nn && (want.includes(nn) || nn.includes(want));
+    });
+    const cust = String(r.customerName || "").trim();
+    const custHit = cust &&
+      (cust.toLowerCase().includes(want) || want.includes(cust.toLowerCase()));
+    if (nameHit || custHit) {
+      out.fromEmails.push(...emails);
+      out.fromNames.push(...(fromNames.length ? fromNames : [name]));
+      if (cust) out.customerName = cust;
+      break;
+    }
+  }
+  if (!out.fromNames.length && name) out.fromNames.push(name);
+  out.fromEmails = [...new Set(out.fromEmails.map((e) => e.toLowerCase()))];
+  return out;
+}
+
+/**
+ * Optional customer / sender filters for zip-fill rules.
+ * @param {string} text User text (may span several turns).
+ * @param {Array<object>} existingRules Live rules.
+ * @return {{customerName: string, fromEmails: Array<string>, fromNames: Array<string>}}
+ */
+function parseZipFillExtraConditions(text, existingRules) {
+  const emails = extractEmailsFromText(text);
+  let customerName = parseRefinementCustomerName(text);
+  const senderName = parseRefinementSenderName(text);
+  const senderHints = senderName ?
+    resolveSenderHintsFromRules(senderName, existingRules) :
+    {fromEmails: [], fromNames: [], customerName: ""};
+  if (!customerName && senderHints.customerName) {
+    customerName = senderHints.customerName;
+  }
+  customerName = resolveCustomerNameFromRules(customerName, existingRules);
+  return {
+    customerName: customerName || "",
+    fromEmails: emails.length ? emails : senderHints.fromEmails,
+    fromNames: senderHints.fromNames,
+  };
+}
+
+/**
+ * Canonical Primus customer name from live rules when possible.
+ * @param {string} name Parsed customer name.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {string}
+ */
+function resolveCustomerNameFromRules(name, existingRules) {
+  const raw = String(name || "").trim();
+  if (!raw) return "";
+  const want = raw.toLowerCase();
+  for (const r of existingRules || []) {
+    const cust = String(r.customerName || "").trim();
+    if (!cust) continue;
+    const lower = cust.toLowerCase();
+    if (lower === want || lower.includes(want) || want.includes(lower)) {
+      return cust;
+    }
+  }
+  return raw;
+}
+
+/**
+ * Merge array-valued match fields without dropping prior needles.
+ * @param {object} base Existing match.
+ * @param {object} extra New match fields.
+ * @return {object}
+ */
+function mergeMatchFields(base, extra) {
+  const out = {...(base && typeof base === "object" ? base : {})};
+  for (const [k, v] of Object.entries(extra || {})) {
+    if (Array.isArray(v)) {
+      const prev = Array.isArray(out[k]) ? out[k] : [];
+      out[k] = [...new Set([...prev, ...v].map(String))];
+    } else if (v != null && String(v).trim()) {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+/**
+ * Rule id for a refinement turn (pending, lastAppliedRule, or chat context).
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object|null} pending Pending proposal.
+ * @param {object} ruleContext Client rule pointers.
+ * @return {string|null}
+ */
+function findRuleIdForRefinement(messages, existingRules, pending, ruleContext) {
+  return resolveReferencedRuleId(
+      ruleContext || {}, messages, pending, existingRules);
+}
+
+/**
+ * Patch object from a pending / lastProposed / lastApplied envelope.
+ * @param {object|null} envelope Pending proposal or nested proposal.
+ * @return {object|null}
+ */
+function extractRefinementBasePatch(envelope) {
+  if (!envelope || typeof envelope !== "object") return null;
+  if (envelope.patch && typeof envelope.patch === "object") {
+    return envelope.patch;
+  }
+  if (envelope.proposal && typeof envelope.proposal === "object" &&
+      envelope.proposal.patch && typeof envelope.proposal.patch === "object") {
+    return envelope.proposal.patch;
+  }
+  return null;
+}
+
+/**
+ * Live rule doc for refinement — prefers pending patch, then applied /
+ * proposed snapshots (so mid-confirm "yes, but only when…" can refine
+ * without saving the incomplete rule first).
+ * @param {string} ruleId Rule id.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object} ruleContext Client rule pointers.
+ * @param {object|null} [pending] Pending proposal from UI.
+ * @return {object|null}
+ */
+function findRuleDocForRefinement(ruleId, existingRules, ruleContext, pending) {
+  const live = (existingRules || []).find((r) => r.id === ruleId);
+  if (live) return live;
+
+  if (pending && String(pending.ruleId || pending.deleteRuleId || "") ===
+      String(ruleId)) {
+    const pendingPatch = extractRefinementBasePatch(pending);
+    if (pendingPatch) return {id: ruleId, ...pendingPatch};
+  }
+
+  const applied = normalizeLastAppliedRule(
+      ruleContext && ruleContext.lastAppliedRule);
+  const proposed = normalizeLastAppliedRule(
+      ruleContext && ruleContext.lastProposedRule);
+  const snap = (applied && applied.ruleId === ruleId && applied) ||
+    (proposed && proposed.ruleId === ruleId && proposed) || null;
+  if (!snap) return null;
+  const snapPatch = extractRefinementBasePatch(snap) ||
+    extractRefinementBasePatch(snap.proposal);
+  if (!snapPatch) return null;
+  return {id: ruleId, ...snapPatch};
+}
+
+/**
+ * Human summary of zip-fill extra conditions.
+ * @param {object} conditions Parsed conditions.
+ * @param {object} match Rule match object.
+ * @param {Array<string>} fromNames Rule fromNames.
+ * @return {Array<string>}
+ */
+function zipFillConditionBits(conditions, match, fromNames) {
+  const bits = [];
+  if (conditions.customerName) bits.push(`customer **${conditions.customerName}**`);
+  const emails = [].concat(match.fromEmails || match.senderEmails || []);
+  if (emails.length) bits.push(`sender ${emails.join(", ")}`);
+  else if ((fromNames || []).length) bits.push(`sender ${fromNames.join(", ")}`);
+  return bits;
+}
+
+/**
+ * Apply optional customer/sender filters onto a zip-fill patch.
+ * @param {object} patch Outgoing patch (mutated).
+ * @param {object} match Outgoing match (mutated).
+ * @param {object} conditions Parsed conditions.
+ */
+function applyZipFillExtraConditionsToPatch(patch, match, conditions) {
+  if (!conditions) return;
+  if (conditions.customerName) {
+    patch.customerName = conditions.customerName;
+  }
+  if (conditions.fromEmails && conditions.fromEmails.length) {
+    match.fromEmails = conditions.fromEmails;
+  }
+  if (conditions.fromNames && conditions.fromNames.length) {
+    patch.fromNames = conditions.fromNames
+        .map((n) => String(n).trim().toLowerCase())
+        .filter(Boolean);
+  }
+  const hasEmailCond = (match.fromEmails || []).length > 0 ||
+    (patch.fromNames || []).length > 0;
+  if (hasEmailCond || conditions.customerName) {
+    patch.identifyVia = "both";
+  }
+}
+
+/**
+ * Update proposal for a zip-fill rule after apply or mid-confirm refine.
+ * @param {object} live Existing rule doc (or pending patch as doc).
+ * @param {object} conditions New filters.
+ * @param {{pendingAction?: string, ruleExists?: boolean}=} opts
+ *   pendingAction: keep create when refining an unsaved proposal.
+ * @return {object}
+ */
+function buildZipFillRefinementProposal(live, conditions, opts) {
+  const options = opts && typeof opts === "object" ? opts : {};
+  const ruleExists = options.ruleExists === true;
+  const pendingAction = options.pendingAction ?
+    String(options.pendingAction) : "";
+  // Mid-confirm refine of an unsaved create → still one create Confirm.
+  const keepCreate = !ruleExists &&
+    (pendingAction === "propose_create_rule" || !pendingAction);
+  const action = keepCreate ? "propose_create_rule" : "propose_update_rule";
+  const confirmHint = keepCreate ?
+    "Confirm to save this rule" :
+    "Confirm to save this update";
+
+  const match = mergeMatchFields(live.match || {}, {
+    fromEmails: conditions.fromEmails || [],
+    senderEmails: conditions.fromEmails || [],
+  });
+  const fromNames = [...new Set([]
+      .concat(live.fromNames || [])
+      .concat(conditions.fromNames || [])
+      .map((n) => String(n).trim().toLowerCase())
+      .filter(Boolean))];
+  const customerName = conditions.customerName ||
+    live.customerName || "";
+  const sideLabel = live.applyTo === "dest" ? "delivery" : "pickup";
+  const zip = String(live.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+  const bits = zipFillConditionBits(
+      {customerName}, match, fromNames);
+  const patch = {
+    active: live.active !== false,
+    priority: live.priority || 3,
+    name: live.name || `${sideLabel} ZIP fill`,
+    ruleKind: RULE_KIND_ZIP_FILL,
+    identifyVia: (match.fromEmails || []).length || fromNames.length ||
+      customerName ? "both" : (live.identifyVia || "ai"),
+    applyTo: live.applyTo || "origin",
+    match,
+    fillZipCode: zip,
+    addAccessorials: live.addAccessorials || [],
+    autoApply: live.autoApply !== false,
+    requiresConfirm: !!live.requiresConfirm,
+  };
+  if (customerName) patch.customerName = customerName;
+  if (fromNames.length) patch.fromNames = fromNames;
+  if (bits.length) {
+    const baseName = String(live.name || `${sideLabel} ZIP fill`)
+        .replace(/\s*—\s*customer\b.*$/i, "")
+        .trim();
+    patch.name = `${baseName} — ${bits.join(", ").replace(/\*\*/g, "")}`;
+    patch.notes = `When ${sideLabel} city matches and ` +
+      bits.map((b) => b.replace(/\*\*/g, "")).join(" + ") +
+      `, use ZIP ${zip}.`;
+  } else {
+    patch.notes = live.notes || "";
+  }
+  const condText = bits.length ?
+    `but only when ${bits.join(" and ")}` :
+    "with your added condition";
+  const lead = keepCreate ?
+    `Got it — same ${sideLabel} ZIP **${zip}**, ${condText}` :
+    `Got it — updating **${live.id}**: same ${sideLabel} ZIP **${zip}**, ` +
+      `${condText}`;
+  return {
+    reply: `${lead}. Does that look right? Say yes / sounds good / go ahead, ` +
+      `or click ${confirmHint}.`,
+    action,
+    proposal: {ruleId: live.id, patch},
+    quickReplies: [],
+    replacedPending: keepCreate,
+  };
+}
+
+/**
+ * Refine a recently applied / pending rule with additive conditions.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object|null} [pending] Pending proposal from UI.
+ * @return {object|null}
+ */
+function buildRuleRefinementProposal(messages, existingRules, pending, ruleContext) {
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (!looksLikeRuleRefinement(lastText)) return null;
+
+  const ruleId = findRuleIdForRefinement(
+      messages, existingRules || [], pending, ruleContext);
+  if (!ruleId) {
+    return {
+      reply: "Got it — which rule should I update? Repeat the rule " +
+        "(e.g. La Mirada pickup → ZIP 90670) and the extra condition " +
+        "(customer or sender).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
+  const live = findRuleDocForRefinement(
+      ruleId, existingRules || [], ruleContext || {}, pending || null);
+  if (!live) return null;
+
+  let conditions = parseZipFillExtraConditions(lastText, existingRules || []);
+  const priorUserText = (messages || [])
+      .filter((m) => m && m.role === "user" && m !== last)
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (priorUserText) {
+    const prior = parseZipFillExtraConditions(
+        priorUserText, existingRules || []);
+    if (!conditions.fromEmails.length) {
+      conditions.fromEmails = prior.fromEmails;
+    }
+    if (!conditions.fromNames.length) conditions.fromNames = prior.fromNames;
+    if (!conditions.customerName) conditions.customerName = prior.customerName;
+  }
+
+  if (!conditions.customerName && !conditions.fromEmails.length &&
+      !conditions.fromNames.length) {
+    return {
+      reply: `Got it — you mean rule **${live.id}**` +
+        (live.name ? ` (${live.name})` : "") +
+        ". What should I add — customer name, sender email, " +
+        "or sender name (e.g. only when customer is Brumis Imports Inc)?",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+      referencedRuleId: live.id,
+    };
+  }
+
+  if (isZipFillRuleDoc(live)) {
+    const ruleExists = !!(existingRules || []).find((r) => r && r.id === ruleId);
+    return buildZipFillRefinementProposal(live, conditions, {
+      pendingAction: pending && pending.action ? pending.action : "",
+      ruleExists,
+    });
+  }
+  return null;
+}
+
+/**
+ * Parse city + optional state from zip-fill phrasing.
+ * @param {string} text User text.
+ * @return {{city: string, state: string, side: "origin"|"dest"}}
+ */
+function parseCityStateFromZipFillText(text) {
+  const t = String(text || "").replace(/\s+/g, " ").trim();
+  let side = "origin";
+  if (/\b(delivery|deliver|consignee|ship\s*to|destination)\b/i.test(t)) {
+    side = "dest";
+  }
+  if (/\b(pickup|pick\s*up|ship\s*from|origin)\b/i.test(t)) {
+    side = "origin";
+  }
+
+  const known = [
+    {re: /\bla\s*mirada\b/i, city: "La Mirada", state: "CA"},
+    {re: /\bsanta\s*fe\s*springs\b/i, city: "Santa Fe Springs", state: "CA"},
+    {re: /\brialto\b/i, city: "Rialto", state: "CA"},
+    {re: /\blakewood\b/i, city: "Lakewood", state: "NJ"},
+  ];
+  for (const row of known) {
+    if (row.re.test(t)) {
+      return {city: row.city, state: row.state, side};
+    }
+  }
+
+  const pickupFrom = t.match(
+      /\b(?:pickup|pick\s*up|ship\s*from|ship\s*from)\s+(?:from|at|in|is)\s+(.+?)(?:\s+(?:use|with|zip|zipcode)\b|$)/i);
+  if (pickupFrom && pickupFrom[1]) {
+    const chunk = pickupFrom[1].replace(/,\s*$/, "").trim();
+    for (const row of known) {
+      if (row.re.test(chunk)) {
+        return {city: row.city, state: row.state, side: "origin"};
+      }
+    }
+    const cs = chunk.match(/^([A-Za-z .'-]+?)(?:\s*,?\s*([A-Z]{2}))?$/);
+    if (cs && cs[1] && cs[1].trim().length >= 2) {
+      return {
+        city: cs[1].replace(/,/g, "").trim(),
+        state: cs[2] ? cs[2].toUpperCase() : "",
+        side: "origin",
+      };
+    }
+  }
+
+  const whenCity = t.match(
+      /\b(?:when|if|for)\s+(?:pickup\s+(?:is|from|at)\s+)?(?:delivery\s+(?:is|to)\s+)?(.+?)\s+(?:use\s+)?(?:zip|zipcode)\b/i);
+  if (whenCity && whenCity[1]) {
+    const chunk = whenCity[1].replace(/,\s*$/, "").trim();
+    const cs = chunk.match(/^([A-Za-z .'-]+?)(?:\s*,?\s*([A-Z]{2}))?$/);
+    if (cs && cs[1]) {
+      return {
+        city: cs[1].replace(/,/g, "").trim(),
+        state: cs[2] ? cs[2].toUpperCase() : "",
+        side,
+      };
+    }
+  }
+
+  const cityStateZip = t.match(
+      /\b([A-Za-z .'-]{2,40}?)\s*,?\s*([A-Z]{2})\b(?:\s+\d{5})?/);
+  if (cityStateZip) {
+    return {
+      city: cityStateZip[1].replace(/,/g, "").trim(),
+      state: cityStateZip[2].toUpperCase(),
+      side,
+    };
+  }
+
+  return {city: "", state: "", side};
+}
+
+/**
+ * Infer zip-fill rule fields from chat history.
+ * @param {Array<object>} messages Chat turns.
+ * @return {object|null}
+ */
+function inferZipFillTopic(messages) {
+  const blob = (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  if (!blob.trim()) return null;
+  const zipCode = parseZipCodeFromText(blob);
+  const place = parseCityStateFromZipFillText(blob);
+  if (!zipCode || !place.city) return null;
+  return {
+    city: place.city,
+    state: place.state,
+    side: place.side,
+    zipCode,
+  };
+}
+
+/**
+ * Stable rule id from city/state/side.
+ * @param {object} topic Inferred topic.
+ * @return {string}
+ */
+function zipFillRuleIdFromTopic(topic) {
+  const slug = String(topic.city || "custom")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_|_$/g, "")
+      .slice(0, 40);
+  const side = topic.side === "dest" ? "dest" : "origin";
+  return `zip_fill_${slug}_${side}`;
+}
+
+/**
+ * User wants a city/state → ZIP correction rule.
+ * @param {Array<object>} messages Chat turns.
+ * @return {boolean}
+ */
+function looksLikeZipFillIntent(messages) {
+  if (looksLikeDeleteRuleIntent(messages)) return false;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (!lastText || /^\[applied\]/i.test(lastText.trim())) return false;
+  if (looksLikeRuleRefinement(lastText)) return false;
+  if (/\bfor\s+this\s+rule\b/i.test(lastText)) return false;
+  if (extractQuotedRuleText(lastText)) return false;
+  const blob = isMetaFollowUpText(lastText) ?
+    userTopicBlob(messages) : lastText.toLowerCase();
+  const hasZip = !!parseZipCodeFromText(blob);
+  const place = parseCityStateFromZipFillText(blob);
+  const zipCue = /\b(zip|zipcode|postal)\b/.test(blob) ||
+    /\buse\s+(?:zip\s+)?\d{5}\b/.test(blob) ||
+    hasZip;
+  const cityCue = !!place.city ||
+    /\b(pickup|pick\s*up|ship\s*from|origin|delivery|city)\b/.test(blob);
+  if (zipCue && (place.city || /\bla\s*mirada\b|\bsanta\s*fe\b/.test(blob))) {
+    return true;
+  }
+  if (/\bwhen\b.{0,40}\b(pickup|pick\s*up|ship\s*from)\b/.test(blob) &&
+      hasZip) {
+    return true;
+  }
+  if (/\b(fill|correct|fix|override)\b.{0,40}\bzip\b/.test(blob) &&
+      (place.city || hasZip)) {
+    return true;
+  }
+  if (place.city &&
+      /\b(pickup|pick\s*up|ship\s*from|origin|delivery|consignee)\b/.test(blob)) {
+    return true;
+  }
+  const topic = inferZipFillTopic(messages);
+  return !!(topic && topic.city && topic.zipCode && cityCue);
+}
+
+/**
+ * Find an existing zip-fill rule for the same city/side.
+ * @param {Array<object>} existingRules Live rules.
+ * @param {object} topic Inferred topic.
+ * @return {object|null}
+ */
+function findExistingZipFillRule(existingRules, topic) {
+  const wantCity = String(topic.city || "").trim().toLowerCase();
+  const wantState = String(topic.state || "").trim().toUpperCase();
+  const wantSide = topic.side === "dest" ? "dest" : "origin";
+  for (const r of existingRules || []) {
+    if (!r || r.active === false || !isZipFillRuleDoc(r)) continue;
+    const side = r.applyTo === "dest" || r.applyTo === "origin" ?
+      r.applyTo : "origin";
+    if (side !== wantSide) continue;
+    const match = r.match && typeof r.match === "object" ? r.match : {};
+    const cities = side === "origin" ?
+      [].concat(match.shipperCityContains || match.cityContains || []) :
+      [].concat(match.consigneeCityContains || match.cityContains || []);
+    const cityHit = cities.some((c) =>
+      wantCity.includes(String(c || "").trim().toLowerCase()) ||
+      String(c || "").trim().toLowerCase().includes(wantCity));
+    const stateRaw = side === "origin" ?
+      match.shipperState || match.state : match.consigneeState || match.state;
+    const stateHit = !wantState || !stateRaw ||
+      String(stateRaw).trim().toUpperCase() === wantState;
+    if (cityHit && stateHit) return r;
+  }
+  return null;
+}
+
+/**
+ * @param {object} rule Rule doc.
+ * @return {boolean}
+ */
+function isZipFillRuleDoc(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  if (rule.ruleKind === RULE_KIND_ZIP_FILL) return true;
+  const zip = String(rule.fillZipCode || "").replace(/\D/g, "").slice(0, 5);
+  if (!/^\d{5}$/.test(zip)) return false;
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  return !!(match.shipperCityContains || match.consigneeCityContains);
+}
+
+/**
+ * Deterministic create/update proposal for city/state → ZIP fill.
+ * @param {Array<object>} messages Chat turns.
+ * @param {Array<object>} existingRules Live rules.
+ * @return {object|null}
+ */
+function buildZipFillProposal(messages, existingRules) {
+  if (!looksLikeZipFillIntent(messages)) return null;
+  const last = lastUserTurn(messages);
+  const lastText = last ? String(last.content || "") : "";
+  if (looksLikeRuleRefinement(lastText) ||
+      /\bfor\s+this\s+rule\b/i.test(lastText)) {
+    return null;
+  }
+  const topic = inferZipFillTopic(messages);
+  if (!topic || !topic.city) {
+    return {
+      reply: "I can add a ZIP fill rule for pickup or delivery cities. " +
+        "Tell me the city, state, and ZIP (e.g. La Mirada CA → 90670).",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+  if (!topic.zipCode) {
+    return {
+      reply: `Got ${topic.city}${topic.state ? ", " + topic.state : ""} — ` +
+        "which 5-digit ZIP should we use for rating?",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    };
+  }
+
+  const live = findExistingZipFillRule(existingRules || [], topic);
+  const side = topic.side === "dest" ? "dest" : "origin";
+  const cityNeedle = topic.city.trim().toLowerCase();
+  const match = {};
+  if (side === "origin") {
+    match.shipperCityContains = [cityNeedle];
+    if (topic.state) match.shipperState = topic.state.toUpperCase();
+  } else {
+    match.consigneeCityContains = [cityNeedle];
+    if (topic.state) match.consigneeState = topic.state.toUpperCase();
+  }
+
+  const ruleId = live ? String(live.id) : zipFillRuleIdFromTopic(topic);
+  const sideLabel = side === "origin" ? "pickup" : "delivery";
+  const name = `${topic.city}${topic.state ? ", " + topic.state : ""} ` +
+    `${sideLabel} → ZIP ${topic.zipCode}`;
+
+  const patch = {
+    active: true,
+    priority: (live && live.priority) || 3,
+    name,
+    ruleKind: RULE_KIND_ZIP_FILL,
+    identifyVia: "ai",
+    applyTo: side,
+    match,
+    fillZipCode: topic.zipCode,
+    addAccessorials: [],
+    notes: `When ${sideLabel} city matches ${topic.city}` +
+      `${topic.state ? " " + topic.state : ""}, use ZIP ${topic.zipCode}.`,
+    autoApply: true,
+    requiresConfirm: false,
+  };
+
+  const userBlob = (messages || [])
+      .filter((m) => m && m.role !== "assistant")
+      .map((m) => String(m.content || ""))
+      .join("\n");
+  const extra = parseZipFillExtraConditions(userBlob, existingRules || []);
+  applyZipFillExtraConditionsToPatch(patch, match, extra);
+  const condBits = zipFillConditionBits(extra, match, patch.fromNames || []);
+  if (condBits.length) {
+    patch.name = `${name} — ${condBits.join(", ").replace(/\*\*/g, "")}`;
+    patch.notes = `When ${sideLabel} city matches ${topic.city}` +
+      `${topic.state ? " " + topic.state : ""} and ` +
+      condBits.map((b) => b.replace(/\*\*/g, "")).join(" + ") +
+      `, use ZIP ${topic.zipCode}.`;
+  }
+
+  const condReply = condBits.length ?
+    ` (only when ${condBits.join(" and ")})` : "";
+
+  return {
+    reply: `I'll set pickup/delivery ZIP for ${topic.city}` +
+      `${topic.state ? ", " + topic.state : ""} to **${topic.zipCode}** ` +
+      `when the ${sideLabel} city matches${condReply}. Does that look right? ` +
+      "Say yes / sounds good / go ahead, or click Confirm to save this rule.",
+    action: live ? "propose_update_rule" : "propose_create_rule",
+    proposal: {ruleId, patch},
+    quickReplies: [],
+  };
+}
+
+/**
+ * True when a model/create proposal already has enough match info to
+ * skip the identify questionnaire.
+ * @param {object} result Chat result with action/proposal.
+ * @return {boolean}
+ */
+function proposalHasEnoughIdentifyInfo(result) {
+  if (!result || typeof result !== "object") return false;
+  const action = result.action || "none";
+  if (action !== "propose_create_rule" && action !== "propose_update_rule") {
+    return false;
+  }
+  const patch = result.proposal && result.proposal.patch &&
+    typeof result.proposal.patch === "object" ?
+    result.proposal.patch : null;
+  if (!patch || !String(patch.name || "").trim()) return false;
+  const match = patch.match && typeof patch.match === "object" ?
+    patch.match : null;
+  if (!match || !Object.keys(match).length) return false;
+  if (patch.identifyVia === "email" ||
+      patch.ruleKind === RULE_KIND_SENDER_CUSTOMER ||
+      String(patch.customerName || "").trim()) {
+    const emails = [].concat(match.fromEmails || [])
+        .concat(match.senderEmails || []);
+    const domains = [].concat(match.senderDomains || []);
+    return emails.length > 0 || domains.length > 0;
+  }
+  if (patch.ruleKind === RULE_KIND_ZIP_FILL ||
+      String(patch.fillZipCode || "").replace(/\D/g, "").length === 5) {
+    const cities = [].concat(match.shipperCityContains || [])
+        .concat(match.consigneeCityContains || [])
+        .concat(match.cityContains || []);
+    return cities.length > 0;
+  }
+  if (match.siteType || (Array.isArray(match.flags) && match.flags.length)) {
+    return true;
+  }
+  const textKeys = [
+    "consigneeNameContains", "consigneeAddressContains",
+    "instructionsContains", "referenceContains",
+  ];
+  return textKeys.some((k) => {
+    const v = match[k];
+    return Array.isArray(v) ? v.length > 0 : !!String(v || "").trim();
+  });
+}
+
+/**
  * Enforce identify questionnaire before create proposals.
+ * Soft gate: only ask when info is truly missing; never steal a complete
+ * sender/site/accessorial proposal or a clear delete/update.
  * @param {object} result Model JSON result.
  * @param {Array} messages Chat history including latest user turn.
  * @param {Array<object>=} existingRules Live rules.
@@ -1351,6 +2576,17 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
   const senderOut = buildSenderCustomerProposal(
       messages, existingRules || []);
   if (senderOut) return senderOut;
+  const zipOut = buildZipFillProposal(messages, existingRules || []);
+  if (zipOut) return zipOut;
+
+  // Model already produced a complete Confirmable proposal — keep it.
+  if (proposalHasEnoughIdentifyInfo(out)) {
+    if (/could not process|try rephrasing/i.test(String(out.reply || ""))) {
+      out.reply = "Here's what I'd change — review the summary below. " +
+        "Say yes / sounds good / go ahead, or click Confirm to save it.";
+    }
+    return out;
+  }
 
   const gate = detectCreateIdentifyGate(messages);
   const extras = collectCreateFlowExtras(messages);
@@ -1360,8 +2596,15 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       parseAccessorialsAnswer(lastUser.content).length);
   const lastIsIdentifyAnswer = !!parseIdentifyChoiceAnswer(lastText);
   const lastIsMeta = isMetaFollowUpText(lastText);
+  // Site + accessorials already in chat → propose without identify.
+  if ((isClearlySiteTypeTopic(messages) || extras.siteType) &&
+      (extras.accessorials || []).length) {
+    return finalizeAddressOnlyCreate(out, messages, extras) || out;
+  }
   // Only stay in the questionnaire for a real identify/accessorial
   // answer — leftover "ready" must not steal "i asked you something".
+  // Soft: "needed" alone does NOT force identify when the model said
+  // none / asked a clarifying question.
   const inIdentifyFlow =
     (gate.status === "awaiting_choice" && lastIsIdentifyAnswer) ||
     (gate.status === "awaiting_email_signals" &&
@@ -1370,7 +2613,10 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       (lastIsAccessorials || lastIsIdentifyAnswer)) ||
     (extras.askedAccessorials && lastIsAccessorials) ||
     (gate.status === "needed" && looksLikeCreateRuleIntent(messages) &&
-      !isClearlySiteTypeTopic(messages));
+      !isClearlySiteTypeTopic(messages) &&
+      !looksLikeSenderCustomerIntent(messages) &&
+      !looksLikeZipFillIntent(messages) &&
+      action !== "none");
   const creating = action === "propose_create_rule" ||
     looksLikeCreateRuleIntent(messages) ||
     inIdentifyFlow;
@@ -1382,6 +2628,11 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
     const forced = buildSenderCustomerProposal(
         messages, existingRules || []);
     if (forced) return forced;
+  }
+  if (looksLikeZipFillIntent(messages)) {
+    const forcedZip = buildZipFillProposal(
+        messages, existingRules || []);
+    if (forcedZip) return forcedZip;
   }
 
   const addressOnlyReady = gate.status === "ready" &&
@@ -1402,6 +2653,9 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
   // Never ask LAD/APD / site-type for sender email mapping.
   if (looksLikeSenderCustomerIntent(messages)) {
     return buildSenderCustomerProposal(messages, existingRules || []) || out;
+  }
+  if (looksLikeZipFillIntent(messages)) {
+    return buildZipFillProposal(messages, existingRules || []) || out;
   }
 
   if (gate.status === "ready") {
@@ -1456,9 +2710,9 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
       out.quickReplies = [];
       if (extras.askedAccessorials && lastIsAccessorials === false &&
           lastUser && !parseIdentifyChoiceAnswer(lastUser.content)) {
-        out.reply = "I didn't catch an accessorial code. Send codes like " +
-          "LAD, LFD, APD (any case), or a name like \"limited access\". " +
-          "LOAD is treated as LAD.";
+        out.reply = "Do you mean accessorial codes like LAD, LFD, or APD? " +
+          "You can use the code or a name like \"limited access\" " +
+          "(LOAD counts as LAD).";
       } else {
         out.reply = "Got it — address / site classification only " +
           "(AI enrichment). I'll match via siteType / flags " +
@@ -1513,7 +2767,28 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
     };
   }
 
+  // Soft: if model asked a clarifying question, keep it.
+  if (action === "none" && String(out.reply || "").trim()) {
+    if (/could not process|try rephrasing/i.test(String(out.reply))) {
+      out.reply = fallbackUnclearReply(messages);
+    }
+    return out;
+  }
+
   // needed or awaiting_choice — stop and ask with two clear options.
+  // Only when we truly need identify (create intent, not sender/site).
+  if (!looksLikeCreateRuleIntent(messages) &&
+      action !== "ask_identify_source") {
+    out.reply = out.reply || fallbackUnclearReply(messages);
+    if (/could not process|try rephrasing/i.test(String(out.reply))) {
+      out.reply = fallbackUnclearReply(messages);
+    }
+    out.action = "none";
+    out.proposal = null;
+    out.quickReplies = [];
+    return out;
+  }
+
   const reply = (out.action === "ask_identify_source" && out.reply) ?
     out.reply :
     "Before I propose that rule: how can this condition be identified?\n\n" +
@@ -1538,32 +2813,95 @@ function enforceCreateIdentifyGate(result, messages, existingRules) {
  * @return {Promise<object>} {reply, action, proposal}
  */
 async function runQuoteRulesChatTurn(opts) {
-  const chatTurns = opts.messages || [];
+  const chatTurns = resolveChatTurns(opts || {});
   const existingRules = opts.existingRules || [];
+  const finish = (r) => polishChatResult(r, chatTurns);
+  const pending = opts.pendingProposal && typeof opts.pendingProposal === "object" ?
+    opts.pendingProposal : null;
+  const ruleContext = {
+    lastAppliedRule: normalizeLastAppliedRule(opts.lastAppliedRule),
+    lastProposedRule: normalizeLastAppliedRule(opts.lastProposedRule),
+    lastAppliedRuleId: opts.lastAppliedRuleId ?
+      String(opts.lastAppliedRuleId) : null,
+    referencedRuleId: opts.referencedRuleId ?
+      String(opts.referencedRuleId) :
+      (normalizeLastAppliedRule(opts.lastAppliedRule) || {}).ruleId ||
+      (normalizeLastAppliedRule(opts.lastProposedRule) || {}).ruleId ||
+      findLastAppliedRuleId(chatTurns),
+  };
+  const last = lastUserTurn(chatTurns);
+  const lastText = last ? String(last.content || "") : "";
+
+  if (pending && lastText) {
+    const refinePending = buildRuleRefinementProposal(
+        chatTurns, existingRules, pending, ruleContext);
+    if (refinePending) return finish(refinePending);
+    if (parseNaturalConfirmation(lastText, {pendingProposal: true})) {
+      return finish({
+        reply: "Perfect — applying that rule now.",
+        action: pending.action || "propose_create_rule",
+        proposal: {
+          ruleId: pending.ruleId || pending.deleteRuleId,
+          patch: pending.patch || {},
+          deleteRuleId: pending.deleteRuleId || pending.ruleId,
+          deleteRuleIds: pending.deleteRuleIds,
+        },
+        confirmApply: true,
+        quickReplies: [],
+      });
+    }
+    const rej = parseRejectionWithCorrection(lastText);
+    if (rej.rejected) {
+      return finish({
+        reply: rejectionReply(rej.correction),
+        action: rej.correction ? "none" : "dismiss_pending",
+        proposal: null,
+        quickReplies: [],
+        dismissedCorrection: rej.correction || null,
+      });
+    }
+  }
+
+  if (isMetaFollowUpText(lastText)) {
+    return finish({
+      reply: "Sorry about that — tell me again what rule you want and " +
+        "I'll propose it clearly for you to confirm.",
+      action: "none",
+      proposal: null,
+      quickReplies: [],
+    });
+  }
+
+  const refineOut = buildRuleRefinementProposal(
+      chatTurns, existingRules, null, ruleContext);
+  if (refineOut) return finish(refineOut);
+
   // Obvious delete / military APD+LAD updates skip the model so a leftover
   // identify gate cannot steal the turn.
   const deleteOut = buildDeleteRuleProposal(chatTurns, existingRules);
-  if (deleteOut) return deleteOut;
+  if (deleteOut) return finish(deleteOut);
   const militaryOut = buildMilitaryAccessorialProposal(
       chatTurns, existingRules);
-  if (militaryOut) return militaryOut;
+  if (militaryOut) return finish(militaryOut);
   const senderOut = buildSenderCustomerProposal(chatTurns, existingRules);
-  if (senderOut) return senderOut;
+  if (senderOut) return finish(senderOut);
+  const zipOut = buildZipFillProposal(chatTurns, existingRules);
+  if (zipOut) return finish(zipOut);
 
   const gateHint = detectCreateIdentifyGate(chatTurns);
-  const last = lastUserTurn(chatTurns);
-  const lastText = last ? String(last.content || "") : "";
-  const lastIsAcc = parseAccessorialsAnswer(lastText).length > 0;
-  const lastIsChoice = !!parseIdentifyChoiceAnswer(lastText);
+  const lastTurn = lastUserTurn(chatTurns);
+  const lastTurnText = lastTurn ? String(lastTurn.content || "") : "";
+  const lastIsAcc = parseAccessorialsAnswer(lastTurnText).length > 0;
+  const lastIsChoice = !!parseIdentifyChoiceAnswer(lastTurnText);
   // After Cannot-be, only skip the model for a structured accessorial
-  // or identify answer. Follow-ups go to gpt-5.6-sol.
+  // or identify answer. Follow-ups go to gpt-5.6-luna.
   if (gateHint.status === "ready" && gateHint.source === "address_only" &&
       (lastIsAcc || lastIsChoice)) {
-    return enforceCreateIdentifyGate({
+    return finish(enforceCreateIdentifyGate({
       reply: "",
       action: "none",
       proposal: null,
-    }, chatTurns, existingRules);
+    }, chatTurns, existingRules));
   }
 
   const apiKey = process.env.QUOTE_RULES_CHAT_OPENAI_API_KEY ||
@@ -1582,145 +2920,193 @@ async function runQuoteRulesChatTurn(opts) {
   ).slice(0, 8000);
 
   const systemPrompt = [
-    "You help freight dispatchers manage LTL quote accessorial rules",
-    "AND sender→customer mapping rules.",
-    "Accessorial rules map site types or instructions to Primus codes.",
-    "Sender rules map From emails (or @domains) to a Primus customerName,",
-    "optional protocolOnly, and optional defaultDims.",
-    "Common codes: LFO LFD (liftgate), APD (appointment dest),",
-    "LAD (limited access), NUD (nursing home), HOD (hotel),",
-    "RSD (residential), SCD (school), INS (insurance).",
+    "You are a sharp, conversational quote-rules assistant for Innovative",
+    "Carriers dispatchers. Talk like ChatGPT or Cursor — a general helpful",
+    "AI for ANY quote-automation rule request, not just a fixed menu.",
+    "Infer messy natural-language intent, ask ONE smart clarifying question",
+    "when something is ambiguous (\"Do you mean …?\" / \"You mean that …?\"),",
+    "and propose a confirmable rule as soon as you have enough facts.",
+    "Never act like a rigid form or bot. NEVER say \"I don't understand\",",
+    "\"I could not process that\", or \"Try rephrasing\".",
+    "If the user says no / wrong: \"Oh sorry — …\" and refine or ask again.",
+    "Accept any reply format — no required keywords or button-only confirm.",
+    "",
+    "You manage THREE rule kinds:",
+    "1) Accessorial / site rules — site types or text → Primus codes",
+    "   (LAD limited access, APD appointment dest, LFD/LFO liftgate,",
+    "   NUD nursing, HOD hotel, RSD residential, SCD school, INS).",
+    "2) Sender→customer rules — From email/@domain → Primus customerName,",
+    "   optional protocolOnly, optional defaultDims. No accessorials.",
+    "3) ZIP fill rules — city/state pickup or delivery → rating ZIP.",
+    "   ruleKind zip_fill; fillZipCode 5 digits; applyTo origin|dest;",
+    "   match shipperCityContains+shipperState (pickup) or",
+    "   consigneeCityContains+consigneeState (delivery). No accessorials.",
     "",
     "Current active rules JSON:",
     rulesJson,
     "",
-    "When user asks to add, change, or remove a rule, respond JSON only:",
+    "Respond with JSON only:",
     "{",
-    "  \"reply\": \"friendly confirmation message for the user\",",
+    "  \"reply\": \"friendly message\",",
     "  \"action\": \"none\" | \"ask_identify_source\" |",
     "    \"ask_email_signals\" | \"propose_create_rule\" |",
     "    \"propose_update_rule\" | \"propose_delete_rule\",",
     "  \"proposal\": null | {",
     "    \"ruleId\": \"snake_case_id\",",
-    "    \"patch\": { rule fields for create/update },",
+    "    \"patch\": { rule fields },",
     "    \"deleteRuleId\": \"id for delete\"",
     "  },",
-    "  \"quickReplies\": [] | [\"Can be identified from the email\",",
-    "    \"Cannot be — address / site classification only\"]",
+    "  \"quickReplies\": [] | [\"" + QUICK_REPLY_CAN_BE + "\",",
+    "    \"" + QUICK_REPLY_CANNOT_BE + "\"]",
     "}",
     "",
-    "Rule patch fields: active, priority, name, match, addAccessorials,",
+    "Patch fields: active, priority, name, match, addAccessorials,",
     "filterCarrierWarnings, notes, autoApply, requiresConfirm, identifyVia,",
-    "ruleKind, customerName, protocolOnly, defaultDims.",
-    "match may use: consigneeNameContains, consigneeAddressContains,",
+    "ruleKind, customerName, protocolOnly, defaultDims, fillZipCode, applyTo.",
+    "match: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType,",
-    "fromEmails, senderEmails, senderDomains, ccEmails, toEmails.",
+    "fromEmails, senderEmails, senderDomains, ccEmails, toEmails,",
+    "shipperCityContains, shipperState, consigneeCityContains, consigneeState.",
     "",
-    "=== Sender email → customer (IMPORTANT) ===",
-    "Phrases: map this email to customer X, when email from Y use",
-    "customer Z, protocol only, match customer name to that email,",
-    "default dims 40x48x62 when missing, also when CC'd / on Cc or To.",
-    "→ propose_create_rule (or update) immediately.",
-    "identifyVia MUST be \"email\"; ruleKind \"sender_customer\".",
-    "match.fromEmails: array of emails (one rule can list many).",
-    "Optional match.senderDomains: [\"ediexpressinc.com\"].",
-    "When they say CC'd / Cc / To / participant: also set",
-    "match.ccEmails and match.toEmails to the same addresses.",
-    "Set customerName; protocolOnly true when they say protocol only;",
-    "defaultDims {length,width,height} when they give missing dims.",
-    "addAccessorials: []. Do NOT ask site type, LAD, APD, or the",
-    "Can-be / Cannot-be questionnaire for these.",
-    "Example ids: sender_mike_oseback, sender_jared_berman,",
-    "sender_lifeworks_picking, sender_shaya_jacobowitz /",
-    "\"Sender → Mike Oseback\".",
-    "NEVER reply \"I could not process that\" for sender mapping.",
+    "=== CORE BEHAVIOR ===",
+    "- Infer intent from typos and casual English.",
+    "- If email + customer name are both present → propose_create_rule",
+    "  (or update) IMMEDIATELY. Never re-ask for From/customer.",
+    "- If site type + accessorials are both present → propose immediately",
+    "  (identifyVia ai for known sites). Do not restart questionnaires.",
+    "- Ask identify ONLY when creating a NEW ambiguous accessorial rule",
+    "  and you truly lack how to match it (not military/nursing/hotel,",
+    "  not sender→customer, and they have not already chosen).",
+    "- Updates and deletes never use the identify questionnaire.",
+    "- \"can you add …\" is a REQUEST, not a Can-be identify answer.",
+    "- Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
+    "- If one fact is missing, ask ONE short question (action none).",
+    "- If unsure, guess and ask \"Do you mean …?\" — never dead-end.",
+    "- Never claim you saved/updated/deleted — only Confirm applies.",
+    "- When proposing a rule, summarize it plainly and invite natural",
+    "  confirmation (yes, sounds good, go ahead, that's right).",
+    "- If user confirms naturally but action is still propose_*, keep the",
+    "  proposal — the UI applies on confirm.",
+    "- Full conversation thread is in messages — use ALL prior turns.",
+    "- [APPLIED] messages are ground-truth Confirm results.",
+    "- \"yes, but only when…\" / \"for this rule…\" = refine the last",
+    "  applied or pending rule — propose_update_rule, not a new guess.",
+    "- Live rule truth = Current active rules JSON only.",
     "",
-    "=== Follow the user's LAST intent ===",
-    "Read the full conversation. Do not restart the identify",
-    "questionnaire if they already chose Cannot be, already named",
-    "accessorials, or asked to add APD/LAD for a known site type.",
-    "\"can you add …\" is a request, NOT the Can-be identify answer.",
-    "Typos: militery, millitary, fecileties, facilites, aadd, apointment.",
-    "NEVER reply \"I could not process that\" or \"Try rephrasing\".",
-    "If unsure, ask one short question (action none) that advances",
-    "their last request — do not change the subject.",
+    "=== FEW-SHOT EXAMPLES (follow these patterns) ===",
+    "User: mshglck@gmail.com should be registered as customer name moses",
+    "→ propose_create_rule ruleId sender_moses, ruleKind sender_customer,",
+    "  identifyVia email, match.fromEmails [mshglck@gmail.com],",
+    "  customerName moses, addAccessorials [].",
     "",
-    "=== Military / AAFES / nursing home / hotel are site types ===",
-    "These are identified via AI address classification, not email.",
-    "Default identifyVia \"ai\" and match.siteType (aafes_military,",
-    "nursing_home, hotel). Do NOT ask email-signals for them.",
-    "\"add appointment delivery for military facilities\" (and typos)",
-    "→ update existing aafes_military or create it with LAD + APD.",
-    "Keep LAD if the prior military rule / intent already had it.",
-    "If aafes_military is missing from Current active rules JSON,",
-    "propose_create_rule to recreate it (tombstones must not block).",
+    "User: mshglck@gmail.com mapped to moses customer name",
+    "→ same as above (propose immediately).",
     "",
-    "=== Deletes ===",
-    "delete/remove/drop (typos militery / millitary, \"remove military\",",
-    "\"delete aafes\"): action MUST be propose_delete_rule. Do NOT ask",
-    "identify. Ask them to click Confirm; do not claim the rule is gone.",
+    "User: map jared@corehome.com to Brumis, dims 40x48x62",
+    "→ propose_create_rule Sender → Brumis, fromEmails [jared@corehome.com],",
+    "  customerName Brumis, defaultDims {40,48,62}.",
     "",
-    "=== Identify questionnaire (new accessorial rules only) ===",
-    "Ask identify ONLY when creating a NEW accessorial/site rule and",
-    "it is NOT a known site type and NOT a sender→customer mapping",
-    "and they have not already chosen Cannot be. Updates skip this.",
-    "Step 1 action ask_identify_source with exactly two quickReplies:",
-    "  \"" + QUICK_REPLY_CAN_BE + "\"",
-    "  \"" + QUICK_REPLY_CANNOT_BE + "\"",
-    "User may answer 1, 2, A, B, can, cannot, can be, cannot be, or the",
-    "button text. Those are definitive — do not re-ask.",
-    "CAN BE (email): ask_email_signals; only use signals they list;",
-    "identifyVia address_text or both.",
-    "CANNOT BE: identifyVia ai; match.siteType and/or flags; never",
-    "invent email keywords; never match: {}.",
+    "User: mike oseback cc → Mike Oseback protocol only",
+    "  (with email mike.oseback@ediexpressinc.com in context)",
+    "→ propose_update/create with fromEmails+ccEmails+toEmails,",
+    "  customerName Mike Oseback, protocolOnly true.",
+    "",
+    "User: Map lfwpicking@coreforce.com to Lifeworks Technology Group",
+    "→ propose_create_rule sender_lifeworks_picking.",
+    "",
+    "User: Shaya Jacobowitz shaya@primepackaging.com → Prime Packaging Inc",
+    "→ propose_create_rule with fromEmails + customerName.",
+    "",
+    "User: add appointment delivery for military facilities",
+    "→ propose create/update aafes_military identifyVia ai,",
+    "  match.siteType aafes_military, addAccessorials [LAD, APD].",
+    "",
+    "User: aadd for militery also delivery appointment",
+    "→ same military LAD+APD proposal (typos OK).",
+    "",
+    "User: delete nursing home rule / remove NUD nursing",
+    "→ propose_delete_rule for nursing_home (or matching id).",
+    "",
+    "User: delete all rules for militery bases",
+    "→ propose_delete_rule aafes_military. Do not ask identify.",
+    "",
+    "User: when jared quotes pickup from la mirada use zip 90670",
+    "→ propose_create_rule zip_fill_la_mirada_origin (same as La Mirada).",
+    "",
+    "User: when pickup is La Mirada use zip 90670",
+    "→ propose_create_rule zip_fill, applyTo origin, fillZipCode 90670.",
+    "",
+    "User: yes, but only when the customer is Brumis Imports Inc",
+    "  (while that create proposal is STILL PENDING — not saved yet)",
+    "→ REPLACE the pending create with the refined create (same rule id,",
+    "  add customerName Brumis Imports Inc, identifyVia both).",
+    "  Do NOT apply/save the bare city-only rule first. One Confirm saves",
+    "  the complete rule.",
+    "",
+    "User: yes, but only when the customer is Brumis Imports Inc",
+    "  (after applying La Mirada zip fill)",
+    "→ propose_update_rule same rule id; add customerName Brumis Imports Inc;",
+    "  identifyVia both. Do NOT create a new bare city-only rule.",
+    "",
+    "User: for this rule, when pickup is La Mirada use zip 90670 — only Jared",
+    "→ propose_update_rule zip_fill_la_mirada_* with fromNames/emails for Jared.",
+    "",
+    "User: military bases need LAD and APD",
+    "→ propose create/update aafes_military, addAccessorials [LAD, APD].",
+    "",
+    "User: add liftgate whenever consignee says no dock",
+    "→ ask_identify_source (truly missing how to identify) OR if they",
+    "  already said Cannot-be / site type, propose with LFD/LFO.",
+    "",
+    "User: Cannot be — address / site classification only  then  LAD, APD",
+    "→ propose_create_rule identifyVia ai with those codes.",
+    "",
+    "=== Sender→customer details ===",
+    "ruleKind sender_customer; identifyVia email; addAccessorials [].",
+    "Set match.fromEmails (and ccEmails/toEmails when CC'd/To).",
+    "Optional match.senderDomains. protocolOnly / defaultDims when said.",
+    "Do NOT ask site type, LAD, APD, or Can-be/Cannot-be for these.",
+    "Ids like sender_mike_oseback / name \"Sender → Mike Oseback\".",
+    "",
+    "=== ZIP fill details ===",
+    "ruleKind zip_fill; identifyVia ai|both when sender/customer filters;",
+    "addAccessorials []. Optional customerName, fromNames, match.fromEmails.",
+    "applyTo origin for pickup/Ship From; dest for delivery/Ship To.",
+    "fillZipCode must be 5 digits. Overrides wrong geocoded ZIPs.",
+    "Do NOT ask identify questionnaire for zip-fill rules.",
+    "",
+    "=== Site types (AI address classify) ===",
+    "military/AAFES/nursing/hotel → identifyVia ai + match.siteType",
+    "(aafes_military, nursing_home, hotel). No email-signals.",
     "Known siteType: nursing_home, hotel, amazon_fc, menards_dc,",
     "aafes_military, chain_store, residential, other.",
-    "Codes: LAD LFD APD RSD NUD LTD LFO HOD SCD INS; \"limited access\";",
-    "LOAD = LAD; \"delivery appointment\" = APD.",
+    "LOAD=LAD; delivery appointment=APD.",
     "",
-    "Current questionnaire state from chat history:",
+    "=== Identify questionnaire (rare) ===",
+    "Only for NEW ambiguous accessorial rules lacking match method.",
+    "ask_identify_source with exactly those two quickReplies.",
+    "Answers 1/2/A/B/can/cannot/button text are definitive.",
+    "CAN BE → ask_email_signals; only use signals they list.",
+    "CANNOT BE → identifyVia ai; siteType/flags; never invent keywords;",
+    "never match: {}.",
+    "",
+    "Current questionnaire state:",
     `  status=${gateHint.status}; source=${gateHint.source || "null"};`,
     `  emailSignalsListed=${gateHint.emailSignalsListed};`,
     `  askedAccessorials=${!!gateHint.askedAccessorials};`,
     `  accessorials=${(gateHint.accessorials || []).join(",") || "none"};`,
     `  siteType=${gateHint.siteType || "null"}`,
-    "If they already chose cannot-be (source=address_only) or the",
-    "topic is a site type, do NOT ask identify or email-signals.",
-    "If accessorials are listed, propose now.",
+    "If cannot-be / known site / accessorials listed → propose now.",
     "",
-    "identifyVia values:",
-    "  email — sender From address / domain → customer mapping.",
-    "  address_text — match from email/text fields only.",
-    "  ai — match only from AI address classification.",
-    "  both — either text OR AI signals (default when both apply).",
-    "",
-    "Include identifyVia in every create/update proposal patch.",
-    "",
-    "For propose_update_rule:",
-    "  - proposal.ruleId MUST be the existing rule id (e.g. amazon_fc).",
-    "  - patch may be partial (only changed fields), e.g. addAccessorials.",
-    "  - Always copy name and match from the current rule into patch",
-    "    so the proposal is self-contained even for partial edits.",
-    "For propose_create_rule: patch MUST include name and a NON-EMPTY",
-    "match (siteType and/or flags for address-only; text needles for email;",
-    "fromEmails/senderDomains for sender→customer).",
-    "Never use match: {}.",
-    "",
-    "Never claim you saved, updated, or deleted a rule.",
-    "Never say \"Confirmed\", \"rule removed\", \"deleted\", or \"it's gone\".",
-    "Only the Confirm button applies changes — chat text cannot apply them.",
-    "If the user types Confirm / Yes / Done without clicking the button,",
-    "reply that they must click the Confirm button (action none).",
-    "For propose_delete_rule: ask them to click Confirm; do not claim removal.",
-    "When asked if a rule is gone: answer ONLY from Current active rules JSON",
-    "above (fresh from Firestore this turn). Ignore prior chat claims.",
-    "Messages starting with [APPLIED] are ground-truth UI Confirm results.",
-    "If unclear, ask one short clarifying question with action none.",
+    "identifyVia: email | address_text | ai | both — include on every",
+    "create/update patch.",
+    "propose_update_rule: copy name+match from live rule; ruleId must",
+    "match an existing id. propose_create_rule: NON-EMPTY match.",
   ].join("\n");
 
   const messages = [
     {role: "system", content: systemPrompt},
-    ...(opts.messages || []).slice(-30).map((m) => ({
+    ...chatTurns.slice(-RULES_CHAT_MAX_TURNS).map((m) => ({
       role: m.role === "assistant" ? "assistant" : "user",
       content: String(m.content || "").slice(0, 4000),
     })),
@@ -1745,14 +3131,30 @@ async function runQuoteRulesChatTurn(opts) {
     parsed = JSON.parse(raw);
   } catch (_) {
     parsed = {
-      reply: raw || fallbackUnclearReply(opts.messages || []),
+      reply: raw || fallbackUnclearReply(chatTurns),
       action: "none",
       proposal: null,
     };
   }
 
-  return enforceCreateIdentifyGate(
-      parsed, opts.messages || [], existingRules);
+  const gated = enforceCreateIdentifyGate(
+      parsed, chatTurns, existingRules);
+  return finish(gated);
+}
+
+/**
+ * Sanitize any deterministic chat result before returning to UI.
+ * @param {object|null} result Chat turn result.
+ * @param {Array<object>} messages Chat history.
+ * @return {object|null}
+ */
+function polishChatResult(result, messages) {
+  if (!result || typeof result !== "object") return result;
+  const out = {...result};
+  if (typeof out.reply === "string") {
+    out.reply = sanitizeChatReply(out.reply, messages);
+  }
+  return out;
 }
 
 /**
@@ -1851,8 +3253,22 @@ function normalizePartialPatch(patch) {
   if (Object.prototype.hasOwnProperty.call(patch, "customerName")) {
     normalized.customerName = String(patch.customerName || "").trim();
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "fromNames") &&
+      Array.isArray(patch.fromNames)) {
+    normalized.fromNames = patch.fromNames.map(String);
+  }
   if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
     normalized.protocolOnly = !!patch.protocolOnly;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "fillZipCode")) {
+    normalized.fillZipCode = String(patch.fillZipCode || "")
+        .replace(/\D/g, "")
+        .slice(0, 5);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "applyTo")) {
+    const v = String(patch.applyTo || "");
+    normalized.applyTo = ["dest", "origin", "both"].includes(v) ?
+      v : "origin";
   }
   if (Object.prototype.hasOwnProperty.call(patch, "defaultDims") &&
       patch.defaultDims && typeof patch.defaultDims === "object") {
@@ -1899,6 +3315,16 @@ function normalizeCreatePatch(patch, ruleId) {
   }
   if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
     normalized.protocolOnly = !!patch.protocolOnly;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "fillZipCode")) {
+    normalized.fillZipCode = String(patch.fillZipCode || "")
+        .replace(/\D/g, "")
+        .slice(0, 5);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "applyTo")) {
+    const v = String(patch.applyTo || "");
+    normalized.applyTo = ["dest", "origin", "both"].includes(v) ?
+      v : "origin";
   }
   if (patch.defaultDims && typeof patch.defaultDims === "object") {
     normalized.defaultDims = {
@@ -1977,6 +3403,15 @@ function validateRuleProposal(proposal) {
       return {ok: false, error: "Rule match cannot be empty"};
     }
   }
+  if (normalized.ruleKind === RULE_KIND_ZIP_FILL ||
+      Object.prototype.hasOwnProperty.call(normalized, "fillZipCode")) {
+    const zip = String(normalized.fillZipCode || "")
+        .replace(/\D/g, "")
+        .slice(0, 5);
+    if (!/^\d{5}$/.test(zip)) {
+      return {ok: false, error: "ZIP fill rule needs fillZipCode (5 digits)"};
+    }
+  }
 
   return {
     ok: true,
@@ -1988,12 +3423,24 @@ function validateRuleProposal(proposal) {
 
 module.exports = {
   runQuoteRulesChatTurn,
+  resolveChatTurns,
+  resolveReferencedRuleId,
+  findRecentProposedRuleId,
+  findRuleByDescriptionMatch,
+  extractQuotedRuleText,
+  normalizeLastAppliedRule,
   validateRuleProposal,
   extractPatch,
   detectCreateIdentifyGate,
   enforceCreateIdentifyGate,
   parseIdentifyChoiceAnswer,
   parseAccessorialsAnswer,
+  parseNaturalConfirmation,
+  parseNaturalRejection,
+  parseRejectionWithCorrection,
+  sanitizeChatReply,
+  polishChatResult,
+  rejectionReply,
   inferCreateTopic,
   looksLikeDeleteRuleIntent,
   looksLikeCreateRuleIntent,
@@ -2002,7 +3449,14 @@ module.exports = {
   buildDeleteRuleProposal,
   buildMilitaryAccessorialProposal,
   buildSenderCustomerProposal,
+  buildZipFillProposal,
+  buildRuleRefinementProposal,
+  looksLikeRuleRefinement,
+  findLastAppliedRuleId,
+  parseZipFillExtraConditions,
   inferSenderCustomerTopic,
+  inferZipFillTopic,
+  looksLikeZipFillIntent,
   isMilitaryTopicBlob,
   RULES_CHAT_MODEL,
   IDENTIFY_QUICK_REPLIES,

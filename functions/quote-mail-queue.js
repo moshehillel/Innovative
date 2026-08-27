@@ -14,6 +14,41 @@ const QUEUE_STATUS = Object.freeze({
   FAILED: "failed",
 });
 
+/** Cap stored email body so huge HTML/threads never hit Firestore limits. */
+const QUEUE_EMAIL_BODY_MAX = 20000;
+
+/**
+ * Plain-text + truncate for quoteMailQueue persistence.
+ * @param {string} raw Body from Outlook (may be HTML).
+ * @return {string}
+ */
+function sanitizeQueueEmailBody(raw) {
+  let text = String(raw || "");
+  text = text.replace(/data:[a-z0-9.+/-]+;base64,[a-z0-9+/=\s]+/gi, " ");
+  if (/<[a-z][\s\S]*>/i.test(text)) {
+    text = text
+        .replace(/<style[\s\S]*?<\/style>/gi, " ")
+        .replace(/<script[\s\S]*?<\/script>/gi, " ")
+        .replace(/<!--[\s\S]*?-->/g, " ")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<\/p>/gi, "\n")
+        .replace(/<\/div>/gi, "\n")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&lt;/gi, "<")
+        .replace(/&gt;/gi, ">")
+        .replace(/&quot;/gi, "\"");
+  }
+  return text
+      .replace(/\r/g, "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .trim()
+      .slice(0, QUEUE_EMAIL_BODY_MAX);
+}
+
 /**
  * @param {string} dispatcherId Dispatcher id.
  * @param {string} outlookMessageId Outlook message id.
@@ -85,10 +120,19 @@ async function enqueueQuoteEmail(opts) {
     from: String(opts.from || "").slice(0, 500),
     to: String(opts.to || "").slice(0, 1000),
     cc: String(opts.cc || "").slice(0, 1000),
-    emailBody: String(opts.emailBody || "").slice(0, 50000),
+    emailBody: sanitizeQueueEmailBody(opts.emailBody),
     receivedMailboxEmail: opts.receivedMailboxEmail ||
       dispatcher.outlookConnectedEmail || dispatcher.email || null,
     classify: opts.classify || null,
+    // Never persist attachment blobs on the queue doc (refs only if provided).
+    attachmentRefs: Array.isArray(opts.attachmentRefs) ?
+      opts.attachmentRefs.slice(0, 20).map((a) => ({
+        id: a && a.id ? String(a.id).slice(0, 200) : null,
+        name: a && a.name ? String(a.name).slice(0, 200) : null,
+        size: a && a.size != null ? Number(a.size) || null : null,
+        contentType: a && a.contentType ?
+          String(a.contentType).slice(0, 120) : null,
+      })) : [],
     status: QUEUE_STATUS.QUEUED,
     quoteId: null,
     error: null,
@@ -105,6 +149,8 @@ async function enqueueQuoteEmail(opts) {
 
 /**
  * List queued jobs for a dispatcher (oldest first).
+ * Queries status==queued (not an arbitrary dispatcher slice) so large
+ * dispatcher queues cannot hide stuck jobs outside the first N docs.
  * @param {Function} tcol Tenant collection helper.
  * @param {object} tenant Tenant.
  * @param {string} dispatcherId Dispatcher id.
@@ -113,15 +159,28 @@ async function enqueueQuoteEmail(opts) {
  */
 async function listQueuedForDispatcher(tcol, tenant, dispatcherId, limit) {
   const max = Math.max(1, Math.min(Number(limit) || 10, 25));
-  // Single-field query avoids a composite index requirement.
-  const snap = await queueCol(tcol, tenant)
-      .where("dispatcherId", "==", String(dispatcherId))
-      .limit(Math.max(max * 5, 40))
-      .get();
-  return snap.docs
-      .map((d) => ({id: d.id, ...d.data()}))
-      .filter((d) => d.status === QUEUE_STATUS.QUEUED)
-      .slice(0, max);
+  const wantDispatcher = String(dispatcherId);
+  const out = [];
+  let lastDoc = null;
+  // Single-field status query needs no composite index. Page until we
+  // collect enough jobs for this dispatcher or exhaust queued docs.
+  for (let page = 0; page < 20 && out.length < max; page++) {
+    let q = queueCol(tcol, tenant)
+        .where("status", "==", QUEUE_STATUS.QUEUED)
+        .limit(50);
+    if (lastDoc) q = q.startAfter(lastDoc);
+    const snap = await q.get();
+    if (snap.empty) break;
+    lastDoc = snap.docs[snap.docs.length - 1];
+    for (const d of snap.docs) {
+      const data = d.data() || {};
+      if (String(data.dispatcherId || "") !== wantDispatcher) continue;
+      out.push({id: d.id, ...data});
+      if (out.length >= max) break;
+    }
+    if (snap.size < 50) break;
+  }
+  return out;
 }
 
 /**
@@ -193,7 +252,9 @@ async function failQueuedJob(tcol, tenant, docId, error) {
 
 module.exports = {
   QUEUE_STATUS,
+  QUEUE_EMAIL_BODY_MAX,
   queueDocId,
+  sanitizeQueueEmailBody,
   enqueueQuoteEmail,
   listQueuedForDispatcher,
   claimQueuedJob,

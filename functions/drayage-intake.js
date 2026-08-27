@@ -1,6 +1,6 @@
 /**
- * Drayage invoice intake — Primus vendor type (primary)
- * or container # (secondary).
+ * Drayage invoice intake — carrier identity (Primus vendor type or
+ * configured carrier name). Container # is metadata only, not a route trigger.
  * Inbound → forward to Leo; Leo returns instructions → process per email
  * (never forward Leo returns back to Leo). Missing fields → email Lisa.
  */
@@ -515,13 +515,16 @@ async function probeContainerOnPdfs(pdfAttachments) {
 function resolveInboundDrayageContainer(
     from, invoiceItems, probedContainer, subject, body) {
   if (isDrayageValidatorEmail(from)) return null;
+  const carrierName = carrierNameFromInvoiceItems(invoiceItems);
+  if (!isConfiguredDrayageCarrierName(carrierName)) return null;
   return resolveContainerNumber(
       invoiceItems, probedContainer, subject, body);
 }
 
 /**
- * Classifies inbound freight as drayage using Primus vendor type first,
- * then container number as a secondary signal.
+ * Classifies inbound freight as drayage using configured carrier names or
+ * Primus vendor type — not container numbers (intermodal invoices like Loup
+ * also carry container #s but are not drayage).
  *
  * @param {object} args from, invoiceItems, probedContainer, subject, body.
  * @return {Promise<object>} {isDrayage, reason, containerNumber, carrierName,
@@ -537,13 +540,14 @@ async function resolveInboundDrayageSignal(args) {
 
   const carrierName = carrierNameFromInvoiceItems(invoiceItems);
   let vendorType = null;
+  const containerNumber = resolveContainerNumber(
+      invoiceItems, probedContainer, subject, body);
 
   if (isConfiguredDrayageCarrierName(carrierName)) {
     return {
       isDrayage: true,
       reason: `Drayage invoice — configured carrier ${carrierName}`,
-      containerNumber: resolveContainerNumber(
-          invoiceItems, probedContainer, subject, body),
+      containerNumber,
       carrierName,
       drayageByConfiguredCarrier: true,
     };
@@ -562,8 +566,7 @@ async function resolveInboundDrayageSignal(args) {
           return {
             isDrayage: true,
             reason: `Drayage invoice — Primus vendor type ${vendorType}`,
-            containerNumber: resolveContainerNumber(
-                invoiceItems, probedContainer, subject, body),
+            containerNumber,
             carrierName: carrierName || vendor.name || null,
             vendorType,
             primusVendorId: vendor.id || null,
@@ -573,22 +576,10 @@ async function resolveInboundDrayageSignal(args) {
       }
     }
   } catch (_) {
-    // Primus lookup is best-effort; fall back to container detection.
+    // Primus lookup is best-effort; non-drayage carriers continue as invoices.
   }
 
-  const containerNumber = resolveContainerNumber(
-      invoiceItems, probedContainer, subject, body);
-  if (containerNumber) {
-    return {
-      isDrayage: true,
-      reason: "Drayage invoice — container number detected",
-      containerNumber,
-      carrierName,
-      vendorType,
-    };
-  }
-
-  return {isDrayage: false, carrierName, vendorType};
+  return {isDrayage: false, carrierName, vendorType, containerNumber};
 }
 
 module.exports = {

@@ -33,12 +33,37 @@ const checkNotHas = (name, arr, code) => {
 };
 
 let codes = emailAcc.extractRequestedAccessorialsFromText(
-    "Need liftgate and appointment delivery, residential.");
-checkHas("liftgate unspecified → LFO", codes, "LFO");
+    "Need liftgate and residential.");
+checkNotHas("liftgate unspecified not LFO", codes, "LFO");
 checkHas("liftgate unspecified → LFD", codes, "LFD");
-checkHas("appointment → APD", codes, "APD");
 checkHas("residential → RSD", codes, "RSD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "LIFTGATE NEEDED");
+checkHas("bare LIFTGATE NEEDED → LFD", codes, "LFD");
+checkNotHas("bare LIFTGATE NEEDED not LFO", codes, "LFO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Need appointment delivery.");
+checkHas("appointment → APD", codes, "APD");
 checkNotHas("appointment at dest does not add APO", codes, "APO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Lift gate needed for delivery.");
+checkHas("liftgate for delivery → LFD", codes, "LFD");
+checkNotHas("liftgate for delivery not LFO", codes, "LFO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "These need liftgates. Lift gate needed for delivery.");
+checkHas("these need liftgates + delivery → LFD", codes, "LFD");
+checkNotHas("these need liftgates + delivery not LFO", codes, "LFO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Need liftgate and appointment delivery, residential.");
+checkHas("liftgate near delivery word → LFD", codes, "LFD");
+checkNotHas("liftgate near delivery word not LFO", codes, "LFO");
+checkHas("appointment → APD (with liftgate)", codes, "APD");
+checkHas("residential with liftgate → RSD", codes, "RSD");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Dock 4. Mon-Fri 8:30am - 4:30pm. No Appointment necessary.");
@@ -49,6 +74,7 @@ codes = emailAcc.extractRequestedAccessorialsFromText(
     "no appt needed, liftgate at delivery");
 checkNotHas("no appt needed does not add APD", codes, "APD");
 checkHas("no appt needed still adds LFD", codes, "LFD");
+checkNotHas("liftgate at delivery not LFO", codes, "LFO");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "appointment not required");
@@ -75,8 +101,68 @@ checkNotHas("liftgate pickup not LFD", codes, "LFD");
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Please include limited access charges in the quote.");
-checkHas("limited access → LAD", codes, "LAD");
-checkNotHas("limited access not LAO", codes, "LAO");
+checkNotHas("disclose limited access charges does not add LAD",
+    codes, "LAD");
+checkNotHas("disclose limited access charges does not add LAO",
+    codes, "LAO");
+check("disclose-only detect",
+    emailAcc.isLimitedAccessDiscloseOnly(
+        "Please include limited access charges in the quote."), true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please include any additional charges applicable for " +
+    "restricted or limited delivery directly in the quote email.");
+checkNotHas("restricted/limited delivery disclose does not add LAD",
+    codes, "LAD");
+check("core home disclose-only",
+    emailAcc.isLimitedAccessDiscloseOnly(
+        "Please include any additional charges applicable for " +
+        "restricted or limited delivery directly in the quote email."),
+    true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "any applicable limited access charges");
+checkNotHas("any applicable LAD charges does not add LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "if limited access applies, include in quote");
+checkNotHas("if limited access applies does not add LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Needs limited access.");
+checkHas("needs limited access → LAD", codes, "LAD");
+checkNotHas("needs limited access not LAO", codes, "LAO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "limited access delivery required");
+checkHas("limited access delivery required → LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "restricted access");
+checkHas("bare restricted access → LAD", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "LAD please");
+checkHas("LAD please → LAD", codes, "LAD");
+
+const discloseAi = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal:
+    "Please include any additional charges applicable for " +
+    "restricted or limited delivery directly in the quote email.",
+  customerRequest: {
+    wantsLimitedAccessInQuote: true,
+    requestedAccessorials: ["LAD"],
+  },
+  lanes: [],
+}, {
+  subject: "RFQ",
+  body: "Please include any additional charges applicable for " +
+    "restricted or limited delivery directly in the quote email.",
+});
+checkNotHas("AI LAD stripped for disclose-only boilerplate",
+    discloseAi.customerRequest.requestedAccessorials, "LAD");
+check("wantsLimitedAccess cleared for disclose-only",
+    discloseAi.customerRequest.wantsLimitedAccessInQuote, false);
 
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "Inside delivery required. Also insurance.");
@@ -116,6 +202,42 @@ check("no extra why when all already from rules",
     (noNew.appliedRules || []).some((r) => r.ruleId === "email_requested"),
     false);
 
+const refinedDelivery = emailAcc.applyEmailRequestedAccessorials(
+    {accessorials: ["LFO", "LFD"], appliedRules: []},
+    ["LFD"],
+    (c) => c.join(", "),
+    "Lift gate needed for delivery.");
+checkHas("refine delivery keeps LFD", refinedDelivery.accessorials, "LFD");
+checkNotHas("refine delivery strips LFO", refinedDelivery.accessorials, "LFO");
+
+const aiBothDelivery = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "Lift gate needed for delivery.",
+  customerRequest: {requestedAccessorials: ["LFO", "LFD"]},
+  lanes: [],
+}, {subject: "RFQ", body: "Lift gate needed for delivery."});
+checkHas("AI keeps LFD when delivery-only email",
+    aiBothDelivery.customerRequest.requestedAccessorials, "LFD");
+checkNotHas("AI LFO stripped when delivery-only",
+    aiBothDelivery.customerRequest.requestedAccessorials, "LFO");
+
+const aiBothBare = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "LIFTGATE NEEDED",
+  customerRequest: {requestedAccessorials: ["LFO", "LFD"]},
+  lanes: [],
+}, {subject: "RFQ", body: "LIFTGATE NEEDED"});
+checkHas("AI keeps LFD on bare liftgate",
+    aiBothBare.customerRequest.requestedAccessorials, "LFD");
+checkNotHas("AI LFO stripped on bare liftgate",
+    aiBothBare.customerRequest.requestedAccessorials, "LFO");
+
+const refinedBare = emailAcc.applyEmailRequestedAccessorials(
+    {accessorials: ["LFO", "LFD"], appliedRules: []},
+    ["LFO", "LFD"],
+    (c) => c.join(", "),
+    "LIFTGATE NEEDED");
+checkHas("refine bare keeps LFD", refinedBare.accessorials, "LFD");
+checkNotHas("refine bare strips LFO", refinedBare.accessorials, "LFO");
+
 codes = emailAcc.extractRequestedAccessorialsFromText(
     "No liftgate needed. Dock available.");
 checkNotHas("no liftgate does not add LFD", codes, "LFD");
@@ -131,6 +253,20 @@ checkNotHas("no limited access does not add LAD", codes, "LAD");
 checkNotHas("no limited access does not add LAO", codes, "LAO");
 check("declines limited access",
     emailAcc.declinesLimitedAccess("no limited access"), true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Deliver to Golden Moon Hotel and Casino, Choctaw MS.");
+checkNotHas("facility name hotel does not add HOD", codes, "HOD");
+checkNotHas("facility name hotel does not add LAD from name alone", codes, "LAD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please quote hotel delivery to the consignee.");
+checkHas("explicit hotel delivery → LAD", codes, "LAD");
+checkNotHas("explicit hotel delivery not HOD", codes, "HOD");
+
+check("HOD normalizes to LAD",
+    emailAcc.normalizeHotelCasinoAccessorials(["HOD", "LFD"]).sort(),
+    ["LAD", "LFD"].sort());
 
 const declinedLift = emailAcc.attachRequestedAccessorials({
   specialInstructionsGlobal: "No liftgate needed",

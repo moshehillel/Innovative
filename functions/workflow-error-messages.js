@@ -12,6 +12,88 @@ const ACTION = {
   RESUME: "resume",
 };
 
+/** Resume steps that should run mark-delivered → invoice → customer email. */
+const BILLING_PIPELINE_RESUME_STEPS = new Set([
+  "mark_delivered",
+  "check_customer",
+  "approve_bill",
+  "get_rate",
+  "generate_invoice",
+  "pod_extraction",
+  "customer_invoice",
+]);
+
+/**
+ * True when a resumed workflow should run the billing pipeline (not only
+ * customer email). Fresh starts (no resume step) always run billing.
+ * @param {string|null|undefined} resumeStep workflowPausedAtStep value.
+ * @return {boolean}
+ */
+function shouldRunBillingPipelineOnResume(resumeStep) {
+  if (!resumeStep) return true;
+  return BILLING_PIPELINE_RESUME_STEPS.has(String(resumeStep));
+}
+
+/**
+ * Maps a workflow POST response to user-facing resume outcome copy.
+ * @param {boolean} httpOk fetch response.ok
+ * @param {object} payload Parsed workflow JSON body
+ * @return {{ok: boolean, userMessage: string, code: string|null}}
+ */
+function interpretWorkflowResumeResult(httpOk, payload) {
+  const p = payload || {};
+  if (!httpOk) {
+    return {
+      ok: false,
+      userMessage: p.error ||
+        "Jerry could not reach the workflow — try again in a minute.",
+      code: p.error || "WORKFLOW_HTTP_ERROR",
+    };
+  }
+  if (p.error === "MISSING_POD" || p.workflowStatus === "missing_pod") {
+    return {
+      ok: false,
+      userMessage: "POD is still missing on this load. Upload the POD in " +
+        "ShipPrimus (POD file type on the booking), then click Resume " +
+        "Workflow again.",
+      code: "MISSING_POD",
+    };
+  }
+  if (p.error === "ALREADY_PROCESSING") {
+    return {
+      ok: false,
+      userMessage: "This load is already being processed — wait a minute " +
+        "and check ShipPrimus.",
+      code: "ALREADY_PROCESSING",
+    };
+  }
+  if (p.error === "ALREADY_COMPLETED" ||
+      p.workflowStatus === "completed") {
+    return {
+      ok: true,
+      userMessage: "This load was already invoiced — no further action " +
+        "needed.",
+      code: "ALREADY_COMPLETED",
+    };
+  }
+  if (p.ok === false) {
+    return {
+      ok: false,
+      userMessage: p.error ||
+        "The workflow stopped before finishing — check ShipPrimus or " +
+        "contact Advanced Automations.",
+      code: p.error || p.workflowStatus || "WORKFLOW_FAILED",
+    };
+  }
+  return {
+    ok: true,
+    userMessage: p.message ||
+      "Jerry resumed processing this load. Billing and customer email " +
+      "will continue automatically.",
+    code: p.workflowStatus || "RESUMED",
+  };
+}
+
 /**
  * @param {string} text Raw text.
  * @return {string}
@@ -48,7 +130,8 @@ function detailsTable(rows) {
 function isSystemUiBillingStep(step) {
   const s = String(step || "").toLowerCase();
   if (!s) return false;
-  return /session|cookie|getterms|manage\.php|bookingid|upload|internal|/ +
+  return /session|cookie|getterms|manage\.php|bookingid|upload|internal/
+      .test(s) ||
     /timeout|network|fetch failed|not configured|off$/.test(s);
 }
 
@@ -61,8 +144,9 @@ function looksLikeSystemError(message, step) {
   if (isSystemUiBillingStep(step)) return true;
   const m = String(message || "").toLowerCase();
   if (!m) return false;
-  return /internal server|unexpected|cannot read|undefined is not|/ +
-    /typeerror|referenceerror|manage\.php|session|not configured|env |/ +
+  return /internal server|unexpected|cannot read|undefined is not/.test(m) ||
+    /typeerror|referenceerror|manage\.php|session|not configured|env /
+        .test(m) ||
     /timeout|econnreset|fetch failed|status 5\d\d/.test(m);
 }
 
@@ -301,6 +385,32 @@ function buildWorkflowAlertEmail(opts) {
       }
       break;
 
+    case "MARK_DELIVERED_FAILED":
+      if (looksLikeSystemError(ctx.errorMessage, ctx.step)) {
+        subject = `System issue — Mark delivered failed — Load ${loadNumber}`;
+        title = "Could not mark shipment delivered";
+        summary = "Jerry could not mark this load delivered in ShipPrimus " +
+          "before customer invoicing.";
+        explanation = (ctx.errorMessage ?
+          `${esc(ctx.errorMessage)} ` : "") +
+          "This looks like an automation/API issue. Advanced Automations " +
+          "has been notified. Mark the load delivered in ShipPrimus " +
+          "manually if urgent, then contact Advanced Automations to resume.";
+        action = ACTION.NONE;
+      } else {
+        subject = `Action needed — Mark delivered failed — Load ${loadNumber}`;
+        title = "Could not mark shipment delivered";
+        summary = "Jerry could not mark this load delivered in ShipPrimus, " +
+          "so the customer invoice was not created.";
+        explanation = (ctx.errorMessage ?
+          `${esc(ctx.errorMessage)} ` : "") +
+          "Mark the shipment as delivered in ShipPrimus (or fix the vendor " +
+          "/ webservice issue on the load), then resume. Do not retry until " +
+          "Primus shows the load delivered or dispatchable.";
+        action = ACTION.RESUME;
+      }
+      break;
+
     case "CUSTOMER_EMAIL_FAILED":
       subject = `Action needed — Customer email failed — Load ${loadNumber}`;
       title = "Customer email could not be sent";
@@ -483,6 +593,7 @@ function isSystemAlertCode(code, context) {
     case "STUCK_FLOW":
       return true;
     case "UI_BILLING_FAILED":
+    case "MARK_DELIVERED_FAILED":
       return looksLikeSystemError(ctx.errorMessage, ctx.step);
     default:
       return false;
@@ -495,6 +606,43 @@ const TRANSIENT_NETWORK_RETRY_MS = 3000;
 /** Primus REST reads retried on transient 5xx / rate limits. */
 const PRIMUS_API_RETRY_ATTEMPTS = 3;
 
+/** Wait before re-invoking the whole workflow after in-request retries fail. */
+const WORKFLOW_DELAYED_RETRY_MS = 10 * 60 * 1000;
+
+/** Extra full-workflow retries after immediate Primus/network backoff. */
+const MAX_WORKFLOW_DELAYED_RETRIES = 1;
+
+/**
+ * Backoff before the next in-request Primus/network retry.
+ * @param {number} attempt 1-based attempt that just failed.
+ * @return {number} Milliseconds to wait.
+ */
+function transientRetryDelayMs(attempt) {
+  const n = Math.max(1, Number(attempt) || 1);
+  return TRANSIENT_NETWORK_RETRY_MS * Math.pow(2, n - 1);
+}
+
+/**
+ * True when a thrown workflow error should get a delayed full retry
+ * instead of an immediate ops/system-error email.
+ * @param {object} opts Retry decision inputs.
+ * @param {string} [opts.errorMessage]
+ * @param {number} [opts.delayedRetryCount]
+ * @param {boolean} [opts.extraChargePending]
+ * @param {boolean} [opts.podHold]
+ * @param {boolean} [opts.missingAccountingEmail]
+ * @return {boolean}
+ */
+function shouldDelayWorkflowRetry(opts) {
+  const o = opts || {};
+  if (!isTransientNetworkError(o.errorMessage)) return false;
+  if (o.extraChargePending || o.podHold || o.missingAccountingEmail) {
+    return false;
+  }
+  const used = Number(o.delayedRetryCount) || 0;
+  return used < MAX_WORKFLOW_DELAYED_RETRIES;
+}
+
 /**
  * True for timeouts / connection errors worth retrying once.
  * @param {string|null|undefined} message Error message.
@@ -503,8 +651,8 @@ const PRIMUS_API_RETRY_ATTEMPTS = 3;
 function isTransientNetworkError(message) {
   const m = String(message || "").toLowerCase();
   if (!m) return false;
-  return /timeout|timed out|econnreset|econnrefused|enetunreach|/ +
-    /fetch failed|network error|socket hang up|/ +
+  return /timeout|timed out|econnreset|econnrefused|enetunreach/.test(m) ||
+    /fetch failed|network error|socket hang up/.test(m) ||
     /status 502|status 503|status 504|aborted/.test(m);
 }
 
@@ -521,7 +669,7 @@ function isTransientPrimusApiError(status, message) {
     return true;
   }
   const m = String(message || "").toLowerCase();
-  return /internal server error|service unavailable|bad gateway|/ +
+  return /internal server error|service unavailable|bad gateway/.test(m) ||
     /gateway timeout|too many requests/.test(m);
 }
 
@@ -632,6 +780,7 @@ function shouldSuppressRepeatHoldAlert(opts) {
 
 module.exports = {
   ACTION,
+  BILLING_PIPELINE_RESUME_STEPS,
   buildWorkflowAlertEmail,
   buildWorkflowActionButton,
   looksLikeSystemError,
@@ -642,6 +791,12 @@ module.exports = {
   isCannotEmailHoldAlert,
   holdReasonKey,
   shouldSuppressRepeatHoldAlert,
+  shouldDelayWorkflowRetry,
+  shouldRunBillingPipelineOnResume,
+  interpretWorkflowResumeResult,
+  transientRetryDelayMs,
   TRANSIENT_NETWORK_RETRY_MS,
+  WORKFLOW_DELAYED_RETRY_MS,
+  MAX_WORKFLOW_DELAYED_RETRIES,
   PRIMUS_API_RETRY_ATTEMPTS,
 };

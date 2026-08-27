@@ -6,6 +6,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const statementInvoiceBundle = require("./statement-invoice-bundle");
 
 const DOC_TYPE = Object.freeze({
   EMAIL: "email",
@@ -27,6 +28,15 @@ const OUTCOME = Object.freeze({
   PARTIAL: "partial",
   FAILED: "failed",
   SPLIT: "split",
+});
+
+/** Firestore TTL for emailIntake / gmailQueue docs, from discovery time. */
+const INTAKE_TTL_DAYS = 60;
+
+/** Searchable outcomeReason values for system/workflow crashes. */
+const OUTCOME_REASON = Object.freeze({
+  WORKFLOW_FAILED: "workflow_failed",
+  SYSTEM_ERROR: "system_error",
 });
 
 /**
@@ -59,11 +69,11 @@ function col(tenant, collection) {
 }
 
 /**
- * @param {number} [days=30] TTL days for intake docs.
+ * @param {number} [days=INTAKE_TTL_DAYS] TTL days for intake docs.
  * @return {FirebaseFirestore.Timestamp}
  */
 function deleteAt(days) {
-  const ms = Date.now() + Number(days || 30) * 24 * 60 * 60 * 1000;
+  const ms = Date.now() + Number(days || INTAKE_TTL_DAYS) * 24 * 60 * 60 * 1000;
   return admin.firestore.Timestamp.fromDate(new Date(ms));
 }
 
@@ -114,6 +124,33 @@ function buildIntakeSummary(data) {
   const completedChildCount = Number(d.completedChildCount || 0);
   const receivedLabel = formatReceivedAtEt(d);
 
+  const stmtGap = d.statementExtractionGap;
+  if (stmtGap && stmtGap.underExtracted) {
+    const gapSuffix = statementInvoiceBundle
+        .buildStatementGapSummarySuffix(stmtGap);
+    let core = gapSuffix ?
+      `Partial — ${gapSuffix}` :
+      "Partial — statement PDF missing invoice(s)";
+    if (itemSummaries.length > 0) {
+      const counts = computeIntakeOutcomeCounts({
+        attachmentCount: Number(d.attachmentCount) || 0,
+        itemSummaries,
+      });
+      const parts = [];
+      if (counts.processedCount) {
+        parts.push(`${counts.processedCount} processed`);
+      }
+      if (counts.skippedCount) {
+        parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+      }
+      if (parts.length) core += `; ${parts.join("; ")}`;
+    }
+    if (receivedLabel && !/received /i.test(core)) {
+      return `${core} · received ${receivedLabel}`;
+    }
+    return core;
+  }
+
   let core = null;
 
   if (d.outcome === OUTCOME.SPLIT ||
@@ -125,7 +162,17 @@ function buildIntakeSummary(data) {
     const statusSummary = {
       payment_notification_ignored:
         "Ignored — payment notification (Zelle/bank)",
+      payment_receipt_ignored:
+        "Ignored — payment receipt (not a freight invoice)",
       emodal_broadcast_ignored: "Ignored — eModal/terminal broadcast",
+      cardknox_batch_report_ignored:
+        "Ignored — Cardknox daily batch report",
+      amex_merchant_survey_ignored:
+        "Ignored — AmEx merchant satisfaction survey",
+      dnb_promotional_ignored:
+        "Ignored — D&B promotional / marketing email",
+      coface_ignored: "Ignored — Coface newsletter/marketing",
+      out_of_office_ignored: "Ignored — out of office auto-reply",
       noa_ignored: "Ignored — notice of assignment, no invoice",
       carrier_portal_notification_ignored:
         "Ignored — carrier open-invoice portal (link only)",
@@ -134,22 +181,48 @@ function buildIntakeSummary(data) {
       past_due_only: "Ignored — past-due statement already in Primus",
       statement_ignored_abe_cc: "Ignored — carrier statement (Abe on CC)",
       statement_forwarded: "Forwarded — carrier statement, no freight invoice",
+      customer_payment_remittance_ignored_abe_cc:
+        "Ignored — customer payment remittance (Abe on thread)",
+      customer_payment_remittance_forwarded:
+        "Forwarded — customer payment remittance to accounting",
       hafstaff_forwarded_to_lisa: "Forwarded — Hafstaff to Lisa (ops rule)",
       no_attachment: "Forwarded — no attachments",
       no_invoice_pdf: "Forwarded — no processable invoice PDF",
+      workflow_failed: "Failed — invoice workflow system error",
+      system_error: "Failed — invoice workflow system error",
+      statement_under_extracted:
+        "Partial — statement PDF missing invoice(s)",
     };
     if (finalStatus && statusSummary[finalStatus]) {
       core = statusSummary[finalStatus];
     } else if (itemSummaries.length > 0) {
-      const processed = itemSummaries.filter((s) =>
-        s && s.finalStatus === "processing" && s.invoiceId).length;
-      const skipped = itemSummaries.filter((s) =>
-        s && s.finalStatus === "already_billed_skipped").length;
-      const other = itemSummaries.length - processed - skipped;
+      const attachmentCount = Number(d.attachmentCount) || 0;
+      const counts = computeIntakeOutcomeCounts({attachmentCount, itemSummaries});
+      const other = itemSummaries.length - counts.processedCount -
+        counts.skippedCount;
       const parts = [];
-      if (processed) parts.push(`processed ${processed} invoice(s)`);
-      if (skipped) parts.push(`${skipped} skipped (already in Primus)`);
-      if (other) parts.push(`${other} other outcome(s)`);
+      if (attachmentCount > 1) {
+        if (counts.processedCount) {
+          parts.push(`${counts.processedCount} processed`);
+        }
+        if (counts.skippedCount) {
+          parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+        }
+        if (counts.unaccountedCount > 0) {
+          parts.push(
+              `${counts.unaccountedCount} unaccounted ` +
+              `(of ${counts.attachmentCount} attachments)`);
+        }
+        if (other) parts.push(`${other} other outcome(s)`);
+      } else {
+        if (counts.processedCount) {
+          parts.push(`processed ${counts.processedCount} invoice(s)`);
+        }
+        if (counts.skippedCount) {
+          parts.push(`${counts.skippedCount} skipped (already in Primus)`);
+        }
+        if (other) parts.push(`${other} other outcome(s)`);
+      }
       if (parts.length) core = `Processed email — ${parts.join("; ")}`;
     }
   }
@@ -251,7 +324,7 @@ async function enqueueDiscoveredEmail(opts) {
     createdAt: now,
     updatedAt: now,
     inboxFlowId: opts.inboxFlowId || null,
-    deleteAt: deleteAt(30),
+    deleteAt: deleteAt(INTAKE_TTL_DAYS),
   };
   if (receivedDateTime) {
     payload.receivedDateTime = receivedDateTime;
@@ -406,33 +479,116 @@ async function completeIntakeRecord(opts) {
 }
 
 /**
+ * Resolves parent emailIntake id and gmailQueue id from an invoice.
+ * @param {object} invoice Invoice document data.
+ * @return {{parentMessageId: string, queueDocId: string}}
+ */
+function resolveIntakeIdsFromInvoice(invoice) {
+  const data = invoice || {};
+  const parentMessageId = String(
+      data.gmailMessageId ||
+      data.sourceMessageId ||
+      data.messageId ||
+      "",
+  ).trim();
+  let queueDocId = String(data.queueDocId || "").trim();
+  if (!queueDocId && parentMessageId &&
+      data.itemIndex != null && data.itemIndex !== "") {
+    queueDocId = childQueueDocId(parentMessageId, data.itemIndex);
+  }
+  if (!queueDocId) queueDocId = parentMessageId;
+  return {parentMessageId, queueDocId};
+}
+
+/**
  * @param {object} tenant Tenant config.
- * @param {string} docId Doc id.
+ * @param {string} docId Queue doc id (parent or child).
  * @param {string} error Error message.
+ * @param {object} [opts]
+ * @param {string} [opts.outcomeReason] Searchable reason, e.g. workflow_failed.
+ * @param {string} [opts.finalStatus] Alias for outcomeReason.
+ * @param {object} [opts.extra] Extra Firestore fields.
  * @return {Promise<void>}
  */
-async function failIntakeRecord(tenant, docId, error) {
-  const summary = buildIntakeSummary({
-    outcome: OUTCOME.FAILED,
-    error: error || "Unknown error",
-  });
+async function failIntakeRecord(tenant, docId, error, opts) {
+  opts = opts || {};
+  const parentMessageId = isChildQueueDocId(docId) ?
+    docId.replace(/__item_\d+$/, "") : String(docId || "");
+  let existing = {};
+  try {
+    const existingSnap = await col(tenant, "emailIntake")
+        .doc(parentMessageId).get();
+    existing = existingSnap.exists ? (existingSnap.data() || {}) : {};
+  } catch (_e) {
+    existing = {};
+  }
+  const outcomeReason = opts.outcomeReason || opts.finalStatus || null;
+  const summary = opts.summary || buildIntakeSummary(Object.assign(
+      {}, existing, {
+        outcome: OUTCOME.FAILED,
+        outcomeReason,
+        finalStatus: outcomeReason,
+        error: error || "Unknown error",
+        summary: null,
+        ignoreReason: null,
+        _rebuildSummary: true,
+      }));
   const now = admin.firestore.FieldValue.serverTimestamp();
-  const patch = {
+  const patch = Object.assign({
     intakeStatus: QUEUE_STATUS.FAILED,
     status: QUEUE_STATUS.FAILED,
     outcome: OUTCOME.FAILED,
+    outcomeReason,
     summary,
     error: String(error || "").slice(0, 1000),
     finishedAt: now,
     updatedAt: now,
-  };
+  }, opts.extra || {});
   await col(tenant, "gmailQueue").doc(docId).set(patch, {merge: true});
-  const parentMessageId = isChildQueueDocId(docId) ?
-    docId.replace(/__item_\d+$/, "") : docId;
-  if (!isChildQueueDocId(docId)) {
-    await col(tenant, "emailIntake").doc(parentMessageId).set(
-        patch, {merge: true});
+  if (isChildQueueDocId(docId)) {
+    return;
   }
+  await col(tenant, "emailIntake").doc(parentMessageId).set(
+      Object.assign({}, patch, {
+        gmailMessageId: parentMessageId,
+        tenantId: tenant.tenantId,
+      }), {merge: true});
+}
+
+/**
+ * Marks parent emailIntake (and mirrored gmailQueue / split child) failed
+ * after a Primus workflow system crash. Ops holds should not call this.
+ * @param {object} opts Options.
+ * @param {object} [opts.tenant] Tenant config.
+ * @param {object} [opts.invoice] Invoice document data.
+ * @param {string} [opts.invoiceId] Invoice id stored on the intake row.
+ * @param {string} [opts.error] Error message for summary.
+ * @param {string} [opts.outcomeReason] Defaults to workflow_failed.
+ * @return {Promise<object>} Result with ok / ids.
+ */
+async function failIntakeForWorkflowCrash(opts) {
+  const o = opts || {};
+  const tenant = o.tenant || {tenantId: "default"};
+  const ids = resolveIntakeIdsFromInvoice(o.invoice);
+  if (!ids.parentMessageId) {
+    return {ok: false, reason: "missing_message_id"};
+  }
+  const failOpts = {
+    outcomeReason: o.outcomeReason || OUTCOME_REASON.WORKFLOW_FAILED,
+    extra: o.invoiceId ? {failedInvoiceId: String(o.invoiceId)} : {},
+  };
+  const error = o.error || failOpts.outcomeReason;
+  const seen = new Set();
+  for (const id of [ids.queueDocId, ids.parentMessageId]) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    await failIntakeRecord(tenant, id, error, failOpts);
+  }
+  return {
+    ok: true,
+    parentMessageId: ids.parentMessageId,
+    queueDocId: ids.queueDocId,
+  };
 }
 
 /**
@@ -466,16 +622,29 @@ async function incrementParentChildCompletion(
     };
 
     if (completedChildCount >= childCount && childCount > 0) {
+      const preSkipped = Array.isArray(data.preSkippedItemSummaries) ?
+        data.preSkippedItemSummaries : [];
+      const mergedSummaries = preSkipped.concat(
+          itemSummaries.filter(Boolean));
+      const stmtGap = data.statementExtractionGap;
+      const stmtUnderExtracted = stmtGap && stmtGap.underExtracted;
       const rollup = buildIntakeSummary({
-        itemSummaries,
+        itemSummaries: mergedSummaries,
         childCount,
         completedChildCount,
         receivedDateTime: data.receivedDateTime || data.receivedAt || null,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" : null,
+        statementExtractionGap: stmtGap || null,
+        _rebuildSummary: !!stmtUnderExtracted,
       });
       Object.assign(patch, {
         intakeStatus: QUEUE_STATUS.COMPLETED,
         status: QUEUE_STATUS.COMPLETED,
-        outcome: OUTCOME.PROCESSED,
+        outcome: stmtUnderExtracted ? OUTCOME.PARTIAL : OUTCOME.PROCESSED,
+        finalStatus: stmtUnderExtracted ?
+          "statement_under_extracted" :
+          (data.finalStatus || null),
         summary: rollup,
         finishedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
@@ -501,6 +670,12 @@ async function createInvoiceChildJobs(opts) {
     opts.invoiceItems : [];
   if (!parentMessageId || invoiceItems.length <= 1) return 0;
 
+  const preSkippedSummaries = Array.isArray(opts.preSkippedSummaries) ?
+    opts.preSkippedSummaries : [];
+  const stmtGap = opts.statementExtractionGap &&
+    opts.statementExtractionGap.underExtracted ?
+    opts.statementExtractionGap : null;
+
   const now = admin.firestore.FieldValue.serverTimestamp();
   const batch = admin.firestore().batch();
   const parentQueueRef = col(tenant, "gmailQueue").doc(parentMessageId);
@@ -523,10 +698,20 @@ async function createInvoiceChildJobs(opts) {
       claimedAt: now,
       createdAt: now,
       updatedAt: now,
-      deleteAt: deleteAt(30),
+      deleteAt: deleteAt(INTAKE_TTL_DAYS),
     };
     batch.set(
         col(tenant, "gmailQueue").doc(childId), childPayload, {merge: true});
+  }
+
+  let splitSummary = preSkippedSummaries.length > 0 ?
+    `Split into ${invoiceItems.length} invoice job(s); ` +
+    `${preSkippedSummaries.length} already processed — skipped.` :
+    `Split into ${invoiceItems.length} invoice job(s) for processing.`;
+  if (stmtGap) {
+    const gapSuffix = statementInvoiceBundle
+        .buildStatementGapSummarySuffix(stmtGap);
+    if (gapSuffix) splitSummary += ` WARNING: ${gapSuffix}`;
   }
 
   const parentPatch = {
@@ -536,9 +721,12 @@ async function createInvoiceChildJobs(opts) {
     outcome: OUTCOME.SPLIT,
     childCount: invoiceItems.length,
     completedChildCount: 0,
+    preSkippedItemSummaries: preSkippedSummaries,
+    statementExtractionGap: stmtGap,
+    finalStatus: stmtGap ? "statement_under_extracted" : null,
     invoiceItemsPending: invoiceItems.map((item, itemIndex) =>
       Object.assign({itemIndex}, item)),
-    summary: `Split into ${invoiceItems.length} invoice job(s) for processing.`,
+    summary: splitSummary,
     updatedAt: now,
   };
   batch.set(parentQueueRef, parentPatch, {merge: true});
@@ -610,13 +798,47 @@ async function listIgnoredIntakeForReport(tenant, since, until) {
       });
 }
 
+/**
+ * Counts processed/skipped/unaccounted items for intake summaries.
+ * Single-PDF multi-invoice emails do not invent unaccounted gaps.
+ * @param {object} data attachmentCount, itemSummaries.
+ * @return {object}
+ */
+function computeIntakeOutcomeCounts(data) {
+  const d = data || {};
+  const attachmentCount = Number(d.attachmentCount) || 0;
+  const itemSummaries = Array.isArray(d.itemSummaries) ?
+    d.itemSummaries : [];
+  const processedCount = itemSummaries.filter((s) =>
+    s && s.finalStatus === "processing" && s.invoiceId).length;
+  const skippedCount = itemSummaries.filter((s) =>
+    s && (s.finalStatus === "already_billed_skipped" ||
+      s.finalStatus === "already_processed_skipped")).length;
+  let unaccountedCount = 0;
+  if (attachmentCount > 1) {
+    unaccountedCount = Math.max(0,
+        attachmentCount - processedCount - skippedCount);
+  }
+  return {
+    attachmentCount,
+    processedCount,
+    skippedCount,
+    unaccountedCount,
+    itemSummaries,
+  };
+}
+
 module.exports = {
   DOC_TYPE,
   QUEUE_STATUS,
   OUTCOME,
+  OUTCOME,
+  OUTCOME_REASON,
+  INTAKE_TTL_DAYS,
   childQueueDocId,
   isChildQueueDocId,
   buildIntakeSummary,
+  computeIntakeOutcomeCounts,
   formatReceivedAtEt,
   toReceivedTimestamp,
   isAlreadyDiscovered,
@@ -625,6 +847,8 @@ module.exports = {
   markIntakeProcessing,
   completeIntakeRecord,
   failIntakeRecord,
+  failIntakeForWorkflowCrash,
+  resolveIntakeIdsFromInvoice,
   createInvoiceChildJobs,
   listIntakeForDigest,
   listIgnoredIntakeForReport,

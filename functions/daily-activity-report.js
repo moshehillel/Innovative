@@ -101,6 +101,7 @@ function aggregateDailyActivity(logs) {
     noInvoiceEmails: [],
     stuckFlows: 0,
     brokerCommissionSwaps: [],
+    workflowFailures: [],
   };
 
   const billedKeys = new Set();
@@ -195,6 +196,15 @@ function aggregateDailyActivity(logs) {
         step: (d.result && d.result.step) || detail(d, "step"),
       });
     }
+    if (msg === "Primus workflow failed after retries" ||
+        msg === "Primus workflow failed") {
+      agg.workflowFailures.push({
+        load: load || detail(d, "loadNumber"),
+        invoiceId: detail(d, "invoiceId") || log.invoiceId || null,
+        carrier,
+        error: detail(d, "error") || null,
+      });
+    }
     if (msg === "Customer/rate alert sent to dispatcher") {
       agg.rateAlerts.push({
         load: load || detail(d, "loadNumber"),
@@ -248,6 +258,20 @@ function aggregateDailyActivity(logs) {
       });
     }
   }
+
+  const recoveredLoads = new Set(
+      agg.billed.map((b) => b.load != null ? String(b.load) : "")
+          .filter(Boolean),
+  );
+  const seenFail = new Set();
+  agg.workflowFailures = agg.workflowFailures.filter((f) => {
+    const loadKey = f.load != null ? String(f.load) : "";
+    if (loadKey && recoveredLoads.has(loadKey)) return false;
+    const id = f.invoiceId || loadKey || String(f.error || "");
+    if (!id || seenFail.has(id)) return false;
+    seenFail.add(id);
+    return true;
+  });
 
   return agg;
 }
@@ -347,6 +371,14 @@ function buildDeterministicBullets(agg) {
     );
   }
 
+  for (const fail of agg.workflowFailures || []) {
+    const err = fail.error ? `: ${fail.error}` : "";
+    lines.push(
+        `Workflow failed — ${fmtLoad(fail.load)}` +
+        `${fmtCarrier(fail.carrier)}${err}.`,
+    );
+  }
+
   for (const a of agg.apexDownloadFailures) {
     const sub = a.subject ? `"${a.subject}"` : "Apex email";
     lines.push(`Apex PDF download failed — ${sub}.`);
@@ -383,7 +415,8 @@ async function polishBulletsWithAi(agg, fallbackBullets) {
     "CRITICAL: One bullet per event — NEVER combine multiple loads into a ",
     "single line (wrong: 'Invoiced 25 loads'; right: separate line per load). ",
     "Include every item from aggregates.billed, ",
-    "additionalChargeApprovals, billingFailures, forwardedForReview, ",
+    "additionalChargeApprovals, billingFailures, workflowFailures, ",
+    "forwardedForReview, ",
     "pastDueIgnored, etc. Do not say customer emails are waiting on ",
     "reviewer approval — those send automatically. ",
     "Each line: past tense, plain English, max 140 chars, no markdown. ",
@@ -934,12 +967,22 @@ async function runDailyInboxDigestReport(opts = {}) {
 /** Human-readable labels for ignore categories (by finalStatus). */
 const IGNORE_CATEGORY_LABELS = {
   payment_notification_ignored: "Payment notification",
+  payment_receipt_ignored: "Payment receipt",
   emodal_broadcast_ignored: "eModal / terminal broadcast",
+  cardknox_batch_report_ignored: "Cardknox batch report",
+  amex_merchant_survey_ignored: "AmEx merchant satisfaction survey",
+  dnb_promotional_ignored: "D&B promotional / marketing",
+  coface_ignored: "Coface newsletter/marketing",
+  out_of_office_ignored: "Out of office auto-reply",
   noa_ignored: "Notice of assignment (NOA)",
   carrier_portal_notification_ignored: "Carrier open-invoice portal",
   credit_agency_notification_ignored: "Credit-agency / trade-credit alert",
   already_processed: "Already processed",
   statement_ignored_abe_cc: "Carrier statement (Abe on CC)",
+  customer_payment_remittance_ignored_abe_cc:
+    "Customer payment remittance (Abe on thread)",
+  customer_payment_remittance_forwarded:
+    "Customer payment remittance forwarded to Abe",
   past_due_only: "Past-due / already in Primus",
   administrative_ignored: "Administrative",
   payment_inquiry_ignored_abe_cc: "Payment inquiry (Abe on thread)",

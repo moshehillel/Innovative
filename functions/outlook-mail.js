@@ -115,7 +115,11 @@ async function getValidTokens(tokens, onTokenUpdate) {
   const resp = await fetch(TOKEN_URL, {method: "POST", body});
   const text = await resp.text();
   if (!resp.ok) {
-    throw new Error(`Outlook token refresh failed: ${text}`);
+    const err = new Error(`Outlook token refresh failed: ${text}`);
+    if (/invalid_grant/i.test(text)) {
+      err.code = "outlook_invalid_grant";
+    }
+    throw err;
   }
   const refreshed = JSON.parse(text);
   t = normalizeTokenExpiry({

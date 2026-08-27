@@ -227,24 +227,9 @@ async function handleApplyQuoteRule(req, res) {
     const existingRules = await quoteRules.listAllRules(tenant);
     const existing = existingRules.find((r) => r.id === validated.ruleId);
     if (existing) {
-      patch = {
-        active: existing.active,
-        priority: existing.priority,
-        name: existing.name,
-        match: existing.match || {},
-        addAccessorials: existing.addAccessorials || [],
-        filterCarrierWarnings: existing.filterCarrierWarnings || [],
-        notes: existing.notes || "",
-        autoApply: existing.autoApply,
-        requiresConfirm: existing.requiresConfirm,
-        identifyVia: existing.identifyVia,
-        ...patch,
-      };
-      if (Array.isArray(existing.addAccessorialsWithData) &&
-          !Object.prototype.hasOwnProperty.call(
-              validated.patch, "addAccessorialsWithData")) {
-        patch.addAccessorialsWithData = existing.addAccessorialsWithData;
-      }
+      const existingRest = {...existing};
+      delete existingRest.id;
+      patch = {...existingRest, ...patch};
     }
     const rule = await quoteRules.upsertRule(
         tenant, validated.ruleId, patch, updatedBy);
@@ -322,16 +307,29 @@ async function handleQuoteRulesChat(req, res) {
   }
   try {
     const tenant = await deps.resolveDashboardTenant(req);
-    const messages = req.body && req.body.messages;
-    if (!Array.isArray(messages) || !messages.length) {
-      return res.status(400).json({ok: false, error: "messages required"});
+    const body = req.body || {};
+    const chatTurns = quoteRulesChat.resolveChatTurns(body);
+    if (!chatTurns.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "messages or history required (non-empty array)",
+      });
     }
     const allRules = await quoteRules.listAllRules(tenant);
     // Chat only sees live rules — inactive / tombstoned-away defaults stay out.
     const existingRules = allRules.filter((r) => r.active !== false);
     const result = await quoteRulesChat.runQuoteRulesChatTurn({
-      messages,
+      messages: chatTurns,
+      history: chatTurns,
       existingRules,
+      pendingProposal: body.pendingProposal || null,
+      lastAppliedRule: body.lastAppliedRule || null,
+      lastProposedRule: body.lastProposedRule || null,
+      lastAppliedRuleId: body.lastAppliedRuleId ||
+        (body.lastAppliedRule && body.lastAppliedRule.ruleId) || null,
+      referencedRuleId: body.referencedRuleId ||
+        (body.lastAppliedRule && body.lastAppliedRule.ruleId) ||
+        (body.lastProposedRule && body.lastProposedRule.ruleId) || null,
     });
     // Backfill name/match on update proposals so Confirm never fails
     // with "Proposal needs name or match criteria".
