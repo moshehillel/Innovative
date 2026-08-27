@@ -9,13 +9,15 @@
  *      from what is on the Primus booking. For W&I we re-rate via Primus
  *      GET /rate with the invoice's updated weight/class and compare the
  *      returned total to the carrier invoice (default $10 tolerance).
- *   C. Approval email offers FOUR decisions:
+ *   C. Approval email offers FIVE decisions:
  *        A — pay carrier + bill customer; auto-email the customer contact.
  *        B — pay carrier + bill customer; dispatcher notifies the customer
  *            (system reminds the dispatcher / adds to their task list).
  *        C — pay carrier only; customer rate stays the same (not itemized).
  *        D — not approved; generate a carrier dispute draft for manual
  *            submission (LTL portals) or email (TL).
+ *        E — pay carrier + bill customer; enter amount and bump rate; no
+ *            separate customer notification (invoice carries the charge).
  *   D. Every case is tracked on an Additional Charges Follow-Up list until
  *      resolved.
  *
@@ -668,7 +670,7 @@ function pickCarrierInvoiceAttachment(attachments) {
 }
 
 /**
- * Builds the 4-option approval email for Sarah + the dispatcher.
+ * Builds the 5-option approval email for Sarah + the dispatcher.
  * @param {object} opts baseUrl, invoiceId, tenantId, loadNumber, carrierName,
  *   customerName, invoiceAmount, primusAmount, charges, chargesTotal,
  *   category, freightMismatch, hasCertificate, dispatcherName,
@@ -807,6 +809,9 @@ function buildAdditionalChargeApprovalEmail(opts) {
         "C - Approve: pay carrier only (customer rate unchanged)") +
     btn("d", "#dc2626",
         "D - Not approved: dispute with carrier") +
+    btn("e", "#7c3aed",
+        "E - Approve: pay carrier + bill customer " +
+        "(enter amount; apply rate; no separate customer notification)") +
     `<p style="font-size:12px;color:#6b7280">A: enter how much to charge the ` +
     `customer on the confirm page; the customer rate is bumped by that ` +
     `amount and the customer is emailed. B: the base customer rate stays ` +
@@ -814,7 +819,9 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `on separate lines; the dispatcher gets a ready customer-notification ` +
     `template. C: the carrier bill is entered at the full carrier amount ` +
     `and the customer rate stays the same (no itemization needed). D: Jerry ` +
-    `will draft the wording for manual submission.` +
+    `will draft the wording for manual submission. E: like A (enter amount ` +
+    `and bump the customer rate) but no separate customer notification - ` +
+    `the charge is included when the customer invoice is sent.` +
     `</p>`;
 
   return {

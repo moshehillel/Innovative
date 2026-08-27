@@ -2788,7 +2788,7 @@ async function resolveCurrentCustomerRate(invoice, booking) {
 /**
  * Atomically claims an additional-charge decision (blocks double-execute).
  * @param {object} invoiceRef Firestore invoice document reference.
- * @param {string} decision Decision letter A, B, C, or D.
+ * @param {string} decision Decision letter A, B, C, D, or E.
  * @return {Promise<object>} Claim result with ok flag.
  */
 async function claimAdditionalChargeDecision(invoiceRef, decision) {
@@ -2812,7 +2812,7 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
 }
 
 /**
- * Handles the A/B/C/D decision buttons from the additional-charge approval
+ * Handles the A/B/C/D/E decision buttons from the additional-charge approval
  * email:
  *   a — pay carrier + bill customer (enter customer charge amount;
  *       auto-email the customer contact).
@@ -2820,6 +2820,8 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
  *       rate; dispatcher gets a ready customer-notification template).
  *   c — pay carrier only; customer rate unchanged.
  *   d — not approved; dispute draft generated for manual submission.
+ *   e - pay carrier + bill customer (enter amount; bump rate; no separate
+ *       customer notification - charge rides on the customer invoice).
  */
 exports.additionalChargeAction = onRequest(
     {invoker: "public"}, handleAdditionalChargeAction);
@@ -2841,9 +2843,9 @@ async function handleAdditionalChargeAction(req, res) {
     const exp = (req.body && req.body.exp) || req.query.exp;
     const sig = (req.body && req.body.sig) || req.query.sig;
 
-    if (!invoiceId || !["a", "b", "c", "d"].includes(option)) {
+    if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
       return res.status(400).send(
-          "Missing invoiceId or a valid option (a|b|c|d).");
+          "Missing invoiceId or a valid option (a|b|c|d|e).");
     }
 
     const tokenOk = emailActionTokens.verify({
@@ -2897,6 +2899,8 @@ async function handleAdditionalChargeAction(req, res) {
         "dispatcher notifies customer)",
       c: "C - Pay carrier only (customer rate unchanged)",
       d: "D - Not approved (dispute with carrier)",
+      e: "E - Pay carrier + bill customer (enter amount; apply rate; " +
+        "no separate customer notification)",
     };
 
     if (req.method !== "POST") {
@@ -2907,7 +2911,8 @@ async function handleAdditionalChargeAction(req, res) {
           `${optionLabels[option]}. Nothing is sent until you click Confirm.`,
         confirmLabel: `Confirm option ${option.toUpperCase()}`,
         confirmColor: option === "d" ? "#dc2626" :
-          (option === "c" ? "#2563eb" : "#16a34a"),
+          (option === "c" ? "#2563eb" :
+            (option === "e" ? "#7c3aed" : "#16a34a")),
         actionPath: "additionalChargeAction",
         fields: {
           invoiceId: String(invoiceId),
@@ -2917,7 +2922,7 @@ async function handleAdditionalChargeAction(req, res) {
           sig: String(sig),
         },
       };
-      if (option === "a") {
+      if (option === "a" || option === "e") {
         let bookingForRate = null;
         try {
           bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
@@ -2929,15 +2934,22 @@ async function handleAdditionalChargeAction(req, res) {
         const defaultCharge = Number(charge.amount) || 0;
         const rateNote = currentRate > 0 ?
           ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
-        confirmOpts.title = "Confirm option A";
+        const isE = option === "e";
+        confirmOpts.title = isE ? "Confirm option E" : "Confirm option A";
         confirmOpts.description =
           `Load ${invoice.loadNumber || invoiceId}: ` +
           `${optionLabels[option]}. Enter how much to charge the customer ` +
           `for this additional charge. The customer rate will be bumped by ` +
-          `that amount and the customer will be emailed.` + rateNote +
+          `that amount` +
+          (isE ?
+            `; no separate customer notification is sent - the charge is ` +
+            `included when the customer invoice goes out.` :
+            ` and the customer will be emailed.`) +
+          rateNote +
           ` Nothing is sent until you click Confirm.`;
-        confirmOpts.confirmLabel = "Confirm option A";
-        confirmOpts.confirmColor = "#16a34a";
+        confirmOpts.confirmLabel = isE ?
+          "Confirm option E" : "Confirm option A";
+        confirmOpts.confirmColor = isE ? "#7c3aed" : "#16a34a";
         confirmOpts.inputFields = [{
           name: "customerChargeAmount",
           label: "Amount to charge the customer ($)",
@@ -2991,12 +3003,13 @@ async function handleAdditionalChargeAction(req, res) {
     const decision = option.toUpperCase();
     let optionBCustomerBillLines = null;
     let optionACustomerChargeAmount = null;
-    if (option === "a") {
+    if (option === "a" || option === "e") {
       const parsedAmount =
         additionalCharges.parseCustomerChargeAmountFromRequest(req.body || {});
       if (!parsedAmount.ok) {
         return res.status(400).send(parsedAmount.error ||
-            "Option A requires a customer charge amount greater than 0.");
+            `Option ${decision} requires a customer charge amount ` +
+            `greater than 0.`);
       }
       optionACustomerChargeAmount = parsedAmount.amount;
     }
@@ -3082,10 +3095,10 @@ async function handleAdditionalChargeAction(req, res) {
           "for manual submission to the carrier.");
     }
 
-    // Options a/b/c — the charge is approved for the carrier side.
-    const billCustomer = option === "a" || option === "b";
+    // Options a/b/c/e — the charge is approved for the carrier side.
+    const billCustomer = option === "a" || option === "b" || option === "e";
 
-    // A: approver enters customer charge amount; bump sell rate by that amount.
+    // A/E: approver enters customer charge amount; bump sell rate by that amount.
     // B: approver itemizes accessorials on the confirm page.
     let rateBumpNote = "";
     const approvalUpdate = {
@@ -3093,7 +3106,8 @@ async function handleAdditionalChargeAction(req, res) {
       "additionalCharge.approved": true,
       "additionalCharge.billCustomer": billCustomer,
       "additionalCharge.notifyCustomer": option === "a" ? "auto" :
-        (option === "b" ? "dispatcher" : null),
+        (option === "b" ? "dispatcher" :
+          (option === "e" ? "none" : null)),
       "additionalCharge.status": "approved",
       "additionalCharge.decidedAt":
         admin.firestore.FieldValue.serverTimestamp(),
@@ -3109,7 +3123,8 @@ async function handleAdditionalChargeAction(req, res) {
       "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (option === "a" && optionACustomerChargeAmount > 0) {
+    if ((option === "a" || option === "e") &&
+        optionACustomerChargeAmount > 0) {
       const baseRate = await resolveCurrentCustomerRate(invoice, booking);
       const billAmount = optionACustomerChargeAmount;
       approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
@@ -3185,6 +3200,17 @@ async function handleAdditionalChargeAction(req, res) {
         extraNote += " Could not resolve the customer email from Primus — " +
           "please notify the customer manually.";
       }
+      await additionalCharges.updateFollowUp(db, {
+        invoiceId: String(invoiceId),
+        status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
+        decision,
+        notes: extraNote.trim(),
+      });
+    } else if (option === "e") {
+      // Same billing as A, but skip the separate customer notification —
+      // the additional charge is included on the customer invoice.
+      extraNote += " No separate customer notification sent; charge will " +
+        "be included on the customer invoice.";
       await additionalCharges.updateFollowUp(db, {
         invoiceId: String(invoiceId),
         status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
@@ -3314,6 +3340,7 @@ async function handleAdditionalChargeAction(req, res) {
         "Approved — carrier matches Primus; no dispatcher notify needed" :
         "Approved — dispatcher will notify the customer",
       c: "Approved — carrier only",
+      e: "Approved — customer billed via invoice (no separate notification)",
     };
     const messages = {
       a: "The carrier bill will be paid in full and the charge billed " +
@@ -3328,6 +3355,9 @@ async function handleAdditionalChargeAction(req, res) {
         "ready customer-notification template." + extraNote,
       c: "The carrier bill will be paid in full. The customer rate " +
         "stays the same.",
+      e: "The carrier bill will be paid in full and the charge billed " +
+        "to the customer on the invoice (no separate notification)." +
+        extraNote,
     };
     return htmlPage(titles[option], "#16a34a",
         messages[option] + " Billing is resuming now.");
@@ -5175,7 +5205,7 @@ function customerNameFromPrimusBooking(booking) {
 }
 
 /**
- * Sends the 4-option (A/B/C/D) additional-charge approval email to the
+ * Sends the 5-option (A/B/C/D/E) additional-charge approval email to the
  * approver (Sarah) with the dispatcher CC'd, and creates the follow-up
  * entry so the charge is tracked until resolved.
  * @param {object} opts invoiceId, tenant, aiResult, pending (category,
@@ -5297,7 +5327,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
   await saveOutboundEmail(emailPayload);
 
   await writeLog("info", "email",
-      "Additional-charge approval email sent (A/B/C/D)", {
+      "Additional-charge approval email sent (A/B/C/D/E)", {
         invoiceId,
         followUpId,
         loadNumber: aiResult.loadNumber,

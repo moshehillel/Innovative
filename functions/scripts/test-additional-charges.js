@@ -93,7 +93,7 @@ const noMatch = ac.evaluateRequoteMatch({
 });
 check("rate mismatch over $10", noMatch.matched, false);
 
-// 3. Approval email contains all four buttons (signed confirm links)
+// 3. Approval email contains all five buttons (signed confirm links)
 const email = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
   invoiceId: "inv123",
@@ -123,7 +123,7 @@ check("email shows quote number",
 check("email shows customer rate", email.html.includes("$545.00"), true);
 check("email shows customer rate label",
     email.html.includes("Customer rate (Primus)"), true);
-for (const opt of ["a", "b", "c", "d"]) {
+for (const opt of ["a", "b", "c", "d", "e"]) {
   check(`button ${opt} has action`,
       email.html.includes("additionalChargeAction") &&
       email.html.includes(`invoiceId=inv123`) &&
@@ -140,6 +140,11 @@ check("button A label mentions auto-email",
 check("button B label mentions updated rate / dispatcher",
     email.html.includes("enter updated rate") &&
     email.html.includes("dispatcher notifies customer"), true);
+check("button E label mentions no separate notification",
+    email.html.includes("no separate customer notification"), true);
+check("footer explains E vs A",
+    email.html.includes("like A") &&
+    email.html.includes("no separate customer notification"), true);
 
 // 3b. Option A amount parsing
 const badA = ac.parseCustomerChargeAmountFromRequest({});
