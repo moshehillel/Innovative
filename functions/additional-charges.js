@@ -636,6 +636,38 @@ function chargesHtml(charges) {
 }
 
 /**
+ * Picks the carrier invoice PDF from an invoice doc's attachments list
+ * (GCS storagePath). Skips weight-cert / POD image docs so approval emails
+ * get the bill PDF, not a certificate sidecar.
+ * @param {Array<object>|null|undefined} attachments Invoice attachments.
+ * @return {{filename: string, storagePath: string, mimeType: string}|null}
+ */
+function pickCarrierInvoiceAttachment(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  const withPath = list.filter((a) => a && a.storagePath);
+  if (!withPath.length) return null;
+
+  const skipDocType =
+      /WEIGHT_INSPECTION_CERT|POD_IMAGE|TRAILER_IMAGE|^POD$/i;
+  const notSidecar = withPath.filter((a) => {
+    const dt = String(a.docType || "");
+    return !dt || !skipDocType.test(dt);
+  });
+  const pool = notSidecar.length ? notSidecar : withPath;
+
+  const pdfLike = pool.find((a) =>
+    /\.pdf$/i.test(String(a.filename || "")) ||
+    /pdf/i.test(String(a.mimeType || "")));
+  const chosen = pdfLike || pool[0];
+  if (!chosen || !chosen.storagePath) return null;
+  return {
+    filename: String(chosen.filename || "carrier-invoice.pdf"),
+    storagePath: String(chosen.storagePath),
+    mimeType: String(chosen.mimeType || "application/pdf"),
+  };
+}
+
+/**
  * Builds the 4-option approval email for Sarah + the dispatcher.
  * @param {object} opts baseUrl, invoiceId, tenantId, loadNumber, carrierName,
  *   customerName, invoiceAmount, primusAmount, charges, chargesTotal,
@@ -752,7 +784,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Additional charges", money(chargesTotal)) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
-      row("W&amp;I certificate", "Attached / referenced on invoice") : "") +
+      row("W&I certificate", "Attached / referenced on invoice") : "") +
     (dispatcherName ? row("Dispatcher", esc(dispatcherName)) : "") +
     `</table>` +
     accessorialConfirmHtml +
@@ -1351,6 +1383,7 @@ module.exports = {
   LUMPER_BASE_TOLERANCE,
   resolveEffectiveChargeCategory,
   categoryLabel,
+  pickCarrierInvoiceAttachment,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
   buildCustomerChargeNotificationEmail,

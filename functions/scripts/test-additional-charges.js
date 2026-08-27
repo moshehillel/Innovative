@@ -277,6 +277,53 @@ const emailExcluded = ac.buildAdditionalChargeApprovalEmail({
 check("email notes excluded Primus charges",
     emailExcluded.html.includes("2 charge(s) already on file"), true);
 
+// 3d. W&I certificate label is single-escaped (not W&amp;amp;I)
+const emailCert = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv123",
+  loadNumber: "266614",
+  carrierName: "Central",
+  invoiceAmount: 550,
+  primusAmount: 430,
+  charges: [{label: "Reweigh Fee", amount: 120}],
+  chargesTotal: 120,
+  category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  hasCertificate: true,
+});
+check("W&I label single-escaped",
+    emailCert.html.includes("W&amp;I certificate") &&
+    !emailCert.html.includes("W&amp;amp;I"), true);
+check("subject matches Lisa example shape",
+    emailCert.subject.includes("Approval needed - additional charge on Load") &&
+    emailCert.subject.includes("266614") &&
+    emailCert.subject.includes("Weight / Reweigh / Inspection"), true);
+
+// 3e. Carrier invoice PDF attachment picker
+check("pick null when empty",
+    ac.pickCarrierInvoiceAttachment([]), null);
+check("pick null when no storagePath",
+    ac.pickCarrierInvoiceAttachment([{filename: "a.pdf"}]), null);
+const picked = ac.pickCarrierInvoiceAttachment([
+  {filename: "invoice-266614.pdf", storagePath: "invoices/a.pdf",
+    mimeType: "application/pdf"},
+  {filename: "weight-cert.pdf", storagePath: "weightCert/b.pdf",
+    mimeType: "application/pdf", docType: "WEIGHT_INSPECTION_CERT"},
+]);
+check("pick prefers invoice over weight cert",
+    picked && picked.storagePath === "invoices/a.pdf", true);
+check("pick skips cert-only list falls back",
+    ac.pickCarrierInvoiceAttachment([{
+      filename: "cert.pdf", storagePath: "weightCert/c.pdf",
+      docType: "WEIGHT_INSPECTION_CERT",
+    }]).storagePath, "weightCert/c.pdf");
+const preferredFirst = ac.pickCarrierInvoiceAttachment([
+  {filename: "carrier_invoice.pdf", storagePath: "invoices/inv.pdf"},
+  {filename: "pod-photo.jpg", storagePath: "pods/p.jpg",
+    mimeType: "image/jpeg", docType: "POD_IMAGE"},
+]);
+check("pick skips POD image",
+    preferredFirst && preferredFirst.filename === "carrier_invoice.pdf", true);
+
 // 6. Lumper validation — invoice total matches Primus (lumper included)
 const westhill = ac.validateLumperAmount({
   invoiceAmount: 2901.20,
