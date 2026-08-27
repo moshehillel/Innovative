@@ -3967,7 +3967,7 @@ async function handleStatementOnlyEmail(args) {
 }
 
 /**
- * Forwards a drayage invoice (container # present) to Leo for validation.
+ * Forwards a drayage invoice to Leo for validation.
  * @param {object} args Handler arguments.
  * @return {Promise<void>}
  */
@@ -3978,7 +3978,7 @@ async function handleDrayageInvoiceEmail(args) {
   } = args;
   const docId = queueDocId || messageId;
   const forwardReason =
-    reason || "Drayage invoice — container number detected";
+    reason || "Drayage invoice — carrier identified as drayage";
   const intakeExtra = {
     gmailMessageId: messageId,
     subject,
@@ -9380,7 +9380,7 @@ async function processGmailMessage(
               containerNumber: drayageSignal.containerNumber,
               carrierName: drayageSignal.carrierName,
               reason: drayageSignal.reason ||
-                "Drayage paperwork — container number detected",
+                "Drayage paperwork — carrier identified as drayage",
             });
             return;
           }
@@ -9583,7 +9583,7 @@ async function processGmailMessage(
               containerNumber: drayageSignal.containerNumber,
               carrierName: drayageSignal.carrierName,
               reason: drayageSignal.reason ||
-                "Drayage invoice — container number detected",
+                "Drayage invoice — carrier identified as drayage",
             });
             return;
           }
