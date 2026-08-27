@@ -441,13 +441,28 @@ function shouldHandleCustomerPaymentRemittance(subject, from, body) {
 }
 
 /**
- * Bank / Zelle payment alerts — not carrier freight invoices.
+ * Bank of America payment-alert sender (Zelle/ACH deposit notifications).
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isBankOfAmericaSender(from) {
+  const fromL = String(from || "").toLowerCase();
+  return (
+    fromL.includes("bankofamerica.com") ||
+    fromL.includes("@bofa.com")
+  );
+}
+
+/**
+ * Bank of America Zelle / ACH payment alerts — not carrier freight invoices.
+ * Only BoA senders match; invoice replies quoting Zelle remittance tips do not.
  * @param {string} subject Email subject.
  * @param {string} from From header.
  * @param {string} body Plain body.
  * @return {boolean}
  */
 function isPaymentNotificationEmail(subject, from, body) {
+  if (!isBankOfAmericaSender(from)) return false;
   const hay = `${subject || ""}\n${from || ""}\n${body || ""}`.toLowerCase();
   if (/\bzelle\b/.test(hay)) return true;
   if (/payment (?:was )?(?:sent|received|posted|completed|processed)/i
@@ -470,13 +485,7 @@ function isPaymentNotificationEmail(subject, from, body) {
   if (/wire transfer (?:sent|received|completed|notification)/i.test(hay)) {
     return true;
   }
-  const bankDomains = [
-    "bankofamerica", "chase.com", "wellsfargo", "capitalone", "usbank",
-    "pnc.com", "tdbank", "citibank", "ally.com", "paypal.com",
-  ];
-  const fromBank = bankDomains.some((d) =>
-    String(from || "").toLowerCase().includes(d));
-  if (fromBank && /(?:payment|transfer|deposit|withdrawal|alert)/i.test(hay)) {
+  if (/(?:payment|transfer|deposit|withdrawal|alert)/i.test(hay)) {
     return true;
   }
   return false;
@@ -856,6 +865,11 @@ function looksLikeInvoiceEmailContent(subject, body) {
   // Allow optional whitespace after "#": "Invoice # 981 …"
   if (/^(?:fw:\s*)?invoice\s+#?\s*\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
+  // "Re: Invoice for BOL#265028" — no invoice number in subject
+  if (/^(?:(?:re|fw|fwd):\s*)+invoice\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/
+      .test(sub)) {
+    return true;
+  }
   // Compass FS factored invoices: PO # in subject is the broker load.
   if (/^purchase\s+order\s+number\s*[;:]\s*purchase\s+order\s*#\s*\d{5,9}/i
       .test(sub)) {
@@ -1267,6 +1281,7 @@ module.exports = {
   subjectLooksLikeMcNumberNoa,
   isCustomerPaymentRemittanceEmail,
   shouldHandleCustomerPaymentRemittance,
+  isBankOfAmericaSender,
   isPaymentNotificationEmail,
   isPaymentReceiptEmail,
   shouldIgnoreAsPaymentNotification,

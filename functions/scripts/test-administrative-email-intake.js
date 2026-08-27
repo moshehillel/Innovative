@@ -390,6 +390,12 @@ check("Zelle in forwarded body does not ignore invoice email",
         [{filename: "invoice_28415.pdf", mimeType: "application/pdf"}]));
 check("plain Zelle alert still ignored",
     adm.shouldIgnoreAsPaymentNotification(
+        "Goldengate Logistics Llc sent you $36.00",
+        "Bank of America <customerservice@ealerts.bankofamerica.com>",
+        "You received a Zelle payment of $500",
+        []));
+check("Chase Zelle alert not ignored (BoA-only rule)",
+    !adm.shouldIgnoreAsPaymentNotification(
         "Zelle payment received",
         "alerts@chase.com",
         "You received a Zelle payment of $500",
@@ -552,6 +558,12 @@ check("ArcBest eInvoice has invoice veto",
 check("real ACH deposit alert still ignored",
     adm.shouldIgnoreAsPaymentNotification(
         "ACH payment received",
+        "Bank of America <customerservice@ealerts.bankofamerica.com>",
+        "An ACH payment was received for $1,200.00",
+        []));
+check("Chase ACH deposit alert not ignored (BoA-only rule)",
+    !adm.shouldIgnoreAsPaymentNotification(
+        "ACH payment received",
         "alerts@chase.com",
         "An ACH payment was received for $1,200.00",
         []));
@@ -584,8 +596,8 @@ check("second Amfast invoice subject also recognized",
         amfastBody));
 check("plain Zelle alert still ignored after Amfast fix",
     adm.shouldIgnoreAsPaymentNotification(
-        "Zelle payment received",
-        "alerts@chase.com",
+        "Goldengate Logistics Llc sent you $36.00",
+        "Bank of America <customerservice@ealerts.bankofamerica.com>",
         "You received a Zelle payment of $500",
         []));
 
@@ -626,6 +638,31 @@ check("payment receipt with invoice filename not ignored",
     !adm.shouldIgnoreAsPaymentReceipt(
         amfastReceiptSubject, amfastReceiptFrom, amfastReceiptBody,
         [{filename: "carrier_invoice_123.pdf", mimeType: "application/pdf"}]));
+
+const heypharmaSubject = "Re: Invoice for BOL#265028";
+const heypharmaFrom = "Moshe Myski <mmyski@heypharma.com>";
+const heypharmaBody =
+  "Please see attached invoice.\n\n" +
+  "On Tue, Aug 26, 2026 Abe <abe@innovativecarriers.com> wrote:\n" +
+  "PLEASE NOTE OUR NEW BANKING INFORMATION\n" +
+  "Quickpay/Zelle\naccounting@innovativecarriers.com\n";
+check("Re: Invoice for BOL subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent(heypharmaSubject, heypharmaBody));
+check("Heypharma invoice reply with Zelle in quoted body not ignored",
+    !adm.shouldIgnoreAsPaymentNotification(
+        heypharmaSubject, heypharmaFrom, heypharmaBody, []));
+check("Heypharma invoice reply has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: heypharmaSubject,
+      body: heypharmaBody,
+      from: heypharmaFrom,
+      attachments: [],
+    }));
+check("BoA sender detected",
+    adm.isBankOfAmericaSender(
+        "Bank of America <customerservice@ealerts.bankofamerica.com>"));
+check("non-BoA sender not detected",
+    !adm.isBankOfAmericaSender("Moshe Myski <mmyski@heypharma.com>"));
 
 const compassSubject = "Purchase order number; Purchase Order #266265";
 const compassFrom = "notify@mg.compassfs.net <notify@mg.compassfs.net>";
