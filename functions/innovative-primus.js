@@ -2656,9 +2656,13 @@ exports.processPrimusWorkflow = onRequest(
                   invoiceId,
                   tenantId: (req.body && req.body.tenantId) || null,
                   loadNumber: invoice.loadNumber,
+                  customerName: customerNameForCheck ||
+                    manualCustomerName || null,
                   context: {
                     loadNumber: invoice.loadNumber,
                     carrierName: invoice.carrierName,
+                    customerName: customerNameForCheck ||
+                      manualCustomerName || null,
                     invoiceAmount: invoice.invoiceAmount,
                   },
                 });
@@ -2671,6 +2675,8 @@ exports.processPrimusWorkflow = onRequest(
                   context: {
                     loadNumber: invoice.loadNumber,
                     carrierName: invoice.carrierName,
+                    customerName: customerNameForCheck ||
+                      manualCustomerName || null,
                     invoiceAmount: invoice.invoiceAmount,
                   },
                 });
@@ -2762,6 +2768,7 @@ exports.processPrimusWorkflow = onRequest(
                   invoiceId,
                   tenantId: (req.body && req.body.tenantId) || null,
                   loadNumber: invoice.loadNumber,
+                  customerName: customerName || null,
                   context: {
                     loadNumber: invoice.loadNumber,
                     carrierName: invoice.carrierName,

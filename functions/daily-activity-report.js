@@ -205,7 +205,8 @@ function aggregateDailyActivity(logs) {
         error: detail(d, "error") || null,
       });
     }
-    if (msg === "Customer/rate alert sent to dispatcher") {
+    if (msg === "Customer/rate alert sent to dispatcher" ||
+        msg === "Customer/rate alert sent to Sarah (Children's Apparel)") {
       agg.rateAlerts.push({
         load: load || detail(d, "loadNumber"),
         code: detail(d, "code") || null,

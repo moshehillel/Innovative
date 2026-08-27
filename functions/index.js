@@ -1100,6 +1100,14 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
       loadResolvedFrom: null,
     };
   }
+  // Valid 6-digit BOL/load wins over PRO remap even when Primus fetch failed.
+  if (direct.ok) {
+    return {
+      aiResult: {...refs, loadNumber: direct.loadNumber},
+      gateFailed: false,
+      loadResolvedFrom: null,
+    };
+  }
   if (normalizedProNumber) {
     const proResolved = await resolveLoadNumberFromPrimusPro(
         normalizedProNumber);
@@ -2422,9 +2430,11 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
       invoiceId,
       tenantId: tenant.tenantId,
       loadNumber: invoice.loadNumber || invoiceId,
+      customerName: invoice.customerName || null,
       context: {
         loadNumber: invoice.loadNumber || invoiceId,
         carrierName: invoice.carrierName,
+        customerName: invoice.customerName || null,
         customerRate,
         profit,
         marginPct: customerRate > 0 ?
@@ -4968,9 +4978,22 @@ async function notifyDispatcherLowProfit(opts) {
 }
 
 /**
+ * True when the bill-to customer is Children's Apparel (Network).
+ * Missing-rate alerts for this account go to Sarah, not the dispatcher.
+ * @param {string} customerName Primus / invoice customer name.
+ * @return {boolean}
+ */
+function isChildrensApparelCustomer(customerName) {
+  const n = String(customerName || "").toLowerCase().replace(/['’]/g, "");
+  return n.includes("children") && n.includes("apparel");
+}
+
+/**
  * Emails the load dispatcher (CC Lisa) when customer rate is missing or
  * margin is too low to auto-invoice. Includes the set-rate / resume links
  * from the standard workflow alert. Falls back to Lisa as To.
+ * Children's Apparel missing-rate alerts go to Sarah instead of the
+ * dispatcher.
  * @param {object} opts Notification context.
  * @return {Promise<object>} Delivery result.
  */
@@ -4982,23 +5005,38 @@ async function notifyDispatcherRateIssue(opts) {
     tenantId,
     loadNumber,
     context,
+    customerName: customerNameOpt,
   } = opts || {};
   const ccLisa = process.env.LOW_PROFIT_CC_EMAIL ||
     "Lisa@innovativecarriers.com";
+  const podFollowupLocal = require("./pod-followup");
+  const sarahEmail = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+    podFollowupLocal.SARAH_EMAIL;
   const primusUiBridgeLocal = require("./primus-ui-bridge");
 
+  const customerName = String(
+      customerNameOpt ||
+      (context && context.customerName) ||
+      "",
+  ).trim();
+  const routeToSarah = code === "MISSING_RATE" &&
+    isChildrensApparelCustomer(customerName);
+
   let dispatcher = {ok: false};
-  try {
-    dispatcher = await primusUiBridgeLocal.resolveDispatcherEmail({
-      loadNumber,
-      fetchBooking: fetchPrimusBooking,
-    });
-  } catch (err) {
-    dispatcher = {ok: false, error: err.message};
+  if (!routeToSarah) {
+    try {
+      dispatcher = await primusUiBridgeLocal.resolveDispatcherEmail({
+        loadNumber,
+        fetchBooking: fetchPrimusBooking,
+      });
+    } catch (err) {
+      dispatcher = {ok: false, error: err.message};
+    }
   }
 
-  const to = (dispatcher.ok && dispatcher.email) ?
-    dispatcher.email : ccLisa;
+  const to = routeToSarah ?
+    sarahEmail :
+    ((dispatcher.ok && dispatcher.email) ? dispatcher.email : ccLisa);
 
   const baseUrl = req && req.get ? `https://${req.get("host")}` : "";
   const alert = workflowErrors.buildWorkflowAlertEmail({
@@ -5010,12 +5048,14 @@ async function notifyDispatcherRateIssue(opts) {
   });
 
   let html = alert.html;
-  if (dispatcher.displayName) {
+  if (routeToSarah) {
+    html = `<p>Hi Sarah,</p>` + html;
+  } else if (dispatcher.displayName) {
     html = `<p>Hi ${escapeHtml(dispatcher.displayName.trim())},</p>` + html;
   } else if (dispatcher.ok && dispatcher.email) {
     html = `<p>Hi,</p>` + html;
   }
-  if (!dispatcher.ok) {
+  if (!routeToSarah && !dispatcher.ok) {
     html += `<p style="color:#b45309"><em>Note: could not resolve ` +
       `dispatcher email from Primus` +
       (dispatcher.error ? ` (${escapeHtml(dispatcher.error)})` : "") +
@@ -5035,12 +5075,16 @@ async function notifyDispatcherRateIssue(opts) {
   await saveOutboundEmail(emailPayload);
 
   await writeLog("info", "email",
-      "Customer/rate alert sent to dispatcher", {
+      routeToSarah ?
+        "Customer/rate alert sent to Sarah (Children's Apparel)" :
+        "Customer/rate alert sent to dispatcher", {
         invoiceId: invoiceId || null,
         loadNumber: loadNumber || null,
+        customerName: customerName || null,
         code,
         to: emailPayload.to,
         cc: emailPayload.cc || null,
+        routedToSarah: routeToSarah,
         dispatcherOk: Boolean(dispatcher.ok),
         dispatcherUserName: dispatcher.userName || null,
       });
@@ -5049,6 +5093,7 @@ async function notifyDispatcherRateIssue(opts) {
     ok: true,
     to: emailPayload.to,
     cc: emailPayload.cc || null,
+    routedToSarah: routeToSarah,
     dispatcher,
   };
 }
