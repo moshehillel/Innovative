@@ -382,6 +382,29 @@ check("normalizeExtractedQuote requestedAccessorials no APD",
     !(noApptNorm.customerRequest.requestedAccessorials || []).includes("APD"),
     true);
 
+const heightMiddleBody = [
+  "Pallet 1: 40x57x48, 1268 lbs",
+  "Pallet 2: 45x79x45, 1862 lbs",
+  "Pallet 3: 45x72x45, 1912 lbs",
+].join("\n");
+const heightMiddle = intake.extractCompactPalletBlocks(heightMiddleBody);
+check("compact 3 pallets", heightMiddle.length, 3);
+check("compact 40x57x48 → 40x48x57", [
+  heightMiddle[0].length, heightMiddle[0].width, heightMiddle[0].height,
+], [40, 48, 57]);
+check("compact 45x79x45 → 45x45x79", [
+  heightMiddle[1].length, heightMiddle[1].width, heightMiddle[1].height,
+], [45, 45, 79]);
+check("compact 45x72x45 → 45x45x72", [
+  heightMiddle[2].length, heightMiddle[2].width, heightMiddle[2].height,
+], [45, 45, 72]);
+
+const labeledSuffix = intake.parseLabeledFreightTotals(
+    "Pallet dimensions – 40L x 57H x 48W");
+check("labeled suffix L 40", labeledSuffix.length, 40);
+check("labeled suffix W 48", labeledSuffix.width, 48);
+check("labeled suffix H 57", labeledSuffix.height, 57);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

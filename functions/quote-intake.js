@@ -399,11 +399,20 @@ function quoteExtractSystemPrompt() {
     "  If the email says Total weight / \"total weight – N\", weightType",
     "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
     "- Standard GMA pallet footprint is 40 x 48 (length 40, width 48).",
+    "  Store L×W×H. If dims are labeled (Length/Width/Height, or",
+    "  40L x 57H x 48W), map by label — not written order.",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
+    "  If 40 and 48 are the two ends (e.g. 40x57x48), those are L and W",
+    "  (store 40x48); the middle number is height (57).",
+    "  If first and last match (e.g. 45x79x45), that pair is the base",
+    "  and the middle number is height (45x45x79).",
     "  Non-standard footprints (e.g. 48*45*39) keep the stated L and W",
     "  (length 48, width 45, height 39) — do NOT collapse to 40x48.",
-    "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
-    "  and dimType PLT — do not invent dims over explicit values.",
+    "  Do NOT assume the largest number is height (96x48x40 stays",
+    "  length 96; 96x48x48 stays length 96).",
+    "  Height is unchanged otherwise. If pallet L/W/H are missing,",
+    "  use 40x48x60 and dimType PLT — do not invent dims over",
+    "  explicit values.",
     "- Multiple \"Shipping From STG <city>, <ST>\" sections in one email",
     "  mean separate origin warehouses. Create one lane per origin +",
     "  destination row — never merge freight from different STG origins",
@@ -619,7 +628,8 @@ function extractCompactPalletBlocks(body) {
   const seen = new Set();
   const pattern = new RegExp(
       "Pallet\\s+(\\d+)\\s*[:.\\-]?\\s+" +
-      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*,?\\s*" +
+      "([\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*[\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*" +
+      "[\\d.]+\\s*[lLwWhH]?)\\s*,?\\s*" +
       "([\\d.,]+)\\s*lbs",
       "gi");
   let m;
@@ -627,15 +637,17 @@ function extractCompactPalletBlocks(body) {
     const n = Number(m[1]);
     if (seen.has(n)) continue;
     seen.add(n);
-    const weight = Number(String(m[5]).replace(/,/g, ""));
+    const dims = freightDims.parseDimTripleString(m[2]);
+    if (!dims) continue;
+    const weight = Number(String(m[3]).replace(/,/g, ""));
     freight.push(freightDims.normalizePalletDims({
       qty: 1,
       weight: Number.isFinite(weight) ? weight : null,
       weightType: "total",
       class: null,
-      length: Number(m[2]),
-      width: Number(m[3]),
-      height: Number(m[4]),
+      length: dims.length,
+      width: dims.width,
+      height: dims.height,
       dimType: "PLT",
     }));
   }
@@ -911,16 +923,18 @@ function parseLabeledFreightTotals(body) {
   const weight = matchLabeledNumber(text,
       /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d.]+)/i);
   const dim = text.match(new RegExp(
-      "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*([\\d.]+)\\s*[x×*]\\s*" +
-      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
+      "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*" +
+      "([\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*[\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*" +
+      "[\\d.]+\\s*[lLwWhH]?)",
       "i"));
+  const parsed = dim ? freightDims.parseDimTripleString(dim[1]) : null;
   return {
     cartonCount,
     palletCount,
     weight,
-    length: dim ? Number(dim[1]) : null,
-    width: dim ? Number(dim[2]) : null,
-    height: dim ? Number(dim[3]) : null,
+    length: parsed ? parsed.length : null,
+    width: parsed ? parsed.width : null,
+    height: parsed ? parsed.height : null,
   };
 }
 

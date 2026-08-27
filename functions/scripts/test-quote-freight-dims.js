@@ -1,0 +1,53 @@
+/* eslint-disable no-console */
+"use strict";
+
+const freightDims = require("../quote-freight-dims");
+
+let failures = 0;
+const check = (name, got, exp) => {
+  const pass = JSON.stringify(got) === JSON.stringify(exp);
+  if (!pass) failures++;
+  console.log(`${pass ? "PASS" : "FAIL"} ${name}`);
+  if (!pass) {
+    console.log(`  got: ${JSON.stringify(got)}`);
+    console.log(`  exp: ${JSON.stringify(exp)}`);
+  }
+};
+
+const lwh = (row) => [row.length, row.width, row.height];
+const plt = (length, width, height, extra) => freightDims.normalizePalletDims({
+  qty: 1, weight: 1000, dimType: "PLT", length, width, height, ...extra,
+});
+
+check("48x40x28 → 40x48x28", lwh(plt(48, 40, 28)), [40, 48, 28]);
+check("40x48x57 stays", lwh(plt(40, 48, 57)), [40, 48, 57]);
+check("40x57x48 → 40x48x57", lwh(plt(40, 57, 48)), [40, 48, 57]);
+check("48x57x40 → 40x48x57", lwh(plt(48, 57, 40)), [40, 48, 57]);
+check("45x79x45 → 45x45x79", lwh(plt(45, 79, 45)), [45, 45, 79]);
+check("45x72x45 → 45x45x72", lwh(plt(45, 72, 45)), [45, 45, 72]);
+check("45x45x79 stays", lwh(plt(45, 45, 79)), [45, 45, 79]);
+check("48x45x39 stays non-GMA", lwh(plt(48, 45, 39)), [48, 45, 39]);
+check("96x48x48 stays long", lwh(plt(96, 48, 48)), [96, 48, 48]);
+check("96x40x48 stays long GMA", lwh(plt(96, 40, 48)), [96, 40, 48]);
+check("40x48x40 stays short GMA", lwh(plt(40, 48, 40)), [40, 48, 40]);
+check("48x40x48 → 40x48x48", lwh(plt(48, 40, 48)), [40, 48, 48]);
+
+check("carton not reordered", lwh(freightDims.normalizePalletDims({
+  qty: 1, length: 40, width: 57, height: 48, dimType: "CTN",
+})), [40, 57, 48]);
+
+check("labels 40L x 57H x 48W",
+    freightDims.parseDimTripleString("40L x 57H x 48W"),
+    {length: 40, width: 48, height: 57});
+check("labels 57H x 40W x 48L",
+    freightDims.parseDimTripleString("57H x 40W x 48L"),
+    {length: 48, width: 40, height: 57});
+check("unlabeled 48*40*28 written order",
+    freightDims.parseDimTripleString("48*40*28"),
+    {length: 48, width: 40, height: 28});
+
+if (failures) {
+  console.log(`FAILED ${failures}`);
+  process.exit(1);
+}
+console.log("OK");

@@ -72,6 +72,32 @@ check("rate payload 48x40 → L 40", swappedFreight[0].length, 40);
 check("rate payload 48x40 → W 48", swappedFreight[0].width, 48);
 check("rate payload height kept", swappedFreight[0].height, 28);
 
+const heightInMiddle = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},
+  consignee: {city: "B", state: "MA", zipCode: "01040", country: "US"},
+  freightInfo: [{
+    qty: 1, weight: 1268, weightType: "total",
+    length: 40, width: 57, height: 48, dimType: "PLT",
+  }],
+}, {UOM: "US"});
+const heightInMiddleFreight = JSON.parse(heightInMiddle.freightInfo);
+check("rate 40x57x48 → L 40", heightInMiddleFreight[0].length, 40);
+check("rate 40x57x48 → W 48", heightInMiddleFreight[0].width, 48);
+check("rate 40x57x48 → H 57", heightInMiddleFreight[0].height, 57);
+
+const squareBase = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},
+  consignee: {city: "B", state: "MA", zipCode: "01040", country: "US"},
+  freightInfo: [{
+    qty: 1, weight: 1862, weightType: "total",
+    length: 45, width: 79, height: 45, dimType: "PLT",
+  }],
+}, {UOM: "US"});
+const squareBaseFreight = JSON.parse(squareBase.freightInfo);
+check("rate 45x79x45 → L 45", squareBaseFreight[0].length, 45);
+check("rate 45x79x45 → W 45", squareBaseFreight[0].width, 45);
+check("rate 45x79x45 → H 79", squareBaseFreight[0].height, 79);
+
 const missingDimsQ = rateShop.buildRateMultipleQuery({
   shipper: {city: "A", state: "NY", zipCode: "10913", country: "US"},
   consignee: {city: "B", state: "MA", zipCode: "01040", country: "US"},
