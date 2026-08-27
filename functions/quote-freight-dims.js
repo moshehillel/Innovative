@@ -3,8 +3,9 @@
  * GMA footprint is stored as 40 × 48 (not 48 × 40). Missing pallet dims
  * default to 40 × 48 × 60. Explicit non-40/48 footprints are left alone.
  * Customers sometimes write L×H×W (height in the middle); we reorder
- * that when 40 and 48 are the two ends, or when the first and last
- * numbers match (square base).
+ * when 40 and 48 appear anywhere in the triple (leftover is height),
+ * or when the first and last numbers match (square base). L/W/H and
+ * length/width/height labels are equivalent.
  */
 
 "use strict";
@@ -13,60 +14,127 @@ const STANDARD_PALLET_LENGTH = 40;
 const STANDARD_PALLET_WIDTH = 48;
 const DEFAULT_PALLET_HEIGHT = 60;
 
+/** Non-capturing axis names for embedding in other regexes. */
+const AXIS_TOKEN_NC = "(?:length|width|height|len|wid|ht|l|w|h)";
+/** Axis names: full words first so "length" is not read as "l". */
+const AXIS_TOKEN = "(length|width|height|len|wid|ht|l|w|h)";
+
 /**
- * Map three dim tokens. When every token has an L/W/H suffix, use labels
- * (any order). Otherwise keep written order.
+ * Capturing blob for a dim triple with optional L/W/H labels on each
+ * number. Used by intake scanners; feed the capture to parseDimTripleString.
+ */
+const DIM_TRIPLE_CAPTURE =
+    "(?:" + AXIS_TOKEN_NC + "\\s*[:=]?\\s*)?[\\d.]+(?:\\s*" + AXIS_TOKEN_NC +
+    ")?\\s*[x×*]\\s*(?:" + AXIS_TOKEN_NC + "\\s*[:=]?\\s*)?[\\d.]+(?:\\s*" +
+    AXIS_TOKEN_NC + ")?\\s*[x×*]\\s*(?:" + AXIS_TOKEN_NC +
+    "\\s*[:=]?\\s*)?[\\d.]+(?:\\s*" + AXIS_TOKEN_NC + ")?";
+
+/**
+ * Map L / W / H / length / width / height (and short aliases) to an axis.
+ * @param {*} raw Label token.
+ * @return {"l"|"w"|"h"|null}
+ */
+function dimAxisFromToken(raw) {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "l" || s === "len" || s === "length") return "l";
+  if (s === "w" || s === "wid" || s === "width") return "w";
+  if (s === "h" || s === "ht" || s === "height") return "h";
+  return null;
+}
+
+/**
+ * Map three dim tokens. When every token has an L/W/H (or
+ * length/width/height) label, use labels (any order). Otherwise keep
+ * written order.
  * @param {*} a First number.
- * @param {*} aLab First suffix (l/w/h) or empty.
+ * @param {*} aLab First label or empty.
  * @param {*} b Second number.
- * @param {*} bLab Second suffix.
+ * @param {*} bLab Second label.
  * @param {*} c Third number.
- * @param {*} cLab Third suffix.
- * @return {{length: number, width: number, height: number}}
+ * @param {*} cLab Third label.
+ * @return {{length: number, width: number, height: number, labeled: boolean}}
  */
 function dimsFromOptionalLabels(a, aLab, b, bLab, c, cLab) {
   const tokens = [
-    {n: Number(a), k: String(aLab || "").trim().toLowerCase()},
-    {n: Number(b), k: String(bLab || "").trim().toLowerCase()},
-    {n: Number(c), k: String(cLab || "").trim().toLowerCase()},
+    {n: Number(a), k: dimAxisFromToken(aLab)},
+    {n: Number(b), k: dimAxisFromToken(bLab)},
+    {n: Number(c), k: dimAxisFromToken(cLab)},
   ];
   const map = {l: null, w: null, h: null};
   let labeled = 0;
   for (const t of tokens) {
-    if (t.k === "l" || t.k === "w" || t.k === "h") {
+    if (t.k) {
       map[t.k] = t.n;
       labeled++;
     }
   }
   if (labeled === 3 && map.l > 0 && map.w > 0 && map.h > 0) {
-    return {length: map.l, width: map.w, height: map.h};
+    return {length: map.l, width: map.w, height: map.h, labeled: true};
   }
   return {
     length: tokens[0].n,
     width: tokens[1].n,
     height: tokens[2].n,
+    labeled: false,
   };
 }
 
 /**
- * Parse "40x57x48" or "40L x 57H x 48W" into L/W/H.
+ * One dim token: optional axis, number, optional axis.
+ * "40L", "L40", "L: 40", "height 57", "48".
+ * @type {string}
+ */
+const DIM_TOKEN_RE =
+    "(?:" + AXIS_TOKEN + "\\s*[:=]?\\s*)?([\\d.]+)(?:\\s*" + AXIS_TOKEN + ")?";
+
+/**
+ * Parse "40x57x48", "40L x 57H x 48W", "L 40 x H 57 x W 48",
+ * "L:40 x H:57 x W:48" into L/W/H.
  * @param {string} text Dim triple.
- * @return {{length: number, width: number, height: number}|null}
+ * @return {{length: number, width: number, height: number, labeled: boolean}|null}
  */
 function parseDimTripleString(text) {
-  const m = String(text || "").match(
-      /^\s*([\d.]+)\s*([lLwWhH])?\s*[x×*]\s*([\d.]+)\s*([lLwWhH])?\s*[x×*]\s*([\d.]+)\s*([lLwWhH])?\s*$/);
+  const re = new RegExp(
+      "^\\s*" + DIM_TOKEN_RE + "\\s*[x×*]\\s*" + DIM_TOKEN_RE +
+      "\\s*[x×*]\\s*" + DIM_TOKEN_RE + "\\s*$",
+      "i");
+  const m = String(text || "").match(re);
   if (!m) return null;
-  const dims = dimsFromOptionalLabels(m[1], m[2], m[3], m[4], m[5], m[6]);
+  const dims = dimsFromOptionalLabels(
+      m[2], m[1] || m[3], m[5], m[4] || m[6], m[8], m[7] || m[9]);
   if (!(dims.length > 0 && dims.width > 0 && dims.height > 0)) return null;
   return dims;
 }
 
 /**
+ * Parse scattered L/W/H or length/width/height fields in any order.
+ * "H: 57 L: 40 W: 48", "Length 40 Width 57 Height 48".
+ * @param {string} text Body or pallet block.
+ * @return {{length: number, width: number, height: number}|null}
+ */
+function parseAxisLabeledDims(text) {
+  const src = String(text || "");
+  const map = {l: null, w: null, h: null};
+  const re = new RegExp(
+      "(?:^|[^a-z])" + AXIS_TOKEN + "\\s*[:=]?\\s*([\\d.]+)",
+      "gi");
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const k = dimAxisFromToken(m[1]);
+    const n = Number(m[2]);
+    if (k && n > 0 && map[k] == null) map[k] = n;
+  }
+  if (map.l > 0 && map.w > 0 && map.h > 0) {
+    return {length: map.l, width: map.w, height: map.h};
+  }
+  return null;
+}
+
+/**
  * Customers often write L×H×W (height in the middle) instead of L×W×H.
- * GMA: 40 and 48 on the two ends → leftover (middle) is height.
+ * GMA: 40 and 48 anywhere in the three numbers → leftover is height.
  * Square: first === last, middle is not 40/48 → pair is the base.
- * Does not treat "largest = height" (keeps 96×48×48 and 96×40×48).
+ * Does not treat "largest = height" (keeps 96×48×48).
  * @param {*} length Raw length.
  * @param {*} width Raw width.
  * @param {*} height Raw height.
@@ -80,13 +148,18 @@ function reorderMisplacedPalletDims(length, width, height) {
     return {length: L, width: W, height: H};
   }
   const gma = new Set([STANDARD_PALLET_LENGTH, STANDARD_PALLET_WIDTH]);
-  const endsAreGma = gma.has(L) && gma.has(H) && L !== H && !gma.has(W);
-  if (endsAreGma) {
-    return {
-      length: STANDARD_PALLET_LENGTH,
-      width: STANDARD_PALLET_WIDTH,
-      height: W,
-    };
+  const vals = [L, W, H];
+  const has40 = vals.filter((v) => v === STANDARD_PALLET_LENGTH).length === 1;
+  const has48 = vals.filter((v) => v === STANDARD_PALLET_WIDTH).length === 1;
+  if (has40 && has48) {
+    const leftover = vals.find((v) => !gma.has(v));
+    if (leftover > 0) {
+      return {
+        length: STANDARD_PALLET_LENGTH,
+        width: STANDARD_PALLET_WIDTH,
+        height: leftover,
+      };
+    }
   }
   if (L === H && W !== L && !gma.has(W)) {
     return {length: L, width: L, height: W};
@@ -148,10 +221,11 @@ function resolvePalletDimDefaults(opts = {}) {
 }
 
 /**
- * Reorder L×H×W when height is in the middle (GMA 40/48 on the ends,
- * or matching first/last); rewrite 48×40 → 40×48; fill missing pallet
+ * Reorder unlabeled L×H×W (40/48 anywhere → leftover is height, or
+ * matching first/last); rewrite 48×40 → 40×48; fill missing pallet
  * L/W/H with defaults (global 40×48×60, or opts.defaultDims).
- * Does not overwrite explicit non-standard footprints or present dims.
+ * Labeled L/W/H (or length/width/height) keep the mapped axes; 48×40
+ * L/W is still stored 40×48.
  * @param {object} row Freight row.
  * @param {object} [opts] Optional `defaultDims` {length, width, height}.
  * @return {object}
@@ -159,6 +233,8 @@ function resolvePalletDimDefaults(opts = {}) {
 function normalizePalletDims(row, opts = {}) {
   if (!row || typeof row !== "object") return row;
   const next = {...row};
+  const labeled = !!next.dimAxesLabeled;
+  delete next.dimAxesLabeled;
   if (!isPalletPackaging(next)) return next;
 
   const defaults = resolvePalletDimDefaults(opts);
@@ -169,7 +245,7 @@ function normalizePalletDims(row, opts = {}) {
   const hasW = Number.isFinite(W) && W > 0;
   const hasH = Number.isFinite(H) && H > 0;
 
-  if (hasL && hasW && hasH) {
+  if (hasL && hasW && hasH && !labeled) {
     const reordered = reorderMisplacedPalletDims(L, W, H);
     next.length = reordered.length;
     next.width = reordered.width;
@@ -257,11 +333,14 @@ module.exports = {
   STANDARD_PALLET_LENGTH,
   STANDARD_PALLET_WIDTH,
   DEFAULT_PALLET_HEIGHT,
+  DIM_TRIPLE_CAPTURE,
   isStandardPalletFootprint,
   isPalletPackaging,
   resolvePalletDimDefaults,
   dimsFromOptionalLabels,
   parseDimTripleString,
+  parseAxisLabeledDims,
+  dimAxisFromToken,
   reorderMisplacedPalletDims,
   normalizePalletDims,
   normalizePalletFreightRows,

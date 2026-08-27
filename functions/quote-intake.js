@@ -399,17 +399,20 @@ function quoteExtractSystemPrompt() {
     "  If the email says Total weight / \"total weight – N\", weightType",
     "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
     "- Standard GMA pallet footprint is 40 x 48 (length 40, width 48).",
-    "  Store L×W×H. If dims are labeled (Length/Width/Height, or",
-    "  40L x 57H x 48W), map by label — not written order.",
+    "  Store L×W×H. If dims are labeled — Length/Width/Height OR just",
+    "  L/W/H (L: 40, W 57, H 48, 40L x 57H x 48W, L 40 x H 57 x W 48)",
+    "  — map by label, not written order. L/W/H means the same as",
+    "  length/width/height.",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
-    "  If 40 and 48 are the two ends (e.g. 40x57x48), those are L and W",
-    "  (store 40x48); the middle number is height (57).",
+    "  If unlabeled numbers include 40 and 48 anywhere (e.g. 40x57x48",
+    "  or 57x40x48), those are L and W (store 40x48); the other number",
+    "  is height.",
     "  If first and last match (e.g. 45x79x45), that pair is the base",
     "  and the middle number is height (45x45x79).",
     "  Non-standard footprints (e.g. 48*45*39) keep the stated L and W",
     "  (length 48, width 45, height 39) — do NOT collapse to 40x48.",
-    "  Do NOT assume the largest number is height (96x48x40 stays",
-    "  length 96; 96x48x48 stays length 96).",
+    "  Do NOT assume the largest number is height when 40 and 48 are",
+    "  absent (96x48x48 stays length 96).",
     "  Height is unchanged otherwise. If pallet L/W/H are missing,",
     "  use 40x48x60 and dimType PLT — do not invent dims over",
     "  explicit values.",
@@ -628,8 +631,7 @@ function extractCompactPalletBlocks(body) {
   const seen = new Set();
   const pattern = new RegExp(
       "Pallet\\s+(\\d+)\\s*[:.\\-]?\\s+" +
-      "([\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*[\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*" +
-      "[\\d.]+\\s*[lLwWhH]?)\\s*,?\\s*" +
+      "(" + freightDims.DIM_TRIPLE_CAPTURE + ")\\s*,?\\s*" +
       "([\\d.,]+)\\s*lbs",
       "gi");
   let m;
@@ -649,6 +651,7 @@ function extractCompactPalletBlocks(body) {
       width: dims.width,
       height: dims.height,
       dimType: "PLT",
+      dimAxesLabeled: !!dims.labeled,
     }));
   }
   const cartonPattern = new RegExp(
@@ -703,24 +706,31 @@ function parseInformalPalletCount(text) {
  * @return {Array<object>}
  */
 function extractPalletFreight(body) {
+  const text = String(body || "");
   const freight = [];
-  const pattern = new RegExp(
-      "Pallet\\s+(\\d+)\\s*[\\s\\S]*?Weight:\\s*([\\d.]+)\\s*lbs" +
-      "[\\s\\S]*?Length:\\s*([\\d.]+)\\s*in" +
-      "[\\s\\S]*?Width:\\s*([\\d.]+)\\s*in" +
-      "[\\s\\S]*?Height:\\s*([\\d.]+)\\s*in",
-      "gi");
-  let m;
-  while ((m = pattern.exec(String(body || ""))) !== null) {
+  const headerRe = /Pallet\s+(\d+)/gi;
+  const headers = [];
+  let hm;
+  while ((hm = headerRe.exec(text)) !== null) {
+    headers.push({n: Number(hm[1]), index: hm.index});
+  }
+  for (let i = 0; i < headers.length; i++) {
+    const start = headers[i].index;
+    const end = i + 1 < headers.length ? headers[i + 1].index : text.length;
+    const block = text.slice(start, end);
+    const wt = block.match(/Weight:\s*([\d.]+)\s*lbs/i);
+    const labeled = freightDims.parseAxisLabeledDims(block);
+    if (!wt || !labeled) continue;
     freight.push(freightDims.normalizePalletDims({
       qty: 1,
-      weight: Number(m[2]),
+      weight: Number(wt[1]),
       weightType: "total",
       class: null,
-      length: Number(m[3]),
-      width: Number(m[4]),
-      height: Number(m[5]),
+      length: labeled.length,
+      width: labeled.width,
+      height: labeled.height,
       dimType: "PLT",
+      dimAxesLabeled: true,
     }));
   }
   if (freight.length) return freight;
@@ -924,8 +934,7 @@ function parseLabeledFreightTotals(body) {
       /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d.]+)/i);
   const dim = text.match(new RegExp(
       "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*" +
-      "([\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*[\\d.]+\\s*[lLwWhH]?\\s*[x×*]\\s*" +
-      "[\\d.]+\\s*[lLwWhH]?)",
+      "(" + freightDims.DIM_TRIPLE_CAPTURE + ")",
       "i"));
   const parsed = dim ? freightDims.parseDimTripleString(dim[1]) : null;
   return {
