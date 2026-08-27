@@ -20,9 +20,18 @@ check("container normalized",
     dray.sanitizeContainerNumber("mscu 1234567"), "MSCU1234567");
 check("random load rejected",
     dray.isPlausibleContainerNumber("265551"), false);
+check("Averitt PRO is not a container",
+    dray.isPlausibleContainerNumber("AVRT1467163"), false);
+check("SCAC+digits without U/J/Z rejected",
+    dray.sanitizeContainerNumber("AVRT1467163"), null);
 check("extract labeled container",
-    dray.extractContainerFromText("", "Container # ABCD1234567"),
-    "ABCD1234567");
+    dray.extractContainerFromText("", "Container # ABDU1234567"),
+    "ABDU1234567");
+check("Averitt PRO not extracted as container",
+    dray.extractContainerFromText(
+        "Averitt Invoice - Summary45673 (1 of 1)",
+        "PRO AVRT1467163"),
+    null);
 check("find on invoice item",
     dray.findContainerOnInvoiceItems([{containerNumber: "HLCU7654321"}]),
     "HLCU7654321");
@@ -33,18 +42,6 @@ check("Leo is validator",
     true);
 check("carrier not validator",
     dray.isDrayageValidatorEmail("Billing@EvansDelivery.com"), false);
-check("Mark Evans inbound container",
-    dray.resolveInboundDrayageContainer(
-        "Billing@EvansDelivery.com",
-        [{containerNumber: "EGSU9876543", carrierName: "Mark Evans Delivery"}],
-        null, "", ""),
-    "EGSU9876543");
-check("Evans Delivery Company not configured drayage container",
-    dray.resolveInboundDrayageContainer(
-        "Billing@EvansDelivery.com",
-        [{containerNumber: "EGSU9876543", carrierName: "Evans Delivery Company"}],
-        null, "", ""),
-    null);
 check("Leo return not forwarded again",
     dray.resolveInboundDrayageContainer(
         "leo@innovativecarriers.com",
@@ -58,22 +55,26 @@ check("drayage vendor type Drayage Broker",
     dray.isDrayageVendorType("Drayage Broker"), true);
 check("LTL vendor type not drayage",
     dray.isDrayageVendorType("LTL"), false);
-check("Mark Evans Delivery is configured drayage",
-    dray.isConfiguredDrayageCarrierName("Mark Evans Delivery"), true);
-check("Mark Evans variant is configured drayage",
-    dray.isConfiguredDrayageCarrierName("Mark Evans"), true);
-check("MARK EVANS DELIVERY uppercase",
-    dray.isConfiguredDrayageCarrierName("MARK EVANS DELIVERY"), true);
-check("Mark Evans Delivery LLC",
-    dray.isConfiguredDrayageCarrierName("Mark Evans Delivery LLC"), true);
-check("Evans Delivery Company not Mark Evans",
-    dray.isConfiguredDrayageCarrierName("Evans Delivery Company"), false);
 check("carrier name from invoice items",
     dray.carrierNameFromInvoiceItems(
         [{carrierName: "Evans Delivery Company"}]),
     "Evans Delivery Company");
 
 async function runAsyncChecks() {
+  const primusByName = async (carrierName) => {
+    const name = String(carrierName || "").toLowerCase();
+    if (name.includes("mark evans")) {
+      return {id: "1", name: "Mark Evans Delivery", type: "DRAYAGE"};
+    }
+    if (name.includes("averitt")) {
+      return {id: "2", name: "Averitt Express", type: "LTL"};
+    }
+    if (name.includes("loup")) {
+      return {id: "3", name: "Loup", type: "RAIL"};
+    }
+    return null;
+  };
+
   const loupSignal = await dray.resolveInboundDrayageSignal({
     from: "Loup <loupintermodalops@up.com>",
     invoiceItems: [{
@@ -84,6 +85,7 @@ async function runAsyncChecks() {
     probedContainer: "MSCU1234567",
     subject: "Loup - ORIGINAL BILL",
     body: "Please see attached original bill.",
+    lookupVendor: primusByName,
   });
   check("Loup ORIGINAL BILL not drayage", loupSignal.isDrayage, false);
   check("Loup still extracts container metadata",
@@ -95,6 +97,7 @@ async function runAsyncChecks() {
     probedContainer: null,
     subject: "Invoice attached",
     body: "Container HLCU7654321",
+    lookupVendor: primusByName,
   });
   check("container alone does not trigger drayage",
       containerOnlySignal.isDrayage, false);
@@ -108,11 +111,27 @@ async function runAsyncChecks() {
     probedContainer: null,
     subject: "Invoice",
     body: "",
+    lookupVendor: primusByName,
   });
-  check("Mark Evans configured carrier is drayage",
+  check("Mark Evans Primus DRAYAGE vendor is drayage",
       markEvansSignal.isDrayage, true);
-  check("Mark Evans drayage reason mentions carrier",
-      /configured carrier/i.test(markEvansSignal.reason || ""), true);
+  check("Mark Evans reason cites Primus vendor",
+      /Primus vendor/i.test(markEvansSignal.reason || ""), true);
+
+  const averittSignal = await dray.resolveInboundDrayageSignal({
+    from: "invoicing@averittexpress.com",
+    invoiceItems: [{
+      carrierName: "Averitt Express",
+      containerNumber: "AVRT1467163",
+    }],
+    probedContainer: "AVRT1467163",
+    subject: "Averitt Invoice - Summary45673 (1 of 1)",
+    body: "Container #: AVRT1467163",
+    lookupVendor: primusByName,
+  });
+  check("Averitt Primus LTL vendor is not drayage",
+      averittSignal.isDrayage, false);
+  check("Averitt Primus type is LTL", averittSignal.vendorType, "LTL");
 }
 
 runAsyncChecks().then(() => {

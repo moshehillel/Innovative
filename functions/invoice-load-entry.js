@@ -1,6 +1,7 @@
 /**
  * Lisa manual load entry for regular invoices missing load / PRO resolution.
- * Not used for drayage (container # → Leo workflow).
+ * Drayage is identified by Primus vendor type (or Leo-validated), not
+ * container number or a hardcoded carrier list.
  */
 "use strict";
 
@@ -16,8 +17,7 @@ function isDrayageInvoiceItem(item) {
   if (!item || typeof item !== "object") return false;
   if (item.drayageLeoValidated) return true;
   if (item.drayageByVendorType) return true;
-  const container = String(item.containerNumber || "").trim();
-  return !!container;
+  return false;
 }
 
 /**

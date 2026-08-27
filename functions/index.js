@@ -4043,7 +4043,7 @@ async function handleDrayageInvoiceEmail(args) {
   } = args;
   const docId = queueDocId || messageId;
   const forwardReason =
-    reason || "Drayage invoice — carrier identified as drayage";
+    reason || "Drayage invoice — Primus vendor is drayage";
   const intakeExtra = {
     gmailMessageId: messageId,
     subject,
@@ -5503,10 +5503,13 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "reference when labeled Reference #, Ref, Shipment ID, FBA ID, " +
         "Amazon FBA (e.g. FBA19FXCCFZT), PT# shipper ref, or similar " +
         "alphanumeric key — NOT the broker Primus load number.",
-        "containerNumber is the intermodal/ocean container ID when labeled " +
-        "Container #, Container No, CNTR, Unit #, or similar. ISO format is " +
-        "4 letters + 7 digits (e.g. MSCU1234567). ONLY drayage invoices " +
-        "have a container number — leave empty for truckload/LTL freight.",
+        "containerNumber is the ISO 6346 intermodal/ocean container ID when " +
+        "labeled Container #, Container No, CNTR, Unit #, or similar. " +
+        "Format is 3 letters + U/J/Z + 7 digits (e.g. MSCU1234567). " +
+        "Do not put LTL/truckload PRO numbers here (e.g. Averitt AVRT + " +
+        "digits). Container # can appear on intermodal paperwork that is " +
+        "NOT drayage — leave empty when the value is a PRO, trailer, or " +
+        "account number.",
         "proNumber is ONLY when the invoice labels PRO #, Carrier PRO, " +
         "Beyond PRO, Advance PRO, or (LTL only) freight bill number. " +
         "Leave proNumber empty when no PRO / freight bill field is shown " +
@@ -9481,7 +9484,7 @@ async function processGmailMessage(
               containerNumber: drayageSignal.containerNumber,
               carrierName: drayageSignal.carrierName,
               reason: drayageSignal.reason ||
-                "Drayage paperwork — carrier identified as drayage",
+                "Drayage paperwork — Primus vendor is drayage",
             });
             return;
           }
@@ -9684,7 +9687,7 @@ async function processGmailMessage(
               containerNumber: drayageSignal.containerNumber,
               carrierName: drayageSignal.carrierName,
               reason: drayageSignal.reason ||
-                "Drayage invoice — carrier identified as drayage",
+                "Drayage invoice — Primus vendor is drayage",
             });
             return;
           }
