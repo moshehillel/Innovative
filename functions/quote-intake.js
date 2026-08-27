@@ -375,12 +375,25 @@ function quoteExtractSystemPrompt() {
     "   requestedAccessorials.",
     "10) \"Lift gate needed for delivery\" / liftgate near the word",
     "   delivery → LFD only. Do NOT also add LFO.",
+    "11) \"Are there any accessorials needed (liftgate, inside",
+    "   delivery etc.)\" / \"does liftgate apply?\" / \"any",
+    "   accessorials?\" / \"please advise if inside delivery is",
+    "   required\" / \"if any accs fees apply\" → do NOT put LFO,",
+    "   LFD, IND, NTD, or other codes in requestedAccessorials.",
+    "   That is a question about whether they apply, not a request",
+    "   to apply them. Site rules (e.g. chain-store APD) may still",
+    "   apply from the address.",
     "",
     "FALSE POSITIVES (never treat these as requests):",
     "- Limited-access disclose boilerplate (Core Home / RFQ templates)",
     "  that asks to show charges IF limited access applies.",
     "- \"No appointment necessary\" / \"no appt needed\" (decline APD).",
     "- Liftgate scoped to delivery only (do not invent LFO).",
+    "- Questions / questionnaires: \"are there any accessorials",
+    "  needed\", \"does liftgate apply\", \"please advise if\",",
+    "  \"if any accs apply\". Parenthetical examples (liftgate,",
+    "  inside delivery etc.) inside that question are not requests.",
+    "- Confidentiality \"please notify the sender\" is not NTD.",
     "",
     "Real patterns to recognize:",
     "- Ship From / Ship To blocks (Coreforce, warehouse quotes)",
@@ -426,7 +439,11 @@ function quoteExtractSystemPrompt() {
     "  appointment, limited access, inside delivery, insurance,",
     "  etc.), copy those phrases into specialInstructions /",
     "  specialInstructionsGlobal AND map them to Primus codes in",
-    "  customerRequest.requestedAccessorials:",
+    "  customerRequest.requestedAccessorials ONLY when they are",
+    "  actual requests (\"liftgate needed\", \"inside delivery",
+    "  required\"), not questions (\"does liftgate apply?\",",
+    "  \"are there any accessorials needed (liftgate, inside",
+    "  delivery etc.)\", \"please advise if ...\"):",
     "  liftgate pickup/origin → LFO; liftgate delivery /",
     "  liftgate needed for delivery / liftgate near the word",
     "  delivery → LFD only (do NOT also add LFO); bare",
@@ -1089,7 +1106,11 @@ function buildSingleLaneExtract(opts) {
       .toUpperCase()
       .replace(/[^A-Z0-9]+/g, "_");
   const special = [];
-  if (/lift\s*gate/i.test(body)) special.push("Liftgate required");
+  const requestedFromBody =
+    emailAccessorials.extractRequestedAccessorialsFromText(body);
+  if (requestedFromBody.includes("LFD") || requestedFromBody.includes("LFO")) {
+    special.push("Liftgate required");
+  }
   if (/residential/i.test(body)) special.push("Residential delivery");
   if (/no loading dock|no dock/i.test(body)) special.push("No loading dock");
   if (/floor\s*loaded/i.test(body)) special.push("Floor loaded");

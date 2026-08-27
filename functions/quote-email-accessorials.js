@@ -108,8 +108,147 @@ const SINGLE_PATTERNS = [
   // rule applies LAD. Explicit "hotel delivery" → LAD via pattern below.
   {code: "LAD", re: /\b(?:hotel|casino|resort)\s+delivery\b/i},
   {code: "SCD", re: /\bschool(\s+delivery)?\b/i},
-  {code: "NTD", re: /\bnotif(y|ication)(\s+(before\s+)?delivery)?\b/i},
+  // Bare "notify" matches confidentiality "please notify the sender".
+  {
+    code: "NTD",
+    // eslint-disable-next-line max-len
+    re: /\bnotification(?:\s+(?:before\s+)?delivery)?\b|\bnotify\s+(?:before\s+)?delivery\b|\bnotify\s+(?:consignee|receiver|customer)\b/i,
+  },
 ];
+
+/**
+ * AI-inferred codes that must not be applied from a question /
+ * "advise if" / "any accessorials needed?" prompt. Heuristic extract
+ * on inquiry-stripped text has to corroborate them.
+ */
+const INQUIRY_SENSITIVE_CODES = new Set([
+  "LFO", "LFD", "IND", "INO", "NTD", "APD", "APO", "RSD", "RSO", "INS",
+]);
+
+const ACC_INQUIRY_WORD_RE = new RegExp(
+    "\\b(?:accessorials?|accs?|lift[\\s-]*gates?|inside(?:\\s+delivery)?|" +
+    "notification(?:\\s+delivery)?|limited\\s+access|residential)\\b",
+    "i");
+
+/**
+ * Split email text into line / sentence chunks for inquiry detection.
+ * @param {string} text Email / instruction text.
+ * @return {Array<string>}
+ */
+function chunksForInquiryScan(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  const chunks = [];
+  for (const line of lines) {
+    const trimmed = String(line || "").replace(/^[·•\-*\d.)\s]+/, "").trim();
+    if (!trimmed) continue;
+    const parts = trimmed.split(/(?<=[.!?])\s+/);
+    for (const part of parts) {
+      if (part && part.trim()) chunks.push(part.trim());
+    }
+  }
+  return chunks;
+}
+
+/**
+ * True when this chunk asks WHETHER accessorials apply — not a request
+ * to apply them. "liftgate needed" / "inside delivery required" are
+ * requests; "does liftgate apply?" / "are there any accessorials
+ * needed (liftgate, inside delivery etc.)" are not.
+ * @param {string} chunk Sentence or bullet.
+ * @return {boolean}
+ */
+function isAccessorialInquiryChunk(chunk) {
+  const t = String(chunk || "").trim();
+  if (!t) return false;
+  const hasAcc = ACC_INQUIRY_WORD_RE.test(t);
+  const hasAccsFees =
+    /\b(?:any\s+)?(?:additional\s+)?(?:accs?|accessorials?)(?:\s+fees?)?\b/i
+        .test(t) ||
+    /\b(?:any\s+)?(?:additional\s+)?(?:charges?|fees?)\s+apply\b/i.test(t);
+  if (!hasAcc && !hasAccsFees && !/\b(?:if\s+it\s+applies)\b/i.test(t)) {
+    return false;
+  }
+  if (/\bare\s+there\s+(?:any\s+)?(?:accessorials?|accs?)\b/i.test(t)) {
+    return true;
+  }
+  // eslint-disable-next-line max-len
+  if (/\bany\s+(?:accessorials?|accs?)(?:\s+fees?)?\s+(?:needed|required|apply)/i
+      .test(t)) {
+    return true;
+  }
+  if (/\bany\s+(?:accessorials?|accs?)\s*\?/i.test(t)) return true;
+  // Interrogative auxiliary + apply/need — not "will call required".
+  // eslint-disable-next-line max-len
+  if (/\b(?:does|do|did|is|are)\b[\s\S]{0,80}\b(?:apply|applies|needed|required|need)\b/i
+      .test(t)) {
+    return true;
+  }
+  if (/\bwill\s+there\b[\s\S]{0,80}\b(?:apply|needed|required|need)\b/i
+      .test(t)) {
+    return true;
+  }
+  // eslint-disable-next-line max-len
+  if (/\b(?:please\s+)?(?:advise|confirm|indicate|specify|let\s+(?:me|us)\s+know)\s+if\b/i
+      .test(t)) {
+    return true;
+  }
+  // eslint-disable-next-line max-len
+  if (/\bif\s+(?:any\s+)?(?:accessorials?|accs?|additional\s+(?:charges?|fees?))\b/i
+      .test(t)) {
+    return true;
+  }
+  if (/\bif\s+(?:it\s+)?applies\b/i.test(t) && (hasAcc || hasAccsFees)) {
+    return true;
+  }
+  if (/\?/.test(t) && (hasAcc || hasAccsFees) &&
+      !/\b(?:please\s+add|needs?|required|must\s+have)\b/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * True when the RFQ asks about accessorials rather than (or in
+ * addition to) requesting them.
+ * @param {string} text Email / instruction text.
+ * @return {boolean}
+ */
+function hasAccessorialInquiryLanguage(text) {
+  return chunksForInquiryScan(text).some(isAccessorialInquiryChunk);
+}
+
+/**
+ * Drop confidentiality "notify the sender" and interrogative /
+ * advise-if chunks so keyword scans do not treat questions as
+ * requests.
+ * @param {string} text Email / instruction text.
+ * @return {string}
+ */
+function sanitizeAccessorialScanText(text) {
+  let t = String(text || "");
+  if (!t.trim()) return "";
+  t = t.replace(/CONFIDENTIALITY NOTICE:[\s\S]*$/i, " ");
+  t = t.replace(/please notify the sender\b[^.!?\n]*/gi, " ");
+  const kept = [];
+  for (const chunk of chunksForInquiryScan(t)) {
+    if (!isAccessorialInquiryChunk(chunk)) kept.push(chunk);
+  }
+  return kept.join("\n");
+}
+
+/**
+ * AI-listed codes whose only support was an accessorial question.
+ * @param {Array<string>} aiCodes From normalizeRequestedCodeList.
+ * @param {string} scanText Original email / instructions.
+ * @return {Array<string>}
+ */
+function filterInquirySensitiveAiCodes(aiCodes, scanText) {
+  const list = uniqueCodes(aiCodes);
+  if (!list.length || !hasAccessorialInquiryLanguage(scanText)) return list;
+  const corroborated = new Set(extractRequestedAccessorialsFromText(scanText));
+  return list.filter((c) =>
+    !INQUIRY_SENSITIVE_CODES.has(c) || corroborated.has(c));
+}
 
 /**
  * Clear request to apply limited/restricted access (LAD/LAO).
@@ -249,7 +388,7 @@ function uniqueCodes(codes) {
  * @return {Array<string>} Primus codes.
  */
 function extractRequestedAccessorialsFromText(text) {
-  const blob = String(text || "");
+  const blob = sanitizeAccessorialScanText(text);
   if (!blob.trim()) return [];
   const known = knownAccessorialCodes();
   const codes = [];
@@ -406,10 +545,11 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
   const ex = extracted && typeof extracted === "object" ? extracted : {};
   const cr = ex.customerRequest && typeof ex.customerRequest === "object" ?
     ex.customerRequest : {};
-  const fromAi = normalizeRequestedCodeList(cr.requestedAccessorials);
-  const fromText = extractRequestedAccessorialsFromText(
-      extractedAccessorialText(ex, opts));
   const scanText = extractedAccessorialText(ex, opts);
+  const fromAi = filterInquirySensitiveAiCodes(
+      normalizeRequestedCodeList(cr.requestedAccessorials),
+      scanText);
+  const fromText = extractRequestedAccessorialsFromText(scanText);
   const declined = declinedAcc.detectDeclinedAccessorials(scanText);
   const persisted = Array.isArray(ex.customerDeclinedAccessorials) ?
     ex.customerDeclinedAccessorials : [];
@@ -528,6 +668,9 @@ module.exports = {
   isLimitedAccessClearRequest,
   isLimitedAccessDiscloseBoilerplate,
   isLimitedAccessDiscloseOnly,
+  isAccessorialInquiryChunk,
+  hasAccessorialInquiryLanguage,
+  sanitizeAccessorialScanText,
   extractRequestedAccessorialsFromText,
   normalizeRequestedCodeList,
   resolveRequestedAccessorials,

@@ -278,6 +278,66 @@ checkNotHas("AI LFD stripped when email says no liftgate",
 check("persisted declined LFD",
     (declinedLift.customerDeclinedAccessorials || []).includes("LFD"), true);
 
+const inquiryQ = "Are there any accessorials needed (liftgate, inside " +
+    "delivery etc.)";
+codes = emailAcc.extractRequestedAccessorialsFromText(inquiryQ);
+checkNotHas("questionnaire liftgate not LFD", codes, "LFD");
+checkNotHas("questionnaire liftgate not LFO", codes, "LFO");
+checkNotHas("questionnaire inside not IND", codes, "IND");
+check("questionnaire is inquiry",
+    emailAcc.hasAccessorialInquiryLanguage(inquiryQ), true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Does liftgate apply?");
+checkNotHas("does liftgate apply not LFD", codes, "LFD");
+checkNotHas("does liftgate apply not LFO", codes, "LFO");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please advise if inside delivery is required.");
+checkNotHas("advise if inside not IND", codes, "IND");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "any accessorials?");
+check("any accessorials? extracts none", codes, []);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "if any accs fees apply, include in the quote");
+checkNotHas("if any accs fees apply not LFD", codes, "LFD");
+checkNotHas("if any accs fees apply not IND", codes, "IND");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Are there any accessorials needed (liftgate, inside delivery etc.)\n" +
+    "Liftgate needed for delivery. Inside delivery required.");
+checkHas("inquiry + request still LFD", codes, "LFD");
+checkNotHas("inquiry + delivery request not LFO", codes, "LFO");
+checkHas("inquiry + request still IND", codes, "IND");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please notify the sender immediately by telephone.");
+checkNotHas("notify the sender not NTD", codes, "NTD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Notification before delivery required.");
+checkHas("notification before delivery → NTD", codes, "NTD");
+
+const ediThread =
+    "Hi Alan\nIt was a pleasure speaking with you.\n" +
+    "Please provide the following info for your shipments\n" +
+    "· Pallets dimensions\n· Total weight\n" +
+    "· Are there any accessorials needed (liftgate, inside delivery etc.)\n" +
+    "· Origin zip code\n· Destination zip code\n· Commodity\n" +
+    "Please notify the sender immediately if received in error.";
+codes = emailAcc.extractRequestedAccessorialsFromText(ediThread);
+check("EDI questionnaire extracts none", codes, []);
+
+const inquiryAi = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "",
+  customerRequest: {requestedAccessorials: ["LFO", "LFD", "IND", "NTD"]},
+  lanes: [],
+}, {subject: "FW: Re:", body: ediThread});
+check("AI codes stripped for accessorial question",
+    inquiryAi.customerRequest.requestedAccessorials, []);
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
