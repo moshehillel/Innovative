@@ -823,6 +823,80 @@ check("remittance with load number is not customer remittance",
         "dispatch@carrier.com",
         "Please find remittance for load #265721"));
 
+const ruelilySubject = "Your Remittance Advice 1557";
+const ruelilyFrom = "Leonore Dalmacio <leonored@ruelily.com>";
+const ruelilyBody =
+  "Please see attached Remittance Advice.\n\n" +
+  "Invoice #981 for BOL #265400 — Amount paid $1,250.00\n" +
+  "Invoice #982 for BOL #265401 — Amount paid $980.00\n";
+const ruelilyAtt = [
+  {filename: "Remittance_Advice_1557.pdf", mimeType: "application/pdf"},
+  {filename: "1557_detail.pdf", mimeType: "application/pdf"},
+];
+check("Ruelily Remittance Advice subject detected",
+    adm.subjectLooksLikeRemittanceAdvice(ruelilySubject));
+check("Ruelily Remittance Advice with invoice/BOL lines still remittance",
+    adm.isCustomerPaymentRemittanceEmail(
+        ruelilySubject, ruelilyFrom, ruelilyBody));
+check("Ruelily Remittance Advice should handle → Abe",
+    adm.shouldHandleCustomerPaymentRemittance(
+        ruelilySubject, ruelilyFrom, ruelilyBody));
+check("Ruelily Remittance Advice not ignored as bank payment alert",
+    !adm.shouldIgnoreAsPaymentNotification(
+        ruelilySubject, ruelilyFrom, ruelilyBody, ruelilyAtt));
+check("Ruelily Remittance Advice does not invoice-veto",
+    !adm.hasInvoiceVeto({
+      subject: ruelilySubject,
+      body: ruelilyBody,
+      from: ruelilyFrom,
+      attachments: ruelilyAtt,
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+check("Remittance Advice #1557 subject detected",
+    adm.subjectLooksLikeRemittanceAdvice("Remittance Advice #1557"));
+check("Re: Your Remittance Advice subject detected",
+    adm.subjectLooksLikeRemittanceAdvice("Re: Your Remittance Advice 1557"));
+
+const altarebSubject = "Re: Invoice for BOL#265388";
+const altarebFrom = "Taha AltaReb <taha@altarebglobal.com>";
+const altarebBody =
+  "Hi Abe,\n\nPayment was sent via Zelle for this invoice. " +
+  "Paid in full today.\n\nThanks,\nTaha\n\n" +
+  "On Mon, Aug 25, 2026 Abe <abe@innovativecarriers.com> wrote:\n" +
+  "PLEASE NOTE OUR NEW BANKING INFORMATION\n" +
+  "Quickpay/Zelle\naccounting@innovativecarriers.com\n";
+check("AltaReb Invoice for BOL reply subject recognized",
+    adm.subjectLooksLikeInvoiceForBolReply(altarebSubject));
+check("AltaReb paid notice in top-of-thread detected",
+    adm.bodyLooksLikeCustomerPaidNotice(altarebBody));
+check("AltaReb remittance reply detected → Abe",
+    adm.isCustomerPaymentRemittanceEmail(
+        altarebSubject, altarebFrom, altarebBody));
+check("AltaReb should handle customer remittance",
+    adm.shouldHandleCustomerPaymentRemittance(
+        altarebSubject, altarebFrom, altarebBody));
+check("AltaReb not ignored as payment_notification (BoA-only)",
+    !adm.shouldIgnoreAsPaymentNotification(
+        altarebSubject, altarebFrom, altarebBody, []));
+check("AltaReb remittance does not invoice-veto",
+    !adm.hasInvoiceVeto({
+      subject: altarebSubject,
+      body: altarebBody,
+      from: altarebFrom,
+      attachments: [],
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+check("Heypharma invoice attach reply is NOT customer remittance",
+    !adm.isCustomerPaymentRemittanceEmail(
+        heypharmaSubject, heypharmaFrom, heypharmaBody));
+check("quoted Zelle banking tip alone is NOT customer paid notice",
+    !adm.bodyLooksLikeCustomerPaidNotice(
+        "Please see attached invoice.\n\n" +
+        "On Tue, Aug 26, 2026 Abe <abe@innovativecarriers.com> wrote:\n" +
+        "Quickpay/Zelle\naccounting@innovativecarriers.com\n"));
+
 const sandersSubject = "CK 6706";
 const sandersFrom = "Accounts Payable <ap@sanderscollection.com>";
 const sandersBody =

@@ -378,6 +378,63 @@ function subjectLooksLikeCustomerCheckNumber(subject) {
 }
 
 /**
+ * Subject like "Your Remittance Advice 1557" or "Remittance Advice".
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeRemittanceAdvice(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  return /^(?:your\s+)?remittance\s+advice(?:\s*#?\s*\d+)?\s*$/i
+      .test(stripped);
+}
+
+/**
+ * Subject is a reply on our customer-invoice thread (Invoice for BOL/Load#).
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeInvoiceForBolReply(subject) {
+  const sub = String(subject || "").trim().toLowerCase();
+  return /^(?:(?:re|fw|fwd):\s*)+invoice\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/
+      .test(sub);
+}
+
+/**
+ * Strip quoted reply history so banking footers in prior messages do not
+ * look like the customer announcing a payment.
+ * @param {string} body Plain body.
+ * @return {string}
+ */
+function topOfThreadBody(body) {
+  let top = String(body || "");
+  top = top.split(/\n\s*On .+?wrote:\s*\n/i)[0];
+  top = top.split(/\n-{2,}\s*Original Message\s*-{2,}/i)[0];
+  top = top.split(/\nFrom:\s+.+\nSent:\s+/i)[0];
+  return top;
+}
+
+/**
+ * Customer top-of-thread text saying they paid / sent remittance.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeCustomerPaidNotice(body) {
+  const top = topOfThreadBody(body).toLowerCase();
+  if (!top.trim()) return false;
+  const patterns = [
+    /\bremittance\b/,
+    /\bpayment\s+(?:was\s+)?(?:sent|made|submitted|completed|received)\b/,
+    /\b(?:we|i)\s+(?:have\s+)?(?:just\s+)?paid\b/,
+    /\bpaid\s+(?:in\s+full|via|by|through|already|today)\b/,
+    /\bsent\s+(?:the\s+)?(?:payment|funds)\b/,
+    /\bwire(?:d)?\s+(?:the\s+)?payment\b/,
+    /\b(?:payment|invoice)\s+(?:has\s+been|was)\s+paid\b/,
+  ];
+  return patterns.some((re) => re.test(top));
+}
+
+/**
  * Bare MC# subject — factor NOA notices (e.g. "MC#856665", "MC #856665").
  * @param {string} subject Email subject.
  * @return {boolean}
@@ -399,7 +456,6 @@ function subjectLooksLikeMcNumberNoa(subject) {
 function isCustomerPaymentRemittanceEmail(subject, from, body) {
   if (isCarrierOrFactorSender(from)) return false;
   if (isPaymentNotificationEmail(subject, from, body)) return false;
-  if (looksLikeInvoiceEmailContent(subject, body)) return false;
   if (looksLikeNoaEmailContent(subject, body, from)) return false;
 
   const addr = emailAddressFromHeader(from);
@@ -408,10 +464,21 @@ function isCustomerPaymentRemittanceEmail(subject, from, body) {
   const sub = String(subject || "").trim();
   const hay = `${sub}\n${body || ""}`.toLowerCase();
 
-  // "Payment MM/DD/YY" or "CK 6706" from a customer — before payment-inquiry
-  // guards (body may mention "outstanding invoices" like carrier AR follow-ups).
+  // Subject-first remittance signals — before invoice-content veto.
+  // Remittance-advice bodies often list invoice# / BOL lines that would
+  // otherwise look like a carrier invoice package.
   if (subjectLooksLikeCustomerPaymentDate(subject)) return true;
   if (subjectLooksLikeCustomerCheckNumber(subject)) return true;
+  if (subjectLooksLikeRemittanceAdvice(subject)) return true;
+
+  // Customer reply on "Invoice for BOL#" saying they paid → Abe (not ignore
+  // as bank alert, not process as freight invoice).
+  if (subjectLooksLikeInvoiceForBolReply(subject) &&
+      bodyLooksLikeCustomerPaidNotice(body)) {
+    return true;
+  }
+
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
 
   if (isPaymentInquiryEmail(subject, from, body)) return false;
 
@@ -1145,13 +1212,14 @@ function hasInvoiceVeto(signals = {}) {
     invoicePdfCount,
   } = signals;
 
-  if (looksLikeInvoiceEmailContent(subject, body)) return true;
-
-  if (shouldIgnoreAsPaymentReceipt(subject, from, body, attachments)) {
+  // Remittances forward to Abe even when subject/body cite invoice/BOL #s.
+  if (isCustomerPaymentRemittanceEmail(subject, from, body)) {
     return false;
   }
 
-  if (isCustomerPaymentRemittanceEmail(subject, from, body)) {
+  if (looksLikeInvoiceEmailContent(subject, body)) return true;
+
+  if (shouldIgnoreAsPaymentReceipt(subject, from, body, attachments)) {
     return false;
   }
 
@@ -1278,6 +1346,9 @@ module.exports = {
   isCarrierOrFactorSender,
   subjectLooksLikeCustomerPaymentDate,
   subjectLooksLikeCustomerCheckNumber,
+  subjectLooksLikeRemittanceAdvice,
+  subjectLooksLikeInvoiceForBolReply,
+  bodyLooksLikeCustomerPaidNotice,
   subjectLooksLikeMcNumberNoa,
   isCustomerPaymentRemittanceEmail,
   shouldHandleCustomerPaymentRemittance,
