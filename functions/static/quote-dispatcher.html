@@ -547,6 +547,14 @@
       box-shadow: 0 0 0 3px rgba(5, 150, 105, 0.15);
     }
     .rate-meta { color: var(--muted); font-weight: 500; }
+    .rates-load-more {
+      margin: 10px 0 2px;
+      text-align: center;
+    }
+    .rates-load-more button.ghost {
+      font-size: 0.8125rem;
+      padding: 8px 14px;
+    }
     .suggested-sell {
       color: var(--muted);
       font-size: 0.75rem;
@@ -1004,6 +1012,9 @@
     const selections = {};
     const customerPrices = {};
     const laneAccessorials = {};
+    /** How many rate options are visible per lane (Load more adds 20). */
+    const ratesVisibleByLane = {};
+    const RATES_PAGE_SIZE = 20;
     let draftReady = false;
     const hasLegacyToken = DISPATCHER_ID && TOKEN;
     let accessorialCatalog = null;
@@ -1386,6 +1397,9 @@
       document.getElementById("btn-dismiss").disabled =
         quote.status === "sent" || quote.status === "dismissed";
 
+      Object.keys(ratesVisibleByLane).forEach((k) => {
+        delete ratesVisibleByLane[k];
+      });
       (quote.lanes || []).forEach((lane) => {
         selections[lane.laneKey] = (lane.selectedRateIds || []).slice();
         laneAccessorials[lane.laneKey] = (lane.accessorials || []).slice();
@@ -2284,15 +2298,32 @@
       });
     }
 
-    function renderLanes() {
+    function renderLanes(opts) {
+      const preserveUi = !!(opts && opts.preserveUi);
       const root = document.getElementById("lanes");
+      const openLaneKeys = new Set();
+      const openRatesLaneKeys = new Set();
+      if (preserveUi) {
+        root.querySelectorAll(".lane.open").forEach((el) => {
+          const k = el.getAttribute("data-lane-key");
+          if (k) openLaneKeys.add(k);
+        });
+        root.querySelectorAll(".lane").forEach((el) => {
+          const k = el.getAttribute("data-lane-key");
+          if (k && el.querySelector(".rates-section.open")) {
+            openRatesLaneKeys.add(k);
+          }
+        });
+      }
       root.innerHTML = "";
       const cat = accessorialCatalog;
       const loaded = !!cat;
 
       (quote.lanes || []).forEach((lane, idx) => {
         const div = document.createElement("div");
-        div.className = "lane" + (idx === 0 ? " open" : "");
+        const keepOpen = preserveUi ?
+          openLaneKeys.has(lane.laneKey) : idx === 0;
+        div.className = "lane" + (keepOpen ? " open" : "");
         div.setAttribute("data-lane-key", lane.laneKey);
         const selected = new Set(selections[lane.laneKey] || []);
         const accSet = new Set(laneAccessorials[lane.laneKey] || lane.accessorials || []);
@@ -2332,7 +2363,17 @@
           }
           optsHtml += "<div class='warn'>" + esc(w) + "</div>";
         });
-        (lane.options || []).forEach((opt) => {
+        const allOpts = lane.options || [];
+        let showCount = ratesVisibleByLane[lane.laneKey] || RATES_PAGE_SIZE;
+        allOpts.forEach((opt, i) => {
+          const rateId = optionRateId(opt);
+          if (rateId && selected.has(rateId)) {
+            showCount = Math.max(showCount, i + 1);
+          }
+        });
+        showCount = Math.min(Math.max(showCount, 0), allOpts.length);
+        ratesVisibleByLane[lane.laneKey] = showCount || RATES_PAGE_SIZE;
+        allOpts.slice(0, showCount).forEach((opt) => {
           const rateId = optionRateId(opt);
           const isChecked = rateId ? selected.has(rateId) : false;
           const custVal = rateId && customerPrices[lane.laneKey] &&
@@ -2368,16 +2409,27 @@
             </div>
           </div>`;
         });
-        if (!(lane.options || []).length && !lane.rateError) {
+        if (showCount < allOpts.length) {
+          const next = Math.min(RATES_PAGE_SIZE, allOpts.length - showCount);
+          optsHtml += "<div class='rates-load-more'>" +
+            "<button type='button' class='ghost btn-load-more-rates' " +
+            "data-lane='" + esc(lane.laneKey) + "'>" +
+            "Load more (" + next + ")</button></div>";
+        }
+        if (!allOpts.length && !lane.rateError) {
           optsHtml = "<p style='color:var(--muted);font-size:0.875rem'>No rates returned.</p>";
         }
 
         const ratesCountLabel = ratesSectionCountLabel(
-            (lane.options || []).length, selected.size);
+            allOpts.length, selected.size);
+        const ratesOpen = preserveUi ?
+          openRatesLaneKeys.has(lane.laneKey) : true;
         const ratesSectionHtml =
-          "<div class='rates-section open' data-rates-section='1'>" +
+          "<div class='rates-section" + (ratesOpen ? " open" : "") +
+            "' data-rates-section='1'>" +
             "<button type='button' class='rates-section-toggle' " +
-              "aria-expanded='true' data-rates-toggle='1'>" +
+              "aria-expanded='" + (ratesOpen ? "true" : "false") +
+              "' data-rates-toggle='1'>" +
               "<span class='rates-chevron'>▶</span>" +
               "<h4>Cheapest rates</h4>" +
               "<span class='rates-count'>" + esc(ratesCountLabel) + "</span>" +
@@ -2414,6 +2466,18 @@
       bindAccSectionToggles(root);
       bindAccCheckboxHandlers(root);
       if (detailsEditMode) bindFreightEditors(root);
+
+      root.querySelectorAll(".btn-load-more-rates").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const laneKey = btn.dataset.lane;
+          if (!laneKey) return;
+          const cur = ratesVisibleByLane[laneKey] || RATES_PAGE_SIZE;
+          ratesVisibleByLane[laneKey] = cur + RATES_PAGE_SIZE;
+          renderLanes({preserveUi: true});
+        });
+      });
 
       root.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
         input.addEventListener("change", () => {

@@ -861,7 +861,8 @@ async function rateLane(lane, ctx) {
   });
 
   const tagged = rateShop.tagRateOptions(enriched, ctx.customerPrefs || {});
-  const topN = Number(process.env.QUOTE_TOP_RATES) || 20;
+  // Keep enough for dispatcher "Load more" (UI shows 20 at a time).
+  const topN = Number(process.env.QUOTE_TOP_RATES) || 100;
   const options = rateShop.pickTopOptions(tagged, topN, {
     ensureGuaranteed: wantsGuaranteed,
     mode: "cheapest",

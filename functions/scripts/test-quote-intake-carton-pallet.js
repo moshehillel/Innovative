@@ -327,6 +327,72 @@ check("D7365 lane1 weights", d7365Split.lanes[0].freightInfo.map((r) => r.weight
 check("D7365 lane2 weights", d7365Split.lanes[1].freightInfo.map((r) => r.weight),
     [1020, 276, 464, 241]);
 
+// Q#D5648: 5th MA line omitted dash before lbs; (x2) NJ line is 2 pallets.
+const D5648_BODY = [
+  "Shipment 1:",
+  "",
+  "BJS WHOLESALES CLUB 0800",
+  "869 QUAKER HWY",
+  "UXBRIDGE MA 015692252 US",
+  "",
+  "PO# 117803919//PT# 2356497",
+  "158ctns – 5pallets",
+  "48*41*59 – 37ctns – 366lbs (charging cables)",
+  "48*40*52 – 28ctns – 207lbs (charging cables)",
+  "48*40*53 – 28ctns – 955lbs ( canned air )",
+  "48*40*50 – 32ctns 327lbs (charging cables)",
+  "48*40*59 – 33ctns – 629lbs (charging cables & canned air )",
+  "2484lbs",
+  "",
+  "Shipment 2:",
+  "",
+  "BJS WHOLESALES CLUB 0820",
+  "309 DULTY'S LANE",
+  "BURLINGTON NJ 08016 US",
+  "",
+  "PO# 117803228 //PT# 2356495",
+  "163ctns – 6pallets",
+  "(x2) 48*40*54 – 30ctns each – 1020lbs each ( canned air )",
+  "48*40*39 – 21ctns – 419lbs (charging cables & canned air )",
+  "48*40*52 – 33ctns – 286lbs (charging cables)",
+  "48*40*39 – 24ctns – 247lbs (charging cables)",
+  "48*40*42 – 25ctns – 265lbs (charging cables)",
+  "3257lbs",
+].join("\n");
+
+const d5648Sections = intake.extractNumberedShipmentSections(D5648_BODY);
+check("D5648 shipment 1 five blocks",
+    d5648Sections[0].blocks.map((r) => r.weight),
+    [366, 207, 955, 327, 629]);
+check("D5648 shipment 2 six blocks",
+    d5648Sections[1].blocks.map((r) => r.weight),
+    [1020, 1020, 419, 286, 247, 265]);
+
+const d5648Split = {
+  lanes: [
+    {
+      laneKey: "BJS_UXBRIDGE_MA",
+      consignee: {city: "UXBRIDGE", state: "MA", zipCode: "01569"},
+      freightInfo: [{qty: 1, weight: 366, dimType: "PLT"}],
+    },
+    {
+      laneKey: "BJS_BURLINGTON_NJ",
+      consignee: {city: "BURLINGTON", state: "NJ", zipCode: "08016"},
+      freightInfo: [{qty: 1, weight: 419, dimType: "PLT"}],
+    },
+  ],
+};
+intake.applyEmailPalletBlocks(d5648Split, {body: D5648_BODY});
+check("D5648 MA pallet count 5",
+    d5648Split.lanes[0].freightInfo
+        .reduce((s, r) => s + (Number(r.qty) || 0), 0), 5);
+check("D5648 MA includes 327lb pallet",
+    d5648Split.lanes[0].freightInfo.map((r) => r.weight),
+    [366, 207, 955, 327, 629]);
+check("D5648 NJ pallet count 6",
+    d5648Split.lanes[1].freightInfo
+        .reduce((s, r) => s + (Number(r.qty) || 0), 0), 6);
+
 const twoPalletsPhrase = {
   lanes: [{
     freightInfo: [{qty: 1, weight: 2000, dimType: "PLT"}],
@@ -447,6 +513,172 @@ check("Comfortel (W x H x L) → 96x40x20", [
   comfortel.lanes[0].freightInfo[0].width,
   comfortel.lanes[0].freightInfo[0].height,
 ], [96, 40, 20]);
+
+// WEIGHT- 139\\nPallets must NOT read as 139 pallets (NEXCOM trailer bug).
+check("informal ignores WEIGHT above Pallets line",
+    intake.parseInformalPalletCount("WEIGHT- 139\nPallets- 1"), null);
+check("Pallets- 1 labeled count",
+    intake.parseLabeledFreightTotals("CTNS- 28\nWEIGHT- 139\nPallets- 1\n48x40x15")
+        .palletCount, 1);
+check("Pallets- 1 labeled weight 139",
+    intake.parseLabeledFreightTotals("CTNS- 28\nWEIGHT- 139\nPallets- 1\n48x40x15")
+        .weight, 139);
+
+const AAFES_WACO_BODY = [
+  "Ship From:",
+  "Weida Freight System",
+  "9050 Hermosa Ave, Rancho Cucamonga, CA 91730",
+  "",
+  "Ship To -1:",
+  "French Camp CA 95231",
+  "Total Cartons – 133",
+  "Total weight – 1076",
+  "Number of Pallets -2",
+  "Pallet dimensions – 48*40*88",
+  "48*40*52",
+  "",
+  "Ship To-2:",
+  "Waco TX 76712",
+  "Total Cartons – 92",
+  "Total weight – 633",
+  "Number of Pallets -1",
+  "Pallet dimensions – 48*40*88",
+  "",
+  "Ship To - 3:",
+  "Newport News VA 23603",
+  "Total Cartons – 213",
+  "Total weight – 2000",
+  "Number of Pallets -3",
+  "Pallet dimensions – 48*40*88",
+  "48*40*85",
+  "48*40*75",
+].join("\n");
+
+const aafesSections = intake.extractShipToNumberedSections(AAFES_WACO_BODY);
+check("AAFES three Ship To sections", aafesSections.length, 3);
+check("AAFES Waco zip 76712", aafesSections[1].zip, "76712");
+check("AAFES Waco one freight line", aafesSections[1].blocks.length, 1);
+check("AAFES Waco qty 1", aafesSections[1].blocks[0].qty, 1);
+check("AAFES Waco dims 40x48x88", [
+  aafesSections[1].blocks[0].length,
+  aafesSections[1].blocks[0].width,
+  aafesSections[1].blocks[0].height,
+], [40, 48, 88]);
+check("AAFES French Camp 2 lines", aafesSections[0].blocks.length, 2);
+
+const aafesAi = {
+  lanes: [
+    {
+      laneKey: "FC_CA",
+      consignee: {city: "French Camp", state: "CA", zipCode: "95231"},
+      freightInfo: [{qty: 2, weight: 1076, dimType: "PLT",
+        length: 48, width: 40, height: 88}],
+    },
+    {
+      laneKey: "WACO_TX",
+      consignee: {city: "Waco", state: "TX", zipCode: "76712"},
+      freightInfo: [{qty: 1, weight: 633, dimType: "PLT",
+        length: 48, width: 40, height: 88}],
+      flags: {suspiciousPalletCount: false},
+    },
+    {
+      laneKey: "NN_VA",
+      consignee: {city: "Newport News", state: "VA", zipCode: "23603"},
+      freightInfo: [{qty: 3, weight: 2000, dimType: "PLT",
+        length: 48, width: 40, height: 88}],
+    },
+  ],
+};
+const aafesNorm = intake.normalizeExtractedQuote(
+    JSON.parse(JSON.stringify(aafesAi)), {
+      subject: "LFW-AAFES-PO#0069665246 QL5247",
+      body: AAFES_WACO_BODY,
+    });
+const waco = aafesNorm.lanes.find((l) => l.laneKey === "WACO_TX");
+const wacoQty = (waco.freightInfo || [])
+    .reduce((s, r) => s + (Number(r.qty) || 0), 0);
+check("AAFES Waco stays 1 pallet not 2", wacoQty, 1);
+check("AAFES Waco one freight row", (waco.freightInfo || []).length, 1);
+check("AAFES Waco normalized 40x48x88", [
+  waco.freightInfo[0].length,
+  waco.freightInfo[0].width,
+  waco.freightInfo[0].height,
+], [40, 48, 88]);
+check("AAFES Waco weight 633", waco.freightInfo[0].weight, 633);
+
+const NEXCOM_BODY = [
+  "Ship From:",
+  "DCG FULFILLMENT REDLANDS",
+  "1300 CALIFORNIA STREET, REDLANDS CA 92374",
+  "",
+  "Ship To:",
+  "",
+  "Shipment 1:",
+  "",
+  "SE Retail Dist Ctr",
+  "Pensacola FL 32508",
+  "",
+  "PO# 0038255607//PT# 2353976",
+  "Total Cartons – 28",
+  "Total Weight – 129",
+  "1 pallet – 48x40x15",
+  "",
+  "PO# 0038267626//PT# 2354719",
+  "CTNS- 28",
+  "WEIGHT- 139",
+  "Pallets- 1",
+  "48x40x15",
+  "",
+  "Shipment 2:",
+  "",
+  "WC Retail Dist Ctr",
+  "CHINO CA 91710",
+  "",
+  "PO# 0038255612//PT# 2353978",
+  "Total Cartons – 18",
+  "Total Weight – 101",
+  "1 pallet – 48x40x10",
+].join("\n");
+
+const nexAi = {
+  lanes: [
+    {
+      laneKey: "PENS_FL",
+      consignee: {city: "Pensacola", state: "FL", zipCode: "32508"},
+      freightInfo: [{
+        qty: 28, weight: 129, dimType: "PLT",
+        length: 48, width: 40, height: 15,
+      }],
+    },
+    {
+      laneKey: "CHINO_CA",
+      consignee: {city: "Chino", state: "CA", zipCode: "91710"},
+      freightInfo: [{
+        qty: 18, weight: 101, dimType: "PLT",
+        length: 48, width: 40, height: 10,
+      }],
+    },
+  ],
+};
+const nexNorm = intake.normalizeExtractedQuote(
+    JSON.parse(JSON.stringify(nexAi)), {
+      subject: "LFW-NEXCOM WEST COAST QL5264",
+      body: NEXCOM_BODY,
+      from: "lfwpicking@coreforce.com",
+    });
+const pensQty = (nexNorm.lanes[0].freightInfo || [])
+    .reduce((s, r) => s + (Number(r.qty) || 0), 0);
+const chinoQty = (nexNorm.lanes[1].freightInfo || [])
+    .reduce((s, r) => s + (Number(r.qty) || 0), 0);
+check("NEXCOM Pensacola 2 pallets not 28/139", pensQty, 2);
+check("NEXCOM Chino 1 pallet not 18/139", chinoQty, 1);
+const nexRuled = freightRules.applyFreightRules(nexNorm);
+check("NEXCOM no trailer split (2 lanes)", nexRuled.lanes.length, 2);
+check("NEXCOM Pensacola dims 40x48x15", [
+  nexNorm.lanes[0].freightInfo[0].length,
+  nexNorm.lanes[0].freightInfo[0].width,
+  nexNorm.lanes[0].freightInfo[0].height,
+], [40, 48, 15]);
 
 if (failures) {
   console.log(`\n${failures} failed`);

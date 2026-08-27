@@ -656,27 +656,37 @@ function extractCompactPalletBlocks(body) {
       dimAxesLabeled: !!dims.labeled,
     }));
   }
+  // Lifeworks often uses en-dashes; sometimes omits the dash before lbs
+  // (e.g. "48*40*50 - 32ctns 327lbs"). Optional (xN) expands to N rows
+  // at the stated per-pallet weight ("1020lbs each").
   const cartonPattern = new RegExp(
+      "(?:\\(x\\s*(\\d+)\\)\\s*)?" +
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*" +
-      "[–\\-—]\\s*(\\d+)\\s*ctns?\\s*" +
-      "[–\\-—]\\s*([\\d.,]+)\\s*(?:lbs|ctns)\\b",
+      "[–\\-—]\\s*(\\d+)\\s*ctns?(?:\\s*each)?\\s*" +
+      "(?:[–\\-—]\\s*)?([\\d.,]+)\\s*(?:lbs|ctns)(?:\\s*each)?\\b",
       "gi");
   let cm;
   while ((cm = cartonPattern.exec(String(body || ""))) !== null) {
-    const key = [cm[1], cm[2], cm[3], cm[5]].join("|");
+    const copies = Math.max(1, Number(cm[1]) || 1);
+    const length = Number(cm[2]);
+    const width = Number(cm[3]);
+    const height = Number(cm[4]);
+    const weight = Number(String(cm[6]).replace(/,/g, ""));
+    const key = [copies, length, width, height, cm[6]].join("|");
     if (seen.has(key)) continue;
     seen.add(key);
-    const weight = Number(String(cm[5]).replace(/,/g, ""));
-    freight.push(freightDims.normalizePalletDims({
-      qty: 1,
-      weight: Number.isFinite(weight) ? weight : null,
-      weightType: "total",
-      class: null,
-      length: Number(cm[1]),
-      width: Number(cm[2]),
-      height: Number(cm[3]),
-      dimType: "PLT",
-    }));
+    for (let i = 0; i < copies; i++) {
+      freight.push(freightDims.normalizePalletDims({
+        qty: 1,
+        weight: Number.isFinite(weight) ? weight : null,
+        weightType: "total",
+        class: null,
+        length,
+        width,
+        height,
+        dimType: "PLT",
+      }));
+    }
   }
   return freight;
 }
@@ -688,9 +698,9 @@ function extractCompactPalletBlocks(body) {
  * @return {number|null}
  */
 function parseInformalPalletCount(text) {
-  // Do not span newlines — zip codes above a "pallet:" line (e.g. 91601)
-  // were being read as pallet counts.
-  const re = /\b(\d{1,3})\s+(?:pallets?|plts?|skids?)\b/gi;
+  // Spaces/tabs only — never span newlines. Otherwise "WEIGHT- 139\nPallets"
+  // is read as 139 pallets (Coreforce NEXCOM → bogus trailer splits).
+  const re = /\b(\d{1,3})[ \t]+(?:pallets?|plts?|skids?)\b/gi;
   let max = null;
   let m;
   while ((m = re.exec(String(text || ""))) !== null) {
@@ -856,6 +866,10 @@ function applyEmailPalletBlocks(extracted, opts) {
   if (applyNumberedShipmentPalletBlocks(extracted, body)) {
     return extracted;
   }
+  // Coreforce Ship To -N: keep each dest's pallet count + dims scoped.
+  if (applyDestinationSectionFreight(extracted, body)) {
+    return extracted;
+  }
   const blob = [subject, body].filter(Boolean).join("\n");
   let blocks = extractPalletFreight(body);
   if (!blocks.length) blocks = extractCompactPalletBlocks(body);
@@ -923,6 +937,13 @@ function parseLabeledFreightTotals(body) {
     palletCount = matchLabeledNumber(text,
         /Pallet\s+Counts?\s*[-–—:=]?\s*(\d+)/i);
   }
+  // Coreforce "Pallets- 1" / "Pallet: 1" (number after the label).
+  // Do not treat "1 pallet – 48x40x15" as qty 48/4 (dim triple;
+  // \d+ must not backtrack into 48 → 4).
+  if (palletCount == null) {
+    palletCount = matchLabeledNumber(text,
+        /\bPallets?\s*[-–—:=]\s*(\d+)(?!\d)(?!\s*[x×*])/i);
+  }
   if (palletCount == null) {
     const blocks = extractCompactPalletBlocks(text);
     if (blocks.length) palletCount = blocks.length;
@@ -930,15 +951,32 @@ function parseLabeledFreightTotals(body) {
   if (palletCount == null) {
     palletCount = parseInformalPalletCount(text);
   }
-  const cartonCount = matchLabeledNumber(text,
+  let cartonCount = matchLabeledNumber(text,
       /Total\s+Cartons?\s*[-–—:=]?\s*(\d+)/i);
-  const weight = matchLabeledNumber(text,
+  if (cartonCount == null) {
+    cartonCount = matchLabeledNumber(text,
+        /\bCTNS?\s*[-–—:=]\s*(\d+)/i);
+  }
+  let weight = matchLabeledNumber(text,
       /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d.]+)/i);
+  if (weight == null) {
+    weight = matchLabeledNumber(text,
+        /\bWEIGHT\s*[-–—:=]\s*([\d.]+)/i);
+  }
   const dim = text.match(new RegExp(
       "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*" +
       "(" + freightDims.DIM_TRIPLE_CAPTURE + ")",
       "i"));
-  const parsed = dim ? freightDims.parseDimTripleString(dim[1]) : null;
+  let parsed = dim ? freightDims.parseDimTripleString(dim[1]) : null;
+  // "1 pallet – 48x40x15" / "2 pallets - 48*40*88"
+  if (!parsed) {
+    const informalDim = text.match(new RegExp(
+        "\\b\\d{1,3}[ \\t]+pallets?\\s*[–\\-—:]\\s*" +
+        "(" + freightDims.DIM_TRIPLE_CAPTURE + ")",
+        "i"));
+    parsed = informalDim ?
+      freightDims.parseDimTripleString(informalDim[1]) : null;
+  }
   return {
     cartonCount,
     palletCount,
@@ -947,6 +985,191 @@ function parseLabeledFreightTotals(body) {
     width: parsed ? parsed.width : null,
     height: parsed ? parsed.height : null,
   };
+}
+
+/**
+ * Collect L×W×H triples from a Coreforce Ship-To / PO block.
+ * Prefers triples under "Pallet dimensions", else all triples in block.
+ * @param {string} text Section text.
+ * @return {Array<{length: number, width: number, height: number}>}
+ */
+function extractPalletDimensionTriples(text) {
+  const s = String(text || "");
+  const headerAt = s.search(/Pallet\s+Dimensions?/i);
+  const region = headerAt >= 0 ? s.slice(headerAt) : s;
+  const re = new RegExp(freightDims.DIM_TRIPLE_CAPTURE, "gi");
+  const out = [];
+  const seen = new Set();
+  let m;
+  while ((m = re.exec(region)) !== null) {
+    const parsed = freightDims.parseDimTripleString(m[0]);
+    if (!parsed) continue;
+    const key = [parsed.length, parsed.width, parsed.height].join("x");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(parsed);
+  }
+  return out;
+}
+
+/**
+ * Split a destination section into PO# sub-blocks when 2+ POs exist.
+ * @param {string} sectionText Ship-To / Shipment section body.
+ * @return {Array<string>}
+ */
+function splitPoFreightChunks(sectionText) {
+  const text = String(sectionText || "");
+  const headers = [...text.matchAll(/\bPO\s*#\s*/gi)];
+  if (headers.length < 2) return [text];
+  const chunks = [];
+  for (let i = 0; i < headers.length; i++) {
+    const start = headers[i].index;
+    const end = i + 1 < headers.length ?
+      headers[i + 1].index : text.length;
+    chunks.push(text.slice(start, end));
+  }
+  return chunks;
+}
+
+/**
+ * Build PLT freight rows from one Coreforce PO / Ship-To chunk.
+ * @param {string} chunk Block text.
+ * @return {Array<object>}
+ */
+function freightRowsFromLabeledChunk(chunk) {
+  const labeled = parseLabeledFreightTotals(chunk);
+  const dims = extractPalletDimensionTriples(chunk);
+  const palletCount = labeled.palletCount;
+  const weight = labeled.weight;
+
+  if (dims.length > 1 &&
+      (palletCount == null || palletCount === dims.length)) {
+    const n = dims.length;
+    const rows = [];
+    let assigned = 0;
+    for (let i = 0; i < n; i++) {
+      let w = null;
+      if (weight != null && Number.isFinite(weight)) {
+        if (i === n - 1) {
+          w = Math.round((weight - assigned) * 100) / 100;
+        } else {
+          w = Math.round((weight / n) * 100) / 100;
+          assigned += w;
+        }
+      }
+      rows.push(freightDims.normalizePalletDims({
+        qty: 1,
+        weight: w,
+        weightType: "total",
+        class: null,
+        length: dims[i].length,
+        width: dims[i].width,
+        height: dims[i].height,
+        dimType: "PLT",
+      }));
+    }
+    return rows;
+  }
+
+  const dim0 = dims[0] || null;
+  const lab = {
+    ...labeled,
+    length: dim0 ? dim0.length : labeled.length,
+    width: dim0 ? dim0.width : labeled.width,
+    height: dim0 ? dim0.height : labeled.height,
+  };
+  if (lab.palletCount == null && lab.cartonCount == null &&
+      lab.weight == null && lab.length == null) {
+    return [];
+  }
+  return applyLabeledFreightTotals([], lab);
+}
+
+/**
+ * Build freight for a destination section (optional multi-PO).
+ * @param {string} sectionText Section body.
+ * @return {Array<object>}
+ */
+function freightRowsFromDestSection(sectionText) {
+  const chunks = splitPoFreightChunks(sectionText);
+  const rows = [];
+  for (const chunk of chunks) {
+    rows.push(...freightRowsFromLabeledChunk(chunk));
+  }
+  return rows;
+}
+
+/**
+ * Coreforce "Ship To -1" / "Ship To-2" / "Ship To - 3" sections.
+ * @param {string} body Plain text body.
+ * @return {Array<object>}
+ */
+function extractShipToNumberedSections(body) {
+  const text = String(body || "");
+  const headerRe = /\bShip\s*To\s*-?\s*(\d+)\s*:?/gi;
+  const headers = [...text.matchAll(headerRe)];
+  if (headers.length < 2) return [];
+
+  const sections = [];
+  for (let i = 0; i < headers.length; i++) {
+    const h = headers[i];
+    const start = h.index + h[0].length;
+    const end = i + 1 < headers.length ? headers[i + 1].index : text.length;
+    const block = text.slice(start, end);
+    const addr = block.match(
+        /\b([A-Za-z][A-Za-z.\s]+?)\s+([A-Z]{2})\s+(\d{5})\d*\b/);
+    sections.push({
+      num: Number(h[1]),
+      text: block,
+      city: addr ? addr[1].trim() : "",
+      state: addr ? addr[2].toUpperCase() : "",
+      zip: addr ? addr[3] : "",
+      blocks: freightRowsFromDestSection(block),
+    });
+  }
+  return sections;
+}
+
+/**
+ * Multi-dest sections: Ship To -N first, else Shipment N.
+ * @param {string} body Plain text body.
+ * @return {Array<object>}
+ */
+function extractDestinationFreightSections(body) {
+  const shipTo = extractShipToNumberedSections(body);
+  if (shipTo.length >= 2) return shipTo;
+  return extractNumberedShipmentSections(body).map((s) => ({
+    ...s,
+    blocks: (s.blocks && s.blocks.length) ?
+      s.blocks : freightRowsFromDestSection(s.text),
+  }));
+}
+
+/**
+ * Assign per-destination Coreforce / Shipment freight onto matching lanes.
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Plain text body.
+ * @return {boolean} True when at least one lane was updated.
+ */
+function applyDestinationSectionFreight(extracted, body) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return false;
+  const sections = extractDestinationFreightSections(body);
+  if (sections.length < 2) return false;
+
+  let matched = 0;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const section = sections.find((s) => laneMatchesShipmentSection(lane, s));
+    if (!section) continue;
+    const rows = (section.blocks && section.blocks.length) ?
+      section.blocks.map((row) => ({...row})) :
+      freightRowsFromDestSection(section.text);
+    if (!rows.length) continue;
+    lane.freightInfo = rows;
+    if (lane.flags) lane.flags.suspiciousPalletCount = false;
+    matched++;
+  }
+  return matched > 0;
 }
 
 /**
@@ -1036,19 +1259,24 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
 
 /**
  * Correct AI/heuristic PLT qty when the email labeled cartons vs pallets.
- * Mutates extracted lanes in place.
+ * Mutates extracted lanes in place. Multi Ship-To / Shipment sections are
+ * scoped per destination so lane 1's "Number of Pallets -2" does not
+ * overwrite Waco's "Number of Pallets -1".
  * @param {object} extracted Parsed quote request.
  * @param {string} body Email body.
  * @return {object}
  */
 function correctCartonVsPalletFreight(extracted, body) {
   if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  if (applyDestinationSectionFreight(extracted, body)) {
+    return extracted;
+  }
   const labeled = parseLabeledFreightTotals(body);
   if (labeled.palletCount == null && labeled.cartonCount == null &&
       labeled.weight == null && labeled.length == null) {
     return extracted;
   }
-  if (!Array.isArray(extracted.lanes)) return extracted;
   for (const lane of extracted.lanes) {
     if (!lane || typeof lane !== "object") continue;
     lane.freightInfo = applyLabeledFreightTotals(
@@ -2139,6 +2367,9 @@ module.exports = {
   extractPalletFreight,
   extractInformalPalletFreight,
   extractNumberedShipmentSections,
+  extractShipToNumberedSections,
+  extractDestinationFreightSections,
+  applyDestinationSectionFreight,
   applyNumberedShipmentPalletBlocks,
   applyEmailPalletBlocks,
   parseInformalPalletCount,
