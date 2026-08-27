@@ -12,6 +12,88 @@ const ACTION = {
   RESUME: "resume",
 };
 
+/** Resume steps that should run mark-delivered → invoice → customer email. */
+const BILLING_PIPELINE_RESUME_STEPS = new Set([
+  "mark_delivered",
+  "check_customer",
+  "approve_bill",
+  "get_rate",
+  "generate_invoice",
+  "pod_extraction",
+  "customer_invoice",
+]);
+
+/**
+ * True when a resumed workflow should run the billing pipeline (not only
+ * customer email). Fresh starts (no resume step) always run billing.
+ * @param {string|null|undefined} resumeStep workflowPausedAtStep value.
+ * @return {boolean}
+ */
+function shouldRunBillingPipelineOnResume(resumeStep) {
+  if (!resumeStep) return true;
+  return BILLING_PIPELINE_RESUME_STEPS.has(String(resumeStep));
+}
+
+/**
+ * Maps a workflow POST response to user-facing resume outcome copy.
+ * @param {boolean} httpOk fetch response.ok
+ * @param {object} payload Parsed workflow JSON body
+ * @return {{ok: boolean, userMessage: string, code: string|null}}
+ */
+function interpretWorkflowResumeResult(httpOk, payload) {
+  const p = payload || {};
+  if (!httpOk) {
+    return {
+      ok: false,
+      userMessage: p.error ||
+        "Jerry could not reach the workflow — try again in a minute.",
+      code: p.error || "WORKFLOW_HTTP_ERROR",
+    };
+  }
+  if (p.error === "MISSING_POD" || p.workflowStatus === "missing_pod") {
+    return {
+      ok: false,
+      userMessage: "POD is still missing on this load. Upload the POD in " +
+        "ShipPrimus (POD file type on the booking), then click Resume " +
+        "Workflow again.",
+      code: "MISSING_POD",
+    };
+  }
+  if (p.error === "ALREADY_PROCESSING") {
+    return {
+      ok: false,
+      userMessage: "This load is already being processed — wait a minute " +
+        "and check ShipPrimus.",
+      code: "ALREADY_PROCESSING",
+    };
+  }
+  if (p.error === "ALREADY_COMPLETED" ||
+      p.workflowStatus === "completed") {
+    return {
+      ok: true,
+      userMessage: "This load was already invoiced — no further action " +
+        "needed.",
+      code: "ALREADY_COMPLETED",
+    };
+  }
+  if (p.ok === false) {
+    return {
+      ok: false,
+      userMessage: p.error ||
+        "The workflow stopped before finishing — check ShipPrimus or " +
+        "contact Advanced Automations.",
+      code: p.error || p.workflowStatus || "WORKFLOW_FAILED",
+    };
+  }
+  return {
+    ok: true,
+    userMessage: p.message ||
+      "Jerry resumed processing this load. Billing and customer email " +
+      "will continue automatically.",
+    code: p.workflowStatus || "RESUMED",
+  };
+}
+
 /**
  * @param {string} text Raw text.
  * @return {string}
@@ -593,6 +675,7 @@ function isTransientPrimusApiError(status, message) {
 
 module.exports = {
   ACTION,
+  BILLING_PIPELINE_RESUME_STEPS,
   buildWorkflowAlertEmail,
   buildWorkflowActionButton,
   looksLikeSystemError,
@@ -601,6 +684,8 @@ module.exports = {
   isTransientNetworkError,
   isTransientPrimusApiError,
   shouldDelayWorkflowRetry,
+  shouldRunBillingPipelineOnResume,
+  interpretWorkflowResumeResult,
   transientRetryDelayMs,
   TRANSIENT_NETWORK_RETRY_MS,
   WORKFLOW_DELAYED_RETRY_MS,

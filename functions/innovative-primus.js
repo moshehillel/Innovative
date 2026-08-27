@@ -2167,11 +2167,7 @@ exports.processPrimusWorkflow = onRequest(
         // PRO is optional for FTL; workflow proceeds on load number alone.
 
         const runBillingPipeline = !skipToCustomerEmail &&
-            (!currentStep || currentStep === "mark_delivered" ||
-        currentStep === "check_customer" ||
-        currentStep === "approve_bill" ||
-        currentStep === "get_rate" ||
-        currentStep === "generate_invoice");
+            workflowErrors.shouldRunBillingPipelineOnResume(currentStep);
         const runCustomerEmailStep =
             skipToCustomerEmail || runBillingPipeline ||
             currentStep === "send_customer_email";
@@ -2228,11 +2224,7 @@ exports.processPrimusWorkflow = onRequest(
               primusSteps.amountValidated = primusSteps.amountValidated || true;
             }
           } else if (runBillingPipeline) {
-            if (!currentStep || currentStep === "mark_delivered" ||
-        currentStep === "check_customer" ||
-        currentStep === "approve_bill" ||
-        currentStep === "get_rate" ||
-        currentStep === "generate_invoice") {
+            if (workflowErrors.shouldRunBillingPipelineOnResume(currentStep)) {
               // Skip if already marked delivered (from primusSteps or
               // Primus duplicate)
               if (primusSteps.shipmentDelivered) {
@@ -3575,6 +3567,23 @@ exports.processPrimusWorkflow = onRequest(
             qbBillingSynced: !!primusSteps.qbBillingSynced,
           });
         } // end runCustomerEmailStep
+
+        await writeLog("warn", "workflow",
+            "Workflow ended without billing or customer email step", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              currentStep,
+              skipToCustomerEmail,
+            });
+        await invoiceDoc.ref.update({
+          processingLock: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        return res.status(500).json({
+          ok: false,
+          error: "WORKFLOW_STEP_NOT_RUN",
+          currentStep,
+        });
       } catch (error) {
         const invoiceId = (req.body && req.body.invoiceId) || null;
         try {

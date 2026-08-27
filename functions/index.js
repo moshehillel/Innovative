@@ -2468,6 +2468,9 @@ exports.continueWorkflow = onRequest(async (req, res) => {
 
     const invoice = snap.data();
     const paused = invoice.workflowPausedAtStep;
+    const loadNumber = invoice.loadNumber || "—";
+    const wantsJson = req.query.format === "json" ||
+      String(req.get("accept") || "").includes("application/json");
 
     await invoiceRef.update({
       workflowPausedAtStep: null,
@@ -2484,6 +2487,14 @@ exports.continueWorkflow = onRequest(async (req, res) => {
         error: `No workflow configured for tenant ${tenant.tenantId}.`,
       });
     }
+
+    await writeLog("info", "workflow", "Resume Workflow clicked", {
+      invoiceId,
+      tenantId: tenant.tenantId,
+      loadNumber: invoice.loadNumber || null,
+      resumedFrom: paused || null,
+    });
+
     const response = await fetch(
         workflowUrl,
         {
@@ -2500,12 +2511,36 @@ exports.continueWorkflow = onRequest(async (req, res) => {
     );
 
     const payload = await response.json().catch(() => ({}));
-
-    return res.json({
-      ok: true,
+    const result = workflowErrors.interpretWorkflowResumeResult(
+        response.ok, payload);
+    const body = {
+      ok: result.ok,
       resumedFrom: paused || null,
       workflow: payload,
-    });
+      message: result.userMessage,
+      code: result.code || null,
+    };
+
+    if (!wantsJson && req.method === "GET") {
+      const color = result.ok ? "#16a34a" : "#dc2626";
+      const title = result.ok ? "Workflow resumed" : "Could not resume";
+      return res.status(result.ok ? 200 : 422).send(
+          `<!doctype html><html><head><meta charset="utf-8">` +
+          `<meta name="viewport" content="width=device-width,` +
+          `initial-scale=1"><title>${escapeHtml(title)}</title></head>` +
+          `<body style="font-family:Arial,sans-serif;text-align:center;` +
+          `padding:48px;color:#111827">` +
+          `<h1 style="color:${color};margin-bottom:12px">` +
+          `${escapeHtml(title)}</h1>` +
+          `<p style="font-size:16px;color:#374151;max-width:520px;` +
+          `margin:0 auto 16px;line-height:1.5">` +
+          `${escapeHtml(result.userMessage)}</p>` +
+          `<p style="font-size:13px;color:#9ca3af">Load ` +
+          `${escapeHtml(String(loadNumber))}</p>` +
+          `</body></html>`);
+    }
+
+    return res.status(result.ok ? 200 : 422).json(body);
   } catch (error) {
     console.error("continueWorkflow error:", error);
     return res.status(500).json({
@@ -5224,6 +5259,41 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     to: approver,
     cc: dispatcherEmail || undefined,
   });
+
+  // Attach the carrier invoice PDF (GCS) so Sarah/Lisa can review the bill.
+  let attachedInvoicePdf = false;
+  try {
+    let attachmentMeta = additionalCharges.pickCarrierInvoiceAttachment(
+        opts.invoiceAttachments);
+    if (!attachmentMeta && invoiceId && tenant) {
+      const invSnap = await tcol(tenant, "invoices")
+          .doc(String(invoiceId)).get();
+      if (invSnap.exists) {
+        attachmentMeta = additionalCharges.pickCarrierInvoiceAttachment(
+            (invSnap.data() || {}).attachments);
+      }
+    }
+    if (attachmentMeta && attachmentMeta.storagePath) {
+      const contentBase64 = await downloadStorageFileBase64(
+          attachmentMeta.storagePath);
+      if (contentBase64) {
+        emailPayload.attachments = [{
+          filename: attachmentMeta.filename ||
+            `carrier-invoice-${invoiceId}.pdf`,
+          contentType: attachmentMeta.mimeType || "application/pdf",
+          contentBase64,
+        }];
+        attachedInvoicePdf = true;
+      }
+    }
+  } catch (attachErr) {
+    await writeLog("warn", "email",
+        "Could not attach carrier invoice to approval email", {
+          invoiceId,
+          error: attachErr.message,
+        });
+  }
+
   await saveOutboundEmail(emailPayload);
 
   await writeLog("info", "email",
@@ -5236,6 +5306,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         ccDispatcher: dispatcherEmail || null,
         ccLisa: additionalCharges.LISA_EMAIL,
         customerRate,
+        attachedInvoicePdf,
       });
 }
 
@@ -10717,6 +10788,7 @@ async function processGmailMessage(
             tenant,
             aiResult,
             pending: pendingAdditionalCharge,
+            invoiceAttachments,
           });
           await writeLog(
               "info",
