@@ -144,7 +144,10 @@ check("button E label mentions no separate notification",
     email.html.includes("no separate customer notification"), true);
 check("footer explains E vs A",
     email.html.includes("like A") &&
-    email.html.includes("no separate customer notification"), true);
+    email.html.includes("no separate customer notification") &&
+    email.html.includes("included when the customer invoice is sent"), true);
+check("email HTML has no raw em dash",
+    !email.html.includes("\u2014") && !email.html.includes("â€"), true);
 
 // 3b. Option A amount parsing
 const badA = ac.parseCustomerChargeAmountFromRequest({});
