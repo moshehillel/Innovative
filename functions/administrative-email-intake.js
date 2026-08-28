@@ -1006,6 +1006,20 @@ function looksLikeInvoiceEmailContent(subject, body) {
       /\b(?:pronumber|pro\s*#?|attached)\b/i.test(content)) {
     return true;
   }
+  // Internal forwards: FW: REF# 264969 where nested body mentions invoice.
+  if (/^(?:(?:fw|fwd|re):\s*)+ref#\s*\d{5,9}\b/.test(sub) &&
+      /\binvoice\b/.test(content)) {
+    return true;
+  }
+  // Factor/carrier invoice notification in body (e.g. RM Capital for ref #).
+  if (/\b(?:sent|attached|forwarding)\s+(?:an?\s+)?invoice\b/.test(content) &&
+      /\b(?:ref(?:erence)?|load|bol|po)\s*#?\s*\d{5,9}/.test(content)) {
+    return true;
+  }
+  if (/\binvoice\b/.test(content) &&
+      /\bfor\s+(?:ref(?:erence)?|load)\s*#?\s*\d{5,9}/.test(content)) {
+    return true;
+  }
   return false;
 }
 

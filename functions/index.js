@@ -44,10 +44,10 @@ const {
 } = require("./email-outbound-safe");
 const administrativeEmailIntake = require("./administrative-email-intake");
 const statementInvoiceBundle = require("./statement-invoice-bundle");
+const emailAttachmentClassification =
+  require("./email-attachment-classification");
 const {
   sanitizePreCheckLabel,
-  shouldTreatStatementCoverAsInvoiceBundle,
-  normalizePreCheckDocType,
 } = statementInvoiceBundle;
 const drayageIntake = require("./drayage-intake");
 const invoiceLoadEntry = require("./invoice-load-entry");
@@ -8150,6 +8150,12 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  'Single Point Capital; Invoice #265914' with a PDF is a factored",
       "  carrier freight invoice. Classify as carrier_invoice, not statement",
       "  or unknown.",
+      "- Factoring companies (RM Capital, Apex, Chugh, etc.): when the body",
+      "  says they sent an invoice for a reference/load/PO number, classify",
+      "  as carrier_invoice even if the subject is only 'REF# 264969'.",
+      "- Internal forwards from @innovativecarriers.com (e.g. Lisa FW: REF#",
+      "  264969) where the nested message describes a carrier/factor invoice",
+      "  are carrier_invoice — the REF# is usually the broker load number.",
       "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",
       "  delivery photos — not asking us to send one.",
       "- pod_request: sender asks Innovative to SEND or provide a POD /",
@@ -8466,8 +8472,8 @@ async function processGmailMessage(
           emailClassification = await classifyIncomingEmail(
               subject, from, emailBody, attachments,
           );
-          emailClassification = statementInvoiceBundle
-              .overrideStatementClassificationIfInvoicePacket(
+          emailClassification = emailAttachmentClassification
+              .overrideClassificationIfInvoicePackage(
                   emailClassification, subject, from, emailBody,
                   attachments);
           await writeLog("info", "ai", "Incoming email classified", {
@@ -9097,12 +9103,23 @@ async function processGmailMessage(
 
         const preCheckLabel = docType;
         const pageCount = await getPdfPageCount(fileBuffer);
-        docType = normalizePreCheckDocType(docType, {
-          subject, from, filename: attachment.filename,
-          pageCount,
-          body: emailBody,
-        });
-        if (preCheckLabel !== docType && docType === "INVOICE") {
+        const resolved = emailAttachmentClassification.resolveAttachmentDocType(
+            docType, {
+              subject, from, filename: attachment.filename,
+              pageCount, body: emailBody, emailClassification,
+            });
+        docType = resolved.docType;
+        if (resolved.promoted) {
+          await writeLog("info", "mail",
+              "Promoted attachment to INVOICE from email context", {
+                messageId,
+                filename: attachment.filename,
+                preCheckLabel,
+                reason: resolved.reason,
+                emailIntent: emailClassification &&
+                  emailClassification.intent,
+              });
+        } else if (preCheckLabel !== docType && docType === "INVOICE") {
           await writeLog("info", "mail",
               "Carrier statement PDF — attempting multi-invoice extraction", {
                 messageId, filename: attachment.filename,
@@ -9111,21 +9128,7 @@ async function processGmailMessage(
               });
         }
         if (docType !== "INVOICE" && docType !== "POD") {
-          if (shouldTreatStatementCoverAsInvoiceBundle({
-            preCheckLabel,
-            subject, from, filename: attachment.filename,
-            pageCount,
-            body: emailBody,
-          })) {
-            docType = "INVOICE";
-            await writeLog("info", "mail",
-                "Statement-cover PDF treated as invoice bundle", {
-                  messageId,
-                  filename: attachment.filename,
-                  preCheckLabel,
-                  pageCount,
-                });
-          } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
+          if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
             await writeLog("info", "mail",
                 "Carrier statement ignored — not an invoice bundle", {
                   messageId,
@@ -9134,15 +9137,14 @@ async function processGmailMessage(
                 });
             skippedDocTypes.push("STATEMENT");
             continue;
-          } else {
-            await writeLog("info", "mail",
-                `Attachment is ${preCheckLabel}, skipping`, {
-                  messageId, filename: attachment.filename,
-                  docType: preCheckLabel,
-                });
-            skippedDocTypes.push(preCheckLabel);
-            continue;
           }
+          await writeLog("info", "mail",
+              `Attachment is ${preCheckLabel}, skipping`, {
+                messageId, filename: attachment.filename,
+                docType: preCheckLabel,
+              });
+          skippedDocTypes.push(preCheckLabel);
+          continue;
         }
 
         const safeFilename =
@@ -9208,12 +9210,21 @@ async function processGmailMessage(
             }
             const preCheckLabel = docType;
             const pageCount = await getPdfPageCount(attachment.buffer);
-            docType = normalizePreCheckDocType(docType, {
-              subject, from, filename: attachment.filename,
-              pageCount,
-              body: emailBody,
-            });
-            if (preCheckLabel !== docType && docType === "INVOICE") {
+            const resolved =
+              emailAttachmentClassification.resolveAttachmentDocType(docType, {
+                subject, from, filename: attachment.filename,
+                pageCount, body: emailBody, emailClassification,
+              });
+            docType = resolved.docType;
+            if (resolved.promoted) {
+              await writeLog("info", "mail",
+                  "Promoted raw MIME PDF to INVOICE from email context", {
+                    messageId,
+                    filename: attachment.filename,
+                    preCheckLabel,
+                    reason: resolved.reason,
+                  });
+            } else if (preCheckLabel !== docType && docType === "INVOICE") {
               await writeLog("info", "mail",
                   "Carrier statement PDF from raw MIME — multi-invoice", {
                     messageId, filename: attachment.filename,
@@ -9222,20 +9233,12 @@ async function processGmailMessage(
                   });
             }
             if (docType !== "INVOICE" && docType !== "POD") {
-              if (shouldTreatStatementCoverAsInvoiceBundle({
-                preCheckLabel,
-                subject, from, filename: attachment.filename,
-                pageCount,
-                body: emailBody,
-              })) {
-                docType = "INVOICE";
-              } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
+              if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
                 skippedDocTypes.push("STATEMENT");
                 continue;
-              } else {
-                skippedDocTypes.push(preCheckLabel);
-                continue;
               }
+              skippedDocTypes.push(preCheckLabel);
+              continue;
             }
             const safeFilename =
               String(attachment.filename || "invoice.pdf")

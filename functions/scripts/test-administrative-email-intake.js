@@ -770,6 +770,18 @@ check("Single Point Capital OTHER attachment would veto (not forward)",
       invoicePdfCount: 0,
     }));
 
+const rmBody =
+  "RM Capital Inc. sent an invoice for reference #264969 and requested " +
+  "confirmation of receipt.";
+check("Lisa FW REF# + RM Capital body has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: "FW: REF# 264969",
+      body: rmBody,
+      from: "Lisa <lisa@innovativecarriers.com>",
+      attachments: [{filename: "doc.pdf", mimeType: "application/pdf"}],
+      invoicePdfCount: 0,
+    }));
+
 const hstileSubject = "Payment 08/25/26";
 const hstileFrom = "Michel Schwartz <michel@hstile.com>";
 const hstileBody =
