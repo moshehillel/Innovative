@@ -1240,8 +1240,10 @@
         bits.push("<span class='badge nomatch'>" +
           "No Primus match — set customer rates manually</span>");
       }
-      if (q.rateSource === "market_fallback") {
+      if (q.rateSource === "market_fallback" ||
+          q.rateSource === "market_fallback_fak") {
         bits.push("<span class='badge market'>rate source: market fallback" +
+          (q.rateSource === "market_fallback_fak" ? " + FAK" : "") +
           "</span>");
       } else if (q.rateSource === "customer") {
         bits.push("<span class='badge match'>rate source: customer</span>");
@@ -1268,9 +1270,12 @@
           if (warns.indexOf(w) < 0) warns.push(w);
         });
       });
-      if (q.rateSource === "market_fallback" &&
-          warns.indexOf("market fallback") < 0) {
-        warns.push("market fallback");
+      if ((q.rateSource === "market_fallback" ||
+            q.rateSource === "market_fallback_fak") &&
+          warns.indexOf("market fallback") < 0 &&
+          warns.indexOf("market fallback + FAK markup") < 0) {
+        warns.push(q.rateSource === "market_fallback_fak" ?
+          "market fallback + FAK markup" : "market fallback");
       }
       if (!warns.length) {
         el.innerHTML = "";
@@ -2340,13 +2345,21 @@
         } else if (lane.rateWarning) {
           optsHtml = "<div class='warn'>" + esc(lane.rateWarning) + "</div>";
         }
-        if (lane.rateSource === "market_fallback" && !lane.rateWarning) {
+        if ((lane.rateSource === "market_fallback" ||
+              lane.rateSource === "market_fallback_fak") &&
+            !lane.rateWarning) {
           optsHtml += "<div class='warn'>Primus customer matched but no " +
             "customer tariffs — showing market rates.</div>";
         }
         uniqueWarns(lane.extractionWarnings).forEach((w) => {
           if (lane.rateWarning && lane.rateWarning.indexOf(w) >= 0) return;
-          if (w === "market fallback" && lane.rateSource === "market_fallback") {
+          if (w === "market fallback" &&
+              (lane.rateSource === "market_fallback" ||
+                lane.rateSource === "market_fallback_fak")) {
+            return;
+          }
+          if (w === "market fallback + FAK markup" &&
+              lane.rateSource === "market_fallback_fak") {
             return;
           }
           optsHtml += "<div class='warn'>" + esc(w) + "</div>";

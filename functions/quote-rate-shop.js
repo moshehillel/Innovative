@@ -197,6 +197,137 @@ const MARKET_FALLBACK_WARNING =
   "means Primus config, not Jerry).";
 
 /**
+ * Warning when market costs are re-marked with the customer's Primus FAK
+ * (Pricing tab) because /rate/multiple with customerId returned nothing.
+ * @param {object} [fak] Normalized FAK {rate, type, min}.
+ * @return {string}
+ */
+function marketFallbackFakWarning(fak = {}) {
+  const rate = Number(fak.rate);
+  const min = Number(fak.min);
+  const type = String(fak.type || "profit%");
+  const rateLabel = Number.isFinite(rate) ? String(rate) : "?";
+  const minLabel = Number.isFinite(min) ? String(min) : "?";
+  return "Primus customer matched but no carrier contract profiles — " +
+    "showing market costs with this customer's FAK markup " +
+    `(${rateLabel}% ${type}, min $${minLabel}; not contract tariffs).`;
+}
+
+/**
+ * Built-in FAK (Pricing tab) rules keyed by Primus shipping location id.
+ * Primus REST does not expose the Pricing/FAK tab today — confirm in UI
+ * and keep this map (or QUOTE_CUSTOMER_FAK_JSON) in sync.
+ * Mike Oseback protocol only: Rate 15 / Type Profit% / Min 80.
+ * @type {Object<string, {rate: number, type: string, min: number}>}
+ */
+const CUSTOMER_FAK_BY_ID = {
+  "779538209": {rate: 15, type: "profit%", min: 80},
+};
+
+/**
+ * @return {Object<string, object>} Merged built-in + env FAK map.
+ */
+function customerFakPricingMap() {
+  const out = {...CUSTOMER_FAK_BY_ID};
+  const raw = String(process.env.QUOTE_CUSTOMER_FAK_JSON || "").trim();
+  if (!raw) return out;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [id, row] of Object.entries(parsed)) {
+        const norm = normalizeFakPricing(row);
+        if (norm) out[String(id)] = norm;
+      }
+    }
+  } catch (err) {
+    console.warn("QUOTE_CUSTOMER_FAK_JSON parse failed",
+        err && err.message);
+  }
+  return out;
+}
+
+/**
+ * Normalizes a FAK / Pricing-tab markup rule.
+ * Primus: Rate + Type Profit% + Min $ → profit = max(cost×rate%, min).
+ * @param {object|null|undefined} raw Raw config.
+ * @return {{rate: number, type: string, min: number}|null}
+ */
+function normalizeFakPricing(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const rate = Number(raw.rate != null ? raw.rate : raw.percent);
+  const min = Number(raw.min != null ? raw.min : raw.minDollars);
+  if (!Number.isFinite(rate) || rate < 0) return null;
+  if (!Number.isFinite(min) || min < 0) return null;
+  const typeRaw = String(raw.type || raw.markupType || "profit%")
+      .toLowerCase()
+      .replace(/\s+/g, "");
+  let type = "profit%";
+  if (typeRaw === "flat" || typeRaw === "dollar" || typeRaw === "$") {
+    type = "flat";
+  } else if (typeRaw.includes("markup")) {
+    type = "markup%";
+  } else if (typeRaw.includes("profit") || typeRaw.includes("%")) {
+    type = "profit%";
+  }
+  return {rate, type, min};
+}
+
+/**
+ * Looks up configured FAK for a Primus shipping location id.
+ * @param {string|number|null|undefined} customerId Shipping location id.
+ * @return {{rate: number, type: string, min: number}|null}
+ */
+function getCustomerFakPricing(customerId) {
+  const id = customerId != null ? String(customerId).trim() : "";
+  if (!id) return null;
+  return normalizeFakPricing(customerFakPricingMap()[id]) || null;
+}
+
+/**
+ * Best-effort parse if Primus ever returns Pricing fields on a SL row.
+ * Today REST shippinglocation has no FAK fields — returns null.
+ * @param {object|null|undefined} loc Shipping location row.
+ * @return {{rate: number, type: string, min: number}|null}
+ */
+function parseFakPricingFromShippingLocation(loc) {
+  if (!loc || typeof loc !== "object") return null;
+  const candidates = [
+    loc.fakPricing, loc.fak, loc.pricing, loc.pricingInfo,
+    loc.markup, loc.customerPricing, loc.billingInfo && loc.billingInfo.fak,
+    loc.billingInfo && loc.billingInfo.pricing,
+  ];
+  for (const c of candidates) {
+    const norm = normalizeFakPricing(c);
+    if (norm) return norm;
+  }
+  return null;
+}
+
+/**
+ * Resolves FAK for market-fallback sell rates (ctx override → SL parse → map).
+ * @param {string|number|null|undefined} customerId Shipping location id.
+ * @param {object} [opts] fakPricing override, shippingLocation row.
+ * @return {{rate: number, type: string, min: number}|null}
+ */
+function resolveFakPricingForCustomer(customerId, opts = {}) {
+  const fromOpts = normalizeFakPricing(opts.fakPricing);
+  if (fromOpts) return fromOpts;
+  const fromLoc = parseFakPricingFromShippingLocation(opts.shippingLocation);
+  if (fromLoc) return fromLoc;
+  return getCustomerFakPricing(customerId);
+}
+
+/**
+ * True for market / FAK market-fallback rateSource values.
+ * @param {string|null|undefined} rateSource Rate source tag.
+ * @return {boolean}
+ */
+function isMarketFallbackRateSource(rateSource) {
+  const s = String(rateSource || "");
+  return s === "market_fallback" || s === "market_fallback_fak";
+}
+
+/**
  * Always retry /rate/multiple without customerId when the customer
  * call returned no rates — empty noRates, profile errors, class
  * errors, or any other Primus miss.
@@ -1117,13 +1248,36 @@ function buildRateMultipleQuery(lane, opts = {}) {
 }
 
 /**
+ * Primus FAK Pricing-tab sell: profit floor, not Jerry market cap.
+ * Profit%/markup%: sell = cost + max(cost×rate%, min$).
+ * Flat: sell = cost + max(rate, min$).
+ * @param {number} cost Carrier cost.
+ * @param {object} fak Normalized FAK {rate, type, min}.
+ * @return {number|null}
+ */
+function computeFakSellRate(cost, fak) {
+  const c = Number(cost);
+  const rule = normalizeFakPricing(fak);
+  if (!Number.isFinite(c) || !rule) return null;
+  let profit;
+  if (rule.type === "flat") {
+    profit = Math.max(rule.rate, rule.min);
+  } else {
+    // profit% and markup% on cost (Primus Profit% = profit / cost).
+    profit = Math.max(c * (rule.rate / 100), rule.min);
+  }
+  return Math.ceil(c + profit);
+}
+
+/**
  * Applies margin to carrier cost.
  * Customer contract rates (billTo.total or rateSource customer) pass through.
+ * FAK (opts.fak): Primus Pricing-tab profit% with min $ floor.
  * Market rates: cost + min(flat $ markup, percent of cost), default $55 / 10%.
  * All sell rates round UP to the next whole dollar (Math.ceil).
  * @param {number} cost Carrier cost.
  * @param {object} [opts] billToTotal, rateSource, marginPercent,
- *   marginMinDollars.
+ *   marginMinDollars, fak.
  * @return {number|null}
  */
 function computeSellRate(cost, opts = {}) {
@@ -1134,6 +1288,8 @@ function computeSellRate(cost, opts = {}) {
   if (opts.rateSource === "customer") {
     return Math.ceil(c);
   }
+  const fak = normalizeFakPricing(opts.fak);
+  if (fak) return computeFakSellRate(c, fak);
   const flat = Number.isFinite(Number(opts.marginMinDollars)) ?
     Number(opts.marginMinDollars) : 55;
   const pct = Number.isFinite(Number(opts.marginPercent)) &&
@@ -1274,6 +1430,13 @@ module.exports = {
   parseAccessorialCatalogResponse,
   buildRateMultipleQuery,
   computeSellRate,
+  computeFakSellRate,
+  normalizeFakPricing,
+  getCustomerFakPricing,
+  parseFakPricingFromShippingLocation,
+  resolveFakPricingForCustomer,
+  isMarketFallbackRateSource,
+  marketFallbackFakWarning,
   tagRateOptions,
   filterBlockedCarriers,
   pickTopOptions,
@@ -1283,6 +1446,7 @@ module.exports = {
   summarizeNoRateErrors,
   shouldRetryRatesWithoutCustomer,
   MARKET_FALLBACK_WARNING,
+  CUSTOMER_FAK_BY_ID,
   normalizeIsoCountry,
   normalizeDimType,
   normalizeFreightInfoForRate,

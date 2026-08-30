@@ -664,9 +664,15 @@ function collectQuoteWarnings(extracted, lanes) {
   (extracted && extracted.extractionWarnings || []).forEach(add);
   for (const lane of lanes || []) {
     (lane.extractionWarnings || []).forEach(add);
-    if (lane.rateSource === "market_fallback") add("market fallback");
-    if (lane.rateWarning === rateShop.MARKET_FALLBACK_WARNING) {
-      add("market fallback");
+    if (rateShop.isMarketFallbackRateSource(lane.rateSource)) {
+      add(lane.rateSource === "market_fallback_fak" ?
+        "market fallback + FAK markup" : "market fallback");
+    }
+    if (lane.rateWarning === rateShop.MARKET_FALLBACK_WARNING ||
+        (lane.rateWarning &&
+          String(lane.rateWarning).includes("FAK markup"))) {
+      add(lane.rateSource === "market_fallback_fak" ?
+        "market fallback + FAK markup" : "market fallback");
     }
   }
   return out;
@@ -680,6 +686,9 @@ function collectQuoteWarnings(extracted, lanes) {
  */
 function quoteRateSource(lanes, shippingLocationId) {
   const rows = Array.isArray(lanes) ? lanes : [];
+  if (rows.some((l) => l && l.rateSource === "market_fallback_fak")) {
+    return "market_fallback_fak";
+  }
   if (rows.some((l) => l && l.rateSource === "market_fallback")) {
     return "market_fallback";
   }
@@ -827,9 +836,12 @@ async function rateLane(lane, ctx) {
   let noRates = fetched.noRates || [];
   let rateNote = null;
   let rateSource = ctx.shippingLocationId ? "customer" : null;
+  let fakPricing = null;
 
   // Customer tariffs empty for any reason → retry market rates.
   // Keep the Primus customer match; never present market as contract.
+  // If this customer has FAK (Pricing tab), re-mark market costs with
+  // that FAK instead of Jerry's default ~10%/$55 market margin.
   if (!rates.length && ctx.shippingLocationId) {
     const fallbackQuery = {...query};
     delete fallbackQuery.customerId;
@@ -837,15 +849,25 @@ async function rateLane(lane, ctx) {
     rates = fetched.rates || [];
     noRates = fetched.noRates || [];
     if (rates.length) {
-      rateSource = "market_fallback";
-      rateNote = rateShop.MARKET_FALLBACK_WARNING;
+      fakPricing = rateShop.resolveFakPricingForCustomer(
+          ctx.shippingLocationId, {
+            fakPricing: ctx.fakPricing,
+            shippingLocation: ctx.shippingLocation,
+          });
+      if (fakPricing) {
+        rateSource = "market_fallback_fak";
+        rateNote = rateShop.marketFallbackFakWarning(fakPricing);
+      } else {
+        rateSource = "market_fallback";
+        rateNote = rateShop.MARKET_FALLBACK_WARNING;
+      }
     }
   }
 
   const filtered = rateShop.filterBlockedCarriers(
       rates, rulesOut.filterCarrierWarnings);
 
-  const marginOpts = {
+  const marginOpts = fakPricing ? {fak: fakPricing} : {
     marginPercent: Number(process.env.QUOTE_MARGIN_PERCENT) || 10,
     marginMinDollars: Number(process.env.QUOTE_MARGIN_MIN_DOLLARS) || 55,
   };
@@ -879,7 +901,11 @@ async function rateLane(lane, ctx) {
     }
   };
   (lane.extractionWarnings || []).forEach(addWarn);
-  if (rateSource === "market_fallback") addWarn("market fallback");
+  if (rateSource === "market_fallback_fak") {
+    addWarn("market fallback + FAK markup");
+  } else if (rateSource === "market_fallback") {
+    addWarn("market fallback");
+  }
   for (const w of rulesOut.extractionWarnings || []) addWarn(w);
   if (!options.length) {
     rateError = rateShop.summarizeNoRateErrors(noRates) ||
@@ -895,6 +921,7 @@ async function rateLane(lane, ctx) {
     rateError,
     rateWarning,
     rateSource,
+    fakPricing: fakPricing || null,
     extractionWarnings,
   };
 }

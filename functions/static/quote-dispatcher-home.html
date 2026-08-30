@@ -1062,8 +1062,10 @@
           "</div>" :
           '<div class="quote-card-customer nomatch">No Primus match</div>';
         const warnBits = [];
-        if (item.rateSource === "market_fallback") {
-          warnBits.push("market fallback");
+        if (item.rateSource === "market_fallback" ||
+            item.rateSource === "market_fallback_fak") {
+          warnBits.push(item.rateSource === "market_fallback_fak" ?
+            "market fallback + FAK" : "market fallback");
         } else if (item.rateSource === "customer") {
           warnBits.push("customer rates");
         }
@@ -1074,9 +1076,13 @@
           if (lane.rateWarning && warnBits.indexOf(lane.rateWarning) < 0) {
             warnBits.push(lane.rateWarning);
           }
-          if (lane.rateSource === "market_fallback" &&
-              warnBits.indexOf("market fallback") < 0) {
-            warnBits.push("market fallback");
+          if ((lane.rateSource === "market_fallback" ||
+                lane.rateSource === "market_fallback_fak") &&
+              warnBits.indexOf("market fallback") < 0 &&
+              warnBits.indexOf("market fallback + FAK") < 0 &&
+              warnBits.indexOf("market fallback + FAK markup") < 0) {
+            warnBits.push(lane.rateSource === "market_fallback_fak" ?
+              "market fallback + FAK" : "market fallback");
           }
         });
         const warnHtml = warnBits.length ?

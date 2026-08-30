@@ -219,6 +219,45 @@ check("sell rate keeps whole billTo",
 check("customer rateSource ceils fractional",
     rateShop.computeSellRate(400.01, {rateSource: "customer"}), 401);
 
+// FAK (Primus Pricing tab): profit = max(cost×rate%, min$) — floor, not cap.
+const mikeFak = {rate: 15, type: "profit%", min: 80};
+check("Mike FAK map for 779538209",
+    JSON.stringify(rateShop.getCustomerFakPricing("779538209")),
+    JSON.stringify(mikeFak));
+check("unknown customer has no FAK",
+    rateShop.getCustomerFakPricing("999"), null);
+check("FAK sell low cost uses min $80",
+    rateShop.computeSellRate(300, {fak: mikeFak}), 380);
+check("FAK sell high cost uses 15%",
+    rateShop.computeSellRate(1000, {fak: mikeFak}), 1150);
+check("FAK sell at crossover cost=$533.34 → 15%>80",
+    rateShop.computeSellRate(533.34, {fak: mikeFak}), 614);
+check("FAK computeFakSellRate matches",
+    rateShop.computeFakSellRate(300, mikeFak), 380);
+check("FAK billTo still wins over FAK markup",
+    rateShop.computeSellRate(300, {billToTotal: 350, fak: mikeFak}), 350);
+check("FAK warning mentions FAK markup",
+    String(rateShop.marketFallbackFakWarning(mikeFak))
+        .includes("FAK markup") &&
+    String(rateShop.marketFallbackFakWarning(mikeFak)).includes("15%") &&
+    String(rateShop.marketFallbackFakWarning(mikeFak)).includes("min $80"),
+    true);
+check("isMarketFallbackRateSource market",
+    rateShop.isMarketFallbackRateSource("market_fallback"), true);
+check("isMarketFallbackRateSource fak",
+    rateShop.isMarketFallbackRateSource("market_fallback_fak"), true);
+check("isMarketFallbackRateSource customer false",
+    rateShop.isMarketFallbackRateSource("customer"), false);
+check("resolveFakPricing prefers opts override",
+    JSON.stringify(rateShop.resolveFakPricingForCustomer("779538209", {
+      fakPricing: {rate: 20, type: "profit%", min: 100},
+    })),
+    JSON.stringify({rate: 20, type: "profit%", min: 100}));
+check("parseFak from empty SL is null",
+    rateShop.parseFakPricingFromShippingLocation({id: 1, name: "x"}), null);
+check("normalizeFak rejects bad rows",
+    rateShop.normalizeFakPricing({rate: "x", min: 80}), null);
+
 const slim = rateShop.normalizeRateRow({
   id: "Rabc123",
   name: "Roadrunner J&I",
