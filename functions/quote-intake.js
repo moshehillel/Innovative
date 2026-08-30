@@ -121,7 +121,9 @@ function normalizeExtractedQuote(extracted, opts) {
   fillShipperFromLaneLabelOrigin(next);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
+  applyMixedPalletDimLines(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
+  redistributeEvenTotalWeight(next, opts && opts.body);
   senderRules.applySenderDefaultedDimOverrides(
       next, senderFrom, opts && opts.body, undefined, recipientOpts);
   if (missingDimsBefore && !palletRowsMissingDims(next)) {
@@ -395,9 +397,16 @@ function quoteExtractSystemPrompt() {
     "   [{qty:1, weight:137, weightType:\"total\", length:40, width:48,",
     "   height:28, dimType:\"PLT\"}]. Cartons ≠ pallets. Mention 35",
     "   cartons in specialInstructions only.",
-    "6) \"Total weight – 8146.05\" (or 8146) on many pallets →",
-    "   weight 8146.05 (or 8146), weightType \"total\". Never per-pallet",
-    "   / each. Never strip the decimal (814605 is wrong).",
+    "6) \"Total weight – 8146.05\" (or 8146) on many pallets with ONE",
+    "   freight line (same dims) → weight 8146.05 (or 8146),",
+    "   weightType \"total\". Never strip the decimal (814605 is wrong).",
+    "   Keep thousands commas as numbers (\"1,300\" → 1300, not 1).",
+    "6b) Total weight + mixed pallet dims (e.g. \"Total weight – 1,300\",",
+    "   \"Number of Pallets - 4\", \"3 plts @ 48x40x85, 48x40x66\") →",
+    "   TWO freight lines with dims preserved; divide total evenly per",
+    "   pallet: weight 325, weightType \"each\" on EVERY line",
+    "   (1300/4). Do NOT put 1300 on the first line and invent 1 lb",
+    "   on the second. Do NOT put the full total on only one dim group.",
     "7) Zip-only \"from 08701 to 22911\" → shipper.zipCode 08701 and",
     "   consignee.zipCode 22911 even if city/state are blank.",
     "8) \"Please include any additional charges applicable for",
@@ -443,8 +452,11 @@ function quoteExtractSystemPrompt() {
     "- Group table rows by destination city/state/zip into one lane each.",
     "- Sum weight and pallets per lane when table groups freight blocks.",
     "- weightType should be total unless clearly per-piece.",
-    "  If the email says Total weight / \"total weight – N\", weightType",
-    "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
+    "  If the email says Total weight / \"total weight – N\" and there is",
+    "  ONE freight line (same dims for all pallets), weightType MUST be",
+    "  \"total\" even when qty > 1. If there are MULTIPLE dim lines /",
+    "  mixed heights and only a shipment total weight (no per-line lbs),",
+    "  divide total/palletCount per piece and use weightType \"each\".",
     "- Standard GMA pallet footprint is 40 x 48 (length 40, width 48).",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
     "  Non-standard footprints (e.g. 48*45*39) keep the stated L and W",
@@ -691,25 +703,33 @@ function extractCompactPalletBlocks(body) {
       dimType: "PLT",
     }));
   }
+  // Coreforce dim lines: "48*40*50 – 32ctns – 327lbs", optional second
+  // dash ("32ctns 327lbs"), optional "(x2) … 30ctns each – 1020lbs each".
   const cartonPattern = new RegExp(
+      "(?:\\(\\s*x\\s*(\\d+)\\s*\\)\\s*)?" +
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*" +
       "[–\\-—]\\s*(\\d+)\\s*ctns?\\s*" +
-      "[–\\-—]\\s*([\\d.,]+)\\s*(?:lbs|ctns)\\b",
+      "(?:each\\s*)?" +
+      "[–\\-—]?\\s*([\\d.,]+)\\s*(?:lbs|ctns)\\b" +
+      "(?:\\s*each\\b)?",
       "gi");
   let cm;
   while ((cm = cartonPattern.exec(String(body || ""))) !== null) {
-    const key = [cm[1], cm[2], cm[3], cm[5]].join("|");
+    const mult = cm[1] != null ? Number(cm[1]) : 1;
+    const qty = Number.isFinite(mult) && mult >= 1 ? mult : 1;
+    const key = [cm[2], cm[3], cm[4], cm[6], qty].join("|");
     if (seen.has(key)) continue;
     seen.add(key);
-    const weight = Number(String(cm[5]).replace(/,/g, ""));
+    const weight = Number(String(cm[6]).replace(/,/g, ""));
+    const isEach = /\beach\b/i.test(cm[0]);
     freight.push(freightDims.normalizePalletDims({
-      qty: 1,
+      qty,
       weight: Number.isFinite(weight) ? weight : null,
-      weightType: "total",
+      weightType: isEach ? "each" : "total",
       class: null,
-      length: Number(cm[1]),
-      width: Number(cm[2]),
-      height: Number(cm[3]),
+      length: Number(cm[2]),
+      width: Number(cm[3]),
+      height: Number(cm[4]),
       dimType: "PLT",
     }));
   }
@@ -930,6 +950,7 @@ function applyEmailPalletBlocks(extracted, opts) {
 
 /**
  * Parse a labeled integer/float after a heading (colon, dash, em dash).
+ * Strips thousands commas ("1,300" → 1300).
  * @param {string} text Body.
  * @param {RegExp} re Pattern with one capture group.
  * @return {number|null}
@@ -937,7 +958,17 @@ function applyEmailPalletBlocks(extracted, opts) {
 function matchLabeledNumber(text, re) {
   const m = String(text || "").match(re);
   if (!m) return null;
-  const n = Number(m[1]);
+  return parseLooseNumber(m[1]);
+}
+
+/**
+ * Number from a capture that may include thousands commas.
+ * @param {*} raw Raw capture.
+ * @return {number|null}
+ */
+function parseLooseNumber(raw) {
+  if (raw == null || raw === "") return null;
+  const n = Number(String(raw).replace(/,/g, "").trim());
   return Number.isFinite(n) ? n : null;
 }
 
@@ -962,7 +993,17 @@ function parseLabeledFreightTotals(body) {
   }
   if (palletCount == null) {
     const blocks = extractCompactPalletBlocks(text);
-    if (blocks.length) palletCount = blocks.length;
+    if (blocks.length) {
+      palletCount = blocks.reduce((sum, r) =>
+        sum + (Math.max(0, Number(r.qty) || 0)), 0);
+    }
+  }
+  if (palletCount == null) {
+    const mixed = extractMixedQtyAtDimLines(text, null);
+    if (mixed.length) {
+      palletCount = mixed.reduce((sum, r) =>
+        sum + (Math.max(0, Number(r.qty) || 0)), 0);
+    }
   }
   if (palletCount == null) {
     palletCount = parseInformalPalletCount(text);
@@ -974,35 +1015,267 @@ function parseLabeledFreightTotals(body) {
         /\bCTNS?\s*[-–—:=]\s*(\d+)\b/i);
   }
   let weight = matchLabeledNumber(text,
-      /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d.]+)/i);
+      /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d,]+(?:\.\d+)?)/i);
   if (weight == null) {
     weight = matchLabeledNumber(text,
-        /\bWEIGHT\s*[-–—:=]\s*([\d.]+)\b/i);
+        /\bWEIGHT\s*[-–—:=]\s*([\d,]+(?:\.\d+)?)\b/i);
   }
   const dim = text.match(new RegExp(
       "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*([\\d.]+)\\s*[x×*]\\s*" +
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
       "i"));
+  // Prefer single LxWxH only when not a mixed "N plts @ …" line.
+  const dimLine = text.match(
+      /Pallet\s+[Dd]imensions?\s*(?:\([^)]*\))?\s*[-–—:=]\s*([^\n\r]+)/);
+  const dimBlob = dimLine ? dimLine[1] : "";
+  const mixedDims = /\d+\s*plts?\s*@/i.test(dimBlob);
   return {
     cartonCount,
     palletCount,
     weight,
-    length: dim ? Number(dim[1]) : null,
-    width: dim ? Number(dim[2]) : null,
-    height: dim ? Number(dim[3]) : null,
+    length: (!mixedDims && dim) ? Number(dim[1]) : null,
+    width: (!mixedDims && dim) ? Number(dim[2]) : null,
+    height: (!mixedDims && dim) ? Number(dim[3]) : null,
   };
+}
+
+/**
+ * "3 plts @ 48x40x85, 48x40x66" / "3 plts @ 48x40x85, 1 plt @ 48x40x66".
+ * Bare trailing dims get remaining pallet qty when hint is known.
+ * @param {string} body Email body.
+ * @param {number|null} palletCountHint Number of Pallets from labels.
+ * @return {Array<object>}
+ */
+function extractMixedQtyAtDimLines(body, palletCountHint) {
+  const text = String(body || "");
+  const dimLine = text.match(
+      /Pallet\s+[Dd]imensions?\s*(?:\([^)]*\))?\s*[-–—:=]\s*([^\n\r]+)/);
+  const blob = dimLine ? dimLine[1] : text;
+  if (!/\d+\s*(?:plts?|pallets?|skids?)?\s*@\s*[\d.]+/i.test(blob)) {
+    return [];
+  }
+
+  const freight = [];
+  const covered = [];
+  const qtyAtRe = new RegExp(
+      "(\\d+)\\s*(?:plts?|pallets?|skids?)?\\s*@\\s*" +
+      "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
+      "gi");
+  let m;
+  while ((m = qtyAtRe.exec(blob)) !== null) {
+    const qty = Number(m[1]);
+    if (!(qty > 0)) continue;
+    covered.push([m.index, m.index + m[0].length]);
+    freight.push(freightDims.normalizePalletDims({
+      qty,
+      weight: null,
+      weightType: "total",
+      class: null,
+      length: Number(m[2]),
+      width: Number(m[3]),
+      height: Number(m[4]),
+      dimType: "PLT",
+    }));
+  }
+
+  const allDims = /([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/gi;
+  while ((m = allDims.exec(blob)) !== null) {
+    const start = m.index;
+    const end = start + m[0].length;
+    if (covered.some(([a, b]) => start >= a && end <= b)) continue;
+    freight.push(freightDims.normalizePalletDims({
+      qty: 1,
+      weight: null,
+      weightType: "total",
+      class: null,
+      length: Number(m[1]),
+      width: Number(m[2]),
+      height: Number(m[3]),
+      dimType: "PLT",
+    }));
+  }
+
+  if (!freight.length) return [];
+
+  if (palletCountHint != null && palletCountHint > 0) {
+    const sum = freight.reduce((s, r) =>
+      s + (Math.max(0, Number(r.qty) || 0)), 0);
+    if (sum < palletCountHint) {
+      const last = freight[freight.length - 1];
+      last.qty = (Math.max(0, Number(last.qty) || 0)) +
+        (palletCountHint - sum);
+    }
+  }
+  return freight;
+}
+
+/**
+ * Implied shipment pounds for one freight row.
+ * @param {object} row Freight row.
+ * @return {number}
+ */
+function lineImpliedTotalWeight(row) {
+  const w = Number(row && row.weight);
+  if (!(w > 0) || !Number.isFinite(w)) return 0;
+  const qty = Math.max(1, Number(row.qty) || 1);
+  const wt = String(row.weightType || "total").trim().toLowerCase();
+  const isEach = wt === "each" || wt === "perpiece" || wt === "per-piece";
+  return isEach ? w * qty : w;
+}
+
+/**
+ * True when the RFQ already lists distinct per-line lbs (not just a
+ * shipment total).
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function bodyHasExplicitPerLineWeights(body) {
+  const text = String(body || "");
+  if (/plts?\s*@[^.\n]{0,40}\d[\d,]*\s*lbs/i.test(text)) return true;
+  const blocks = extractCompactPalletBlocks(text);
+  if (blocks.length < 2) return false;
+  const labeled = parseLabeledFreightTotals(text);
+  const total = labeled.weight;
+  const withWeight = blocks.filter((b) => Number(b.weight) > 0);
+  if (withWeight.length < 2) return false;
+  if (total == null) return true;
+  return withWeight.some((b) => Math.abs(Number(b.weight) - total) > 0.5);
+}
+
+/**
+ * Even lbs/pallet from a shipment total (Leo: 1300/4 = 325 each).
+ * @param {Array<object>} rows Freight lines.
+ * @param {number} totalWeight Shipment total lbs.
+ * @return {Array<object>}
+ */
+function assignEvenWeightPerPallet(rows, totalWeight) {
+  const list = (Array.isArray(rows) ? rows : []).map((r) =>
+    (r && typeof r === "object" ? {...r} : {}));
+  const qtySum = list.reduce((s, r) =>
+    s + (Math.max(0, Number(r.qty) || 0)), 0);
+  if (!(qtySum > 0) || !(totalWeight > 0)) return list;
+  const exact = totalWeight / qtySum;
+  const per = Number.isInteger(totalWeight) && Number.isInteger(qtySum) &&
+    (totalWeight % qtySum === 0) ?
+    (totalWeight / qtySum) :
+    Math.round(exact * 100) / 100;
+  return list.map((r) => freightDims.normalizePalletDims({
+    ...r,
+    weight: per,
+    weightType: "each",
+  }));
+}
+
+/**
+ * When Total weight + mixed dim lines (no per-line lbs), divide total
+ * evenly per pallet with weightType "each".
+ * @param {Array<object>} rows Freight lines.
+ * @param {string} body Email body.
+ * @param {object} [labeled] parseLabeledFreightTotals result.
+ * @return {boolean}
+ */
+function shouldEvenSplitTotalWeight(rows, body, labeled) {
+  const lab = labeled || parseLabeledFreightTotals(body);
+  if (lab.weight == null || !(lab.weight > 0)) return false;
+  if (!/total\s+weight/i.test(String(body || ""))) return false;
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length < 2) return false;
+  const qtySum = list.reduce((s, r) =>
+    s + (Math.max(0, Number(r.qty) || 0)), 0);
+  if (qtySum < 2) return false;
+  if (lab.palletCount != null && qtySum !== lab.palletCount) return false;
+  if (bodyHasExplicitPerLineWeights(body)) return false;
+
+  const per = lab.weight / qtySum;
+  const allEachOk = list.every((r) => {
+    const wt = String(r.weightType || "").trim().toLowerCase();
+    const isEach = wt === "each" || wt === "perpiece" || wt === "per-piece";
+    return isEach && Math.abs(Number(r.weight) - per) < 1;
+  });
+  if (allEachOk) return false;
+
+  const implied = list.map(lineImpliedTotalWeight);
+  const sum = implied.reduce((a, b) => a + b, 0);
+  const anyHoldsFullTotal = list.some((r) => {
+    const w = Number(r.weight);
+    const qty = Math.max(0, Number(r.qty) || 0);
+    const wt = String(r.weightType || "total").trim().toLowerCase();
+    const isEach = wt === "each" || wt === "perpiece" || wt === "per-piece";
+    return !isEach && Math.abs(w - lab.weight) < 0.5 && qty < qtySum;
+  });
+  if (!anyHoldsFullTotal && Math.abs(sum - lab.weight) < 1 &&
+      implied.every((w) => w > 1)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Replace collapsed AI freight with mixed "N plts @ dims" lines when
+ * the email states them.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyMixedPalletDimLines(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  const labeled = parseLabeledFreightTotals(body);
+  const mixed = extractMixedQtyAtDimLines(body, labeled.palletCount);
+  if (mixed.length < 2) return extracted;
+  const mixedQty = mixed.reduce((s, r) =>
+    s + (Math.max(0, Number(r.qty) || 0)), 0);
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+    const qty = rows.reduce((s, r) =>
+      s + (Math.max(0, Number(r.qty) || 0)), 0);
+    const sameShape = rows.length === mixed.length && qty === mixedQty &&
+      rows.every((r, i) =>
+        Number(r.height) === Number(mixed[i].height) &&
+        Math.max(0, Number(r.qty) || 0) ===
+          Math.max(0, Number(mixed[i].qty) || 0));
+    if (sameShape) continue;
+    if (rows.length >= 2 && qty === mixedQty) continue;
+    lane.freightInfo = mixed.map((row) => ({...row}));
+  }
+  return extracted;
+}
+
+/**
+ * Deterministic: Total weight + mixed PLT lines → even lbs each.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function redistributeEvenTotalWeight(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  const labeled = parseLabeledFreightTotals(body);
+  if (labeled.weight == null || !(labeled.weight > 0)) return extracted;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+    if (!shouldEvenSplitTotalWeight(rows, body, labeled)) continue;
+    lane.freightInfo = assignEvenWeightPerPallet(rows, labeled.weight);
+  }
+  return extracted;
 }
 
 /**
  * Fill missing weight/dims on a freight row from labeled totals.
  * @param {object} row Freight row.
  * @param {object} labeled Parsed labeled totals.
+ * @param {object} [opts] skipWeight — do not copy shipment total onto row.
  * @return {object}
  */
-function fillLabeledFreightFields(row, labeled) {
+function fillLabeledFreightFields(row, labeled, opts) {
   const next = row && typeof row === "object" ? {...row} : {};
   const lab = labeled || {};
-  if (next.weight == null && lab.weight != null) next.weight = lab.weight;
+  const skipWeight = opts && opts.skipWeight;
+  if (!skipWeight && next.weight == null && lab.weight != null) {
+    next.weight = lab.weight;
+  }
   if (next.length == null && lab.length != null) next.length = lab.length;
   if (next.width == null && lab.width != null) next.width = lab.width;
   if (next.height == null && lab.height != null) next.height = lab.height;
@@ -1071,9 +1344,16 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
     return [freightDims.normalizePalletDims(row)];
   }
 
+  // Multi-line: fill dims only — never dump shipment total onto every row.
+  // redistributeEvenTotalWeight assigns even per-pallet lbs afterward.
   return rows.map((r) => {
-    const filled = fillLabeledFreightFields(r, lab);
-    if (lab.weight != null) filled.weightType = "total";
+    const filled = fillLabeledFreightFields(r, lab, {skipWeight: true});
+    if (lab.weight != null && rows.length >= 2) {
+      // leave weightType for redistribute; keep existing if present
+      if (filled.weightType == null) filled.weightType = "total";
+    } else if (lab.weight != null) {
+      filled.weightType = "total";
+    }
     return freightDims.normalizePalletDims(filled);
   });
 }
@@ -2193,11 +2473,15 @@ module.exports = {
   applyLabeledFreightTotals,
   correctCartonVsPalletFreight,
   extractCompactPalletBlocks,
+  extractMixedQtyAtDimLines,
   extractPalletFreight,
   extractInformalPalletFreight,
   extractNumberedShipmentSections,
   applyNumberedShipmentPalletBlocks,
   applyEmailPalletBlocks,
+  applyMixedPalletDimLines,
+  redistributeEvenTotalWeight,
+  assignEvenWeightPerPallet,
   parseInformalPalletCount,
   heuristicExtractQuote,
   heuristicPickUpAt,

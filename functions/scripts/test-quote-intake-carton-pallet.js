@@ -517,6 +517,201 @@ intake.applyEmailPalletBlocks(bleed, {body: D6062_BODY});
 check("D6062 applyEmailPalletBlocks no 139 inflate",
     bleed.lanes[0].freightInfo[0].qty, 1);
 
+// Q#I1083 family: Lifeworks/BJ's — Shipment 1 drops 327lb when the
+// second dash is missing; Shipment 2 drops "(x2) … each" dim lines.
+const I1083_BODY = [
+  "Shipment 1:",
+  "",
+  "BJS WHOLESALES CLUB 0800",
+  "869 QUAKER HWY",
+  "UXBRIDGE MA 015692252 US",
+  "",
+  "PO# 117803919//PT# 2356497",
+  "158ctns – 5pallets",
+  "48*41*59 – 37ctns – 366lbs (charging cables)",
+  "48*40*52 – 28ctns – 207lbs (charging cables)",
+  "48*40*53 – 28ctns – 955lbs (canned air)",
+  "48*40*50 – 32ctns 327lbs (charging cables)",
+  "48*40*59 – 33ctns – 629lbs (charging cables & canned air)",
+  "2484lbs",
+  "",
+  "Shipment 2:",
+  "",
+  "BJS WHOLESALES CLUB 0820",
+  "309 DULTY'S LANE",
+  "BURLINGTON NJ 08016 US",
+  "",
+  "PO# 117803228 //PT# 2356495",
+  "163ctns – 6pallets",
+  "(x2) 48*40*54 – 30ctns each – 1020lbs each ( canned air )",
+  "48*40*39 – 21ctns – 419lbs (charging cables & canned air )",
+  "48*40*52 – 33ctns – 286lbs (charging cables)",
+  "48*40*39 – 24ctns – 247lbs (charging cables)",
+  "48*40*42 – 25ctns – 265lbs (charging cables)",
+  "3257lbs",
+  "",
+  "Shipment 3:",
+  "",
+  "BJS WHOLESALES CLUB 0840",
+  "4500 DIRECTORS RD",
+  "JACKSONVILLE FL 322202864 US",
+  "",
+  "PO# 117803499//PT# 2356496",
+  "137ctns – 5pallets",
+  "48*40*40 – 26ctns – 263lbs (charging cables)",
+  "48*41*39 – 25ctns – 268lbs (charging cables)",
+  "48*40*41 – 24ctns – 184lbs (charging cables)",
+  "48*40*53 – 29ctns – 988lbs ( canned air )",
+  "48*40*59 – 33ctns – 667lbs (charging cables & canned air )",
+  "2370lbs",
+].join("\n");
+
+const i1083Sections = intake.extractNumberedShipmentSections(I1083_BODY);
+check("I1083 three shipment sections", i1083Sections.length, 3);
+check("I1083 ship1 includes 327lbs (no 2nd dash)",
+    i1083Sections[0].blocks.map((r) => r.weight),
+    [366, 207, 955, 327, 629]);
+check("I1083 ship1 pallet qty 5",
+    i1083Sections[0].blocks.reduce((s, r) => s + (Number(r.qty) || 0), 0),
+    5);
+check("I1083 ship2 (x2) 1020lbs each",
+    i1083Sections[1].blocks.map((r) => ({
+      qty: r.qty, weight: r.weight, weightType: r.weightType,
+    })),
+    [
+      {qty: 2, weight: 1020, weightType: "each"},
+      {qty: 1, weight: 419, weightType: "total"},
+      {qty: 1, weight: 286, weightType: "total"},
+      {qty: 1, weight: 247, weightType: "total"},
+      {qty: 1, weight: 265, weightType: "total"},
+    ]);
+check("I1083 ship2 pallet qty 6",
+    i1083Sections[1].blocks.reduce((s, r) => s + (Number(r.qty) || 0), 0),
+    6);
+check("I1083 ship3 pallet qty 5",
+    i1083Sections[2].blocks.reduce((s, r) => s + (Number(r.qty) || 0), 0),
+    5);
+
+const i1083Split = {
+  lanes: [
+    {
+      laneKey: "BJS_UXBRIDGE_MA",
+      consignee: {city: "UXBRIDGE", state: "MA", zipCode: "01569"},
+      freightInfo: [{qty: 1, weight: 366, dimType: "PLT"}],
+    },
+    {
+      laneKey: "BJS_BURLINGTON_NJ",
+      consignee: {city: "BURLINGTON", state: "NJ", zipCode: "08016"},
+      freightInfo: [{qty: 1, weight: 419, dimType: "PLT"}],
+    },
+    {
+      laneKey: "BJS_JACKSONVILLE_FL",
+      consignee: {city: "JACKSONVILLE", state: "FL", zipCode: "32220"},
+      freightInfo: [{qty: 1, weight: 263, dimType: "PLT"}],
+    },
+  ],
+};
+intake.applyEmailPalletBlocks(i1083Split, {body: I1083_BODY});
+check("I1083 applyEmail Uxbridge 5 PLT",
+    i1083Split.lanes[0].freightInfo
+        .reduce((s, r) => s + (Number(r.qty) || 0), 0),
+    5);
+check("I1083 applyEmail Burlington 6 PLT",
+    i1083Split.lanes[1].freightInfo
+        .reduce((s, r) => s + (Number(r.qty) || 0), 0),
+    6);
+check("I1083 applyEmail Jacksonville 5 PLT",
+    i1083Split.lanes[2].freightInfo
+        .reduce((s, r) => s + (Number(r.qty) || 0), 0),
+    5);
+check("I1083 Uxbridge includes 327",
+    i1083Split.lanes[0].freightInfo.map((r) => r.weight).includes(327),
+    true);
+
+// Leo: Total weight + mixed dims → even lbs/pallet (not dump total on
+// line 1 and invent 1 lb on line 2). Screenshot: 3@1300 total + 1@1.
+const LEO_MIXED_BODY = [
+  "Total Cartons – 166",
+  "Total weight – 1,300 with pallets",
+  "Number of Pallets - 4",
+  "Pallet dimensions (L *W *H) – 3 plts @ 48x40x85, 48x40x66",
+].join("\n");
+
+const leoLabeled = intake.parseLabeledFreightTotals(LEO_MIXED_BODY);
+check("Leo labeled weight 1300 not 1", leoLabeled.weight, 1300);
+check("Leo labeled palletCount 4", leoLabeled.palletCount, 4);
+check("Leo labeled no single dim (mixed)", leoLabeled.length, null);
+
+const leoMixed = intake.extractMixedQtyAtDimLines(
+    LEO_MIXED_BODY, leoLabeled.palletCount);
+check("Leo mixed lines qty", leoMixed.map((r) => r.qty), [3, 1]);
+check("Leo mixed heights", leoMixed.map((r) => r.height), [85, 66]);
+check("Leo mixed GMA 40x48", [
+  leoMixed[0].length, leoMixed[0].width,
+  leoMixed[1].length, leoMixed[1].width,
+], [40, 48, 40, 48]);
+
+const leoAiWrong = {
+  lanes: [{
+    laneKey: "DEST",
+    freightInfo: [
+      {
+        qty: 3, weight: 1300, weightType: "total",
+        length: 40, width: 48, height: 85, dimType: "PLT",
+      },
+      {
+        qty: 1, weight: 1, weightType: "total",
+        length: 40, width: 48, height: 66, dimType: "PLT",
+      },
+    ],
+  }],
+};
+intake.normalizeExtractedQuote(leoAiWrong, {body: LEO_MIXED_BODY});
+const leoRows = leoAiWrong.lanes[0].freightInfo;
+check("Leo fix qty 3+1", leoRows.map((r) => r.qty), [3, 1]);
+check("Leo fix weight 325 each", leoRows.map((r) => r.weight), [325, 325]);
+check("Leo fix weightType each",
+    leoRows.map((r) => r.weightType), ["each", "each"]);
+check("Leo fix heights preserved",
+    leoRows.map((r) => r.height), [85, 66]);
+
+const leoCollapsed = {
+  lanes: [{
+    laneKey: "DEST",
+    freightInfo: [{
+      qty: 4, weight: 1300, weightType: "total",
+      length: 40, width: 48, height: 85, dimType: "PLT",
+    }],
+  }],
+};
+intake.normalizeExtractedQuote(leoCollapsed, {body: LEO_MIXED_BODY});
+const leoSplit = leoCollapsed.lanes[0].freightInfo;
+check("Leo collapsed → 2 dim lines", leoSplit.length, 2);
+check("Leo collapsed qty 3+1", leoSplit.map((r) => r.qty), [3, 1]);
+check("Leo collapsed 325 each",
+    leoSplit.map((r) => r.weight), [325, 325]);
+check("Leo collapsed weightType each",
+    leoSplit.map((r) => r.weightType), ["each", "each"]);
+
+// Per-line lbs already present → do not overwrite with even split.
+const coreforceKeep = {
+  lanes: [{
+    freightInfo: [
+      {qty: 2, weight: 1020, weightType: "each", dimType: "PLT",
+        length: 40, width: 48, height: 54},
+      {qty: 1, weight: 419, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 39},
+    ],
+  }],
+};
+intake.redistributeEvenTotalWeight(coreforceKeep,
+    "Total weight – 2459\n" +
+    "(x2) 48*40*54 – 30ctns each – 1020lbs each\n" +
+    "48*40*39 – 21ctns – 419lbs\n");
+check("explicit per-line lbs kept",
+    coreforceKeep.lanes[0].freightInfo.map((r) => r.weight),
+    [1020, 419]);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
