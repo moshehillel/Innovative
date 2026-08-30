@@ -288,6 +288,59 @@ checkNotHas("AI LFD stripped when email says no liftgate",
 check("persisted declined LFD",
     (declinedLift.customerDeclinedAccessorials || []).includes("LFD"), true);
 
+// --- NTD: bare "notify" in signatures must not add notification ---
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "If you have received this message in error, please notify " +
+    "the sender immediately by telephone or by electronic mail.");
+checkNotHas("EDI confidentiality notify does not add NTD", codes, "NTD");
+check("confidentiality is not notification request",
+    emailAcc.isNotificationDeliveryRequest(
+        "please notify the sender immediately"), false);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please quote. Lift Gate Delivery.");
+checkNotHas("liftgate alone does not add NTD", codes, "NTD");
+checkHas("liftgate alone still adds LFD", codes, "LFD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Notification delivery required.");
+checkHas("notification delivery → NTD", codes, "NTD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Please notify before delivery.");
+checkHas("notify before delivery → NTD", codes, "NTD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Notify the consignee prior to arrival.");
+checkHas("notify consignee → NTD", codes, "NTD");
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "Call ahead for delivery.");
+checkHas("call ahead → NTD", codes, "NTD");
+
+const ntdAiStripped = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "Lift Gate Delivery",
+  customerRequest: {requestedAccessorials: ["NTD", "LFD"]},
+  lanes: [],
+}, {
+  subject: "RE: 2 rates needed",
+  body: "Please quote 1 skid. CONFIDENTIALITY NOTICE: If you have " +
+    "received this message in error, please notify the sender " +
+    "immediately by telephone or by electronic mail.",
+});
+checkNotHas("AI NTD stripped for confidentiality notify",
+    ntdAiStripped.customerRequest.requestedAccessorials, "NTD");
+checkHas("AI LFD kept when liftgate + confidentiality notify",
+    ntdAiStripped.customerRequest.requestedAccessorials, "LFD");
+
+const ntdAiKept = emailAcc.attachRequestedAccessorials({
+  specialInstructionsGlobal: "notify before delivery",
+  customerRequest: {requestedAccessorials: ["NTD"]},
+  lanes: [],
+}, {subject: "RFQ", body: "Please notify before delivery."});
+checkHas("AI NTD kept for clear delivery notify",
+    ntdAiKept.customerRequest.requestedAccessorials, "NTD");
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

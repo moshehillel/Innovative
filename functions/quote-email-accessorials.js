@@ -108,8 +108,31 @@ const SINGLE_PATTERNS = [
   // rule applies LAD. Explicit "hotel delivery" → LAD via pattern below.
   {code: "LAD", re: /\b(?:hotel|casino|resort)\s+delivery\b/i},
   {code: "SCD", re: /\bschool(\s+delivery)?\b/i},
-  {code: "NTD", re: /\bnotif(y|ication)(\s+(before\s+)?delivery)?\b/i},
+  // NTD only via isNotificationDeliveryRequest (not bare "notify").
 ];
+
+/**
+ * Clear request for notification / call-ahead delivery (NTD).
+ * Bare "notify" / "notification" alone are NOT enough — EDI and
+ * legal signatures often say "please notify the sender".
+ * @param {string} text Email / instruction text.
+ * @return {boolean}
+ */
+function isNotificationDeliveryRequest(text) {
+  const t = String(text || "");
+  if (!t.trim()) return false;
+  return (
+    // eslint-disable-next-line max-len
+    /\bnotif(?:y|ication)\s+(?:before\s+)?delivery\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:before\s+)?delivery\s+notif(?:y|ication)\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\bnotify\s+(?:the\s+)?(?:consignee|receiver)\b/i.test(t) ||
+    // eslint-disable-next-line max-len
+    /\b(?:call|phone)[\s-]*ahead(?:\s+(?:before\s+)?delivery)?\b/i.test(t) ||
+    /\bnotification\s+delivery\b/i.test(t)
+  );
+}
 
 /**
  * Clear request to apply limited/restricted access (LAD/LAO).
@@ -300,6 +323,11 @@ function extractRequestedAccessorialsFromText(text) {
       !declined.has("LAD") && !codes.includes("LAD")) {
     codes.push("LAD");
   }
+  // Notification delivery — never from bare "notify" in signatures.
+  if (isNotificationDeliveryRequest(blob) && !declined.has("NTD") &&
+      !codes.includes("NTD")) {
+    codes.push("NTD");
+  }
   return uniqueCodes(codes).filter((c) => isKnownCode(c, known) &&
     !declined.has(c));
 }
@@ -429,6 +457,11 @@ function resolveRequestedAccessorials(extracted, opts = {}) {
   if (discloseOnly) {
     codes = codes.filter((c) => c !== "LAD" && c !== "LAO");
   }
+  // Strip AI NTD when email only has boilerplate "notify the sender"
+  // (no clear delivery-notification / call-ahead request).
+  if (!isNotificationDeliveryRequest(scanText)) {
+    codes = codes.filter((c) => c !== "NTD");
+  }
   return normalizeHotelCasinoAccessorials(
       codes.filter((c) => !ban.has(c)));
 }
@@ -533,6 +566,7 @@ module.exports = {
   isLimitedAccessClearRequest,
   isLimitedAccessDiscloseBoilerplate,
   isLimitedAccessDiscloseOnly,
+  isNotificationDeliveryRequest,
   extractRequestedAccessorialsFromText,
   normalizeRequestedCodeList,
   resolveRequestedAccessorials,
