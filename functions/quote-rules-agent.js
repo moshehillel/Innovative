@@ -896,6 +896,9 @@ async function runQuoteRulesAgentTurn(opts) {
     const completion = await client.chat.completions.create({
       model,
       max_completion_tokens: 1600,
+      // gpt-5.6-luna rejects function tools on chat.completions unless
+      // reasoning is disabled (or we use /v1/responses).
+      reasoning_effort: "none",
       messages,
       tools: getToolDefinitions(),
       tool_choice: "auto",
