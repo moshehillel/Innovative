@@ -8,6 +8,7 @@ const fs = require("fs");
 const path = require("path");
 const quoteRules = require("./quote-accessorial-rules");
 const quoteRulesChat = require("./quote-rules-chat");
+const quoteRulesAgent = require("./quote-rules-agent");
 const quoteAutomation = require("./quote-automation");
 const addressEnrichment = require("./quote-address-enrichment");
 const quoteOutput = require("./quote-output");
@@ -318,7 +319,7 @@ async function handleQuoteRulesChat(req, res) {
     const allRules = await quoteRules.listAllRules(tenant);
     // Chat only sees live rules — inactive / tombstoned-away defaults stay out.
     const existingRules = allRules.filter((r) => r.active !== false);
-    const result = await quoteRulesChat.runQuoteRulesChatTurn({
+    const chatOpts = {
       messages: chatTurns,
       history: chatTurns,
       existingRules,
@@ -330,7 +331,12 @@ async function handleQuoteRulesChat(req, res) {
       referencedRuleId: body.referencedRuleId ||
         (body.lastAppliedRule && body.lastAppliedRule.ruleId) ||
         (body.lastProposedRule && body.lastProposedRule.ruleId) || null,
-    });
+      agentState: body.agentState || null,
+    };
+    // Tool agent by default (QUOTE_RULES_CHAT_AGENT=0 falls back to legacy).
+    const result = quoteRulesAgent.isRulesChatAgentEnabled() ?
+      await quoteRulesAgent.runQuoteRulesAgentTurn(chatOpts) :
+      await quoteRulesChat.runQuoteRulesChatTurn(chatOpts);
     // Backfill name/match on update proposals so Confirm never fails
     // with "Proposal needs name or match criteria".
     if (result && result.action === "propose_update_rule" &&

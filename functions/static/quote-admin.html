@@ -581,6 +581,7 @@
     let pendingProposal = null;
     let lastAppliedRule = null;
     let lastProposedRule = null;
+    let agentState = null;
     const CHAT_STATE_KEY = "quoteAdminChat:" + TENANT_ID;
 
     function isInternalChatMarker(text) {
@@ -594,8 +595,29 @@
           chatMessages,
           lastAppliedRule,
           lastProposedRule,
+          agentState,
         }));
       } catch (e) { /* quota / private mode */ }
+    }
+
+    function hasAgentContext() {
+      if (!agentState || typeof agentState !== "object") return false;
+      return !!(agentState.goal || agentState.awaiting || agentState.draft ||
+        agentState.intentSummary || agentState.openQuestion ||
+        agentState.focusRuleId);
+    }
+
+    function clearAgentDraftMemory() {
+      if (!agentState || typeof agentState !== "object") {
+        agentState = null;
+        return;
+      }
+      agentState = {
+        ...agentState,
+        draft: null,
+        awaiting: null,
+        openQuestion: null,
+      };
     }
 
     function renderChatLogFromState() {
@@ -617,6 +639,7 @@
         chatMessages = st.chatMessages;
         lastAppliedRule = st.lastAppliedRule || null;
         lastProposedRule = st.lastProposedRule || null;
+        agentState = st.agentState || null;
         renderChatLogFromState();
       } catch (e) { /* ignore corrupt storage */ }
     }
@@ -1356,6 +1379,7 @@
         lastProposedRule,
         referencedRuleId,
         lastAppliedRuleId: lastAppliedRule && lastAppliedRule.ruleId,
+        agentState,
       };
     }
 
@@ -1424,6 +1448,18 @@
         }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
+        clearAgentDraftMemory();
+        if (lastAppliedRule && lastAppliedRule.ruleId) {
+          agentState = {
+            ...(agentState || {}),
+            focusRuleId: lastAppliedRule.ruleId,
+            goal: null,
+            draft: null,
+            awaiting: null,
+            openQuestion: null,
+            intentSummary: null,
+          };
+        }
         saveChatState();
         await loadRules();
       } catch (e) {
@@ -1468,6 +1504,7 @@
           appendChat("user", text);
           document.getElementById("proposal-box").classList.add("hidden");
           pendingProposal = null;
+          clearAgentDraftMemory();
           const msg = "Oh sorry — I'll drop that proposal. What should the rule do instead?";
           chatMessages.push({ role: "assistant", content: msg });
           appendChat("assistant", msg);
@@ -1476,10 +1513,13 @@
         }
         document.getElementById("proposal-box").classList.add("hidden");
         pendingProposal = null;
+        clearAgentDraftMemory();
         saveChatState();
         // Fall through — send correction to the assistant to rework.
       }
-      if (!pendingProposal && isNaturalConfirm(text, false)) {
+      // Only short-circuit bare "yes" when there is truly nothing in flight —
+      // including agent working memory (clarify / draft / goal).
+      if (!pendingProposal && !hasAgentContext() && isNaturalConfirm(text, false)) {
         input.value = "";
         clearQuickReplies();
         chatMessages.push({ role: "user", content: text });
@@ -1504,13 +1544,18 @@
         });
         showChatThinking(false);
         res = normalizeChatProposal(res) || res;
+        if (res.agentState && typeof res.agentState === "object") {
+          agentState = res.agentState;
+        }
         if (res.action === "dismiss_pending") {
           document.getElementById("proposal-box").classList.add("hidden");
           pendingProposal = null;
+          clearAgentDraftMemory();
         }
         if (res.dismissedCorrection) {
           document.getElementById("proposal-box").classList.add("hidden");
           pendingProposal = null;
+          clearAgentDraftMemory();
         }
         if (res.reply) {
           chatMessages.push({ role: "assistant", content: res.reply });
@@ -1609,6 +1654,7 @@
       document.getElementById("proposal-box").classList.add("hidden");
       pendingProposal = null;
       lastProposedRule = null;
+      clearAgentDraftMemory();
       clearQuickReplies();
       saveChatState();
     });

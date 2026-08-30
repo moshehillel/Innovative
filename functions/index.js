@@ -15145,8 +15145,11 @@ exports.applyQuoteRule = onRequest({invoker: "public"},
     quoteDashboard.handleApplyQuoteRule);
 exports.testQuoteRules = onRequest({invoker: "public"},
     quoteDashboard.handleTestQuoteRules);
-exports.quoteRulesChat = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteRulesChat);
+exports.quoteRulesChat = onRequest({
+  invoker: "public",
+  timeoutSeconds: 120,
+  memory: "512MiB",
+}, quoteDashboard.handleQuoteRulesChat);
 exports.getQuoteAdminConfig = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteAdminConfig);
 exports.getQuoteRequests = onRequest({invoker: "public"},
