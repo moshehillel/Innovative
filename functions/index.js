@@ -15171,6 +15171,13 @@ exports.approveQuoteEmail = onRequest({invoker: "public"},
     quoteDashboard.handleApproveQuoteEmail);
 exports.dismissQuote = onRequest({invoker: "public"},
     quoteDashboard.handleDismissQuote);
+exports.markQuoteForReview = onRequest({invoker: "public"},
+    quoteDashboard.handleMarkQuoteForReview);
+exports.exportQuoteDispatcherReport = onRequest({
+  invoker: "public",
+  timeoutSeconds: 120,
+  memory: "512MiB",
+}, quoteDashboard.handleExportQuoteDispatcherReport);
 exports.rerunQuoteRates = onRequest({
   invoker: "public",
   timeoutSeconds: 540,

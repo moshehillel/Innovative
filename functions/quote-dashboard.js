@@ -710,6 +710,136 @@ async function handleDismissQuote(req, res) {
 }
 
 /**
+ * POST mark / unmark quote for review (stays on main list).
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleMarkQuoteForReview(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST"});
+  }
+  try {
+    let body = req.body || {};
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body || "{}");
+      } catch (_) {
+        body = {};
+      }
+    }
+    const quoteId = body.quoteId || body.id ||
+      (req.query && (req.query.quoteId || req.query.id));
+    if (!quoteId) {
+      return res.status(400).json({ok: false, error: "quoteId required"});
+    }
+    const auth = await authorizeQuoteAccess(req, String(quoteId));
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({
+        ok: false,
+        error: auth.error,
+      });
+    }
+    const forReview = body.forReview != null ? body.forReview :
+      (req.query && req.query.forReview != null ? req.query.forReview : true);
+    const result = await quoteAutomation.setQuoteForReview(
+        auth.tenant, String(quoteId), {
+          forReview,
+          markedBy: (auth.dispatcher && auth.dispatcher.email) ||
+            auth.email || auth.dispatcherId,
+        });
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ok: false, error: err.message});
+  }
+}
+
+/**
+ * Escape one CSV cell.
+ * @param {*} value Cell value.
+ * @return {string}
+ */
+function csvEscapeCell(value) {
+  const s = value == null ? "" : String(value);
+  if (/[",\r\n]/.test(s)) {
+    return `"${s.replace(/"/g, "\"\"")}"`;
+  }
+  return s;
+}
+
+/**
+ * Build CSV for dispatcher quote report.
+ * @param {Array<object>} rows Report rows.
+ * @return {string}
+ */
+function buildQuoteReportCsv(rows) {
+  const header = [
+    "date", "customer", "from", "subject", "status",
+    "carrier_price", "primus_quote_number", "dispatcher",
+    "for_review", "batch_quote_id", "created_at", "sent_at",
+  ];
+  const lines = [header.join(",")];
+  for (const row of rows || []) {
+    lines.push([
+      csvEscapeCell(row.date),
+      csvEscapeCell(row.customer),
+      csvEscapeCell(row.from),
+      csvEscapeCell(row.subject),
+      csvEscapeCell(row.status),
+      csvEscapeCell(row.carrierPrice),
+      csvEscapeCell(row.primusQuoteNumber),
+      csvEscapeCell(row.dispatcher),
+      csvEscapeCell(row.forReview),
+      csvEscapeCell(row.batchQuoteId),
+      csvEscapeCell(row.createdAt),
+      csvEscapeCell(row.sentAt),
+    ].join(","));
+  }
+  return lines.join("\r\n");
+}
+
+/**
+ * GET CSV report of draft_ready / sent quotes for the signed-in dispatcher.
+ * Query: fromDate, toDate (YYYY-MM-DD), status=draft_ready,sent
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleExportQuoteDispatcherReport(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const user = await resolveDashboardUser(req);
+    if (!user.ok) {
+      return res.status(user.status || 401).json({
+        ok: false,
+        error: user.error,
+      });
+    }
+    const fromDate = req.query.fromDate || req.query.from || "";
+    const toDate = req.query.toDate || req.query.to || "";
+    const status = req.query.status || "draft_ready,sent";
+    const listed = await quoteAutomation.listQuotesForDispatcherReport(
+        user.tenant, user.dispatcher, {
+          fromDate: fromDate || undefined,
+          toDate: toDate || undefined,
+          status,
+          limit: Number(req.query.limit) || 500,
+        });
+    const csv = buildQuoteReportCsv(listed.rows || []);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const filename = `quote-report-${stamp}.csv`;
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Content-Disposition", `attachment; filename="${filename}"`);
+    res.set("Access-Control-Expose-Headers", "Content-Disposition");
+    return res.status(200).send(`\uFEFF${csv}`);
+  } catch (err) {
+    console.error("exportQuoteDispatcherReport:", err);
+    return res.status(500).json({ok: false, error: err.message});
+  }
+}
+
+/**
  * POST re-rate quote with optional accessorial overrides.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -862,6 +992,8 @@ async function handleGetQuoteDispatcherInbox(req, res) {
       pending: 0,
       awaiting: 0,
       draftReady: 0,
+      sent: 0,
+      forReview: 0,
       dismissed: 0,
     };
     const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
@@ -1293,6 +1425,8 @@ module.exports = {
   handleGenerateQuoteEmail,
   handleApproveQuoteEmail,
   handleDismissQuote,
+  handleMarkQuoteForReview,
+  handleExportQuoteDispatcherReport,
   handleRerunQuoteRates,
   handleGetQuoteAccessorialCatalog,
   handleGetQuoteDispatcherProfile,

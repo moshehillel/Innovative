@@ -598,6 +598,9 @@ function serializeForDispatcherPage(quote) {
     readyDate: quote.readyDate || null,
     specialInstructionsGlobal: quote.specialInstructionsGlobal || "",
     status: quote.status,
+    forReview: quote.forReview === true || quote.forReview === "true" ||
+      quote.forReview === 1,
+    forReviewAt: quote.forReviewAt || null,
     shipper: quoteShipper,
     originSiteType: quote.originSiteType ||
       (quote.lanes && quote.lanes[0] && quote.lanes[0].originSiteType) ||

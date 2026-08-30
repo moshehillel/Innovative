@@ -1209,7 +1209,17 @@ function isPendingQuote(row) {
 
 /**
  * @param {object} row Quote doc.
- * @param {string} [statusFilter] pending | dismissed | exact status.
+ * @return {boolean}
+ */
+function isForReviewQuote(row) {
+  if (!row || isDismissedQuote(row)) return false;
+  return row.forReview === true || row.forReview === "true" ||
+    row.forReview === 1;
+}
+
+/**
+ * @param {object} row Quote doc.
+ * @param {string} [statusFilter] pending | dismissed | for_review | exact.
  * @return {boolean}
  */
 function matchesInboxStatus(row, statusFilter) {
@@ -1217,6 +1227,9 @@ function matchesInboxStatus(row, statusFilter) {
   if (!want) return !isDismissedQuote(row);
   if (want === "dismissed") return isDismissedQuote(row);
   if (want === "pending") return isPendingQuote(row);
+  if (want === "for_review" || want === "review") {
+    return isForReviewQuote(row);
+  }
   if (isDismissedQuote(row)) return false;
   return normalizeQuoteStatus(row.status) === want;
 }
@@ -1233,10 +1246,13 @@ function serializeInboxQuote(doc, data) {
     subject: data.subject,
     from: data.from,
     status: data.status,
+    forReview: isForReviewQuote(data),
+    forReviewAt: data.forReviewAt || null,
     dismissedAt: data.dismissedAt || null,
     laneCount: (data.lanes || []).length,
     createdAt: data.createdAt,
     assignedDispatcherEmail: data.assignedDispatcherEmail,
+    assignedDispatcherName: data.assignedDispatcherName || null,
     receivedMailboxEmail: data.receivedMailboxEmail,
     dispatcherQuoteUrl: data.dispatcherQuoteUrl,
     shippingLocationId: data.shippingLocationId || null,
@@ -1300,13 +1316,16 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
       dispatcher.email || "");
   const snap = await col(tenant, "quoteRequests")
       .where("assignedDispatcherId", "==", dispatcherId)
-      .select("status", "dismissedAt", "assignedDispatcherEmail")
+      .select(
+          "status", "dismissedAt", "assignedDispatcherEmail", "forReview")
       .get();
   const counts = {
     total: 0,
     pending: 0,
     awaiting: 0,
     draftReady: 0,
+    sent: 0,
+    forReview: 0,
     dismissed: 0,
   };
   for (const doc of snap.docs) {
@@ -1319,6 +1338,7 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
       counts.dismissed += 1;
       continue;
     }
+    if (isForReviewQuote(data)) counts.forReview += 1;
     const status = normalizeQuoteStatus(data.status);
     if (status === "awaiting_dispatcher") {
       counts.awaiting += 1;
@@ -1326,6 +1346,8 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
     } else if (status === "draft_ready") {
       counts.draftReady += 1;
       counts.pending += 1;
+    } else if (status === "sent") {
+      counts.sent += 1;
     }
   }
   return counts;
@@ -1508,6 +1530,185 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
       status: "draft_ready",
     }),
   };
+}
+
+/**
+ * Marks or clears the "for review" archive tag. Does not change status —
+ * quote stays in the main inbox list.
+ * @param {object} tenant Tenant.
+ * @param {string} quoteId Quote id.
+ * @param {object} [opts] forReview (bool), markedBy.
+ * @return {Promise<object>}
+ */
+async function setQuoteForReview(tenant, quoteId, opts = {}) {
+  const ref = col(tenant, "quoteRequests").doc(quoteId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Quote not found");
+  const data = snap.data();
+  if (isDismissedQuote(data)) {
+    throw new Error("Quote was dismissed");
+  }
+  const want = opts.forReview === false || opts.forReview === "false" ||
+    opts.forReview === 0 || opts.forReview === "0" ?
+    false : opts.forReview != null ? !!opts.forReview : true;
+  const patch = {
+    forReview: want,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (want) {
+    patch.forReviewAt = admin.firestore.FieldValue.serverTimestamp();
+    patch.forReviewBy = opts.markedBy || null;
+  } else {
+    patch.forReviewAt = null;
+    patch.forReviewBy = null;
+  }
+  await ref.update(patch);
+  return {ok: true, forReview: want, status: data.status || null};
+}
+
+/**
+ * @param {*} ts Firestore Timestamp | Date | string | number.
+ * @return {Date|null}
+ */
+function coerceDate(ts) {
+  if (!ts) return null;
+  if (typeof ts.toDate === "function") {
+    try {
+      return ts.toDate();
+    } catch (_) {
+      return null;
+    }
+  }
+  const d = ts instanceof Date ? ts : new Date(ts);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+/**
+ * @param {*} ts Timestamp-like.
+ * @return {string} YYYY-MM-DD or "".
+ */
+function formatReportDate(ts) {
+  const d = coerceDate(ts);
+  if (!d) return "";
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Pulls selected carrier / price / Primus quote # for CSV export.
+ * @param {object} data Quote fields.
+ * @return {{carriers: string, quoteNumbers: string}}
+ */
+function selectedCarrierReportFields(data) {
+  const carriers = [];
+  const quoteNumbers = [];
+  const pushOpt = (o) => {
+    if (!o || typeof o !== "object") return;
+    const name = o.name || o.SCAC || "Carrier";
+    const price = quoteOutput.effectiveCustomerRate(o);
+    const priceBit = price != null && isFinite(Number(price)) ?
+      `$${Number(price).toFixed(0)}` : "";
+    carriers.push(priceBit ? `${name} ${priceBit}` : name);
+    const q = o.quoteNumber || o.savedQuoteNumber || "";
+    if (q) quoteNumbers.push(String(q));
+  };
+  const snapshot = data.selectedOptionsSnapshot;
+  if (Array.isArray(snapshot) && snapshot.length) {
+    for (const lane of snapshot) {
+      const opts = (lane && lane.options) || [];
+      opts.forEach(pushOpt);
+    }
+  } else {
+    for (const lane of (data.lanes || [])) {
+      let opts = [];
+      if (Array.isArray(lane.selectedOptions) && lane.selectedOptions.length) {
+        opts = lane.selectedOptions;
+      } else if (lane.selectedOption) {
+        opts = [lane.selectedOption];
+      } else if (Array.isArray(lane.selectedRateIds) &&
+          lane.selectedRateIds.length && Array.isArray(lane.options)) {
+        const want = new Set(lane.selectedRateIds.map(String));
+        opts = lane.options.filter((o) =>
+          want.has(String(quoteOutput.optionRateId(o))));
+      }
+      opts.forEach(pushOpt);
+    }
+  }
+  return {
+    carriers: carriers.join("; "),
+    quoteNumbers: [...new Set(quoteNumbers)].join("; "),
+  };
+}
+
+/**
+ * Lists draft_ready / sent quotes for CSV report pull.
+ * @param {object} tenant Tenant.
+ * @param {object} dispatcher Dispatcher row.
+ * @param {object} [opts] fromDate, toDate (YYYY-MM-DD), statuses[], limit.
+ * @return {Promise<{rows: Array<object>, counts: object}>}
+ */
+async function listQuotesForDispatcherReport(tenant, dispatcher, opts = {}) {
+  const limit = Math.min(Number(opts.limit) || 500, 1000);
+  const dispatcherId = String(dispatcher.id || dispatcher);
+  const dispatcherEmail = quoteDispatchers.normalizeEmail(
+      dispatcher.email || "");
+  let statuses = Array.isArray(opts.statuses) ? opts.statuses :
+    String(opts.status || "draft_ready,sent").split(",");
+  statuses = statuses.map((s) => normalizeQuoteStatus(s)).filter(Boolean);
+  if (!statuses.length) statuses = ["draft_ready", "sent"];
+  const statusSet = new Set(statuses);
+
+  const fromDate = opts.fromDate ? coerceDate(opts.fromDate) : null;
+  let toDate = opts.toDate ? coerceDate(opts.toDate) : null;
+  if (toDate && opts.toDate && String(opts.toDate).length <= 10) {
+    // Inclusive end-of-day when only a date was provided.
+    toDate = new Date(toDate);
+    toDate.setUTCHours(23, 59, 59, 999);
+  }
+
+  const [snap, counts] = await Promise.all([
+    col(tenant, "quoteRequests")
+        .orderBy("createdAt", "desc")
+        .limit(Math.min(limit * 8, 2000))
+        .get(),
+    countQuotesForDispatcher(tenant, dispatcher),
+  ]);
+
+  const rows = [];
+  for (const doc of snap.docs) {
+    const data = doc.data();
+    if (!quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail)) {
+      continue;
+    }
+    if (isDismissedQuote(data)) continue;
+    const status = normalizeQuoteStatus(data.status);
+    if (!statusSet.has(status)) continue;
+    const created = coerceDate(data.createdAt);
+    const sent = coerceDate(data.sentAt);
+    const anchor = status === "sent" && sent ? sent : created;
+    if (fromDate && anchor && anchor < fromDate) continue;
+    if (toDate && anchor && anchor > toDate) continue;
+    if (rows.length >= limit) continue;
+    const selected = selectedCarrierReportFields(data);
+    const dispatcherName = data.assignedDispatcherName ||
+      (data.sentBy && data.sentBy.name) ||
+      data.assignedDispatcherEmail || "";
+    rows.push({
+      date: formatReportDate(anchor) || formatReportDate(created),
+      createdAt: formatReportDate(created),
+      sentAt: formatReportDate(sent),
+      customer: data.shippingLocationName || "",
+      from: data.from || "",
+      subject: data.subject || "",
+      status: status,
+      forReview: isForReviewQuote(data) ? "yes" : "",
+      carrierPrice: selected.carriers,
+      primusQuoteNumber: selected.quoteNumbers,
+      dispatcher: dispatcherName,
+      batchQuoteId: data.batchQuoteId || "",
+      quoteId: doc.id,
+    });
+  }
+  return {rows, counts};
 }
 
 /**
@@ -1809,11 +2010,14 @@ module.exports = {
   generateQuoteEmail,
   approveQuoteEmail,
   dismissQuote,
+  setQuoteForReview,
+  listQuotesForDispatcherReport,
   rerunQuoteRates,
   getQuoteRequest,
   listQuotesForDispatcher,
   isDismissedQuote,
   isPendingQuote,
+  isForReviewQuote,
   resolveShippingLocationId,
   resolveCustomerMatch,
   rateLane,

@@ -689,6 +689,12 @@
     .badge.sent { background: var(--success-bg); color: var(--success); border-color: #6ee7b7; }
     .badge.dismissed { background: var(--surface-muted); color: var(--muted); border-color: var(--border); }
     .badge.draft_ready { background: var(--primary-light); color: var(--primary-dark); border-color: #c7d2fe; }
+    .badge.for-review { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; margin-left: 6px; }
+    #btn-for-review.is-on {
+      background: #f5f3ff;
+      border-color: #ddd6fe;
+      color: #6d28d9;
+    }
 
     .login-page {
       min-height: 100vh;
@@ -964,11 +970,13 @@
       <div class="meta">
         <span id="meta"></span>
         <span id="status-badge" class="badge" style="margin-left:8px"></span>
+        <span id="review-badge" class="badge for-review hidden">For review</span>
       </div>
       <div id="customer-match" class="customer-match hidden"></div>
       <div id="quote-warnings" class="quote-warnings hidden"></div>
       <div class="toolbar">
         <button type="button" id="btn-generate">Save rate and generate draft email</button>
+        <button type="button" class="ghost" id="btn-for-review">For review</button>
         <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
         <span style="flex:1"></span>
         <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
@@ -1373,6 +1381,17 @@
       const badge = document.getElementById("status-badge");
       badge.textContent = quote.status || "";
       badge.className = "badge " + (quote.status || "");
+      const reviewBadge = document.getElementById("review-badge");
+      const forReview = !!quote.forReview;
+      if (reviewBadge) {
+        reviewBadge.classList.toggle("hidden", !forReview);
+      }
+      const reviewBtn = document.getElementById("btn-for-review");
+      if (reviewBtn) {
+        reviewBtn.textContent = forReview ? "Unmark review" : "For review";
+        reviewBtn.classList.toggle("is-on", forReview);
+        reviewBtn.disabled = quote.status === "dismissed";
+      }
       draftReady = quote.status === "draft_ready" || quote.status === "sent" ||
         !!(quote.customerEmailText);
       document.getElementById("draft-text").value =
@@ -2657,6 +2676,8 @@
         document.getElementById("status-badge").className = "badge dismissed";
         document.getElementById("btn-approve").disabled = true;
         document.getElementById("btn-generate").disabled = true;
+        const reviewBtn = document.getElementById("btn-for-review");
+        if (reviewBtn) reviewBtn.disabled = true;
         btn.disabled = true;
         btn.textContent = "Dismissed";
         showMsg("Quote dismissed. Returning to inbox…", true);
@@ -2669,6 +2690,43 @@
         btn.removeAttribute("data-confirm");
         btn.textContent = "Dismiss";
         showMsg(err.message || "Dismiss failed", false);
+      }
+    });
+
+    document.getElementById("btn-for-review").addEventListener("click", async () => {
+      const btn = document.getElementById("btn-for-review");
+      if (btn.disabled) return;
+      const currentlyOn = !!(quote && quote.forReview);
+      btn.disabled = true;
+      try {
+        const res = await apiFetch(
+            "/markQuoteForReview?tenantId=" + encodeURIComponent(TENANT_ID) +
+            "&quoteId=" + encodeURIComponent(QUOTE_ID), {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: QUOTE_ID,
+                id: QUOTE_ID,
+                forReview: !currentlyOn,
+                dispatcherId: DISPATCHER_ID || undefined,
+                token: TOKEN || undefined,
+              }),
+            });
+        if (!res.ok) throw new Error(res.error || "Update failed");
+        if (quote) quote.forReview = !currentlyOn;
+        const reviewBadge = document.getElementById("review-badge");
+        if (reviewBadge) {
+          reviewBadge.classList.toggle("hidden", currentlyOn);
+        }
+        btn.textContent = currentlyOn ? "For review" : "Unmark review";
+        btn.classList.toggle("is-on", !currentlyOn);
+        showMsg(currentlyOn ?
+          "Removed from For review. Still on your dashboard." :
+          "Tagged For review. Still on your dashboard.", true);
+      } catch (err) {
+        showMsg(err.message || "Could not update review flag", false);
+      } finally {
+        btn.disabled = quote && quote.status === "dismissed";
       }
     });
 

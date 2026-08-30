@@ -247,6 +247,74 @@
       gap: 10px;
       margin-bottom: 16px;
       flex-wrap: wrap;
+      align-items: center;
+    }
+    .filter-bar button.active {
+      background: var(--primary-light);
+      border-color: #c7d2fe;
+      color: var(--primary-dark);
+      box-shadow: 0 0 0 2px rgba(31, 79, 216, 0.12);
+    }
+    .report-bar {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      align-items: end;
+      padding: 14px 16px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-sm);
+    }
+    .report-bar label {
+      display: grid;
+      gap: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .report-bar input[type="date"] {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      font-family: inherit;
+      font-size: 0.875rem;
+      color: var(--text);
+      background: var(--surface);
+    }
+    .report-bar .report-note {
+      font-size: 0.75rem;
+      color: var(--muted);
+      align-self: center;
+      margin-left: auto;
+    }
+    .badge.for-review {
+      background: #f5f3ff;
+      color: #6d28d9;
+      border-color: #ddd6fe;
+    }
+    .badge.sent {
+      background: var(--success-bg);
+      color: var(--success);
+      border-color: #6ee7b7;
+    }
+    .badge.draft_ready {
+      background: var(--primary-light);
+      color: var(--primary-dark);
+      border-color: #c7d2fe;
+    }
+    .quote-card-badges {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      align-items: flex-end;
+    }
+    .quote-card-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      align-items: stretch;
     }
     .table-wrap {
       background: var(--surface);
@@ -416,10 +484,17 @@
       cursor: pointer;
       user-select: none;
     }
-    .quote-card-head .btn-dismiss-card {
+    .quote-card-head .btn-dismiss-card,
+    .quote-card-head .btn-review-card {
       padding: 8px 12px;
       font-size: 0.8125rem;
       align-self: start;
+      white-space: nowrap;
+    }
+    .quote-card-head .btn-review-card.is-on {
+      background: #f5f3ff;
+      border-color: #ddd6fe;
+      color: #6d28d9;
     }
     .quote-card-head:hover { background: var(--surface-muted); }
     .quote-card .chevron {
@@ -581,11 +656,25 @@
         <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Total quotes</div></div>
         <div class="stat"><div class="num" id="stat-awaiting">—</div><div class="lbl">Awaiting</div></div>
         <div class="stat"><div class="num" id="stat-draft">—</div><div class="lbl">Draft ready</div></div>
+        <div class="stat"><div class="num" id="stat-sent">—</div><div class="lbl">Sent</div></div>
+        <div class="stat"><div class="num" id="stat-review">—</div><div class="lbl">For review</div></div>
         <div class="stat"><div class="num muted" id="stat-dismissed">—</div><div class="lbl">Dismissed</div></div>
       </div>
       <div class="filter-bar">
-        <button type="button" id="filter-pending" class="ghost">Pending only</button>
-        <button type="button" id="filter-all" class="ghost">All recent</button>
+        <button type="button" id="filter-pending" class="ghost active">Pending</button>
+        <button type="button" id="filter-sent" class="ghost">Sent</button>
+        <button type="button" id="filter-review" class="ghost">For review</button>
+        <button type="button" id="filter-all" class="ghost">All</button>
+      </div>
+      <div class="report-bar" id="report-bar">
+        <label>From
+          <input type="date" id="report-from" />
+        </label>
+        <label>To
+          <input type="date" id="report-to" />
+        </label>
+        <button type="button" id="btn-report-pull">Report pull (CSV)</button>
+        <span class="report-note">Saved drafts + sent quotes</span>
       </div>
       <div id="page-thinking" class="page-thinking hidden" aria-live="polite" aria-busy="false">
         <div class="thinking-panel">
@@ -611,7 +700,7 @@
     const TENANT_ID = "__TENANT_ID__";
     const SYNC_THROTTLE_MS = 5 * 60 * 1000;
     const SYNC_KEY = "quoteOutlookLastSync:" + TENANT_ID;
-    let filterStatus = "";
+    let filterStatus = "pending";
     let outlookConnected = false;
     let syncInFlight = null;
     let thinkingTimer = null;
@@ -743,6 +832,16 @@
       return status === "awaiting_dispatcher" || status === "draft_ready";
     }
 
+    function isForReviewItem(item) {
+      if (isDismissedItem(item)) return false;
+      return !!(item && item.forReview);
+    }
+
+    function isSentItem(item) {
+      if (isDismissedItem(item)) return false;
+      return quoteStatusOf(item) === "sent";
+    }
+
     function writeStat(id, value) {
       const el = document.getElementById(id);
       if (el) el.textContent = String(Math.max(0, value));
@@ -758,7 +857,34 @@
       writeStat("stat-total", Number(c.total) || 0);
       writeStat("stat-awaiting", Number(c.awaiting) || 0);
       writeStat("stat-draft", Number(c.draftReady) || 0);
+      writeStat("stat-sent", Number(c.sent) || 0);
+      writeStat("stat-review", Number(c.forReview) || 0);
       writeStat("stat-dismissed", Number(c.dismissed) || 0);
+    }
+
+    function syncFilterButtons() {
+      const map = {
+        pending: "filter-pending",
+        sent: "filter-sent",
+        for_review: "filter-review",
+        "": "filter-all",
+      };
+      Object.keys(map).forEach((key) => {
+        const el = document.getElementById(map[key]);
+        if (!el) return;
+        el.classList.toggle("active", filterStatus === key);
+      });
+    }
+
+    function defaultReportDates() {
+      const to = new Date();
+      const from = new Date();
+      from.setDate(from.getDate() - 30);
+      const iso = (d) => d.toISOString().slice(0, 10);
+      const fromEl = document.getElementById("report-from");
+      const toEl = document.getElementById("report-to");
+      if (fromEl && !fromEl.value) fromEl.value = iso(from);
+      if (toEl && !toEl.value) toEl.value = iso(to);
     }
 
     function applyLocalDismissStats(status) {
@@ -786,6 +912,57 @@
           });
       if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
       return res2;
+    }
+
+    async function markQuoteForReview(quoteId, forReview) {
+      const id = String(quoteId || "").trim();
+      if (!id) throw new Error("Missing quote id");
+      const res2 = await apiFetch(
+          "/markQuoteForReview?tenantId=" + encodeURIComponent(TENANT_ID) +
+          "&quoteId=" + encodeURIComponent(id), {
+            method: "POST",
+            body: JSON.stringify({
+              tenantId: TENANT_ID,
+              quoteId: id,
+              id: id,
+              forReview: !!forReview,
+            }),
+          });
+      if (!res2.ok) throw new Error(res2.error || "Update failed");
+      return res2;
+    }
+
+    async function downloadReportCsv() {
+      defaultReportDates();
+      const from = document.getElementById("report-from").value || "";
+      const to = document.getElementById("report-to").value || "";
+      let path = "/exportQuoteDispatcherReport?tenantId=" +
+        encodeURIComponent(TENANT_ID) +
+        "&status=" + encodeURIComponent("draft_ready,sent");
+      if (from) path += "&fromDate=" + encodeURIComponent(from);
+      if (to) path += "&toDate=" + encodeURIComponent(to);
+      let authHeaders = {};
+      try {
+        authHeaders = await QuoteAuth.authHeaders();
+      } catch (_) { /* unsigned */ }
+      const res = await fetch(API + path, {headers: authHeaders});
+      if (!res.ok) {
+        let msg = "Report failed (" + res.status + ")";
+        try {
+          const data = await res.json();
+          if (data && data.error) msg = data.error;
+        } catch (_) { /* ignore */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "quote-report-" + (to || from || "export") + ".csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
     }
 
     async function loadProfile() {
@@ -822,9 +999,10 @@
       let path = "/getQuoteDispatcherInbox?tenantId=" +
         encodeURIComponent(TENANT_ID) + "&limit=50&syncOutlook=" +
         (sync ? "1" : "0");
-      const pendingView = filterStatus === "pending" ||
-        filterStatus === "awaiting_dispatcher";
-      if (pendingView) path += "&status=pending";
+      if (filterStatus === "pending") path += "&status=pending";
+      else if (filterStatus === "sent") path += "&status=sent";
+      else if (filterStatus === "for_review") path += "&status=for_review";
+      syncFilterButtons();
       try {
       const res = await apiFetch(path);
       const root = document.getElementById("rows");
@@ -833,16 +1011,24 @@
         return;
       }
       const visible = (res.items || []).filter((i) => !isDismissedItem(i));
-      const pendingItems = visible.filter(isPendingItem);
       const counts = res.counts || {};
       applyCounts(counts);
-      let items = pendingView ? pendingItems : visible;
+      let items = visible;
+      if (filterStatus === "pending") {
+        items = visible.filter(isPendingItem);
+      } else if (filterStatus === "sent") {
+        items = visible.filter(isSentItem);
+      } else if (filterStatus === "for_review") {
+        items = visible.filter(isForReviewItem);
+      }
       if (!items.length) {
         root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
         return;
       }
       root.innerHTML = items.map((item) => {
         const pending = isPendingItem(item);
+        const forReview = isForReviewItem(item);
+        const status = quoteStatusOf(item);
         const lanes = item.lanesPreview || [];
         const lanesHtml = lanes.map((lane) => {
           const opts = (lane.topOptions || []).map((o) =>
@@ -897,7 +1083,13 @@
           '<div class="quote-card-warn">' +
             esc(warnBits.join(" · ")) + "</div>" : "";
 
-        return `<div class="quote-card" data-id="${esc(item.id)}" data-status="${esc(item.status || "")}">
+        const badgeClass = pending ? "pending" :
+          (status === "sent" ? "sent" :
+            (status === "draft_ready" ? "draft_ready" : ""));
+        const reviewBadge = forReview ?
+          '<span class="badge for-review">For review</span>' : "";
+
+        return `<div class="quote-card" data-id="${esc(item.id)}" data-status="${esc(item.status || "")}" data-for-review="${forReview ? "1" : "0"}">
           <div class="quote-card-head">
             <span class="chevron">▶</span>
             <div>
@@ -906,8 +1098,14 @@
               ${warnHtml}
               <div class="quote-card-sub">${esc(item.from || "")}<br>${esc(item.subject || "")}<br>${item.laneCount || 0} lane(s)</div>
             </div>
-            <span class="badge ${pending ? "pending" : ""}">${esc(item.status || "")}</span>
-            <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}">Dismiss</button>
+            <div class="quote-card-badges">
+              <span class="badge ${badgeClass}">${esc(item.status || "")}</span>
+              ${reviewBadge}
+            </div>
+            <div class="quote-card-actions">
+              <button type="button" class="ghost btn-review-card${forReview ? " is-on" : ""}" data-id="${esc(item.id)}" data-on="${forReview ? "1" : "0"}">${forReview ? "Unmark review" : "For review"}</button>
+              <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}">Dismiss</button>
+            </div>
           </div>
           <div class="quote-card-body">
             ${lanesHtml || '<div class="empty" style="padding:12px">No lane preview</div>'}
@@ -921,7 +1119,24 @@
       root.querySelectorAll(".quote-card-head").forEach((el) => {
         el.addEventListener("click", (e) => {
           if (e.target.closest(".btn-dismiss-card")) return;
+          if (e.target.closest(".btn-review-card")) return;
           el.parentElement.classList.toggle("open");
+        });
+      });
+      root.querySelectorAll(".btn-review-card").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+          const currentlyOn = btn.getAttribute("data-on") === "1";
+          btn.disabled = true;
+          try {
+            await markQuoteForReview(quoteId, !currentlyOn);
+            await loadInbox({sync: false});
+          } catch (err) {
+            btn.disabled = false;
+            alert(err.message || "Could not update review flag");
+          }
         });
       });
       root.querySelectorAll(".btn-dismiss-card").forEach((btn) => {
@@ -1087,8 +1302,28 @@
     document.getElementById("filter-pending").addEventListener("click", () => {
       filterStatus = "pending"; loadInbox({sync: false});
     });
+    document.getElementById("filter-sent").addEventListener("click", () => {
+      filterStatus = "sent"; loadInbox({sync: false});
+    });
+    document.getElementById("filter-review").addEventListener("click", () => {
+      filterStatus = "for_review"; loadInbox({sync: false});
+    });
     document.getElementById("filter-all").addEventListener("click", () => {
       filterStatus = ""; loadInbox({sync: false});
+    });
+    document.getElementById("btn-report-pull").addEventListener("click", async () => {
+      const btn = document.getElementById("btn-report-pull");
+      btn.disabled = true;
+      const prev = btn.textContent;
+      btn.textContent = "Preparing…";
+      try {
+        await downloadReportCsv();
+      } catch (err) {
+        alert(err.message || "Report failed");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
     });
     document.getElementById("btn-rules").addEventListener("click", () => {
       window.open(API + "/quoteAdminPage?tenantId=" + encodeURIComponent(TENANT_ID), "_blank");
@@ -1096,6 +1331,7 @@
 
     (async () => {
       try {
+        defaultReportDates();
         await QuoteAuth.init({apiBase: API, tenantId: TENANT_ID});
         QuoteAuth.onAuth(async (user) => {
           if (!user) { showApp(false); return; }
