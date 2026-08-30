@@ -727,9 +727,9 @@ function extractCompactPalletBlocks(body) {
 function parseInformalPalletCount(text) {
   const blob = String(text || "");
   if (freightRules.isAlternateQuantityQuote(blob)) return null;
-  // Do not span newlines — zip codes above a "pallet:" line (e.g. 91601)
-  // were being read as pallet counts.
-  const re = /\b(\d{1,3})\s+(?:pallets?|plts?|skids?)\b/gi;
+  // Same-line only — never span newlines. Otherwise WEIGHT- 139\nPallets- 1
+  // (and zip codes above a "pallet:" line) become fake pallet counts.
+  const re = /\b(\d{1,3})[^\S\r\n]+(?:pallets?|plts?|skids?)\b/gi;
   let max = null;
   let m;
   while ((m = re.exec(blob)) !== null) {
@@ -955,6 +955,11 @@ function parseLabeledFreightTotals(body) {
     palletCount = matchLabeledNumber(text,
         /Pallet\s+Counts?\s*[-–—:=]?\s*(\d+)/i);
   }
+  // "Pallets- 1" / "Pallet: 2" — not "1 pallet – 48x40x15" dims.
+  if (palletCount == null) {
+    palletCount = matchLabeledNumber(text,
+        /\bPallets?\s*[-–—:=]\s*(\d+)(?!\d)(?!\s*[x×*])/i);
+  }
   if (palletCount == null) {
     const blocks = extractCompactPalletBlocks(text);
     if (blocks.length) palletCount = blocks.length;
@@ -962,10 +967,18 @@ function parseLabeledFreightTotals(body) {
   if (palletCount == null) {
     palletCount = parseInformalPalletCount(text);
   }
-  const cartonCount = matchLabeledNumber(text,
+  let cartonCount = matchLabeledNumber(text,
       /Total\s+Cartons?\s*[-–—:=]?\s*(\d+)/i);
-  const weight = matchLabeledNumber(text,
+  if (cartonCount == null) {
+    cartonCount = matchLabeledNumber(text,
+        /\bCTNS?\s*[-–—:=]\s*(\d+)\b/i);
+  }
+  let weight = matchLabeledNumber(text,
       /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d.]+)/i);
+  if (weight == null) {
+    weight = matchLabeledNumber(text,
+        /\bWEIGHT\s*[-–—:=]\s*([\d.]+)\b/i);
+  }
   const dim = text.match(new RegExp(
       "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*([\\d.]+)\\s*[x×*]\\s*" +
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
@@ -1067,21 +1080,35 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
 
 /**
  * Correct AI/heuristic PLT qty when the email labeled cartons vs pallets.
- * Mutates extracted lanes in place.
+ * Mutates extracted lanes in place. Uses per-Shipment N sections when
+ * present so WEIGHT/Pallets from shipment 1 cannot bleed into shipment 2.
  * @param {object} extracted Parsed quote request.
  * @param {string} body Email body.
  * @return {object}
  */
 function correctCartonVsPalletFreight(extracted, body) {
   if (!extracted || typeof extracted !== "object") return extracted;
-  const labeled = parseLabeledFreightTotals(body);
-  if (labeled.palletCount == null && labeled.cartonCount == null &&
-      labeled.weight == null && labeled.length == null) {
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  const sections = extractNumberedShipmentSections(body);
+  const useSections = sections.length >= 2;
+  const globalLabeled = parseLabeledFreightTotals(body);
+  if (!useSections &&
+      globalLabeled.palletCount == null && globalLabeled.cartonCount == null &&
+      globalLabeled.weight == null && globalLabeled.length == null) {
     return extracted;
   }
-  if (!Array.isArray(extracted.lanes)) return extracted;
   for (const lane of extracted.lanes) {
     if (!lane || typeof lane !== "object") continue;
+    let labeled = globalLabeled;
+    if (useSections) {
+      const section = sections.find((s) =>
+        laneMatchesShipmentSection(lane, s));
+      if (section) labeled = parseLabeledFreightTotals(section.text);
+    }
+    if (labeled.palletCount == null && labeled.cartonCount == null &&
+        labeled.weight == null && labeled.length == null) {
+      continue;
+    }
     lane.freightInfo = applyLabeledFreightTotals(
         lane.freightInfo, labeled);
     if (labeled.palletCount != null && labeled.cartonCount != null &&

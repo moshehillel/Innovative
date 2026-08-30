@@ -411,6 +411,112 @@ check("normalize stamps alternateQuantityQuotes",
 check("normalize stamps lane doNotCombine",
     !!(altNorm.lanes[0].flags && altNorm.lanes[0].flags.doNotCombine), true);
 
+// Q#D6062: WEIGHT- 139\nPallets- 1 must not become 139 PLT (→ 6 trailers).
+const D6062_BODY = [
+  "Ship To:",
+  "",
+  "Shipment 1:",
+  "",
+  "SE Retail Dist Ctr",
+  "BLDG 781 PAGE ROAD",
+  "PENSACOLA FL 32508 US",
+  "",
+  "PO# 0038255607//PT# 2353976",
+  "Total Cartons – 28",
+  "Total Weight – 129",
+  "1 pallet – 48x40x15",
+  "",
+  "PO# 0038267626//PT# 2354719",
+  "CTNS- 28",
+  "WEIGHT- 139",
+  "Pallets- 1",
+  "48x40x15",
+  "",
+  "Shipment 2:",
+  "",
+  "WC Retail Dist Ctr",
+  "4250 EUCALYPTUS AVE",
+  "CHINO CA 917109704 US",
+  "",
+  "PO# 0038255612//PT# 2353978",
+  "Total Cartons – 18",
+  "Total Weight – 101",
+  "1 pallet – 48x40x10",
+].join("\n");
+
+check("D6062 informal ignores WEIGHT\\nPallets",
+    intake.parseInformalPalletCount(D6062_BODY), 1);
+check("D6062 labeled Pallets- 1",
+    intake.parseLabeledFreightTotals(
+        "CTNS- 28\nWEIGHT- 139\nPallets- 1\n48x40x15").palletCount,
+    1);
+check("D6062 labeled does not read dim 48 as pallets",
+    intake.parseLabeledFreightTotals("1 pallet – 48x40x15").palletCount,
+    1);
+
+const d6062Extracted = {
+  shipper: {
+    name: "DCG FULFILLMENT REDLANDS",
+    city: "REDLANDS", state: "CA", zipCode: "92374",
+  },
+  lanes: [
+    {
+      consignee: {
+        name: "SE Retail Dist Ctr",
+        city: "PENSACOLA", state: "FL", zipCode: "32508",
+      },
+      freightInfo: [
+        {qty: 1, weight: 129, dimType: "PLT", length: 48, width: 40, height: 15},
+        {qty: 1, weight: 139, dimType: "PLT", length: 48, width: 40, height: 15},
+      ],
+      flags: {},
+      specialInstructions: "Total Cartons – 28",
+    },
+    {
+      consignee: {
+        name: "WC Retail Dist Ctr",
+        city: "CHINO", state: "CA", zipCode: "91710",
+      },
+      // Simulate under-count that applyEmailPalletBlocks used to inflate
+      // from WEIGHT-139\\nPallets via informal max.
+      freightInfo: [
+        {qty: 1, weight: 101, dimType: "PLT", length: 48, width: 40, height: 10},
+      ],
+      flags: {},
+      specialInstructions: "Total Cartons – 18",
+    },
+  ],
+};
+const d6062Norm = intake.normalizeExtractedQuote(d6062Extracted, {
+  subject: "LFW-NEXCOM WEST COAST",
+  body: D6062_BODY,
+});
+const d6062Chino = (d6062Norm.lanes || []).find((l) =>
+  /chino/i.test(String((l.consignee && l.consignee.city) || "")));
+const d6062ChinoQty = (d6062Chino && d6062Chino.freightInfo || [])
+    .reduce((s, r) => s + (Number(r.qty) || 0), 0);
+check("D6062 normalize Chino stays 1 PLT", d6062ChinoQty, 1);
+
+const d6062Ruled = freightRules.applyFreightRules(d6062Norm, {maxPallets: 26});
+const d6062ChinoLanes = (d6062Ruled.lanes || []).filter((l) =>
+  /chino/i.test(JSON.stringify(l.consignee || {})));
+check("D6062 freight rules no Chino trailer split",
+    d6062ChinoLanes.length, 1);
+check("D6062 Chino ruled qty 1",
+    freightRules.countPallets(d6062ChinoLanes[0].freightInfo), 1);
+
+// applyEmailPalletBlocks must not promote WEIGHT\\nPallets into qty.
+const bleed = {
+  lanes: [{
+    consignee: {city: "CHINO", state: "CA", zipCode: "91710"},
+    freightInfo: [{qty: 1, weight: 101, dimType: "PLT"}],
+    flags: {},
+  }],
+};
+intake.applyEmailPalletBlocks(bleed, {body: D6062_BODY});
+check("D6062 applyEmailPalletBlocks no 139 inflate",
+    bleed.lanes[0].freightInfo[0].qty, 1);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
