@@ -485,9 +485,14 @@ function applyEmailRequestedAccessorials(
     filterCarrierWarnings: [],
     requiresConfirm: false,
   };
-  const requested = uniqueCodes(requestedCodes);
+  const declined = scanText ?
+    new Set(declinedAcc.detectDeclinedAccessorials(scanText).codes) :
+    new Set();
+  const requested = uniqueCodes(requestedCodes)
+      .filter((c) => !declined.has(c));
   const existing = new Set(
-      (out.accessorials || []).map((c) => String(c).toUpperCase()));
+      (out.accessorials || []).map((c) => String(c).toUpperCase())
+          .filter((c) => !declined.has(c)));
   const added = [];
   for (const code of requested) {
     if (existing.has(code)) continue;

@@ -192,8 +192,11 @@ check("any empty rates retries market",
       {error: "Invalid zipcode"},
     ]), true);
 check("market fallback warning text",
-    rateShop.MARKET_FALLBACK_WARNING,
-    "Primus customer matched but no customer tariffs — showing market rates.");
+    String(rateShop.MARKET_FALLBACK_WARNING || "")
+        .startsWith(
+            "Primus customer matched but no customer tariffs — showing " +
+            "market rates."),
+    true);
 
 check("market sell uses min($55, 10%) — low cost",
     rateShop.computeSellRate(300), 330);

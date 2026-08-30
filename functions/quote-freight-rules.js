@@ -2,6 +2,8 @@
  * Built-in quote freight rules (always on):
  * 1. Combine — same shipper+consignee OD lanes whose combined pallet qty
  *    is ≤ MAX_PALLETS_PER_TRAILER merge into one lane before rating.
+ *    Skipped for alternate quantity scenarios ("also quote 2 skids",
+ *    "2 rates needed") — those must stay separate lanes.
  * 2. Split — a lane with more than MAX pallets becomes ceil(qty/MAX)
  *    trailer portions (rated separately under the same quote request).
  *
@@ -15,6 +17,21 @@ const rateShop = require("./quote-rate-shop");
 const freightDims = require("./quote-freight-dims");
 
 const DEFAULT_MAX_PALLETS_PER_TRAILER = 26;
+
+/**
+ * RFQ asks for separate rates for different pallet quantities on the
+ * same OD (not two shipments to combine). QL5229-class.
+ */
+const ALTERNATE_QUANTITY_QUOTE_RE = new RegExp(
+    "\\b(?:" +
+    "(?:then\\s+)?also\\s+quote" +
+    "|quote\\s+also" +
+    "|(?:2|two)\\s+rates?\\s+needed" +
+    "|rates?\\s+needed\\s+for\\s+both" +
+    "|alternate\\s+(?:quote|rate)s?" +
+    "|either\\s+\\d+\\s+or\\s+\\d+\\s+(?:skids?|pallets?|plts?)" +
+    ")\\b",
+    "i");
 
 /** dimTypes that count as pallets for trailer capacity. */
 const PALLET_DIM_TYPES = new Set(["PLT"]);
@@ -258,17 +275,54 @@ function buildCombinedLane(members, maxPallets) {
 }
 
 /**
+ * True when the RFQ wants separate quotes for alternate pallet qtys
+ * on the same lane (do not combine into one shipment).
+ * @param {string} text Subject + body + instructions.
+ * @return {boolean}
+ */
+function isAlternateQuantityQuote(text) {
+  return ALTERNATE_QUANTITY_QUOTE_RE.test(String(text || ""));
+}
+
+/**
+ * Lane-level alternate / do-not-combine markers.
+ * @param {object} lane Lane.
+ * @return {boolean}
+ */
+function laneMarksDoNotCombine(lane) {
+  const l = lane && typeof lane === "object" ? lane : {};
+  const flags = l.flags && typeof l.flags === "object" ? l.flags : {};
+  if (flags.doNotCombine || flags.alternateQuote ||
+      flags.alternateQuantityQuote) {
+    return true;
+  }
+  const blob = [
+    l.label,
+    l.specialInstructions,
+    ...(Array.isArray(l.referenceNumbers) ? l.referenceNumbers : []),
+  ].filter(Boolean).join(" ");
+  return /\b(?:alternate\s+(?:quote|rate)|option\s*[12]|also\s+quote)\b/i
+      .test(blob);
+}
+
+/**
  * Merge 2+ lanes that share OD and fit under max pallets.
  * Preserves relative order by first-seen OD group.
+ * Never combines alternate quantity scenarios (separate rate options).
  * @param {Array<object>} lanes Lanes (each should already have shipper).
  * @param {number} maxPallets Max per trailer.
+ * @param {object} [opts] skipCombine / alternateQuantityQuotes / sourceText.
  * @return {{lanes: Array<object>, applied: Array<object>}}
  */
-function combineSameOdLanes(lanes, maxPallets) {
+function combineSameOdLanes(lanes, maxPallets, opts = {}) {
   const list = Array.isArray(lanes) ? lanes : [];
   if (list.length < 2) {
     return {lanes: list.map((l) => ({...l})), applied: []};
   }
+
+  const alternate = !!(opts && (opts.skipCombine ||
+    opts.alternateQuantityQuotes ||
+    isAlternateQuantityQuote(opts.sourceText || "")));
 
   const groups = new Map();
   const groupOrder = [];
@@ -286,15 +340,28 @@ function combineSameOdLanes(lanes, maxPallets) {
 
   for (const key of groupOrder) {
     const members = groups.get(key);
+    const groupAlternate = alternate ||
+      members.some((m) => laneMarksDoNotCombine(m.lane));
     const totalPallets = members.reduce(
         (sum, m) => sum + countPallets(m.lane.freightInfo), 0);
-    const canCombine = !key.startsWith("__solo_") &&
+    const canCombine = !groupAlternate &&
+      !key.startsWith("__solo_") &&
       members.length >= 2 &&
       totalPallets > 0 &&
       totalPallets <= maxPallets;
 
     if (!canCombine) {
-      for (const m of members) out.push({...m.lane});
+      for (const m of members) {
+        const copy = {...m.lane};
+        if (groupAlternate) {
+          copy.flags = {
+            ...(copy.flags || {}),
+            doNotCombine: true,
+            alternateQuantityQuote: true,
+          };
+        }
+        out.push(copy);
+      }
       continue;
     }
 
@@ -389,6 +456,17 @@ function applyFreightRules(extracted, opts = {}) {
   const src = extracted && typeof extracted === "object" ? extracted : {};
   const globalShipper = src.shipper || null;
   const inputLanes = Array.isArray(src.lanes) ? src.lanes : [];
+  const sourceText = [
+    opts.sourceText,
+    src._sourceSubject,
+    src._sourceBody,
+    src.specialInstructionsGlobal,
+    ...(inputLanes.map((l) => l && l.specialInstructions)),
+  ].filter(Boolean).join("\n");
+  const alternateQuantityQuotes = !!(
+    (src.flags && src.flags.alternateQuantityQuotes) ||
+    isAlternateQuantityQuote(sourceText) ||
+    inputLanes.some((l) => laneMarksDoNotCombine(l)));
 
   const withShipper = inputLanes.map((lane, i) => ({
     ...lane,
@@ -396,7 +474,10 @@ function applyFreightRules(extracted, opts = {}) {
     laneKey: lane.laneKey || `LANE_${i + 1}`,
   }));
 
-  const combined = combineSameOdLanes(withShipper, maxPallets);
+  const combined = combineSameOdLanes(withShipper, maxPallets, {
+    alternateQuantityQuotes,
+    sourceText,
+  });
   const applied = [...combined.applied];
   const splitLanes = [];
   for (const lane of combined.lanes) {
@@ -405,14 +486,22 @@ function applyFreightRules(extracted, opts = {}) {
     splitLanes.push(...split.lanes);
   }
 
+  const flags = src.flags && typeof src.flags === "object" ?
+    {...src.flags} : {};
+  if (alternateQuantityQuotes) {
+    flags.alternateQuantityQuotes = true;
+  }
+
   return {
     ...src,
+    flags,
     lanes: splitLanes,
     freightRulesMeta: {
       maxPalletsPerTrailer: maxPallets,
       appliedRules: applied,
       inputLaneCount: inputLanes.length,
       outputLaneCount: splitLanes.length,
+      alternateQuantityQuotes,
     },
   };
 }
@@ -429,4 +518,7 @@ module.exports = {
   freightForPortion,
   applyFreightRules,
   isPalletLikeRow,
+  isAlternateQuantityQuote,
+  laneMarksDoNotCombine,
+  ALTERNATE_QUANTITY_QUOTE_RE,
 };

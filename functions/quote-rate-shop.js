@@ -191,7 +191,10 @@ function summarizeNoRateErrors(noRates) {
  * show market rates instead. Never imply those are contract rates.
  */
 const MARKET_FALLBACK_WARNING =
-  "Primus customer matched but no customer tariffs — showing market rates.";
+  "Primus customer matched but no customer tariffs — showing market rates. " +
+  "If this account is protocol-only / FAK, confirm the Primus customer " +
+  "profile has active carrier tariffs (Customer Profile not found usually " +
+  "means Primus config, not Jerry).";
 
 /**
  * Always retry /rate/multiple without customerId when the customer

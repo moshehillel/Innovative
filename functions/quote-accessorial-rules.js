@@ -916,9 +916,38 @@ function ruleMatchViaText(lane, context, rule, side = "dest") {
     if (match.flags.some((f) => flagFromEmail(lane, f, side))) return "flags";
   }
   if (match.siteType && getEmailSiteType(lane, side) === match.siteType) {
+    // chain_store / amazon APD must not win over "no appointment" / FCFS.
+    if (addsOnlyDeclinedAccessorials(lane, context, rule)) return null;
     return "siteType";
   }
   return null;
+}
+
+/**
+ * True when every code the rule would add is customer-declined.
+ * @param {object} lane Lane.
+ * @param {object} context Global context.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function addsOnlyDeclinedAccessorials(lane, context, rule) {
+  const adds = (rule.addAccessorials || [])
+      .map((c) => String(c || "").toUpperCase())
+      .filter(Boolean);
+  if (!adds.length) return false;
+  const declineText = [
+    lane && lane.specialInstructions,
+    context.specialInstructionsGlobal,
+    context.emailBody,
+    context.subject,
+    context.body,
+  ].filter(Boolean).join(" ");
+  const declined = new Set(
+      declinedAcc.detectDeclinedAccessorials(declineText).codes);
+  const extra = Array.isArray(context.customerDeclinedAccessorials) ?
+    context.customerDeclinedAccessorials : [];
+  for (const c of extra) declined.add(String(c || "").toUpperCase());
+  return adds.every((c) => declined.has(c));
 }
 
 /**
@@ -937,6 +966,7 @@ function ruleMatchViaAi(lane, context, rule, side = "dest") {
   if (!meta) return null;
 
   if (match.siteType && meta.classifiedAs === match.siteType) {
+    if (addsOnlyDeclinedAccessorials(lane, context, rule)) return null;
     return "siteType";
   }
   if (match.flags && Array.isArray(match.flags)) {

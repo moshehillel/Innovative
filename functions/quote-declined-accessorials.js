@@ -8,13 +8,18 @@
 
 /**
  * Customer said appointment is not needed — APD/APO must not apply.
+ * Also treats FIRST COME FIRST SERVED / FCFS as no-appointment (common
+ * grocery / market receiving language; e.g. Kirk Market).
  */
 const NO_APPOINTMENT_RE = new RegExp(
     "\\b(?:" +
     "no\\s+(?:delivery\\s+)?(?:appointments?|appts?)" +
-    "(?:\\s*(?:necessary|needed|required))?" +
+    "(?:\\s*[.,:;\\-]\\s*|\\s+)?" +
+    "(?:necessary|needed|required)?" +
     "|(?:appointment|appt)s?\\s+not\\s+(?:necessary|needed|required)" +
     "|(?:appointment|appt)s?\\s+unnecessary" +
+    "|first\\s*come\\s*,?\\s*first\\s*served" +
+    "|fcfs" +
     ")\\b",
     "i");
 
@@ -183,8 +188,8 @@ function applyDeclinedAccessorials(rulesOut, text, extraDeclined) {
     return true;
   });
   for (const row of detected.classes) {
-    const hit = row.codes.some((c) => stripped.includes(c) || before.has(c));
-    if (!hit) continue;
+    // Always record detected declines (even when site/email rules never
+    // added the code — e.g. chain_store skipped because FCFS declined APD).
     kept.push({
       ruleId: row.ruleId,
       name: row.name,

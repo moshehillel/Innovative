@@ -203,6 +203,40 @@ const outChainNoAppt = quoteRules.applyRulesToLane(chainNoAppt, rules, {
 });
 checkNotHas("chain + no appt strips APD", outChainNoAppt.accessorials, "APD");
 
+const kirkFcfs = {
+  consignee: {
+    name: "Kirk Market",
+    city: "Hialeah",
+    state: "FL",
+    zipCode: "33018",
+  },
+  shipper: {name: "STG", city: "Santa Fe Springs", state: "CA"},
+  specialInstructions:
+    "All deliveries will be received on a FIRST COME, FIRST SERVED " +
+    "basis. NO APPOINTMENT necessary.",
+  flags: {},
+  siteType: "chain_store",
+  enrichmentMeta: {classifiedAs: "chain_store", source: "ai"},
+};
+const outKirk = quoteRules.applyRulesToLane(kirkFcfs, rules, {
+  specialInstructionsGlobal: kirkFcfs.specialInstructions,
+  emailBody: kirkFcfs.specialInstructions,
+});
+checkNotHas("Kirk Market FCFS strips chain APD", outKirk.accessorials, "APD");
+check("Kirk FCFS records no-appointment suppress",
+    (outKirk.appliedRules || [])
+        .some((r) => r.ruleId === "email_no_appointment"), true);
+
+const kirkFcfsOnly = {
+  ...kirkFcfs,
+  specialInstructions: "Receiving is FIRST COME FIRST SERVED.",
+};
+const outKirkFcfsOnly = quoteRules.applyRulesToLane(kirkFcfsOnly, rules, {
+  emailBody: kirkFcfsOnly.specialInstructions,
+});
+checkNotHas("Kirk FCFS-only (no explicit no-appt) strips APD",
+    outKirkFcfsOnly.accessorials, "APD");
+
 const walmartH = addressEnrichment.classifyFromNameHeuristics({
   name: "Walmart Supercenter #1234",
 });

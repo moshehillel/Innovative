@@ -9,6 +9,7 @@ const OpenAI = require("openai");
 const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const emailAccessorials = require("./quote-email-accessorials");
 const freightDims = require("./quote-freight-dims");
+const freightRules = require("./quote-freight-rules");
 const senderRules = require("./quote-sender-rules");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
@@ -135,7 +136,42 @@ function normalizeExtractedQuote(extracted, opts) {
   for (const w of declined.warnings || []) {
     pushExtractWarning(next, w);
   }
+  stampAlternateQuantityQuoteFlags(next, opts);
   return next;
+}
+
+/**
+ * Mark alternate qty RFQs so freight combine never merges them.
+ * @param {object} extracted Intake payload (mutated).
+ * @param {object} [opts] subject, body.
+ * @return {void}
+ */
+function stampAlternateQuantityQuoteFlags(extracted, opts) {
+  if (!extracted || typeof extracted !== "object") return;
+  const blob = [
+    opts && opts.subject,
+    opts && opts.body,
+    extracted._sourceSubject,
+    extracted._sourceBody,
+    extracted.specialInstructionsGlobal,
+    ...(Array.isArray(extracted.lanes) ?
+      extracted.lanes.map((l) => l && l.specialInstructions) : []),
+  ].filter(Boolean).join("\n");
+  if (!freightRules.isAlternateQuantityQuote(blob) &&
+      !(extracted.flags && extracted.flags.alternateQuantityQuotes)) {
+    return;
+  }
+  extracted.flags = extracted.flags && typeof extracted.flags === "object" ?
+    {...extracted.flags} : {};
+  extracted.flags.alternateQuantityQuotes = true;
+  if (!Array.isArray(extracted.lanes)) return;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    lane.flags = lane.flags && typeof lane.flags === "object" ?
+      {...lane.flags} : {};
+    lane.flags.doNotCombine = true;
+    lane.flags.alternateQuantityQuote = true;
+  }
 }
 
 /**
@@ -335,15 +371,17 @@ function quoteExtractSystemPrompt() {
     "  }",
     "- customerDeclinedAccessorials: string[]  // e.g. [\"APD\"] when the",
     "    customer said appointment is NOT needed",
-    "- flags: {needsDispatcherReview: boolean}",
+    "- flags: {needsDispatcherReview: boolean,",
+    "    alternateQuantityQuotes: boolean}",
     "",
     "WORKED EXAMPLES (follow these exactly):",
     "1) \"No Appointment necessary\" / \"no appt needed\" /",
-    "   \"appointment not required\" → do NOT put APD or APO in",
+    "   \"appointment not required\" / \"FIRST COME, FIRST SERVED\" /",
+    "   \"FCFS\" → do NOT put APD or APO in",
     "   requestedAccessorials. Put \"APD\" in",
     "   customerDeclinedAccessorials. Copy the phrase into",
     "   specialInstructions only. The word \"appointment\" is not a",
-    "   request when it is negated.",
+    "   request when it is negated or when receiving is FCFS.",
     "2) \"Delivery appointment required\" / \"must call to schedule\"",
     "   → requestedAccessorials MUST include APD. Do not decline it.",
     "3) Pallet 1 (40x48x70, 1822 lbs) and Pallet 2 (40x48x66, 1702 lbs)",
@@ -375,11 +413,18 @@ function quoteExtractSystemPrompt() {
     "   requestedAccessorials.",
     "10) \"Lift gate needed for delivery\" / liftgate near the word",
     "   delivery → LFD only. Do NOT also add LFO.",
+    "11) \"quote 1 skid … Then also quote 2 skids\" / \"2 rates needed\"",
+    "   / alternate qty on the SAME origin+dest → TWO separate lanes",
+    "   (lane A qty 1 with that line's weight/class/dims; lane B qty 2",
+    "   with its own weight/class/dims). Never put qty 2 on the 1-skid",
+    "   line. Never merge into one shipment. Set flags",
+    "   alternateQuantityQuotes true on the top-level flags object.",
     "",
     "FALSE POSITIVES (never treat these as requests):",
     "- Limited-access disclose boilerplate (Core Home / RFQ templates)",
     "  that asks to show charges IF limited access applies.",
-    "- \"No appointment necessary\" / \"no appt needed\" (decline APD).",
+    "- \"No appointment necessary\" / \"no appt needed\" /",
+    "  \"FIRST COME FIRST SERVED\" / FCFS (decline APD).",
     "- Liftgate scoped to delivery only (do not invent LFO).",
     "",
     "Real patterns to recognize:",
@@ -434,7 +479,8 @@ function quoteExtractSystemPrompt() {
     "  LFD only (do NOT add LFO unless pickup/origin is explicit);",
     "  appointment",
     "  → APD (APO if pickup) UNLESS the email says no appointment",
-    "  / no appt needed / appointment not required;",
+    "  / no appt needed / appointment not required / FCFS /",
+    "  first come first served;",
     "  residential → RSD; limited/restricted",
     "  access → LAD (LAO if pickup) ONLY when clearly requested",
     "  (needs limited access, limited access delivery required,",
@@ -667,16 +713,20 @@ function extractCompactPalletBlocks(body) {
 /**
  * "2 pallets" / "2 plt" / "2 skids" — number before the word.
  * Does not treat "Pallet 1" as qty 1.
+ * Returns null for alternate quantity RFQs ("also quote 2 skids") so
+ * we never overwrite a 1-skid line with the max mentioned qty.
  * @param {string} text Body.
  * @return {number|null}
  */
 function parseInformalPalletCount(text) {
+  const blob = String(text || "");
+  if (freightRules.isAlternateQuantityQuote(blob)) return null;
   // Do not span newlines — zip codes above a "pallet:" line (e.g. 91601)
   // were being read as pallet counts.
   const re = /\b(\d{1,3})\s+(?:pallets?|plts?|skids?)\b/gi;
   let max = null;
   let m;
-  while ((m = re.exec(String(text || ""))) !== null) {
+  while ((m = re.exec(blob)) !== null) {
     const n = Number(m[1]);
     if (!Number.isFinite(n) || n < 1 || n > 200) continue;
     if (max == null || n > max) max = n;

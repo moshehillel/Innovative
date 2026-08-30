@@ -85,6 +85,16 @@ check("declines no appointment necessary",
 check("does not decline bare appointment",
     emailAcc.declinesAppointmentDelivery("appointment delivery required"),
     false);
+check("declines FCFS receiving",
+    emailAcc.declinesAppointmentDelivery(
+        "All deliveries FIRST COME, FIRST SERVED basis."), true);
+check("declines fcfs token",
+    emailAcc.declinesAppointmentDelivery("Receiving is FCFS."), true);
+
+codes = emailAcc.extractRequestedAccessorialsFromText(
+    "All deliveries will be received on a FIRST COME, FIRST SERVED " +
+    "basis. NO APPOINTMENT necessary.");
+checkNotHas("FCFS + no appt does not add APD", codes, "APD");
 
 const declinedAi = emailAcc.attachRequestedAccessorials({
   specialInstructionsGlobal: "No Appointment necessary",

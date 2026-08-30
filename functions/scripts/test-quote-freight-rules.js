@@ -162,6 +162,66 @@ checkTrue("max default 26", freightRules.getMaxPalletsPerTrailer() === 26);
   check("no combine different OD", out.length, 2);
 }
 
+{
+  const lanes = [
+    {
+      laneKey: "A1",
+      label: "1 skid option",
+      shipper: shipA,
+      consignee: consB,
+      freightInfo: [{qty: 1, weight: 2040, class: "65", dimType: "PLT"}],
+      flags: {alternateQuantityQuote: true, doNotCombine: true},
+    },
+    {
+      laneKey: "A2",
+      label: "2 skid option",
+      shipper: {...shipA},
+      consignee: {...consB},
+      freightInfo: [{qty: 2, weight: 3050, class: "70", dimType: "PLT"}],
+      flags: {alternateQuantityQuote: true, doNotCombine: true},
+    },
+  ];
+  const {lanes: out, applied} = freightRules.combineSameOdLanes(lanes, 26);
+  check("alternate flags → no combine", out.length, 2);
+  check("alternate no applied combine", applied.length, 0);
+  check("lane1 qty stays 1",
+      freightRules.countPallets(out[0].freightInfo), 1);
+  check("lane2 qty stays 2",
+      freightRules.countPallets(out[1].freightInfo), 2);
+}
+
+{
+  const body =
+    "Please quote 1 skid class 65 2040 lbs. " +
+    "Then also quote 2 skids class 70 3050 lbs. 2 rates needed.";
+  checkTrue("detect also quote / 2 rates needed",
+      freightRules.isAlternateQuantityQuote(body));
+  const extracted = {
+    _sourceBody: body,
+    shipper: shipA,
+    lanes: [
+      {
+        laneKey: "OPT1",
+        consignee: consB,
+        freightInfo: [{qty: 1, weight: 2040, class: "65", dimType: "PLT"}],
+      },
+      {
+        laneKey: "OPT2",
+        consignee: consB,
+        freightInfo: [{qty: 2, weight: 3050, class: "70", dimType: "PLT"}],
+      },
+    ],
+  };
+  const out = freightRules.applyFreightRules(extracted, {maxPallets: 26});
+  check("e2e alternate keeps 2 lanes", out.lanes.length, 2);
+  checkTrue("e2e alternate meta flag",
+      !!(out.freightRulesMeta &&
+        out.freightRulesMeta.alternateQuantityQuotes));
+  checkTrue("e2e no combine rule",
+      !(out.freightRulesMeta.appliedRules || [])
+          .some((r) => r.ruleId === "combine_same_od"));
+}
+
 // --- applyFreightRules end-to-end ---
 {
   const extracted = {

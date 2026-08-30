@@ -382,6 +382,35 @@ check("normalizeExtractedQuote requestedAccessorials no APD",
     !(noApptNorm.customerRequest.requestedAccessorials || []).includes("APD"),
     true);
 
+const altBody =
+  "Please quote 1 skid class 65 2040 lbs 48x48x65. " +
+  "Then also quote 2 skids class 70 3050 lbs. 2 rates needed.";
+check("parseInformalPalletCount null on alternate qty RFQ",
+    intake.parseInformalPalletCount(altBody), null);
+check("parseInformalPalletCount still reads plain 2 pallets",
+    intake.parseInformalPalletCount("Need rates for 2 pallets to Dallas"),
+    2);
+
+const altNorm = intake.normalizeExtractedQuote({
+  shipper: {name: "WH", city: "Edison", state: "NJ", zipCode: "08817"},
+  lanes: [
+    {
+      laneKey: "OPT1",
+      consignee: {city: "Baxter", state: "MN", zipCode: "56425"},
+      freightInfo: [{qty: 1, weight: 2040, class: "65", dimType: "PLT"}],
+    },
+    {
+      laneKey: "OPT2",
+      consignee: {city: "Baxter", state: "MN", zipCode: "56425"},
+      freightInfo: [{qty: 2, weight: 3050, class: "70", dimType: "PLT"}],
+    },
+  ],
+}, {subject: "RFQ", body: altBody});
+check("normalize stamps alternateQuantityQuotes",
+    !!(altNorm.flags && altNorm.flags.alternateQuantityQuotes), true);
+check("normalize stamps lane doNotCombine",
+    !!(altNorm.lanes[0].flags && altNorm.lanes[0].flags.doNotCombine), true);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
