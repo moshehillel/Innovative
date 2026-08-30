@@ -232,9 +232,11 @@ function getToolDefinitions() {
               type: "array",
               items: {type: "string"},
               description:
-                "Codes that must never be applied with this rule " +
-                "(e.g. NTD when APD). Schema has no mutual-exclusion " +
-                "field — tool may return unsupported.",
+                "Not supported. Quote rules can ADD services only; they " +
+                "cannot block another service (e.g. Notification with " +
+                "Appointment delivery). Tool returns userReply — use that " +
+                "plain English text for the dispatcher; do not invent a " +
+                "block/suppress field.",
             },
             reply: {type: "string"},
           },
@@ -354,6 +356,24 @@ function searchRules(existingRules, query) {
 }
 
 /**
+ * Plain-English explanation when "never also apply X" is requested.
+ * Dispatchers see this; keep free of schema / API jargon.
+ * @return {string}
+ */
+function mutualExclusionUserReply() {
+  return "I can't set up a rule that automatically turns off " +
+    "Notification whenever Appointment delivery is on.\n\n" +
+    "Quote rules can add extras (like Appointment delivery), but they " +
+    "can't block another extra from being added.\n\n" +
+    "What we can do instead:\n" +
+    "1) Make sure no rule also adds Notification on those same quotes\n" +
+    "2) Put a reminder in the rule notes so someone double-checks\n" +
+    "3) Ask the team later if we need a real \"never both\" feature\n\n" +
+    "Want me to draft the Appointment delivery rule with a reminder " +
+    "note, or look for rules that currently add Notification?";
+}
+
+/**
  * Detect unsupported mutual-exclusion requests.
  * @param {Array<string>} add Codes to add.
  * @param {Array<string>} suppress Codes to never apply together.
@@ -366,18 +386,45 @@ function checkMutualExclusion(add, suppress) {
   if (!suppressList.length) return null;
   const addSet = new Set((add || []).map((c) => String(c || "").toUpperCase()));
   // Runtime engine only ADDS accessorials — cannot suppress siblings.
+  const userReply = mutualExclusionUserReply();
   return {
     ok: false,
     unsupported: true,
+    // Technical detail for the model only — never paste to the user.
     error:
-      "Quote rules cannot enforce mutual exclusion at rating time " +
-      "(no suppressAccessorials field). Known code NTD = Notification " +
-      "delivery. Options: (1) remove NTD from any rule that also adds APD, " +
-      "(2) put the policy in notes + requiresConfirm, (3) ask ops for a " +
-      "schema change. Do not invent a fake suppress field.",
+      "Cannot suppress accessorials at rating time (no suppress field). " +
+      "NTD=Notification, APD=Appointment delivery. Options: remove NTD " +
+      "from rules that also add APD; notes+requiresConfirm; ops schema " +
+      "change. Copy userReply to the dispatcher in plain English.",
+    userReply,
     suppressAccessorials: suppressList,
     addAccessorials: [...addSet],
   };
+}
+
+/**
+ * Surface mutual-exclusion failure as a plain chat reply.
+ * @param {object} mutex Result from checkMutualExclusion.
+ * @param {object} ctx Agent context.
+ * @return {object} Same mutex (for tool JSON).
+ */
+function surfaceMutualExclusion(mutex, ctx) {
+  const state = ctx.state;
+  const reply = mutex.userReply || mutualExclusionUserReply();
+  state.awaiting = "clarify_yes_no";
+  state.openQuestion = reply.slice(0, 500);
+  state.goal = state.goal || "create";
+  if (!state.intentSummary) {
+    state.intentSummary =
+      "Appointment delivery should not also get Notification";
+  }
+  ctx.outcome = {
+    reply,
+    action: "none",
+    proposal: null,
+    quickReplies: [],
+  };
+  return mutex;
 }
 
 /**
@@ -416,8 +463,9 @@ function executeTool(name, args, ctx) {
           label: ACCESSORIAL_LABELS[code],
         })),
         hint:
-          "NTD = Notification delivery; APD = Appointment delivery. " +
-          "User 'notification' usually means NTD.",
+          "When talking to the user, say 'Appointment delivery' and " +
+          "'Notification' — not APD/NTD unless they used those codes. " +
+          "User 'notification' usually means Notification (NTD).",
       };
     case "set_working_memory": {
       if (args.goal) state.goal = args.goal;
@@ -503,7 +551,7 @@ function draftCreate(args, ctx) {
         .filter(Boolean) :
     [];
   const mutex = checkMutualExclusion(add, suppress);
-  if (mutex) return mutex;
+  if (mutex) return surfaceMutualExclusion(mutex, ctx);
 
   let ruleKind = args.ruleKind || "accessorial";
   if (ruleKind === "accessorial") ruleKind = null;
@@ -609,9 +657,10 @@ function draftUpdate(args, ctx) {
   }
   if (Array.isArray(incoming.suppressAccessorials) &&
       incoming.suppressAccessorials.length) {
-    return checkMutualExclusion(
+    const mutex = checkMutualExclusion(
         incoming.addAccessorials || (live && live.addAccessorials) || [],
         incoming.suppressAccessorials);
+    return surfaceMutualExclusion(mutex, ctx);
   }
 
   const validated = chat.validateRuleProposal({
@@ -850,21 +899,35 @@ async function runQuoteRulesAgentTurn(opts) {
   const systemPrompt = [
     "You are a quote-rules agent for Innovative Carriers dispatchers.",
     "Use tools to inspect rules and draft proposals. Never invent apply",
-    "success — only Confirm saves. Talk like a helpful chat assistant.",
+    "success — only Confirm saves.",
     "",
-    "Rule kinds:",
-    "1) Accessorial / site — match siteType/flags/text → addAccessorials",
-    "   (APD appointment, LAD limited access, LFD liftgate, NTD notification,",
-    "   NUD nursing, HOD hotel, RSD residential, SCD school).",
-    "2) sender_customer — From email/@domain → customerName, optional",
-    "   protocolOnly / defaultDims. No accessorials.",
-    "3) zip_fill — city/state → fillZipCode + applyTo origin|dest.",
+    "VOICE (critical): Audience is non-programmers (dispatchers).",
+    "Every reply they see must be plain everyday English.",
+    "- Explain what can / cannot be done and the next step.",
+    "- Prefer service names: Appointment delivery, Notification,",
+    "  Limited access, Liftgate — not codes, unless the user used codes.",
+    "- Never say: unsupported, schema, field, API, runtime, mutual",
+    "  exclusion, suppressAccessorials, requiresConfirm, or similar jargon.",
+    "- Never paste raw tool JSON or technical error strings.",
+    "  If a tool returns userReply, use that text (or a close paraphrase).",
     "",
-    "When user says 'notification' they usually mean NTD.",
-    "When delivery appointment / APD should not also apply notification,",
-    "call get_accessorial_catalog then explain mutual exclusion is not a",
-    "runtime field — offer notes/requiresConfirm or removing NTD from",
-    "rules that also add APD. Never silently fake suppressAccessorials.",
+    "Rule kinds (internal — do not dump these names at users):",
+    "1) Accessorial / site — match → add extras",
+    "   (Appointment delivery=APD, Limited access=LAD, Liftgate=LFD,",
+    "   Notification=NTD, Nursing=NUD, Hotel=HOD, Residential=RSD,",
+    "   School=SCD).",
+    "2) sender_customer — From email/@domain → customer name / protocol.",
+    "3) zip_fill — city/state → fill missing ZIP.",
+    "",
+    "When user says 'notification' they usually mean Notification (NTD).",
+    "If they want 'when Appointment delivery is on, never also",
+    "Notification': rules can ADD Appointment delivery, but cannot",
+    "automatically block Notification. Explain that simply, then offer:",
+    "(1) remove Notification from rules that also add Appointment",
+    "delivery, (2) add a reminder note on the rule, or (3) ask the team",
+    "later for a real never-both feature. Never fake a block/suppress.",
+    "Prefer draft_create_rule with suppressAccessorials so the tool",
+    "returns the canned userReply — then stop and show that reply.",
     "",
     "On ambiguous requests: ask_user with awaiting=clarify_yes_no and set",
     "intentSummary. After user says yes, draft immediately — do not reset.",
@@ -992,6 +1055,7 @@ module.exports = {
   executeTool,
   searchRules,
   checkMutualExclusion,
+  mutualExclusionUserReply,
   runQuoteRulesAgentTurn,
   RULES_AGENT_MODEL,
   RULES_AGENT_MAX_TOOL_ROUNDS,

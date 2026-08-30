@@ -107,6 +107,16 @@ checkTrue("catalog includes NTD notification",
 const mutex = agent.checkMutualExclusion(["APD"], ["NTD"]);
 checkTrue("mutual exclusion unsupported",
     mutex && mutex.unsupported && /NTD/.test(mutex.error));
+checkTrue("mutual exclusion has plain userReply",
+    mutex && mutex.userReply &&
+    /Appointment delivery/i.test(mutex.userReply) &&
+    /Notification/i.test(mutex.userReply) &&
+    !/schema|suppressAccessorials|unsupported|mutual exclusion|runtime/i
+        .test(mutex.userReply));
+checkTrue("canned mutualExclusionUserReply is plain",
+    /Appointment delivery/i.test(agent.mutualExclusionUserReply()) &&
+    !/schema|suppressAccessorials|unsupported/i
+        .test(agent.mutualExclusionUserReply()));
 
 const suppressDraft = agent.executeTool("draft_create_rule", {
   ruleId: "apd_no_ntd",
@@ -118,6 +128,11 @@ const suppressDraft = agent.executeTool("draft_create_rule", {
 }, ctx);
 checkTrue("draft with suppress returns unsupported",
     suppressDraft && suppressDraft.unsupported);
+checkTrue("draft with suppress surfaces plain reply",
+    ctx.outcome && ctx.outcome.action === "none" &&
+    /Appointment delivery/i.test(ctx.outcome.reply || "") &&
+    !/schema|suppressAccessorials|unsupported/i.test(ctx.outcome.reply || "") &&
+    ctx.state.awaiting === "clarify_yes_no");
 
 const createCtx = {
   existingRules,
@@ -190,16 +205,16 @@ const accOut = agent.executeTool("draft_create_rule", {
   match: {flags: ["appointmentRequired"]},
   addAccessorials: ["APD"],
   identifyVia: "ai",
-  notes: "Policy: do not also add NTD (notification) with APD.",
-  reply: "I'll add APD for delivery appointments. Note: runtime cannot " +
-    "auto-suppress NTD — noted in the rule. Confirm?",
+  notes: "Policy: do not also add Notification with Appointment delivery.",
+  reply: "I'll add Appointment delivery for delivery appointments. " +
+    "I can't auto-block Notification, so I noted that in the rule. Confirm?",
 }, accCtx);
 checkTrue("delivery-appt create without focus rule",
     accOut.ok &&
     accCtx.outcome.action === "propose_create_rule" &&
     Array.isArray(accCtx.state.draft.patch.addAccessorials) &&
     accCtx.state.draft.patch.addAccessorials.includes("APD") &&
-    /NTD/i.test(accCtx.state.draft.patch.notes || ""));
+    /notification/i.test(accCtx.state.draft.patch.notes || ""));
 
 const delCtx = {
   existingRules,
