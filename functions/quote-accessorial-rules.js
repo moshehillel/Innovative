@@ -1095,6 +1095,18 @@ function formatAccessorialLabels(codes) {
 
 /**
  * Applies rules to a lane; returns accessorial codes and filter hints.
+ *
+ * Order (all matching accessorial rules, in priority order):
+ * 1) Apply every matching rule's addAccessorials / addAccessorialsWithData /
+ *    filterCarrierWarnings.
+ * 2) Then apply every matching rule's removeAccessorials (suppress). Removes
+ *    win over adds from any rule, including earlier ones — so a rule that
+ *    only removes NTD when appointment context matches will strip NTD even
+ *    if another rule (or the lane) added it.
+ * removeAccessorials codes are side-mapped via accessorialsForSide (same as
+ * adds). Matching accessorialsWithData rows are dropped when their code is
+ * removed.
+ *
  * @param {object} lane Lane object.
  * @param {Array<object>} rules Active rules.
  * @param {object} [context] Global email context.
@@ -1102,11 +1114,12 @@ function formatAccessorialLabels(codes) {
  */
 function applyRulesToLane(lane, rules, context = {}) {
   const codes = new Set(Array.isArray(lane.accessorials) ?
-    lane.accessorials : []);
-  const withData = Array.isArray(lane.accessorialsWithData) ?
+    lane.accessorials.map(String) : []);
+  let withData = Array.isArray(lane.accessorialsWithData) ?
     [...lane.accessorialsWithData] : [];
   const filterWarnings = [];
   const applied = [];
+  const removeCodes = new Set();
   let requiresConfirm = false;
 
   for (const rule of rules) {
@@ -1135,7 +1148,17 @@ function applyRulesToLane(lane, rules, context = {}) {
       if (Array.isArray(rule.addAccessorialsWithData)) {
         withData.push(...rule.addAccessorialsWithData);
       }
+      accessorialsForSide(rule.removeAccessorials || [], side)
+          .forEach((c) => removeCodes.add(String(c)));
     }
+  }
+
+  if (removeCodes.size) {
+    for (const c of removeCodes) codes.delete(c);
+    withData = withData.filter((row) => {
+      const c = String(row && row.code || "");
+      return c && !removeCodes.has(c);
+    });
   }
 
   const declineText = [

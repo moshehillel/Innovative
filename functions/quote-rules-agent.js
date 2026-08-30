@@ -217,6 +217,15 @@ function getToolDefinitions() {
               type: "array",
               items: {type: "string"},
             },
+            removeAccessorials: {
+              type: "array",
+              items: {type: "string"},
+              description:
+                "Primus codes to suppress/remove when this rule matches " +
+                "(after all matching rules apply their adds). Example: " +
+                "remove NTD (Notification) when Appointment delivery " +
+                "context matches.",
+            },
             identifyVia: {
               type: "string",
               enum: ["email", "address_text", "ai", "both"],
@@ -228,16 +237,6 @@ function getToolDefinitions() {
             applyTo: {type: "string", enum: ["origin", "dest", "both"]},
             notes: {type: "string"},
             priority: {type: "integer"},
-            suppressAccessorials: {
-              type: "array",
-              items: {type: "string"},
-              description:
-                "Not supported. Quote rules can ADD services only; they " +
-                "cannot block another service (e.g. Notification with " +
-                "Appointment delivery). Tool returns userReply — use that " +
-                "plain English text for the dispatcher; do not invent a " +
-                "block/suppress field.",
-            },
             reply: {type: "string"},
           },
           required: ["ruleId", "name", "match"],
@@ -328,6 +327,7 @@ function summarizeRule(rule) {
     ruleKind: rule.ruleKind || "accessorial",
     active: rule.active !== false,
     addAccessorials: rule.addAccessorials || [],
+    removeAccessorials: rule.removeAccessorials || [],
     customerName: rule.customerName || null,
     fillZipCode: rule.fillZipCode || null,
     applyTo: rule.applyTo || null,
@@ -350,81 +350,36 @@ function searchRules(existingRules, query) {
       r.id, r.name, r.ruleKind, r.customerName, r.fillZipCode, r.notes,
       JSON.stringify(r.match || {}),
       (r.addAccessorials || []).join(" "),
+      (r.removeAccessorials || []).join(" "),
     ].join(" ").toLowerCase();
     return tokens.every((t) => blob.includes(t));
   }).slice(0, 25).map(summarizeRule);
 }
 
 /**
- * Plain-English explanation when "never also apply X" is requested.
- * Dispatchers see this; keep free of schema / API jargon.
- * @return {string}
+ * Normalize Primus accessorial code lists from tool args.
+ * @param {*} list Incoming codes.
+ * @return {Array<string>}
  */
-function mutualExclusionUserReply() {
-  return "I can't set up a rule that automatically turns off " +
-    "Notification whenever Appointment delivery is on.\n\n" +
-    "Quote rules can add extras (like Appointment delivery), but they " +
-    "can't block another extra from being added.\n\n" +
-    "What we can do instead:\n" +
-    "1) Make sure no rule also adds Notification on those same quotes\n" +
-    "2) Put a reminder in the rule notes so someone double-checks\n" +
-    "3) Ask the team later if we need a real \"never both\" feature\n\n" +
-    "Want me to draft the Appointment delivery rule with a reminder " +
-    "note, or look for rules that currently add Notification?";
+function normalizeAccessorialCodes(list) {
+  if (!Array.isArray(list)) return [];
+  return [...new Set(
+      list.map((c) => String(c || "").toUpperCase()).filter(Boolean))];
 }
 
 /**
- * Detect unsupported mutual-exclusion requests.
- * @param {Array<string>} add Codes to add.
- * @param {Array<string>} suppress Codes to never apply together.
- * @return {object|null} unsupported payload or null.
+ * Merge removeAccessorials + legacy suppressAccessorials aliases.
+ * @param {object} args Tool args or patch.
+ * @return {Array<string>}
  */
-function checkMutualExclusion(add, suppress) {
-  const suppressList = (suppress || [])
-      .map((c) => String(c || "").toUpperCase())
-      .filter(Boolean);
-  if (!suppressList.length) return null;
-  const addSet = new Set((add || []).map((c) => String(c || "").toUpperCase()));
-  // Runtime engine only ADDS accessorials — cannot suppress siblings.
-  const userReply = mutualExclusionUserReply();
-  return {
-    ok: false,
-    unsupported: true,
-    // Technical detail for the model only — never paste to the user.
-    error:
-      "Cannot suppress accessorials at rating time (no suppress field). " +
-      "NTD=Notification, APD=Appointment delivery. Options: remove NTD " +
-      "from rules that also add APD; notes+requiresConfirm; ops schema " +
-      "change. Copy userReply to the dispatcher in plain English.",
-    userReply,
-    suppressAccessorials: suppressList,
-    addAccessorials: [...addSet],
-  };
-}
-
-/**
- * Surface mutual-exclusion failure as a plain chat reply.
- * @param {object} mutex Result from checkMutualExclusion.
- * @param {object} ctx Agent context.
- * @return {object} Same mutex (for tool JSON).
- */
-function surfaceMutualExclusion(mutex, ctx) {
-  const state = ctx.state;
-  const reply = mutex.userReply || mutualExclusionUserReply();
-  state.awaiting = "clarify_yes_no";
-  state.openQuestion = reply.slice(0, 500);
-  state.goal = state.goal || "create";
-  if (!state.intentSummary) {
-    state.intentSummary =
-      "Appointment delivery should not also get Notification";
-  }
-  ctx.outcome = {
-    reply,
-    action: "none",
-    proposal: null,
-    quickReplies: [],
-  };
-  return mutex;
+function collectRemoveAccessorials(args) {
+  if (!args || typeof args !== "object") return [];
+  return normalizeAccessorialCodes([
+    ...(Array.isArray(args.removeAccessorials) ?
+      args.removeAccessorials : []),
+    ...(Array.isArray(args.suppressAccessorials) ?
+      args.suppressAccessorials : []),
+  ]);
 }
 
 /**
@@ -545,13 +500,8 @@ function executeTool(name, args, ctx) {
  */
 function draftCreate(args, ctx) {
   const state = ctx.state;
-  const suppress = args.suppressAccessorials || [];
-  const add = Array.isArray(args.addAccessorials) ?
-    args.addAccessorials.map((c) => String(c || "").toUpperCase())
-        .filter(Boolean) :
-    [];
-  const mutex = checkMutualExclusion(add, suppress);
-  if (mutex) return surfaceMutualExclusion(mutex, ctx);
+  const add = normalizeAccessorialCodes(args.addAccessorials);
+  const remove = collectRemoveAccessorials(args);
 
   let ruleKind = args.ruleKind || "accessorial";
   if (ruleKind === "accessorial") ruleKind = null;
@@ -562,6 +512,7 @@ function draftCreate(args, ctx) {
     name: String(args.name || args.ruleId),
     match: args.match && typeof args.match === "object" ? args.match : {},
     addAccessorials: add,
+    removeAccessorials: remove,
     notes: args.notes ? String(args.notes) : "",
     autoApply: true,
     requiresConfirm: false,
@@ -572,6 +523,7 @@ function draftCreate(args, ctx) {
     patch.ruleKind = RULE_KIND_SENDER_CUSTOMER;
     patch.identifyVia = "email";
     patch.addAccessorials = [];
+    patch.removeAccessorials = [];
     if (args.customerName) patch.customerName = String(args.customerName);
     if (Object.prototype.hasOwnProperty.call(args, "protocolOnly")) {
       patch.protocolOnly = !!args.protocolOnly;
@@ -587,6 +539,7 @@ function draftCreate(args, ctx) {
     patch.applyTo = ["dest", "origin", "both"].includes(args.applyTo) ?
       args.applyTo : "origin";
     patch.addAccessorials = [];
+    patch.removeAccessorials = [];
     patch.identifyVia = "ai";
   }
 
@@ -614,6 +567,7 @@ function draftCreate(args, ctx) {
   state.openQuestion = null;
   state.focusRuleId = validated.ruleId;
   if (add.length) state.facts.accessorials = add.slice();
+  if (remove.length) state.facts.removeAccessorials = remove.slice();
   if (patch.ruleKind) state.facts.ruleKind = patch.ruleKind;
 
   ctx.outcome = {
@@ -655,12 +609,14 @@ function draftUpdate(args, ctx) {
       incoming.identifyVia = live.identifyVia || "both";
     }
   }
-  if (Array.isArray(incoming.suppressAccessorials) &&
-      incoming.suppressAccessorials.length) {
-    const mutex = checkMutualExclusion(
-        incoming.addAccessorials || (live && live.addAccessorials) || [],
-        incoming.suppressAccessorials);
-    return surfaceMutualExclusion(mutex, ctx);
+  const remove = collectRemoveAccessorials(incoming);
+  if (remove.length) {
+    incoming.removeAccessorials = remove;
+    delete incoming.suppressAccessorials;
+  }
+  if (Array.isArray(incoming.addAccessorials)) {
+    incoming.addAccessorials =
+      normalizeAccessorialCodes(incoming.addAccessorials);
   }
 
   const validated = chat.validateRuleProposal({
@@ -909,10 +865,9 @@ async function runQuoteRulesAgentTurn(opts) {
     "- Never say: unsupported, schema, field, API, runtime, mutual",
     "  exclusion, suppressAccessorials, requiresConfirm, or similar jargon.",
     "- Never paste raw tool JSON or technical error strings.",
-    "  If a tool returns userReply, use that text (or a close paraphrase).",
     "",
     "Rule kinds (internal — do not dump these names at users):",
-    "1) Accessorial / site — match → add extras",
+    "1) Accessorial / site — match → add and/or remove extras",
     "   (Appointment delivery=APD, Limited access=LAD, Liftgate=LFD,",
     "   Notification=NTD, Nursing=NUD, Hotel=HOD, Residential=RSD,",
     "   School=SCD).",
@@ -921,13 +876,12 @@ async function runQuoteRulesAgentTurn(opts) {
     "",
     "When user says 'notification' they usually mean Notification (NTD).",
     "If they want 'when Appointment delivery is on, never also",
-    "Notification': rules can ADD Appointment delivery, but cannot",
-    "automatically block Notification. Explain that simply, then offer:",
-    "(1) remove Notification from rules that also add Appointment",
-    "delivery, (2) add a reminder note on the rule, or (3) ask the team",
-    "later for a real never-both feature. Never fake a block/suppress.",
-    "Prefer draft_create_rule with suppressAccessorials so the tool",
-    "returns the canned userReply — then stop and show that reply.",
+    "Notification': draft a real rule with removeAccessorials [NTD].",
+    "Match appointment context with existing fields, e.g.",
+    "flags [appointmentRequired] and/or instructionsContains",
+    "[appointment, delivery appointment, appt required]. Optionally also",
+    "addAccessorials [APD] on the same rule. Removals run after all adds.",
+    "Speak in service names for the dispatcher reply.",
     "",
     "On ambiguous requests: ask_user with awaiting=clarify_yes_no and set",
     "intentSummary. After user says yes, draft immediately — do not reset.",
@@ -1054,8 +1008,8 @@ module.exports = {
   getToolDefinitions,
   executeTool,
   searchRules,
-  checkMutualExclusion,
-  mutualExclusionUserReply,
+  normalizeAccessorialCodes,
+  collectRemoveAccessorials,
   runQuoteRulesAgentTurn,
   RULES_AGENT_MODEL,
   RULES_AGENT_MAX_TOOL_ROUNDS,

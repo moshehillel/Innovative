@@ -815,11 +815,15 @@
       if (acc.length) {
         lines.push(`Add accessorial${acc.length > 1 ? "s" : ""}: ${acc.map(formatAccessorial).join("; ")}`);
       }
+      const rem = rule.removeAccessorials || [];
+      if (rem.length) {
+        lines.push(`Remove accessorial${rem.length > 1 ? "s" : ""}: ${rem.map(formatAccessorial).join("; ")}`);
+      }
       const filters = rule.filterCarrierWarnings || [];
       if (filters.length) {
         lines.push(`Do not use carriers that warn about: ${filters.map(f => `"${f}"`).join(", ")}`);
       }
-      if (!acc.length && !filters.length && !rule.customerName && !rule.defaultDims) {
+      if (!acc.length && !rem.length && !filters.length && !rule.customerName && !rule.defaultDims) {
         lines.push("No accessorials or carrier filters — rule may only set flags or notes.");
       }
       if (rule.requiresConfirm) {
@@ -842,7 +846,11 @@
       const parts = [];
       const acc = rule.addAccessorials || [];
       if (acc.length) {
-        parts.push(acc.map((c) => ACCESSORIAL_LABELS[c] || c).join(", "));
+        parts.push("add " + acc.map((c) => ACCESSORIAL_LABELS[c] || c).join(", "));
+      }
+      const rem = rule.removeAccessorials || [];
+      if (rem.length) {
+        parts.push("remove " + rem.map((c) => ACCESSORIAL_LABELS[c] || c).join(", "));
       }
       if (rule.customerName) {
         parts.push("customer " + rule.customerName);
@@ -911,7 +919,7 @@
           ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
           <details class="rule-advanced">
             <summary>Advanced (rule ID &amp; technical data)</summary>
-            <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
+            <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, removeAccessorials: rule.removeAccessorials || [], filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>
           </details>
         </div>
       `;
@@ -1094,6 +1102,9 @@
       }
       if (patch.addAccessorials) {
         parts.push(`Add: ${patch.addAccessorials.map(formatAccessorial).map(esc).join("; ")}`);
+      }
+      if (patch.removeAccessorials && patch.removeAccessorials.length) {
+        parts.push(`Remove: ${patch.removeAccessorials.map(formatAccessorial).map(esc).join("; ")}`);
       }
       if (patch.customerName) {
         parts.push(`Customer: ${esc(patch.customerName)}`);

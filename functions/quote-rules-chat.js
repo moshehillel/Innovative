@@ -25,6 +25,7 @@ const PATCH_FIELDS = [
   "name",
   "match",
   "addAccessorials",
+  "removeAccessorials",
   "filterCarrierWarnings",
   "notes",
   "autoApply",
@@ -2961,8 +2962,11 @@ async function runQuoteRulesChatTurn(opts) {
     "}",
     "",
     "Patch fields: active, priority, name, match, addAccessorials,",
-    "filterCarrierWarnings, notes, autoApply, requiresConfirm, identifyVia,",
-    "ruleKind, customerName, protocolOnly, defaultDims, fillZipCode, applyTo.",
+    "removeAccessorials, filterCarrierWarnings, notes, autoApply,",
+    "requiresConfirm, identifyVia, ruleKind, customerName, protocolOnly,",
+    "defaultDims, fillZipCode, applyTo.",
+    "removeAccessorials: Primus codes to strip after all matching adds",
+    "(e.g. remove NTD when appointment/APD context matches).",
     "match: consigneeNameContains, consigneeAddressContains,",
     "instructionsContains, referenceContains, flags, siteType,",
     "fromEmails, senderEmails, senderDomains, ccEmails, toEmails,",
@@ -3226,6 +3230,10 @@ function normalizePartialPatch(patch) {
       Array.isArray(patch.addAccessorials)) {
     normalized.addAccessorials = patch.addAccessorials.map(String);
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "removeAccessorials") &&
+      Array.isArray(patch.removeAccessorials)) {
+    normalized.removeAccessorials = patch.removeAccessorials.map(String);
+  }
   if (Object.prototype.hasOwnProperty.call(patch, "filterCarrierWarnings") &&
       Array.isArray(patch.filterCarrierWarnings)) {
     normalized.filterCarrierWarnings =
@@ -3296,6 +3304,8 @@ function normalizeCreatePatch(patch, ruleId) {
       patch.match : {},
     addAccessorials: Array.isArray(patch.addAccessorials) ?
       patch.addAccessorials.map(String) : [],
+    removeAccessorials: Array.isArray(patch.removeAccessorials) ?
+      patch.removeAccessorials.map(String) : [],
     filterCarrierWarnings: Array.isArray(patch.filterCarrierWarnings) ?
       patch.filterCarrierWarnings.map(String) : [],
     notes: patch.notes ? String(patch.notes) : "",

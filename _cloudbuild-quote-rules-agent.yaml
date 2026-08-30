@@ -8,7 +8,9 @@ steps:
         npm install -g firebase-tools@15.22.4
         cd functions && npm ci
         cd ..
-        firebase deploy --config=_firebase-deploy-nolint.json --only=functions:quoteRulesChat,functions:quoteAdminPage --project=tai-invoice-automation --non-interactive
+        firebase deploy --config=_firebase-deploy-nolint.json \
+          --only=functions:quoteRulesChat,functions:quoteAdminPage,functions:applyQuoteRule,functions:processQuoteWorkflow,functions:rerunQuoteRates \
+          --project=tai-invoice-automation --non-interactive
 timeout: '1800s'
 options:
   logging: CLOUD_LOGGING_ONLY

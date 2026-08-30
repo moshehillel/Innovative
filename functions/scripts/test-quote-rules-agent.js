@@ -104,35 +104,57 @@ checkTrue("catalog includes NTD notification",
     catalog.catalog.some((c) => c.code === "NTD" &&
       /notification/i.test(c.label)));
 
-const mutex = agent.checkMutualExclusion(["APD"], ["NTD"]);
-checkTrue("mutual exclusion unsupported",
-    mutex && mutex.unsupported && /NTD/.test(mutex.error));
-checkTrue("mutual exclusion has plain userReply",
-    mutex && mutex.userReply &&
-    /Appointment delivery/i.test(mutex.userReply) &&
-    /Notification/i.test(mutex.userReply) &&
-    !/schema|suppressAccessorials|unsupported|mutual exclusion|runtime/i
-        .test(mutex.userReply));
-checkTrue("canned mutualExclusionUserReply is plain",
-    /Appointment delivery/i.test(agent.mutualExclusionUserReply()) &&
-    !/schema|suppressAccessorials|unsupported/i
-        .test(agent.mutualExclusionUserReply()));
+const mutex = agent.collectRemoveAccessorials({
+  removeAccessorials: ["NTD"],
+  suppressAccessorials: ["ntd", "LAD"],
+});
+checkTrue("collectRemoveAccessorials merges aliases",
+    mutex.includes("NTD") && mutex.includes("LAD") && mutex.length === 2);
 
 const suppressDraft = agent.executeTool("draft_create_rule", {
   ruleId: "apd_no_ntd",
   name: "APD without notification",
-  match: {siteType: "aafes_military"},
+  match: {
+    flags: ["appointmentRequired"],
+    instructionsContains: ["appointment", "delivery appointment"],
+  },
+  addAccessorials: ["APD"],
+  removeAccessorials: ["NTD"],
+  identifyVia: "both",
+  reply: "When Appointment delivery applies, I'll also turn off " +
+    "Notification. Confirm?",
+}, ctx);
+checkTrue("draft with removeAccessorials proposes create",
+    suppressDraft && suppressDraft.ok &&
+    ctx.outcome && ctx.outcome.action === "propose_create_rule");
+checkTrue("draft patch includes removeAccessorials NTD",
+    ctx.state.draft &&
+    Array.isArray(ctx.state.draft.patch.removeAccessorials) &&
+    ctx.state.draft.patch.removeAccessorials.includes("NTD") &&
+    ctx.state.draft.patch.addAccessorials.includes("APD"));
+checkTrue("draft reply stays plain English",
+    /Appointment delivery/i.test(ctx.outcome.reply || "") &&
+    /Notification/i.test(ctx.outcome.reply || "") &&
+    !/schema|unsupported|mutual exclusion|runtime/i
+        .test(ctx.outcome.reply || ""));
+
+// Legacy suppressAccessorials alias still drafts a real remove rule.
+const legacyCtx = {
+  existingRules,
+  state: agent.normalizeAgentState({}),
+  outcome: null,
+};
+const legacyDraft = agent.executeTool("draft_create_rule", {
+  ruleId: "legacy_suppress_ntd",
+  name: "No notification with appointment",
+  match: {flags: ["appointmentRequired"]},
   addAccessorials: ["APD"],
   suppressAccessorials: ["NTD"],
   identifyVia: "ai",
-}, ctx);
-checkTrue("draft with suppress returns unsupported",
-    suppressDraft && suppressDraft.unsupported);
-checkTrue("draft with suppress surfaces plain reply",
-    ctx.outcome && ctx.outcome.action === "none" &&
-    /Appointment delivery/i.test(ctx.outcome.reply || "") &&
-    !/schema|suppressAccessorials|unsupported/i.test(ctx.outcome.reply || "") &&
-    ctx.state.awaiting === "clarify_yes_no");
+}, legacyCtx);
+checkTrue("legacy suppressAccessorials maps to removeAccessorials",
+    legacyDraft.ok &&
+    legacyCtx.state.draft.patch.removeAccessorials.includes("NTD"));
 
 const createCtx = {
   existingRules,
@@ -201,20 +223,20 @@ const accCtx = {
 };
 const accOut = agent.executeTool("draft_create_rule", {
   ruleId: "delivery_appt_apd",
-  name: "Delivery appointment → APD",
+  name: "Delivery appointment → APD, no NTD",
   match: {flags: ["appointmentRequired"]},
   addAccessorials: ["APD"],
+  removeAccessorials: ["NTD"],
   identifyVia: "ai",
-  notes: "Policy: do not also add Notification with Appointment delivery.",
-  reply: "I'll add Appointment delivery for delivery appointments. " +
-    "I can't auto-block Notification, so I noted that in the rule. Confirm?",
+  reply: "I'll add Appointment delivery and turn off Notification " +
+    "for those quotes. Confirm?",
 }, accCtx);
 checkTrue("delivery-appt create without focus rule",
     accOut.ok &&
     accCtx.outcome.action === "propose_create_rule" &&
     Array.isArray(accCtx.state.draft.patch.addAccessorials) &&
     accCtx.state.draft.patch.addAccessorials.includes("APD") &&
-    /notification/i.test(accCtx.state.draft.patch.notes || ""));
+    accCtx.state.draft.patch.removeAccessorials.includes("NTD"));
 
 const delCtx = {
   existingRules,
