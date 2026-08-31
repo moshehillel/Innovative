@@ -377,6 +377,7 @@ async function managePhpPost(params, retryOnAuthFail = true) {
 
   return result;
 }
+exports.managePhpPost = managePhpPost;
 
 /**
  * Multipart POST manage.php (uploadDriveFile).

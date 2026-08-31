@@ -255,6 +255,15 @@ check("resolveFakPricing prefers opts override",
     JSON.stringify({rate: 20, type: "profit%", min: 100}));
 check("parseFak from empty SL is null",
     rateShop.parseFakPricingFromShippingLocation({id: 1, name: "x"}), null);
+check("normalizeFak type P → profit%",
+    JSON.stringify(rateShop.normalizeFakPricing({rate: 15, min: 80, type: "P"})),
+    JSON.stringify({rate: 15, type: "profit%", min: 80}));
+check("pickFakPricingFromCarrierMarkups All/P",
+    JSON.stringify(rateShop.pickFakPricingFromCarrierMarkups([{
+      carrier: "0", carrierName: "All", rate: "15", min: "80",
+      type: "P", active: "1", erased: "0",
+    }])),
+    JSON.stringify({rate: 15, type: "profit%", min: 80}));
 check("normalizeFak rejects bad rows",
     rateShop.normalizeFakPricing({rate: "x", min: 80}), null);
 

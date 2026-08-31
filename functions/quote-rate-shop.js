@@ -208,21 +208,33 @@ function marketFallbackFakWarning(fak = {}) {
   const type = String(fak.type || "profit%");
   const rateLabel = Number.isFinite(rate) ? String(rate) : "?";
   const minLabel = Number.isFinite(min) ? String(min) : "?";
-  return "Primus customer matched but no carrier contract profiles — " +
-    "showing market costs with this customer's FAK markup " +
-    `(${rateLabel}% ${type}, min $${minLabel}; not contract tariffs).`;
+  return "No carrier contract profiles — market costs with FAK markup " +
+    `(${rateLabel}% ${type}, min $${minLabel}).`;
 }
 
 /**
- * Built-in FAK (Pricing tab) rules keyed by Primus shipping location id.
- * Primus REST does not expose the Pricing/FAK tab today — confirm in UI
- * and keep this map (or QUOTE_CUSTOMER_FAK_JSON) in sync.
+ * Built-in FAK overrides keyed by Primus REST shipping location id.
+ * Primary source is manage.php getShippingLocationsCarrierMarkups
+ * (see fetchCustomerFakPricingFromPrimus). Keep this map / env for
+ * overrides when Primus UI is unreachable or a rule must be forced.
  * Mike Oseback protocol only: Rate 15 / Type Profit% / Min 80.
  * @type {Object<string, {rate: number, type: string, min: number}>}
  */
 const CUSTOMER_FAK_BY_ID = {
   "779538209": {rate: 15, type: "profit%", min: 80},
 };
+
+/** In-memory FAK cache: restId → {expiresAt, value}. */
+const fakPricingLiveCache = new Map();
+const FAK_LIVE_CACHE_TTL_MS = 60 * 60 * 1000;
+
+/** Optional test double for live Primus FAK fetch. */
+let fetchFakPricingImplForTest = null;
+
+/** Cached manage.php PHPSESSID for FAK lookups (process-local). */
+let fakManageSession = null;
+let fakManageSessionAt = 0;
+const FAK_MANAGE_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 /**
  * @return {Object<string, object>} Merged built-in + env FAK map.
@@ -247,6 +259,27 @@ function customerFakPricingMap() {
 }
 
 /**
+ * Maps Primus Pricing-tab type codes to Jerry FAK types.
+ * UI: P=Profit%, F/FL=Flat, M=Money, FRT=Freight %, G=GP %.
+ * @param {string} typeRaw Raw type from config or manage.php.
+ * @return {string} profit% | markup% | flat
+ */
+function normalizeFakTypeCode(typeRaw) {
+  const t = String(typeRaw || "profit%")
+      .toLowerCase()
+      .replace(/\s+/g, "");
+  if (t === "f" || t === "fl" || t === "flat" || t === "dollar" ||
+      t === "$" || t === "m" || t === "money") {
+    return "flat";
+  }
+  if (t === "frt" || t.includes("freight") || t.includes("markup")) {
+    return "markup%";
+  }
+  // P, profit%, g/gp%, bare % → profit floor on cost
+  return "profit%";
+}
+
+/**
  * Normalizes a FAK / Pricing-tab markup rule.
  * Primus: Rate + Type Profit% + Min $ → profit = max(cost×rate%, min).
  * @param {object|null|undefined} raw Raw config.
@@ -258,22 +291,12 @@ function normalizeFakPricing(raw) {
   const min = Number(raw.min != null ? raw.min : raw.minDollars);
   if (!Number.isFinite(rate) || rate < 0) return null;
   if (!Number.isFinite(min) || min < 0) return null;
-  const typeRaw = String(raw.type || raw.markupType || "profit%")
-      .toLowerCase()
-      .replace(/\s+/g, "");
-  let type = "profit%";
-  if (typeRaw === "flat" || typeRaw === "dollar" || typeRaw === "$") {
-    type = "flat";
-  } else if (typeRaw.includes("markup")) {
-    type = "markup%";
-  } else if (typeRaw.includes("profit") || typeRaw.includes("%")) {
-    type = "profit%";
-  }
+  const type = normalizeFakTypeCode(raw.type || raw.markupType || "profit%");
   return {rate, type, min};
 }
 
 /**
- * Looks up configured FAK for a Primus shipping location id.
+ * Looks up configured FAK override for a Primus REST shipping location id.
  * @param {string|number|null|undefined} customerId Shipping location id.
  * @return {{rate: number, type: string, min: number}|null}
  */
@@ -285,7 +308,7 @@ function getCustomerFakPricing(customerId) {
 
 /**
  * Best-effort parse if Primus ever returns Pricing fields on a SL row.
- * Today REST shippinglocation has no FAK fields — returns null.
+ * REST shippinglocation has no FAK fields today — returns null.
  * @param {object|null|undefined} loc Shipping location row.
  * @return {{rate: number, type: string, min: number}|null}
  */
@@ -304,7 +327,305 @@ function parseFakPricingFromShippingLocation(loc) {
 }
 
 /**
- * Resolves FAK for market-fallback sell rates (ctx override → SL parse → map).
+ * Picks the best All-carriers FAK row from manage.php markups[].
+ * Prefers active carrier=0 / "All", then first active row.
+ * @param {Array<object>|null|undefined} markups Carrier markup rows.
+ * @return {{rate: number, type: string, min: number}|null}
+ */
+function pickFakPricingFromCarrierMarkups(markups) {
+  const rows = Array.isArray(markups) ? markups : [];
+  const active = rows.filter((r) => {
+    if (!r || typeof r !== "object") return false;
+    if (String(r.erased || "0") === "1") return false;
+    return String(r.active != null ? r.active : "1") !== "0";
+  });
+  if (!active.length) return null;
+  const allCarrier = active.find((r) => {
+    const carrier = String(r.carrier != null ? r.carrier : "");
+    const name = String(r.carrierName || "").toLowerCase();
+    return carrier === "0" || name === "all" || name === "all carriers";
+  });
+  const chosen = allCarrier || active[0];
+  return normalizeFakPricing({
+    rate: chosen.rate,
+    min: chosen.min,
+    type: chosen.type,
+  });
+}
+
+/**
+ * @return {string}
+ */
+function fakManageUrl() {
+  return process.env.PRIMUS_UI_MANAGE_URL ||
+    "https://shipprimus.com/PRIMUS/trunk/manage.php";
+}
+
+/**
+ * @param {string|null|undefined} setCookie Set-Cookie header.
+ * @return {string|null}
+ */
+function parsePhpSessId(setCookie) {
+  const m = String(setCookie || "").match(/PHPSESSID=([^;,\s]+)/i);
+  return m ? m[1] : null;
+}
+
+/**
+ * Logs into Primus manage.php for FAK Pricing-tab reads.
+ * @return {Promise<string>} PHPSESSID.
+ */
+async function loginFakManageSession() {
+  const username = process.env.PRIMUS_UI_USERNAME ||
+    process.env.PRIMUS_USERNAME || "";
+  const password = process.env.PRIMUS_UI_PASSWORD ||
+    process.env.PRIMUS_PASSWORD || "";
+  if (!username || !password) {
+    throw new Error("Primus UI credentials not configured for FAK lookup");
+  }
+  const body = new URLSearchParams({
+    action: "login",
+    logout: "false",
+    loginUsername: username,
+    loginPassword: password,
+    browser: "Chrome",
+    browserVersion: "149",
+    os: "Windows",
+  });
+  const resp = await fetch(fakManageUrl(), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+      "X-Requested-With": "XMLHttpRequest",
+    },
+    body: body.toString(),
+    redirect: "manual",
+  });
+  let session = parsePhpSessId(resp.headers.get("set-cookie"));
+  if (!session && resp.headers.getSetCookie) {
+    for (const c of resp.headers.getSetCookie() || []) {
+      session = parsePhpSessId(c);
+      if (session) break;
+    }
+  }
+  if (!session) throw new Error("Primus UI login failed for FAK lookup");
+  fakManageSession = session;
+  fakManageSessionAt = Date.now();
+  return session;
+}
+
+/**
+ * @return {Promise<string>}
+ */
+async function getFakManageSession() {
+  if (fakManageSession &&
+      (Date.now() - fakManageSessionAt) < FAK_MANAGE_SESSION_TTL_MS) {
+    return fakManageSession;
+  }
+  return loginFakManageSession();
+}
+
+/**
+ * POST manage.php (FAK / shipping-location Pricing tab).
+ * @param {object} params Form fields including action.
+ * @param {boolean} [retryOnAuthFail=true] Re-login once.
+ * @return {Promise<object|null>} Parsed JSON or null.
+ */
+async function fakManagePost(params, retryOnAuthFail = true) {
+  // Prefer shared bridge session when available (same Cloud Function process).
+  try {
+    const bridge = require("./primus-ui-bridge");
+    if (typeof bridge.managePhpPost === "function") {
+      const res = await bridge.managePhpPost(params);
+      if (res && res.json && typeof res.json === "object") return res.json;
+      if (res && res.ok === false && retryOnAuthFail) {
+        // fall through to direct login
+      } else if (res && res.json == null && res.text) {
+        try {
+          return JSON.parse(res.text);
+        } catch (_) {
+          // continue
+        }
+      }
+    }
+  } catch (_) {
+    // bridge optional / uninitialized
+  }
+
+  let cookie = await getFakManageSession();
+  const doPost = async (sessionCookie) => {
+    const form = new URLSearchParams();
+    for (const [key, value] of Object.entries(params || {})) {
+      if (value == null) continue;
+      form.set(key, typeof value === "object" ?
+        JSON.stringify(value) : String(value));
+    }
+    const resp = await fetch(fakManageUrl(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        Cookie: `PHPSESSID=${sessionCookie}`,
+        "X-Requested-With": "XMLHttpRequest",
+      },
+      body: form.toString(),
+    });
+    const text = await resp.text();
+    if (/no session started|session expired/i.test(text)) {
+      const err = new Error("FAK manage session expired");
+      err.authFailed = true;
+      throw err;
+    }
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return null;
+    }
+  };
+
+  try {
+    return await doPost(cookie);
+  } catch (err) {
+    if (retryOnAuthFail && err && err.authFailed) {
+      cookie = await loginFakManageSession();
+      return doPost(cookie);
+    }
+    throw err;
+  }
+}
+
+/**
+ * Resolves manage.php shipping-location id (recordId) for a REST idHashed.
+ * @param {string} restId REST shipping location id.
+ * @param {object} [opts] customerName / shippingLocationName.
+ * @return {Promise<string|null>} manage.php id.
+ */
+async function resolveManageShippingLocationId(restId, opts = {}) {
+  const rest = String(restId || "").trim();
+  if (!rest) return null;
+  if (opts.manageShippingLocationId) {
+    return String(opts.manageShippingLocationId).trim() || null;
+  }
+
+  const name = String(
+      opts.customerName ||
+      opts.shippingLocationName ||
+      (opts.shippingLocation && (
+        opts.shippingLocation.name ||
+        opts.shippingLocation.companyName ||
+        opts.shippingLocation.company)) ||
+      "").trim();
+  if (!name) return null;
+
+  const listJson = await fakManagePost({
+    action: "getShippingLocations",
+    query: name.slice(0, 80),
+    start: "0",
+    limit: "25",
+  });
+  const rows = (listJson && listJson.shipping_locations) || [];
+  const candidates = rows
+      .filter((r) => r && r.id != null)
+      .sort((a, b) => {
+        // Prefer customer locations over ship-to-only rows.
+        const ac = String(a.customer || "") === "1" ? 0 : 1;
+        const bc = String(b.customer || "") === "1" ? 0 : 1;
+        return ac - bc;
+      })
+      .slice(0, 8);
+
+  for (const row of candidates) {
+    const manageId = String(row.id);
+    try {
+      const detail = await fakManagePost({
+        action: "getShippingLocation",
+        recordId: manageId,
+      });
+      const data = detail && detail.data;
+      if (!data) continue;
+      if (String(data.idHashed) === rest || String(data.showLogId) === rest) {
+        return manageId;
+      }
+    } catch (_) {
+      // try next candidate
+    }
+  }
+
+  // Single exact-name customer hit: accept without hash when unique.
+  const exact = candidates.filter((r) =>
+    String(r.name || "").trim().toLowerCase() === name.toLowerCase() &&
+    String(r.customer || "") === "1");
+  if (exact.length === 1) return String(exact[0].id);
+  return null;
+}
+
+/**
+ * Loads FAK Pricing-tab markup from Primus manage.php for a REST customer id.
+ * Path: name → manage recordId → getShippingLocationsCarrierMarkups
+ * (masterBillingType=FAK). REST /database/shippinglocation has no Pricing.
+ * @param {string|number} customerId REST shipping location id.
+ * @param {object} [opts] customerName, shippingLocation, manageShippingLocationId.
+ * @return {Promise<{rate: number, type: string, min: number}|null>}
+ */
+async function fetchCustomerFakPricingFromPrimus(customerId, opts = {}) {
+  if (typeof fetchFakPricingImplForTest === "function") {
+    return fetchFakPricingImplForTest(customerId, opts);
+  }
+  const restId = customerId != null ? String(customerId).trim() : "";
+  if (!restId) return null;
+
+  const cached = fakPricingLiveCache.get(restId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.value;
+  }
+
+  let value = null;
+  try {
+    const fetchOpts = {...opts};
+    if (!fetchOpts.customerName && !fetchOpts.shippingLocationName &&
+        !(fetchOpts.shippingLocation && fetchOpts.shippingLocation.name)) {
+      try {
+        const loc = await getShippingLocationById(restId);
+        if (loc && loc.name) {
+          fetchOpts.shippingLocation = loc;
+          fetchOpts.customerName = String(loc.name).trim();
+        }
+      } catch (_) {
+        // name lookup optional
+      }
+    }
+    const manageId = await resolveManageShippingLocationId(restId, fetchOpts);
+    if (manageId) {
+      const detail = await fakManagePost({
+        action: "getShippingLocation",
+        recordId: manageId,
+      });
+      const ratingType = String(
+          (detail && detail.data && detail.data.ratingType) || "FAK");
+      const profileId = String(
+          (detail && detail.data && detail.data.profileId) || "0");
+      const markupsJson = await fakManagePost({
+        action: "getShippingLocationsCarrierMarkups",
+        shippingLocationId: manageId,
+        masterBillingType: ratingType || "FAK",
+        profileId: profileId || "0",
+      });
+      value = pickFakPricingFromCarrierMarkups(
+          markupsJson && markupsJson.markups);
+    }
+  } catch (err) {
+    console.warn("fetchCustomerFakPricingFromPrimus failed",
+        restId, err && err.message);
+    value = null;
+  }
+
+  fakPricingLiveCache.set(restId, {
+    expiresAt: Date.now() + FAK_LIVE_CACHE_TTL_MS,
+    value,
+  });
+  return value;
+}
+
+/**
+ * Sync FAK resolve (opts → SL parse → map override). No live Primus call.
  * @param {string|number|null|undefined} customerId Shipping location id.
  * @param {object} [opts] fakPricing override, shippingLocation row.
  * @return {{rate: number, type: string, min: number}|null}
@@ -315,6 +636,42 @@ function resolveFakPricingForCustomer(customerId, opts = {}) {
   const fromLoc = parseFakPricingFromShippingLocation(opts.shippingLocation);
   if (fromLoc) return fromLoc;
   return getCustomerFakPricing(customerId);
+}
+
+/**
+ * Async FAK resolve for market-fallback: opts → map override → live manage
+ * Pricing tab → SL parse.
+ * @param {string|number|null|undefined} customerId REST shipping location id.
+ * @param {object} [opts] fakPricing, shippingLocation, customerName.
+ * @return {Promise<{rate: number, type: string, min: number}|null>}
+ */
+async function resolveFakPricingForCustomerAsync(customerId, opts = {}) {
+  const fromOpts = normalizeFakPricing(opts.fakPricing);
+  if (fromOpts) return fromOpts;
+  // Explicit map/env override wins over live Primus (ops force / cache).
+  const fromMap = getCustomerFakPricing(customerId);
+  if (fromMap) return fromMap;
+  const fromLoc = parseFakPricingFromShippingLocation(opts.shippingLocation);
+  if (fromLoc) return fromLoc;
+  return fetchCustomerFakPricingFromPrimus(customerId, opts);
+}
+
+/**
+ * @param {Function|null} fn Test double (customerId, opts) => fak|null|Promise.
+ * @return {void}
+ */
+function setFetchFakPricingImplForTest(fn) {
+  fetchFakPricingImplForTest = fn;
+  fakPricingLiveCache.clear();
+}
+
+/**
+ * @return {void}
+ */
+function clearFakPricingLiveCacheForTest() {
+  fakPricingLiveCache.clear();
+  fakManageSession = null;
+  fakManageSessionAt = 0;
 }
 
 /**
@@ -1434,7 +1791,13 @@ module.exports = {
   normalizeFakPricing,
   getCustomerFakPricing,
   parseFakPricingFromShippingLocation,
+  pickFakPricingFromCarrierMarkups,
   resolveFakPricingForCustomer,
+  resolveFakPricingForCustomerAsync,
+  fetchCustomerFakPricingFromPrimus,
+  resolveManageShippingLocationId,
+  setFetchFakPricingImplForTest,
+  clearFakPricingLiveCacheForTest,
   isMarketFallbackRateSource,
   marketFallbackFakWarning,
   tagRateOptions,

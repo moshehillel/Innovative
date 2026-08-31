@@ -849,10 +849,16 @@ async function rateLane(lane, ctx) {
     rates = fetched.rates || [];
     noRates = fetched.noRates || [];
     if (rates.length) {
-      fakPricing = rateShop.resolveFakPricingForCustomer(
+      fakPricing = await rateShop.resolveFakPricingForCustomerAsync(
           ctx.shippingLocationId, {
             fakPricing: ctx.fakPricing,
             shippingLocation: ctx.shippingLocation,
+            customerName: ctx.shippingLocationName ||
+              ctx.customerName ||
+              (ctx.shippingLocation && ctx.shippingLocation.name) ||
+              "",
+            shippingLocationName: ctx.shippingLocationName || "",
+            manageShippingLocationId: ctx.manageShippingLocationId,
           });
       if (fakPricing) {
         rateSource = "market_fallback_fak";
