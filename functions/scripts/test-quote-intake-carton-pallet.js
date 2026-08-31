@@ -693,6 +693,68 @@ check("Leo collapsed 325 each",
 check("Leo collapsed weightType each",
     leoSplit.map((r) => r.weightType), ["each", "each"]);
 
+// 3 pallets + three dim variants must stay 3 pcs (not 3+1+1 or 3+2+1).
+// Screenshot bug: Rancho Cucamonga → Kansas City showed 6 pcs @ 316.5.
+const KC_MIXED_BODY = [
+  "Total Cartons – 90",
+  "Total weight – 1,899 with pallets",
+  "Number of Pallets - 3",
+  "Pallet dimensions (L *W *H) – 3 plts @ 40x48x84, 40x48x87, 40x48x47",
+].join("\n");
+
+const kcLabeled = intake.parseLabeledFreightTotals(KC_MIXED_BODY);
+check("KC labeled palletCount 3", kcLabeled.palletCount, 3);
+check("KC labeled weight 1899", kcLabeled.weight, 1899);
+
+const kcMixed = intake.extractMixedQtyAtDimLines(
+    KC_MIXED_BODY, kcLabeled.palletCount);
+check("KC mixed qty 1+1+1 not 3+1+1", kcMixed.map((r) => r.qty), [1, 1, 1]);
+check("KC mixed heights", kcMixed.map((r) => r.height), [84, 87, 47]);
+
+const kcNoHint = intake.extractMixedQtyAtDimLines(KC_MIXED_BODY, null);
+check("KC no-hint still 1+1+1 (N===variants)",
+    kcNoHint.map((r) => r.qty), [1, 1, 1]);
+
+const kcAiOvercount = {
+  lanes: [{
+    laneKey: "KC_MO",
+    freightInfo: [
+      {
+        qty: 3, weight: 316.5, weightType: "each",
+        length: 40, width: 48, height: 84, dimType: "PLT",
+      },
+      {
+        qty: 2, weight: 316.5, weightType: "each",
+        length: 40, width: 48, height: 87, dimType: "PLT",
+      },
+      {
+        qty: 1, weight: 316.5, weightType: "each",
+        length: 40, width: 48, height: 47, dimType: "PLT",
+      },
+    ],
+  }],
+};
+intake.normalizeExtractedQuote(kcAiOvercount, {body: KC_MIXED_BODY});
+const kcRows = kcAiOvercount.lanes[0].freightInfo;
+check("KC fix total pcs 3 not 6",
+    kcRows.reduce((s, r) => s + (Number(r.qty) || 0), 0), 3);
+check("KC fix qty 1+1+1", kcRows.map((r) => r.qty), [1, 1, 1]);
+check("KC fix weight 633 each (1899/3)",
+    kcRows.map((r) => r.weight), [633, 633, 633]);
+check("KC fix weightType each",
+    kcRows.map((r) => r.weightType), ["each", "each", "each"]);
+check("KC fix heights preserved",
+    kcRows.map((r) => r.height), [84, 87, 47]);
+
+// Explicit inflated @ qtys still capped by Number of Pallets.
+const KC_INFLATED_BODY = [
+  "Total weight – 1,899 with pallets",
+  "Number of Pallets - 3",
+  "Pallet dimensions (L *W *H) – 3 plts @ 40x48x84, 2 plts @ 40x48x87, 1 plt @ 40x48x47",
+].join("\n");
+const kcInf = intake.extractMixedQtyAtDimLines(KC_INFLATED_BODY, 3);
+check("KC inflated @ capped to 1+1+1", kcInf.map((r) => r.qty), [1, 1, 1]);
+
 // Per-line lbs already present → do not overwrite with even split.
 const coreforceKeep = {
   lanes: [{

@@ -407,6 +407,9 @@ function quoteExtractSystemPrompt() {
     "   pallet: weight 325, weightType \"each\" on EVERY line",
     "   (1300/4). Do NOT put 1300 on the first line and invent 1 lb",
     "   on the second. Do NOT put the full total on only one dim group.",
+    "6c) \"Number of Pallets - 3\" + \"3 plts @ 40x48x84, 40x48x87,",
+    "   40x48x47\" → THREE freight lines qty 1 each (total 3 pcs),",
+    "   not 3+1+1=5 or 3+2+1=6. Divide total weight by 3 per pallet.",
     "7) Zip-only \"from 08701 to 22911\" → shipper.zipCode 08701 and",
     "   consignee.zipCode 22911 even if city/state are blank.",
     "8) \"Please include any additional charges applicable for",
@@ -1042,6 +1045,8 @@ function parseLabeledFreightTotals(body) {
 /**
  * "3 plts @ 48x40x85, 48x40x66" / "3 plts @ 48x40x85, 1 plt @ 48x40x66".
  * Bare trailing dims get remaining pallet qty when hint is known.
+ * "N plts @ A, B, C" with N dim variants → 1 each (N is total, not
+ * first-line qty). Labeled pallet count caps over-counted @ qtys.
  * @param {string} body Email body.
  * @param {number|null} palletCountHint Number of Pallets from labels.
  * @return {Array<object>}
@@ -1062,9 +1067,11 @@ function extractMixedQtyAtDimLines(body, palletCountHint) {
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
       "gi");
   let m;
+  let explicitQtyAtCount = 0;
   while ((m = qtyAtRe.exec(blob)) !== null) {
     const qty = Number(m[1]);
     if (!(qty > 0)) continue;
+    explicitQtyAtCount += 1;
     covered.push([m.index, m.index + m[0].length]);
     freight.push(freightDims.normalizePalletDims({
       qty,
@@ -1097,13 +1104,35 @@ function extractMixedQtyAtDimLines(body, palletCountHint) {
 
   if (!freight.length) return [];
 
+  // "3 plts @ A, B, C" → leading 3 is the shipment total listing three
+  // dim variants (1 each), not qty 3 of A plus bare B/C.
+  if (explicitQtyAtCount === 1 && freight.length >= 2) {
+    const leadQty = Math.max(0, Number(freight[0].qty) || 0);
+    if (leadQty === freight.length) {
+      for (const row of freight) row.qty = 1;
+    }
+  }
+
   if (palletCountHint != null && palletCountHint > 0) {
-    const sum = freight.reduce((s, r) =>
+    let sum = freight.reduce((s, r) =>
       s + (Math.max(0, Number(r.qty) || 0)), 0);
     if (sum < palletCountHint) {
       const last = freight[freight.length - 1];
       last.qty = (Math.max(0, Number(last.qty) || 0)) +
         (palletCountHint - sum);
+    } else if (sum > palletCountHint) {
+      // Number of Pallets wins over inflated @ multipliers (e.g. AI/email
+      // "3 @ A, 2 @ B, 1 @ C" when labeled total is 3).
+      if (freight.length === palletCountHint) {
+        for (const row of freight) row.qty = 1;
+      } else if (freight.length < palletCountHint) {
+        for (const row of freight) row.qty = 1;
+        const last = freight[freight.length - 1];
+        last.qty += palletCountHint - freight.length;
+      } else {
+        freight.length = palletCountHint;
+        for (const row of freight) row.qty = 1;
+      }
     }
   }
   return freight;
@@ -1346,6 +1375,16 @@ function applyLabeledFreightTotals(freightInfo, labeled) {
 
   // Multi-line: fill dims only — never dump shipment total onto every row.
   // redistributeEvenTotalWeight assigns even per-pallet lbs afterward.
+  // When AI invents 3+2+1 across three dim lines but Number of Pallets is 3,
+  // collapse qtys to 1 each so total pieces match the label.
+  if (palletCount != null && rows.length >= 2 &&
+      rows.length === palletCount) {
+    const totalQty = rows.reduce((sum, r) =>
+      sum + (Math.max(0, Number(r.qty) || 0)), 0);
+    if (totalQty !== palletCount) {
+      rows = rows.map((r) => ({...r, qty: 1}));
+    }
+  }
   return rows.map((r) => {
     const filled = fillLabeledFreightFields(r, lab, {skipWeight: true});
     if (lab.weight != null && rows.length >= 2) {
