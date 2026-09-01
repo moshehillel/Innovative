@@ -653,7 +653,8 @@ function isTransientNetworkError(message) {
   if (!m) return false;
   return /timeout|timed out|econnreset|econnrefused|enetunreach/.test(m) ||
     /fetch failed|network error|socket hang up/.test(m) ||
-    /status 502|status 503|status 504|aborted/.test(m);
+    /status 502|status 503|status 504|aborted/.test(m) ||
+    /referenced transaction has expired|transaction has expired/.test(m);
 }
 
 /**

@@ -1090,24 +1090,39 @@ exports.processPrimusWorkflow = onRequest(
 
         const flowId = invoice.flowId || invoice.gmailMessageId || invoiceId;
 
-        const lockAcquired = await db.runTransaction(async (tx) => {
-          const snap = await tx.get(invoiceDoc.ref);
-          if (!snap.exists) return false;
-          const data = snap.data() || {};
-          if (data.processingLock === true) return false;
-          tx.update(invoiceDoc.ref, {
-            processingLock: true,
-            lastHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(),
-            currentStep: resumeFrom || "start",
-            processingStartedAt: data.processingStartedAt ||
-          admin.firestore.FieldValue.serverTimestamp(),
-            flowId: flowId,
-            finalWorkflowStatus: "running",
-            pendingDelayedRetry: false,
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          return true;
-        });
+        let lockAcquired = false;
+        const lockAttempts = 3;
+        for (let lockAttempt = 1; lockAttempt <= lockAttempts; lockAttempt++) {
+          try {
+            lockAcquired = await db.runTransaction(async (tx) => {
+              const snap = await tx.get(invoiceDoc.ref);
+              if (!snap.exists) return false;
+              const data = snap.data() || {};
+              if (data.processingLock === true) return false;
+              tx.update(invoiceDoc.ref, {
+                processingLock: true,
+                lastHeartbeatAt: admin.firestore.FieldValue.serverTimestamp(),
+                currentStep: resumeFrom || "start",
+                processingStartedAt: data.processingStartedAt ||
+              admin.firestore.FieldValue.serverTimestamp(),
+                flowId: flowId,
+                finalWorkflowStatus: "running",
+                pendingDelayedRetry: false,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              return true;
+            });
+            break;
+          } catch (lockErr) {
+            const lockMsg = lockErr && lockErr.message ?
+              lockErr.message : String(lockErr || "");
+            if (!workflowErrors.isTransientNetworkError(lockMsg) ||
+                lockAttempt === lockAttempts) {
+              throw lockErr;
+            }
+            await new Promise((r) => setTimeout(r, 300 * lockAttempt));
+          }
+        }
 
         if (!lockAcquired) {
           await writeLog("warn", "workflow",

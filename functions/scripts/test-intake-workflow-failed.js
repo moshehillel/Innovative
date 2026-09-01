@@ -40,6 +40,17 @@ check("split child maps to gmailQueue item id",
 check("fetch failed is a system / transient crash",
     workflowErrors.isTransientNetworkError("fetch failed") === true &&
     workflowErrors.looksLikeSystemError("fetch failed") === true);
+check("expired Firestore lock is transient",
+    workflowErrors.isTransientNetworkError(
+        "3 INVALID_ARGUMENT: The referenced transaction has expired " +
+        "or is no longer valid.") === true);
+check("expired Firestore lock schedules a delayed retry",
+    workflowErrors.shouldDelayWorkflowRetry({
+      errorMessage:
+        "3 INVALID_ARGUMENT: The referenced transaction has expired " +
+        "or is no longer valid.",
+      delayedRetryCount: 0,
+    }) === true);
 check("missing POD is not a system crash",
     workflowErrors.isTransientNetworkError("MISSING_POD") === false &&
     workflowErrors.looksLikeSystemError("No POD document") === false);

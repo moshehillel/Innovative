@@ -11746,6 +11746,8 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     taiSteps: {...taiSteps, customerRateChecked: true},
     workflowPausedAtStep: null,
     workflowPausedAt: null,
+    decisionStage: "running",
+    decisionReason: null,
     finalWorkflowStatus: "running",
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });

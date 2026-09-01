@@ -54,6 +54,10 @@ check("UI billing still uses Billing failed",
     lines.some((l) => l.startsWith("Billing failed — load 111")));
 check("fetch failed is treated as transient",
     workflowErrors.isTransientNetworkError("TypeError: fetch failed"));
+check("expired Firestore transaction is treated as transient",
+    workflowErrors.isTransientNetworkError(
+        "3 INVALID_ARGUMENT: The referenced transaction has expired " +
+        "or is no longer valid."));
 check("delayed retry is offered on first transient fail",
     workflowErrors.shouldDelayWorkflowRetry({
       errorMessage: "fetch failed",
