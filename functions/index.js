@@ -3931,7 +3931,11 @@ async function preCheckDocumentType(pdfBuffer) {
             "to pay, even if the first page is only a statement summary " +
             "(common for Saia, AAA Cooper, JTS Express numbered " +
             "Statement packets, and other LTL carriers — later pages " +
-            "are the actual invoices).",
+            "are the actual invoices). Also use INVOICE when the first " +
+            "page is a Notice of Assignment, factor cover letter, or " +
+            "ACH/banking remittance page and later pages are the " +
+            "freight bill (Thunder Funding, REV Capital, and similar " +
+            "factoring companies).",
         },
       ],
     }],
@@ -5529,6 +5533,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Each invoice gets its OWN pod.documents limited to that load's " +
         "delivery pages only.",
         "Find the actual carrier invoice.",
+        "If the first page is a Notice of Assignment, factor cover " +
+        "letter, or ACH/banking remittance instructions, skip that " +
+        "cover and extract the carrier freight invoice from later pages.",
         "loadNumber is ONLY the broker/customer shipment ID that matches " +
         "Primus (often labeled Load #, Customer Ref, Broker Ref, Reference " +
         "#, Reference Number). It must be EXACTLY 6 digits for Innovative " +
@@ -8151,7 +8158,15 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  'Invoice for processing; Invoice #299 - Purchase Order #266504'",
       "  with a PDF is a factored carrier freight invoice — Purchase Order",
       "  # is the broker load. Classify as carrier_invoice, not statement",
-      "  or unknown.",
+      "  or unknown. Do not classify as unknown just because Thunder",
+      "  Funding is a factoring company rather than the trucking carrier.",
+      "  First page is often a Notice of Assignment; later pages are the",
+      "  bill. ACH/banking updates attached with the invoice are still",
+      "  carrier_invoice.",
+      "- Factoring companies (Thunder Funding, REV Capital, RM Capital,",
+      "  Single Point, FactorView, Compass FS, Apex, and similar) that",
+      "  email Invoice # / PO # / REF # with a PDF are carrier_invoice,",
+      "  even when page 1 is a Notice of Assignment or banking letter.",
       "- Single Point Capital (reports@singlepointgroup.com): subject",
       "  'Single Point Capital; Invoice #265914' with a PDF is a factored",
       "  carrier freight invoice. Classify as carrier_invoice, not statement",
@@ -9129,12 +9144,20 @@ async function processGmailMessage(
               });
         }
         if (docType !== "INVOICE" && docType !== "POD") {
-          if (shouldTreatStatementCoverAsInvoiceBundle({
-            preCheckLabel,
-            subject, from, filename: attachment.filename,
-            pageCount,
-            body: emailBody,
-          })) {
+          const keepAsInvoice =
+            shouldTreatStatementCoverAsInvoiceBundle({
+              preCheckLabel,
+              subject, from, filename: attachment.filename,
+              pageCount,
+              body: emailBody,
+            }) ||
+            statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
+                subject, from, emailBody) ||
+            statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
+                attachment.filename, from, "") ||
+            administrativeEmailIntake.looksLikeInvoiceEmailContent(
+                subject, emailBody);
+          if (keepAsInvoice) {
             docType = "INVOICE";
             await writeLog("info", "mail",
                 "Statement-cover PDF treated as invoice bundle", {
@@ -9240,12 +9263,20 @@ async function processGmailMessage(
                   });
             }
             if (docType !== "INVOICE" && docType !== "POD") {
-              if (shouldTreatStatementCoverAsInvoiceBundle({
-                preCheckLabel,
-                subject, from, filename: attachment.filename,
-                pageCount,
-                body: emailBody,
-              })) {
+              const keepAsInvoice =
+                shouldTreatStatementCoverAsInvoiceBundle({
+                  preCheckLabel,
+                  subject, from, filename: attachment.filename,
+                  pageCount,
+                  body: emailBody,
+                }) ||
+                statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
+                    subject, from, emailBody) ||
+                statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
+                    attachment.filename, from, "") ||
+                administrativeEmailIntake.looksLikeInvoiceEmailContent(
+                    subject, emailBody);
+              if (keepAsInvoice) {
                 docType = "INVOICE";
               } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
                 skippedDocTypes.push("STATEMENT");

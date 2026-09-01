@@ -86,21 +86,34 @@ function looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from) {
 }
 
 /**
+ * Factor "Invoice for processing; Invoice #123 - Purchase Order #26xxxx".
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function looksLikeInvoiceForProcessingSubject(subject) {
+  const sub = String(subject || "");
+  return /invoice\s+for\s+processing/i.test(sub) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub);
+}
+
+/**
  * Thunder Funding factored freight invoices:
  * "Invoice for processing; Invoice #299 - Purchase Order #266504".
+ * First page is often a Notice of Assignment; later pages are the bill.
  * @param {string} subject Email subject.
  * @param {string} from Email sender.
  * @return {boolean}
  */
 function looksLikeThunderFundingInvoiceEmail(subject, from) {
   const fromL = String(from || "").toLowerCase();
-  if (!fromL.includes("thunderfunding.com")) return false;
   const sub = String(subject || "");
-  if (/invoice\s+for\s+processing/i.test(sub) &&
-      /\binvoice\s+#?\s*\d+/i.test(sub)) {
-    return true;
+  if (fromL.includes("thunderfunding.com")) {
+    return looksLikeInvoiceForProcessingSubject(sub) ||
+      looksLikeFactoredPurchaseOrderInvoiceEmail(sub) ||
+      /\binvoice\s+#?\s*\d+/i.test(sub);
   }
-  return looksLikeFactoredPurchaseOrderInvoiceEmail(sub);
+  return looksLikeInvoiceForProcessingSubject(sub) &&
+    looksLikeFactoredPurchaseOrderInvoiceEmail(sub);
 }
 
 /**
@@ -201,6 +214,7 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeFactorViewPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeThunderFundingInvoiceEmail(sub, from)) return true;
+  if (looksLikeInvoiceForProcessingSubject(sub)) return true;
   if (looksLikeSinglePointCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeRmCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeRevCapitalInvoiceEmail(sub, from)) return true;
@@ -240,6 +254,9 @@ function looksLikeStatementCoverInvoicePacketEmail(
     return true;
   }
   if (looksLikeThunderFundingInvoiceEmail(subject, from)) {
+    return true;
+  }
+  if (looksLikeInvoiceForProcessingSubject(subject)) {
     return true;
   }
   if (looksLikeSinglePointCapitalInvoiceEmail(subject, from)) {
@@ -300,6 +317,10 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
       context.subject, context.from)) {
     return true;
   }
+  if (looksLikeInvoiceForProcessingSubject(context.subject) ||
+      looksLikeInvoiceForProcessingSubject(context.filename)) {
+    return true;
+  }
   if (looksLikeSinglePointCapitalInvoiceEmail(
       context.subject, context.from)) {
     return true;
@@ -319,6 +340,14 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
     return true;
   }
   if (looksLikeFactorNameInvoiceSubject(context.subject)) {
+    return true;
+  }
+  if (looksLikeCarrierInvoiceEmail(
+      context.subject, context.from, context.body)) {
+    return true;
+  }
+  if (looksLikeCarrierInvoiceEmail(
+      context.filename, context.from, "")) {
     return true;
   }
 
@@ -389,6 +418,11 @@ function normalizePreCheckDocType(docType, context = {}) {
         context.subject, context.from, context.body)) {
       return "INVOICE";
     }
+    // Outlook often names the PDF after the email subject.
+    if (looksLikeCarrierInvoiceEmail(
+        context.filename, context.from, "")) {
+      return "INVOICE";
+    }
   }
   return label || "OTHER";
 }
@@ -431,7 +465,8 @@ function overrideStatementClassificationIfInvoicePacket(
   const current = classification && typeof classification === "object" ?
     classification : {intent: "unknown"};
   const isInvoicePacket = looksLikeStatementCoverInvoicePacketEmail(
-      subject, from, body, attachments);
+      subject, from, body, attachments) ||
+    looksLikeCarrierInvoiceEmail(subject, from, body);
   if (!isInvoicePacket) return current;
   if (current.intent === "carrier_invoice") return current;
   if (current.intent !== "statement" && current.intent !== "unknown") {
@@ -440,6 +475,8 @@ function overrideStatementClassificationIfInvoicePacket(
   const compass = looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from);
   const factorView =
     looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from);
+  const thunder = looksLikeThunderFundingInvoiceEmail(subject, from) ||
+    looksLikeInvoiceForProcessingSubject(subject);
   const rmCapital = looksLikeRmCapitalInvoiceEmail(subject, from);
   const revCapital = looksLikeRevCapitalInvoiceEmail(subject, from);
   let reasoning =
@@ -451,6 +488,10 @@ function overrideStatementClassificationIfInvoicePacket(
   } else if (factorView) {
     reasoning =
       "FactorView factored freight invoice — Your PO # is the load.";
+  } else if (thunder) {
+    reasoning =
+      "Thunder Funding / factor invoice — first page may be NOA; " +
+      "later pages are the carrier bill. Purchase Order # is the load.";
   } else if (rmCapital) {
     reasoning =
       "RM Capital factored freight invoice — REF # is the broker load.";
@@ -578,6 +619,7 @@ module.exports = {
   looksLikeFactoredPurchaseOrderInvoiceEmail,
   looksLikeFactorViewPurchaseOrderInvoiceEmail,
   looksLikeThunderFundingInvoiceEmail,
+  looksLikeInvoiceForProcessingSubject,
   looksLikeSinglePointCapitalInvoiceEmail,
   looksLikeRmCapitalInvoiceEmail,
   looksLikeRevCapitalInvoiceEmail,

@@ -285,6 +285,30 @@ check("Thunder Funding 1-page OTHER cover → INVOICE",
 check("Thunder Funding packet email",
     bundle.looksLikeStatementCoverInvoicePacketEmail(
         tfSubject, tfFrom, "", tfPdf), true);
+check("Thunder Funding unknown classification overridden to carrier_invoice",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "unknown", confidence: "high",
+          reasoning: "funding company not a carrier"},
+        tfSubject, tfFrom, "", tfPdf).intent, "carrier_invoice");
+check("Thunder Funding NOA-cover OTHER + subject filename → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: tfSubject,
+      from: tfFrom,
+      filename:
+        "Invoice for processing; Invoice #7826 - Purchase Order #266943.pdf",
+      pageCount: 3,
+    }), "INVOICE");
+check("Thunder Funding octet-stream PDF still a packet",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        tfSubject, tfFrom, "", [{
+          filename:
+            "Invoice for processing; Invoice #7826 - Purchase Order #266943.pdf",
+          mimeType: "application/octet-stream",
+        }]), true);
+check("Invoice for processing subject without factor domain",
+    bundle.looksLikeInvoiceForProcessingSubject(
+        "Invoice for processing; Invoice #7826 - Purchase Order #266943"),
+    true);
 check("Purchase Order # (not PO #) matches factored PO subject",
     bundle.looksLikeFactoredPurchaseOrderInvoiceEmail(
         "Invoice #299 - Purchase Order #266504"), true);

@@ -730,15 +730,21 @@ check("Thunder Funding has invoice veto",
       attachments: tfPdf,
       invoicePdfCount: 0,
     }));
-check("Thunder Funding carrier_invoice classification triggers veto",
-    adm.hasInvoiceVeto({
-      subject: tfSubject,
-      body: tfBody,
-      from: tfFrom,
-      attachments: tfPdf,
-      emailClassification: {intent: "carrier_invoice"},
-      invoicePdfCount: 0,
-    }));
+check("Thunder Funding 7826 Invoice for processing recognized",
+    adm.looksLikeInvoiceEmailContent(
+        "Invoice for processing; Invoice #7826 - Purchase Order #266943",
+        "updated payment and banking information"));
+check("Thunder Funding 7826 banking update is not a payment alert",
+    !adm.shouldIgnoreAsPaymentNotification(
+        "Invoice for processing; Invoice #7826 - Purchase Order #266943",
+        tfFrom,
+        "They also notify the recipient of updated payment and banking " +
+        "information.",
+        [{
+          filename:
+            "Invoice for processing; Invoice #7826 - Purchase Order #266943.pdf",
+          mimeType: "application/octet-stream",
+        }]));
 
 const spcSubject = "Single Point Capital; Invoice #265914";
 const spcFrom = "reports@singlepointgroup.com";
