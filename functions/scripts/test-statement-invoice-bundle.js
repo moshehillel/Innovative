@@ -339,6 +339,35 @@ check("RM Capital unknown classification overridden to carrier_invoice",
         {intent: "unknown", confidence: "low", reasoning: "unclear"},
         rmSubject, rmFrom, "", rmPdf).intent, "carrier_invoice");
 
+const revSubject =
+  "REV CAPITAL/CENTRAL FORCE TRANSPORT INC., Invoice # 6672 Part 1 of 1";
+const revFrom = "Billing <invoices@revinc.com>";
+const revPdf = [{
+  filename: "6672.pdf",
+  mimeType: "application/pdf",
+}];
+check("REV Capital subject detected",
+    bundle.looksLikeRevCapitalInvoiceEmail(revSubject, revFrom), true);
+check("REV Capital factor-name comma Invoice # subject",
+    bundle.looksLikeFactorNameInvoiceSubject(revSubject), true);
+check("REV Capital looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(revSubject, revFrom, ""), true);
+check("REV Capital 1-page OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: revSubject,
+      from: revFrom,
+      filename: revPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("REV Capital packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        revSubject, revFrom, "", revPdf), true);
+check("REV Capital unknown classification overridden to carrier_invoice",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "unknown", confidence: "low",
+          reasoning: "banking information"},
+        revSubject, revFrom, "", revPdf).intent, "carrier_invoice");
+
 check("parseStatementIndexLoadNumbers dedupes and sorts",
     JSON.stringify(bundle.parseStatementIndexLoadNumbers(
         "Load 265379 266088 265379 266219 265630")),

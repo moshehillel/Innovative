@@ -5292,15 +5292,34 @@ async function sendAdditionalChargeApprovalEmail(opts) {
 
   // Attach the carrier invoice PDF (GCS) so Sarah/Lisa can review the bill.
   let attachedInvoicePdf = false;
+  const attachmentHints = {
+    proNumber: aiResult.proNumber,
+    attachmentFilename: aiResult.attachmentFilename,
+  };
   try {
     let attachmentMeta = additionalCharges.pickCarrierInvoiceAttachment(
-        opts.invoiceAttachments);
+        opts.invoiceAttachments, attachmentHints);
     if (!attachmentMeta && invoiceId && tenant) {
       const invSnap = await tcol(tenant, "invoices")
           .doc(String(invoiceId)).get();
       if (invSnap.exists) {
         attachmentMeta = additionalCharges.pickCarrierInvoiceAttachment(
-            (invSnap.data() || {}).attachments);
+            (invSnap.data() || {}).attachments, attachmentHints);
+      }
+    }
+    if (attachmentMeta && attachmentMeta.storagePath) {
+      const validation = additionalCharges.validateCarrierInvoiceAttachment(
+          attachmentMeta, attachmentHints);
+      if (!validation.ok) {
+        await writeLog("warn", "email",
+            "Blocked wrong carrier invoice PDF on approval email", {
+              invoiceId,
+              loadNumber: aiResult.loadNumber,
+              proNumber: aiResult.proNumber,
+              pickedFilename: attachmentMeta.filename,
+              reason: validation.reason,
+            });
+        attachmentMeta = null;
       }
     }
     if (attachmentMeta && attachmentMeta.storagePath) {
@@ -5315,6 +5334,17 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         }];
         attachedInvoicePdf = true;
       }
+    } else if (Array.isArray(opts.invoiceAttachments) &&
+        opts.invoiceAttachments.length > 1 &&
+        aiResult.proNumber) {
+      await writeLog("warn", "email",
+          "Additional-charge approval sent without carrier PDF " +
+          "(batch PRO match failed)", {
+            invoiceId,
+            loadNumber: aiResult.loadNumber,
+            proNumber: aiResult.proNumber,
+            attachmentCount: opts.invoiceAttachments.length,
+          });
     }
   } catch (attachErr) {
     await writeLog("warn", "email",
@@ -8107,6 +8137,13 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  broker load. Classify as carrier_invoice, not statement or unknown.",
       "- Factoring companies that email 'REF# 26xxxx' (broker load in",
       "  subject) with a PDF freight bill are carrier_invoice, not unknown.",
+      "- REV Capital (invoices@revinc.com): subject",
+      "  'REV CAPITAL/CARRIER NAME, Invoice # 6672 Part 1 of 1' with a",
+      "  PDF is a factored carrier freight invoice. ACH/wire/banking",
+      "  remittance instructions attached with the bill are still",
+      "  carrier_invoice, not a bank payment alert or unknown.",
+      "- Factor invoices that include ACH/wire/banking remittance",
+      "  instructions (how to pay the factor) are still carrier_invoice.",
       "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",
       "  delivery photos — not asking us to send one.",
       "- pod_request: sender asks Innovative to SEND or provide a POD /",
@@ -10637,12 +10674,25 @@ async function processGmailMessage(
           filename: att.filename,
           storagePath: att.storagePath,
           mimeType: att.mimeType,
+          docType: att.docType,
         }));
-        if (preferredName) {
-          const preferred = invoiceAttachments.filter(
-              (a) => a.filename === preferredName);
-          const rest = invoiceAttachments.filter(
-              (a) => a.filename !== preferredName);
+        const loadAtt = podUtils.findInvoiceAttachment(invoiceAttachments, {
+          proNumber: aiResult.proNumber,
+          attachmentFilename: preferredName,
+        });
+        if (loadAtt && aiResult.proNumber) {
+          invoiceAttachments = invoiceAttachments.filter((a) => {
+            if (/WEIGHT_INSPECTION_CERT/i.test(String(a.docType || ""))) {
+              return true;
+            }
+            return podUtils.attachmentFilenamesMatch(
+                a.filename, loadAtt.filename);
+          });
+        } else if (preferredName) {
+          const preferred = invoiceAttachments.filter((a) =>
+            podUtils.attachmentFilenamesMatch(a.filename, preferredName));
+          const rest = invoiceAttachments.filter((a) =>
+            !podUtils.attachmentFilenamesMatch(a.filename, preferredName));
           if (preferred.length) {
             invoiceAttachments = preferred.concat(rest);
           }

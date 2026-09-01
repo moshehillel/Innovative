@@ -339,6 +339,7 @@ function isCarrierOrFactorSender(from) {
     "thunderfunding.com",
     "singlepointgroup.com",
     "rmcapitalinc.com",
+    "revinc.com",
     "rtsinc.com",
     "rtsfinancial.com",
     "cjfinancing.com",
@@ -978,8 +979,21 @@ function looksLikeInvoiceEmailContent(subject, body) {
   }
   // RM Capital / similar factors: "REF# 266111" — REF # is the broker load.
   if (/^ref\s*#\s*\d{5,9}\b/i.test(sub)) return true;
+  // REV Capital: "REV CAPITAL/CARRIER, Invoice # 6672 Part 1 of 1"
+  if (/revinc\.com/i.test(content) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
+  if (/rev\s*capital/i.test(content) &&
+      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
   // Factor-name prefix subjects: "Factor Name; Invoice #123"
-  if (/;\s*invoice\s+#?\s*\d+/i.test(sub)) {
+  // or "FACTOR/CARRIER, Invoice # 6672 Part 1 of 1"
+  if (/[;,]\s*invoice\s+#?\s*\d+/i.test(sub)) {
+    return true;
+  }
+  if (/\binvoice\s+#?\s*\d+\s+part\s+\d+\s+of\s+\d+/i.test(sub)) {
     return true;
   }
   // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."

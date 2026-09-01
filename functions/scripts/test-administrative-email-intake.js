@@ -802,6 +802,41 @@ check("RM Capital carrier_invoice classification triggers veto",
       invoicePdfCount: 0,
     }));
 
+const revSubject =
+  "REV CAPITAL/CENTRAL FORCE TRANSPORT INC., Invoice # 6672 Part 1 of 1";
+const revFrom = "Billing <invoices@revinc.com>";
+const revBody =
+  "REV Capital is sending invoice #6672 for Central Force Transport " +
+  "Inc. and requesting that payment be submitted electronically using " +
+  "the attached banking information.";
+const revPdf = [{filename: "6672.pdf", mimeType: "application/pdf"}];
+check("REV Capital subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent(revSubject, revBody));
+check("REV Capital factor domain recognized",
+    adm.isCarrierOrFactorSender(revFrom));
+check("REV Capital not NOA",
+    !adm.isNoticeOfAssignmentEmail(revSubject, revFrom, revBody));
+check("REV Capital not payment inquiry",
+    !adm.isPaymentInquiryEmail(revSubject, revFrom, revBody));
+check("REV Capital ACH remittance body is not a payment alert",
+    !adm.shouldIgnoreAsPaymentNotification(
+        revSubject, revFrom, revBody, revPdf));
+check("REV Capital has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: revSubject,
+      body: revBody,
+      from: revFrom,
+      attachments: revPdf,
+      invoicePdfCount: 0,
+    }));
+check("REV Capital OTHER attachment would veto (not forward)",
+    adm.hasInvoiceVeto({
+      subject: revSubject,
+      from: revFrom,
+      attachments: [{filename: "6672.pdf", mimeType: "application/pdf"}],
+      invoicePdfCount: 0,
+    }));
+
 const hstileSubject = "Payment 08/25/26";
 const hstileFrom = "Michel Schwartz <michel@hstile.com>";
 const hstileBody =

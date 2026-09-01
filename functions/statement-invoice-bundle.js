@@ -131,6 +131,36 @@ function looksLikeRmCapitalInvoiceEmail(subject, from) {
 }
 
 /**
+ * REV Capital factored freight invoices:
+ * "REV CAPITAL/CENTRAL FORCE TRANSPORT INC., Invoice # 6672 Part 1 of 1"
+ * from invoices@revinc.com. Invoice # is the factor bill; the PDF is the
+ * carrier freight invoice to pay. ACH/banking instructions may be attached.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeRevCapitalInvoiceEmail(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  const sub = String(subject || "");
+  if (!fromL.includes("revinc.com") && !/rev\s*capital/i.test(sub)) {
+    return false;
+  }
+  return /\binvoice\s+#?\s*\d+/i.test(sub);
+}
+
+/**
+ * Factor-name prefix subjects: "Single Point Capital; Invoice #265914"
+ * or "REV CAPITAL/CARRIER, Invoice # 6672 Part 1 of 1".
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function looksLikeFactorNameInvoiceSubject(subject) {
+  const sub = String(subject || "").trim();
+  if (/[;,]\s*invoice\s+#?\s*\d+/i.test(sub)) return true;
+  return /\binvoice\s+#?\s*\d+\s+part\s+\d+\s+of\s+\d+/i.test(sub);
+}
+
+/**
  * Factored carrier invoice subjects that cite the broker load as REF#.
  * @param {string} subject Email subject.
  * @return {boolean}
@@ -173,10 +203,10 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
   if (looksLikeThunderFundingInvoiceEmail(sub, from)) return true;
   if (looksLikeSinglePointCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeRmCapitalInvoiceEmail(sub, from)) return true;
+  if (looksLikeRevCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeRefNumberInvoiceSubject(sub)) return true;
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(sub)) return true;
-  // Factor-name prefix: "Single Point Capital; Invoice #265914"
-  if (/;\s*invoice\s+#?\s*\d+/i.test(sub)) return true;
+  if (looksLikeFactorNameInvoiceSubject(sub)) return true;
   if (looksLikeNumberedStatementSubject(sub)) return true;
   if (/^invoice\s+\d+\s+from\b/i.test(sub)) return true;
   // Allow optional whitespace after "#": "Invoice # 981 …"
@@ -218,13 +248,16 @@ function looksLikeStatementCoverInvoicePacketEmail(
   if (looksLikeRmCapitalInvoiceEmail(subject, from)) {
     return true;
   }
+  if (looksLikeRevCapitalInvoiceEmail(subject, from)) {
+    return true;
+  }
   if (looksLikeRefNumberInvoiceSubject(subject)) {
     return true;
   }
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(subject)) {
     return true;
   }
-  if (/;\s*invoice\s+#?\s*\d+/i.test(String(subject || ""))) {
+  if (looksLikeFactorNameInvoiceSubject(subject)) {
     return true;
   }
   if (looksLikeNumberedStatementSubject(subject)) return true;
@@ -275,13 +308,17 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
       context.subject, context.from)) {
     return true;
   }
+  if (looksLikeRevCapitalInvoiceEmail(
+      context.subject, context.from)) {
+    return true;
+  }
   if (looksLikeRefNumberInvoiceSubject(context.subject)) {
     return true;
   }
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(context.subject)) {
     return true;
   }
-  if (/;\s*invoice\s+#?\s*\d+/i.test(String(context.subject || ""))) {
+  if (looksLikeFactorNameInvoiceSubject(context.subject)) {
     return true;
   }
 
@@ -404,6 +441,7 @@ function overrideStatementClassificationIfInvoicePacket(
   const factorView =
     looksLikeFactorViewPurchaseOrderInvoiceEmail(subject, from);
   const rmCapital = looksLikeRmCapitalInvoiceEmail(subject, from);
+  const revCapital = looksLikeRevCapitalInvoiceEmail(subject, from);
   let reasoning =
     "Numbered carrier statement packet — first page is a " +
     "statement cover; later pages are freight invoices to process.";
@@ -416,9 +454,15 @@ function overrideStatementClassificationIfInvoicePacket(
   } else if (rmCapital) {
     reasoning =
       "RM Capital factored freight invoice — REF # is the broker load.";
+  } else if (revCapital) {
+    reasoning =
+      "REV Capital factored freight invoice — PDF is the carrier bill.";
   } else if (looksLikeRefNumberInvoiceSubject(subject)) {
     reasoning =
       "Factored carrier freight invoice — REF # in subject is the load.";
+  } else if (looksLikeFactorNameInvoiceSubject(subject)) {
+    reasoning =
+      "Factored carrier freight invoice — Invoice # in subject.";
   }
   return {
     ...current,
@@ -536,6 +580,8 @@ module.exports = {
   looksLikeThunderFundingInvoiceEmail,
   looksLikeSinglePointCapitalInvoiceEmail,
   looksLikeRmCapitalInvoiceEmail,
+  looksLikeRevCapitalInvoiceEmail,
+  looksLikeFactorNameInvoiceSubject,
   looksLikeRefNumberInvoiceSubject,
   hasProcessablePdfAttachment,
   looksLikeCarrierInvoiceEmail,
