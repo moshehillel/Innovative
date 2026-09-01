@@ -1345,6 +1345,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `padding:8px 12px;border-radius:8px;font-size:14px;cursor:pointer}` +
     `.remove-btn{background:#fff;color:#dc2626;border:1px solid #fecaca;` +
     `border-radius:8px;width:32px;height:42px;cursor:pointer}` +
+    `@keyframes spin{to{transform:rotate(360deg)}}` +
     `</style></head>` +
     `<body style="font-family:Arial,sans-serif;max-width:560px;` +
     `margin:48px auto;padding:0 16px;color:#111827">` +
@@ -1394,7 +1395,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `container.appendChild(wrap);}` +
     `(seedRows.length?seedRows:[{name:"",amount:""}]).forEach(addRow);` +
     `document.getElementById("add-bill-line").onclick=()=>addRow({});` +
-    `document.getElementById("option-b-form").onsubmit=()=>{` +
+    `document.getElementById("option-b-form").onsubmit=(e)=>{` +
     `const lines=[...container.querySelectorAll(".bill-row")].map((row)=>{` +
     `return {name:row.querySelector(".bill-name").value.trim(),` +
     `amount:Number(row.querySelector(".bill-amount").value)};` +
@@ -1402,7 +1403,15 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `if(!lines.length){alert("Enter at least one accessorial and amount.");` +
     `return false;}` +
     `document.getElementById("customerBillLinesJson").value=` +
-    `JSON.stringify(lines);return true;};` +
+    `JSON.stringify(lines);` +
+    `const btn=e.target.querySelector('button[type="submit"]');` +
+    `if(btn&&!btn.disabled){btn.disabled=true;` +
+    `btn.innerHTML='<span style="display:inline-block;width:16px;` +
+    `height:16px;border:2px solid rgba(255,255,255,.35);` +
+    `border-top-color:#fff;border-radius:50%;` +
+    `animation:spin .7s linear infinite;` +
+    `vertical-align:-3px;margin-right:8px"></span>Processing…';}` +
+    `return true;};` +
     `</script></body></html>`;
 }
 

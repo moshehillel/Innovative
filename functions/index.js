@@ -2734,7 +2734,8 @@ function buildEmailActionConfirmPage(opts) {
   }).join("");
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
-    `<title>${escapeHtml(opts.title || "Confirm")}</title></head>` +
+    `<title>${escapeHtml(opts.title || "Confirm")}</title>` +
+    `<style>@keyframes spin{to{transform:rotate(360deg)}}</style></head>` +
     `<body style="font-family:Arial,sans-serif;max-width:520px;` +
     `margin:48px auto;padding:0 16px;color:#111827">` +
     `<h1 style="font-size:22px;margin-bottom:12px">` +
@@ -2752,7 +2753,44 @@ function buildEmailActionConfirmPage(opts) {
     `</form>` +
     `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
     `If you did not request this, close this page - nothing has been ` +
-    `changed yet.</p></body></html>`;
+    `changed yet.</p>` +
+    `<script>` +
+    `document.querySelector("form")?.addEventListener("submit",(e)=>{` +
+    `const btn=e.target.querySelector('button[type="submit"]');` +
+    `if(!btn||btn.disabled)return;btn.disabled=true;` +
+    `btn.innerHTML='<span style="display:inline-block;width:16px;height:16px;` +
+    `border:2px solid rgba(255,255,255,.35);border-top-color:#fff;` +
+    `border-radius:50%;animation:spin .7s linear infinite;` +
+    `vertical-align:-3px;margin-right:8px"></span>Processing…';` +
+    `});` +
+    `</script></body></html>`;
+}
+
+/**
+ * Immediate acknowledgment page after POST — heavy work continues in background.
+ * @param {object} opts Page options.
+ * @return {string} HTML.
+ */
+function buildEmailActionProcessingPage(opts) {
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${escapeHtml(opts.title || "Processing")}</title>` +
+    `<style>@keyframes spin{to{transform:rotate(360deg)}}</style>` +
+    `</head><body style="font-family:Arial,sans-serif;text-align:center;` +
+    `padding:48px;color:#111827">` +
+    `<div style="width:40px;height:40px;border:3px solid #e5e7eb;` +
+    `border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear ` +
+    `infinite;margin:0 auto 20px"></div>` +
+    `<h1 style="font-size:22px;margin-bottom:12px;color:#111827">` +
+    `${escapeHtml(opts.title || "Processing your decision")}</h1>` +
+    `<p style="font-size:16px;color:#374151;line-height:1.5;max-width:420px;` +
+    `margin:0 auto">` +
+    `${opts.message || "Jerry is updating billing now. You can close this " +
+    "page — we will email if anything needs follow-up."}</p>` +
+    (opts.loadNumber ?
+      `<p style="font-size:13px;color:#9ca3af;margin-top:20px">Load ` +
+      `${escapeHtml(String(opts.loadNumber))}</p>` : "") +
+    `</body></html>`;
 }
 
 /**
@@ -2923,14 +2961,7 @@ async function handleAdditionalChargeAction(req, res) {
         },
       };
       if (option === "a" || option === "e") {
-        let bookingForRate = null;
-        try {
-          bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
-        } catch (_) {
-          // Best-effort default for the amount field.
-        }
-        const currentRate = await resolveCurrentCustomerRate(
-            invoice, bookingForRate);
+        const currentRate = Number(invoice.customerRate) || 0;
         const defaultCharge = Number(charge.amount) || 0;
         const rateNote = currentRate > 0 ?
           ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
@@ -2963,14 +2994,7 @@ async function handleAdditionalChargeAction(req, res) {
         return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
       }
       if (option === "b") {
-        let bookingForRate = null;
-        try {
-          bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
-        } catch (_) {
-          // Best-effort default for the amount field.
-        }
-        const currentRate = await resolveCurrentCustomerRate(
-            invoice, bookingForRate);
+        const currentRate = Number(invoice.customerRate) || 0;
         return res.status(200).send(
             additionalCharges.buildOptionBAccessorialConfirmPage({
               title: "Confirm option B",
@@ -3033,334 +3057,334 @@ async function handleAdditionalChargeAction(req, res) {
       return res.status(400).send("Could not process this decision.");
     }
 
-    const chargesTotal = Number(charge.amount) || 0;
-    const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
-
-    let booking = null;
-    try {
-      booking = await fetchPrimusBooking(invoice.loadNumber);
-    } catch (_) {
-      // Booking lookup is best-effort for emails below.
-    }
-    const customerName = invoice.customerName ||
-      customerNameFromPrimusBooking(booking);
-    const primusUiBridge = require("./primus-ui-bridge");
-
-    if (option === "d") {
-      // Not approved — generate the dispute draft for manual submission.
-      const dispute = additionalCharges.buildDisputeEmailDraft({
-        loadNumber: invoice.loadNumber,
-        carrierName: invoice.carrierName,
-        proNumber: invoice.proNumber,
-        invoiceNumber: invoice.invoiceNumber,
-        invoiceAmount: invoice.invoiceAmount,
-        expectedAmount: invoice.primusAmount ||
-          (Number(invoice.invoiceAmount) || 0) - chargesTotal,
-        charges: chargeRows,
-        category: charge.category,
-        freightMismatch: charge.freightMismatch,
-        hasCertificate: charge.hasCertificate,
-        customerRate: invoice.customerRate ||
-          customerRateFromBooking(booking),
-      });
-      await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
-        type: "carrier_dispute_draft",
-        invoiceId: String(invoiceId),
-        subject: dispute.subject,
-        html: dispute.html,
-      }));
-      await invoiceRef.update({
-        "additionalCharge.decision": decision,
-        "additionalCharge.approved": false,
-        "additionalCharge.status": "disputed",
-        "additionalCharge.decidedAt":
-          admin.firestore.FieldValue.serverTimestamp(),
-        "decisionStage": "additional_charge_disputed",
-        "decisionReason": "Charge not approved — dispute draft generated",
-        "finalWorkflowStatus": "failed",
-        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-      });
-      await additionalCharges.updateFollowUp(db, {
-        invoiceId: String(invoiceId),
-        status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
-        decision,
-        notes: "Dispute draft emailed for manual submission",
-      });
-      await writeLog("info", "workflow",
-          "Additional charge NOT approved — dispute draft generated", {
-            invoiceId, loadNumber: invoice.loadNumber, decision,
-          });
-      return htmlPage("Dispute draft created", "#dc2626",
-          "The charge was not approved. Jerry emailed a dispute draft " +
-          "for manual submission to the carrier.");
-    }
-
-    // Options a/b/c/e — the charge is approved for the carrier side.
-    const billCustomer = option === "a" || option === "b" || option === "e";
-
-    // A/E: approver enters customer charge amount; bump sell rate by that amount.
-    // B: approver itemizes accessorials on the confirm page.
-    let rateBumpNote = "";
-    const approvalUpdate = {
-      "additionalCharge.decision": decision,
-      "additionalCharge.approved": true,
-      "additionalCharge.billCustomer": billCustomer,
-      "additionalCharge.notifyCustomer": option === "a" ? "auto" :
-        (option === "b" ? "dispatcher" :
-          (option === "e" ? "none" : null)),
-      "additionalCharge.status": "approved",
-      "additionalCharge.decidedAt":
-        admin.firestore.FieldValue.serverTimestamp(),
-      // Clear the gates so the workflow can proceed with the full carrier
-      // amount (baseAmount excludes the approved charge).
-      "unrecognizedCharges": [],
-      "chargesNeedProof": [],
-      "decisionStage": "additional_charge_approved",
-      "decisionReason": `Additional charge approved (option ${decision})`,
-      "finalWorkflowStatus": "created",
-      "workflowPausedAtStep": null,
-      "workflowPausedAt": null,
-      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    const processingMessages = {
+      a: "Option A recorded. Jerry is billing the customer and resuming " +
+        "the workflow — you can close this page.",
+      b: "Option B recorded. Jerry is updating accessorial billing and " +
+        "resuming the workflow — you can close this page.",
+      c: "Option C recorded. Jerry is paying the carrier and resuming the " +
+        "workflow — you can close this page.",
+      d: "Option D recorded. Jerry is generating the dispute draft — you " +
+        "can close this page.",
+      e: "Option E recorded. Jerry is updating the customer rate and " +
+        "resuming the workflow — you can close this page.",
     };
+    res.status(200).send(buildEmailActionProcessingPage({
+      title: `Option ${decision} submitted`,
+      message: processingMessages[option],
+      loadNumber: invoice.loadNumber || invoiceId,
+    }));
 
-    if ((option === "a" || option === "e") &&
-        optionACustomerChargeAmount > 0) {
-      const baseRate = await resolveCurrentCustomerRate(invoice, booking);
-      const billAmount = optionACustomerChargeAmount;
-      approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
-      approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
-      if (baseRate > 0) {
-        const bumpedRate =
-          Math.round((baseRate + billAmount) * 100) / 100;
-        approvalUpdate.customerRate = bumpedRate;
-        approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
-        approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
-        rateBumpNote = ` Customer charged $${billAmount.toFixed(2)}; ` +
-          `rate bumped from $${baseRate.toFixed(2)} to ` +
-          `$${bumpedRate.toFixed(2)}.`;
-        invoice.customerRate = bumpedRate;
-      } else {
-        rateBumpNote = ` Customer charge amount $${billAmount.toFixed(2)} ` +
-          `recorded, but the current customer rate could not be resolved - ` +
-          `please bump it manually before invoicing.`;
-      }
-    } else if (billCustomer && chargesTotal > 0 && option === "b") {
-      const baseRate = await resolveCurrentCustomerRate(invoice, booking);
-      const billLines = optionBCustomerBillLines || [];
-      const billExtra = additionalCharges.sumCustomerBillLines(billLines);
-      approvalUpdate["additionalCharge.customerBillLines"] = billLines;
-      approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
-        billExtra;
-      approvalUpdate["additionalCharge.originalCustomerRate"] =
-        baseRate > 0 ? baseRate : null;
-      rateBumpNote = baseRate > 0 ?
-        ` Base customer rate stays $${baseRate.toFixed(2)}.` :
-        " Base customer rate unchanged.";
-      rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
-        ` ($${billExtra.toFixed(2)}).`;
-    }
+    try {
+      const chargesTotal = Number(charge.amount) || 0;
+      const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
 
-    await invoiceRef.update(approvalUpdate);
-
-    let extraNote = rateBumpNote;
-    let skipDispatcherNotify = false;
-    if (option === "a") {
-      // Auto-notify the customer contact on file.
-      let customerEmail = null;
+      let booking = null;
       try {
-        const emails = await primusUiBridge
-            .resolveCustomerAccountingEmails(booking);
-        customerEmail = emails.emails && emails.emails[0] || null;
+        booking = await fetchPrimusBooking(invoice.loadNumber);
       } catch (_) {
-        customerEmail = null;
+        // Booking lookup is best-effort for emails below.
       }
-      if (customerEmail) {
-        const note = additionalCharges.buildCustomerChargeNotificationEmail({
-          customerName,
+      const customerName = invoice.customerName ||
+        customerNameFromPrimusBooking(booking);
+      const primusUiBridge = require("./primus-ui-bridge");
+
+      if (option === "d") {
+        // Not approved — generate the dispute draft for manual submission.
+        const dispute = additionalCharges.buildDisputeEmailDraft({
           loadNumber: invoice.loadNumber,
+          carrierName: invoice.carrierName,
+          proNumber: invoice.proNumber,
+          invoiceNumber: invoice.invoiceNumber,
+          invoiceAmount: invoice.invoiceAmount,
+          expectedAmount: invoice.primusAmount ||
+            (Number(invoice.invoiceAmount) || 0) - chargesTotal,
           charges: chargeRows,
-          chargesTotal: optionACustomerChargeAmount != null ?
-            optionACustomerChargeAmount : chargesTotal,
           category: charge.category,
+          freightMismatch: charge.freightMismatch,
+          hasCertificate: charge.hasCertificate,
           customerRate: invoice.customerRate ||
             customerRateFromBooking(booking),
         });
-        await saveOutboundEmail(
-            additionalCharges.applyAdditionalChargeEmailCc({
-              type: "additional_charge_customer_notice",
-              invoiceId: String(invoiceId),
-              forceRecipient: true,
-              to: customerEmail,
-              subject: note.subject,
-              html: note.html,
-              skipAgentGreeting: true,
-            }));
-        extraNote += ` The customer was notified at ${customerEmail}.`;
-      } else {
-        extraNote += " Could not resolve the customer email from Primus — " +
-          "please notify the customer manually.";
-      }
-      await additionalCharges.updateFollowUp(db, {
-        invoiceId: String(invoiceId),
-        status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
-        decision,
-        notes: extraNote.trim(),
-      });
-    } else if (option === "e") {
-      // Same billing as A, but skip the separate customer notification —
-      // the additional charge is included on the customer invoice.
-      extraNote += " No separate customer notification sent; charge will " +
-        "be included on the customer invoice.";
-      await additionalCharges.updateFollowUp(db, {
-        invoiceId: String(invoiceId),
-        status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
-        decision,
-        notes: extraNote.trim(),
-      });
-    } else if (option === "b") {
-      // Dispatcher notifies the customer — unless Primus already reconciles
-      // the carrier total (line item is breakdown only, not a real overage).
-      try {
-        const reCheck = await reconcileUnrecognizedChargesWithPrimus(
-            invoice.loadNumber,
-            invoice.invoiceAmount,
-            chargeRows);
-        if (reCheck.override) {
-          skipDispatcherNotify = true;
-          extraNote += " Carrier invoice total already matches Primus" +
-            (reCheck.totalMatches ? " (within $10)" :
-              reCheck.chargesInPrimus ?
-                " (charge already in vendor breakdown)" :
-                " (invoice at/under Primus cost)") +
-            " — dispatcher customer notification skipped.";
-          await writeLog("info", "workflow",
-              "Option B: skipped dispatcher notify — Primus reconciled", {
-                invoiceId,
-                loadNumber: invoice.loadNumber,
-                invoiceAmount: invoice.invoiceAmount,
-                vendorCost: reCheck.vendorCost,
-                totalMatches: reCheck.totalMatches,
-                chargesInPrimus: reCheck.chargesInPrimus,
-              });
-        }
-      } catch (_) {
-        // Best-effort; still notify dispatcher if re-check fails.
-      }
-
-      if (!skipDispatcherNotify) {
-        // Dispatcher must notify the customer — remind them / task it.
-        let dispatcher = {ok: false};
-        try {
-          dispatcher = await primusUiBridge.resolveDispatcherEmail({
-            booking,
-            loadNumber: invoice.loadNumber,
-            fetchBooking: fetchPrimusBooking,
-          });
-        } catch (err) {
-          dispatcher = {ok: false, error: err.message};
-        }
-        const reminder = additionalCharges.buildDispatcherNotifyReminderEmail({
-          dispatcherName: dispatcher.displayName || dispatcher.userName || null,
-          loadNumber: invoice.loadNumber,
-          carrierName: invoice.carrierName,
-          customerName,
-          charges: chargeRows,
-          chargesTotal,
-          customerRate: await resolveCurrentCustomerRate(invoice, booking),
-          customerBillLines:
-            approvalUpdate["additionalCharge.customerBillLines"] || [],
+        await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
+          type: "carrier_dispute_draft",
+          invoiceId: String(invoiceId),
+          subject: dispute.subject,
+          html: dispute.html,
+        }));
+        await invoiceRef.update({
+          "additionalCharge.decision": decision,
+          "additionalCharge.approved": false,
+          "additionalCharge.status": "disputed",
+          "additionalCharge.decidedAt":
+            admin.firestore.FieldValue.serverTimestamp(),
+          "decisionStage": "additional_charge_disputed",
+          "decisionReason": "Charge not approved — dispute draft generated",
+          "finalWorkflowStatus": "failed",
+          "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
         });
-        const podFollowup = require("./pod-followup");
-        const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-          podFollowup.SARAH_EMAIL;
-        const reminderPayload = {
-          type: "additional_charge_dispatcher_task",
+        await additionalCharges.updateFollowUp(db, {
           invoiceId: String(invoiceId),
-          subject: reminder.subject,
-          html: reminder.html,
-        };
-        if (dispatcher.ok && dispatcher.email) {
-          reminderPayload.forceRecipient = true;
-          reminderPayload.to = dispatcher.email;
-          if (approver) reminderPayload.cc = approver;
-          extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
-            `to notify the customer.`;
-        } else {
-          extraNote += " Could not resolve the dispatcher email — the " +
-            "reminder went to the ops mailbox instead.";
-        }
-        await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc(
-            additionalCharges.applyAdditionalChargeEmailCc(reminderPayload)));
-      }
-
-      await additionalCharges.updateFollowUp(db, {
-        invoiceId: String(invoiceId),
-        status: skipDispatcherNotify ?
-          additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED :
-          additionalCharges.FOLLOW_UP_STATUS
-              .APPROVED_BILLED_DISPATCHER_NOTIFIES,
-        decision,
-        notes: extraNote.trim(),
-      });
-    } else {
-      // Option c — carrier only, customer rate unchanged.
-      await additionalCharges.updateFollowUp(db, {
-        invoiceId: String(invoiceId),
-        status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_CARRIER_ONLY,
-        decision,
-        notes: "Carrier paid in full; customer not billed",
-      });
-    }
-
-    // Resume the billing workflow with the charge approved.
-    const workflowUrl = workflowUrlForTenant(tenant);
-    if (workflowUrl) {
-      fetch(workflowUrl, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          invoiceId: String(invoiceId),
-          tenantId: tenant.tenantId,
-        }),
-      }).catch((e) =>
-        console.error("additionalChargeAction: resume failed", e.message));
-    }
-
-    await writeLog("info", "workflow",
-        "Additional charge approved — workflow resumed", {
-          invoiceId,
-          loadNumber: invoice.loadNumber,
+          status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
           decision,
-          billCustomer,
+          notes: "Dispute draft emailed for manual submission",
         });
+        await writeLog("info", "workflow",
+            "Additional charge NOT approved — dispute draft generated", {
+              invoiceId, loadNumber: invoice.loadNumber, decision,
+            });
+        return;
+      }
 
-    const titles = {
-      a: "Approved — customer will be notified automatically",
-      b: skipDispatcherNotify ?
-        "Approved — carrier matches Primus; no dispatcher notify needed" :
-        "Approved — dispatcher will notify the customer",
-      c: "Approved — carrier only",
-      e: "Approved — customer billed via invoice (no separate notification)",
-    };
-    const messages = {
-      a: "The carrier bill will be paid in full and the charge billed " +
-        "to the customer." + extraNote,
-      b: skipDispatcherNotify ?
-        "The carrier bill will be paid in full. The base customer rate " +
-        "stays the same and each approved accessorial is added as a " +
-        "separate customer invoice line." + extraNote :
-        "The carrier bill will be paid in full. The base customer rate " +
-        "stays the same and each approved accessorial is added as a " +
-        "separate customer invoice line. The dispatcher was emailed a " +
-        "ready customer-notification template." + extraNote,
-      c: "The carrier bill will be paid in full. The customer rate " +
-        "stays the same.",
-      e: "The carrier bill will be paid in full and the charge billed " +
-        "to the customer on the invoice (no separate notification)." +
-        extraNote,
-    };
-    return htmlPage(titles[option], "#16a34a",
-        messages[option] + " Billing is resuming now.");
+      // Options a/b/c/e — the charge is approved for the carrier side.
+      const billCustomer = option === "a" || option === "b" || option === "e";
+
+      // A/E: approver enters customer charge amount; bump sell rate by that amount.
+      // B: approver itemizes accessorials on the confirm page.
+      let rateBumpNote = "";
+      const approvalUpdate = {
+        "additionalCharge.decision": decision,
+        "additionalCharge.approved": true,
+        "additionalCharge.billCustomer": billCustomer,
+        "additionalCharge.notifyCustomer": option === "a" ? "auto" :
+          (option === "b" ? "dispatcher" :
+            (option === "e" ? "none" : null)),
+        "additionalCharge.status": "approved",
+        "additionalCharge.decidedAt":
+          admin.firestore.FieldValue.serverTimestamp(),
+        // Clear the gates so the workflow can proceed with the full carrier
+        // amount (baseAmount excludes the approved charge).
+        "unrecognizedCharges": [],
+        "chargesNeedProof": [],
+        "decisionStage": "additional_charge_approved",
+        "decisionReason": `Additional charge approved (option ${decision})`,
+        "finalWorkflowStatus": "created",
+        "workflowPausedAtStep": null,
+        "workflowPausedAt": null,
+        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+      };
+
+      if ((option === "a" || option === "e") &&
+          optionACustomerChargeAmount > 0) {
+        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+        const billAmount = optionACustomerChargeAmount;
+        approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
+        approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
+        if (baseRate > 0) {
+          const bumpedRate =
+            Math.round((baseRate + billAmount) * 100) / 100;
+          approvalUpdate.customerRate = bumpedRate;
+          approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
+          approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
+          rateBumpNote = ` Customer charged $${billAmount.toFixed(2)}; ` +
+            `rate bumped from $${baseRate.toFixed(2)} to ` +
+            `$${bumpedRate.toFixed(2)}.`;
+          invoice.customerRate = bumpedRate;
+        } else {
+          rateBumpNote = ` Customer charge amount $${billAmount.toFixed(2)} ` +
+            `recorded, but the current customer rate could not be resolved - ` +
+            `please bump it manually before invoicing.`;
+        }
+      } else if (billCustomer && chargesTotal > 0 && option === "b") {
+        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+        const billLines = optionBCustomerBillLines || [];
+        const billExtra = additionalCharges.sumCustomerBillLines(billLines);
+        approvalUpdate["additionalCharge.customerBillLines"] = billLines;
+        approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
+          billExtra;
+        approvalUpdate["additionalCharge.originalCustomerRate"] =
+          baseRate > 0 ? baseRate : null;
+        rateBumpNote = baseRate > 0 ?
+          ` Base customer rate stays $${baseRate.toFixed(2)}.` :
+          " Base customer rate unchanged.";
+        rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
+          ` ($${billExtra.toFixed(2)}).`;
+      }
+
+      await invoiceRef.update(approvalUpdate);
+
+      let extraNote = rateBumpNote;
+      let skipDispatcherNotify = false;
+      if (option === "a") {
+        // Auto-notify the customer contact on file.
+        let customerEmail = null;
+        try {
+          const emails = await primusUiBridge
+              .resolveCustomerAccountingEmails(booking);
+          customerEmail = emails.emails && emails.emails[0] || null;
+        } catch (_) {
+          customerEmail = null;
+        }
+        if (customerEmail) {
+          const note = additionalCharges.buildCustomerChargeNotificationEmail({
+            customerName,
+            loadNumber: invoice.loadNumber,
+            charges: chargeRows,
+            chargesTotal: optionACustomerChargeAmount != null ?
+              optionACustomerChargeAmount : chargesTotal,
+            category: charge.category,
+            customerRate: invoice.customerRate ||
+              customerRateFromBooking(booking),
+          });
+          await saveOutboundEmail(
+              additionalCharges.applyAdditionalChargeEmailCc({
+                type: "additional_charge_customer_notice",
+                invoiceId: String(invoiceId),
+                forceRecipient: true,
+                to: customerEmail,
+                subject: note.subject,
+                html: note.html,
+                skipAgentGreeting: true,
+              }));
+          extraNote += ` The customer was notified at ${customerEmail}.`;
+        } else {
+          extraNote += " Could not resolve the customer email from Primus — " +
+            "please notify the customer manually.";
+        }
+        await additionalCharges.updateFollowUp(db, {
+          invoiceId: String(invoiceId),
+          status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
+          decision,
+          notes: extraNote.trim(),
+        });
+      } else if (option === "e") {
+        // Same billing as A, but skip the separate customer notification —
+        // the additional charge is included on the customer invoice.
+        extraNote += " No separate customer notification sent; charge will " +
+          "be included on the customer invoice.";
+        await additionalCharges.updateFollowUp(db, {
+          invoiceId: String(invoiceId),
+          status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
+          decision,
+          notes: extraNote.trim(),
+        });
+      } else if (option === "b") {
+        // Dispatcher notifies the customer — unless Primus already reconciles
+        // the carrier total (line item is breakdown only, not a real overage).
+        try {
+          const reCheck = await reconcileUnrecognizedChargesWithPrimus(
+              invoice.loadNumber,
+              invoice.invoiceAmount,
+              chargeRows);
+          if (reCheck.override) {
+            skipDispatcherNotify = true;
+            extraNote += " Carrier invoice total already matches Primus" +
+              (reCheck.totalMatches ? " (within $10)" :
+                reCheck.chargesInPrimus ?
+                  " (charge already in vendor breakdown)" :
+                  " (invoice at/under Primus cost)") +
+              " — dispatcher customer notification skipped.";
+            await writeLog("info", "workflow",
+                "Option B: skipped dispatcher notify — Primus reconciled", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  invoiceAmount: invoice.invoiceAmount,
+                  vendorCost: reCheck.vendorCost,
+                  totalMatches: reCheck.totalMatches,
+                  chargesInPrimus: reCheck.chargesInPrimus,
+                });
+          }
+        } catch (_) {
+          // Best-effort; still notify dispatcher if re-check fails.
+        }
+
+        if (!skipDispatcherNotify) {
+          // Dispatcher must notify the customer — remind them / task it.
+          let dispatcher = {ok: false};
+          try {
+            dispatcher = await primusUiBridge.resolveDispatcherEmail({
+              booking,
+              loadNumber: invoice.loadNumber,
+              fetchBooking: fetchPrimusBooking,
+            });
+          } catch (err) {
+            dispatcher = {ok: false, error: err.message};
+          }
+          const reminder = additionalCharges.buildDispatcherNotifyReminderEmail({
+            dispatcherName: dispatcher.displayName || dispatcher.userName || null,
+            loadNumber: invoice.loadNumber,
+            carrierName: invoice.carrierName,
+            customerName,
+            charges: chargeRows,
+            chargesTotal,
+            customerRate: await resolveCurrentCustomerRate(invoice, booking),
+            customerBillLines:
+              approvalUpdate["additionalCharge.customerBillLines"] || [],
+          });
+          const podFollowup = require("./pod-followup");
+          const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+            podFollowup.SARAH_EMAIL;
+          const reminderPayload = {
+            type: "additional_charge_dispatcher_task",
+            invoiceId: String(invoiceId),
+            subject: reminder.subject,
+            html: reminder.html,
+          };
+          if (dispatcher.ok && dispatcher.email) {
+            reminderPayload.forceRecipient = true;
+            reminderPayload.to = dispatcher.email;
+            if (approver) reminderPayload.cc = approver;
+            extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
+              `to notify the customer.`;
+          } else {
+            extraNote += " Could not resolve the dispatcher email — the " +
+              "reminder went to the ops mailbox instead.";
+          }
+          await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc(
+              additionalCharges.applyAdditionalChargeEmailCc(reminderPayload)));
+        }
+
+        await additionalCharges.updateFollowUp(db, {
+          invoiceId: String(invoiceId),
+          status: skipDispatcherNotify ?
+            additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED :
+            additionalCharges.FOLLOW_UP_STATUS
+                .APPROVED_BILLED_DISPATCHER_NOTIFIES,
+          decision,
+          notes: extraNote.trim(),
+        });
+      } else {
+        // Option c — carrier only, customer rate unchanged.
+        await additionalCharges.updateFollowUp(db, {
+          invoiceId: String(invoiceId),
+          status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_CARRIER_ONLY,
+          decision,
+          notes: "Carrier paid in full; customer not billed",
+        });
+      }
+
+      // Resume the billing workflow with the charge approved.
+      const workflowUrl = workflowUrlForTenant(tenant);
+      if (workflowUrl) {
+        fetch(workflowUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            invoiceId: String(invoiceId),
+            tenantId: tenant.tenantId,
+          }),
+        }).catch((e) =>
+          console.error("additionalChargeAction: resume failed", e.message));
+      }
+
+      await writeLog("info", "workflow",
+          "Additional charge approved — workflow resumed", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            decision,
+            billCustomer,
+          });
+    } catch (bgError) {
+      console.error("additionalChargeAction background error:", bgError);
+      await writeLog("error", "workflow",
+          "Additional charge decision background processing failed", {
+            invoiceId: String(invoiceId),
+            loadNumber: invoice.loadNumber,
+            decision,
+            error: bgError.message,
+          }).catch(() => {});
+    }
+    return;
   } catch (error) {
     console.error("additionalChargeAction error:", error);
     return res.status(500).send("Internal server error.");
