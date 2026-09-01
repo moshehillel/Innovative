@@ -122,6 +122,7 @@ function normalizeExtractedQuote(extracted, opts) {
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
   applyMixedPalletDimLines(next, opts && opts.body);
+  applyPerPalletWeightTable(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
   redistributeEvenTotalWeight(next, opts && opts.body);
   senderRules.applySenderDefaultedDimOverrides(
@@ -461,11 +462,25 @@ function quoteExtractSystemPrompt() {
     "  mixed heights and only a shipment total weight (no per-line lbs),",
     "  divide total/palletCount per piece and use weightType \"each\".",
     "- Standard GMA pallet footprint is 40 x 48 (length 40, width 48).",
+    "  Store L×W×H. If dims are labeled — Length/Width/Height OR just",
+    "  L/W/H (L: 40, W 57, H 48, 40L x 57H x 48W, L 40 x H 57 x W 48)",
+    "  — map by label, not written order. L/W/H means the same as",
+    "  length/width/height. If they put the order in parentheses after",
+    "  the numbers — e.g. 36 x 22 x 45 in (W x H x L) — that is the",
+    "  order of the three numbers (store length 45, width 36, height 22).",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
+    "  If unlabeled numbers include 40 and 48 anywhere (e.g. 40x57x48",
+    "  or 57x40x48), those are L and W (store 40x48); the other number",
+    "  is height.",
+    "  If first and last match (e.g. 45x79x45), that pair is the base",
+    "  and the middle number is height (45x45x79).",
     "  Non-standard footprints (e.g. 48*45*39) keep the stated L and W",
     "  (length 48, width 45, height 39) — do NOT collapse to 40x48.",
-    "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
-    "  and dimType PLT — do not invent dims over explicit values.",
+    "  Do NOT assume the largest number is height when 40 and 48 are",
+    "  absent (96x48x48 stays length 96).",
+    "  Height is unchanged otherwise. If pallet L/W/H are missing,",
+    "  use 40x48x60 and dimType PLT — do not invent dims over",
+    "  explicit values.",
     "- Multiple \"Shipping From STG <city>, <ST>\" sections in one email",
     "  mean separate origin warehouses. Create one lane per origin +",
     "  destination row — never merge freight from different STG origins",
@@ -1025,6 +1040,12 @@ function parseLabeledFreightTotals(body) {
     weight = matchLabeledNumber(text,
         /\bWEIGHT\s*[-–—:=]\s*([\d,]+(?:\.\d+)?)\b/i);
   }
+  if (weight == null) {
+    const tableWeights = extractNumberedPalletWeightTable(text);
+    if (tableWeights.length >= 2) {
+      weight = tableWeights.reduce((sum, w) => sum + w, 0);
+    }
+  }
   const dim = text.match(new RegExp(
       "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*([\\d.]+)\\s*[x×*]\\s*" +
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)",
@@ -1162,6 +1183,88 @@ function extractMixedQtyAtDimLines(body, palletCountHint) {
 }
 
 /**
+ * "pallet weight" numbered table: "1 217" / "2 227" … (iRedeem style).
+ * @param {string} body Email body.
+ * @return {Array<number>} Sequential lbs per pallet (1..N).
+ */
+function extractNumberedPalletWeightTable(body) {
+  const text = String(body || "");
+  const header = text.match(/\bpallet\s+weights?\s*:?\s*(?:\r?\n|$)/i);
+  if (!header) return [];
+  const slice = text.slice(header.index + header[0].length);
+  const entries = [];
+  for (const line of slice.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      if (entries.length) break;
+      continue;
+    }
+    const m = trimmed.match(
+        /^(\d{1,3})\s+([\d,]+(?:\.\d+)?)\s*(?:lbs?\b)?\s*$/i);
+    if (!m) {
+      if (entries.length) break;
+      continue;
+    }
+    const num = Number(m[1]);
+    const weight = parseLooseNumber(m[2]);
+    if (!Number.isFinite(num) || num < 1 || !(weight > 0)) {
+      if (entries.length) break;
+      continue;
+    }
+    entries.push({num, weight});
+  }
+  if (entries.length < 2) return [];
+  for (let i = 0; i < entries.length; i++) {
+    if (entries[i].num !== i + 1) return [];
+  }
+  return entries.map((e) => e.weight);
+}
+
+/**
+ * Expand mixed dim rows (6+1) into unit qty with per-pallet lbs.
+ * @param {Array<object>} dimRows Mixed PLT dim lines.
+ * @param {Array<number>} weights Sequential lbs per pallet.
+ * @return {Array<object>}
+ */
+function expandFreightWithPerPalletWeights(dimRows, weights) {
+  const list = [];
+  let wi = 0;
+  for (const row of Array.isArray(dimRows) ? dimRows : []) {
+    const qty = Math.max(0, Number(row.qty) || 0);
+    for (let i = 0; i < qty; i++) {
+      list.push(freightDims.normalizePalletDims({
+        qty: 1,
+        weight: weights[wi],
+        weightType: "each",
+        class: row.class != null ? row.class : null,
+        length: row.length,
+        width: row.width,
+        height: row.height,
+        dimType: row.dimType || "PLT",
+      }));
+      wi++;
+    }
+  }
+  return list;
+}
+
+/**
+ * Flatten freight rows to qty=1 each (preserve order).
+ * @param {Array<object>} rows Freight lines.
+ * @return {Array<object>}
+ */
+function flattenFreightToUnitQty(rows) {
+  const out = [];
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const qty = Math.max(0, Number(row.qty) || 0) || 1;
+    for (let i = 0; i < qty; i++) {
+      out.push({...row, qty: 1});
+    }
+  }
+  return out;
+}
+
+/**
  * Implied shipment pounds for one freight row.
  * @param {object} row Freight row.
  * @return {number}
@@ -1184,6 +1287,7 @@ function lineImpliedTotalWeight(row) {
 function bodyHasExplicitPerLineWeights(body) {
   const text = String(body || "");
   if (/plts?\s*@[^.\n]{0,40}\d[\d,]*\s*lbs/i.test(text)) return true;
+  if (extractNumberedPalletWeightTable(text).length >= 2) return true;
   const blocks = extractCompactPalletBlocks(text);
   if (blocks.length < 2) return false;
   const labeled = parseLabeledFreightTotals(text);
@@ -1311,6 +1415,64 @@ function applyMixedPalletDimLines(extracted, body) {
     if (sameShape) continue;
     if (rows.length >= 2 && qty === mixedQty) continue;
     lane.freightInfo = mixed.map((row) => ({...row}));
+  }
+  return extracted;
+}
+
+/**
+ * Expand mixed dims + numbered "pallet weight" table into unit rows.
+ * Per-Shipment sections when the RFQ has Shipment 1 / 2 blocks.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyPerPalletWeightTable(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  const sections = extractNumberedShipmentSections(body);
+  const useSections = sections.length >= 2;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    let sectionBody = body;
+    if (useSections) {
+      const section = sections.find((s) =>
+        laneMatchesShipmentSection(lane, s));
+      if (!section) continue;
+      sectionBody = section.text;
+    }
+    const weights = extractNumberedPalletWeightTable(sectionBody);
+    if (weights.length < 2) continue;
+    const labeled = parseLabeledFreightTotals(sectionBody);
+    const dimRows = extractMixedQtyAtDimLines(
+        sectionBody, labeled.palletCount);
+    const dimQty = dimRows.reduce((s, r) =>
+      s + (Math.max(0, Number(r.qty) || 0)), 0);
+    if (dimRows.length && dimQty === weights.length) {
+      lane.freightInfo = expandFreightWithPerPalletWeights(
+          dimRows, weights);
+      continue;
+    }
+    const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+    const flat = flattenFreightToUnitQty(rows);
+    if (flat.length === weights.length) {
+      lane.freightInfo = flat.map((row, i) =>
+        freightDims.normalizePalletDims({
+          ...row,
+          qty: 1,
+          weight: weights[i],
+          weightType: "each",
+        }));
+    } else if (rows.length === 1 &&
+        Math.max(0, Number(rows[0].qty) || 0) === weights.length) {
+      const base = rows[0];
+      lane.freightInfo = weights.map((w) =>
+        freightDims.normalizePalletDims({
+          ...base,
+          qty: 1,
+          weight: w,
+          weightType: "each",
+        }));
+    }
   }
   return extracted;
 }
@@ -2289,6 +2451,7 @@ function normalizeSoleAddressToConsignee(extracted) {
  */
 function inferWeightTypeFromBody(body) {
   const text = String(body || "");
+  if (extractNumberedPalletWeightTable(text).length >= 2) return "each";
   if (/total\s+weight/i.test(text)) return "total";
   if (/(?:weight\s+(?:per|each)|per[\s-]*(?:pallet|piece|skid)|each\s+pallet)/i
       .test(text)) {
@@ -2316,14 +2479,21 @@ function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     lane.freightInfo = rows.map((row) => {
       const base = row && typeof row === "object" ? {...row} : {};
-      const next = freightDims.normalizePalletDims(base, dimOpts);
+      const withLegend = freightDims.applyEmailDimOrderLegend(base, body);
+      const next = freightDims.normalizePalletDims(withLegend, dimOpts);
       if (freightDims.palletDimsWereDefaulted(base, next)) {
         defaultedDims = true;
       }
       const raw = String(next.weightType || "").trim().toLowerCase();
+      const rawIsEach = raw === "each" || raw === "perpiece" ||
+        raw === "per-piece";
       if (weightType === "total") {
-        next.weightType = "total";
-      } else if (raw === "each" || raw === "perpiece" || raw === "per-piece") {
+        if (bodyHasExplicitPerLineWeights(body) && rawIsEach) {
+          next.weightType = "each";
+        } else {
+          next.weightType = "total";
+        }
+      } else if (rawIsEach) {
         next.weightType = "each";
       } else {
         next.weightType = weightType;
@@ -2576,6 +2746,9 @@ module.exports = {
   applyNumberedShipmentPalletBlocks,
   applyEmailPalletBlocks,
   applyMixedPalletDimLines,
+  applyPerPalletWeightTable,
+  extractNumberedPalletWeightTable,
+  expandFreightWithPerPalletWeights,
   redistributeEvenTotalWeight,
   assignEvenWeightPerPallet,
   parseInformalPalletCount,

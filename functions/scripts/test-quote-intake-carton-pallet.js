@@ -881,6 +881,128 @@ check("LFW collapsed 485.6 each",
 check("LFW collapsed heights",
     lfwExp.map((r) => r.height), [90, 87, 85, 89, 22]);
 
+// SH175752 Comfortel axis legend (W x H x L) → Primus LxWxH.
+const sh175752 = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 91, dimType: "PLT",
+      // Scrambled the way the live UI showed (22x36x45).
+      length: 22, width: 36, height: 45,
+    }],
+  }],
+}, {
+  body: "Dimensions: 36 x 22 x 45 in (W x H x L)\nWeight: 91 lbs",
+});
+check("SH175752 (W x H x L) → 45x36x22", [
+  sh175752.lanes[0].freightInfo[0].length,
+  sh175752.lanes[0].freightInfo[0].width,
+  sh175752.lanes[0].freightInfo[0].height,
+], [45, 36, 22]);
+
+// Coraopolis PA 15108 — same Comfortel (W x H x L) legend bug.
+// Live UI stuffed written order into LxWxH as 75x39x38.
+const coraopolis = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 133, dimType: "PLT",
+      length: 75, width: 39, height: 38,
+    }],
+  }],
+}, {
+  body: "Dimensions: 75 x 39 x 38 in (W x H x L)\nWeight: 133 lbs\n" +
+    "Coraopolis, PA 15108",
+});
+check("Coraopolis (W x H x L) → 38x75x39", [
+  coraopolis.lanes[0].freightInfo[0].length,
+  coraopolis.lanes[0].freightInfo[0].width,
+  coraopolis.lanes[0].freightInfo[0].height,
+], [38, 75, 39]);
+
+// iRedeem: numbered "pallet weight" table + mixed @ dims (6+1).
+const IREDEEM_BODY = [
+  "Pallet Dimensions",
+  "6@40x48x68",
+  "1@40x48x47",
+  "",
+  "pallet weight",
+  "1 217",
+  "2 227",
+  "3 234",
+  "4 221",
+  "5 222",
+  "6 230",
+  "7 171",
+  "",
+  "Ship from: 628 Hwy. 202 West, Yellville, AR 72687",
+  "Delivery to: 08527 (Jackson NJ area - consignee same company)",
+  "Ready: 9/1/2026",
+].join("\n");
+
+const iredeemWeights = intake.extractNumberedPalletWeightTable(IREDEEM_BODY);
+check("iRedeem weight table 7 entries",
+    iredeemWeights, [217, 227, 234, 221, 222, 230, 171]);
+check("iRedeem labeled palletCount 7",
+    intake.parseLabeledFreightTotals(IREDEEM_BODY).palletCount, 7);
+check("iRedeem labeled total 1522",
+    intake.parseLabeledFreightTotals(IREDEEM_BODY).weight, 1522);
+
+const iredeemMixed = intake.extractMixedQtyAtDimLines(
+    IREDEEM_BODY,
+    intake.parseLabeledFreightTotals(IREDEEM_BODY).palletCount);
+check("iRedeem mixed dims 6+1",
+    iredeemMixed.map((r) => r.qty), [6, 1]);
+check("iRedeem mixed heights 68+47",
+    iredeemMixed.map((r) => r.height), [68, 47]);
+
+const iredeemEvenSplit = {
+  lanes: [{
+    laneKey: "NJ",
+    freightInfo: [
+      {
+        qty: 6, weight: 217.43, weightType: "each",
+        length: 40, width: 48, height: 68, dimType: "PLT",
+      },
+      {
+        qty: 1, weight: 217.43, weightType: "each",
+        length: 40, width: 48, height: 47, dimType: "PLT",
+      },
+    ],
+  }],
+};
+intake.normalizeExtractedQuote(iredeemEvenSplit, {
+  body: IREDEEM_BODY,
+  subject: "7 pallet quote- PO30516",
+});
+const iredeemRows = iredeemEvenSplit.lanes[0].freightInfo;
+check("iRedeem fix → 7 unit rows", iredeemRows.length, 7);
+check("iRedeem fix qty all 1",
+    iredeemRows.map((r) => r.qty), [1, 1, 1, 1, 1, 1, 1]);
+check("iRedeem fix per-pallet weights",
+    iredeemRows.map((r) => r.weight),
+    [217, 227, 234, 221, 222, 230, 171]);
+check("iRedeem fix heights 6×68 + 1×47",
+    iredeemRows.map((r) => r.height),
+    [68, 68, 68, 68, 68, 68, 47]);
+check("iRedeem fix weightType each",
+    iredeemRows.map((r) => r.weightType),
+    ["each", "each", "each", "each", "each", "each", "each"]);
+
+const iredeemCollapsed = {
+  lanes: [{
+    laneKey: "NJ",
+    freightInfo: [{
+      qty: 7, weight: 1522, weightType: "total",
+      length: 40, width: 48, height: 68, dimType: "PLT",
+    }],
+  }],
+};
+intake.normalizeExtractedQuote(iredeemCollapsed, {body: IREDEEM_BODY});
+const iredeemExp = iredeemCollapsed.lanes[0].freightInfo;
+check("iRedeem collapsed → 7 rows", iredeemExp.length, 7);
+check("iRedeem collapsed weights preserved",
+    iredeemExp.map((r) => r.weight),
+    [217, 227, 234, 221, 222, 230, 171]);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
