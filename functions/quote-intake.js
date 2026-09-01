@@ -118,6 +118,7 @@ function normalizeExtractedQuote(extracted, opts) {
   const missingDimsBefore = palletRowsMissingDims(next);
   normalizeSoleAddressToConsignee(next);
   applyStgShippingFromSections(next, opts && opts.body);
+  applyCoreHomePoTableFreight(next, opts && opts.body);
   fillShipperFromLaneLabelOrigin(next);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
@@ -1286,6 +1287,9 @@ function lineImpliedTotalWeight(row) {
  */
 function bodyHasExplicitPerLineWeights(body) {
   const text = String(body || "");
+  if (isCoreHomePoTable(text) && parseCoreHomeTableRows(text).length >= 2) {
+    return true;
+  }
   if (/plts?\s*@[^.\n]{0,40}\d[\d,]*\s*lbs/i.test(text)) return true;
   if (extractNumberedPalletWeightTable(text).length >= 2) return true;
   const blocks = extractCompactPalletBlocks(text);
@@ -1331,9 +1335,13 @@ function assignEvenWeightPerPallet(rows, totalWeight) {
  * @return {boolean}
  */
 function shouldEvenSplitTotalWeight(rows, body, labeled) {
+  const text = String(body || "");
+  if (isCoreHomePoTable(text) && parseCoreHomeTableRows(text).length >= 2) {
+    return false;
+  }
   const lab = labeled || parseLabeledFreightTotals(body);
   if (lab.weight == null || !(lab.weight > 0)) return false;
-  if (!/total\s+weight/i.test(String(body || ""))) return false;
+  if (!/total\s+weight/i.test(text)) return false;
   const list = Array.isArray(rows) ? rows : [];
   if (list.length < 2) return false;
   const qtySum = list.reduce((s, r) =>
@@ -2261,6 +2269,194 @@ function fillShipperFromLaneLabelOrigin(extracted) {
 }
 
 /**
+ * True for Jared Berman / Core Home STG PO tables (Total Weight + Pallets cols).
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function isCoreHomePoTable(body) {
+  const text = String(body || "");
+  return /shipping\s+from\s+stg\b/i.test(text) &&
+    /\btotal\s+weight\b/i.test(text) &&
+    /\bpallets\b/i.test(text) &&
+    /\bpo\s+number\b/i.test(text);
+}
+
+/**
+ * Count "Shipping From STG" origin headers in the email.
+ * @param {string} body Email body.
+ * @return {number}
+ */
+function countStgOriginHeaders(body) {
+  const text = String(body || "");
+  return [...text.matchAll(
+      /Shipping\s+From\s+STG\s+([^,\n]+),\s*([A-Z]{2})\b/gi)].length;
+}
+
+/**
+ * Parse freight class from text before a weight/ctns/pallets tail.
+ * @param {string} head Text before the numeric tail.
+ * @return {number|null}
+ */
+function parseCoreHomeTableFreightClass(head) {
+  let freightClass = null;
+  const classRe = /(?:^|[\n\r])\s*(\d+(?:\.\d+)?)\s*(?:[\n\r]|\t)/g;
+  let classMatch;
+  while ((classMatch = classRe.exec(head)) !== null) {
+    const n = Number(classMatch[1]);
+    if (n >= 50 && n <= 500) freightClass = n;
+  }
+  return freightClass;
+}
+
+/**
+ * Parse all Core Home / Menards PO table rows (weight + pallets per PO line).
+ * Each row ends with City / State / Zip; numeric tail is
+ * Total Weight, Total Ctns, Pallets, In House Date.
+ * @param {string} body Email body.
+ * @return {Array<object>}
+ */
+function parseCoreHomeTableRows(body) {
+  const text = String(body || "");
+  if (!isCoreHomePoTable(text)) return [];
+  const destRe = new RegExp(
+      "([A-Za-z][A-Za-z .'\\-/()&]{1,48})\\s*[\\n\\r]+\\s*" +
+      "([A-Z]{2})\\s*[\\n\\r]+\\s*(\\d{5})(?:-\\d{4})?\\b",
+      "g");
+  const tailRe = new RegExp(
+      "(\\d[\\d,]*(?:\\.\\d+)?)[\\s\\n]+(\\d+)[\\s\\n]+(\\d+)" +
+      "[\\s\\n]+\\d{2}/\\d{2}/\\d{2,4}\\b",
+      "gi");
+  const rows = [];
+  let destMatch;
+  while ((destMatch = destRe.exec(text)) !== null) {
+    const city = destMatch[1].trim();
+    const state = destMatch[2].toUpperCase();
+    const zip = destMatch[3];
+    const before = text.slice(0, destMatch.index);
+    let tail = null;
+    let tailMatch;
+    while ((tailMatch = tailRe.exec(before)) !== null) {
+      tail = tailMatch;
+    }
+    if (!tail) continue;
+    const weight = Number(String(tail[1]).replace(/,/g, ""));
+    const cartons = Number(tail[2]);
+    const pallets = Number(tail[3]);
+    if (!(weight > 0) || !(pallets > 0)) continue;
+    const head = before.slice(0, tail.index);
+    let po = null;
+    const poRe = new RegExp(
+        "(?:^|[\\n\\r])\\s*([A-Z]{2,8}\\d{6,}|\\d{10,14})\\s*" +
+        "[\\n\\r]+\\s*010\\s*[\\n\\r]",
+        "gi");
+    let poMatch;
+    while ((poMatch = poRe.exec(head)) !== null) {
+      po = poMatch[1].trim().toUpperCase();
+    }
+    rows.push({
+      po,
+      city,
+      state,
+      zip,
+      weight,
+      cartons,
+      pallets,
+      freightClass: parseCoreHomeTableFreightClass(head),
+    });
+  }
+  return rows;
+}
+
+/**
+ * Build one freight line from a parsed Core Home table row.
+ * Multi-pallet rows: per-HU lbs with weightType "each".
+ * @param {object} row Parsed table row.
+ * @return {object}
+ */
+function freightLineFromCoreHomeRow(row) {
+  const pallets = Math.max(1, Number(row.pallets) || 1);
+  const totalWeight = Number(row.weight);
+  const line = {
+    qty: pallets,
+    class: row.freightClass != null ? row.freightClass : null,
+    length: 40,
+    width: 48,
+    height: 60,
+    dimType: "PLT",
+  };
+  if (pallets > 1) {
+    const exact = totalWeight / pallets;
+    line.weight = Number.isInteger(totalWeight) &&
+      totalWeight % pallets === 0 ?
+      totalWeight / pallets :
+      Math.round(exact * 100) / 100;
+    line.weightType = "each";
+  } else {
+    line.weight = totalWeight;
+    line.weightType = "total";
+  }
+  return line;
+}
+
+/**
+ * Lane consignee zip (5 digits).
+ * @param {object} lane Lane.
+ * @return {string}
+ */
+function laneConsigneeZip5(lane) {
+  const z = lane && lane.consignee &&
+    (lane.consignee.zipCode || lane.consignee.zip);
+  return String(z || "").replace(/\D/g, "").slice(0, 5);
+}
+
+/**
+ * Apply parsed Core Home PO table freight per destination zip.
+ * Fixes multi-pallet rows where AI divided weight once then weightType
+ * was forced to "total" (728/2=364 total → Primus 182 ea).
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyCoreHomePoTableFreight(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes)) return extracted;
+  const text = String(body || "");
+  if (!isCoreHomePoTable(text)) return extracted;
+  // Multi-origin STG rebuild (Lidl) owns lane freight entirely.
+  if (countStgOriginHeaders(text) >= 2) return extracted;
+
+  const parsed = parseCoreHomeTableRows(text);
+  if (!parsed.length) return extracted;
+
+  const byZip = new Map();
+  for (const row of parsed) {
+    const z = String(row.zip || "").slice(0, 5);
+    if (!z) continue;
+    if (!byZip.has(z)) byZip.set(z, []);
+    byZip.get(z).push(row);
+  }
+
+  let applied = 0;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const z = laneConsigneeZip5(lane);
+    const tableRows = byZip.get(z);
+    if (!tableRows || !tableRows.length) continue;
+    const lanesForZip = extracted.lanes.filter(
+        (l) => laneConsigneeZip5(l) === z);
+    if (lanesForZip.length !== 1) continue;
+    lane.freightInfo = tableRows.map((row) =>
+      freightDims.normalizePalletDims(freightLineFromCoreHomeRow(row)));
+    applied++;
+  }
+
+  if (applied > 0) {
+    pushExtractWarning(extracted, "core home po table freight");
+  }
+  return extracted;
+}
+
+/**
  * Parse one Core Home STG table row for a known destination.
  * Supports tab-separated rows and newline-separated (one field per line).
  * @param {string} block STG origin section text.
@@ -2731,6 +2927,9 @@ module.exports = {
   normalizeSoleAddressToConsignee,
   fillShipperFromLaneLabelOrigin,
   applyStgShippingFromSections,
+  isCoreHomePoTable,
+  parseCoreHomeTableRows,
+  applyCoreHomePoTableFreight,
   partyHasPhysicalAddress,
   finishExtract,
   normalizeExtractedQuote,

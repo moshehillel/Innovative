@@ -1003,6 +1003,151 @@ check("iRedeem collapsed weights preserved",
     iredeemExp.map((r) => r.weight),
     [217, 227, 234, 221, 222, 230, 171]);
 
+// Core Home / Menards PO table: multi-pallet row must be per-HU lbs (each),
+// not total weight pre-divided then forced to total (Primus 182 ea bug).
+const MENARDS_SHELBY_BODY = [
+  "Please provide quote.",
+  "Ready Date : 8/25",
+  "Shipping From STG Santa Fe Springs, CA",
+  "Shipping To: See below",
+  "",
+  "Freight Class",
+  "Customer #",
+  "Customer Name",
+  "Pick Ticket #",
+  "PO Number",
+  "WHS Code",
+  "Total Weight",
+  "Total Ctns",
+  "Pallets",
+  "In House Date",
+  "Store Name 1",
+  "Address 1",
+  "City",
+  "State",
+  "Zip",
+  "",
+  "400",
+  "MEN001",
+  "Menards",
+  "1302000",
+  "SHXD27679371",
+  "010",
+  "64",
+  "10",
+  "1",
+  "08/25/26",
+  "MENARDS DC",
+  "123 Main",
+  "SHELBY",
+  "IA",
+  "51570",
+  "",
+  "300",
+  "MEN001",
+  "Menards",
+  "1302001",
+  "SHXD27718422",
+  "010",
+  "69",
+  "12",
+  "1",
+  "08/25/26",
+  "MENARDS DC",
+  "123 Main",
+  "SHELBY",
+  "IA",
+  "51570",
+  "",
+  "300",
+  "MEN001",
+  "Menards",
+  "1302002",
+  "SHXD27756250",
+  "010",
+  "82",
+  "15",
+  "1",
+  "08/25/26",
+  "MENARDS DC",
+  "123 Main",
+  "SHELBY",
+  "IA",
+  "51570",
+  "",
+  "250",
+  "MEN001",
+  "Menards",
+  "1302003",
+  "SHXD27793932",
+  "010",
+  "728",
+  "30",
+  "2",
+  "08/25/26",
+  "MENARDS DC",
+  "123 Main",
+  "SHELBY",
+  "IA",
+  "51570",
+  "",
+  "125",
+  "MEN001",
+  "Menards",
+  "1302004",
+  "SHXD27796571",
+  "010",
+  "476",
+  "20",
+  "1",
+  "08/25/26",
+  "MENARDS DC",
+  "123 Main",
+  "SHELBY",
+  "IA",
+  "51570",
+].join("\n");
+
+const shelbyParsed = intake.parseCoreHomeTableRows(MENARDS_SHELBY_BODY);
+check("Menards Shelby parses 5 PO rows", shelbyParsed.length, 5);
+const shxdRow = shelbyParsed.find((r) => r.po === "SHXD27793932");
+check("SHXD27793932 weight 728", shxdRow && shxdRow.weight, 728);
+check("SHXD27793932 pallets 2", shxdRow && shxdRow.pallets, 2);
+
+const menardsAiWrong = {
+  lanes: [{
+    laneKey: "SHELBY_IA",
+    consignee: {city: "SHELBY", state: "IA", zipCode: "51570"},
+    freightInfo: [
+      {qty: 1, weight: 64, weightType: "total", class: 400,
+        dimType: "PLT", length: 40, width: 48, height: 62},
+      {qty: 1, weight: 69, weightType: "total", class: 300,
+        dimType: "PLT", length: 40, width: 48, height: 62},
+      {qty: 1, weight: 82, weightType: "total", class: 300,
+        dimType: "PLT", length: 40, width: 48, height: 62},
+      {qty: 2, weight: 364, weightType: "each", class: 250,
+        dimType: "PLT", length: 40, width: 48, height: 62},
+      {qty: 1, weight: 476, weightType: "total", class: 125,
+        dimType: "PLT", length: 40, width: 48, height: 62},
+    ],
+  }],
+};
+intake.normalizeExtractedQuote(menardsAiWrong, {body: MENARDS_SHELBY_BODY});
+const shelbyRows = menardsAiWrong.lanes[0].freightInfo;
+const shxdFreight = shelbyRows[3];
+check("Menards SHXD row qty 2", shxdFreight.qty, 2);
+check("Menards SHXD row 364 each not 182",
+    shxdFreight.weight, 364);
+check("Menards SHXD weightType each",
+    shxdFreight.weightType, "each");
+const shelbyTotal = shelbyRows.reduce((sum, r) => {
+  const w = Number(r.weight) || 0;
+  const q = Math.max(1, Number(r.qty) || 1);
+  const isEach = String(r.weightType || "").toLowerCase() === "each";
+  return sum + (isEach ? w * q : w);
+}, 0);
+check("Menards Shelby lane total 1419 lbs", shelbyTotal, 1419);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
