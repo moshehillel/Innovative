@@ -382,6 +382,57 @@ check("normalizeExtractedQuote requestedAccessorials no APD",
     !(noApptNorm.customerRequest.requestedAccessorials || []).includes("APD"),
     true);
 
+// Comfortel axis legend (W x H x L) → Primus LxWxH.
+const comfortel = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 231, dimType: "PLT",
+      length: 40, width: 20, height: 96,
+    }],
+  }],
+}, {
+  body: "Dimensions: 40 x 20 x 96 in (W x H x L)\nWeight: 231 lbs",
+});
+check("Comfortel (W x H x L) → 96x40x20", [
+  comfortel.lanes[0].freightInfo[0].length,
+  comfortel.lanes[0].freightInfo[0].width,
+  comfortel.lanes[0].freightInfo[0].height,
+], [96, 40, 20]);
+
+// SH175752 Comfortel axis legend (W x H x L) → Primus LxWxH.
+const sh175752 = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 91, dimType: "PLT",
+      length: 22, width: 36, height: 45,
+    }],
+  }],
+}, {
+  body: "Dimensions: 36 x 22 x 45 in (W x H x L)\nWeight: 91 lbs",
+});
+check("SH175752 (W x H x L) → 45x36x22", [
+  sh175752.lanes[0].freightInfo[0].length,
+  sh175752.lanes[0].freightInfo[0].width,
+  sh175752.lanes[0].freightInfo[0].height,
+], [45, 36, 22]);
+
+// Coraopolis PA 15108 — same Comfortel (W x H x L) legend bug.
+const coraopolis = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 133, dimType: "PLT",
+      length: 75, width: 39, height: 38,
+    }],
+  }],
+}, {
+  body: "Dimensions: 75 x 39 x 38 in (W x H x L)\nWeight: 133 lbs\n" +
+    "Coraopolis, PA 15108",
+});
+check("Coraopolis (W x H x L) → 38x75x39", [
+  coraopolis.lanes[0].freightInfo[0].length,
+  coraopolis.lanes[0].freightInfo[0].width,
+  coraopolis.lanes[0].freightInfo[0].height,
+], [38, 75, 39]);
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
