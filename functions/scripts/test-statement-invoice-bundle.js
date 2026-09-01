@@ -314,6 +314,31 @@ check("Single Point Capital packet email",
     bundle.looksLikeStatementCoverInvoicePacketEmail(
         spcSubject, spcFrom, "", spcPdf), true);
 
+const rmSubject = "REF# 266111";
+const rmFrom = "invoice@rmcapitalinc.com";
+const rmPdf = [{
+  filename: "266111.pdf",
+  mimeType: "application/pdf",
+}];
+check("RM Capital REF# subject detected",
+    bundle.looksLikeRmCapitalInvoiceEmail(rmSubject, rmFrom), true);
+check("RM Capital looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(rmSubject, rmFrom, ""), true);
+check("RM Capital 1-page OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: rmSubject,
+      from: rmFrom,
+      filename: rmPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("RM Capital packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        rmSubject, rmFrom, "", rmPdf), true);
+check("RM Capital unknown classification overridden to carrier_invoice",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "unknown", confidence: "low", reasoning: "unclear"},
+        rmSubject, rmFrom, "", rmPdf).intent, "carrier_invoice");
+
 check("parseStatementIndexLoadNumbers dedupes and sorts",
     JSON.stringify(bundle.parseStatementIndexLoadNumbers(
         "Load 265379 266088 265379 266219 265630")),

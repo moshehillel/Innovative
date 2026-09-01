@@ -338,6 +338,7 @@ function isCarrierOrFactorSender(from) {
     "compassfs.net",
     "thunderfunding.com",
     "singlepointgroup.com",
+    "rmcapitalinc.com",
     "rtsinc.com",
     "rtsfinancial.com",
     "cjfinancing.com",
@@ -970,6 +971,8 @@ function looksLikeInvoiceEmailContent(subject, body) {
       /\binvoice\s+#?\s*\d+/i.test(sub)) {
     return true;
   }
+  // RM Capital / similar factors: "REF# 266111" — REF # is the broker load.
+  if (/^ref\s*#\s*\d{5,9}\b/i.test(sub)) return true;
   // Factor-name prefix subjects: "Factor Name; Invoice #123"
   if (/;\s*invoice\s+#?\s*\d+/i.test(sub)) {
     return true;

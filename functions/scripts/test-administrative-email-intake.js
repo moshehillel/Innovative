@@ -770,6 +770,38 @@ check("Single Point Capital OTHER attachment would veto (not forward)",
       invoicePdfCount: 0,
     }));
 
+const rmSubject = "REF# 266111";
+const rmFrom = "RM Capital Inc <invoice@rmcapitalinc.com>";
+const rmBody =
+  "RM Capital Inc. sent an invoice for reference #266111 and requests " +
+  "confirmation of receipt. Payments should be made payable to RM Capital.";
+const rmPdf = [{filename: "266111.pdf", mimeType: "application/pdf"}];
+check("RM Capital REF# subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent(rmSubject, rmBody));
+check("RM Capital factor domain recognized",
+    adm.isCarrierOrFactorSender(rmFrom));
+check("RM Capital not NOA",
+    !adm.isNoticeOfAssignmentEmail(rmSubject, rmFrom, rmBody));
+check("RM Capital not payment inquiry",
+    !adm.isPaymentInquiryEmail(rmSubject, rmFrom, rmBody));
+check("RM Capital has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: rmSubject,
+      body: rmBody,
+      from: rmFrom,
+      attachments: rmPdf,
+      invoicePdfCount: 0,
+    }));
+check("RM Capital carrier_invoice classification triggers veto",
+    adm.hasInvoiceVeto({
+      subject: rmSubject,
+      body: rmBody,
+      from: rmFrom,
+      attachments: rmPdf,
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+
 const hstileSubject = "Payment 08/25/26";
 const hstileFrom = "Michel Schwartz <michel@hstile.com>";
 const hstileBody =
