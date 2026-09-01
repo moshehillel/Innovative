@@ -4470,6 +4470,370 @@ exports.isManagePhpEnabled = isManagePhpEnabled;
 exports.rePushCarrierBillToQuickBooks = rePushCarrierBillToQuickBooks;
 
 /**
+ * Carrier bill-only entry on an already-issued Primus customer invoice.
+ * Mirrors the insurance close-cost pattern: upload PDF, addVendorRefNumber,
+ * saveInvoice (cost closed) — no consolidateInvoices or re-issue.
+ *
+ * @param {object} args Flow inputs from workflow + GET /book.
+ * @return {Promise<object>}
+ */
+async function enterCarrierBillOnIssuedInvoice(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, skipped: true, reason: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+
+  const booking = args.booking;
+  if (!booking || !booking.BOLId) {
+    return {ok: false, error: "Booking missing BOLId"};
+  }
+
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : null;
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  let uploadFileTypes;
+  try {
+    uploadFileTypes = await resolveUploadFileTypes();
+  } catch (typeErr) {
+    return {ok: false, step: "resolveFileTypes", error: typeErr.message};
+  }
+
+  let bookingDocData = null;
+  if (loadNumber) {
+    const docs = await getBookingDocuments({
+      bookingId,
+      bookingBOL: loadNumber,
+    });
+    if (docs.ok) {
+      bookingDocData = docs.data;
+    }
+  }
+
+  const issuedUi = bookingDocData ?
+    bookingDocData.invoices.find(isIssuedUiInvoice) : null;
+  if (!issuedUi || issuedUi.id == null) {
+    return {ok: false, error: "No issued Primus invoice on booking"};
+  }
+
+  const invoiceId = String(issuedUi.id);
+  const invoiceNumber = String(issuedUi.invoiceNumber);
+
+  const carrierBillUpload = await maybeUploadBookingPdf({
+    docData: bookingDocData,
+    bookingId,
+    bookingBOL: loadNumber || bookingId,
+    fileType: uploadFileTypes.carrierBill.id,
+    fileTypeName: uploadFileTypes.carrierBill.name,
+    file: args.carrierBillPdf,
+    skip: args.skipCarrierBillUpload,
+  });
+  if (!carrierBillUpload.ok && writeLog) {
+    await writeLog("warn", "primus",
+        "Carrier bill PDF upload failed — continuing with cost entry", {
+          loadNumber,
+          bookingId,
+          invoiceId,
+          error: carrierBillUpload.error,
+        });
+  }
+
+  let vendor = booking.vendor || {};
+  if (!vendor.id) {
+    return {ok: false, error: "Booking missing vendor.id"};
+  }
+  const primusVendorName = String(vendor.name || "").trim();
+  const extractedCarrierName = String(args.carrierName || "").trim();
+  try {
+    vendor = await resolveMasterVendorForBilling(
+        vendor,
+        primusVendorName || extractedCarrierName || "",
+    );
+  } catch (vendorErr) {
+    return {
+      ok: false,
+      step: "resolveMasterVendor",
+      error: vendorErr.message || "resolveMasterVendorForBilling failed",
+    };
+  }
+
+  const carrierTotal = roundMoney(
+      args.carrierInvoiceAmount || vendor.cost || 0);
+  if (!carrierTotal) {
+    return {ok: false, error: "Missing carrier invoice amount"};
+  }
+
+  const billDate = args.billDate || new Date();
+  const carrierDueDate = args.billDueDate || null;
+  const billDueDate = carrierDueDate || (() => {
+    const d = new Date(billDate);
+    d.setDate(d.getDate() + 30);
+    return d;
+  })();
+  const {proNumber, vendorInvoiceNumber} =
+      resolveVendorBillRefs({...args, loadNumber}, vendor);
+
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+
+  let actualCosts = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+
+  const carrierLines = actualCosts.filter((c) =>
+    String(c.carrierId) === String(vendor.id));
+  const existingCarrierLine = carrierLines.find((c) =>
+    String(c.vendorInvoiceNumber) === vendorInvoiceNumber);
+  const costAlreadyPosted = existingCarrierLine &&
+    moneyEquals(existingCarrierLine.total, carrierTotal);
+
+  const steps = {
+    carrierBillUpload: carrierBillUpload.skipped ?
+      (carrierBillUpload.reason || "skipped") :
+      (carrierBillUpload.uploaded ? "uploaded" : (carrierBillUpload.error ||
+        "failed")),
+  };
+
+  if (!costAlreadyPosted) {
+    let termsList = [];
+    try {
+      termsList = await fetchUiTerms();
+    } catch (termsErr) {
+      return {
+        ok: false,
+        step: "getTerms",
+        error: termsErr.message || "getTerms failed",
+      };
+    }
+    const termsResolution = resolveTermsForCarrierBill(
+        billDate, carrierDueDate, termsList);
+    if (!termsResolution.ok) {
+      return {
+        ok: false,
+        step: "validateTerms",
+        error: termsResolution.error,
+        details: termsResolution,
+      };
+    }
+    const termsId = termsResolution.termsId;
+
+    const bill = {
+      vendorInvoiceNumber,
+      proNumber,
+      total: carrierTotal,
+      billDate,
+      billDueDate,
+    };
+
+    let billsInfo = extractBillsInfoFromStore(storeData);
+    if (!billsInfo || !billsInfo.length) {
+      billsInfo = reconstructBillsInfoFromActualCosts(actualCosts);
+    }
+    billsInfo = (billsInfo || []).filter((b) =>
+      String(b.carrierId) !== String(vendor.id));
+    billsInfo.push(buildBillsInfo(vendor, bill, termsId));
+
+    const otherCosts = actualCosts.filter((c) =>
+      String(c.carrierId) !== String(vendor.id));
+    const formattedOther = otherCosts.map((line) => ({
+      id: String(line.id),
+      code: line.code || "",
+      description: line.description || "",
+      carrierId: String(line.carrierId),
+      carrierName: String(line.carrierName || ""),
+      qty: Number(line.qty || 1),
+      rate: roundMoney(line.rate),
+      total: roundMoney(line.total).toFixed(2),
+      vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+      terms: "",
+      PRO: String(line.PRO || ""),
+      isAccessorial: !!line.isAccessorial,
+    }));
+
+    const storedCarrierIds = carrierLines.map((l) => ({id: l.id}));
+    const newCarrierCosts = buildActualCosts(vendor, bill, storedCarrierIds);
+    const mergedActualCosts = [...formattedOther, ...newCarrierCosts];
+
+    const totalActual = roundMoney(
+        mergedActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+    const chargesTotal = roundMoney(
+        charges.reduce((s, c) => s + Number(c.total || 0), 0));
+    const totalEstimated = roundMoney(
+        estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+    const profit = roundMoney(chargesTotal - totalActual);
+    const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+    const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+
+    const billtoResolution = await resolveManageBilltoId(booking);
+    const storedBillto = extractBilltoIdFromStore(storeData);
+    const billtoId = billtoResolution.id || storedBillto;
+    if (!billtoId) {
+      return {ok: false, error: "Could not resolve billtoId"};
+    }
+
+    const notes = {
+      internalNotes: String(booking.internalNotes || ""),
+      externalNotes: String(booking.externalNotes || ""),
+    };
+
+    const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+
+    const vendorRef = await managePhpPost({
+      action: "addVendorRefNumber",
+      invoiceId,
+      bookingId,
+      billsInfo,
+      actualCosts: mergedActualCosts,
+      actualProfitUSD: profit,
+      actualProfitPer: profitPer,
+      actualGP: gp,
+      totalActualCost: totalActual,
+      ...refExtra,
+    });
+
+    if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+      return {
+        ok: false,
+        step: "addVendorRefNumber",
+        error: (vendorRef.json && vendorRef.json.message) ||
+          "addVendorRefNumber failed",
+        customerInvoiceId: Number(invoiceId),
+      };
+    }
+    steps.addVendorRefNumber = vendorRef.json.message;
+
+    const phase2Estimated = estimatedCosts.map((line) => ({
+      id: String(line.id),
+      code: line.code || "",
+      description: line.description || "",
+      carrierId: String(line.carrierId || ""),
+      carrierName: String(line.carrierName || ""),
+      editable: line.editable != null ? String(line.editable) : "0",
+      qty: Number(line.qty || 1),
+      rate: roundMoney(line.rate),
+      total: roundMoney(line.total).toFixed(2),
+      isAccessorial: !!line.isAccessorial,
+      vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+      terms: "",
+      PRO: "",
+    }));
+
+    const phase2Charges = charges.map((c) => ({
+      id: String(c.id),
+      code: c.code || "",
+      description: c.description || "",
+      qty: Number(c.qty || 1),
+      rate: roundMoney(c.rate),
+      total: roundMoney(c.total).toFixed(2),
+    }));
+
+    const saveResult = await managePhpPost({
+      action: "saveInvoice",
+      billsInfo,
+      charges: phase2Charges,
+      actualCosts: mergedActualCosts,
+      estimatedCosts: phase2Estimated,
+      chargesTotal,
+      totalEstimatedCosts: totalEstimated,
+      totalActualCosts: totalActual,
+      billtoId: String(billtoId),
+      bookingId,
+      ...notes,
+      costClosed: "1",
+      costActualClosed: "1",
+      readyToInvoice: "1",
+      estimatedProfitUSD: profit,
+      estimatedProfitPer: profitPer,
+      estimatedGP: gp,
+      actualProfitUSD: profit,
+      actualProfitPer: profitPer,
+      actualGP: gp,
+      vendorInvoiceNumber: "",
+      vendorTerm: "",
+      PRONumber: proNumber,
+      invoiceNumber,
+      id: invoiceId,
+    });
+
+    if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+      return {
+        ok: false,
+        step: "saveInvoice",
+        error: (saveResult.json && saveResult.json.message) ||
+          "saveInvoice failed",
+        customerInvoiceId: Number(invoiceId),
+      };
+    }
+    steps.saveInvoice = saveResult.json.message;
+  } else {
+    steps.addVendorRefNumber = "skipped_already_posted";
+    steps.saveInvoice = "skipped_already_posted";
+  }
+
+  const podUpload = await maybeUploadBookingPdf({
+    docData: bookingDocData,
+    bookingId,
+    bookingBOL: loadNumber || bookingId,
+    fileType: uploadFileTypes.pod.id,
+    fileTypeName: uploadFileTypes.pod.name,
+    file: args.podPdf,
+    skip: args.skipPodUpload,
+    forbiddenBuffer: args.carrierBillPdf && args.carrierBillPdf.buffer,
+  });
+  if (!podUpload.ok && writeLog) {
+    await writeLog("warn", "primus",
+        "POD PDF upload failed (carrier bill entered on issued invoice)", {
+          loadNumber,
+          bookingId,
+          invoiceId,
+          error: podUpload.error,
+        });
+  }
+  steps.podUpload = podUpload.skipped ?
+    (podUpload.reason || "skipped") :
+    (podUpload.uploaded ? "uploaded" : (podUpload.error || "failed"));
+
+  if (writeLog) {
+    await writeLog("info", "primus",
+        "Carrier bill entered on already-issued Primus invoice", {
+          loadNumber,
+          bookingId,
+          customerInvoiceId: Number(invoiceId),
+          invoiceNumber,
+          carrierTotal,
+          vendorInvoiceNumber,
+          costAlreadyPosted,
+          carrierBillUploaded: !!(carrierBillUpload.uploaded ||
+            carrierBillUpload.skipped),
+          podUploaded: !!(podUpload.uploaded || podUpload.skipped),
+        });
+  }
+
+  return {
+    ok: true,
+    skipped: !!costAlreadyPosted,
+    reason: costAlreadyPosted ? "carrier cost already posted" : "already issued",
+    generated: true,
+    issued: true,
+    reused: true,
+    customerInvoiceId: Number(invoiceId),
+    invoiceNumber,
+    carrierBillUploaded: !!(carrierBillUpload.uploaded ||
+      carrierBillUpload.skipped),
+    podUploaded: !!(podUpload.uploaded || podUpload.skipped),
+    carrierBillUpload,
+    podUpload,
+    costAlreadyPosted,
+    steps,
+  };
+}
+exports.enterCarrierBillOnIssuedInvoice = enterCarrierBillOnIssuedInvoice;
+
+/**
  * Full Primus UI billing flow captured from production DevTools:
  * saveInvoice (costs) → addVendorRefNumber → saveInvoice (ready) →
  * consolidateInvoices (issue).
@@ -4525,27 +4889,13 @@ async function runPrimusUiBillingFlow(args) {
     if (bookingDocData && Array.isArray(bookingDocData.invoices)) {
       const issued = bookingDocData.invoices.find(isIssuedUiInvoice);
       if (issued) {
-        const podUpload = await maybeUploadBookingPdf({
-          docData: bookingDocData,
-          bookingId,
-          bookingBOL: loadNumber,
-          fileType: uploadFileTypes.pod.id,
-          fileTypeName: uploadFileTypes.pod.name,
-          file: args.podPdf,
-          skip: args.skipPodUpload,
-          forbiddenBuffer: args.carrierBillPdf &&
-            args.carrierBillPdf.buffer,
+        return enterCarrierBillOnIssuedInvoice({
+          ...args,
+          booking,
+          loadNumber,
+          skipCarrierBillUpload: args.skipCarrierBillUpload,
+          skipPodUpload: args.skipPodUpload,
         });
-        return {
-          ok: true,
-          skipped: true,
-          reason: "already issued",
-          generated: true,
-          customerInvoiceId: Number(issued.id),
-          invoiceNumber: String(issued.invoiceNumber),
-          podUpload,
-          podUploaded: !!(podUpload.uploaded || podUpload.skipped),
-        };
       }
     }
   }

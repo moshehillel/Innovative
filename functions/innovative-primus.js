@@ -45,6 +45,7 @@ let generateCustomerInvoice;
 let markShipmentDelivered;
 let isManagePhpEnabled;
 let runPrimusUiBillingFlow;
+let enterCarrierBillOnIssuedInvoice;
 let emailBOLDocs;
 let resolveCustomerAccountingEmails;
 let checkBookingHasPod;
@@ -78,7 +79,8 @@ function init(bundle) {
     validateAmountWithPrimus, addProNumberToLoad,
     getCustomerRate, approveCarrierBill, generateCustomerInvoice,
     markShipmentDelivered,
-    isManagePhpEnabled, runPrimusUiBillingFlow, emailBOLDocs,
+    isManagePhpEnabled, runPrimusUiBillingFlow, enterCarrierBillOnIssuedInvoice,
+    emailBOLDocs,
     resolveCustomerAccountingEmails, checkBookingHasPod,
     ensurePodMarkedOnPrimus,
     ensureCarrierBillUploadedToPrimus,
@@ -122,6 +124,128 @@ async function runUiBillingFlowWithRetry(flowArgs, logContext) {
 }
 
 /**
+ * Enters carrier bill (PDF + close cost) on an already-issued Primus invoice.
+ * Idempotent — skips when carrier cost is already posted in Primus.
+ * @param {object} args Workflow + billing context.
+ * @return {Promise<object|null>} UI result, or null when not applicable.
+ */
+async function runCarrierBillOnIssuedInvoiceFlow(args) {
+  const {
+    invoice,
+    invoiceId,
+    primusSteps,
+    workingProNumber,
+    customerRate,
+    optionBCustomerBillLines,
+    extractedPodOnlyFile,
+    booking: bookingArg,
+    skipCarrierBillUpload,
+    skipPodUpload,
+  } = args;
+
+  if (!isManagePhpEnabled || !isManagePhpEnabled()) return null;
+  if (!enterCarrierBillOnIssuedInvoice) return null;
+  if (!invoice.loadNumber) return null;
+  if (!invoice.customerInvoiceId && !primusSteps.uiInvoiceIssued) return null;
+
+  if (isCarrierBillAlreadyEnteredInPrimus && primusSteps.carrierBillUploaded) {
+    const alreadyEntered = await isCarrierBillAlreadyEnteredInPrimus(invoice);
+    if (alreadyEntered) return null;
+  }
+
+  const bk = bookingArg || await fetchPrimusBooking(invoice.loadNumber);
+  if (!bk) {
+    return {ok: false, error: "Primus booking not found"};
+  }
+
+  const podPath =
+    (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+    (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+    null;
+  let carrierBillPdf = null;
+  let podPdf = null;
+  carrierBillPdf = await loadCarrierBillPdfFromInvoice(invoice);
+  if (podPath) {
+    const podB64 = await downloadStorageFileBase64(podPath);
+    if (podB64) {
+      podPdf = {
+        buffer: Buffer.from(podB64, "base64"),
+        filename: `pod-${invoice.loadNumber}.pdf`,
+      };
+    }
+  }
+
+  const uiResult = await runUiBillingFlowWithRetry({
+    booking: bk,
+    loadNumber: invoice.loadNumber,
+    customerRate,
+    customerBillLines: optionBCustomerBillLines,
+    carrierInvoiceAmount: invoice.invoiceAmount,
+    carrierName: invoice.carrierName || null,
+    proNumber: workingProNumber || invoice.proNumber,
+    vendorInvoiceNumber: invoice.invoiceNumber ||
+      invoice.carrierInvoiceNumber ||
+      workingProNumber || invoice.proNumber,
+    billDate: invoice.invoiceDate || invoice.receivedAt,
+    billDueDate: invoice.dueDate,
+    customerInvoiceId: invoice.customerInvoiceId || null,
+    generated: false,
+    carrierBillPdf,
+    podPdf,
+    skipCarrierBillUpload: skipCarrierBillUpload || primusSteps.carrierBillUploaded,
+    skipPodUpload: skipPodUpload || primusSteps.podUploaded,
+  }, {invoiceId, loadNumber: invoice.loadNumber});
+
+  if (uiResult.ok) {
+    primusSteps.carrierBillUploaded = !!(
+      primusSteps.carrierBillUploaded ||
+      uiResult.carrierBillUploaded ||
+      (uiResult.carrierBillUpload &&
+        (uiResult.carrierBillUpload.uploaded ||
+          uiResult.carrierBillUpload.skipped)));
+    primusSteps.podUploaded = !!(
+      primusSteps.podUploaded ||
+      uiResult.podUploaded ||
+      (uiResult.podUpload &&
+        (uiResult.podUpload.uploaded || uiResult.podUpload.skipped)));
+    if (uiResult.podUpload && uiResult.podUpload.fileId) {
+      primusSteps.podUploadFileId = String(uiResult.podUpload.fileId);
+    }
+    primusSteps.customerInvoiceGenerated = true;
+    primusSteps.uiInvoiceIssued = true;
+  }
+
+  return uiResult;
+}
+
+/**
+ * Applies primusSteps flags from a UI billing / carrier-bill-on-issued result.
+ * @param {object} primusSteps Mutable step flags.
+ * @param {object} uiResult Result from manage.php billing.
+ * @return {void}
+ */
+function applyUiBillingPrimusSteps(primusSteps, uiResult) {
+  primusSteps.customerInvoiceGenerated = true;
+  primusSteps.uiInvoiceIssued = !!(uiResult.issued ||
+    (uiResult.skipped && uiResult.reason === "already issued") ||
+    uiResult.reused);
+  primusSteps.carrierBillUploaded = !!(
+    primusSteps.carrierBillUploaded ||
+    uiResult.carrierBillUploaded ||
+    (uiResult.carrierBillUpload &&
+      (uiResult.carrierBillUpload.uploaded ||
+        uiResult.carrierBillUpload.skipped)));
+  primusSteps.podUploaded = !!(
+    primusSteps.podUploaded ||
+    uiResult.podUploaded ||
+    (uiResult.podUpload &&
+      (uiResult.podUpload.uploaded || uiResult.podUpload.skipped)));
+  if (uiResult.podUpload && uiResult.podUpload.fileId) {
+    primusSteps.podUploadFileId = String(uiResult.podUpload.fileId);
+  }
+}
+
+/**
  * True when Firestore shows carrier bill entered and customer invoice issued.
  * @param {object} invoice Invoice document.
  * @param {object} primusSteps Completed-step flags.
@@ -135,7 +259,6 @@ function isBillingCompleteInFirestore(invoice, primusSteps) {
   );
   const carrierEntered = Boolean(
       primusSteps.carrierBillUploaded ||
-      primusSteps.uiInvoiceIssued ||
       (primusSteps.amountValidated && primusSteps.billApproved),
   );
   return hasCustomerInvoice && carrierEntered;
@@ -2369,6 +2492,41 @@ exports.processPrimusWorkflow = onRequest(
               primusSteps.uiInvoiceIssued = primusSteps.uiInvoiceIssued ||
               Boolean(invoice.customerInvoiceId);
               primusSteps.amountValidated = primusSteps.amountValidated || true;
+              if (isManagePhpEnabled && isManagePhpEnabled()) {
+                const issuedUiResult = await runCarrierBillOnIssuedInvoiceFlow({
+                  invoice,
+                  invoiceId,
+                  primusSteps,
+                  workingProNumber,
+                  customerRate,
+                  optionBCustomerBillLines,
+                  extractedPodOnlyFile,
+                });
+                if (issuedUiResult && issuedUiResult.ok) {
+                  await writeLog("info", "workflow",
+                      "Carrier bill entered on already-issued Primus invoice", {
+                        invoiceId,
+                        loadNumber: invoice.loadNumber,
+                        customerInvoiceId: invoice.customerInvoiceId,
+                        carrierBillUploaded: primusSteps.carrierBillUploaded,
+                        podUploaded: primusSteps.podUploaded,
+                      });
+                }
+              }
+              await invoiceDoc.ref.update({
+                primusSteps,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              await pushCarrierBillToQuickBooks({
+                req,
+                invoiceDoc,
+                invoiceId,
+                invoice,
+                primusSteps,
+                customerInvoiceId: invoice.customerInvoiceId,
+                invoiceNumber: invoice.issuedInvoiceNumber,
+                reuseAlreadyIssued: true,
+              });
             }
           } else if (runBillingPipeline) {
             if (workflowErrors.shouldRunBillingPipelineOnResume(currentStep)) {
@@ -2998,44 +3156,111 @@ exports.processPrimusWorkflow = onRequest(
             const useUiBridge = isManagePhpEnabled && isManagePhpEnabled();
 
             if (useUiBridge) {
-              if (primusSteps.uiInvoiceIssued) {
+              if (primusSteps.uiInvoiceIssued || invoice.customerInvoiceId) {
                 await writeLog(
-                    "info", "workflow", "UI invoice already issued — skipped", {
+                    "info", "workflow",
+                    "UI invoice already issued — entering carrier bill only", {
                       invoiceId,
                       customerInvoiceId: invoice.customerInvoiceId,
                     });
+                const issuedUiResult = await runCarrierBillOnIssuedInvoiceFlow({
+                  invoice,
+                  invoiceId,
+                  primusSteps,
+                  workingProNumber,
+                  customerRate,
+                  optionBCustomerBillLines,
+                  extractedPodOnlyFile,
+                  booking: bookingForInvoice,
+                });
+                const issuedOk = !issuedUiResult || issuedUiResult.ok;
                 await logWorkflowStep({
                   invoiceId,
                   stepName: "customer_invoice_generation_completed",
-                  stepStatus: "skipped",
-                  reason: "UI invoice already issued",
-                  output: {customerInvoiceId: invoice.customerInvoiceId},
+                  stepStatus: issuedOk ? "skipped" : "failed",
+                  reason: "UI invoice already issued — carrier bill only",
+                  output: {
+                    customerInvoiceId: invoice.customerInvoiceId,
+                    carrierBillEntered: issuedOk,
+                    costAlreadyPosted: issuedUiResult &&
+                      issuedUiResult.costAlreadyPosted,
+                  },
+                  error: issuedOk ? null :
+                    (issuedUiResult && issuedUiResult.error) ||
+                    "Carrier bill entry on issued invoice failed",
                 });
                 invoiceGenerationResult = {
-                  ok: true,
+                  ok: issuedOk,
                   customerInvoiceId: invoice.customerInvoiceId,
+                  invoiceNumber: invoice.issuedInvoiceNumber || null,
                   generated: true,
                   reused: true,
                   invoiceTotal: customerRate + customerBillAccessorialTotal,
+                  error: issuedOk ? null :
+                    (issuedUiResult && issuedUiResult.error) || null,
                 };
-                primusSteps.customerInvoiceGenerated = true;
-                await invoiceDoc.ref.update({
-                  primusSteps,
-                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                });
-                await setWorkflowHeartbeat(
-                    invoiceDoc.ref, "customer_invoice_exists");
-                // Already issued: do NOT rePushToQB (creates QB duplicates).
-                await pushCarrierBillToQuickBooks({
-                  req,
-                  invoiceDoc,
-                  invoiceId,
-                  invoice,
-                  primusSteps,
-                  customerInvoiceId: invoice.customerInvoiceId,
-                  invoiceNumber: invoice.issuedInvoiceNumber,
-                  reuseAlreadyIssued: true,
-                });
+                if (issuedOk) {
+                  await invoiceDoc.ref.update({
+                    primusSteps,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                  await setWorkflowHeartbeat(
+                      invoiceDoc.ref, "customer_invoice_exists");
+                  await writeLog("info", "workflow",
+                      "Carrier bill entered on already-issued Primus invoice", {
+                        invoiceId,
+                        loadNumber: invoice.loadNumber,
+                        customerInvoiceId: invoice.customerInvoiceId,
+                        carrierBillUploaded: primusSteps.carrierBillUploaded,
+                        podUploaded: primusSteps.podUploaded,
+                        costAlreadyPosted: issuedUiResult &&
+                          issuedUiResult.costAlreadyPosted,
+                      });
+                  await pushCarrierBillToQuickBooks({
+                    req,
+                    invoiceDoc,
+                    invoiceId,
+                    invoice,
+                    primusSteps,
+                    customerInvoiceId: invoice.customerInvoiceId,
+                    invoiceNumber: invoice.issuedInvoiceNumber,
+                    reuseAlreadyIssued: true,
+                  });
+                } else {
+                  await writeLog("error", "workflow",
+                      "Carrier bill entry on issued invoice failed", {
+                        invoiceId,
+                        loadNumber: invoice.loadNumber,
+                        result: issuedUiResult,
+                      });
+                  await invoiceDoc.ref.update({
+                    processingLock: false,
+                    finalWorkflowStatus: "needs_invoice_review",
+                    decisionStage: "invoice_generation_failed",
+                    decisionReason: (issuedUiResult && issuedUiResult.error) ||
+                      "Carrier bill entry on issued invoice failed",
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                  await sendWorkflowAlert({
+                    req,
+                    code: "UI_BILLING_FAILED",
+                    invoiceId,
+                    type: "invoice_generation_failed",
+                    context: {
+                      loadNumber: invoice.loadNumber,
+                      carrierName: invoice.carrierName,
+                      customerName,
+                      errorMessage: (issuedUiResult && issuedUiResult.error) ||
+                        "Unknown error",
+                      step: issuedUiResult && issuedUiResult.step || null,
+                    },
+                  });
+                  return res.json({
+                    ok: false,
+                    error: "Carrier bill entry on issued invoice failed",
+                    details: issuedUiResult,
+                  });
+                }
               } else {
                 const bk = await fetchPrimusBooking(invoice.loadNumber);
                 const podPath =
@@ -3077,7 +3302,10 @@ exports.processPrimusWorkflow = onRequest(
                 }, {invoiceId, loadNumber: invoice.loadNumber});
 
                 const uiOk = uiResult.ok ||
-              (uiResult.skipped && uiResult.reason === "already issued");
+              (uiResult.skipped && (
+                uiResult.reason === "already issued" ||
+                uiResult.reason === "carrier cost already posted"
+              ));
                 await logWorkflowStep({
                   invoiceId,
                   stepName: "customer_invoice_generation_completed",
@@ -3101,7 +3329,8 @@ exports.processPrimusWorkflow = onRequest(
                   invoiceTotal: customerRate + customerBillAccessorialTotal,
                   generated: !!(uiResult.issued || uiResult.generated),
                   reused: !!(uiResult.skipped &&
-                uiResult.reason === "already issued"),
+                (uiResult.reason === "already issued" ||
+                  uiResult.reason === "carrier cost already posted")),
                   error: uiResult.error || null,
                   step: uiResult.step || null,
                   billtoSource: uiResult.billtoSource || null,
@@ -3150,23 +3379,12 @@ exports.processPrimusWorkflow = onRequest(
                 }
 
                 primusSteps.customerInvoiceGenerated = true;
+                applyUiBillingPrimusSteps(primusSteps, uiResult);
                 primusSteps.uiInvoiceIssued = !!(uiResult.issued ||
-              (uiResult.skipped && uiResult.reason === "already issued"));
-                primusSteps.carrierBillUploaded = !!(
-                  primusSteps.carrierBillUploaded ||
-              uiResult.carrierBillUploaded ||
-              (uiResult.carrierBillUpload &&
-                (uiResult.carrierBillUpload.uploaded ||
-                  uiResult.carrierBillUpload.skipped)));
-                primusSteps.podUploaded = !!(
-                  primusSteps.podUploaded ||
-              uiResult.podUploaded ||
-              (uiResult.podUpload &&
-                (uiResult.podUpload.uploaded || uiResult.podUpload.skipped)));
-                if (uiResult.podUpload && uiResult.podUpload.fileId) {
-                  primusSteps.podUploadFileId =
-                    String(uiResult.podUpload.fileId);
-                }
+              (uiResult.skipped && (
+                uiResult.reason === "already issued" ||
+                uiResult.reason === "carrier cost already posted"
+              )));
                 await invoiceDoc.ref.update({
                   primusSteps,
                   customerInvoiceId: invoiceGenerationResult.customerInvoiceId,

@@ -15041,6 +15041,8 @@ innovativePrimus.init({
   kickPrimusWorkflow,
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
   runPrimusUiBillingFlow: primusUiBridge.runPrimusUiBillingFlow,
+  enterCarrierBillOnIssuedInvoice:
+      primusUiBridge.enterCarrierBillOnIssuedInvoice,
   emailBOLDocs: primusUiBridge.emailBOLDocs,
   resolveCustomerAccountingEmails:
       primusUiBridge.resolveCustomerAccountingEmails,
