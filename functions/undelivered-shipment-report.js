@@ -3,7 +3,8 @@
 /**
  * Twice-weekly report (Mon & Thu): shipments with pickup > N days ago and no
  * delivery date, grouped by dispatcher and emailed to each dispatcher.
- * Dispatcher is To; Leo is CC'd (ops visibility — replaced Lisa).
+ * Dispatcher is To; Leo is CC'd (ops visibility). Loads with no dispatcher
+ * go to Lisa.
  */
 
 /** Ops CC for undelivered reports (same address as drayage validator). */
@@ -11,6 +12,11 @@ const UNDELIVERED_REPORT_CC_EMAIL =
   process.env.UNDELIVERED_REPORT_CC_EMAIL ||
   process.env.DRAYAGE_VALIDATOR_EMAIL ||
   "leo@innovativecarriers.com";
+
+/** When a load has no dispatchedByUser, reports go here (Lisa). */
+const UNDELIVERED_REPORT_FALLBACK_EMAIL =
+  process.env.UNDELIVERED_REPORT_FALLBACK_EMAIL ||
+  "lisa@innovativecarriers.com";
 
 let deps = {};
 
@@ -79,17 +85,26 @@ function readPickupDate(row) {
 }
 
 /**
+ * Primus dispatched-by username only — not CreatedBy or Controlled by.
  * @param {object} row Tracking list row.
  * @return {string}
  */
 function readDispatcherUser(row) {
-  const dispatched = String(row.dispatchedByUser || "").trim();
-  const createdBy = String(row.CreatedBy || "").trim();
-  const controlledBy = String(row.controlledBy || "").trim();
-  if (dispatched && !/^\d+$/.test(dispatched)) return dispatched;
-  if (createdBy && !/^\d+$/.test(createdBy)) return createdBy;
-  if (controlledBy && !/^\d+$/.test(controlledBy)) return controlledBy;
-  return dispatched || createdBy || controlledBy;
+  return String(row.dispatchedByUser || "").trim();
+}
+
+/**
+ * Lisa (or env override) when the load has no dispatcher assigned.
+ * @return {object}
+ */
+function lisaFallbackDispatcher() {
+  return {
+    ok: true,
+    email: UNDELIVERED_REPORT_FALLBACK_EMAIL,
+    userName: "LisaR",
+    displayName: "Lisa",
+    fallback: true,
+  };
 }
 
 /**
@@ -175,9 +190,9 @@ async function resolveDispatcherForRow(row, cache) {
   if (!bridge || typeof bridge.resolveDispatcherEmail !== "function") {
     return {ok: false, error: "dispatcher lookup not configured"};
   }
-  const userName = row.dispatcherUser;
+  const userName = String(row.dispatcherUser || "").trim();
   if (!userName) {
-    return {ok: false, error: "no dispatcher on shipment"};
+    return lisaFallbackDispatcher();
   }
   const cacheKey = userName.toLowerCase();
   if (cache && cache.has(cacheKey)) {
@@ -185,17 +200,13 @@ async function resolveDispatcherForRow(row, cache) {
   }
   const result = await bridge.resolveDispatcherEmail({
     booking: {
-      userName: row.dispatcherUser,
-      dispatchedByUser: row.dispatchedByUser,
+      dispatchedByUser: row.dispatchedByUser || userName,
       controlledBy: row.controlledBy,
-      CreatedBy: row.createdBy,
-      contactInformation: {
-        controlUser: {name: row.dispatcherUser},
-      },
     },
   });
-  if (cache) cache.set(cacheKey, result);
-  return result;
+  const resolved = (result.ok && result.email) ? result : lisaFallbackDispatcher();
+  if (cache) cache.set(cacheKey, resolved);
+  return resolved;
 }
 
 /**
@@ -205,7 +216,6 @@ async function resolveDispatcherForRow(row, cache) {
  */
 async function groupByDispatcherEmail(shipments) {
   const groups = new Map();
-  const unknown = [];
   const dispatcherCache = new Map();
 
   for (const ship of shipments) {
@@ -217,12 +227,7 @@ async function groupByDispatcherEmail(shipments) {
     }
 
     if (!dispatcher.ok || !dispatcher.email) {
-      unknown.push({
-        ...ship,
-        dispatcherLookupError: dispatcher.error || "no email",
-        dispatcherUser: ship.dispatcherUser || dispatcher.userName || "—",
-      });
-      continue;
+      dispatcher = lisaFallbackDispatcher();
     }
 
     const key = dispatcher.email.toLowerCase();
@@ -236,16 +241,10 @@ async function groupByDispatcherEmail(shipments) {
     groups.get(key).shipments.push({
       ...ship,
       dispatcherName: dispatcher.displayName || dispatcher.userName,
+      dispatcherFallback: !!dispatcher.fallback,
     });
   }
 
-  if (unknown.length) {
-    groups.set("__unknown__", {
-      email: null,
-      displayName: "Unknown dispatcher",
-      shipments: unknown,
-    });
-  }
   return groups;
 }
 
@@ -362,14 +361,9 @@ async function runUndeliveredShipmentReport(opts) {
 
   const sent = [];
   const skipped = [];
-  const fallbackEmail = process.env.UNDELIVERED_REPORT_FALLBACK_EMAIL ||
-    process.env.ALERT_EMAIL ||
-    process.env.LOW_PROFIT_CC_EMAIL ||
-    null;
 
   for (const [key, group] of groups.entries()) {
-    const email = group.email ||
-      (key === "__unknown__" ? fallbackEmail : null);
+    const email = group.email;
     if (!email) {
       skipped.push({
         key,
@@ -437,6 +431,8 @@ exports.runUndeliveredShipmentReport = runUndeliveredShipmentReport;
 exports._internal = {
   hasDeliveryDate,
   readPickupDate,
+  readDispatcherUser,
+  lisaFallbackDispatcher,
   dedupeTrackingRows,
   buildDispatcherReportEmail,
 };
