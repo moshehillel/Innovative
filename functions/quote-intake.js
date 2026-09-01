@@ -400,6 +400,9 @@ function quoteExtractSystemPrompt() {
     "  MUST be \"total\" (never per-pallet / each), even when qty > 1.",
     "- Standard GMA pallet footprint is 40 x 48 (length 40, width 48).",
     "  If the email says 48*40 or 48x40, store length:40, width:48.",
+    "  If they put the order in parentheses after the numbers — e.g.",
+    "  40 x 20 x 96 in (W x H x L) — that is the order of the three",
+    "  numbers (store length 96, width 40, height 20).",
     "  Non-standard footprints (e.g. 48*45*39) keep the stated L and W",
     "  (length 48, width 45, height 39) — do NOT collapse to 40x48.",
     "  Height is unchanged. If pallet L/W/H are missing, use 40x48x60",
@@ -1857,7 +1860,8 @@ function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     lane.freightInfo = rows.map((row) => {
       const base = row && typeof row === "object" ? {...row} : {};
-      const next = freightDims.normalizePalletDims(base, dimOpts);
+      const withLegend = freightDims.applyEmailDimOrderLegend(base, body);
+      const next = freightDims.normalizePalletDims(withLegend, dimOpts);
       if (freightDims.palletDimsWereDefaulted(base, next)) {
         defaultedDims = true;
       }
