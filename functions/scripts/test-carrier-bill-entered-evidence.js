@@ -81,6 +81,17 @@ check("carrier bill document counts",
       hasCarrierBillDocument: true,
     }), true);
 
+check("booked vendor cost matching invoice amount is NOT bill entered",
+    carrierBillEnteredFromEvidence({
+      carrierInvoiceNumber: "7826",
+      vendorCost: 500,
+      invoiceAmount: 500,
+      carrierRef: "",
+      invoices: [{
+        status: {generated: false, actualCosts: false},
+      }],
+    }), false);
+
 if (failures) {
   console.error(`${failures} failure(s)`);
   process.exit(1);

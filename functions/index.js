@@ -303,7 +303,6 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
   const carrierInvNum = String(item.invoiceNumber || "").trim();
   const proNumber = String(item.proNumber || "").trim();
   const carrierBol = String(item.carrierBolNumber || "").trim();
-  const invoiceAmount = Number(item.invoiceAmount || 0);
 
   try {
     let booking = await fetchPrimusBooking(loadNumber);
@@ -340,13 +339,6 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
           normalizeCarrierReference(vin)) {
         return true;
       }
-    }
-
-    const vendorCost = Number(booking.vendor && booking.vendor.cost || 0);
-    if (vendorCost > 0 && invoiceAmount > 0 && carrierRef) {
-      const diff = Math.abs(vendorCost - invoiceAmount);
-      const tolerance = Math.max(0.50, vendorCost * 0.02);
-      if (diff <= tolerance) return true;
     }
 
     if (process.env.PRIMUS_USE_MANAGE_PHP === "true") {
@@ -13766,6 +13758,11 @@ async function resetGmailMessageForReprocessing(
   if (queueSnap.exists) {
     await queueRef.set({
       status: "queued",
+      intakeStatus: "queued",
+      summary: null,
+      finalStatus: null,
+      outcome: null,
+      itemSummaries: [],
       reprocessRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, {merge: true});

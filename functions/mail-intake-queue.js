@@ -109,6 +109,24 @@ function formatReceivedAtEt(data) {
 }
 
 /**
+ * Digest skip wording. "Already in Primus" only for verified billed+invoiced.
+ * @param {object} counts computeIntakeOutcomeCounts result.
+ * @param {string[]} parts Accumulator.
+ */
+function pushSkipSummaryParts(counts, parts) {
+  const billed = Number(counts && counts.billedSkippedCount || 0);
+  const handled = Number(counts && counts.alreadyHandledCount || 0);
+  if (billed) {
+    parts.push(
+        `${billed} skipped ` +
+        `(carrier bill and customer invoice already in Primus)`);
+  }
+  if (handled) {
+    parts.push(`${handled} skipped (already processed this email)`);
+  }
+}
+
+/**
  * Builds a one-line human summary from intake fields.
  * @param {object} data Intake / queue fields.
  * @return {string}
@@ -140,9 +158,7 @@ function buildIntakeSummary(data) {
       if (counts.processedCount) {
         parts.push(`${counts.processedCount} processed`);
       }
-      if (counts.skippedCount) {
-        parts.push(`${counts.skippedCount} skipped (already in Primus)`);
-      }
+      pushSkipSummaryParts(counts, parts);
       if (parts.length) core += `; ${parts.join("; ")}`;
     }
     if (receivedLabel && !/received /i.test(core)) {
@@ -178,7 +194,7 @@ function buildIntakeSummary(data) {
         "Ignored — carrier open-invoice portal (link only)",
       credit_agency_notification_ignored:
         "Ignored — credit-agency / trade-credit alert",
-      past_due_only: "Ignored — past-due statement already in Primus",
+      past_due_only: "Ignored — past-due statement, no new freight bill",
       statement_ignored_abe_cc: "Ignored — carrier statement (Abe on CC)",
       statement_forwarded: "Forwarded — carrier statement, no freight invoice",
       customer_payment_remittance_ignored_abe_cc:
@@ -205,9 +221,7 @@ function buildIntakeSummary(data) {
         if (counts.processedCount) {
           parts.push(`${counts.processedCount} processed`);
         }
-        if (counts.skippedCount) {
-          parts.push(`${counts.skippedCount} skipped (already in Primus)`);
-        }
+        pushSkipSummaryParts(counts, parts);
         if (counts.unaccountedCount > 0) {
           parts.push(
               `${counts.unaccountedCount} unaccounted ` +
@@ -218,9 +232,7 @@ function buildIntakeSummary(data) {
         if (counts.processedCount) {
           parts.push(`processed ${counts.processedCount} invoice(s)`);
         }
-        if (counts.skippedCount) {
-          parts.push(`${counts.skippedCount} skipped (already in Primus)`);
-        }
+        pushSkipSummaryParts(counts, parts);
         if (other) parts.push(`${other} other outcome(s)`);
       }
       if (parts.length) core = `Processed email — ${parts.join("; ")}`;
@@ -235,7 +247,9 @@ function buildIntakeSummary(data) {
     } else if (finalStatus === "additional_charge_pending_approval") {
       core = "Additional charge — awaiting A/B/C/D approval.";
     } else if (finalStatus === "already_billed_skipped") {
-      core = "Skipped — load(s) already billed in Primus.";
+      core = "Skipped — carrier bill and customer invoice already in Primus.";
+    } else if (finalStatus === "already_processed_skipped") {
+      core = "Skipped — already processed this email.";
     } else if (d.outcome === OUTCOME.FORWARDED) {
       core = d.forwardReason ?
         `Forwarded — ${d.forwardReason}` : "Forwarded for human review.";
@@ -452,7 +466,10 @@ async function completeIntakeRecord(opts) {
       .doc(parentMessageId).get();
   const existing = existingSnap.exists ? (existingSnap.data() || {}) : {};
   const summary = opts.summary ||
-    buildIntakeSummary(Object.assign({}, existing, opts, opts.extra));
+    buildIntakeSummary(Object.assign({}, existing, opts, opts.extra, {
+      summary: null,
+      _rebuildSummary: true,
+    }));
   const now = admin.firestore.FieldValue.serverTimestamp();
   const patch = Object.assign({
     intakeStatus: QUEUE_STATUS.COMPLETED,
@@ -636,7 +653,8 @@ async function incrementParentChildCompletion(
         finalStatus: stmtUnderExtracted ?
           "statement_under_extracted" : null,
         statementExtractionGap: stmtGap || null,
-        _rebuildSummary: !!stmtUnderExtracted,
+        summary: null,
+        _rebuildSummary: true,
       });
       Object.assign(patch, {
         intakeStatus: QUEUE_STATUS.COMPLETED,
@@ -811,9 +829,11 @@ function computeIntakeOutcomeCounts(data) {
     d.itemSummaries : [];
   const processedCount = itemSummaries.filter((s) =>
     s && s.finalStatus === "processing" && s.invoiceId).length;
-  const skippedCount = itemSummaries.filter((s) =>
-    s && (s.finalStatus === "already_billed_skipped" ||
-      s.finalStatus === "already_processed_skipped")).length;
+  const billedSkippedCount = itemSummaries.filter((s) =>
+    s && s.finalStatus === "already_billed_skipped").length;
+  const alreadyHandledCount = itemSummaries.filter((s) =>
+    s && s.finalStatus === "already_processed_skipped").length;
+  const skippedCount = billedSkippedCount + alreadyHandledCount;
   let unaccountedCount = 0;
   if (attachmentCount > 1) {
     unaccountedCount = Math.max(0,
@@ -822,6 +842,8 @@ function computeIntakeOutcomeCounts(data) {
   return {
     attachmentCount,
     processedCount,
+    billedSkippedCount,
+    alreadyHandledCount,
     skippedCount,
     unaccountedCount,
     itemSummaries,
@@ -831,7 +853,6 @@ function computeIntakeOutcomeCounts(data) {
 module.exports = {
   DOC_TYPE,
   QUEUE_STATUS,
-  OUTCOME,
   OUTCOME,
   OUTCOME_REASON,
   INTAKE_TTL_DAYS,

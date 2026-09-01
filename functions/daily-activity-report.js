@@ -983,7 +983,7 @@ const IGNORE_CATEGORY_LABELS = {
     "Customer payment remittance (Abe on thread)",
   customer_payment_remittance_forwarded:
     "Customer payment remittance forwarded to Abe",
-  past_due_only: "Past-due / already in Primus",
+  past_due_only: "Past-due statement, no new freight bill",
   administrative_ignored: "Administrative",
   payment_inquiry_ignored_abe_cc: "Payment inquiry (Abe on thread)",
   insurance_duplicate: "Duplicate insurance intake",
