@@ -332,6 +332,41 @@ const preferredFirst = ac.pickCarrierInvoiceAttachment([
 check("pick skips POD image",
     preferredFirst && preferredFirst.filename === "carrier_invoice.pdf", true);
 
+const ctBatch = ac.pickCarrierInvoiceAttachment([
+  {filename: "497042887.1         .pdf",
+    storagePath: "batch/497042887.pdf", mimeType: "application/pdf"},
+  {filename: "446757676.1         .pdf",
+    storagePath: "batch/446757676.pdf", mimeType: "application/pdf"},
+], {proNumber: "446757676", attachmentFilename: "446757676.1.pdf"});
+check("CT batch picks PRO-matching PDF not first sibling",
+    ctBatch && ctBatch.storagePath === "batch/446757676.pdf", true);
+check("CT batch fuzzy attachmentFilename with padded spaces",
+    ctBatch && ctBatch.filename.includes("446757676"), true);
+
+const ctWrong = ac.pickCarrierInvoiceAttachment([
+  {filename: "497042887.1         .pdf",
+    storagePath: "batch/497042887.pdf", mimeType: "application/pdf"},
+  {filename: "446757676.1         .pdf",
+    storagePath: "batch/446757676.pdf", mimeType: "application/pdf"},
+], {proNumber: "497042887"});
+check("CT batch first sibling when PRO matches first file",
+    ctWrong && ctWrong.storagePath === "batch/497042887.pdf", true);
+
+const ctNoFallback = ac.pickCarrierInvoiceAttachment([
+  {filename: "497042887.1.pdf",
+    storagePath: "batch/497042887.pdf", mimeType: "application/pdf"},
+  {filename: "446757676.1.pdf",
+    storagePath: "batch/446757676.pdf", mimeType: "application/pdf"},
+], {proNumber: "999999999"});
+check("CT batch no fallback to sibling when PRO unmatched", ctNoFallback, null);
+
+const proMismatch = ac.validateCarrierInvoiceAttachment({
+  filename: "497042887.1.pdf",
+  storagePath: "batch/497042887.pdf",
+}, {proNumber: "446757676"});
+check("validate rejects sibling PRO filename", proMismatch.ok, false);
+check("validate pro_mismatch reason", proMismatch.reason, "pro_mismatch");
+
 // 6. Lumper validation — invoice total matches Primus (lumper included)
 const westhill = ac.validateLumperAmount({
   invoiceAmount: 2901.20,

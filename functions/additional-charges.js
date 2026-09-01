@@ -33,6 +33,11 @@ const {
   toOutboundEmailSafeSubject,
   toOutboundEmailSafeText,
 } = require("./email-outbound-safe");
+const {
+  findInvoiceAttachment,
+  attachmentFilenameContainsPro,
+  listInvoicePdfAttachments,
+} = require("./pod-utils");
 
 const FOLLOW_UP_COLLECTION = "additionalCharges";
 
@@ -638,16 +643,48 @@ function chargesHtml(charges) {
 }
 
 /**
+ * Validates that a picked carrier-invoice PDF matches PRO/filename hints.
+ * @param {object|null} attachmentMeta Picked attachment metadata.
+ * @param {object} [hints] proNumber, attachmentFilename.
+ * @return {{ok: boolean, reason: string|null}}
+ */
+function validateCarrierInvoiceAttachment(attachmentMeta, hints) {
+  if (!attachmentMeta || !attachmentMeta.storagePath) {
+    return {ok: false, reason: "missing_attachment"};
+  }
+  const opts = hints && typeof hints === "object" ? hints : {};
+  const proNumber = String(opts.proNumber || "").trim();
+  const filename = String(attachmentMeta.filename || "");
+  if (proNumber && !attachmentFilenameContainsPro(filename, proNumber)) {
+    return {ok: false, reason: "pro_mismatch"};
+  }
+  return {ok: true, reason: null};
+}
+
+/**
  * Picks the carrier invoice PDF from an invoice doc's attachments list
  * (GCS storagePath). Skips weight-cert / POD image docs so approval emails
  * get the bill PDF, not a certificate sidecar.
  * @param {Array<object>|null|undefined} attachments Invoice attachments.
+ * @param {object} [hints] Optional proNumber / attachmentFilename match.
  * @return {{filename: string, storagePath: string, mimeType: string}|null}
  */
-function pickCarrierInvoiceAttachment(attachments) {
+function pickCarrierInvoiceAttachment(attachments, hints) {
   const list = Array.isArray(attachments) ? attachments : [];
   const withPath = list.filter((a) => a && a.storagePath);
   if (!withPath.length) return null;
+
+  const opts = hints && typeof hints === "object" ? hints : {};
+  const hinted = findInvoiceAttachment(withPath, opts);
+  if (hinted && hinted.storagePath) {
+    const meta = {
+      filename: String(hinted.filename || "carrier-invoice.pdf"),
+      storagePath: String(hinted.storagePath),
+      mimeType: String(hinted.mimeType || "application/pdf"),
+    };
+    const validation = validateCarrierInvoiceAttachment(meta, opts);
+    return validation.ok ? meta : null;
+  }
 
   const skipDocType =
       /WEIGHT_INSPECTION_CERT|POD_IMAGE|TRAILER_IMAGE|^POD$/i;
@@ -656,17 +693,26 @@ function pickCarrierInvoiceAttachment(attachments) {
     return !dt || !skipDocType.test(dt);
   });
   const pool = notSidecar.length ? notSidecar : withPath;
+  const pdfPool = listInvoicePdfAttachments(pool);
+  const proNumber = String(opts.proNumber || "").trim();
+
+  // Batch emails: never attach a sibling PRO's PDF when hint matching failed.
+  if (proNumber && pdfPool.length > 1) {
+    return null;
+  }
 
   const pdfLike = pool.find((a) =>
     /\.pdf$/i.test(String(a.filename || "")) ||
     /pdf/i.test(String(a.mimeType || "")));
   const chosen = pdfLike || pool[0];
   if (!chosen || !chosen.storagePath) return null;
-  return {
+  const meta = {
     filename: String(chosen.filename || "carrier-invoice.pdf"),
     storagePath: String(chosen.storagePath),
     mimeType: String(chosen.mimeType || "application/pdf"),
   };
+  const validation = validateCarrierInvoiceAttachment(meta, opts);
+  return validation.ok ? meta : null;
 }
 
 /**
@@ -1391,6 +1437,7 @@ module.exports = {
   resolveEffectiveChargeCategory,
   categoryLabel,
   pickCarrierInvoiceAttachment,
+  validateCarrierInvoiceAttachment,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
   buildCustomerChargeNotificationEmail,

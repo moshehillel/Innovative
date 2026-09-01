@@ -17,6 +17,7 @@ const admin = require("firebase-admin");
 const loadResolution = require("./invoice-load-resolution");
 const workflowErrors = require("./workflow-error-messages");
 const mailIntakeQueue = require("./mail-intake-queue");
+const {findInvoiceAttachment} = require("./pod-utils");
 
 // Injected from index.js (see init). Declared at module scope so the moved
 // workflow code below can call them by their original bare names, unchanged.
@@ -291,13 +292,23 @@ function formatPrimusQbError(err) {
 async function loadCarrierBillPdfFromInvoice(invoice) {
   const attList = Array.isArray(invoice.attachments) ?
     invoice.attachments : [];
-  const carrierAtt = attList.find((a) => a && a.storagePath) || null;
-  if (!carrierAtt || !carrierAtt.storagePath) return null;
-  const b64 = await downloadStorageFileBase64(carrierAtt.storagePath);
+  const carrierAtt = findInvoiceAttachment(attList, {
+    proNumber: invoice.proNumber,
+    attachmentFilename: invoice.attachmentFilename,
+  });
+  const pdfCount = attList.filter((a) =>
+    a && a.storagePath &&
+    (/\.pdf$/i.test(String(a.filename || "")) ||
+      /pdf/i.test(String(a.mimeType || "")))).length;
+  const fallbackAtt = (pdfCount <= 1 || !invoice.proNumber) ?
+    attList.find((a) => a && a.storagePath) : null;
+  const chosen = carrierAtt || fallbackAtt;
+  if (!chosen || !chosen.storagePath) return null;
+  const b64 = await downloadStorageFileBase64(chosen.storagePath);
   if (!b64) return null;
   return {
     buffer: Buffer.from(b64, "base64"),
-    filename: carrierAtt.filename ||
+    filename: chosen.filename ||
       `carrier-bill-${invoice.loadNumber}.pdf`,
   };
 }

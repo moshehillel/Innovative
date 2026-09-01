@@ -977,6 +977,129 @@ function buildPodClassifierRules(options = {}) {
   return rules;
 }
 
+/**
+ * Normalizes attachment filenames for fuzzy comparison (trim, lowercase,
+ * collapse whitespace — Central Transport pads filenames with spaces).
+ * @param {string} filename Raw filename.
+ * @return {string}
+ */
+function normalizeAttachmentFilenameKey(filename) {
+  return String(filename || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "");
+}
+
+/**
+ * @param {string} a First filename.
+ * @param {string} b Second filename.
+ * @return {boolean}
+ */
+function attachmentFilenamesMatch(a, b) {
+  if (!a || !b) return false;
+  return normalizeAttachmentFilenameKey(a) ===
+    normalizeAttachmentFilenameKey(b);
+}
+
+/**
+ * True when a carrier-invoice filename embeds the expected PRO (Central
+ * Transport batch PDFs are named like "446757676.1.pdf").
+ * @param {string} filename Attachment filename.
+ * @param {string} proNumber Expected carrier PRO.
+ * @return {boolean}
+ */
+function attachmentFilenameContainsPro(filename, proNumber) {
+  const pro = String(proNumber || "").trim().toLowerCase();
+  if (!pro) return true;
+  const key = normalizeAttachmentFilenameKey(filename);
+  if (!key) return false;
+  return key.startsWith(pro + ".") || key.includes(pro);
+}
+
+/**
+ * @param {Array<object>|null|undefined} attachments Attachment list.
+ * @return {Array<object>}
+ */
+function listInvoicePdfAttachments(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.filter((a) => {
+    if (!a || !a.filename) return false;
+    if (String(a.docType || "").toUpperCase() === "POD") return false;
+    return /\.pdf$/i.test(String(a.filename)) ||
+      /pdf/i.test(String(a.mimeType || ""));
+  });
+}
+
+/**
+ * Invoice PDF attachments not claimed by any classifier item.
+ * @param {Array<object>} invoiceItems Classifier invoice items.
+ * @param {Array<object>} attachments Stored attachment metadata.
+ * @return {Array<object>}
+ */
+function listUncoveredInvoiceAttachments(invoiceItems, attachments) {
+  const pdfs = listInvoicePdfAttachments(attachments);
+  const claimed = new Set();
+  for (const item of (Array.isArray(invoiceItems) ? invoiceItems : [])) {
+    const name = item && item.attachmentFilename;
+    if (!name) continue;
+    claimed.add(normalizeAttachmentFilenameKey(name));
+    for (const pdf of pdfs) {
+      if (attachmentFilenamesMatch(pdf.filename, name)) {
+        claimed.add(normalizeAttachmentFilenameKey(pdf.filename));
+      }
+    }
+  }
+  return pdfs.filter((pdf) =>
+    !claimed.has(normalizeAttachmentFilenameKey(pdf.filename)));
+}
+
+/**
+ * Finds the carrier-invoice PDF for a load within a batch email's
+ * attachment list (match by attachmentFilename hint and/or PRO number).
+ * @param {Array<object>|null|undefined} attachments Attachment list.
+ * @param {object} [hints] proNumber, attachmentFilename.
+ * @return {object|null}
+ */
+function findInvoiceAttachment(attachments, hints) {
+  const skipDocType =
+      /WEIGHT_INSPECTION_CERT|POD_IMAGE|TRAILER_IMAGE|^POD$/i;
+  const list = (Array.isArray(attachments) ? attachments : [])
+      .filter((a) => a && a.storagePath)
+      .filter((a) => {
+        const dt = String(a.docType || "");
+        return !dt || !skipDocType.test(dt);
+      });
+  if (!list.length) return null;
+
+  const opts = hints && typeof hints === "object" ? hints : {};
+  const {proNumber, attachmentFilename} = opts;
+
+  if (attachmentFilename) {
+    const hit = list.find((a) =>
+      attachmentFilenamesMatch(a.filename, attachmentFilename));
+    if (hit) return hit;
+  }
+
+  if (proNumber) {
+    const pro = String(proNumber).trim().toLowerCase();
+    if (pro) {
+      const hits = list.filter((a) => {
+        const key = normalizeAttachmentFilenameKey(a.filename);
+        return key.startsWith(pro + ".") || key.includes(pro);
+      });
+      if (hits.length === 1) return hits[0];
+      if (hits.length > 1) {
+        const exact = hits.find((a) => {
+          const key = normalizeAttachmentFilenameKey(a.filename);
+          return key.startsWith(pro + ".1") || key.startsWith(pro + ".");
+        });
+        return exact || hits[0];
+      }
+    }
+  }
+  return null;
+}
+
 module.exports = {
   POD_PACKAGE_SOURCES,
   POD_DOCUMENT_SHAPE,
@@ -1008,4 +1131,10 @@ module.exports = {
   detectPodDiscrepanciesInText,
   scanPodBufferForDiscrepancies,
   mergePodDiscrepancies,
+  normalizeAttachmentFilenameKey,
+  attachmentFilenamesMatch,
+  attachmentFilenameContainsPro,
+  listInvoicePdfAttachments,
+  listUncoveredInvoiceAttachments,
+  findInvoiceAttachment,
 };
