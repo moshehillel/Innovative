@@ -391,14 +391,20 @@ function subjectLooksLikeRemittanceAdvice(subject) {
 }
 
 /**
+ * Reply/forward of our customer-invoice thread.
+ * Matches both "Re: Invoice for BOL#267130" and
+ * "Re: Invoice #28415 for BOL #267130".
+ */
+const INVOICE_FOR_BOL_REPLY_RE =
+  /^(?:(?:re|fw|fwd):\s*)+invoice(?:\s*#\s*\d+)?\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/i;
+
+/**
  * Subject is a reply on our customer-invoice thread (Invoice for BOL/Load#).
  * @param {string} subject Email subject.
  * @return {boolean}
  */
 function subjectLooksLikeInvoiceForBolReply(subject) {
-  const sub = String(subject || "").trim().toLowerCase();
-  return /^(?:(?:re|fw|fwd):\s*)+invoice\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/
-      .test(sub);
+  return INVOICE_FOR_BOL_REPLY_RE.test(String(subject || "").trim());
 }
 
 /**
@@ -933,9 +939,8 @@ function looksLikeInvoiceEmailContent(subject, body) {
   // Allow optional whitespace after "#": "Invoice # 981 …"
   if (/^(?:fw:\s*)?invoice\s+#?\s*\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
-  // "Re: Invoice for BOL#265028" — no invoice number in subject
-  if (/^(?:(?:re|fw|fwd):\s*)+invoice\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/
-      .test(sub)) {
+  // "Re: Invoice for BOL#265028" and "Re: Invoice #28415 for BOL #267130"
+  if (INVOICE_FOR_BOL_REPLY_RE.test(sub)) {
     return true;
   }
   // Compass FS factored invoices: PO # in subject is the broker load.

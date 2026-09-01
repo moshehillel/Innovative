@@ -12,6 +12,7 @@ const {
   enrichBillToPartyFromConsignee,
   preferredBilltoSuffixFromBooking,
   initialsFromPersonName,
+  defaultCustomerInvoiceEmailSubject,
 } = bridge._internal;
 
 let failures = 0;
@@ -22,6 +23,16 @@ const check = (name, actual, expected) => {
     (ok ? "" : `\n  got: ${JSON.stringify(actual)}` +
       `\n  exp: ${JSON.stringify(expected)}`));
 };
+
+check("customer invoice subject includes invoice number",
+    defaultCustomerInvoiceEmailSubject("267130", "28415"),
+    "Invoice #28415 for BOL #267130");
+check("customer invoice subject omits placeholder invoice #0",
+    defaultCustomerInvoiceEmailSubject("267130", "0"),
+    "Invoice for BOL#267130");
+check("customer invoice subject omits missing invoice number",
+    defaultCustomerInvoiceEmailSubject("267130"),
+    "Invoice for BOL#267130");
 
 check("normalizeCompanyName strips INC",
     normalizeCompanyName("CUSTOM TRAILER MOVES INC"),

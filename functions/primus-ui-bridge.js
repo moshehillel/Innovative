@@ -1696,6 +1696,23 @@ async function resolvePodDriveIdsForEmail(args) {
 }
 
 /**
+ * Default customer-invoice email subject. Accounting's historical format is
+ * "Invoice #28415 for BOL #264557"; Jerry previously sent "Invoice for BOL#…"
+ * with no invoice number.
+ * @param {string|number} loadNumber Primus load / BOL number.
+ * @param {string|number} [invoiceNumber] Issued customer invoice number.
+ * @return {string}
+ */
+function defaultCustomerInvoiceEmailSubject(loadNumber, invoiceNumber) {
+  const load = String(loadNumber || "").trim();
+  const inv = String(invoiceNumber || "").trim();
+  if (inv && inv !== "0") {
+    return `Invoice #${inv} for BOL #${load}`;
+  }
+  return `Invoice for BOL#${load}`;
+}
+
+/**
  * Sends invoice + BOL + drive docs to the customer via manage.php emailBOLDocs.
  * Mirrors UI document checkboxes:
  * email-docs-invoice-{id}, email-docs-drive-{id}.
@@ -1770,7 +1787,8 @@ async function emailBOLDocs(args) {
   }
 
   const subject = toOutboundEmailSafeSubject(
-      args.subject || `Invoice for BOL#${loadNumber}`);
+      args.subject ||
+      defaultCustomerInvoiceEmailSubject(loadNumber, invoiceNumber));
   const customBody = process.env.PRIMUS_UI_EMAIL_DOCS_BODY;
   const bodyRaw = customBody ?
     (customBody.includes("cardknox.com/innovativecarriers") ?
@@ -5488,4 +5506,5 @@ exports._internal = {
   buildVendorRefExtraFieldsForBills,
   sanitizeBillToReferenceText,
   invoiceChargesIncludeReference,
+  defaultCustomerInvoiceEmailSubject,
 };

@@ -900,6 +900,15 @@ const altarebBody =
   "Quickpay/Zelle\naccounting@innovativecarriers.com\n";
 check("AltaReb Invoice for BOL reply subject recognized",
     adm.subjectLooksLikeInvoiceForBolReply(altarebSubject));
+check("Invoice # in BOL subject still recognized as reply",
+    adm.subjectLooksLikeInvoiceForBolReply(
+        "Re: Invoice #28415 for BOL #267130"));
+check("Invoice # in BOL# subject still recognized as reply",
+    adm.subjectLooksLikeInvoiceForBolReply(
+        "Re: Invoice #28415 for BOL#267130"));
+check("looksLikeInvoiceEmailContent accepts Invoice # for BOL reply",
+    adm.looksLikeInvoiceEmailContent(
+        "Re: Invoice #28415 for BOL #267130", ""));
 check("AltaReb paid notice in top-of-thread detected",
     adm.bodyLooksLikeCustomerPaidNotice(altarebBody));
 check("AltaReb remittance reply detected → Abe",
