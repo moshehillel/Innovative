@@ -2680,6 +2680,10 @@
         return;
       }
       if (!confirm("Send this email to the customer via your connected Outlook?")) return;
+      const btn = document.getElementById("btn-approve");
+      const prevLabel = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Sending…";
       try {
         const res = await apiFetch("/approveQuoteEmail", {
           method: "POST",
@@ -2694,11 +2698,13 @@
         if (!res.ok) throw new Error(res.error || "Send failed");
         document.getElementById("status-badge").textContent = "sent";
         document.getElementById("status-badge").className = "badge sent";
-        document.getElementById("btn-approve").disabled = true;
         document.getElementById("btn-generate").disabled = true;
         document.getElementById("btn-dismiss").disabled = true;
+        btn.textContent = "Sent";
         showMsg("Email sent to " + (res.to && res.to.join(", ")) + ".", true);
       } catch (err) {
+        btn.disabled = false;
+        btn.textContent = prevLabel;
         showMsg(err.message || "Send failed", false);
       }
     });
@@ -2760,7 +2766,9 @@
       const btn = document.getElementById("btn-for-review");
       if (btn.disabled) return;
       const currentlyOn = !!(quote && quote.forReview);
+      const prevLabel = btn.textContent;
       btn.disabled = true;
+      btn.textContent = "Updating…";
       try {
         const res = await apiFetch(
             "/markQuoteForReview?tenantId=" + encodeURIComponent(TENANT_ID) +
@@ -2787,6 +2795,7 @@
           "Removed from For review. Still on your dashboard." :
           "Tagged For review. Still on your dashboard.", true);
       } catch (err) {
+        btn.textContent = prevLabel;
         showMsg(err.message || "Could not update review flag", false);
       } finally {
         btn.disabled = quote && quote.status === "dismissed";
@@ -2838,6 +2847,13 @@
       document.getElementById("login-error").textContent = "";
       document.getElementById("login-error").classList.add("hidden");
       document.getElementById("login-success").classList.add("hidden");
+      const submitBtn = e.target.querySelector(".btn-login") ||
+        document.querySelector("#login-form .btn-login");
+      const prevLabel = submitBtn ? submitBtn.textContent : "Sign in";
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Signing in…";
+      }
       try {
         await QuoteAuth.signInWithEmailPassword(
             document.getElementById("login-email").value,
@@ -2846,6 +2862,11 @@
         const errEl = document.getElementById("login-error");
         errEl.textContent = err.message;
         errEl.classList.remove("hidden");
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = prevLabel;
+        }
       }
     });
 

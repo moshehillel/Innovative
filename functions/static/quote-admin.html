@@ -1173,7 +1173,18 @@
       });
     });
 
-    document.getElementById("reload-rules").addEventListener("click", loadRules);
+    document.getElementById("reload-rules").addEventListener("click", async () => {
+      const btn = document.getElementById("reload-rules");
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Refreshing…";
+      try {
+        await loadRules();
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
+      }
+    });
 
     function clearQuickReplies() {
       pendingQuickReplies = [];
@@ -1417,7 +1428,10 @@
         deleteRuleIds,
         updatedBy: "quote-admin-ui",
       };
-      if (confirmBtn) confirmBtn.disabled = true;
+      if (confirmBtn) {
+        confirmBtn.disabled = true;
+        confirmBtn.textContent = "Saving…";
+      }
       showChatThinking(true);
       try {
         const res = await api("/applyQuoteRule", {
@@ -1481,7 +1495,10 @@
         saveChatState();
       } finally {
         showChatThinking(false);
-        if (confirmBtn) confirmBtn.disabled = false;
+        if (confirmBtn) {
+          confirmBtn.disabled = false;
+          confirmBtn.textContent = "Confirm";
+        }
       }
     }
 
@@ -1547,6 +1564,8 @@
       appendChat("user", text);
       input.value = "";
       sendBtn.disabled = true;
+      const sendPrev = sendBtn.textContent;
+      sendBtn.textContent = "Sending…";
       showChatThinking(true);
       try {
         let res = await api("/quoteRulesChat", {
@@ -1581,6 +1600,9 @@
             patch: res.proposal.patch || {},
           };
           await applyPendingProposal();
+          sendBtn.disabled = false;
+          sendBtn.textContent = sendPrev;
+          input.focus();
           return;
         }
         if (res.action === "ask_identify_source" &&
@@ -1643,6 +1665,7 @@
       }
       showChatThinking(false);
       sendBtn.disabled = false;
+      sendBtn.textContent = sendPrev;
       input.focus();
     }
 
@@ -1671,6 +1694,10 @@
     });
 
     document.getElementById("run-test").addEventListener("click", async () => {
+      const btn = document.getElementById("run-test");
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Checking…";
       const resultEl = document.getElementById("test-result");
       resultEl.classList.remove("hidden");
       resultEl.innerHTML = "<p class=\"none\">Checking rules…</p>";
@@ -1696,6 +1723,9 @@
             res.originEnrichment, res.originAddressKey);
       } catch (e) {
         resultEl.innerHTML = `<p class="none">Error: ${esc(e.message)}</p>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
       }
     });
 

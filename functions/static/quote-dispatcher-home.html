@@ -241,6 +241,11 @@
       transition: background 0.15s ease, transform 0.15s ease;
     }
     button:hover, .btn:hover { background: var(--primary-dark); }
+    button:disabled, .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+      transform: none;
+    }
     button.ghost, .btn.ghost {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -632,6 +637,133 @@
       border-radius: 8px;
     }
 
+    .bulk-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px 20px 20px;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .bulk-panel h2 {
+      margin: 0 0 6px;
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+      letter-spacing: -0.02em;
+    }
+    .bulk-panel .bulk-desc {
+      margin: 0 0 14px;
+      font-size: 0.875rem;
+      color: var(--muted);
+    }
+    .bulk-cols {
+      background: var(--surface-muted);
+      border: 1px dashed var(--border-strong);
+      border-radius: 10px;
+      padding: 12px 14px;
+      font-size: 0.8125rem;
+      color: var(--text-secondary);
+      margin-bottom: 16px;
+      line-height: 1.55;
+    }
+    .bulk-cols code {
+      font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+      font-size: 0.78rem;
+      background: #eef2ff;
+      color: var(--primary-dark);
+      padding: 1px 6px;
+      border-radius: 4px;
+    }
+    .bulk-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .bulk-grid label,
+    .bulk-field label {
+      display: grid;
+      gap: 4px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .bulk-grid input,
+    .bulk-field input[type="text"],
+    .bulk-field input[type="file"],
+    .bulk-field select {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      font-family: inherit;
+      font-size: 0.875rem;
+      color: var(--text);
+      background: var(--surface);
+    }
+    .bulk-field { margin-bottom: 12px; }
+    .bulk-acc {
+      min-height: 110px;
+      max-height: 180px;
+      width: 100%;
+    }
+    .bulk-options {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px 20px;
+      margin: 8px 0 14px;
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+    .bulk-options label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .bulk-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .bulk-progress {
+      margin-top: 14px;
+      font-size: 0.875rem;
+      color: var(--text-secondary);
+    }
+    .bulk-progress .bar {
+      margin-top: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #e8eefc;
+      overflow: hidden;
+    }
+    .bulk-progress .bar > span {
+      display: block;
+      height: 100%;
+      width: 0%;
+      background: var(--primary);
+      transition: width 0.25s ease;
+    }
+    .bulk-msg {
+      margin-top: 10px;
+      font-size: 0.8125rem;
+    }
+    .bulk-msg.err {
+      color: var(--error);
+      background: var(--error-bg);
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+    .bulk-msg.ok {
+      color: var(--success);
+      background: var(--success-bg);
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+
     @media (max-width: 640px) {
       .login { padding: 32px 24px 28px; }
       header { padding: 16px; }
@@ -697,6 +829,74 @@
         <button type="button" class="ghost" id="btn-outlook-connect">Connect Outlook</button>
         <button type="button" class="ghost hidden" id="btn-outlook-disconnect">Disconnect</button>
       </div>
+
+      <section class="bulk-panel" id="bulk-panel" aria-labelledby="bulk-title">
+        <h2 id="bulk-title">Bulk rate shop</h2>
+        <p class="bulk-desc">
+          Upload a CSV or XLSX of destinations. Primus rates Estes Standard
+          (carrier cost + quote numbers) from your origin address.
+        </p>
+        <div class="bulk-cols">
+          <strong>Required columns</strong> (Book5-style preferred):<br>
+          <code>CNSG City</code>, <code>CNSG State</code>,
+          <code>CNSG Zipcode</code>, <code>Total Weight</code>,
+          <code>Total Pieces</code>, <code>dims</code>
+          (e.g. <code>40x48x60</code>)<br>
+          Also accepted (Book4-style): <code>city</code>, <code>st</code>,
+          <code>zip</code>, <code>PALLET</code>, <code>WEIGHT</code>
+          (optional second weight column), <code>dims</code>
+        </div>
+        <div class="bulk-field">
+          <label>Spreadsheet (CSV or XLSX)
+            <input type="file" id="bulk-file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+          </label>
+        </div>
+        <div class="bulk-grid">
+          <label>From street (optional)
+            <input type="text" id="bulk-from-street" placeholder="Street address" autocomplete="shipping street-address">
+          </label>
+          <label>From city *
+            <input type="text" id="bulk-from-city" required placeholder="City" autocomplete="shipping address-level2">
+          </label>
+          <label>From state *
+            <input type="text" id="bulk-from-state" required placeholder="CA" maxlength="2" autocomplete="shipping address-level1">
+          </label>
+          <label>From zip *
+            <input type="text" id="bulk-from-zip" required placeholder="91752" autocomplete="shipping postal-code">
+          </label>
+          <label>Primus customer ID (optional)
+            <input type="text" id="bulk-customer-id" placeholder="shippingLocationId — leave blank for market">
+          </label>
+        </div>
+        <div class="bulk-field">
+          <label>Accessorials (optional — Ctrl/Cmd+click multi-select)
+            <select id="bulk-accessorials" class="bulk-acc" multiple size="6">
+              <option value="" disabled>Loading catalog…</option>
+            </select>
+          </label>
+        </div>
+        <div class="bulk-options">
+          <label>
+            <input type="checkbox" id="bulk-estes-only" checked>
+            Estes Standard only
+          </label>
+          <label>
+            <input type="checkbox" id="bulk-guaranteed">
+            Include Guaranteed
+          </label>
+        </div>
+        <div class="bulk-actions">
+          <button type="button" id="btn-bulk-start">Start bulk rate shop</button>
+          <button type="button" class="ghost hidden" id="btn-bulk-download">Download results (XLSX)</button>
+          <button type="button" class="ghost hidden" id="btn-bulk-download-csv">Download CSV</button>
+        </div>
+        <div class="bulk-progress hidden" id="bulk-progress">
+          <div id="bulk-progress-text">Ready</div>
+          <div class="bar" aria-hidden="true"><span id="bulk-progress-bar"></span></div>
+        </div>
+        <div class="bulk-msg hidden" id="bulk-msg"></div>
+      </section>
+
       <div class="stats">
         <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Total quotes</div></div>
         <div class="stat"><div class="num" id="stat-awaiting">—</div><div class="lbl">Awaiting</div></div>
@@ -748,6 +948,7 @@
     let filterStatus = "pending";
     let outlookConnected = false;
     let syncInFlight = null;
+    let inboxLoadInFlight = null;
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
     let thinkingStep = 0;
@@ -1039,8 +1240,23 @@
       return res;
     }
 
+    function setFilterBarBusy(busy) {
+      ["filter-pending", "filter-sent", "filter-review", "filter-all"]
+          .forEach((id) => {
+            const el = document.getElementById(id);
+            if (el) el.disabled = !!busy;
+          });
+    }
+
     async function loadInbox(opts) {
       const sync = !!(opts && opts.sync);
+      const silent = !!(opts && opts.silent);
+      if (inboxLoadInFlight) {
+        try {
+          await inboxLoadInFlight;
+        } catch (_) { /* prior load failed */ }
+        if (silent) return;
+      }
       let path = "/getQuoteDispatcherInbox?tenantId=" +
         encodeURIComponent(TENANT_ID) + "&limit=50&syncOutlook=" +
         (sync ? "1" : "0");
@@ -1048,6 +1264,11 @@
       else if (filterStatus === "sent") path += "&status=sent";
       else if (filterStatus === "for_review") path += "&status=for_review";
       syncFilterButtons();
+      if (!silent) {
+        showInboxThinking(true);
+        setFilterBarBusy(true);
+      }
+      inboxLoadInFlight = (async () => {
       try {
       const res = await apiFetch(path);
       const root = document.getElementById("rows");
@@ -1187,12 +1408,15 @@
           e.stopPropagation();
           const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
           const currentlyOn = btn.getAttribute("data-on") === "1";
+          const prevLabel = btn.textContent;
           btn.disabled = true;
+          btn.textContent = "Updating…";
           try {
             await markQuoteForReview(quoteId, !currentlyOn);
             await loadInbox({sync: false});
           } catch (err) {
             btn.disabled = false;
+            btn.textContent = prevLabel;
             alert(err.message || "Could not update review flag");
           }
         });
@@ -1235,7 +1459,16 @@
         });
       });
       } finally {
-        showInboxThinking(false);
+        if (!silent) {
+          showInboxThinking(false);
+          setFilterBarBusy(false);
+        }
+      }
+      })();
+      try {
+        await inboxLoadInFlight;
+      } finally {
+        inboxLoadInFlight = null;
       }
     }
 
@@ -1265,7 +1498,7 @@
       }
       syncInFlight = (async () => {
         try {
-          await loadInbox({sync: true});
+          await loadInbox({sync: true, silent: true});
           markSynced();
         } catch (_) {
           // Non-fatal: scheduler still syncs ~every 20 min.
@@ -1304,6 +1537,13 @@
       e.preventDefault();
       document.getElementById("login-error").textContent = "";
       document.getElementById("login-success").classList.add("hidden");
+      const submitBtn = e.target.querySelector(".btn-login") ||
+        document.querySelector("#login-form .btn-login");
+      const prevLabel = submitBtn ? submitBtn.textContent : "Sign in";
+      if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Signing in…";
+      }
       try {
         await QuoteAuth.signInWithEmailPassword(
             document.getElementById("login-email").value,
@@ -1311,6 +1551,11 @@
       } catch (err) {
         document.getElementById("login-error").textContent =
           err.message || "Sign-in failed";
+      } finally {
+        if (submitBtn) {
+          submitBtn.disabled = false;
+          submitBtn.textContent = prevLabel;
+        }
       }
     });
 
@@ -1337,6 +1582,10 @@
 
     document.getElementById("btn-signout").addEventListener("click", () => QuoteAuth.signOut());
     document.getElementById("btn-outlook-connect").addEventListener("click", async () => {
+      const btn = document.getElementById("btn-outlook-connect");
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Opening…";
       try {
         const res = await apiFetch("/getQuoteOutlookConnectUrl?tenantId=" +
           encodeURIComponent(TENANT_ID));
@@ -1344,10 +1593,17 @@
         window.open(res.url, "_blank", "noopener,noreferrer");
       } catch (err) {
         alert(err.message || "Could not start Outlook connect");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
       }
     });
     document.getElementById("btn-outlook-disconnect").addEventListener("click", async () => {
       if (!confirm("Disconnect Outlook from this dashboard?")) return;
+      const btn = document.getElementById("btn-outlook-disconnect");
+      const prev = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Disconnecting…";
       try {
         const res = await apiFetch("/quoteOutlookDisconnect?tenantId=" +
           encodeURIComponent(TENANT_ID), {method: "POST"});
@@ -1355,6 +1611,9 @@
         await loadProfile();
       } catch (err) {
         alert(err.message || "Could not disconnect Outlook");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prev;
       }
     });
     document.getElementById("filter-pending").addEventListener("click", () => {
@@ -1387,6 +1646,275 @@
       window.open(API + "/quoteAdminPage?tenantId=" + encodeURIComponent(TENANT_ID), "_blank");
     });
 
+    let bulkJobId = null;
+    let bulkRunning = false;
+
+    function setBulkMsg(text, kind) {
+      const el = document.getElementById("bulk-msg");
+      if (!el) return;
+      if (!text) {
+        el.className = "bulk-msg hidden";
+        el.textContent = "";
+        return;
+      }
+      el.className = "bulk-msg " + (kind || "");
+      el.textContent = text;
+    }
+
+    function setBulkProgress(processed, total, status) {
+      const wrap = document.getElementById("bulk-progress");
+      const text = document.getElementById("bulk-progress-text");
+      const bar = document.getElementById("bulk-progress-bar");
+      if (!wrap || !text || !bar) return;
+      wrap.classList.remove("hidden");
+      const t = Math.max(0, Number(total) || 0);
+      const p = Math.max(0, Number(processed) || 0);
+      const pct = t ? Math.min(100, Math.round((p / t) * 100)) : 0;
+      text.textContent = (status || "Processing") + ": " + p + " / " + t +
+        " lanes (" + pct + "%)";
+      bar.style.width = pct + "%";
+    }
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const result = String(reader.result || "");
+          const comma = result.indexOf(",");
+          resolve(comma >= 0 ? result.slice(comma + 1) : result);
+        };
+        reader.onerror = () => reject(new Error("Could not read file"));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function selectedAccessorials() {
+      const sel = document.getElementById("bulk-accessorials");
+      if (!sel) return [];
+      return Array.from(sel.selectedOptions || [])
+          .map((o) => String(o.value || "").trim())
+          .filter(Boolean);
+    }
+
+    function fillAccessorialSelect(catalog) {
+      const sel = document.getElementById("bulk-accessorials");
+      if (!sel) return;
+      const sections = [
+        {key: "destination", label: "Destination"},
+        {key: "origin", label: "Origin"},
+        {key: "other", label: "Other"},
+      ];
+      const frag = document.createDocumentFragment();
+      // Prefer APD near top of destination for easy find
+      for (const sec of sections) {
+        const items = (catalog && catalog[sec.key]) || [];
+        if (!items.length) continue;
+        const group = document.createElement("optgroup");
+        group.label = sec.label;
+        const sorted = items.slice().sort((a, b) => {
+          const ac = String(a.code || "");
+          const bc = String(b.code || "");
+          if (ac === "APD") return -1;
+          if (bc === "APD") return 1;
+          return String(a.label || ac).localeCompare(String(b.label || bc));
+        });
+        for (const item of sorted) {
+          if (item.selectable === false) continue;
+          const code = String(item.code || "").trim();
+          if (!code) continue;
+          const opt = document.createElement("option");
+          opt.value = code;
+          opt.textContent = (item.label || code) + " (" + code + ")";
+          group.appendChild(opt);
+        }
+        if (group.childNodes.length) frag.appendChild(group);
+      }
+      sel.innerHTML = "";
+      if (!frag.childNodes.length) {
+        const opt = document.createElement("option");
+        opt.disabled = true;
+        opt.textContent = "No accessorials available";
+        sel.appendChild(opt);
+        return;
+      }
+      sel.appendChild(frag);
+    }
+
+    async function loadBulkAccessorialCatalog() {
+      try {
+        const res = await apiFetch("/getQuoteAccessorialCatalog?tenantId=" +
+          encodeURIComponent(TENANT_ID));
+        if (res && (res.origin || res.destination || res.other)) {
+          fillAccessorialSelect(res);
+          return;
+        }
+      } catch (_) { /* fallback below */ }
+      fillAccessorialSelect({
+        origin: [
+          {label: "Liftgate at Origin", code: "LFO", selectable: true},
+          {label: "Residential Pickup", code: "RSO", selectable: true},
+        ],
+        destination: [
+          {label: "Appointment at Destination", code: "APD", selectable: true},
+          {label: "Liftgate at Destination", code: "LFD", selectable: true},
+          {label: "Limited Access Delivery", code: "LAD", selectable: true},
+          {label: "Residential Delivery", code: "RSD", selectable: true},
+        ],
+        other: [],
+      });
+    }
+
+    async function downloadBulkResults(format) {
+      if (!bulkJobId) return;
+      let path = "/downloadBulkRateShopResults?tenantId=" +
+        encodeURIComponent(TENANT_ID) +
+        "&jobId=" + encodeURIComponent(bulkJobId) +
+        "&format=" + encodeURIComponent(format || "xlsx");
+      let authHeaders = {};
+      try {
+        authHeaders = await QuoteAuth.authHeaders();
+      } catch (_) { /* unsigned */ }
+      const res = await fetch(API + path, {headers: authHeaders});
+      if (!res.ok) {
+        let msg = "Download failed (" + res.status + ")";
+        try {
+          const data = await res.json();
+          if (data && data.error) msg = data.error;
+        } catch (_) { /* ignore */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "bulk-rates-results." + (format === "csv" ? "csv" : "xlsx");
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+    }
+
+    function showBulkDownload(show) {
+      document.getElementById("btn-bulk-download")
+          .classList.toggle("hidden", !show);
+      document.getElementById("btn-bulk-download-csv")
+          .classList.toggle("hidden", !show);
+    }
+
+    async function runBulkJob(jobId) {
+      bulkJobId = jobId;
+      bulkRunning = true;
+      const startBtn = document.getElementById("btn-bulk-start");
+      startBtn.disabled = true;
+      showBulkDownload(false);
+      setBulkMsg("");
+      try {
+        let status = await apiFetch(
+            "/getBulkRateShopJob?tenantId=" + encodeURIComponent(TENANT_ID) +
+            "&jobId=" + encodeURIComponent(jobId));
+        if (!status.ok) throw new Error(status.error || "Job status failed");
+        setBulkProgress(status.processedRows, status.totalRows, status.status);
+
+        while (status.status !== "completed" && status.status !== "failed") {
+          const chunk = await apiFetch("/processBulkRateShopJob?tenantId=" +
+            encodeURIComponent(TENANT_ID), {
+            method: "POST",
+            body: JSON.stringify({
+              tenantId: TENANT_ID,
+              jobId: jobId,
+              maxRows: 3,
+            }),
+          });
+          if (!chunk.ok) throw new Error(chunk.error || "Processing failed");
+          status = chunk;
+          setBulkProgress(status.processedRows, status.totalRows, status.status);
+          if (status.status === "completed" || status.remaining === 0) break;
+        }
+
+        setBulkProgress(status.processedRows, status.totalRows, "completed");
+        setBulkMsg(
+            "Done — " + (status.successRows || 0) + " rates, " +
+            (status.errorRows || 0) + " errors. Download results below.",
+            "ok");
+        showBulkDownload(true);
+      } catch (err) {
+        setBulkMsg(err.message || "Bulk rate shop failed", "err");
+      } finally {
+        bulkRunning = false;
+        startBtn.disabled = false;
+      }
+    }
+
+    document.getElementById("btn-bulk-start").addEventListener("click", async () => {
+      if (bulkRunning) return;
+      setBulkMsg("");
+      const fileEl = document.getElementById("bulk-file");
+      const file = fileEl && fileEl.files && fileEl.files[0];
+      if (!file) {
+        setBulkMsg("Choose a CSV or XLSX file first.", "err");
+        return;
+      }
+      const city = document.getElementById("bulk-from-city").value.trim();
+      const state = document.getElementById("bulk-from-state").value.trim();
+      const zip = document.getElementById("bulk-from-zip").value.trim();
+      if (!city || !state || !zip) {
+        setBulkMsg("From city, state, and zip are required.", "err");
+        return;
+      }
+      const startBtn = document.getElementById("btn-bulk-start");
+      startBtn.disabled = true;
+      startBtn.textContent = "Uploading…";
+      showBulkDownload(false);
+      try {
+        const fileBase64 = await fileToBase64(file);
+        const created = await apiFetch("/createBulkRateShopJob?tenantId=" +
+          encodeURIComponent(TENANT_ID), {
+          method: "POST",
+          body: JSON.stringify({
+            tenantId: TENANT_ID,
+            fileName: file.name,
+            fileBase64,
+            origin: {
+              street: document.getElementById("bulk-from-street").value.trim(),
+              city,
+              state,
+              zip,
+            },
+            accessorials: selectedAccessorials(),
+            customerId: document.getElementById("bulk-customer-id").value.trim() ||
+              null,
+            estesStandardOnly:
+              document.getElementById("bulk-estes-only").checked,
+            includeGuaranteed:
+              document.getElementById("bulk-guaranteed").checked,
+          }),
+        });
+        if (!created.ok) throw new Error(created.error || "Upload failed");
+        setBulkProgress(0, created.totalRows, "queued");
+        startBtn.textContent = "Start bulk rate shop";
+        await runBulkJob(created.jobId);
+      } catch (err) {
+        setBulkMsg(err.message || "Upload failed", "err");
+        startBtn.disabled = false;
+        startBtn.textContent = "Start bulk rate shop";
+      }
+    });
+
+    document.getElementById("btn-bulk-download").addEventListener("click", async () => {
+      try {
+        await downloadBulkResults("xlsx");
+      } catch (err) {
+        setBulkMsg(err.message || "Download failed", "err");
+      }
+    });
+    document.getElementById("btn-bulk-download-csv").addEventListener("click", async () => {
+      try {
+        await downloadBulkResults("csv");
+      } catch (err) {
+        setBulkMsg(err.message || "Download failed", "err");
+      }
+    });
+
     (async () => {
       try {
         defaultReportDates();
@@ -1399,6 +1927,7 @@
             await Promise.all([
               loadProfile(),
               loadInbox({sync: false}),
+              loadBulkAccessorialCatalog(),
             ]);
             maybeDeferredSync();
           } catch (e) {
