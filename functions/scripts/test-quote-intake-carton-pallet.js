@@ -774,6 +774,113 @@ check("explicit per-line lbs kept",
     coreforceKeep.lanes[0].freightInfo.map((r) => r.weight),
     [1020, 419]);
 
+// Lifeworks/Nexcom (Izzy Falkowitz): Total weight + 5 bare dim variants
+// must even-split — not park 2428 on line 1 with 2 lb stubs.
+const LFW_NEXCOM_BODY = [
+  "LFW-NEXCOM WEST COAST-PO# 0038240112,0038240113",
+  "Shipment 1 (Suffolk VA):",
+  "Lifeworks",
+  "Suffolk, VA 23434",
+  "Total Cartons – 352",
+  "Total weight – 2,428 with pallets",
+  "Number of Pallets - 5",
+  "Pallet dimensions (L *W *H) – 48x40x90, 48x40x87, 48x40x85, 48x40x89, 48x40x22",
+  "",
+  "Shipment 2 (Chino CA):",
+  "Nexcom",
+  "Chino, CA 91710",
+  "Total Cartons – 20",
+  "Total weight – 166 with pallets",
+  "Number of Pallets - 1",
+  "Pallet dimensions (L *W *H) – 48x40x28",
+].join("\n");
+
+const lfwSections = intake.extractNumberedShipmentSections(LFW_NEXCOM_BODY);
+check("LFW two shipment sections (paren headers)", lfwSections.length, 2);
+check("LFW Suffolk section zip", lfwSections[0].zip, "23434");
+check("LFW Chino section zip", lfwSections[1].zip, "91710");
+
+const lfwSuffolkLabeled = intake.parseLabeledFreightTotals(lfwSections[0].text);
+check("LFW Suffolk weight 2428", lfwSuffolkLabeled.weight, 2428);
+check("LFW Suffolk palletCount 5", lfwSuffolkLabeled.palletCount, 5);
+check("LFW Suffolk no single dim from mixed list",
+    lfwSuffolkLabeled.length, null);
+
+const lfwBare = intake.extractMixedQtyAtDimLines(
+    lfwSections[0].text, lfwSuffolkLabeled.palletCount);
+check("LFW bare dims → 5 lines", lfwBare.length, 5);
+check("LFW bare heights", lfwBare.map((r) => r.height),
+    [90, 87, 85, 89, 22]);
+check("LFW bare GMA 40x48", [
+  lfwBare[0].length, lfwBare[0].width,
+], [40, 48]);
+
+const lfwAiDump = {
+  lanes: [
+    {
+      laneKey: "SUFFOLK_VA",
+      consignee: {city: "Suffolk", state: "VA", zipCode: "23434"},
+      freightInfo: [
+        {qty: 1, weight: 2428, weightType: "total",
+          length: 40, width: 48, height: 90, dimType: "PLT"},
+        {qty: 1, weight: 2, weightType: "total",
+          length: 40, width: 48, height: 87, dimType: "PLT"},
+        {qty: 1, weight: 2, weightType: "total",
+          length: 40, width: 48, height: 85, dimType: "PLT"},
+        {qty: 1, weight: 2, weightType: "total",
+          length: 40, width: 48, height: 89, dimType: "PLT"},
+        {qty: 1, weight: 2, weightType: "total",
+          length: 40, width: 48, height: 22, dimType: "PLT"},
+      ],
+    },
+    {
+      laneKey: "CHINO_CA",
+      consignee: {city: "Chino", state: "CA", zipCode: "91710"},
+      freightInfo: [
+        {qty: 1, weight: 166, weightType: "total",
+          length: 40, width: 48, height: 28, dimType: "PLT"},
+      ],
+    },
+  ],
+};
+intake.normalizeExtractedQuote(lfwAiDump, {body: LFW_NEXCOM_BODY});
+const lfwSuffolk = lfwAiDump.lanes[0].freightInfo;
+const lfwChino = lfwAiDump.lanes[1].freightInfo;
+check("LFW Suffolk 5 PLT lines", lfwSuffolk.length, 5);
+check("LFW Suffolk even 485.6 each (2428/5)",
+    lfwSuffolk.map((r) => r.weight),
+    [485.6, 485.6, 485.6, 485.6, 485.6]);
+check("LFW Suffolk weightType each",
+    lfwSuffolk.map((r) => r.weightType),
+    ["each", "each", "each", "each", "each"]);
+check("LFW Suffolk heights preserved",
+    lfwSuffolk.map((r) => r.height), [90, 87, 85, 89, 22]);
+check("LFW Chino stays 1 PLT @ 166", [
+  lfwChino.length, lfwChino[0].qty, lfwChino[0].weight, lfwChino[0].height,
+], [1, 1, 166, 28]);
+
+// Collapsed AI (1×5 @ total) + bare dim list → expand then even-split.
+const lfwCollapsed = {
+  lanes: [{
+    laneKey: "SUFFOLK_VA",
+    consignee: {city: "Suffolk", state: "VA", zipCode: "23434"},
+    freightInfo: [{
+      qty: 5, weight: 2428, weightType: "total",
+      length: 40, width: 48, height: 90, dimType: "PLT",
+    }],
+  }],
+};
+intake.normalizeExtractedQuote(lfwCollapsed, {
+  body: lfwSections[0].text,
+});
+const lfwExp = lfwCollapsed.lanes[0].freightInfo;
+check("LFW collapsed → 5 dim lines", lfwExp.length, 5);
+check("LFW collapsed 485.6 each",
+    lfwExp.map((r) => r.weight),
+    [485.6, 485.6, 485.6, 485.6, 485.6]);
+check("LFW collapsed heights",
+    lfwExp.map((r) => r.height), [90, 87, 85, 89, 22]);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
