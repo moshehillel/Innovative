@@ -38,10 +38,12 @@ function isCardknoxBatchReport(subject, from) {
 
 /**
  * Legitimate D&B credit / trade-credit alert content — not marketing.
+ * Does not include productized "Credit Insights" inquiry digests (Lisa: ignore).
  * @param {string} hay Lowercased subject + body haystack.
  * @return {boolean}
  */
 function looksLikeDnbCreditAlert(hay) {
+  if (isDnbCreditInsightsDigest(hay)) return false;
   const patterns = [
     /\bcredit (?:alert|report|score|monitoring|change|inquiry|inquiries)\b/,
     /\btrade credit\b/,
@@ -58,8 +60,24 @@ function looksLikeDnbCreditAlert(hay) {
 }
 
 /**
- * Dun & Bradstreet promotional/marketing (e.g. Lili business banking ads).
- * Does not ignore legitimate D&B credit or trade-credit alerts.
+ * D&B Credit Insights "new inquiry reported" digests — informational noise.
+ * @param {string} hay Lowercased subject + body (or subject alone).
+ * @return {boolean}
+ */
+function isDnbCreditInsightsDigest(hay) {
+  const text = String(hay || "").toLowerCase();
+  if (/credit insights/.test(text) &&
+      /(?:new )?inquir(?:y|ies) reported/.test(text)) {
+    return true;
+  }
+  if (/alert:\s*new inquiry reported/.test(text)) return true;
+  return false;
+}
+
+/**
+ * Dun & Bradstreet promotional/marketing (e.g. Lili business banking ads,
+ * Credit Insights inquiry digests from e.email@dnb.com).
+ * Does not ignore legitimate D&B credit alerts from alerts/notifications.
  * @param {string} subject Email subject.
  * @param {string} from From header.
  * @param {string} body Plain body.
@@ -72,8 +90,6 @@ function isDnbPromotionalEmail(subject, from, body) {
     return false;
   }
   const hay = `${subject || ""}\n${body || ""}`.toLowerCase();
-  if (looksLikeDnbCreditAlert(hay)) return false;
-
   const addrMatch =
     fromL.match(/<([^>]+)>/) || fromL.match(/([\w.+-]+@[\w.-]+)/);
   const addr = String(addrMatch && addrMatch[1] || fromL).toLowerCase();
@@ -81,6 +97,15 @@ function isDnbPromotionalEmail(subject, from, body) {
     addr.startsWith("e.email@dnb.com") ||
     addr.includes("marketing@") ||
     addr.includes("@e.email.dnb.com");
+
+  // Marketing ESP + Credit Insights digests — always ignore (Lisa).
+  if (isMarketingSender) return true;
+  if (isDnbCreditInsightsDigest(hay) ||
+      isDnbCreditInsightsDigest(String(subject || ""))) {
+    return true;
+  }
+
+  if (looksLikeDnbCreditAlert(hay)) return false;
 
   const promotionalPatterns = [
     /\blili\b/,
@@ -93,16 +118,7 @@ function isDnbPromotionalEmail(subject, from, body) {
     /\blimited[- ]time offer\b/,
     /\bstart(?:ing)? (?:your|a) business (?:bank|banking)\b/,
   ];
-  const looksPromotional = promotionalPatterns.some((re) => re.test(hay));
-  if (looksPromotional) return true;
-
-  // e.email@dnb.com is D&B's marketing sender — banking-ad subjects only.
-  if (isMarketingSender &&
-      /\b(?:banking|bank account|checking|overdraft|fees)\b/i
-          .test(String(subject || ""))) {
-    return true;
-  }
-  return false;
+  return promotionalPatterns.some((re) => re.test(hay));
 }
 
 /**
@@ -1366,6 +1382,7 @@ module.exports = {
   isEmodalBroadcast,
   isCardknoxBatchReport,
   looksLikeDnbCreditAlert,
+  isDnbCreditInsightsDigest,
   isDnbPromotionalEmail,
   isPromotionalMarketingEmail,
   isCofaceEmail,

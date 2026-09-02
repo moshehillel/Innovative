@@ -154,6 +154,22 @@ check("D&B promo evaluate ignored",
     adm.evaluateAdministrativeIgnore(
         dnbPromoSubject, dnbPromoFrom, dnbPromoBody, []).status ===
     "dnb_promotional_ignored");
+check("D&B Credit Insights inquiry alert ignored",
+    adm.isDnbPromotionalEmail(
+        "ALERT: New Inquiry Reported in D&B Credit Insights",
+        "Dun & Bradstreet <e.email@dnb.com>",
+        "A new inquiry was reported in Credit Insights."));
+check("D&B Credit Insights evaluate ignored",
+    adm.evaluateAdministrativeIgnore(
+        "ALERT: New Inquiry Reported in D&B Credit Insights",
+        "Dun & Bradstreet <e.email@dnb.com>",
+        "View the inquiry in Credit Insights.",
+        []).status === "dnb_promotional_ignored");
+check("D&B marketing ESP ignored even without banking subject",
+    adm.isDnbPromotionalEmail(
+        "Your weekly D&B update",
+        "Dun & Bradstreet <e.email@dnb.com>",
+        "See what's new this week."));
 check("D&B credit alert not treated as promo",
     !adm.isDnbPromotionalEmail(
         "Business credit alert for Innovative Carriers",
