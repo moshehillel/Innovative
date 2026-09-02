@@ -13,9 +13,11 @@ const freightRules = require("./quote-freight-rules");
 const senderRules = require("./quote-sender-rules");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
-// Live bake-off tied (Haiku / Sonnet 4.5 / Sonnet 5 / luna / sol / gpt-4o
-// all 17/17). Keep Haiku. Override with QUOTE_EXTRACT_MODEL (Claude or gpt-*).
-const DEFAULT_QUOTE_EXTRACT_MODEL = "claude-haiku-4-5";
+// Bake-off winner: Cursor Grok bot (grok-4.5) scored 19/20 vs Sonnet 4.6
+// Agent SDK 18/20 and Haiku+patches 9/20. Override with QUOTE_EXTRACT_MODEL.
+const DEFAULT_QUOTE_EXTRACT_MODEL = "grok-4.5";
+/** Haiku fallback when Cursor Agent extract fails. */
+const FALLBACK_QUOTE_EXTRACT_MODEL = "claude-haiku-4-5";
 
 /** Max plain-text body kept for extract / queue persistence. */
 const QUOTE_BODY_STORE_MAX = 20000;
@@ -317,11 +319,21 @@ function parseQuoteExtractJson(raw) {
 }
 
 /**
- * Configured extract model (Claude or OpenAI slug).
+ * Configured extract model (Cursor Grok/Composer, Claude, or OpenAI slug).
  * @return {string}
  */
 function getQuoteExtractModel() {
   return process.env.QUOTE_EXTRACT_MODEL || DEFAULT_QUOTE_EXTRACT_MODEL;
+}
+
+/**
+ * Cursor API key. Prefer CRSR_API_KEY (project convention); also accept
+ * CURSOR_API_KEY (SDK / docs name).
+ * @return {string|null}
+ */
+function getCursorApiKey() {
+  const key = process.env.CRSR_API_KEY || process.env.CURSOR_API_KEY || null;
+  return key && String(key).trim() ? String(key).trim() : null;
 }
 
 /**
@@ -333,6 +345,16 @@ function isOpenAiExtractModel(model) {
   const m = String(model || "").toLowerCase();
   return m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") ||
     m.startsWith("o4");
+}
+
+/**
+ * True for Cursor Agent SDK extract models (Grok bot / Composer).
+ * @param {string} model Model slug.
+ * @return {boolean}
+ */
+function isCursorExtractModel(model) {
+  const m = String(model || "").toLowerCase();
+  return m.startsWith("grok-") || m.startsWith("composer-");
 }
 
 /**
@@ -617,12 +639,110 @@ async function callOpenAiQuoteExtraction(payload, model) {
 }
 
 /**
+ * Cursor Agent SDK extract (same path as bake-off winner grok-4.5).
+ * @param {object} payload subject/from/body.
+ * @param {string} model Cursor model id (e.g. grok-4.5).
+ * @return {Promise<string>} Raw model text.
+ */
+async function callCursorQuoteExtraction(payload, model) {
+  const apiKey = getCursorApiKey();
+  if (!apiKey) throw new Error("CRSR_API_KEY not configured");
+  let Agent;
+  let Cursor;
+  try {
+    ({Agent, Cursor} = require("@cursor/sdk"));
+  } catch (err) {
+    throw new Error(
+        `@cursor/sdk not installed (${err.message}). ` +
+        "Run npm install in functions/",
+    );
+  }
+  const fs = require("fs");
+  const os = require("os");
+  const path = require("path");
+  const {spawnSync} = require("child_process");
+
+  // Bake-off fix: HTTP/1 avoids intermittent local Protocol errors.
+  try {
+    Cursor.configure({local: {useHttp1ForAgent: true}});
+  } catch (_) {
+    // older SDK — ignore
+  }
+
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "quote-cursor-"));
+  try {
+    spawnSync("git", ["init"], {cwd: scratch, stdio: "ignore"});
+    const prompt = [
+      quoteExtractSystemPrompt(),
+      "",
+      "Return ONLY the extract JSON object. Do not edit files. Do not use tools.",
+      "No markdown fences. No explanation.",
+      "",
+      "EMAIL:",
+      JSON.stringify(payload),
+    ].join("\n");
+    const result = await Agent.prompt(prompt, {
+      apiKey,
+      model: {id: model},
+      tools: [],
+      local: {
+        cwd: scratch,
+        settingSources: [],
+        enableAgentRetries: true,
+      },
+    });
+
+    let text = "";
+    if (result && typeof result.stream === "function") {
+      try {
+        for await (const event of result.stream()) {
+          if (event && event.type === "assistant" && event.message &&
+              Array.isArray(event.message.content)) {
+            for (const block of event.message.content) {
+              if (block && block.type === "text" && block.text) {
+                text += block.text;
+              }
+            }
+          }
+        }
+      } catch (_) {
+        // fall through to wait/result
+      }
+    }
+    const waited = result && typeof result.wait === "function" ?
+      await result.wait() : result;
+    const resultText = String(
+        (waited && waited.result) || (waited && waited.text) || "",
+    ).trim();
+    if (resultText && resultText.length > text.length) text = resultText;
+    text = String(text || "").trim();
+
+    if (waited && waited.status === "error") {
+      const msg = (waited.error && waited.error.message) ||
+        "Cursor Agent run error";
+      throw new Error(msg);
+    }
+    if (!text) throw new Error("Cursor Agent returned empty extract");
+    return text;
+  } finally {
+    try {
+      fs.rmSync(scratch, {recursive: true, force: true});
+    } catch (_) {
+      // ignore cleanup
+    }
+  }
+}
+
+/**
  * @param {object} payload subject/from/body.
  * @param {string} [model] Override model slug.
  * @return {Promise<string>} Raw model text.
  */
 async function callQuoteExtractionModel(payload, model) {
   const slug = model || getQuoteExtractModel();
+  if (isCursorExtractModel(slug)) {
+    return callCursorQuoteExtraction(payload, slug);
+  }
   if (isOpenAiExtractModel(slug)) {
     return callOpenAiQuoteExtraction(payload, slug);
   }
@@ -2721,18 +2841,25 @@ async function extractQuoteRequest(opts) {
   };
 
   const extractModel = getQuoteExtractModel();
-  const canCallModel = isOpenAiExtractModel(extractModel) ?
-    Boolean(getQuoteClassifyOpenAiKey()) :
-    Boolean(process.env.ANTHROPIC_API_KEY);
+  let canCallModel = false;
+  let missingKeyError = "extract API key not configured";
+  if (isCursorExtractModel(extractModel)) {
+    canCallModel = Boolean(getCursorApiKey());
+    missingKeyError = "CRSR_API_KEY not configured";
+  } else if (isOpenAiExtractModel(extractModel)) {
+    canCallModel = Boolean(getQuoteClassifyOpenAiKey());
+    missingKeyError = "OpenAI API key not configured";
+  } else {
+    canCallModel = Boolean(process.env.ANTHROPIC_API_KEY);
+    missingKeyError = "ANTHROPIC_API_KEY not configured";
+  }
   if (!canCallModel) {
     const heuristic = heuristicExtractQuote({subject, from, body});
     if (heuristic) {
       heuristic.extractModel = "heuristic";
       return finishExtract(heuristic, {subject, body, from});
     }
-    fallback.error = isOpenAiExtractModel(extractModel) ?
-      "OpenAI API key not configured" :
-      "ANTHROPIC_API_KEY not configured";
+    fallback.error = missingKeyError;
     fallback.extractModel = extractModel;
     return fallback;
   }
@@ -2756,6 +2883,24 @@ async function extractQuoteRequest(opts) {
       lastErr = new Error("model returned zero lanes");
     } catch (err) {
       lastErr = err;
+    }
+  }
+
+  // Cursor path: fall back to Haiku so quoting still works if Agent fails.
+  if (isCursorExtractModel(extractModel) && process.env.ANTHROPIC_API_KEY) {
+    try {
+      raw = await callClaudeQuoteExtraction(
+          {subject, from, body}, FALLBACK_QUOTE_EXTRACT_MODEL);
+      const parsed = parseQuoteExtractJson(raw);
+      if (parsed && Array.isArray(parsed.lanes) && parsed.lanes.length) {
+        if (!parsed.flags) parsed.flags = {};
+        parsed.extractModel = FALLBACK_QUOTE_EXTRACT_MODEL;
+        pushExtractWarning(parsed,
+            `Cursor extract failed (${(lastErr && lastErr.message) || "unknown"}); used Haiku fallback`);
+        return finishExtract(parsed, {subject, body, from});
+      }
+    } catch (fallbackErr) {
+      lastErr = fallbackErr;
     }
   }
 
@@ -2911,9 +3056,12 @@ async function classifyIsQuoteRequest(opts) {
 
 module.exports = {
   DEFAULT_QUOTE_EXTRACT_MODEL,
+  FALLBACK_QUOTE_EXTRACT_MODEL,
   QUOTE_BODY_STORE_MAX,
   getQuoteExtractModel,
+  getCursorApiKey,
   isOpenAiExtractModel,
+  isCursorExtractModel,
   quoteExtractSystemPrompt,
   callQuoteExtractionModel,
   extractJsonObject,
