@@ -139,55 +139,107 @@ function freightFromRow(row) {
 
 /**
  * Real Primus quote number (not W000 account ids).
- * @param {object} r Normalized rate.
- * @param {object|null} rawById Raw rates by id.
+ * Prefers raw Primus rate fields; falls back to normalized row.
+ * @param {object} r Rate (raw or normalized).
+ * @param {object|null} [rawById] Raw rates by id (optional).
  * @return {string|null}
  */
 function realQuoteNumber(r, rawById) {
   const raw = rawById && r && (rawById[r.id] || rawById[r.rateId]);
-  const q = raw ? raw.quoteNumber : (r && r.quoteNumber);
-  const s = String(q || "").trim();
+  const src = raw || r || {};
+  const s = String(src.quoteNumber || "").trim();
   if (!s) return null;
-  const acct = raw && String(raw.accountNumber || "").trim();
+  const acct = String(src.accountNumber || "").trim();
   if (acct && s === acct) return null;
   if (/^W000\d+$/i.test(s)) return null;
   return s;
 }
 
 /**
- * Prefer Estes Express non-volume LTL standard (not guaranteed unless asked).
+ * @param {object} r Rate.
+ * @return {boolean}
+ */
+function isEstesNonVolume(r) {
+  const blob = `${r.name || ""} ${r.SCAC || ""} ${r.scac || ""}`;
+  if (!/estes|EXLA/i.test(blob)) return false;
+  if (/volume/i.test(String(r.name || ""))) return false;
+  return true;
+}
+
+/**
+ * @param {object} r Rate.
+ * @return {boolean}
+ */
+function isGuaranteedRate(r) {
+  return r.guaranteed === true ||
+    String(r.rateType || "").toUpperCase() === "GUARANTEED";
+}
+
+/**
+ * Estes Retail Guarantee (ERG) — Book8 pattern.
+ * @param {object} r Rate (prefer raw for serviceLevel / quote prefix).
+ * @return {boolean}
+ */
+function isErgRate(r) {
+  const lvl = String(r.serviceLevel || "").toLowerCase();
+  if (/retail\s*guarantee|\berg\b/.test(lvl)) return true;
+  const code = String(r.serviceLevelCode || "").toUpperCase();
+  if (code === "ERG" || /RETAIL/.test(code)) return true;
+  const q = String(r.quoteNumber || "");
+  if (/^R[A-Z0-9]+$/i.test(q) && isGuaranteedRate(r)) return true;
+  return false;
+}
+
+/**
+ * Prefer Estes Express non-volume LTL: standard / guaranteed / ERG.
+ * Picks from raw Primus rates when available (quote # + ERG fields).
  * @param {Array<object>} rates Normalized rates.
  * @param {object} rawById Raw by id.
  * @param {object} opts includeGuaranteed.
- * @return {object|null}
+ * @return {{standard:object|null,guaranteed:object|null,erg:object|null}}
  */
 function pickEstesStandard(rates, rawById, opts = {}) {
-  const estes = (rates || []).filter((r) => {
-    const blob = `${r.name || ""} ${r.SCAC || ""}`;
-    if (!/estes|EXLA/i.test(blob)) return false;
-    if (/volume/i.test(String(r.name || ""))) return false;
-    return true;
-  });
-  const isGtd = (r) => r.guaranteed ||
-    String(r.rateType || "").toUpperCase() === "GUARANTEED";
+  const rawList = rawById && typeof rawById === "object" ?
+    Object.values(rawById).filter(Boolean) : [];
+  const pool = rawList.length ? rawList : (rates || []);
+  const estes = pool.filter(isEstesNonVolume);
   const isExpress = (r) => /express/i.test(String(r.name || ""));
   const byTotal = (a, b) => Number(a.total) - Number(b.total);
+  const annotate = (r) => {
+    if (!r) return null;
+    r._quote = realQuoteNumber(r, rawById);
+    return r;
+  };
 
-  const stdPool = estes.filter((r) => !isGtd(r));
+  const stdPool = estes.filter((r) => !isGuaranteedRate(r));
   const stdExpress = stdPool.filter(isExpress);
-  const std = (stdExpress.length ? stdExpress : stdPool).sort(byTotal)[0] ||
-    null;
-  if (std) std._quote = realQuoteNumber(std, rawById);
+  const std = annotate(
+      (stdExpress.length ? stdExpress : stdPool).sort(byTotal)[0] || null,
+  );
 
   let gtd = null;
+  let erg = null;
   if (opts.includeGuaranteed) {
-    const gtdPool = estes.filter(isGtd);
+    const gtdPool = estes.filter((r) => isGuaranteedRate(r) && !isErgRate(r));
     const gtdExpress = gtdPool.filter(isExpress);
     gtd = (gtdExpress.length ? gtdExpress : gtdPool).sort(byTotal)[0] || null;
-    if (gtd) gtd._quote = realQuoteNumber(gtd, rawById);
+    // Prefer a guaranteed row that has a real quote # when possible
+    if (gtd && !realQuoteNumber(gtd, rawById) && gtdExpress.length) {
+      gtd = gtdExpress.map((r) => {
+        r._quote = realQuoteNumber(r, rawById);
+        return r;
+      }).filter((r) => r._quote).sort(byTotal)[0] || gtd;
+    }
+    gtd = annotate(gtd);
+
+    const ergPool = estes.filter(isErgRate);
+    const ergExpress = ergPool.filter(isExpress);
+    erg = annotate(
+        (ergExpress.length ? ergExpress : ergPool).sort(byTotal)[0] || null,
+    );
   }
 
-  return {standard: std, guaranteed: gtd};
+  return {standard: std, guaranteed: gtd, erg};
 }
 
 /**
@@ -261,6 +313,8 @@ function parseSpreadsheet(buffer, fileName) {
       standardName: null,
       estesGuaranteed: null,
       guaranteedQuote: null,
+      estesErg: null,
+      ergQuote: null,
       error: null,
     });
   }
@@ -419,18 +473,25 @@ async function rateOneRow(job, row) {
   });
   const std = picked.standard;
   const gtd = picked.guaranteed;
+  const erg = picked.erg;
   const stdCost = std && Number.isFinite(Number(std.total)) ?
     Number(std.total) : null;
   const gtdCost = gtd && Number.isFinite(Number(gtd.total)) ?
     Number(gtd.total) : null;
+  const ergCost = erg && Number.isFinite(Number(erg.total)) ?
+    Number(erg.total) : null;
 
   return {
     status: stdCost != null ? "done" : "no_rate",
     estesStandard: stdCost,
-    standardQuote: (std && std._quote) || null,
+    // Always persist quote # beside cost (Book4/Book5/Book8 pattern)
+    standardQuote: (std && std._quote) || realQuoteNumber(std, rawById) || null,
     standardName: (std && std.name) || null,
     estesGuaranteed: gtdCost,
-    guaranteedQuote: (gtd && gtd._quote) || null,
+    guaranteedQuote: (gtd && gtd._quote) || realQuoteNumber(gtd, rawById) ||
+      null,
+    estesErg: ergCost,
+    ergQuote: (erg && erg._quote) || realQuoteNumber(erg, rawById) || null,
     rateCount: (result.rates || []).length,
     error: stdCost == null ? "No Estes Standard rate" : null,
   };
@@ -599,10 +660,12 @@ function publicRow(row) {
     dims: r.dims,
     status: r.status,
     estesStandard: r.estesStandard,
-    standardQuote: r.standardQuote,
+    standardQuote: r.standardQuote || null,
     standardName: r.standardName,
     estesGuaranteed: r.estesGuaranteed,
-    guaranteedQuote: r.guaranteedQuote,
+    guaranteedQuote: r.guaranteedQuote || null,
+    estesErg: r.estesErg != null ? r.estesErg : null,
+    ergQuote: r.ergQuote || null,
     error: r.error || null,
   };
 }
@@ -656,13 +719,17 @@ async function buildResultsDownload(tenant, jobId, opts = {}) {
     throw err;
   }
   const includeGtd = !!(job.options && job.options.includeGuaranteed);
+  // Always pair every cost column with its quote # (Book8 sheet pattern)
   const header = [
     "CNSG City", "CNSG State", "CNSG Zipcode",
     "Total Weight", "Total Pieces", "dims",
     "estes standard", "estes standard quote",
   ];
   if (includeGtd) {
-    header.push("estes guaranteed", "estes guaranteed quote");
+    header.push(
+        "estes guaranteed", "estes guaranteed quote",
+        "estes erg", "estes erg quote",
+    );
   }
   header.push("status", "error");
 
@@ -675,11 +742,16 @@ async function buildResultsDownload(tenant, jobId, opts = {}) {
       row.weight,
       row.pieces,
       row.dims,
-      row.estesStandard,
-      row.standardQuote,
+      row.estesStandard != null ? row.estesStandard : "",
+      row.standardQuote != null ? row.standardQuote : "",
     ];
     if (includeGtd) {
-      line.push(row.estesGuaranteed, row.guaranteedQuote);
+      line.push(
+          row.estesGuaranteed != null ? row.estesGuaranteed : "",
+          row.guaranteedQuote != null ? row.guaranteedQuote : "",
+          row.estesErg != null ? row.estesErg : "",
+          row.ergQuote != null ? row.ergQuote : "",
+      );
     }
     line.push(row.status || "", row.error || "");
     aoa.push(line);
@@ -720,6 +792,7 @@ module.exports = {
   buildResultsDownload,
   pickEstesStandard,
   realQuoteNumber,
+  isErgRate,
   freightFromRow,
   COLLECTION,
   MAX_ROWS,

@@ -641,21 +641,57 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 18px 20px 20px;
+      padding: 14px 16px;
       margin-bottom: 24px;
       box-shadow: var(--shadow-sm);
     }
+    .bulk-compact {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px 14px;
+    }
+    .bulk-compact-copy {
+      flex: 1 1 220px;
+      min-width: 0;
+    }
     .bulk-panel h2 {
-      margin: 0 0 6px;
+      margin: 0 0 2px;
       font-size: 1.05rem;
       font-weight: 700;
       color: var(--primary-dark);
       letter-spacing: -0.02em;
     }
     .bulk-panel .bulk-desc {
-      margin: 0 0 14px;
-      font-size: 0.875rem;
+      margin: 0;
+      font-size: 0.8125rem;
       color: var(--muted);
+    }
+    .bulk-compact-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .bulk-file-inline {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      color: var(--muted);
+    }
+    .bulk-file-inline input[type="file"] {
+      max-width: 220px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      color: var(--text);
+    }
+    .bulk-opts-summary {
+      width: 100%;
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-top: 2px;
     }
     .bulk-cols {
       background: var(--surface-muted);
@@ -729,7 +765,7 @@
       align-items: center;
     }
     .bulk-progress {
-      margin-top: 14px;
+      margin-top: 12px;
       font-size: 0.875rem;
       color: var(--text-secondary);
     }
@@ -762,6 +798,52 @@
       background: var(--success-bg);
       padding: 8px 12px;
       border-radius: 8px;
+    }
+    .bulk-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.45);
+      z-index: 80;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 48px 16px 24px;
+      overflow-y: auto;
+    }
+    .bulk-modal-backdrop.hidden { display: none; }
+    .bulk-modal {
+      width: min(640px, 100%);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-lg);
+      padding: 20px 22px 18px;
+    }
+    .bulk-modal-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .bulk-modal-head h3 {
+      margin: 0;
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--primary-dark);
+    }
+    .bulk-modal-head p {
+      margin: 4px 0 0;
+      font-size: 0.8125rem;
+      color: var(--muted);
+    }
+    .bulk-modal-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 8px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
     }
 
     @media (max-width: 640px) {
@@ -831,64 +913,23 @@
       </div>
 
       <section class="bulk-panel" id="bulk-panel" aria-labelledby="bulk-title">
-        <h2 id="bulk-title">Bulk rate shop</h2>
-        <p class="bulk-desc">
-          Upload a CSV or XLSX of destinations. Primus rates Estes Standard
-          (carrier cost + quote numbers) from your origin address.
-        </p>
-        <div class="bulk-cols">
-          <strong>Required columns</strong> (Book5-style preferred):<br>
-          <code>CNSG City</code>, <code>CNSG State</code>,
-          <code>CNSG Zipcode</code>, <code>Total Weight</code>,
-          <code>Total Pieces</code>, <code>dims</code>
-          (e.g. <code>40x48x60</code>)<br>
-          Also accepted (Book4-style): <code>city</code>, <code>st</code>,
-          <code>zip</code>, <code>PALLET</code>, <code>WEIGHT</code>
-          (optional second weight column), <code>dims</code>
-        </div>
-        <div class="bulk-field">
-          <label>Spreadsheet (CSV or XLSX)
-            <input type="file" id="bulk-file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
-          </label>
-        </div>
-        <div class="bulk-grid">
-          <label>From street (optional)
-            <input type="text" id="bulk-from-street" placeholder="Street address" autocomplete="shipping street-address">
-          </label>
-          <label>From city *
-            <input type="text" id="bulk-from-city" required placeholder="City" autocomplete="shipping address-level2">
-          </label>
-          <label>From state *
-            <input type="text" id="bulk-from-state" required placeholder="CA" maxlength="2" autocomplete="shipping address-level1">
-          </label>
-          <label>From zip *
-            <input type="text" id="bulk-from-zip" required placeholder="91752" autocomplete="shipping postal-code">
-          </label>
-          <label>Primus customer ID (optional)
-            <input type="text" id="bulk-customer-id" placeholder="shippingLocationId — leave blank for market">
-          </label>
-        </div>
-        <div class="bulk-field">
-          <label>Accessorials (optional — Ctrl/Cmd+click multi-select)
-            <select id="bulk-accessorials" class="bulk-acc" multiple size="6">
-              <option value="" disabled>Loading catalog…</option>
-            </select>
-          </label>
-        </div>
-        <div class="bulk-options">
-          <label>
-            <input type="checkbox" id="bulk-estes-only" checked>
-            Estes Standard only
-          </label>
-          <label>
-            <input type="checkbox" id="bulk-guaranteed">
-            Include Guaranteed
-          </label>
-        </div>
-        <div class="bulk-actions">
-          <button type="button" id="btn-bulk-start">Start bulk rate shop</button>
-          <button type="button" class="ghost hidden" id="btn-bulk-download">Download results (XLSX)</button>
-          <button type="button" class="ghost hidden" id="btn-bulk-download-csv">Download CSV</button>
+        <div class="bulk-compact">
+          <div class="bulk-compact-copy">
+            <h2 id="bulk-title">Bulk rate shop</h2>
+            <p class="bulk-desc">
+              Upload destinations — results include carrier cost + quote numbers.
+            </p>
+          </div>
+          <div class="bulk-compact-actions">
+            <label class="bulk-file-inline">File
+              <input type="file" id="bulk-file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+            </label>
+            <button type="button" class="ghost" id="btn-bulk-options">Options</button>
+            <button type="button" id="btn-bulk-start">Start bulk rate shop</button>
+            <button type="button" class="ghost hidden" id="btn-bulk-download">Download XLSX</button>
+            <button type="button" class="ghost hidden" id="btn-bulk-download-csv">Download CSV</button>
+          </div>
+          <div class="bulk-opts-summary" id="bulk-opts-summary">Origin not set · no accessorials</div>
         </div>
         <div class="bulk-progress hidden" id="bulk-progress">
           <div id="bulk-progress-text">Ready</div>
@@ -896,6 +937,65 @@
         </div>
         <div class="bulk-msg hidden" id="bulk-msg"></div>
       </section>
+
+      <div class="bulk-modal-backdrop hidden" id="bulk-options-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-options-title">
+        <div class="bulk-modal">
+          <div class="bulk-modal-head">
+            <div>
+              <h3 id="bulk-options-title">Bulk rate options</h3>
+              <p>Origin address, accessorials, and rate modes for the spreadsheet job.</p>
+            </div>
+            <button type="button" class="ghost" id="btn-bulk-options-close" aria-label="Close options">Close</button>
+          </div>
+          <div class="bulk-cols">
+            <strong>Required columns</strong> (Book5-style preferred):<br>
+            <code>CNSG City</code>, <code>CNSG State</code>,
+            <code>CNSG Zipcode</code>, <code>Total Weight</code>,
+            <code>Total Pieces</code>, <code>dims</code>
+            (e.g. <code>40x48x60</code>)<br>
+            Also accepted (Book4-style): <code>city</code>, <code>st</code>,
+            <code>zip</code>, <code>PALLET</code>, <code>WEIGHT</code>
+            (optional second weight column), <code>dims</code>
+          </div>
+          <div class="bulk-grid">
+            <label>From street (optional)
+              <input type="text" id="bulk-from-street" placeholder="Street address" autocomplete="shipping street-address">
+            </label>
+            <label>From city *
+              <input type="text" id="bulk-from-city" required placeholder="City" autocomplete="shipping address-level2">
+            </label>
+            <label>From state *
+              <input type="text" id="bulk-from-state" required placeholder="CA" maxlength="2" autocomplete="shipping address-level1">
+            </label>
+            <label>From zip *
+              <input type="text" id="bulk-from-zip" required placeholder="91752" autocomplete="shipping postal-code">
+            </label>
+            <label>Primus customer ID (optional)
+              <input type="text" id="bulk-customer-id" placeholder="shippingLocationId — leave blank for market">
+            </label>
+          </div>
+          <div class="bulk-field">
+            <label>Accessorials (optional — Ctrl/Cmd+click multi-select)
+              <select id="bulk-accessorials" class="bulk-acc" multiple size="6">
+                <option value="" disabled>Loading catalog…</option>
+              </select>
+            </label>
+          </div>
+          <div class="bulk-options">
+            <label>
+              <input type="checkbox" id="bulk-estes-only" checked>
+              Estes Standard only
+            </label>
+            <label>
+              <input type="checkbox" id="bulk-guaranteed">
+              Include Guaranteed + ERG
+            </label>
+          </div>
+          <div class="bulk-modal-foot">
+            <button type="button" id="btn-bulk-options-done">Done</button>
+          </div>
+        </div>
+      </div>
 
       <div class="stats">
         <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Total quotes</div></div>
@@ -1649,6 +1749,30 @@
     let bulkJobId = null;
     let bulkRunning = false;
 
+    function updateBulkOptsSummary() {
+      const summary = document.getElementById("bulk-opts-summary");
+      if (!summary) return;
+      const city = (document.getElementById("bulk-from-city").value || "").trim();
+      const state = (document.getElementById("bulk-from-state").value || "").trim();
+      const zip = (document.getElementById("bulk-from-zip").value || "").trim();
+      const acc = selectedAccessorials();
+      const gtd = document.getElementById("bulk-guaranteed").checked;
+      const origin = (city && state && zip) ?
+        (city + ", " + state + " " + zip) : "Origin not set";
+      const accTxt = acc.length ? (acc.length + " accessorial" +
+        (acc.length === 1 ? "" : "s")) : "no accessorials";
+      const mode = gtd ? "Standard + Guaranteed/ERG" : "Estes Standard";
+      summary.textContent = origin + " · " + accTxt + " · " + mode;
+    }
+
+    function setBulkOptionsOpen(open) {
+      const modal = document.getElementById("bulk-options-modal");
+      if (!modal) return;
+      modal.classList.toggle("hidden", !open);
+      if (!open) updateBulkOptsSummary();
+    }
+
+
     function setBulkMsg(text, kind) {
       const el = document.getElementById("bulk-msg");
       if (!el) return;
@@ -1746,6 +1870,7 @@
           encodeURIComponent(TENANT_ID));
         if (res && (res.origin || res.destination || res.other)) {
           fillAccessorialSelect(res);
+          updateBulkOptsSummary();
           return;
         }
       } catch (_) { /* fallback below */ }
@@ -1762,6 +1887,7 @@
         ],
         other: [],
       });
+      updateBulkOptsSummary();
     }
 
     async function downloadBulkResults(format) {
@@ -1845,6 +1971,27 @@
       }
     }
 
+    document.getElementById("btn-bulk-options").addEventListener("click", () => {
+      setBulkOptionsOpen(true);
+    });
+    document.getElementById("btn-bulk-options-close").addEventListener("click", () => {
+      setBulkOptionsOpen(false);
+    });
+    document.getElementById("btn-bulk-options-done").addEventListener("click", () => {
+      setBulkOptionsOpen(false);
+    });
+    document.getElementById("bulk-options-modal").addEventListener("click", (ev) => {
+      if (ev.target && ev.target.id === "bulk-options-modal") setBulkOptionsOpen(false);
+    });
+    ["bulk-from-city", "bulk-from-state", "bulk-from-zip", "bulk-guaranteed",
+      "bulk-estes-only", "bulk-accessorials"].forEach((id) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener("change", updateBulkOptsSummary);
+      el.addEventListener("input", updateBulkOptsSummary);
+    });
+    updateBulkOptsSummary();
+
     document.getElementById("btn-bulk-start").addEventListener("click", async () => {
       if (bulkRunning) return;
       setBulkMsg("");
@@ -1858,7 +2005,8 @@
       const state = document.getElementById("bulk-from-state").value.trim();
       const zip = document.getElementById("bulk-from-zip").value.trim();
       if (!city || !state || !zip) {
-        setBulkMsg("From city, state, and zip are required.", "err");
+        setBulkMsg("From city, state, and zip are required — open Options.", "err");
+        setBulkOptionsOpen(true);
         return;
       }
       const startBtn = document.getElementById("btn-bulk-start");
