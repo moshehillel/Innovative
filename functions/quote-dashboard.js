@@ -18,6 +18,7 @@ const quoteFirebaseAuth = require("./quote-firebase-auth");
 const quoteOutlook = require("./quote-outlook");
 const quoteAccCatalog = require("./quote-accessorial-catalog");
 const quotePasswordReset = require("./quote-password-reset");
+const quoteBulkRateShop = require("./quote-bulk-rate-shop");
 
 /** Bumped when quote-auth-client.js API changes (cache-bust HTML). */
 const QUOTE_AUTH_CLIENT_VERSION = "3";
@@ -35,6 +36,10 @@ function init(d) {
   quoteOutlook.init({tcol: d.tcol, writeLog: d.writeLog});
   addressEnrichment.init({tcol: d.tcol});
   quoteAccCatalog.init({tcol: d.tcol});
+  quoteBulkRateShop.init({
+    tcol: d.tcol,
+    getPrimusToken: d.getPrimusToken,
+  });
 }
 
 /**
@@ -1410,6 +1415,142 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
   }
 }
 
+/**
+ * POST create bulk Primus rate-shop job from CSV/XLSX (base64).
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleCreateBulkRateShopJob(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST"});
+  }
+  try {
+    const user = await resolveDashboardUser(req);
+    if (!user.ok) {
+      return res.status(user.status || 401).json({
+        ok: false,
+        error: user.error,
+      });
+    }
+    const body = req.body || {};
+    const result = await quoteBulkRateShop.createJob(user.tenant, {
+      fileBase64: body.fileBase64,
+      fileName: body.fileName,
+      origin: body.origin,
+      accessorials: body.accessorials,
+      customerId: body.customerId || body.shippingLocationId,
+      estesStandardOnly: body.estesStandardOnly !== false,
+      includeGuaranteed: !!body.includeGuaranteed,
+      dispatcherId: user.dispatcherId,
+      email: user.email || (user.dispatcher && user.dispatcher.email),
+    });
+    return res.json(result);
+  } catch (err) {
+    console.error("createBulkRateShopJob:", err);
+    return res.status(400).json({ok: false, error: err.message});
+  }
+}
+
+/**
+ * POST process next chunk of a bulk rate-shop job.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleProcessBulkRateShopJob(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST"});
+  }
+  try {
+    const user = await resolveDashboardUser(req);
+    if (!user.ok) {
+      return res.status(user.status || 401).json({
+        ok: false,
+        error: user.error,
+      });
+    }
+    const body = req.body || {};
+    const jobId = body.jobId || req.query.jobId;
+    const result = await quoteBulkRateShop.processJobChunk(
+        user.tenant, String(jobId || ""), {
+          maxRows: body.maxRows,
+          dispatcherId: user.dispatcherId,
+        });
+    return res.json(result);
+  } catch (err) {
+    const status = err.status || 500;
+    console.error("processBulkRateShopJob:", err);
+    return res.status(status).json({ok: false, error: err.message});
+  }
+}
+
+/**
+ * GET bulk rate-shop job status.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleGetBulkRateShopJob(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const user = await resolveDashboardUser(req);
+    if (!user.ok) {
+      return res.status(user.status || 401).json({
+        ok: false,
+        error: user.error,
+      });
+    }
+    const jobId = (req.query && req.query.jobId) ||
+      (req.body && req.body.jobId);
+    const result = await quoteBulkRateShop.getJob(
+        user.tenant, String(jobId || ""), {
+          dispatcherId: user.dispatcherId,
+        });
+    return res.json(result);
+  } catch (err) {
+    const status = err.status || 500;
+    return res.status(status).json({ok: false, error: err.message});
+  }
+}
+
+/**
+ * GET download bulk rate-shop results (xlsx or csv).
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleDownloadBulkRateShopResults(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const user = await resolveDashboardUser(req);
+    if (!user.ok) {
+      return res.status(user.status || 401).json({
+        ok: false,
+        error: user.error,
+      });
+    }
+    const jobId = (req.query && req.query.jobId) ||
+      (req.body && req.body.jobId);
+    const format = (req.query && req.query.format) || "xlsx";
+    const file = await quoteBulkRateShop.buildResultsDownload(
+        user.tenant, String(jobId || ""), {
+          format,
+          dispatcherId: user.dispatcherId,
+        });
+    res.setHeader("Content-Type", file.contentType);
+    res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${file.fileName.replace(/"/g, "")}"`);
+    return res.status(200).send(file.buffer);
+  } catch (err) {
+    const status = err.status || 500;
+    return res.status(status).json({ok: false, error: err.message});
+  }
+}
+
 module.exports = {
   init,
   handleGetQuoteRules,
@@ -1442,4 +1583,8 @@ module.exports = {
   handleQuoteDispatcherHomePage,
   handleQuoteAuthClient,
   handleSyncQuoteOutlookInboxes,
+  handleCreateBulkRateShopJob,
+  handleProcessBulkRateShopJob,
+  handleGetBulkRateShopJob,
+  handleDownloadBulkRateShopResults,
 };

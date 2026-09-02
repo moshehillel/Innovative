@@ -15238,6 +15238,7 @@ quoteDashboard.init({
   writeLog,
   db,
   tcol,
+  getPrimusToken,
 });
 
 const jerrySupportChatWidget = require("./jerry-support-chat-widget");
@@ -15297,6 +15298,23 @@ exports.getQuoteAccessorialCatalog = onRequest({
   timeoutSeconds: 120,
   memory: "512MiB",
 }, quoteDashboard.handleGetQuoteAccessorialCatalog);
+exports.createBulkRateShopJob = onRequest({
+  invoker: "public",
+  timeoutSeconds: 120,
+  memory: "512MiB",
+}, quoteDashboard.handleCreateBulkRateShopJob);
+exports.processBulkRateShopJob = onRequest({
+  invoker: "public",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+}, quoteDashboard.handleProcessBulkRateShopJob);
+exports.getBulkRateShopJob = onRequest({invoker: "public"},
+    quoteDashboard.handleGetBulkRateShopJob);
+exports.downloadBulkRateShopResults = onRequest({
+  invoker: "public",
+  timeoutSeconds: 120,
+  memory: "512MiB",
+}, quoteDashboard.handleDownloadBulkRateShopResults);
 exports.getQuoteDispatcherProfile = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteDispatcherProfile);
 exports.getQuoteDispatcherInbox = onRequest({
