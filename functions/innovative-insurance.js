@@ -69,6 +69,7 @@ const MONEY_EPSILON = 0.005;
 const SKIP_REASON = {
   NO_BOL: "NO_BOL",
   LOAD_NOT_FOUND: "LOAD_NOT_FOUND",
+  NO_INVOICE: "NO_INVOICE",
   ZERO_AMOUNT: "ZERO_AMOUNT",
   CREDIT_MANUAL: "CREDIT_MANUAL",
   DUPLICATE_INSURANCE: "DUPLICATE_INSURANCE",
@@ -89,13 +90,17 @@ function skipReasonText(code, ctx = {}) {
     case SKIP_REASON.LOAD_NOT_FOUND:
       return `BOL ${ctx.bol || "(unknown)"} did not match any load in ` +
         "Primus.";
+    case SKIP_REASON.NO_INVOICE:
+      return `Load ${ctx.bol || "(unknown)"} was found in Primus but Jerry ` +
+        "could not open/create an invoice to post the premium" +
+        (ctx.error ? `: ${ctx.error}` : ".");
     case SKIP_REASON.ZERO_AMOUNT:
       return "Premium amount is zero or unreadable on the Excel row.";
     case SKIP_REASON.CREDIT_MANUAL:
       return "Credit for a canceled premium — enter manually in Primus " +
         "(Jerry does not auto-post credits).";
     case SKIP_REASON.DUPLICATE_INSURANCE:
-      return "This load already has an insurance charge in Primus" +
+      return "This load already has a closed insurance invoice in Primus" +
         (ctx.existingBill ? ` (bill # ${ctx.existingBill}` +
           (ctx.existingAmount != null ?
             `, $${Number(ctx.existingAmount).toFixed(2)}` : "") +
@@ -465,8 +470,18 @@ async function applyPremiums(opts) {
         existingAmount: result.existingAmount,
         error: result.error,
       });
+    } else if (result && result.noInvoice) {
+      failed.push({
+        ...row,
+        reason: SKIP_REASON.NO_INVOICE,
+        error: result.error,
+      });
     } else if (result && result.notFound) {
-      failed.push({...row, reason: SKIP_REASON.LOAD_NOT_FOUND});
+      failed.push({
+        ...row,
+        reason: SKIP_REASON.LOAD_NOT_FOUND,
+        error: result.error,
+      });
     } else {
       failed.push({
         ...row,
@@ -562,12 +577,15 @@ function buildReconciliationEmail(opts) {
   const duplicates = skipped.filter(
       (r) => r.reason === SKIP_REASON.DUPLICATE_INSURANCE);
   const missingLoad = skipped.filter((r) =>
-    r.reason === SKIP_REASON.NO_BOL || r.reason === SKIP_REASON.LOAD_NOT_FOUND);
+    r.reason === SKIP_REASON.NO_BOL ||
+    r.reason === SKIP_REASON.LOAD_NOT_FOUND ||
+    r.reason === SKIP_REASON.NO_INVOICE);
   const otherSkipped = skipped.filter((r) =>
     r.reason !== SKIP_REASON.CREDIT_MANUAL &&
     r.reason !== SKIP_REASON.DUPLICATE_INSURANCE &&
     r.reason !== SKIP_REASON.NO_BOL &&
-    r.reason !== SKIP_REASON.LOAD_NOT_FOUND);
+    r.reason !== SKIP_REASON.LOAD_NOT_FOUND &&
+    r.reason !== SKIP_REASON.NO_INVOICE);
 
   const reconLine = rec.matchesInvoice ?
     `<span style="color:#16a34a;font-weight:700">` +
@@ -607,16 +625,18 @@ function buildReconciliationEmail(opts) {
       `did not post them — please enter in Primus yourself.</p>` +
       rowTable(credits, "") : "") +
     (duplicates.length ?
-      `<h3 style="color:#dc2626">Duplicate insurance on load (` +
+      `<h3 style="color:#dc2626">Duplicate closed insurance invoice (` +
       `${duplicates.length})</h3>` +
-      `<p style="font-size:14px">These loads already had an insurance charge ` +
-      `in Primus. Jerry did not add a second premium.</p>` +
+      `<p style="font-size:14px">These loads already have a <em>closed</em> ` +
+      `insurance invoice in Primus. Jerry did not add another premium. ` +
+      `(Open insurance charges with no Redkik bill # are filled in and ` +
+      `closed automatically.)</p>` +
       rowTable(duplicates, "") : "") +
     (missingLoad.length ?
       `<h3>Could not find load — needs review (${missingLoad.length})</h3>` +
-      `<p style="font-size:14px">No BOL on the Excel row, or the BOL did ` +
-      `not match a load in Primus. Please locate the shipment and handle ` +
-      `manually.</p>` +
+      `<p style="font-size:14px">No BOL on the Excel row, the BOL did not ` +
+      `match a load in Primus, or Jerry could not open/create an invoice on ` +
+      `the load. Please locate the shipment and handle manually.</p>` +
       rowTable(missingLoad, "") : "") +
     (otherSkipped.length ?
       `<h3>Other rows not posted (${otherSkipped.length})</h3>` +
@@ -1124,7 +1144,12 @@ function createInsurancePostAdapter(deps) {
       insuranceVendor,
     });
     if (result.notFound) {
-      return {ok: false, notFound: true, error: result.error};
+      return {
+        ok: false,
+        notFound: true,
+        noInvoice: !!result.noInvoice,
+        error: result.error,
+      };
     }
     if (result.duplicate) {
       return {

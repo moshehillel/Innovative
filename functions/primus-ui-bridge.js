@@ -3904,11 +3904,189 @@ function moneyEquals(a, b) {
 }
 
 /**
+ * True when an existing Redkik actual-cost line already has a *closed* prior
+ * insurance vendor bill (not the current Redkik invoice). Empty bill numbers
+ * and long carrier-PRO-style numbers are NOT closed insurance invoices — those
+ * lines just need the Redkik invoice # filled in and costs closed.
+ *
+ * @param {string|number|null|undefined} billNo Existing vendorInvoiceNumber.
+ * @param {string|number|null|undefined} currentInvoiceNumber Current Redkik #.
+ * @return {boolean}
+ */
+function isClosedPriorInsuranceBill(billNo, currentInvoiceNumber) {
+  const n = String(billNo == null ? "" : billNo).trim();
+  if (!n) return false;
+  if (n === String(currentInvoiceNumber == null ? "" : currentInvoiceNumber)
+      .trim()) {
+    return false;
+  }
+  if (/^REDKIK-/i.test(n)) return true;
+  // Redkik vendor bills are short (e.g. 1414). Carrier PROs / freight bills
+  // accidentally copied onto the insurance line are typically 7+ digits.
+  if (/^\d+$/.test(n) && n.length >= 3 && n.length <= 6) return true;
+  return false;
+}
+
+/**
+ * Customer id for REST POST /invoice/{BOLId}.
+ * @param {object} booking Primus booking.
+ * @return {string|number|null}
+ */
+function resolveCustomerIdForInsuranceDraft(booking) {
+  if (!booking) return null;
+  const billTo = booking.billTo || "";
+  if (billTo === "thirdparty" && booking.thirdParty) {
+    return booking.thirdParty.id || null;
+  }
+  if (booking.shipper) return booking.shipper.id || null;
+  return null;
+}
+
+/**
+ * Sell rate for a minimal REST draft when the load has no invoice yet.
+ * @param {object} booking Primus booking.
+ * @return {number}
+ */
+function resolveCustomerRateForInsuranceDraft(booking) {
+  const acct = (booking && booking.accountingInformation) || {};
+  for (const key of ["customerQuoteAmount", "invoiceAmount", "total"]) {
+    const n = Number(acct[key]);
+    if (Number.isFinite(n) && n > 0) return roundMoney(n);
+  }
+  return 0;
+}
+
+/**
+ * Creates a Primus draft invoice via REST when the load has none, so insurance
+ * close-cost can attach a Redkik bill #. Always sends a freight breakdown —
+ * customerId-only POST 500s on many third-party quote loads.
+ *
+ * @param {object} args booking, loadNumber, bookingId.
+ * @return {Promise<object>} {ok, uiInvoice?, docs?, created?, error?}
+ */
+async function ensureDraftInvoiceForInsurance(args) {
+  const booking = args.booking;
+  const loadNumber = String(args.loadNumber || "");
+  const bookingId = args.bookingId || resolveManageBookingId(booking);
+  if (!booking || !loadNumber || !bookingId) {
+    return {ok: false, error: "booking/loadNumber/bookingId required"};
+  }
+  if (!booking.BOLId) {
+    return {ok: false, error: "Booking missing BOLId"};
+  }
+
+  let docs = await getBookingDocuments({bookingId, bookingBOL: loadNumber});
+  if (!docs.ok || !docs.data) {
+    return {ok: false, error: docs.error || "getBookingDocuments failed"};
+  }
+  let uiInvoice = findUiInvoice(docs.data);
+  if (uiInvoice && uiInvoice.id != null) {
+    return {ok: true, created: false, uiInvoice, docs};
+  }
+
+  const base = process.env.PRIMUS_BASE_URL;
+  if (!base) return {ok: false, error: "PRIMUS_BASE_URL not set"};
+
+  const customerId = resolveCustomerIdForInsuranceDraft(booking);
+  const rate = resolveCustomerRateForInsuranceDraft(booking);
+  if (!customerId) {
+    return {ok: false, error: "Could not resolve customerId for draft invoice"};
+  }
+  if (!(rate > 0)) {
+    return {
+      ok: false,
+      error: "Could not resolve customer rate for draft invoice",
+    };
+  }
+
+  let token;
+  try {
+    const login = await fetch(`${base}/login`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        username: process.env.PRIMUS_USERNAME,
+        password: process.env.PRIMUS_PASSWORD,
+      }),
+    });
+    const loginJson = await login.json();
+    token = loginJson && loginJson.data && loginJson.data.accessToken;
+  } catch (err) {
+    return {ok: false, error: err.message || "Primus login failed"};
+  }
+  if (!token) return {ok: false, error: "Primus login returned no token"};
+
+  const body = {
+    customerId,
+    invoiceBreakdown: [{
+      code: "FREIGHT",
+      description: "Freight Charges",
+      qty: 1,
+      rate,
+    }],
+  };
+  let createJson;
+  try {
+    const resp = await fetch(`${base}/invoice/${booking.BOLId}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await resp.text();
+    try {
+      createJson = text ? JSON.parse(text) : null;
+    } catch (_) {
+      createJson = null;
+    }
+    if (!resp.ok) {
+      const msg = (createJson && createJson.error && createJson.error.message) ||
+        text.slice(0, 200) || `HTTP ${resp.status}`;
+      return {ok: false, error: `Draft invoice create failed: ${msg}`};
+    }
+  } catch (err) {
+    return {ok: false, error: err.message || "Draft invoice create failed"};
+  }
+
+  docs = await getBookingDocuments({bookingId, bookingBOL: loadNumber});
+  if (!docs.ok || !docs.data) {
+    return {
+      ok: false,
+      error: docs.error || "getBookingDocuments failed after draft create",
+    };
+  }
+  uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {
+      ok: false,
+      error: "Draft invoice created via REST but not visible in manage.php yet",
+      restResult: createJson,
+    };
+  }
+  if (writeLog) {
+    await writeLog("info", "primus",
+        "Created draft invoice for insurance premium posting", {
+          loadNumber,
+          bookingId,
+          invoiceId: uiInvoice.id,
+          customerId,
+          rate,
+        });
+  }
+  return {ok: true, created: true, uiInvoice, docs, restResult: createJson};
+}
+
+/**
  * Close-cost insurance entry — mirrors the manual Primus UI sequence:
  * getTerms → addVendorRefNumber → saveInvoice (cost closed) → getInvoiceStores.
  *
  * Adds a Redkik premium line to an existing load invoice without blocking on
  * rows that lack a BOL (caller handles batching via innovative-insurance).
+ * When a Redkik charge already exists without a closed insurance bill #, fills
+ * in the vendor invoice number and closes — does not treat that as a duplicate.
  *
  * @param {object} args Flow inputs.
  * @param {object} args.booking Primus booking from GET /book/bolnumber.
@@ -3946,7 +4124,7 @@ async function addInsurancePremiumToLoad(args) {
     return {ok: false, error: "Could not resolve manage.php bookingId"};
   }
 
-  const docs = await getBookingDocuments({bookingId, bookingBOL: loadNumber});
+  let docs = await getBookingDocuments({bookingId, bookingBOL: loadNumber});
   if (!docs.ok || !docs.data) {
     return {
       ok: false,
@@ -3954,9 +4132,21 @@ async function addInsurancePremiumToLoad(args) {
     };
   }
 
-  const uiInvoice = findUiInvoice(docs.data);
+  let uiInvoice = findUiInvoice(docs.data);
   if (!uiInvoice || uiInvoice.id == null) {
-    return {ok: false, notFound: true, error: "No Primus invoice on booking"};
+    const ensured = await ensureDraftInvoiceForInsurance({
+      booking, loadNumber, bookingId,
+    });
+    if (!ensured.ok) {
+      return {
+        ok: false,
+        notFound: true,
+        noInvoice: true,
+        error: ensured.error || "No Primus invoice on booking",
+      };
+    }
+    docs = ensured.docs;
+    uiInvoice = ensured.uiInvoice;
   }
 
   const invoiceId = String(uiInvoice.id);
@@ -3975,9 +4165,9 @@ async function addInsurancePremiumToLoad(args) {
 
   const insuranceLines = actualCosts.filter((c) =>
     String(c.carrierId) === String(insuranceVendor.id));
-  const existing = insuranceLines.find((c) =>
+  const exactMatch = insuranceLines.find((c) =>
     String(c.vendorInvoiceNumber) === vendorInvoiceNumber);
-  if (existing && moneyEquals(existing.total, premium)) {
+  if (exactMatch && moneyEquals(exactMatch.total, premium)) {
     return {
       ok: true,
       skipped: true,
@@ -3987,22 +4177,37 @@ async function addInsurancePremiumToLoad(args) {
       premium,
     };
   }
-  if (insuranceLines.length > 0) {
-    const prior = insuranceLines[0];
+
+  const closedPrior = insuranceLines.find((c) =>
+    isClosedPriorInsuranceBill(c.vendorInvoiceNumber, vendorInvoiceNumber));
+  if (closedPrior && !exactMatch) {
     return {
       ok: false,
       duplicate: true,
-      error: `Load ${loadNumber} already has insurance in Primus`,
-      existingBill: prior.vendorInvoiceNumber || null,
-      existingAmount: prior.total,
+      error: `Load ${loadNumber} already has a closed insurance invoice ` +
+        `in Primus`,
+      existingBill: closedPrior.vendorInvoiceNumber || null,
+      existingAmount: closedPrior.total,
       loadNumber,
       invoiceId,
     };
   }
 
-  actualCosts = actualCosts.filter((c) =>
-    !(String(c.carrierId) === String(insuranceVendor.id) &&
-      String(c.vendorInvoiceNumber) === vendorInvoiceNumber));
+  // Prefer updating an open Redkik line (empty / non-closed bill #) rather
+  // than adding a second premium.
+  const upgradeable = exactMatch || insuranceLines.find((c) =>
+    !isClosedPriorInsuranceBill(c.vendorInvoiceNumber, vendorInvoiceNumber)) ||
+    null;
+  const existing = upgradeable;
+  const oldBillNo = existing ?
+    String(existing.vendorInvoiceNumber || "") : "";
+
+  actualCosts = actualCosts.filter((c) => {
+    if (String(c.carrierId) !== String(insuranceVendor.id)) return true;
+    if (existing && String(c.id) === String(existing.id)) return false;
+    if (String(c.vendorInvoiceNumber) === vendorInvoiceNumber) return false;
+    return true;
+  });
 
   let termsList = [];
   try {
@@ -4045,9 +4250,13 @@ async function addInsurancePremiumToLoad(args) {
   if (!billsInfo || !billsInfo.length) {
     billsInfo = reconstructBillsInfoFromActualCosts(actualCosts);
   } else {
-    billsInfo = billsInfo.filter((b) =>
-      !(String(b.carrierId) === String(insuranceVendor.id) &&
-        String(b.vendorInvoiceNumber) === vendorInvoiceNumber));
+    billsInfo = billsInfo.filter((b) => {
+      if (String(b.carrierId) !== String(insuranceVendor.id)) return true;
+      const bn = String(b.vendorInvoiceNumber || "");
+      if (bn === vendorInvoiceNumber) return false;
+      if (existing && bn === oldBillNo) return false;
+      return true;
+    });
   }
   billsInfo.push(insuranceBillsInfo);
 
@@ -4477,6 +4686,8 @@ exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
 exports.removeInsurancePremiumFromLoad = removeInsurancePremiumFromLoad;
 exports.resolveInsuranceVendor = resolveInsuranceVendor;
 exports.lookupVendorByCarrierHint = lookupVendorByCarrierHint;
+exports.isClosedPriorInsuranceBill = isClosedPriorInsuranceBill;
+exports.ensureDraftInvoiceForInsurance = ensureDraftInvoiceForInsurance;
 
 /**
  * @return {boolean}
@@ -5507,4 +5718,6 @@ exports._internal = {
   sanitizeBillToReferenceText,
   invoiceChargesIncludeReference,
   defaultCustomerInvoiceEmailSubject,
+  isClosedPriorInsuranceBill,
+  ensureDraftInvoiceForInsurance,
 };
