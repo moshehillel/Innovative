@@ -438,6 +438,12 @@ function bodyLooksLikeCustomerPaidNotice(body) {
     /\bsent\s+(?:the\s+)?(?:payment|funds)\b/,
     /\bwire(?:d)?\s+(?:the\s+)?payment\b/,
     /\b(?:payment|invoice)\s+(?:has\s+been|was)\s+paid\b/,
+    /\bproof\s+of\s+payment\b/,
+    /\bpay(?:s)?\s+directly\b/,
+    /\bpaid?\s+(?:directly\s+)?(?:upon|at|on)\s+pickup\b/,
+    /\bfront\s+and\s+back\s+of\s+(?:the\s+)?check\b/,
+    /\bphotos?\s+of\s+(?:the\s+)?(?:front\s+and\s+back\s+of\s+(?:the\s+)?)?check\b/,
+    /\bcheck\s+(?:as\s+)?proof\b/,
   ];
   return patterns.some((re) => re.test(top));
 }

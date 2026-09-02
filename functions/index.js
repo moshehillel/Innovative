@@ -3927,7 +3927,9 @@ async function preCheckDocumentType(pdfBuffer) {
             "page is a Notice of Assignment, factor cover letter, or " +
             "ACH/banking remittance page and later pages are the " +
             "freight bill (Thunder Funding, REV Capital, and similar " +
-            "factoring companies).",
+            "factoring companies). Also use INVOICE when the PDF is a " +
+            "Weight & Inspection (W&I / WNI) class-correction or reweigh " +
+            "certificate that shows a revised class, weight, or rate.",
         },
       ],
     }],
@@ -5612,6 +5614,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Inspection (W&I) / reweigh / inspection certificate page is " +
         "attached or referenced, or when the invoice shows a corrected, " +
         "reweighed, or reclassified weight/class versus an original.",
+        "A W&I / WNI class-correction or reweigh certificate that shows " +
+        "a revised class, weight, or rate IS the freight bill to extract " +
+        "(corrected invoice / additional charge). Do not set status error.",
         "If attachment is not a freight invoice, status is error.",
         "Detect Proof of Delivery (POD) and shipment document pages.",
         "Include in pod.documents every post-invoice page that supports " +
@@ -8173,6 +8178,10 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  PDF is a factored carrier freight invoice. ACH/wire/banking",
       "  remittance instructions attached with the bill are still",
       "  carrier_invoice, not a bank payment alert or unknown.",
+      "- Daylight Transport and similar LTL carriers: subject",
+      "  'WNI Class Correction on Pro …' with a WI_Certificate / Weight",
+      "  & Inspection PDF is a revised-rate freight bill (class/reweigh",
+      "  additional charge). Classify as carrier_invoice, not unknown.",
       "- Factor invoices that include ACH/wire/banking remittance",
       "  instructions (how to pay the factor) are still carrier_invoice.",
       "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",

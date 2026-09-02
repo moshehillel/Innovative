@@ -201,6 +201,35 @@ function hasProcessablePdfAttachment(attachments) {
 }
 
 /**
+ * LTL Weight & Inspection / class-correction billing packets.
+ * Daylight and similar carriers email "WNI Class Correction on Pro …"
+ * with a WI_Certificate PDF that is the revised-rate bill to extract.
+ * @param {string} [subject] Email subject.
+ * @param {string} [from] From header.
+ * @param {string} [filename] Attachment filename.
+ * @return {boolean}
+ */
+function looksLikeWniClassCorrectionPacket(subject, from, filename) {
+  const hay = `${subject || ""} ${from || ""} ${filename || ""}`.toLowerCase();
+  if (!hay.trim()) return false;
+  const wni = /\bwni\b/.test(hay) ||
+    /\bw\s*&\s*i\b/.test(hay) ||
+    /wi[_\s-]?cert/.test(hay) ||
+    /weight\s*(?:and|&)\s*inspect/.test(hay);
+  const correction = /class\s+correction/.test(hay) ||
+    /re-?class(?:ification)?/.test(hay) ||
+    /re-?weigh/.test(hay) ||
+    /revised\s+rate/.test(hay);
+  if (wni && correction) return true;
+  if (wni && /\bpro\s*#?\s*\d{6,}/.test(hay)) return true;
+  if (/class\s+correction/.test(hay) && /\bpro\s*#?\s*\d{6,}/.test(hay)) {
+    return true;
+  }
+  if (/wi[_\s-]?certificate/.test(hay)) return true;
+  return false;
+}
+
+/**
  * True when the email subject/sender/body looks like a carrier invoice
  * packet (possibly with a statement summary cover page before the bills).
  * @param {string} subject Email subject.
@@ -211,6 +240,7 @@ function hasProcessablePdfAttachment(attachments) {
 function looksLikeCarrierInvoiceEmail(subject, from, body) {
   const sub = String(subject || "").trim();
   const hints = `${subject || ""} ${from || ""}`.toLowerCase();
+  if (looksLikeWniClassCorrectionPacket(sub, from, "")) return true;
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeFactorViewPurchaseOrderInvoiceEmail(sub, from)) return true;
   if (looksLikeThunderFundingInvoiceEmail(sub, from)) return true;
@@ -247,6 +277,9 @@ function looksLikeStatementCoverInvoicePacketEmail(
     subject, from, body, attachments) {
   // Strong subject/body signals first — JTS "Statement 22568" must not
   // depend on Gmail exposing a top-level PDF (often only a nested .eml).
+  if (looksLikeWniClassCorrectionPacket(subject, from, "")) {
+    return true;
+  }
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(subject, from)) {
     return true;
   }
@@ -305,6 +338,10 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
       context.preCheckLabel || context.docType);
   if (label !== "STATEMENT" && label !== "OTHER") return false;
 
+  if (looksLikeWniClassCorrectionPacket(
+      context.subject, context.from, context.filename)) {
+    return true;
+  }
   if (looksLikeCompassFsPurchaseOrderInvoiceEmail(
       context.subject, context.from)) {
     return true;
@@ -411,6 +448,10 @@ function normalizePreCheckDocType(docType, context = {}) {
     context.body,
   ].map((s) => String(s || "")).join(" ");
   if (label === "OTHER") {
+    if (looksLikeWniClassCorrectionPacket(
+        context.subject, context.from, context.filename)) {
+      return "INVOICE";
+    }
     if (/freight\s*inv|carrier\s*inv|transportation/i.test(hints)) {
       return "INVOICE";
     }
@@ -618,6 +659,7 @@ module.exports = {
   looksLikeCompassFsPurchaseOrderInvoiceEmail,
   looksLikeFactoredPurchaseOrderInvoiceEmail,
   looksLikeFactorViewPurchaseOrderInvoiceEmail,
+  looksLikeWniClassCorrectionPacket,
   looksLikeThunderFundingInvoiceEmail,
   looksLikeInvoiceForProcessingSubject,
   looksLikeSinglePointCapitalInvoiceEmail,

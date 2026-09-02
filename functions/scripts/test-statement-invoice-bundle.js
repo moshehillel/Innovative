@@ -313,6 +313,37 @@ check("Purchase Order # (not PO #) matches factored PO subject",
     bundle.looksLikeFactoredPurchaseOrderInvoiceEmail(
         "Invoice #299 - Purchase Order #266504"), true);
 
+const dyltSubject =
+  "FW: Daylight Transport - WNI Class Correction on Pro 161772686";
+const dyltFrom = "Higgins, Kevin <KHiggins@dylt.com>";
+const dyltPdf = [{
+  filename: "WI_Certificate_DAWG_DYLT.pdf",
+  mimeType: "application/pdf",
+}];
+check("Daylight WNI class correction packet detected",
+    bundle.looksLikeWniClassCorrectionPacket(
+        dyltSubject, dyltFrom, dyltPdf[0].filename), true);
+check("Daylight WNI looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(dyltSubject, dyltFrom, ""), true);
+check("Daylight WI certificate filename is a WNI packet",
+    bundle.looksLikeWniClassCorrectionPacket(
+        "", "", "WI_Certificate_DAWG_DYLT.pdf"), true);
+check("Daylight WNI OTHER pre-check → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: dyltSubject,
+      from: dyltFrom,
+      filename: dyltPdf[0].filename,
+      pageCount: 2,
+    }), "INVOICE");
+check("Daylight WNI packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        dyltSubject, dyltFrom, "", dyltPdf), true);
+check("quote reclass note is not a WNI billing packet",
+    bundle.looksLikeWniClassCorrectionPacket(
+        "Menards quote — Saia has reclass fees",
+        "sales@customer.com",
+        "quote.pdf"), false);
+
 const spcSubject = "Single Point Capital; Invoice #265914";
 const spcFrom = "reports@singlepointgroup.com";
 const spcPdf = [{

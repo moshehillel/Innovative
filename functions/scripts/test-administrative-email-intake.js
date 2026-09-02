@@ -979,6 +979,32 @@ check("quoted Zelle banking tip alone is NOT customer paid notice",
         "On Tue, Aug 26, 2026 Abe <abe@innovativecarriers.com> wrote:\n" +
         "Quickpay/Zelle\naccounting@innovativecarriers.com\n"));
 
+const venetoSubject = "Re: Invoice #29395 for BOL #265373";
+const venetoFrom = "Veneto Luce Office <veneto.luce@gmail.com>";
+const venetoBody =
+  "Hi,\n\nWe pay directly upon pickup. Please locate the previously " +
+  "emailed photos of the front and back of the check as proof of " +
+  "payment for invoice #29395/BOL #265373.\n\nThank you\nVeneto Luce\n";
+check("Veneto Invoice # for BOL reply subject recognized",
+    adm.subjectLooksLikeInvoiceForBolReply(venetoSubject));
+check("Veneto check-photo proof of payment detected",
+    adm.bodyLooksLikeCustomerPaidNotice(venetoBody));
+check("Veneto remittance reply detected → Abe",
+    adm.isCustomerPaymentRemittanceEmail(
+        venetoSubject, venetoFrom, venetoBody));
+check("Veneto should handle customer remittance",
+    adm.shouldHandleCustomerPaymentRemittance(
+        venetoSubject, venetoFrom, venetoBody));
+check("Veneto remittance does not invoice-veto",
+    !adm.hasInvoiceVeto({
+      subject: venetoSubject,
+      body: venetoBody,
+      from: venetoFrom,
+      attachments: [],
+      emailClassification: {intent: "unknown"},
+      invoicePdfCount: 0,
+    }));
+
 const sandersSubject = "CK 6706";
 const sandersFrom = "Accounts Payable <ap@sanderscollection.com>";
 const sandersBody =
