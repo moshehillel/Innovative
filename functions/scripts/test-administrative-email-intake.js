@@ -982,9 +982,13 @@ check("quoted Zelle banking tip alone is NOT customer paid notice",
 const venetoSubject = "Re: Invoice #29395 for BOL #265373";
 const venetoFrom = "Veneto Luce Office <veneto.luce@gmail.com>";
 const venetoBody =
-  "Hi,\n\nWe pay directly upon pickup. Please locate the previously " +
-  "emailed photos of the front and back of the check as proof of " +
-  "payment for invoice #29395/BOL #265373.\n\nThank you\nVeneto Luce\n";
+  "Hi, Thanks for the invoice. B ut every time we pay you directly " +
+  "when we confirm the pick up so can you&nbsp; check your email and " +
+  "find the pictures i sent you for the fron and back images of the " +
+  "check Thank you and have a nice day. Veneto Luce Inc. " +
+  "On Wed, Sep 2, 2026 at 1:54 PM Innovative Accounting " +
+  "<accounting@innovativecarriers.com> wrote: Hi, Please see your " +
+  "invoices attached.";
 check("Veneto Invoice # for BOL reply subject recognized",
     adm.subjectLooksLikeInvoiceForBolReply(venetoSubject));
 check("Veneto check-photo proof of payment detected",

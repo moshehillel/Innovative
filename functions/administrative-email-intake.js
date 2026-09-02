@@ -416,7 +416,9 @@ function subjectLooksLikeInvoiceForBolReply(subject) {
  */
 function topOfThreadBody(body) {
   let top = String(body || "");
+  top = top.replace(/&nbsp;/gi, " ");
   top = top.split(/\n\s*On .+?wrote:\s*\n/i)[0];
+  top = top.split(/\sOn .+?wrote:\s/i)[0];
   top = top.split(/\n-{2,}\s*Original Message\s*-{2,}/i)[0];
   top = top.split(/\nFrom:\s+.+\nSent:\s+/i)[0];
   return top;
@@ -439,10 +441,10 @@ function bodyLooksLikeCustomerPaidNotice(body) {
     /\bwire(?:d)?\s+(?:the\s+)?payment\b/,
     /\b(?:payment|invoice)\s+(?:has\s+been|was)\s+paid\b/,
     /\bproof\s+of\s+payment\b/,
-    /\bpay(?:s)?\s+directly\b/,
-    /\bpaid?\s+(?:directly\s+)?(?:upon|at|on)\s+pickup\b/,
-    /\bfront\s+and\s+back\s+of\s+(?:the\s+)?check\b/,
-    /\bphotos?\s+of\s+(?:the\s+)?(?:front\s+and\s+back\s+of\s+(?:the\s+)?)?check\b/,
+    /\bpay(?:s)?(?:\s+\w+){0,2}\s+directly\b/,
+    /\bpaid?\s+(?:directly\s+)?(?:upon|at|on)\s+pick(?:\s+|-)?up\b/,
+    /\b(?:front|fron)\s+and\s+back\b/,
+    /\b(?:photos?|pictures?|images?)\b.{0,80}\bcheck\b/,
     /\bcheck\s+(?:as\s+)?proof\b/,
   ];
   return patterns.some((re) => re.test(top));
