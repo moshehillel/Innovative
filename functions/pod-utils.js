@@ -1054,6 +1054,241 @@ function listUncoveredInvoiceAttachments(invoiceItems, attachments) {
 }
 
 /**
+ * Digits-only reference for matching PRO / invoice # in page text.
+ * @param {string|number|null|undefined} value Raw value.
+ * @return {string}
+ */
+function digitsOnlyRef(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+/**
+ * True when page text contains the digit reference as a whole token.
+ * @param {string} pageText PDF page text.
+ * @param {string} digits Digits-only reference (6+).
+ * @return {boolean}
+ */
+function pageTextContainsDigitsRef(pageText, digits) {
+  const d = String(digits || "");
+  if (d.length < 6) return false;
+  const spaced = String(pageText || "").replace(/\D+/g, " ");
+  return new RegExp(`(?:^|\\s)${d}(?:\\s|$)`).test(spaced);
+}
+
+/**
+ * Resolves which PDF attachment an invoice item refers to.
+ * @param {object} item Classifier invoice item.
+ * @param {Array<object>} invoicePdfs INVOICE PDF attachments.
+ * @return {object|null}
+ */
+function resolveItemInvoicePdf(item, invoicePdfs) {
+  const list = Array.isArray(invoicePdfs) ? invoicePdfs : [];
+  if (!list.length) return null;
+  const name = String(item && item.attachmentFilename || "").trim();
+  if (name) {
+    const hit = list.find((a) => attachmentFilenamesMatch(a.filename, name));
+    if (hit) return hit;
+  }
+  if (list.length === 1) return list[0];
+  return null;
+}
+
+/**
+ * True when scoped pages are missing or cover (almost) the entire PDF —
+ * typical when the model lists every page for each sibling invoice.
+ * @param {number[]} pages 1-based pages.
+ * @param {number} pageCount PDF page count.
+ * @return {boolean}
+ */
+function scopedPagesNeedRepair(pages, pageCount) {
+  if (!Array.isArray(pages) || pages.length === 0) return true;
+  if (!pageCount || pageCount < 2) return false;
+  const uniq = [...new Set(pages.map((p) => Math.trunc(Number(p)))
+      .filter((p) => Number.isFinite(p) && p >= 1 && p <= pageCount))];
+  if (uniq.length === 0) return true;
+  if (uniq.length >= pageCount) return true;
+  // Nearly entire packet (≥80%) for a multi-page PDF → sibling bleed.
+  if (pageCount >= 3 && uniq.length / pageCount >= 0.8) return true;
+  return false;
+}
+
+/**
+ * When several invoices share one PDF (FedEx Freight batches, statement
+ * packets), the model often lists every page on every item. Re-scope each
+ * item to pages that mention its PRO / invoice # so Primus uploads only
+ * that load's bill — not the whole multi-invoice packet.
+ * @param {Array<object>} invoiceItems Classifier invoice items (mutated).
+ * @param {Array<object>} pdfAttachments PDFs with buffers.
+ * @return {Promise<{items: Array<object>, repaired: Array<object>}>}
+ */
+async function repairSharedPdfInvoicePages(invoiceItems, pdfAttachments) {
+  const items = Array.isArray(invoiceItems) ?
+    invoiceItems.filter((i) => i && typeof i === "object") : [];
+  if (items.length <= 1) {
+    return {items, repaired: []};
+  }
+
+  const invoicePdfs = listInvoicePdfAttachments(pdfAttachments)
+      .filter((a) => a && a.buffer);
+  if (!invoicePdfs.length) {
+    return {items, repaired: []};
+  }
+
+  const groups = new Map();
+  items.forEach((item, index) => {
+    const pdf = resolveItemInvoicePdf(item, invoicePdfs);
+    const key = pdf ?
+      `pdf:${normalizeAttachmentFilenameKey(pdf.filename)}` :
+      `unique:${index}`;
+    if (!groups.has(key)) {
+      groups.set(key, {pdf, entries: []});
+    }
+    groups.get(key).entries.push({item, index});
+  });
+
+  const repaired = [];
+  for (const [, group] of groups) {
+    if (!group.pdf || group.entries.length <= 1) continue;
+
+    let pageCount = 0;
+    try {
+      const src = await PDFDocument.load(group.pdf.buffer, {
+        ignoreEncryption: true,
+      });
+      pageCount = src.getPageCount();
+    } catch (_) {
+      continue;
+    }
+    if (pageCount < 2) continue;
+
+    const pageSets = group.entries.map(({item}) =>
+      collectInvoiceScopedPages(item));
+    const needsRepair = group.entries.some(({item}, i) =>
+      scopedPagesNeedRepair(pageSets[i], pageCount)) ||
+      pageSets.every((p) => p.join(",") === pageSets[0].join(","));
+    if (!needsRepair) continue;
+
+    let pageTexts = null;
+    try {
+      pageTexts = await extractPdfPageTexts(group.pdf.buffer);
+    } catch (_) {
+      pageTexts = null;
+    }
+
+    const assigned = new Map(); // itemIndex -> pages[]
+    const claimed = new Set();
+
+    for (const {item, index} of group.entries) {
+      const refs = [
+        digitsOnlyRef(item.proNumber),
+        digitsOnlyRef(item.invoiceNumber),
+      ].filter((d, i, arr) => d.length >= 6 && arr.indexOf(d) === i);
+      if (!refs.length || !pageTexts || !pageTexts.length) continue;
+
+      const pages = [];
+      for (let p = 0; p < pageTexts.length; p++) {
+        const pageNo = p + 1;
+        if (claimed.has(pageNo)) continue;
+        if (refs.some((d) => pageTextContainsDigitsRef(pageTexts[p], d))) {
+          pages.push(pageNo);
+        }
+      }
+      if (pages.length) {
+        assigned.set(index, pages);
+        pages.forEach((p) => claimed.add(p));
+      }
+    }
+
+    // FedEx-style one-page-per-invoice fallback when text match missed some.
+    const unmatched = group.entries.filter(({index}) => !assigned.has(index));
+    if (unmatched.length > 0 &&
+        group.entries.length === pageCount &&
+        claimed.size < pageCount) {
+      const freePages = [];
+      for (let p = 1; p <= pageCount; p++) {
+        if (!claimed.has(p)) freePages.push(p);
+      }
+      unmatched.forEach((entry, i) => {
+        if (i < freePages.length) {
+          assigned.set(entry.index, [freePages[i]]);
+          claimed.add(freePages[i]);
+        }
+      });
+    } else if (unmatched.length > 0 && unmatched.length === pageCount &&
+        claimed.size === 0) {
+      // No text hits at all: sequential 1:1 when counts match.
+      unmatched.forEach((entry, i) => {
+        assigned.set(entry.index, [i + 1]);
+      });
+    }
+
+    if (assigned.size === 0) continue;
+
+    // Ensure every shared-PDF item that got pages is scoped; leave items
+    // without a match unchanged (safer than inventing pages).
+    for (const {item, index} of group.entries) {
+      const pages = assigned.get(index);
+      if (!pages || !pages.length) continue;
+      const before = collectInvoiceScopedPages(item);
+      item.invoicePages = pages.slice();
+      item.attachmentFilename = group.pdf.filename;
+      if (item.pod && typeof item.pod === "object") {
+        if (Array.isArray(item.pod.documents)) {
+          item.pod.documents = item.pod.documents.filter((doc) =>
+            doc && pages.includes(Math.trunc(Number(doc.page))));
+        }
+        if (item.pod.page != null &&
+            !pages.includes(Math.trunc(Number(item.pod.page)))) {
+          item.pod.page = pages[0];
+        }
+        if (!item.pod.attachmentFilename) {
+          item.pod.attachmentFilename = group.pdf.filename;
+        }
+      }
+      repaired.push({
+        loadNumber: item.loadNumber || null,
+        proNumber: item.proNumber || null,
+        attachmentFilename: group.pdf.filename,
+        beforePages: before,
+        afterPages: pages.slice(),
+      });
+    }
+  }
+
+  return {items, repaired};
+}
+
+/**
+ * For a single invoice item, find PDF pages that mention its PRO /
+ * invoice #. Used as a last-chance slice scope when the classifier
+ * listed the entire multi-invoice packet on one item.
+ * @param {object} item Classifier invoice item.
+ * @param {Buffer|Uint8Array} pdfBuffer Source PDF.
+ * @return {Promise<number[]>} 1-based pages (may be empty).
+ */
+async function findInvoicePagesByProInPdf(item, pdfBuffer) {
+  const refs = [
+    digitsOnlyRef(item && item.proNumber),
+    digitsOnlyRef(item && item.invoiceNumber),
+  ].filter((d, i, arr) => d.length >= 6 && arr.indexOf(d) === i);
+  if (!refs.length || !pdfBuffer) return [];
+  let pageTexts = null;
+  try {
+    pageTexts = await extractPdfPageTexts(pdfBuffer);
+  } catch (_) {
+    return [];
+  }
+  if (!pageTexts || !pageTexts.length) return [];
+  const pages = [];
+  for (let p = 0; p < pageTexts.length; p++) {
+    if (refs.some((d) => pageTextContainsDigitsRef(pageTexts[p], d))) {
+      pages.push(p + 1);
+    }
+  }
+  return pages;
+}
+
+/**
  * Finds the carrier-invoice PDF for a load within a batch email's
  * attachment list (match by attachmentFilename hint and/or PRO number).
  * @param {Array<object>|null|undefined} attachments Attachment list.
@@ -1123,6 +1358,10 @@ module.exports = {
   normalizeClassificationToInvoices,
   preferRevisedInvoicesForSameLoad,
   scoreInvoiceRevisionPreference,
+  repairSharedPdfInvoicePages,
+  findInvoicePagesByProInPdf,
+  scopedPagesNeedRepair,
+  pageTextContainsDigitsRef,
   slicePdfByPages,
   collectInvoiceScopedPages,
   remapPodPagesAfterSlice,

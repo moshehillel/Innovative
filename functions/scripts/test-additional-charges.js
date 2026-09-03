@@ -367,6 +367,39 @@ const proMismatch = ac.validateCarrierInvoiceAttachment({
 check("validate rejects sibling PRO filename", proMismatch.ok, false);
 check("validate pro_mismatch reason", proMismatch.reason, "pro_mismatch");
 
+// 3f. Approval emails attach full carrier packet + W&I cert (not invoice-only)
+const approvalAtts = ac.listAdditionalChargeApprovalAttachments([
+  {filename: "446757676.1.pdf", storagePath: "inv/full.pdf",
+    mimeType: "application/pdf", docType: "INVOICE"},
+  {filename: "weight-cert.pdf", storagePath: "weightCert/b.pdf",
+    mimeType: "application/pdf", docType: "WEIGHT_INSPECTION_CERT"},
+  {filename: "pod-photo.jpg", storagePath: "pods/p.jpg",
+    mimeType: "image/jpeg", docType: "POD_IMAGE"},
+], {proNumber: "446757676", attachmentFilename: "446757676.1.pdf"});
+check("approval list includes invoice PDF",
+    approvalAtts.some((a) => a.storagePath === "inv/full.pdf"), true);
+check("approval list includes W&I cert backup",
+    approvalAtts.some((a) => a.storagePath === "weightCert/b.pdf"), true);
+check("approval list skips POD image",
+    approvalAtts.every((a) => a.storagePath !== "pods/p.jpg"), true);
+check("approval list has invoice then cert (2 files)",
+    approvalAtts.length, 2);
+
+const approvalBatchSafe = ac.listAdditionalChargeApprovalAttachments([
+  {filename: "497042887.1.pdf", storagePath: "batch/497.pdf"},
+  {filename: "446757676.1.pdf", storagePath: "batch/446.pdf"},
+], {proNumber: "999999999"});
+check("approval list empty when PRO unmatched in batch",
+    approvalBatchSafe.length, 0);
+
+const approvalInvoiceOnly = ac.listAdditionalChargeApprovalAttachments([
+  {filename: "446757676.1.pdf", storagePath: "inv/full.pdf",
+    mimeType: "application/pdf"},
+], {proNumber: "446757676"});
+check("approval list works with invoice alone",
+    approvalInvoiceOnly.length === 1 &&
+    approvalInvoiceOnly[0].storagePath === "inv/full.pdf", true);
+
 // 6. Lumper validation — invoice total matches Primus (lumper included)
 const westhill = ac.validateLumperAmount({
   invoiceAmount: 2901.20,

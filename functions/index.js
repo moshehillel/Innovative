@@ -17,6 +17,9 @@ const {
   parseClassificationResponse,
   normalizeClassificationToInvoices,
   preferRevisedInvoicesForSameLoad,
+  repairSharedPdfInvoicePages,
+  findInvoicePagesByProInPdf,
+  scopedPagesNeedRepair,
   slicePdfByPages,
   collectInvoiceScopedPages,
   remapPodPagesAfterSlice,
@@ -5345,50 +5348,65 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     cc: dispatcherEmail || undefined,
   });
 
-  // Attach the carrier invoice PDF (GCS) so Sarah/Lisa can review the bill.
+  // Attach the full original carrier packet (invoice + W&I backups), not
+  // an invoice-only page extract, so Sarah/Lisa can review supporting docs.
   let attachedInvoicePdf = false;
+  let attachedApprovalPdfCount = 0;
   const attachmentHints = {
     proNumber: aiResult.proNumber,
     attachmentFilename: aiResult.attachmentFilename,
   };
   try {
-    let attachmentMeta = additionalCharges.pickCarrierInvoiceAttachment(
-        opts.invoiceAttachments, attachmentHints);
-    if (!attachmentMeta && invoiceId && tenant) {
+    let attachmentMetas =
+      additionalCharges.listAdditionalChargeApprovalAttachments(
+          opts.invoiceAttachments, attachmentHints);
+    if ((!attachmentMetas || !attachmentMetas.length) &&
+        invoiceId && tenant) {
       const invSnap = await tcol(tenant, "invoices")
           .doc(String(invoiceId)).get();
       if (invSnap.exists) {
-        attachmentMeta = additionalCharges.pickCarrierInvoiceAttachment(
-            (invSnap.data() || {}).attachments, attachmentHints);
+        attachmentMetas =
+          additionalCharges.listAdditionalChargeApprovalAttachments(
+              (invSnap.data() || {}).attachments, attachmentHints);
       }
     }
-    if (attachmentMeta && attachmentMeta.storagePath) {
-      const validation = additionalCharges.validateCarrierInvoiceAttachment(
-          attachmentMeta, attachmentHints);
-      if (!validation.ok) {
-        await writeLog("warn", "email",
-            "Blocked wrong carrier invoice PDF on approval email", {
-              invoiceId,
-              loadNumber: aiResult.loadNumber,
-              proNumber: aiResult.proNumber,
-              pickedFilename: attachmentMeta.filename,
-              reason: validation.reason,
-            });
-        attachmentMeta = null;
+    const emailAttachments = [];
+    for (const attachmentMeta of (attachmentMetas || [])) {
+      if (!attachmentMeta || !attachmentMeta.storagePath) continue;
+      const isWeightCert =
+        /WEIGHT_INSPECTION_CERT/i.test(String(attachmentMeta.docType || ""));
+      // Only enforce PRO-filename match on the primary carrier bill — W&I
+      // sidecars (and XPO cert pulls) may not include the PRO in the name.
+      if (!isWeightCert) {
+        const validation =
+          additionalCharges.validateCarrierInvoiceAttachment(
+              attachmentMeta, attachmentHints);
+        if (!validation.ok) {
+          await writeLog("warn", "email",
+              "Blocked wrong carrier invoice PDF on approval email", {
+                invoiceId,
+                loadNumber: aiResult.loadNumber,
+                proNumber: aiResult.proNumber,
+                pickedFilename: attachmentMeta.filename,
+                reason: validation.reason,
+              });
+          continue;
+        }
       }
-    }
-    if (attachmentMeta && attachmentMeta.storagePath) {
       const contentBase64 = await downloadStorageFileBase64(
           attachmentMeta.storagePath);
-      if (contentBase64) {
-        emailPayload.attachments = [{
-          filename: attachmentMeta.filename ||
-            `carrier-invoice-${invoiceId}.pdf`,
-          contentType: attachmentMeta.mimeType || "application/pdf",
-          contentBase64,
-        }];
-        attachedInvoicePdf = true;
-      }
+      if (!contentBase64) continue;
+      emailAttachments.push({
+        filename: attachmentMeta.filename ||
+          `carrier-invoice-${invoiceId}.pdf`,
+        contentType: attachmentMeta.mimeType || "application/pdf",
+        contentBase64,
+      });
+    }
+    if (emailAttachments.length) {
+      emailPayload.attachments = emailAttachments;
+      attachedInvoicePdf = true;
+      attachedApprovalPdfCount = emailAttachments.length;
     } else if (Array.isArray(opts.invoiceAttachments) &&
         opts.invoiceAttachments.length > 1 &&
         aiResult.proNumber) {
@@ -5422,6 +5440,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         ccLisa: additionalCharges.LISA_EMAIL,
         customerRate,
         attachedInvoicePdf,
+        attachedApprovalPdfCount,
       });
 }
 
@@ -5556,7 +5575,10 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "invoice (the document title).",
         "Set invoicePages to the 1-based page numbers in that PDF that " +
         "belong to THIS carrier bill (not sibling invoices). If the whole " +
-        "file is one invoice, list every invoice page.",
+        "file is one invoice, list every invoice page. When a Weight & " +
+        "Inspection (W&I) / reweigh / inspection certificate is in the " +
+        "SAME PDF as this bill, include those certificate page numbers in " +
+        "invoicePages too — do not leave W&I backup pages out.",
         "Each invoice gets its OWN pod.documents limited to that load's " +
         "delivery pages only.",
         "Find the actual carrier invoice.",
@@ -5620,6 +5642,12 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "carrier invoice number / tracking number (often 9–12 digits). " +
         "Set proNumber to that tracking number even when a separate broker " +
         "load number is also shown.",
+        "FedEx Freight often emails ONE PDF containing many separate " +
+        "freight invoices (one bill per page, or invoice+POD pages per " +
+        "PRO). Return a SEPARATE invoices[] entry for EACH PRO/load. " +
+        "Set invoicePages to ONLY the page(s) for THAT PRO — never list " +
+        "sibling invoices' pages on the same item. Do not merge the " +
+        "packet into one invoice.",
         "Find invoice total, invoice date, and due date.",
         "invoiceDate is the date the carrier issued the invoice " +
         "(YYYY-MM-DD).",
@@ -9795,6 +9823,25 @@ async function processGmailMessage(
       }
 
       try {
+        const scoped = await repairSharedPdfInvoicePages(
+            invoiceItems, pdfAttachments);
+        if (scoped.repaired.length > 0) {
+          await writeLog("info", "ai",
+              "Re-scoped shared multi-invoice PDF pages per PRO", {
+                messageId,
+                repaired: scoped.repaired,
+              });
+          invoiceItems = scoped.items;
+        }
+      } catch (scopeErr) {
+        await writeLog("warn", "ai",
+            "Shared-PDF page scoping failed; keeping classifier pages", {
+              messageId,
+              error: scopeErr.message,
+            });
+      }
+
+      try {
         const filtered = await filterAlreadyProcessedInvoiceItems(
             tenant, messageId, invoiceItems);
         preSkippedItemSummaries = filtered.skippedSummaries;
@@ -9955,23 +10002,68 @@ async function processGmailMessage(
       const invoiceIdsBefore = createdInvoiceIds.length;
 
       try {
-        const scopedPages = collectInvoiceScopedPages(aiResult);
+        let scopedPages = collectInvoiceScopedPages(aiResult);
         const primaryName = String(aiResult.attachmentFilename || "").trim();
         let primaryAtt = primaryName ?
-          pdfAttachments.find((a) => a.filename === primaryName) : null;
+          pdfAttachments.find((a) =>
+            podUtils.attachmentFilenamesMatch(a.filename, primaryName)) :
+          null;
         if (!primaryAtt) {
           primaryAtt = pdfAttachments.find((a) => a.docType !== "POD") ||
             pdfAttachments[0];
         }
+        let pageCount = 0;
+        if (primaryAtt && primaryAtt.buffer) {
+          try {
+            pageCount = await getPdfPageCount(primaryAtt.buffer);
+          } catch (_) {
+            pageCount = 0;
+          }
+          // Classifier sometimes lists every page of a FedEx multi-invoice
+          // PDF on each item — re-scope by PRO before upload.
+          if (pageCount >= 2 &&
+              scopedPagesNeedRepair(scopedPages, pageCount)) {
+            const byPro = await findInvoicePagesByProInPdf(
+                aiResult, primaryAtt.buffer);
+            if (byPro.length > 0 && byPro.length < pageCount) {
+              aiResult.invoicePages = byPro.slice();
+              scopedPages = collectInvoiceScopedPages(aiResult);
+              await writeLog("info", "mail",
+                  "Scoped multi-invoice PDF pages by PRO before upload", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    proNumber: aiResult.proNumber,
+                    pages: scopedPages,
+                    pageCount,
+                  });
+            }
+          }
+        }
         if (primaryAtt && scopedPages.length > 0) {
-          const sliced = await slicePdfByPages(
-              primaryAtt.buffer, scopedPages);
+          // Keep the full original packet when this PDF belongs to a single
+          // load and includes a W&I certificate — slicing to invoicePages
+          // alone drops inspection / backup pages needed on additional-
+          // charge approval emails (Lisa / Load 265447).
+          const claimantCount = invoiceItems.filter((item) => {
+            const n = String((item && item.attachmentFilename) || "").trim();
+            return n && podUtils.attachmentFilenamesMatch(
+                n, primaryAtt.filename);
+          }).length;
+          const keepFullWiPacket =
+            !!aiResult.hasWeightInspectionCertificate &&
+            claimantCount <= 1;
+          const sliced = keepFullWiPacket ? null :
+            await slicePdfByPages(primaryAtt.buffer, scopedPages);
           if (sliced) {
             remapPodPagesAfterSlice(aiResult, scopedPages);
             const safeBase = String(primaryAtt.filename || "invoice.pdf")
                 .replace(/[^a-zA-Z0-9._-]/g, "_");
+            const proDigits = String(aiResult.proNumber || "")
+                .replace(/\D/g, "");
             const slicedName =
-                "load-" + (aiResult.loadNumber || itemIndex) + "-" + safeBase;
+                "load-" + (aiResult.loadNumber || itemIndex) +
+                (proDigits ? "-pro-" + proDigits : "") +
+                "-" + safeBase;
             const slicedPath =
                 "emailAttachments/" + messageId + "/scoped-" +
                 Date.now() + "-" + slicedName;
@@ -9985,12 +10077,15 @@ async function processGmailMessage(
               storagePath: slicedPath,
               docType: "INVOICE",
               scopedFrom: primaryAtt.filename,
+              scopedFromStoragePath: primaryAtt.storagePath || null,
             });
             storedAttachments.push({
               filename: slicedName,
               mimeType: "application/pdf",
               storagePath: slicedPath,
               docType: "INVOICE",
+              scopedFrom: primaryAtt.filename,
+              scopedFromStoragePath: primaryAtt.storagePath || null,
             });
             aiResult.attachmentFilename = slicedName;
             if (aiResult.pod && typeof aiResult.pod === "object") {
@@ -10007,6 +10102,21 @@ async function processGmailMessage(
                 }
               }
             }
+          } else if (pageCount >= 2 &&
+              scopedPagesNeedRepair(scopedPages, pageCount)) {
+            // Never upload the unsliced multi-invoice packet to Primus —
+            // it would attach every sibling FedEx bill to this load.
+            aiResult.blockUnscopedMultiInvoicePacket = true;
+            aiResult.unscopedPacketFilename = primaryAtt.filename;
+            await writeLog("warn", "mail",
+                "Could not slice multi-invoice PDF — refusing full packet", {
+                  messageId,
+                  loadNumber: aiResult.loadNumber,
+                  proNumber: aiResult.proNumber,
+                  scopedPages,
+                  pageCount,
+                  packetFilename: primaryAtt.filename,
+                });
           }
         }
       } catch (sliceErr) {
@@ -10800,7 +10910,26 @@ async function processGmailMessage(
           storagePath: att.storagePath,
           mimeType: att.mimeType,
           docType: att.docType,
+          scopedFrom: att.scopedFrom || null,
+          scopedFromStoragePath: att.scopedFromStoragePath || null,
         }));
+        // Drop the unsliced multi-invoice packet when we could not isolate
+        // this load's pages — never upload sibling FedEx bills to Primus.
+        if (aiResult.blockUnscopedMultiInvoicePacket) {
+          const packetName = String(
+              aiResult.unscopedPacketFilename || "").trim();
+          invoiceAttachments = invoiceAttachments.filter((a) => {
+            if (/WEIGHT_INSPECTION_CERT/i.test(String(a.docType || ""))) {
+              return true;
+            }
+            if (a.scopedFrom) return true;
+            if (packetName &&
+                podUtils.attachmentFilenamesMatch(a.filename, packetName)) {
+              return false;
+            }
+            return true;
+          });
+        }
         const loadAtt = podUtils.findInvoiceAttachment(invoiceAttachments, {
           proNumber: aiResult.proNumber,
           attachmentFilename: preferredName,
@@ -10819,7 +10948,10 @@ async function processGmailMessage(
           const rest = invoiceAttachments.filter((a) =>
             !podUtils.attachmentFilenamesMatch(a.filename, preferredName));
           if (preferred.length) {
-            invoiceAttachments = preferred.concat(rest);
+            // Prefer the scoped per-load PDF; keep sidecars after it.
+            invoiceAttachments = preferred.concat(rest.filter((a) =>
+              a.scopedFrom ||
+              /WEIGHT_INSPECTION_CERT|POD/i.test(String(a.docType || ""))));
           }
         }
         if (pendingXpoWeightCert && pendingXpoWeightCert.storagePath) {

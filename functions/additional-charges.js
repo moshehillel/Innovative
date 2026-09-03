@@ -663,8 +663,9 @@ function validateCarrierInvoiceAttachment(attachmentMeta, hints) {
 
 /**
  * Picks the carrier invoice PDF from an invoice doc's attachments list
- * (GCS storagePath). Skips weight-cert / POD image docs so approval emails
- * get the bill PDF, not a certificate sidecar.
+ * (GCS storagePath). Skips weight-cert / POD image docs — callers that need
+ * the full original packet (invoice + W&I backups) should use
+ * listAdditionalChargeApprovalAttachments instead.
  * @param {Array<object>|null|undefined} attachments Invoice attachments.
  * @param {object} [hints] Optional proNumber / attachmentFilename match.
  * @return {{filename: string, storagePath: string, mimeType: string}|null}
@@ -681,6 +682,8 @@ function pickCarrierInvoiceAttachment(attachments, hints) {
       filename: String(hinted.filename || "carrier-invoice.pdf"),
       storagePath: String(hinted.storagePath),
       mimeType: String(hinted.mimeType || "application/pdf"),
+      scopedFrom: hinted.scopedFrom || null,
+      scopedFromStoragePath: hinted.scopedFromStoragePath || null,
     };
     const validation = validateCarrierInvoiceAttachment(meta, opts);
     return validation.ok ? meta : null;
@@ -710,9 +713,61 @@ function pickCarrierInvoiceAttachment(attachments, hints) {
     filename: String(chosen.filename || "carrier-invoice.pdf"),
     storagePath: String(chosen.storagePath),
     mimeType: String(chosen.mimeType || "application/pdf"),
+    scopedFrom: chosen.scopedFrom || null,
+    scopedFromStoragePath: chosen.scopedFromStoragePath || null,
   };
   const validation = validateCarrierInvoiceAttachment(meta, opts);
   return validation.ok ? meta : null;
+}
+
+/**
+ * Attachments for additional-charge approval emails: the carrier invoice
+ * PDF plus any W&I certificate backups stored on the invoice. Skips POD /
+ * trailer images and does not fall back to sibling-PRO batch PDFs.
+ * Prefer the invoice attachment already on the load (for single-load W&I
+ * packets intake keeps the full original PDF instead of an invoice-only
+ * page extract).
+ * @param {Array<object>|null|undefined} attachments Invoice attachments.
+ * @param {object} [hints] Optional proNumber / attachmentFilename match.
+ * @return {Array<{filename: string, storagePath: string, mimeType: string,
+ *   docType: string|null}>}
+ */
+function listAdditionalChargeApprovalAttachments(attachments, hints) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  const withPath = list.filter((a) => a && a.storagePath);
+  if (!withPath.length) return [];
+
+  const opts = hints && typeof hints === "object" ? hints : {};
+  const picked = pickCarrierInvoiceAttachment(withPath, opts);
+  const out = [];
+  const seen = new Set();
+  const push = (meta, docType) => {
+    if (!meta || !meta.storagePath || seen.has(meta.storagePath)) return;
+    seen.add(meta.storagePath);
+    out.push({
+      filename: String(meta.filename || "carrier-invoice.pdf"),
+      storagePath: String(meta.storagePath),
+      mimeType: String(meta.mimeType || "application/pdf"),
+      docType: docType || meta.docType || null,
+    });
+  };
+
+  if (picked) {
+    push(picked, "INVOICE");
+  }
+
+  for (const att of withPath) {
+    const dt = String(att.docType || "");
+    if (/WEIGHT_INSPECTION_CERT/i.test(dt)) {
+      push({
+        filename: String(att.filename || "weight-inspection-cert.pdf"),
+        storagePath: String(att.storagePath),
+        mimeType: String(att.mimeType || "application/pdf"),
+        docType: "WEIGHT_INSPECTION_CERT",
+      }, "WEIGHT_INSPECTION_CERT");
+    }
+  }
+  return out;
 }
 
 /**
@@ -1446,6 +1501,7 @@ module.exports = {
   resolveEffectiveChargeCategory,
   categoryLabel,
   pickCarrierInvoiceAttachment,
+  listAdditionalChargeApprovalAttachments,
   validateCarrierInvoiceAttachment,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
