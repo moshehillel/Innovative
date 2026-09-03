@@ -165,10 +165,36 @@ check("D&B Credit Insights evaluate ignored",
         "Dun & Bradstreet <e.email@dnb.com>",
         "View the inquiry in Credit Insights.",
         []).status === "dnb_promotional_ignored");
+// Exact Lisa 2026-09-03 forward case (no-attachment path).
+check("Lisa D&B New Inquiry alert (exact subject) ignored",
+    adm.evaluateAdministrativeIgnore(
+        "ALERT: New Inquiry Reported in D&B Credit Insights",
+        "Dun & Bradstreet <e.email@dnb.com>",
+        "",
+        []).status === "dnb_promotional_ignored");
+check("D&B Credit Insights ignored with empty From",
+    adm.evaluateAdministrativeIgnore(
+        "ALERT: New Inquiry Reported in D&B Credit Insights",
+        "",
+        "A new inquiry was reported.",
+        []).status === "dnb_promotional_ignored");
+check("D&B Credit Insights not blocked by invoice veto",
+    !adm.hasInvoiceVeto({
+      subject: "ALERT: New Inquiry Reported in D&B Credit Insights",
+      from: "Dun & Bradstreet <e.email@dnb.com>",
+      body: "View the inquiry in Credit Insights.",
+      attachments: [],
+      emailClassification: {intent: "carrier_invoice", confidence: "high"},
+    }));
 check("D&B marketing ESP ignored even without banking subject",
     adm.isDnbPromotionalEmail(
         "Your weekly D&B update",
         "Dun & Bradstreet <e.email@dnb.com>",
+        "See what's new this week."));
+check("D&B email.dnb.com ESP ignored",
+    adm.isDnbPromotionalEmail(
+        "Your D&B account update",
+        "Dun & Bradstreet <noreply@email.dnb.com>",
         "See what's new this week."));
 check("D&B credit alert not treated as promo",
     !adm.isDnbPromotionalEmail(

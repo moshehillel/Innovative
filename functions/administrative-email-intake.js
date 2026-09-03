@@ -71,6 +71,11 @@ function isDnbCreditInsightsDigest(hay) {
     return true;
   }
   if (/alert:\s*new inquiry reported/.test(text)) return true;
+  // "New Inquiry Reported" + D&B branding (subject may omit "Credit Insights")
+  if (/(?:new )?inquir(?:y|ies) reported/.test(text) &&
+      /(?:d\s*&\s*b|dun\s*&\s*bradstreet|dnb\.com)/.test(text)) {
+    return true;
+  }
   return false;
 }
 
@@ -84,26 +89,33 @@ function isDnbCreditInsightsDigest(hay) {
  * @return {boolean}
  */
 function isDnbPromotionalEmail(subject, from, body) {
+  const sub = String(subject || "");
+  const hay = `${sub}\n${body || ""}`.toLowerCase();
+
+  // Credit Insights inquiry alerts — ignore by subject/body alone so a
+  // missing/mangled From header cannot fall through to Lisa as
+  // "Email received with no attachments".
+  if (isDnbCreditInsightsDigest(hay) || isDnbCreditInsightsDigest(sub)) {
+    return true;
+  }
+
   const fromL = String(from || "").toLowerCase();
   if (!fromL.includes("dnb.com") &&
       !fromL.includes("dunandbradstreet")) {
     return false;
   }
-  const hay = `${subject || ""}\n${body || ""}`.toLowerCase();
   const addrMatch =
     fromL.match(/<([^>]+)>/) || fromL.match(/([\w.+-]+@[\w.-]+)/);
   const addr = String(addrMatch && addrMatch[1] || fromL).toLowerCase();
   const isMarketingSender =
     addr.startsWith("e.email@dnb.com") ||
     addr.includes("marketing@") ||
-    addr.includes("@e.email.dnb.com");
+    addr.includes("@e.email.dnb.com") ||
+    /@email\.dnb\.com$/.test(addr) ||
+    /^e\.email(?:[.+][^@]*)?@dnb\.com$/.test(addr);
 
-  // Marketing ESP + Credit Insights digests — always ignore (Lisa).
+  // Marketing ESP — always ignore (Lisa).
   if (isMarketingSender) return true;
-  if (isDnbCreditInsightsDigest(hay) ||
-      isDnbCreditInsightsDigest(String(subject || ""))) {
-    return true;
-  }
 
   if (looksLikeDnbCreditAlert(hay)) return false;
 
@@ -1305,6 +1317,11 @@ function hasInvoiceVeto(signals = {}) {
 
   // Remittances forward to Abe even when subject/body cite invoice/BOL #s.
   if (isCustomerPaymentRemittanceEmail(subject, from, body)) {
+    return false;
+  }
+
+  // Never block intentional D&B marketing / Credit Insights noise ignores.
+  if (isDnbPromotionalEmail(subject, from, body)) {
     return false;
   }
 
