@@ -23,6 +23,46 @@ check("vendorInvoiceNumber on REST invoice row",
       invoices: [{vendorInvoiceNumber: "OTR-24633649"}],
     }).present, true);
 
+check("payableBreakdown invoiceNumber on REST invoice row",
+    verify.carrierInvoiceNumberPresentInPrimusEvidence({
+      carrierInvoiceNumber: "331113126",
+      invoices: [{
+        payableBreakdown: [{invoiceNumber: "331113126", amount: 412.5}],
+      }],
+    }).source, "invoice_payableBreakdown");
+
+check("costBreakdown actual breakdown vendorInvoiceNumber",
+    verify.carrierInvoiceNumberPresentInPrimusEvidence({
+      carrierInvoiceNumber: "331113126",
+      invoices: [{
+        costBreakdown: [
+          {type: "estimated", breakdown: [{vendorInvoiceNumber: ""}]},
+          {type: "actual", breakdown: [{vendorInvoiceNumber: "331113126"}]},
+        ],
+      }],
+    }).source, "invoice_costBreakdown_actual");
+
+check("costBreakdown estimated-only does NOT match",
+    verify.carrierInvoiceNumberPresentInPrimusEvidence({
+      carrierInvoiceNumber: "331113126",
+      invoices: [{
+        costBreakdown: [
+          {type: "estimated", breakdown: [{vendorInvoiceNumber: "331113126"}]},
+        ],
+      }],
+    }).present, false);
+
+check("PRO-only match is NOT entered",
+    verify.carrierInvoiceNumberPresentInPrimusEvidence({
+      carrierInvoiceNumber: "331113126",
+      invoices: [{
+        shipment: {carrierPRO: "331113126"},
+        vendor: {PRO: "331113126"},
+        payableBreakdown: [{invoiceNumber: ""}],
+        costBreakdown: [{type: "actual", breakdown: [{charge: 412.5}]}],
+      }],
+    }).present, false);
+
 check("actual cost line vendorInvoiceNumber",
     verify.carrierInvoiceNumberPresentInPrimusEvidence({
       carrierInvoiceNumber: "7826",

@@ -10,6 +10,43 @@ function normalizeCarrierReference(value) {
 }
 
 /**
+ * Carrier invoice # candidates nested inside a REST /invoice row.
+ * Deliberately excludes PRO fields (shipment.carrierPRO, vendor.PRO):
+ * a PRO match alone must never count as the bill being entered.
+ * @param {object} inv REST invoice row.
+ * @return {Array<{value: string, source: string}>}
+ */
+function nestedInvoiceNumberCandidates(inv) {
+  const out = [];
+  const push = (value, source) => {
+    const str = String(value == null ? "" : value).trim();
+    if (str) out.push({value: str, source});
+  };
+
+  const payable = Array.isArray(inv.payableBreakdown) ?
+    inv.payableBreakdown : [];
+  for (const row of payable) {
+    if (!row) continue;
+    push(row.invoiceNumber, "invoice_payableBreakdown");
+    push(row.vendorInvoiceNumber, "invoice_payableBreakdown");
+  }
+
+  const costs = Array.isArray(inv.costBreakdown) ? inv.costBreakdown : [];
+  for (const cost of costs) {
+    if (!cost) continue;
+    if (String(cost.type || "").trim().toLowerCase() !== "actual") continue;
+    const lines = Array.isArray(cost.breakdown) ? cost.breakdown : [];
+    for (const line of lines) {
+      if (!line) continue;
+      push(line.vendorInvoiceNumber, "invoice_costBreakdown_actual");
+      push(line.invoiceNumber, "invoice_costBreakdown_actual");
+    }
+  }
+
+  return out;
+}
+
+/**
  * True when the carrier invoice number from email appears in Primus fields.
  * PDF / file-type upload alone does not count.
  * @param {object} args Evidence inputs.
@@ -43,6 +80,11 @@ function carrierInvoiceNumberPresentInPrimusEvidence(args) {
     ).trim();
     if (vin && normalizeCarrierReference(vin) === norm) {
       return {ok: true, present: true, source: "invoice_vendorInvoiceNumber"};
+    }
+    for (const cand of nestedInvoiceNumberCandidates(inv)) {
+      if (normalizeCarrierReference(cand.value) === norm) {
+        return {ok: true, present: true, source: cand.source};
+      }
     }
   }
 
