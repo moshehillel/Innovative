@@ -199,6 +199,21 @@ async function adjustBrokerCommissionForLowMargin(opts) {
     return {adjusted: false, notified: false, reason: "margin_ok"};
   }
 
+  // Fully approved-charge (or otherwise $0 freight) invoices yield an
+  // undefined Profit %. Callers used to pass margin=0 which falsely swapped
+  // healthy loads. Refuse when an explicit non-positive cost basis is given.
+  const costBasis = vendorCost != null ? Number(vendorCost) :
+    (carrierCost != null ? Number(carrierCost) : null);
+  if (costBasis != null && Number.isFinite(costBasis) && costBasis <= 0) {
+    await log("info", "primus",
+        "Low margin — broker swap skipped (no freight cost basis)", {
+          loadNumber, margin, profit, costBasis, trigger,
+          customerRate: Number.isFinite(customerRate) ? customerRate : null,
+          invoiceAmount: Number.isFinite(invoiceAmount) ? invoiceAmount : null,
+        });
+    return {adjusted: false, notified: false, reason: "no_cost_basis"};
+  }
+
   if (!deps.primusUiBridge ||
       typeof deps.primusUiBridge.isManagePhpEnabled !== "function" ||
       !deps.primusUiBridge.isManagePhpEnabled()) {

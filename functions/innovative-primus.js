@@ -3189,11 +3189,18 @@ exports.processPrimusWorkflow = onRequest(
             }
 
             // Broker 10% swap before billing — load must still be editable.
+            // Profit % = profit / freight cost (after approved charges).
+            // When the bill is fully approved charges, freight cost is $0 and
+            // Profit % is undefined — do NOT treat that as low margin (that
+            // falsely swapped healthy loads like 264422/264437/264427).
             const vendorCostForBroker = bookingCarrierCost -
               approvedChargesTotal;
             const brokerProfitPct = vendorCostForBroker > 0 ?
-              Math.round((profit / vendorCostForBroker) * 10000) / 100 : 0;
-            if (brokerProfitPct < 10 && invoice.loadNumber) {
+              Math.round((profit / vendorCostForBroker) * 10000) / 100 : null;
+            if (vendorCostForBroker > 0 &&
+                brokerProfitPct != null &&
+                brokerProfitPct < 10 &&
+                invoice.loadNumber) {
               let brokerNameForSwap = "";
               const contact = bookingForInvoice &&
                 bookingForInvoice.contactInformation;
@@ -3224,6 +3231,17 @@ exports.processPrimusWorkflow = onRequest(
                       error: brokerErr.message,
                     });
               }
+            } else if (vendorCostForBroker <= 0 && invoice.loadNumber) {
+              await writeLog("info", "workflow",
+                  "Broker commission check skipped — no freight cost basis", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    bookingCarrierCost,
+                    approvedChargesTotal,
+                    vendorCostForBroker,
+                    profit,
+                    invoiceAmount: invoice.invoiceAmount,
+                  });
             }
 
             const isPowerOnlyForInvoice = bookingForInvoice &&
