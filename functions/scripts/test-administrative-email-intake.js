@@ -963,9 +963,12 @@ check("Invoice # in BOL subject still recognized as reply",
 check("Invoice # in BOL# subject still recognized as reply",
     adm.subjectLooksLikeInvoiceForBolReply(
         "Re: Invoice #28415 for BOL#267130"));
-check("looksLikeInvoiceEmailContent accepts Invoice # for BOL reply",
+check("EXTERNAL customer invoice reply subject recognized",
+    adm.subjectLooksLikeInvoiceForBolReply(
+        "RE: [EXTERNAL]Invoice #28301 for BOL #265467"));
+check("looksLikeInvoiceEmailContent accepts EXTERNAL BOL reply",
     adm.looksLikeInvoiceEmailContent(
-        "Re: Invoice #28415 for BOL #267130", ""));
+        "RE: [EXTERNAL]Invoice #28301 for BOL #265467", ""));
 check("AltaReb paid notice in top-of-thread detected",
     adm.bodyLooksLikeCustomerPaidNotice(altarebBody));
 check("AltaReb remittance reply detected → Abe",

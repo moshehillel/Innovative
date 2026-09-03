@@ -413,7 +413,7 @@ function subjectLooksLikeRemittanceAdvice(subject) {
  * "Re: Invoice #28415 for BOL #267130".
  */
 const INVOICE_FOR_BOL_REPLY_RE =
-  /^(?:(?:re|fw|fwd):\s*)+invoice(?:\s*#\s*\d+)?\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/i;
+  /^(?:(?:re|fw|fwd):\s*)+(?:\[(?:external|secure)\]\s*)?invoice(?:\s*#\s*\d+)?\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/i;
 
 /**
  * Subject is a reply on our customer-invoice thread (Invoice for BOL/Load#).

@@ -401,15 +401,48 @@ async function hasIssuedCustomerInvoiceInPrimus(loadNumber) {
 }
 
 /**
- * True when carrier bill and customer invoice are already complete in Primus.
- * @param {object} item AI invoice item with loadNumber.
+ * True when a prior Jerry run completed billing for this load + carrier inv #.
+ * @param {object} tenant Tenant config.
+ * @param {string} loadNumber Broker load number.
+ * @param {string} [carrierInvoiceNumber] Carrier freight bill number.
  * @return {Promise<boolean>}
  */
-async function isInvoiceFullyBilledAndInvoicedInPrimus(item) {
+async function hasPriorCompletedBillingForLoad(
+    tenant, loadNumber, carrierInvoiceNumber) {
+  const normalized = normalizeLoadNumber(loadNumber);
+  if (!normalized) return false;
+  const snap = await tcol(tenant, "invoices")
+      .where("loadNumber", "==", normalized)
+      .limit(12)
+      .get();
+  const carrierNorm = String(carrierInvoiceNumber || "").trim() ?
+    normalizeCarrierReference(carrierInvoiceNumber) : "";
+  for (const doc of snap.docs) {
+    const data = doc.data() || {};
+    if (data.finalWorkflowStatus !== "completed") continue;
+    if (!carrierNorm) return true;
+    const prev = normalizeCarrierReference(
+        data.invoiceNumber || data.proNumber || "");
+    if (prev && prev === carrierNorm) return true;
+  }
+  return false;
+}
+
+/**
+ * True when carrier bill and customer invoice are already complete in Primus.
+ * @param {object} item AI invoice item with loadNumber.
+ * @param {object} [tenant] Tenant config.
+ * @return {Promise<boolean>}
+ */
+async function isInvoiceFullyBilledAndInvoicedInPrimus(
+    item, tenant = DEFAULT_TENANT) {
   if (!item || !item.loadNumber) return false;
-  const carrierEntered = await isCarrierBillAlreadyEnteredInPrimus(item);
-  if (!carrierEntered) return false;
-  return hasIssuedCustomerInvoiceInPrimus(item.loadNumber);
+  if (!(await hasIssuedCustomerInvoiceInPrimus(item.loadNumber))) {
+    return false;
+  }
+  if (await isCarrierBillAlreadyEnteredInPrimus(item)) return true;
+  return hasPriorCompletedBillingForLoad(
+      tenant, item.loadNumber, item.invoiceNumber);
 }
 
 /**

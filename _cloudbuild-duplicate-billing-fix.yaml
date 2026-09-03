@@ -1,0 +1,14 @@
+steps:
+  - name: 'node:24'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        npm install -g firebase-tools@15.22.4
+        cd functions && npm ci
+        cd ..
+        firebase deploy --config=_firebase-deploy-nolint.json --only=functions:processGmailQueue,functions:processPrimusWorkflow --project=tai-invoice-automation --non-interactive
+timeout: '3600s'
+options:
+  logging: CLOUD_LOGGING_ONLY

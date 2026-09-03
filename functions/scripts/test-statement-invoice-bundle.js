@@ -487,6 +487,19 @@ check("fully extracted index does not alert",
           pageCount: 54,
         })), false);
 
+check("EXTERNAL customer invoice reply not statement-only short-circuit",
+    bundle.shouldShortCircuitAsStatementOnly(
+        {
+          intent: "statement",
+          confidence: "high",
+          reasoning: "payment confirmation",
+        },
+        "RE: [EXTERNAL]Invoice #28301 for BOL #265467",
+        "Blimie Berger <blimie@ctadigital.com>",
+        "Payment received",
+        []),
+    false);
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);

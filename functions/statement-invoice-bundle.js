@@ -5,6 +5,8 @@
  */
 "use strict";
 
+const administrativeEmailIntake = require("./administrative-email-intake");
+
 /**
  * Normalizes a first-page pre-check label (strip punctuation / whitespace).
  * @param {string} docType Raw label.
@@ -484,6 +486,9 @@ function shouldShortCircuitAsStatementOnly(
     return false;
   }
   if (classification.confidence === "low") return false;
+  if (administrativeEmailIntake.subjectLooksLikeInvoiceForBolReply(subject)) {
+    return false;
+  }
   if (looksLikeStatementCoverInvoicePacketEmail(
       subject, from, body, attachments)) {
     return false;

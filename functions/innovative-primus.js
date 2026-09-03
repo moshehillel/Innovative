@@ -237,9 +237,20 @@ async function resolveBillingSkipAction(invoice, primusSteps, resumeFrom) {
   if (invoice.customerEmailApproval === "rejected") {
     return {action: "skip_entirely", workflowStatus: "customer_email_rejected"};
   }
+
+  // Duplicate carrier invoice email — load already billed in Primus but this
+  // intake created a fresh Firestore doc. Do not re-send customer invoice #.
+  if (!inFirestore) {
+    return {
+      action: "skip_entirely",
+      workflowStatus: "already_billed_in_primus",
+      source: "primus",
+    };
+  }
+
   return {
     action: "customer_email_only",
-    source: inFirestore ? "firestore" : "primus",
+    source: "firestore",
   };
 }
 
@@ -1247,7 +1258,13 @@ exports.processPrimusWorkflow = onRequest(
             finalWorkflowStatus: billingSkip.workflowStatus ===
               "awaiting_customer_email_approval" ?
               "waiting_manual" :
+              billingSkip.workflowStatus === "already_billed_in_primus" ?
+              "already_billed_skipped" :
               (invoice.finalWorkflowStatus || "waiting_manual"),
+            decisionReason: billingSkip.workflowStatus ===
+              "already_billed_in_primus" ?
+              "Load already billed and customer invoice issued in Primus" :
+              invoice.decisionReason,
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
           return res.json({
