@@ -35,6 +35,7 @@ const fedexFreightPod = require("./fedex-freight-pod");
 const xpoImaging = require("./xpo-imaging");
 const loadResolution = require("./invoice-load-resolution");
 const apexCapitalIntake = require("./apex-capital-intake");
+const invoiceZipAttachments = require("./invoice-zip-attachments");
 const dailyActivityReport = require("./daily-activity-report");
 const podRequestIntake = require("./pod-request-intake");
 const podSendDedup = require("./pod-send-dedup");
@@ -3902,6 +3903,10 @@ function shouldProcessAttachment(attachment, fileBuffer) {
   const name = String(attachment && attachment.filename || "").toLowerCase();
   // Nested .eml / RFC822 wrappers are expanded separately.
   if (mime.includes("message/rfc822") || name.endsWith(".eml")) {
+    return false;
+  }
+  // ZIP packets are expanded into PDF/image attachments separately.
+  if (invoiceZipAttachments.isZipAttachment(attachment, fileBuffer)) {
     return false;
   }
   if (!isPdfAttachment(attachment, fileBuffer)) return false;
@@ -8459,6 +8464,32 @@ async function processGmailMessage(
               error: expandErr.message,
             });
       }
+      try {
+        const beforeZipCount = attachments.length;
+        attachments = await invoiceZipAttachments.expandZipAttachments(
+            gmail, messageId, attachments, resolveAttachmentBuffer);
+        const fromZip = attachments.filter((a) => a && a.fromZip);
+        if (fromZip.length > 0) {
+          await writeLog("info", "mail",
+              "Extracted invoice file(s) from ZIP attachment(s)", {
+                messageId,
+                beforeCount: beforeZipCount,
+                afterCount: attachments.length,
+                extracted: fromZip.map((a) => ({
+                  filename: a.filename,
+                  mimeType: a.mimeType,
+                  zipFilename: a.zipFilename || null,
+                  bytes: a.buffer && a.buffer.length || 0,
+                })),
+              });
+        }
+      } catch (zipErr) {
+        await writeLog("warn", "mail",
+            "ZIP attachment expand failed; continuing", {
+              messageId,
+              error: zipErr.message,
+            });
+      }
 
       if (attachments.length === 0) {
         try {
@@ -9131,16 +9162,26 @@ async function processGmailMessage(
             filename: attachment.filename,
             mimeType: attachment.mimeType,
             fileSize: fileBuffer.length,
+            zipExpanded: Boolean(attachment.zipExpanded),
+            fromZip: Boolean(attachment.fromZip),
           });
           const isPdfMime = isPdfAttachment(attachment, fileBuffer);
+          const isExpandedZip =
+            Boolean(attachment.zipExpanded) ||
+            invoiceZipAttachments.isZipAttachment(attachment, fileBuffer);
           if (isPdfMime && isPdfTooSmallForIntake(attachment, fileBuffer)) {
           // Small PDF — likely a real document but too short to be an invoice
             skippedDocTypes.push("small PDF");
-          } else if (!isPdfMime && fileBuffer.length >= 10000) {
+          } else if (!isPdfMime && !isExpandedZip &&
+              fileBuffer.length >= 10000) {
           // Substantive non-PDF (Excel, Word, image, etc.)
+          // Expanded ZIP shells are omitted — their inner PDFs are processed.
             const ext = String(attachment.filename || "")
                 .split(".").pop().toUpperCase();
             skippedDocTypes.push(ext || attachment.mimeType || "non-PDF file");
+          } else if (isExpandedZip && !attachment.zipExpanded) {
+            // ZIP present but nothing invoice-like extracted.
+            skippedDocTypes.push("ZIP");
           }
           continue;
         }
