@@ -1072,6 +1072,57 @@ check("factor sender excluded even with Check subject",
         "Surety Financial LLC <notification@factorview.com>",
         "Remit for payment"));
 
+const berkshireSubject = "Berkshire Fashions Inc Payment";
+const berkshireFrom = "Francia Marcelo <FranciaM@berkshireinc.com>";
+const berkshireBody =
+  "The sender reports that Berkshire Fashions Inc. wired a payment of " +
+  "$12,155.00 and references an attached payment confirmation.";
+const berkshireBodyAlt =
+  "Hi, We wired a payment of $12,155.00. Attached is the payment confirmation.";
+const berkshireAtt = [
+  {filename: "wire_confirmation.pdf", mimeType: "application/pdf"},
+  {filename: "payment_screenshot.png", mimeType: "image/png"},
+];
+check("Berkshire company Payment subject detected",
+    adm.subjectLooksLikeCustomerPaymentNotice(berkshireSubject));
+check("Payment Confirmation subject detected",
+    adm.subjectLooksLikeCustomerPaymentNotice("Payment Confirmation"));
+check("Pending Payment for Load is not customer payment notice",
+    !adm.subjectLooksLikeCustomerPaymentNotice(
+        "Pending Payment for Load # 265721"));
+check("Berkshire wired-a-payment body is paid notice",
+    adm.bodyLooksLikeCustomerPaidNotice(berkshireBody));
+check("Berkshire Attached is the payment confirmation is paid notice",
+    adm.bodyLooksLikeCustomerPaidNotice(berkshireBodyAlt));
+check("Berkshire customer remittance detected → Abe",
+    adm.isCustomerPaymentRemittanceEmail(
+        berkshireSubject, berkshireFrom, berkshireBody));
+check("Berkshire alt wording still remittance → Abe",
+    adm.isCustomerPaymentRemittanceEmail(
+        berkshireSubject, berkshireFrom, berkshireBodyAlt));
+check("Berkshire should handle customer remittance",
+    adm.shouldHandleCustomerPaymentRemittance(
+        berkshireSubject, berkshireFrom, berkshireBody));
+check("Berkshire OTHER attachments do not invoice-veto remittance",
+    !adm.hasInvoiceVeto({
+      subject: berkshireSubject,
+      body: berkshireBody,
+      from: berkshireFrom,
+      attachments: berkshireAtt,
+      emailClassification: {intent: "unknown"},
+      invoicePdfCount: 0,
+    }));
+check("Berkshire not a freight invoice subject",
+    !adm.looksLikeInvoiceEmailContent(berkshireSubject, berkshireBody));
+check("Berkshire not ignored as bank payment alert",
+    !adm.shouldIgnoreAsPaymentNotification(
+        berkshireSubject, berkshireFrom, berkshireBody, berkshireAtt));
+check("Berkshire factor-style load remittance still excluded",
+    !adm.isCustomerPaymentRemittanceEmail(
+        "Payment update",
+        berkshireFrom,
+        "Please find remittance for load #265721"));
+
 const averittSubject = "1467163 INNOVATIVE CARRIERS INC";
 const averittFrom = "Amanda Tate <atate@averitt.com>";
 const averittBody =

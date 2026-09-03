@@ -408,6 +408,35 @@ function subjectLooksLikeRemittanceAdvice(subject) {
 }
 
 /**
+ * Subject like "Berkshire Fashions Inc Payment" or "Payment Confirmation".
+ * Customer notifying us they paid — not a carrier payment inquiry.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeCustomerPaymentNotice(subject) {
+  const sub = String(subject || "").trim();
+  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  if (!stripped) return false;
+
+  if (/\b(?:payment|wire|ach|remittance)\s+confirmation\b/i.test(stripped)) {
+    return true;
+  }
+  if (/\bproof\s+of\s+payment\b/i.test(stripped)) return true;
+  if (/\bwired?\s+(?:a\s+|the\s+)?payment\b/i.test(stripped)) return true;
+  if (/\bpayment\s+remittance\b/i.test(stripped)) return true;
+
+  // "{Company} Payment" / bare "Payment" — exclude inquiry/status subjects.
+  if (/\bpayment\s*$/i.test(stripped)) {
+    if (/\b(?:pending|status|request|inquiry|inquiries|reminder|overdue|outstanding|receipt|for\s+load|quick\s*pay|update)\b/i
+        .test(stripped)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+/**
  * Reply/forward of our customer-invoice thread.
  * Matches both "Re: Invoice for BOL#267130" and
  * "Re: Invoice #28415 for BOL #267130".
@@ -454,9 +483,14 @@ function bodyLooksLikeCustomerPaidNotice(body) {
     /\b(?:we|i)\s+(?:have\s+)?(?:just\s+)?paid\b/,
     /\bpaid\s+(?:in\s+full|via|by|through|already|today)\b/,
     /\bsent\s+(?:the\s+)?(?:payment|funds)\b/,
-    /\bwire(?:d)?\s+(?:the\s+)?payment\b/,
+    /\bwire(?:d)?\s+(?:a\s+|the\s+)?payment\b/,
+    /\b(?:we|i)\s+(?:have\s+)?wired\b/,
+    /\bwired\s+(?:funds|money|\$)/,
+    /\bach\s+(?:payment\s+)?(?:was\s+)?(?:sent|made|completed|submitted)\b/,
     /\b(?:payment|invoice)\s+(?:has\s+been|was)\s+paid\b/,
     /\bproof\s+of\s+payment\b/,
+    /\bpayment\s+confirmation\b/,
+    /\bwire\s+confirmation\b/,
     /\bpay(?:s)?(?:\s+\w+){0,2}\s+directly\b/,
     /\bpaid?\s+(?:directly\s+)?(?:upon|at|on)\s+pick(?:\s+|-)?up\b/,
     /\b(?:front|fron)\s+and\s+back\b/,
@@ -502,6 +536,7 @@ function isCustomerPaymentRemittanceEmail(subject, from, body) {
   if (subjectLooksLikeCustomerPaymentDate(subject)) return true;
   if (subjectLooksLikeCustomerCheckNumber(subject)) return true;
   if (subjectLooksLikeRemittanceAdvice(subject)) return true;
+  if (subjectLooksLikeCustomerPaymentNotice(subject)) return true;
 
   // Customer reply on "Invoice for BOL#" saying they paid → Abe (not ignore
   // as bank alert, not process as freight invoice).
@@ -514,13 +549,23 @@ function isCustomerPaymentRemittanceEmail(subject, from, body) {
 
   if (isPaymentInquiryEmail(subject, from, body)) return false;
 
+  // Payment-ish subject + body saying they paid / wired / attached confirmation.
+  if (/\bpayment\b/i.test(sub) && bodyLooksLikeCustomerPaidNotice(body)) {
+    if (/\bload\s*#?\s*\d{5,9}\b/.test(hay)) return false;
+    if (/\bquick\s*pay\b/.test(hay)) return false;
+    return true;
+  }
+
   const remittancePatterns = [
     /\bremittance\s+advice\b/,
     /\bpayment\s+remittance\b/,
     /\bcheck\s+remittance\b/,
     /\bplease\s+find\s+(?:attached\s+)?(?:the\s+)?remittance\b/,
-    /\benclosed\s+(?:is\s+)?(?:our\s+)?payment\b/,
-    /\battached\s+(?:is\s+)?(?:our\s+)?(?:payment|check|remittance)\b/,
+    /\benclosed\s+(?:is\s+)?(?:(?:the|our|a)\s+)?payment\b/,
+    /\battached\s+(?:is\s+)?(?:(?:the|our|a)\s+)?(?:payment|check|remittance)(?:\s+confirmation)?\b/,
+    /\bpayment\s+confirmation\b/,
+    /\bwire\s+confirmation\b/,
+    /\bwire(?:d)?\s+(?:a\s+|the\s+)?payment\b/,
   ];
   if (!remittancePatterns.some((re) => re.test(hay))) return false;
   if (/\bload\s*#?\s*\d{5,9}\b/.test(hay)) return false;
@@ -1394,6 +1439,7 @@ module.exports = {
   subjectLooksLikeCustomerPaymentDate,
   subjectLooksLikeCustomerCheckNumber,
   subjectLooksLikeRemittanceAdvice,
+  subjectLooksLikeCustomerPaymentNotice,
   subjectLooksLikeInvoiceForBolReply,
   bodyLooksLikeCustomerPaidNotice,
   subjectLooksLikeMcNumberNoa,
