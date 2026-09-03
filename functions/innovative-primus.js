@@ -542,6 +542,237 @@ async function uploadPaperworkEarly(args) {
 }
 
 /**
+ * Collects Primus evidence for carrier invoice number verification.
+ * @param {object} invoice Invoice document.
+ * @param {object|null} bookingArg Primus booking if already loaded.
+ * @return {Promise<object>}
+ */
+async function gatherCarrierInvoicePrimusEvidence(invoice, bookingArg) {
+  const loadNumber = invoice && invoice.loadNumber;
+  const carrierInvNum = String(invoice && invoice.invoiceNumber || "").trim();
+  let booking = bookingArg || null;
+  if (!booking && loadNumber) {
+    try {
+      booking = await fetchPrimusBooking(loadNumber);
+    } catch (_) {
+      booking = null;
+    }
+  }
+  const carrierRef = booking ? String(
+      (booking.vendor && booking.vendor.carrierRef) ||
+      booking.carrierRef || "").trim() : "";
+
+  let invoices = [];
+  if (loadNumber) {
+    try {
+      const invData = await primusRequest(
+          "GET",
+          `/invoice/bolnumber/${encodeURIComponent(loadNumber)}`,
+      );
+      const results = invData && invData.data && invData.data.results;
+      invoices = Array.isArray(results) ?
+        results : (results ? [results] : []);
+    } catch (_) {
+      invoices = [];
+    }
+  }
+
+  let actualCosts = [];
+  let hasCarrierBillFileType = false;
+  if (isManagePhpEnabled && isManagePhpEnabled() && booking && loadNumber) {
+    try {
+      const bridge = require("./primus-ui-bridge");
+      const bookingId = bridge.resolveManageBookingId(booking);
+      if (bookingId) {
+        const docs = await bridge.getBookingDocuments({
+          bookingId,
+          bookingBOL: String(loadNumber),
+        });
+        if (docs.ok && docs.data) {
+          try {
+            const uploadFileTypes = await bridge.resolveUploadFileTypes();
+            hasCarrierBillFileType = bridge._internal.bookingHasFileType(
+                docs.data, uploadFileTypes.carrierBill.id);
+          } catch (_) {
+            // File-type lookup is best-effort.
+          }
+          const uiInvoice = bridge._internal.findUiInvoice(docs.data);
+          if (uiInvoice && uiInvoice.id != null) {
+            const stores = await bridge.getInvoiceStores(String(uiInvoice.id));
+            if (stores.ok && stores.data) {
+              actualCosts = bridge._internal.extractActualCostsFromStore(
+                  stores.data) || [];
+            }
+          }
+        }
+      }
+    } catch (_) {
+      // UI lookup is best-effort.
+    }
+  }
+
+  return {
+    carrierInvoiceNumber: carrierInvNum,
+    carrierRef,
+    invoices,
+    actualCosts,
+    hasCarrierBillFileType,
+    booking,
+  };
+}
+
+/**
+ * Verifies carrier invoice # is in Primus after bill entry; attempts fix.
+ * @param {object} args Workflow context.
+ * @return {Promise<object>}
+ */
+async function verifyAndEnsureCarrierInvoiceNumberInPrimus(args) {
+  const {
+    invoice, invoiceId, invoiceDoc, req, proNumber, pauseOnMissing,
+  } = args;
+  const verifyMod = require("./carrier-invoice-primus-verify");
+  const evidence = await gatherCarrierInvoicePrimusEvidence(
+      invoice, args.booking || null);
+  if (!evidence.carrierInvoiceNumber) {
+    return {ok: true, skipped: true, reason: "no_carrier_invoice_number"};
+  }
+
+  let check = verifyMod.carrierInvoiceNumberPresentInPrimusEvidence(evidence);
+  if (check.present) {
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "carrier_invoice_number_verified",
+      stepStatus: "success",
+      output: {source: check.source},
+    });
+    return {ok: true, present: true, source: check.source};
+  }
+
+  await writeLog("warn", "workflow",
+      "Carrier invoice number not found in Primus after bill entry", {
+        invoiceId,
+        loadNumber: invoice.loadNumber,
+        carrierInvoiceNumber: evidence.carrierInvoiceNumber,
+        hasCarrierBillFileType: evidence.hasCarrierBillFileType,
+        reason: check.reason || "carrier_invoice_number_not_in_primus",
+      });
+  await logWorkflowStep({
+    invoiceId,
+    stepName: "carrier_invoice_number_verified",
+    stepStatus: "failed",
+    reason: "carrier_invoice_number_not_in_primus",
+    output: {
+      carrierInvoiceNumber: evidence.carrierInvoiceNumber,
+      hasCarrierBillFileType: evidence.hasCarrierBillFileType,
+    },
+    error: "carrier_invoice_number_not_in_primus",
+  });
+
+  const fixAttempts = [];
+  if (addProNumberToLoad) {
+    const proResult = await addProNumberToLoad(
+        invoice.loadNumber,
+        proNumber || invoice.proNumber || evidence.carrierInvoiceNumber,
+        {
+          invoiceNumber: evidence.carrierInvoiceNumber,
+          dueDate: invoice.dueDate,
+          carrierName: invoice.carrierName,
+        },
+    );
+    fixAttempts.push({method: "addProNumberToLoad", result: proResult});
+  }
+
+  try {
+    const bridge = require("./primus-ui-bridge");
+    if (bridge.writeCarrierInvoiceNumberToPrimus && evidence.booking) {
+      const fixResult = await bridge.writeCarrierInvoiceNumberToPrimus({
+        booking: evidence.booking,
+        loadNumber: invoice.loadNumber,
+        vendorInvoiceNumber: evidence.carrierInvoiceNumber,
+        carrierInvoiceAmount: invoice.invoiceAmount,
+        proNumber: proNumber || invoice.proNumber,
+        billDate: invoice.invoiceDate || invoice.receivedAt,
+        billDueDate: invoice.dueDate,
+        carrierName: invoice.carrierName,
+      });
+      fixAttempts.push({
+        method: "writeCarrierInvoiceNumberToPrimus",
+        result: fixResult,
+      });
+    }
+  } catch (fixErr) {
+    fixAttempts.push({
+      method: "writeCarrierInvoiceNumberToPrimus",
+      result: {ok: false, error: fixErr.message},
+    });
+  }
+
+  const evidenceAfter = await gatherCarrierInvoicePrimusEvidence(
+      invoice, evidence.booking);
+  check = verifyMod.carrierInvoiceNumberPresentInPrimusEvidence(evidenceAfter);
+  if (check.present) {
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "carrier_invoice_number_fixed",
+      stepStatus: "success",
+      output: {source: check.source, fixAttempts},
+    });
+    await writeLog("info", "workflow",
+        "Carrier invoice number written to Primus after fix attempt", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          carrierInvoiceNumber: evidence.carrierInvoiceNumber,
+          source: check.source,
+        });
+    return {ok: true, present: true, fixed: true, source: check.source};
+  }
+
+  if (pauseOnMissing !== false) {
+    await pauseWorkflow(
+        invoiceDoc.ref,
+        "carrier_invoice_number",
+        "carrier_invoice_number_missing_in_primus",
+        "Carrier bill uploaded but invoice # missing in Primus",
+    );
+    await invoiceDoc.ref.update({
+      processingLock: false,
+      finalWorkflowStatus: "carrier_invoice_number_missing_in_primus",
+      decisionStage: "carrier_invoice_number_missing_in_primus",
+      decisionReason:
+        "Carrier bill uploaded but carrier invoice number not in Primus",
+      carrierInvoiceNumberFixAttempts: fixAttempts,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await sendWorkflowAlert({
+      req,
+      code: "CARRIER_INVOICE_NUMBER_MISSING",
+      invoiceId,
+      type: "carrier_invoice_number_missing",
+      context: {
+        loadNumber: invoice.loadNumber,
+        carrierInvoiceNumber: evidence.carrierInvoiceNumber,
+        hasCarrierBillFileType: evidence.hasCarrierBillFileType,
+        fixAttempts,
+      },
+    });
+    return {
+      ok: false,
+      present: false,
+      reason: "carrier_invoice_number_not_in_primus",
+      fixAttempts,
+      workflowStatus: "carrier_invoice_number_missing_in_primus",
+    };
+  }
+
+  return {
+    ok: false,
+    present: false,
+    reason: "carrier_invoice_number_not_in_primus",
+    fixAttempts,
+  };
+}
+
+/**
  * Loads prior cannot-email / missing-POD outbound rows for one invoice.
  * @param {string} invoiceId Firestore invoice id.
  * @param {string} code Alert catalog code.
@@ -2723,6 +2954,25 @@ exports.processPrimusWorkflow = onRequest(
             });
 
             await setWorkflowHeartbeat(invoiceDoc.ref, "bill_approved");
+
+            const carrierInvNumVerify =
+              await verifyAndEnsureCarrierInvoiceNumberInPrimus({
+                invoice,
+                invoiceId,
+                invoiceDoc,
+                req,
+                booking: bookingForMode,
+                proNumber: workingProNumber,
+              });
+            if (!carrierInvNumVerify.ok &&
+                carrierInvNumVerify.workflowStatus) {
+              return res.json({
+                ok: false,
+                error: "CARRIER_INVOICE_NUMBER_MISSING_IN_PRIMUS",
+                workflowStatus: carrierInvNumVerify.workflowStatus,
+                details: carrierInvNumVerify,
+              });
+            }
 
             await logWorkflowStep({
               invoiceId,

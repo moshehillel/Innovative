@@ -639,6 +639,7 @@ async function resolveUploadFileTypes() {
 
   return {carrierBill: carrier, pod, quoteApproval};
 }
+exports.resolveUploadFileTypes = resolveUploadFileTypes;
 
 /**
  * True when bill-to / customer name is Miworld (spacing/case variants).
@@ -3298,6 +3299,7 @@ async function getInvoiceStores(invoiceId) {
   }
   return {ok: true, data: result.json};
 }
+exports.getInvoiceStores = getInvoiceStores;
 
 /**
  * Reads Primus Summary "Profit %" (actualProfitPer) from getInvoiceStores.
@@ -5577,6 +5579,288 @@ async function ensurePodMarkedOnPrimus(args) {
 exports.ensurePodMarkedOnPrimus = ensurePodMarkedOnPrimus;
 
 /**
+ * Writes carrier vendor invoice # onto an existing manage.php invoice via
+ * addVendorRefNumber (when PDF was uploaded but number fields were empty).
+ * @param {object} args Flow inputs.
+ * @param {object} args.booking Primus booking.
+ * @param {string} args.loadNumber BOL / load number.
+ * @param {string} args.vendorInvoiceNumber Carrier freight bill number.
+ * @param {number} [args.carrierInvoiceAmount] Carrier bill total.
+ * @param {string} [args.proNumber] Carrier PRO.
+ * @param {string|Date} [args.billDate] Bill date.
+ * @param {string|Date} [args.billDueDate] Bill due date.
+ * @return {Promise<object>}
+ */
+async function writeCarrierInvoiceNumberToPrimus(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, skipped: true, reason: "manage.php off"};
+  }
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  const vendorInvoiceNumber = String(args.vendorInvoiceNumber || "").trim();
+  if (!loadNumber || !vendorInvoiceNumber) {
+    return {ok: false, error: "loadNumber and vendorInvoiceNumber required"};
+  }
+  const booking = args.booking;
+  if (!booking) return {ok: false, error: "booking required"};
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: loadNumber,
+  });
+  if (!docs.ok || !docs.data) {
+    return {ok: false, error: docs.error || "getBookingDocuments failed"};
+  }
+  const uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {ok: false, error: "No manage.php invoice on booking"};
+  }
+  const invoiceId = String(uiInvoice.id);
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+  let actualCosts = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+
+  let vendor = booking.vendor || {};
+  if (!vendor.id) return {ok: false, error: "Booking missing vendor.id"};
+  try {
+    vendor = await resolveMasterVendorForBilling(
+        vendor,
+        String(vendor.name || args.carrierName || ""),
+    );
+  } catch (vendorErr) {
+    return {ok: false, error: vendorErr.message || "resolveMasterVendor failed"};
+  }
+
+  const billDate = args.billDate || new Date();
+  const billDueDate = args.billDueDate || (() => {
+    const d = new Date(billDate);
+    d.setDate(d.getDate() + 30);
+    return d;
+  })();
+  const proNumber = String(args.proNumber || vendorInvoiceNumber);
+  const total = roundMoney(
+      args.carrierInvoiceAmount || vendor.cost || 0);
+
+  let termsList = [];
+  try {
+    termsList = await fetchUiTerms();
+  } catch (termsErr) {
+    return {ok: false, error: termsErr.message || "getTerms failed"};
+  }
+  const termsResolution = resolveTermsForCarrierBill(
+      billDate, billDueDate, termsList);
+  if (!termsResolution.ok) {
+    return {ok: false, error: termsResolution.error};
+  }
+  const termsId = termsResolution.termsId;
+  const bill = {
+    vendorInvoiceNumber,
+    proNumber,
+    total,
+    billDate,
+    billDueDate,
+  };
+
+  let billsInfo = extractBillsInfoFromStore(storeData);
+  if (!billsInfo || !billsInfo.length) {
+    billsInfo = [buildBillsInfo(vendor, bill, termsId)];
+  } else {
+    billsInfo = billsInfo.map((row) => {
+      const sameCarrier = String(row.carrierId) === String(vendor.id);
+      const missingNum = !String(row.vendorInvoiceNumber || "").trim();
+      if (sameCarrier && missingNum) {
+        return Object.assign({}, row, {
+          vendorInvoiceNumber,
+          PRO: proNumber || row.PRO || "",
+        });
+      }
+      return row;
+    });
+  }
+
+  let carrierActualCosts;
+  if (actualCosts.length) {
+    carrierActualCosts = actualCosts.map((line) => {
+      const sameCarrier = String(line.carrierId) === String(vendor.id);
+      const vin = String(line.vendorInvoiceNumber || "").trim();
+      return {
+        id: String(line.id),
+        code: line.code || "",
+        description: line.description || "",
+        carrierId: String(line.carrierId || vendor.id),
+        carrierName: String(line.carrierName || vendor.name || ""),
+        qty: Number(line.qty || 1),
+        rate: roundMoney(line.rate),
+        total: roundMoney(line.total).toFixed(2),
+        vendorInvoiceNumber: vin ||
+          (sameCarrier ? vendorInvoiceNumber : ""),
+        terms: String(line.terms || ""),
+        PRO: String(line.PRO || proNumber || ""),
+        isAccessorial: !!line.isAccessorial,
+      };
+    });
+  } else {
+    carrierActualCosts = buildActualCosts(vendor, bill).map((line) => ({
+      id: String(line.id),
+      code: line.code || "",
+      description: line.description || "",
+      carrierId: String(line.carrierId),
+      carrierName: String(line.carrierName || ""),
+      qty: Number(line.qty || 1),
+      rate: roundMoney(line.rate),
+      total: roundMoney(line.total).toFixed(2),
+      vendorInvoiceNumber: String(line.vendorInvoiceNumber || vendorInvoiceNumber),
+      terms: "",
+      PRO: String(line.PRO || proNumber || ""),
+      isAccessorial: !!line.isAccessorial,
+    }));
+  }
+
+  const totalActual = roundMoney(
+      carrierActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const totalEstimated = roundMoney(
+      estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+  const profit = roundMoney(chargesTotal - totalActual);
+  const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+  const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+
+  const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+  const vendorRef = await managePhpPost({
+    action: "addVendorRefNumber",
+    invoiceId,
+    bookingId,
+    billsInfo,
+    actualCosts: carrierActualCosts,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    totalActualCost: totalActual,
+    ...refExtra,
+  });
+
+  if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+    return {
+      ok: false,
+      step: "addVendorRefNumber",
+      error: (vendorRef.json && vendorRef.json.message) ||
+        "addVendorRefNumber failed",
+      invoiceId,
+    };
+  }
+
+  const phase2Estimated = estimatedCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId || ""),
+    carrierName: String(line.carrierName || ""),
+    editable: line.editable != null ? String(line.editable) : "0",
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    isAccessorial: !!line.isAccessorial,
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: "",
+  }));
+
+  const phase2Charges = charges.map((c) => ({
+    id: String(c.id),
+    code: c.code || "",
+    description: c.description || "",
+    qty: Number(c.qty || 1),
+    rate: roundMoney(c.rate),
+    total: roundMoney(c.total).toFixed(2),
+  }));
+
+  const notes = {
+    internalNotes: String(booking.internalNotes || ""),
+    externalNotes: String(booking.externalNotes || ""),
+  };
+
+  const saveResult = await managePhpPost({
+    action: "saveInvoice",
+    billsInfo,
+    charges: phase2Charges,
+    actualCosts: carrierActualCosts,
+    estimatedCosts: phase2Estimated.length ? phase2Estimated :
+      buildEstimatedCosts(vendor).map((line) => ({
+        id: String(line.id),
+        code: line.code || "",
+        description: line.description || "",
+        carrierId: String(line.carrierId || ""),
+        carrierName: String(line.carrierName || ""),
+        editable: "0",
+        qty: Number(line.qty || 1),
+        rate: roundMoney(line.rate),
+        total: roundMoney(line.total).toFixed(2),
+        isAccessorial: !!line.isAccessorial,
+        vendorInvoiceNumber: "",
+        terms: "",
+        PRO: "",
+      })),
+    chargesTotal: chargesTotal || total,
+    totalEstimatedCosts: totalEstimated || total,
+    totalActualCosts: totalActual || total,
+    billtoId: String(extractBilltoIdFromStore(storeData) || "0"),
+    bookingId,
+    ...notes,
+    costClosed: "0",
+    costActualClosed: "1",
+    readyToInvoice: uiInvoice.invoiceNumber ? "1" : "0",
+    estimatedProfitUSD: profit,
+    estimatedProfitPer: profitPer,
+    estimatedGP: gp,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    vendorInvoiceNumber: "",
+    vendorTerm: "",
+    PRONumber: proNumber,
+    invoiceNumber: String(uiInvoice.invoiceNumber || "0"),
+    id: invoiceId,
+  });
+
+  if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+    return {
+      ok: false,
+      step: "saveInvoice",
+      error: (saveResult.json && saveResult.json.message) ||
+        "saveInvoice after addVendorRefNumber failed",
+      invoiceId,
+      addVendorRefOk: true,
+    };
+  }
+
+  if (writeLog) {
+    await writeLog("info", "primus",
+        "Carrier invoice number written to Primus via addVendorRefNumber", {
+          loadNumber,
+          bookingId,
+          invoiceId,
+          vendorInvoiceNumber,
+        });
+  }
+  return {
+    ok: true,
+    invoiceId,
+    method: "addVendorRefNumber",
+    vendorInvoiceNumber,
+  };
+}
+exports.writeCarrierInvoiceNumberToPrimus = writeCarrierInvoiceNumberToPrimus;
+
+/**
  * Uploads the carrier bill PDF to Primus (internal Carrier Bill file type)
  * as soon as the invoice PDF is available — does not wait for customer
  * invoice generation or rate check.
@@ -5723,6 +6007,7 @@ exports._internal = {
   parseTermsFromResponse,
   diffCalendarDays,
   findUiInvoice,
+  extractActualCostsFromStore,
   extractBillsInfoFromStore,
   buildInsuranceBillsInfo,
   buildInsuranceActualCostLine,

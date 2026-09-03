@@ -318,29 +318,15 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
         (booking.vendor && booking.vendor.carrierRef) ||
         booking.carrierRef || "").trim();
 
-    if (carrierInvNum && carrierRef &&
-        normalizeCarrierReference(carrierInvNum) ===
-        normalizeCarrierReference(carrierRef)) {
-      return true;
-    }
-
     const invData = await primusRequest(
         "GET",
         `/invoice/bolnumber/${encodeURIComponent(loadNumber)}`);
     const results = invData && invData.data && invData.data.results;
     const list = Array.isArray(results) ?
       results : (results ? [results] : []);
-    for (const inv of list) {
-      const vin = String(
-          inv.vendorInvoiceNumber || inv.carrierInvoiceNumber || "",
-      ).trim();
-      if (carrierInvNum && vin &&
-          normalizeCarrierReference(carrierInvNum) ===
-          normalizeCarrierReference(vin)) {
-        return true;
-      }
-    }
 
+    let actualCosts = [];
+    let hasCarrierBillFileType = false;
     if (process.env.PRIMUS_USE_MANAGE_PHP === "true") {
       try {
         const bridge = require("./primus-ui-bridge");
@@ -351,17 +337,19 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
             bookingBOL: String(loadNumber),
           });
           if (docs.ok && docs.data) {
-            const fileLists = [
-              docs.data.files,
-              docs.data.documents,
-              docs.data.bookingDocuments,
-            ].filter(Array.isArray);
-            for (const list of fileLists) {
-              for (const f of list) {
-                const name = String(
-                    f.name || f.fileName || f.description || "",
-                ).toLowerCase();
-                if (/carrier bill|vendor bill/.test(name)) return true;
+            try {
+              const uploadFileTypes = await bridge.resolveUploadFileTypes();
+              hasCarrierBillFileType = bridge._internal.bookingHasFileType(
+                  docs.data, uploadFileTypes.carrierBill.id);
+            } catch (_) {
+              // File-type lookup is best-effort.
+            }
+            const uiInvoice = bridge._internal.findUiInvoice(docs.data);
+            if (uiInvoice && uiInvoice.id != null) {
+              const stores = await bridge.getInvoiceStores(String(uiInvoice.id));
+              if (stores.ok && stores.data) {
+                actualCosts = bridge._internal.extractActualCostsFromStore(
+                    stores.data) || [];
               }
             }
           }
@@ -371,7 +359,14 @@ async function isCarrierBillAlreadyEnteredInPrimus(item) {
       }
     }
 
-    return false;
+    const verify = require("./carrier-invoice-primus-verify");
+    return verify.carrierBillEnteredInPrimusEvidence({
+      carrierInvoiceNumber: carrierInvNum,
+      carrierRef,
+      invoices: list,
+      actualCosts,
+      hasCarrierBillFileType,
+    });
   } catch (_) {
     return false;
   }

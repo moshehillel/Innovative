@@ -2,35 +2,19 @@
 "use strict";
 
 /**
- * Pure helper mirroring isCarrierBillAlreadyEnteredInPrimus evidence rules.
+ * Evidence rules for isCarrierBillAlreadyEnteredInPrimus (shared verify module).
  */
+const verify = require("../carrier-invoice-primus-verify");
 
-/**
- * @param {object} args Evidence inputs.
- * @return {boolean} True when THIS carrier invoice appears entered.
- */
 function carrierBillEnteredFromEvidence(args) {
-  const carrierInvNum = String(args.carrierInvoiceNumber || "").trim();
-  const carrierRef = String(args.carrierRef || "").trim();
-  const normalize = (v) => String(v || "").replace(/[\s-]/g, "")
-      .toLowerCase();
-
-  if (carrierInvNum && carrierRef &&
-      normalize(carrierInvNum) === normalize(carrierRef)) {
-    return true;
-  }
-  const invoices = Array.isArray(args.invoices) ? args.invoices : [];
-  for (const inv of invoices) {
-    const vin = String(
-        inv.vendorInvoiceNumber || inv.carrierInvoiceNumber || "",
-    ).trim();
-    if (carrierInvNum && vin &&
-        normalize(carrierInvNum) === normalize(vin)) {
-      return true;
-    }
-  }
-  if (args.hasCarrierBillDocument) return true;
-  return false;
+  return verify.carrierBillEnteredInPrimusEvidence({
+    carrierInvoiceNumber: args.carrierInvoiceNumber,
+    carrierRef: args.carrierRef,
+    invoices: args.invoices,
+    actualCosts: args.actualCosts,
+    hasCarrierBillFileType: args.hasCarrierBillDocument ||
+      args.hasCarrierBillFileType,
+  });
 }
 
 let failures = 0;
@@ -74,12 +58,12 @@ check("customer invoice generated alone is NOT carrier bill entered",
       }],
     }), false);
 
-check("carrier bill document counts",
+check("carrier bill document alone is NOT bill entered",
     carrierBillEnteredFromEvidence({
       carrierInvoiceNumber: "688914393",
       invoices: [{status: {generated: true}}],
       hasCarrierBillDocument: true,
-    }), true);
+    }), false);
 
 check("booked vendor cost matching invoice amount is NOT bill entered",
     carrierBillEnteredFromEvidence({
