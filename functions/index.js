@@ -47,6 +47,7 @@ const {
   toOutboundEmailSafeText,
 } = require("./email-outbound-safe");
 const administrativeEmailIntake = require("./administrative-email-intake");
+const paymentNotificationClassify = require("./payment-notification-classify");
 const statementInvoiceBundle = require("./statement-invoice-bundle");
 const {
   sanitizePreCheckLabel,
@@ -8334,6 +8335,79 @@ function isQuoteInboxProcessingEnabled() {
 }
 
 /**
+ * Quiet-ignore payment alerts: clear bank-sender regex stays cheap; ambiguous
+ * Zelle/QuickPay language uses AI (never silent-drop without classifier).
+ * @param {object} opts Inputs gathered at the call site.
+ * @return {Promise<object>} {ignore, source, ai, reason}
+ */
+async function resolveQuietPaymentIgnore(opts = {}) {
+  const subject = opts.subject || "";
+  const from = opts.from || "";
+  const body = opts.body || "";
+  const attachments = Array.isArray(opts.attachments) ? opts.attachments : [];
+  const emailClassification = opts.emailClassification || null;
+  const invoicePdfCount = opts.invoicePdfCount;
+
+  if (administrativeEmailIntake.hasInvoiceVeto({
+    subject,
+    body,
+    from,
+    attachments,
+    emailClassification,
+    invoicePdfCount,
+  })) {
+    return {
+      ignore: false,
+      source: "invoice_veto",
+      ai: null,
+      reason: "invoice_veto",
+    };
+  }
+
+  if (administrativeEmailIntake.shouldIgnoreAsPaymentNotification(
+      subject, from, body, attachments)) {
+    return {
+      ignore: true,
+      source: "regex_bank",
+      ai: null,
+      reason: "Known bank payment alert sender",
+    };
+  }
+
+  if (!administrativeEmailIntake.isAmbiguousPaymentNotificationCandidate(
+      subject, from, body, attachments)) {
+    return {
+      ignore: false,
+      source: "none",
+      ai: null,
+      reason: null,
+    };
+  }
+
+  const ai = await paymentNotificationClassify
+      .classifyPaymentNotificationIntent({
+        subject,
+        from,
+        body,
+        attachments,
+      });
+  if (paymentNotificationClassify.aiSaysQuietIgnoreBankAlert(ai)) {
+    return {
+      ignore: true,
+      source: "ai",
+      ai,
+      reason: ai.reasoning || "AI classified as bank payment alert",
+    };
+  }
+  return {
+    ignore: false,
+    source: "ai",
+    ai,
+    reason: ai.intent || null,
+  };
+}
+
+/**
  * Processes a Gmail message and ingests it into the invoice workflow.
  * @param {object} gmail - Gmail client instance.
  * @param {object} message - Message metadata.
@@ -8829,6 +8903,9 @@ async function processGmailMessage(
         }
       }
 
+      // Clear bank-sender alerts: cheap regex quiet-ignore.
+      // Ambiguous Zelle/QuickPay language: defer to post-scan / no-attachment
+      // AI path — never silent-drop invoice/BOL threads early.
       if (!isTai &&
           administrativeEmailIntake.shouldIgnoreAsPaymentNotification(
               subject, from, emailBody, attachments) &&
@@ -9066,6 +9143,48 @@ async function processGmailMessage(
             reason: "Customer payment remittance with no attachments",
           });
           return;
+        }
+        {
+          const payIgnore = await resolveQuietPaymentIgnore({
+            subject,
+            from,
+            body: emailBody,
+            attachments,
+            emailClassification,
+            invoicePdfCount: 0,
+          });
+          if (payIgnore.ignore) {
+            await completeAdministrativeIgnore({
+              messageId,
+              subject,
+              from,
+              tenant,
+              queueDocId,
+              finalStatus: "payment_notification_ignored",
+              reason: payIgnore.source === "ai" ?
+                `Payment notification (AI) — ${payIgnore.reason}` :
+                "Payment notification (Zelle/bank) — ignored",
+              extra: payIgnore.ai ? {
+                paymentNotificationAi: {
+                  intent: payIgnore.ai.intent,
+                  confidence: payIgnore.ai.confidence,
+                  model: payIgnore.ai.model,
+                  source: payIgnore.ai.source,
+                },
+              } : undefined,
+            });
+            return;
+          }
+          if (payIgnore.ai &&
+              payIgnore.ai.intent === "customer_remittance") {
+            await handleCustomerPaymentRemittanceEmail({
+              gmail, messageId, subject, from, emailBody, tenant, headers,
+              emailClassification,
+              queueDocId,
+              reason: "Customer remittance (AI) with no attachments",
+            });
+            return;
+          }
         }
         await writeLog("warn", "mail",
             "No attachments found, forwarding for review", {
@@ -9598,27 +9717,40 @@ async function processGmailMessage(
           });
           return;
         }
-        if (administrativeEmailIntake.shouldIgnoreAsPaymentNotification(
-            subject, from, emailBody, attachments) &&
-          invoicePdfCount === 0 &&
-          !administrativeEmailIntake.hasInvoiceVeto({
+        {
+          const payIgnore = await resolveQuietPaymentIgnore({
             subject,
+            from,
             body: emailBody,
             attachments,
             emailClassification,
             invoicePdfCount,
-          })) {
-          await completeAdministrativeIgnore({
-            messageId,
-            subject,
-            from,
-            tenant,
-            queueDocId,
-            finalStatus: "payment_notification_ignored",
-            reason: "Payment notification (Zelle/bank) — no freight invoice",
-            extra: {skippedAttachmentTypes: skippedDocTypes},
           });
-          return;
+          if (payIgnore.ignore && invoicePdfCount === 0) {
+            await completeAdministrativeIgnore({
+              messageId,
+              subject,
+              from,
+              tenant,
+              queueDocId,
+              finalStatus: "payment_notification_ignored",
+              reason: payIgnore.source === "ai" ?
+                `Payment notification (AI) — ${payIgnore.reason}` :
+                "Payment notification (Zelle/bank) — no freight invoice",
+              extra: {
+                skippedAttachmentTypes: skippedDocTypes,
+                ...(payIgnore.ai ? {
+                  paymentNotificationAi: {
+                    intent: payIgnore.ai.intent,
+                    confidence: payIgnore.ai.confidence,
+                    model: payIgnore.ai.model,
+                    source: payIgnore.ai.source,
+                  },
+                } : {}),
+              },
+            });
+            return;
+          }
         }
         let noInvoiceReason =
           "Could not find a freight invoice in this email";

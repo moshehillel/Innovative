@@ -436,11 +436,17 @@ check("plain Zelle alert still ignored",
         "Bank of America <customerservice@ealerts.bankofamerica.com>",
         "You received a Zelle payment of $500",
         []));
-check("Chase Zelle alert not ignored (BoA-only rule)",
-    !adm.shouldIgnoreAsPaymentNotification(
+check("Chase Zelle alert ignored (known bank-alert sender)",
+    adm.shouldIgnoreAsPaymentNotification(
         "Zelle payment received",
         "alerts@chase.com",
         "You received a Zelle payment of $500",
+        []));
+check("Chase marketing sender is not a bank-alert ignore",
+    !adm.shouldIgnoreAsPaymentNotification(
+        "Zelle tips from Chase",
+        "marketing@chase.com",
+        "Learn about Zelle payment features",
         []));
 
 check("FW invoice + Zelle body + PDF triggers veto",
@@ -449,7 +455,7 @@ check("FW invoice + Zelle body + PDF triggers veto",
       body: "Please pay via Zelle for other loads",
       attachments: [{filename: "invoice_28415.pdf"}],
     }));
-check("real Zelle from chase has no veto",
+check("real Zelle from chase has no invoice veto",
     !adm.hasInvoiceVeto({
       subject: "Zelle payment received",
       body: "You received a Zelle payment of $500",
@@ -603,8 +609,8 @@ check("real ACH deposit alert still ignored",
         "Bank of America <customerservice@ealerts.bankofamerica.com>",
         "An ACH payment was received for $1,200.00",
         []));
-check("Chase ACH deposit alert not ignored (BoA-only rule)",
-    !adm.shouldIgnoreAsPaymentNotification(
+check("Chase ACH deposit alert ignored (known bank-alert sender)",
+    adm.shouldIgnoreAsPaymentNotification(
         "ACH payment received",
         "alerts@chase.com",
         "An ACH payment was received for $1,200.00",
@@ -1249,6 +1255,39 @@ check("ArcBest eInvoice is not carrier statement follow-up",
         "brooklyncustomerservice@abf.com",
         arcBestBody,
         arcBestAttachments));
+
+// Ambiguous Zelle language (non-bank from) must NOT regex quiet-ignore —
+// AI owns that path. Clear bank alerts still ignore.
+check("CHB 266272-style subject+quoted Zelle is NOT ambiguous candidate",
+    !adm.isAmbiguousPaymentNotificationCandidate(
+        chbSubject, chbFrom, chbBody, []));
+check("CHB 266272-style never regex quiet-ignores",
+    !adm.shouldIgnoreAsPaymentNotification(
+        chbSubject, chbFrom, chbBody, []));
+check("quoted Zelle from random Gmail is ambiguous (AI path), not regex ignore",
+    adm.isAmbiguousPaymentNotificationCandidate(
+        "Payment update",
+        "random.person@gmail.com",
+        "Just FYI about Zelle — not sure if this is the right inbox.",
+        []) &&
+    !adm.shouldIgnoreAsPaymentNotification(
+        "Payment update",
+        "random.person@gmail.com",
+        "Just FYI about Zelle — not sure if this is the right inbox.",
+        []));
+check("BoA Zelle is known bank sender, not ambiguous",
+    adm.isKnownBankPaymentAlertSender(
+        "Bank of America <customerservice@ealerts.bankofamerica.com>") &&
+    !adm.isAmbiguousPaymentNotificationCandidate(
+        "Goldengate Logistics Llc sent you $36.00",
+        "Bank of America <customerservice@ealerts.bankofamerica.com>",
+        "You received a Zelle payment of $500",
+        []));
+check("Chase alerts@ is known bank-alert sender",
+    adm.isKnownBankPaymentAlertSender("Chase <alerts@chase.com>"));
+check("payment alert language detects Zelle",
+    adm.hasPaymentAlertLanguage(
+        "hi", "Quickpay/Zelle accounting@innovativecarriers.com"));
 
 if (failures) {
   console.error(`\n${failures} test(s) failed`);

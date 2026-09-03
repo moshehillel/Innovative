@@ -1,0 +1,509 @@
+{
+  "at": "2026-09-03T23:13:11.701Z",
+  "defaultWiredModel": "gpt-5.6-luna",
+  "winner": "gpt-4o",
+  "ranked": [
+    {
+      "model": "gpt-4o",
+      "pass": 10,
+      "total": 10,
+      "avgMs": 3236,
+      "failCount": 0
+    },
+    {
+      "model": "gpt-4.1",
+      "pass": 10,
+      "total": 10,
+      "avgMs": 4008,
+      "failCount": 0
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "pass": 10,
+      "total": 10,
+      "avgMs": 4745,
+      "failCount": 0
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "pass": 10,
+      "total": 10,
+      "avgMs": 4801,
+      "failCount": 0
+    }
+  ],
+  "byModel": {
+    "gpt-5.6-luna": {
+      "pass": 10,
+      "total": 10,
+      "avgMs": 4745,
+      "fails": [],
+      "rows": [
+        {
+          "id": "CHB-266272",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The subject references an invoice, CR number, and BOL, and the message concerns attached customs documents; the quoted banking information is not a bank alert.",
+          "source": "openai",
+          "ms": 5793,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "HEYPHARMA-BOL-ZELLE-QUOTE",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email contains an invoice attachment and a BOL number, while the quoted banking information does not change its classification.",
+          "source": "openai",
+          "ms": 4592,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ZELLE-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "This is an automated Bank of America Zelle alert stating that money was received.",
+          "source": "openai",
+          "ms": 4257,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CHASE-QUICKPAY-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "This is an automated Chase Zelle notification stating that money was received.",
+          "source": "openai",
+          "ms": 4171,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BERKSHIRE-WIRE-REMIT",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The customer says they wired $12,155.00 and attached payment confirmations.",
+          "source": "openai",
+          "ms": 4089,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "ALTAREB-PAID-REPLY",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The customer states that payment was sent via Zelle and paid in full for the referenced invoice; the quoted banking instructions are not a bank alert.",
+          "source": "openai",
+          "ms": 6724,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CARRIER-INVOICE-ARCBEST",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email is from a carrier and includes an attached invoice for a listed pronumber.",
+          "source": "openai",
+          "ms": 4047,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMFAST-QB-ZELLE-TIP",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "This is an invoice from a freight company with a balance due, and the quoted Zelle/QuickPay instructions do not make it a bank payment alert.",
+          "source": "openai",
+          "ms": 5647,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMBIGUOUS-ZELLE-NO-BANK-FROM",
+          "expect": "other",
+          "got": "other",
+          "confidence": "high",
+          "reasoning": "The message is an unclear payment inquiry from an unknown sender, not an actual bank alert or customer remittance.",
+          "source": "openai",
+          "ms": 4126,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ACH-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "This is an automated Bank of America alert stating that an ACH payment was received.",
+          "source": "openai",
+          "ms": 4004,
+          "pass": true,
+          "err": null
+        }
+      ]
+    },
+    "gpt-5.6-sol": {
+      "pass": 10,
+      "total": 10,
+      "avgMs": 4801,
+      "fails": [],
+      "rows": [
+        {
+          "id": "CHB-266272",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The subject contains invoice, CR, and BOL numbers and the message concerns customs documents; the quoted Zelle information is only prior banking guidance.",
+          "source": "openai",
+          "ms": 4716,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "HEYPHARMA-BOL-ZELLE-QUOTE",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The sender attached an invoice for BOL#265028, while the Quickpay/Zelle text is only quoted from a prior reply.",
+          "source": "openai",
+          "ms": 5043,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ZELLE-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "This is an automated Bank of America Zelle alert confirming receipt of a $36 payment.",
+          "source": "openai",
+          "ms": 4476,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CHASE-QUICKPAY-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "This is an automated Chase alert confirming receipt of a Zelle payment.",
+          "source": "openai",
+          "ms": 5171,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BERKSHIRE-WIRE-REMIT",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The customer states they wired payment and attached payment confirmation.",
+          "source": "openai",
+          "ms": 4383,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "ALTAREB-PAID-REPLY",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The customer AP contact states that the invoice was paid in full via Zelle today.",
+          "source": "openai",
+          "ms": 4935,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CARRIER-INVOICE-ARCBEST",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "ArcBest is sending an attached freight invoice for a specified PRO number.",
+          "source": "openai",
+          "ms": 4465,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMFAST-QB-ZELLE-TIP",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "This is a freight company invoice requesting payment, and the Zelle/QuickPay text is merely payment instructions.",
+          "source": "openai",
+          "ms": 4896,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMBIGUOUS-ZELLE-NO-BANK-FROM",
+          "expect": "other",
+          "got": "other",
+          "confidence": "high",
+          "reasoning": "This is an unclear FYI about Zelle, not an automated bank alert or a clear customer remittance.",
+          "source": "openai",
+          "ms": 5595,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ACH-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "This is an automated Bank of America ACH payment receipt alert.",
+          "source": "openai",
+          "ms": 4327,
+          "pass": true,
+          "err": null
+        }
+      ]
+    },
+    "gpt-4.1": {
+      "pass": 10,
+      "total": 10,
+      "avgMs": 4008,
+      "fails": [],
+      "rows": [
+        {
+          "id": "CHB-266272",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The subject includes invoice, CR, and BOL numbers, and the body references attached customs documents—this indicates a freight-related document, not a bank alert.",
+          "source": "openai",
+          "ms": 3971,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "HEYPHARMA-BOL-ZELLE-QUOTE",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email contains an attached invoice with a BOL number in the subject and body, and the banking information is only quoted from a prior response.",
+          "source": "openai",
+          "ms": 4035,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ZELLE-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "The email is a direct automated bank alert from ealerts.bankofamerica.com confirming receipt of a Zelle payment.",
+          "source": "openai",
+          "ms": 4039,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CHASE-QUICKPAY-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "The sender is a bank alert address and the body is an automated notice of a Zelle payment received.",
+          "source": "openai",
+          "ms": 3774,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BERKSHIRE-WIRE-REMIT",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The sender says they wired a payment and attached confirmation, indicating a customer remittance.",
+          "source": "openai",
+          "ms": 4285,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "ALTAREB-PAID-REPLY",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The sender confirms payment was sent for a specific invoice and BOL, indicating a remittance from a customer.",
+          "source": "openai",
+          "ms": 3949,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CARRIER-INVOICE-ARCBEST",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email is from a carrier with an invoice attached and references invoice numbers in the subject and body.",
+          "source": "openai",
+          "ms": 3858,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMFAST-QB-ZELLE-TIP",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email is sending an invoice from a carrier with details for payment; the banking instructions are quoted, not a bank alert.",
+          "source": "openai",
+          "ms": 3983,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMBIGUOUS-ZELLE-NO-BANK-FROM",
+          "expect": "other",
+          "got": "other",
+          "confidence": "high",
+          "reasoning": "The email is informational about Zelle and does not confirm a payment, contain an invoice, or match a bank alert.",
+          "source": "openai",
+          "ms": 3941,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ACH-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "The sender and content match an automated bank deposit alert notification.",
+          "source": "openai",
+          "ms": 4242,
+          "pass": true,
+          "err": null
+        }
+      ]
+    },
+    "gpt-4o": {
+      "pass": 10,
+      "total": 10,
+      "avgMs": 3236,
+      "fails": [],
+      "rows": [
+        {
+          "id": "CHB-266272",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The subject and body reference an invoice, CR number, and BOL, indicating it's related to freight documentation.",
+          "source": "openai",
+          "ms": 3881,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "HEYPHARMA-BOL-ZELLE-QUOTE",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email contains an attached invoice for a specific BOL number in the subject line.",
+          "source": "openai",
+          "ms": 3815,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ZELLE-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "The email is a direct bank alert from Bank of America about a received payment via Zelle.",
+          "source": "openai",
+          "ms": 3810,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CHASE-QUICKPAY-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "The email is from a bank alert domain and informs Innovative of a received Zelle payment, matching bank payment alert criteria.",
+          "source": "openai",
+          "ms": 3825,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BERKSHIRE-WIRE-REMIT",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The email is from a customer mentioning a wired payment with payment confirmation attached.",
+          "source": "openai",
+          "ms": 3607,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "ALTAREB-PAID-REPLY",
+          "expect": "customer_remittance",
+          "got": "customer_remittance",
+          "confidence": "high",
+          "reasoning": "The email clearly states that payment was sent via Zelle for a specific invoice, indicating a customer remittance.",
+          "source": "openai",
+          "ms": 3879,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "CARRIER-INVOICE-ARCBEST",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email contains invoice details and an attachment related to freight services.",
+          "source": "openai",
+          "ms": 3758,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMFAST-QB-ZELLE-TIP",
+          "expect": "freight_invoice",
+          "got": "freight_invoice",
+          "confidence": "high",
+          "reasoning": "The email contains an invoice number and a balance due, indicating it's related to a freight invoice.",
+          "source": "openai",
+          "ms": 3650,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "AMBIGUOUS-ZELLE-NO-BANK-FROM",
+          "expect": "other",
+          "got": "other",
+          "confidence": "high",
+          "reasoning": "The email is an inquiry about Zelle, not an actual payment alert or remittance.",
+          "source": "openai",
+          "ms": 887,
+          "pass": true,
+          "err": null
+        },
+        {
+          "id": "BOA-ACH-ALERT",
+          "expect": "bank_payment_alert",
+          "got": "bank_payment_alert",
+          "confidence": "high",
+          "reasoning": "The email is from a bank alert domain indicating an ACH payment was received.",
+          "source": "openai",
+          "ms": 1251,
+          "pass": true,
+          "err": null
+        }
+      ]
+    }
+  }
+}

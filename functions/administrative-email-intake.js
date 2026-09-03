@@ -620,23 +620,43 @@ function isBankOfAmericaSender(from) {
 }
 
 /**
- * Bank of America Zelle / ACH payment alerts — not carrier freight invoices.
- * Only BoA senders match; invoice replies quoting Zelle remittance tips do not.
- * @param {string} subject Email subject.
+ * Known bank / payment-system alert senders that may quiet-ignore via regex.
+ * Ambiguous Zelle language from other senders must NOT use this path — AI
+ * (payment-notification-classify) owns those decisions.
  * @param {string} from From header.
+ * @return {boolean}
+ */
+function isKnownBankPaymentAlertSender(from) {
+  const fromL = String(from || "").toLowerCase();
+  if (isBankOfAmericaSender(from)) return true;
+  // Chase QuickPay / Zelle alert mailers only — not marketing@chase.com.
+  if (fromL.includes("alerts@chase.com") ||
+      fromL.includes("@ealerts.chase.com") ||
+      fromL.includes("noreply@chase.com") ||
+      fromL.includes("no-reply@chase.com")) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Payment-alert language in subject/body (Zelle / QuickPay / ACH deposit).
+ * Used to detect ambiguous cases that need AI — not alone enough to ignore.
+ * @param {string} subject Email subject.
  * @param {string} body Plain body.
  * @return {boolean}
  */
-function isPaymentNotificationEmail(subject, from, body) {
-  if (!isBankOfAmericaSender(from)) return false;
-  const hay = `${subject || ""}\n${from || ""}\n${body || ""}`.toLowerCase();
+function hasPaymentAlertLanguage(subject, body) {
+  const hay = `${subject || ""}\n${body || ""}`.toLowerCase();
+  if (!hay.trim()) return false;
   if (/\bzelle\b/.test(hay)) return true;
+  if (/\bquick\s*pay\b|\bquickpay\b/.test(hay)) return true;
+  if (/sent you\s*\$/.test(hay)) return true;
+  if (/you received (?:a )?(?:zelle |ach )?payment/.test(hay)) return true;
   if (/payment (?:was )?(?:sent|received|posted|completed|processed)/i
       .test(hay)) {
     return true;
   }
-  // Require alert verbs — carrier invoice boilerplate often offers ACH
-  // remittance options ("utilize ACH payments") without being a bank alert.
   const achNoun = "(?:payment|transfer|credit|debit|deposit)";
   const achVerb =
     "(?:sent|received|posted|completed|processed|confirmed|" +
@@ -651,10 +671,46 @@ function isPaymentNotificationEmail(subject, from, body) {
   if (/wire transfer (?:sent|received|completed|notification)/i.test(hay)) {
     return true;
   }
-  if (/(?:payment|transfer|deposit|withdrawal|alert)/i.test(hay)) {
-    return true;
-  }
   return false;
+}
+
+/**
+ * Bank Zelle / ACH payment alerts from known bank-alert senders only.
+ * Invoice replies quoting Zelle remittance tips do not match.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isPaymentNotificationEmail(subject, from, body) {
+  if (!isKnownBankPaymentAlertSender(from)) return false;
+  return hasPaymentAlertLanguage(subject, body) ||
+    /(?:payment|transfer|deposit|withdrawal|alert)/i
+        .test(`${subject || ""}\n${body || ""}`);
+}
+
+/**
+ * Ambiguous "might be Zelle/payment" email: payment language present, but
+ * NOT from a known bank-alert sender and NOT already an invoice package.
+ * These must not silent-ignore via regex — AI / intake owns the decision.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function isAmbiguousPaymentNotificationCandidate(
+    subject, from, body, attachments) {
+  if (isKnownBankPaymentAlertSender(from)) return false;
+  if (!hasPaymentAlertLanguage(subject, body)) return false;
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  if (subjectLooksLikeInvoiceForBolReply(subject)) return false;
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
+    return false;
+  }
+  if (isCustomerPaymentRemittanceEmail(subject, from, body)) return false;
+  return true;
 }
 
 /**
@@ -1132,7 +1188,9 @@ function looksLikeInvoiceEmailContent(subject, body) {
 }
 
 /**
- * Ignore bank/Zelle alerts only when the email is not an invoice package.
+ * Quiet-ignore ONLY clear known-bank payment alerts (regex).
+ * Ambiguous Zelle/QuickPay language from non-bank senders returns false —
+ * callers should use payment-notification-classify AI instead of dropping.
  * @param {string} subject Email subject.
  * @param {string} from From header.
  * @param {string} body Plain body.
@@ -1484,7 +1542,10 @@ module.exports = {
   isCustomerPaymentRemittanceEmail,
   shouldHandleCustomerPaymentRemittance,
   isBankOfAmericaSender,
+  isKnownBankPaymentAlertSender,
+  hasPaymentAlertLanguage,
   isPaymentNotificationEmail,
+  isAmbiguousPaymentNotificationCandidate,
   isPaymentReceiptEmail,
   shouldIgnoreAsPaymentNotification,
   shouldIgnoreAsPaymentReceipt,

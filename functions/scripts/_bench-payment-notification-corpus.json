@@ -1,0 +1,89 @@
+{
+  "at": null,
+  "note": "Bake-off gold labels for payment-notification vs invoice/remittance. Representative of 266272-style false ignore, BoA Zelle, Berkshire remittance, carrier invoice.",
+  "cases": [
+    {
+      "id": "CHB-266272",
+      "expect": "freight_invoice",
+      "subject": "RE: Invoice-0003138, CR#: 266272 RE: BOL# 266272",
+      "from": "Isreal Rosenfeld <ir@innovativechb.com>",
+      "body": "Please see attached customs docs.\n\nOn Tue, Sep 2, 2026 Abe <abe@innovativecarriers.com> wrote:\nPLEASE NOTE OUR NEW BANKING INFORMATION\nQuickpay/Zelle\naccounting@innovativecarriers.com\n",
+      "attachments": []
+    },
+    {
+      "id": "HEYPHARMA-BOL-ZELLE-QUOTE",
+      "expect": "freight_invoice",
+      "subject": "Re: Invoice for BOL#265028",
+      "from": "Moshe Myski <mmyski@heypharma.com>",
+      "body": "Please see attached invoice.\n\nOn Tue, Aug 26, 2026 Abe <abe@innovativecarriers.com> wrote:\nPLEASE NOTE OUR NEW BANKING INFORMATION\nQuickpay/Zelle\naccounting@innovativecarriers.com\n",
+      "attachments": [{"filename": "invoice_265028.pdf", "mimeType": "application/pdf"}]
+    },
+    {
+      "id": "BOA-ZELLE-ALERT",
+      "expect": "bank_payment_alert",
+      "subject": "Goldengate Logistics Llc sent you $36.00",
+      "from": "Bank of America <customerservice@ealerts.bankofamerica.com>",
+      "body": "You received a Zelle payment of $36.00 from Goldengate Logistics Llc.",
+      "attachments": []
+    },
+    {
+      "id": "CHASE-QUICKPAY-ALERT",
+      "expect": "bank_payment_alert",
+      "subject": "You received money with Zelle",
+      "from": "Chase <alerts@chase.com>",
+      "body": "You received a Zelle payment of $500.00. View details in Chase QuickPay.",
+      "attachments": []
+    },
+    {
+      "id": "BERKSHIRE-WIRE-REMIT",
+      "expect": "customer_remittance",
+      "subject": "Berkshire Fashions Inc Payment",
+      "from": "Francia Marcelo <FranciaM@berkshireinc.com>",
+      "body": "Hi, We wired a payment of $12,155.00. Attached is the payment confirmation.",
+      "attachments": [
+        {"filename": "wire_confirmation.pdf", "mimeType": "application/pdf"},
+        {"filename": "payment_screenshot.png", "mimeType": "image/png"}
+      ]
+    },
+    {
+      "id": "ALTAREB-PAID-REPLY",
+      "expect": "customer_remittance",
+      "subject": "Re: Invoice #28415 for BOL #267130",
+      "from": "Taha <ap@altareb.com>",
+      "body": "Hi Abe,\n\nPayment was sent via Zelle for this invoice. Paid in full today.\n\nThanks,\nTaha\n\nOn Mon, Aug 25, 2026 Abe <abe@innovativecarriers.com> wrote:\nPLEASE NOTE OUR NEW BANKING INFORMATION\nQuickpay/Zelle\naccounting@innovativecarriers.com\n",
+      "attachments": []
+    },
+    {
+      "id": "CARRIER-INVOICE-ARCBEST",
+      "expect": "freight_invoice",
+      "subject": "ArcBest eInvoice(s) - 760981 INNOVATIVE CARRIERS - 8/11/2026",
+      "from": "brooklyncustomerservice@abf.com",
+      "body": "Attached are the invoice(s) for the following pronumber(s):\n151579720\n\nPlease note that we offer the ability to utilize ACH payments.",
+      "attachments": [{"filename": "151579720.pdf", "mimeType": "application/pdf"}]
+    },
+    {
+      "id": "AMFAST-QB-ZELLE-TIP",
+      "expect": "freight_invoice",
+      "subject": "New payment request from Amfast Freight, Inc. - invoice 173867",
+      "from": "Amfast Freight, Inc. <quickbooks@notification.intuit.com>",
+      "body": "Your invoice is ready! BALANCE DUE $472.50. Your invoice is attached. For Zelle or Chase Quickpay send to: ar@amfastlogistics.com",
+      "attachments": []
+    },
+    {
+      "id": "AMBIGUOUS-ZELLE-NO-BANK-FROM",
+      "expect": "other",
+      "subject": "Payment update",
+      "from": "random.person@gmail.com",
+      "body": "Just FYI about Zelle — not sure if this is the right inbox.",
+      "attachments": []
+    },
+    {
+      "id": "BOA-ACH-ALERT",
+      "expect": "bank_payment_alert",
+      "subject": "ACH payment received",
+      "from": "Bank of America <customerservice@ealerts.bankofamerica.com>",
+      "body": "An ACH payment was received for $1,200.00",
+      "attachments": []
+    }
+  ]
+}
