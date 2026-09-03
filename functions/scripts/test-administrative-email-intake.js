@@ -1015,6 +1015,50 @@ check("AltaReb remittance does not invoice-veto",
       emailClassification: {intent: "carrier_invoice"},
       invoicePdfCount: 0,
     }));
+
+// Innovative CHB customs-broker invoice/BOL thread (Sep 3 2026 ops miss).
+// Was misclassified as payment_notification_ignored when quoted body had
+// Quickpay/Zelle tips and subject used Invoice-##### + CR#/BOL# (not
+// "Invoice for BOL#").
+const chbSubject =
+  "RE: Invoice-0003138, CR#: 266272 RE: BOL# 266272";
+const chbFrom = "Isreal Rosenfeld <ir@innovativechb.com>";
+const chbBody =
+  "Please see attached customs docs.\n\n" +
+  "On Tue, Sep 2, 2026 Abe <abe@innovativecarriers.com> wrote:\n" +
+  "PLEASE NOTE OUR NEW BANKING INFORMATION\n" +
+  "Quickpay/Zelle\naccounting@innovativecarriers.com\n";
+check("CHB Invoice-##### + CR#/BOL# subject recognized as invoice thread",
+    adm.looksLikeInvoiceEmailContent(chbSubject, chbBody));
+check("CHB Invoice-##### + CR#/BOL# subjectLooksLikeInvoiceForBolReply",
+    adm.subjectLooksLikeInvoiceForBolReply(chbSubject));
+check("CHB invoice/BOL reply not ignored as Zelle/bank payment notification",
+    !adm.shouldIgnoreAsPaymentNotification(
+        chbSubject, chbFrom, chbBody, []));
+check("CHB invoice/BOL reply has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: chbSubject,
+      body: chbBody,
+      from: chbFrom,
+      attachments: [],
+    }));
+check("CHB invoice/BOL reply is not customer remittance (no paid notice)",
+    !adm.isCustomerPaymentRemittanceEmail(chbSubject, chbFrom, chbBody));
+check("Lisa reply on CHB invoice thread also not Zelle-ignored",
+    !adm.shouldIgnoreAsPaymentNotification(
+        chbSubject,
+        "Lisa <lisa@innovativecarriers.com>",
+        chbBody,
+        []));
+check("hyphenated Invoice-0003138 subject alone recognized",
+    adm.looksLikeInvoiceEmailContent(
+        "RE: Invoice-0003138", "customs invoice attached"));
+check("BoA Zelle alert still ignored after CHB subject fix",
+    adm.shouldIgnoreAsPaymentNotification(
+        "Goldengate Logistics Llc sent you $36.00",
+        "Bank of America <customerservice@ealerts.bankofamerica.com>",
+        "You received a Zelle payment of $500",
+        []));
 check("Heypharma invoice attach reply is NOT customer remittance",
     !adm.isCustomerPaymentRemittanceEmail(
         heypharmaSubject, heypharmaFrom, heypharmaBody));

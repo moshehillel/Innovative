@@ -457,12 +457,22 @@ const INVOICE_FOR_BOL_REPLY_RE =
   /^(?:(?:re|fw|fwd):\s*)+(?:\[(?:external|secure)\]\s*)?invoice(?:\s*#\s*\d+)?\s+for\s+(?:bol|load)\s*#?\s*\d{5,9}/i;
 
 /**
+ * CHB / broker invoice threads that cite Invoice-##### with CR# and/or BOL#.
+ * Example: "RE: Invoice-0003138, CR#: 266272 RE: BOL# 266272"
+ * (hyphenated invoice id — not "Invoice #3138 for BOL#…").
+ */
+const INVOICE_CR_BOL_THREAD_RE =
+  /invoice[\s#_:-]*\d{4,}[\s\S]{0,80}\b(?:cr|bol|load)\s*#?\s*:?\s*\d{5,9}/i;
+
+/**
  * Subject is a reply on our customer-invoice thread (Invoice for BOL/Load#).
  * @param {string} subject Email subject.
  * @return {boolean}
  */
 function subjectLooksLikeInvoiceForBolReply(subject) {
-  return INVOICE_FOR_BOL_REPLY_RE.test(String(subject || "").trim());
+  const sub = String(subject || "").trim();
+  if (INVOICE_FOR_BOL_REPLY_RE.test(sub)) return true;
+  return INVOICE_CR_BOL_THREAD_RE.test(sub);
 }
 
 /**
@@ -1021,8 +1031,17 @@ function looksLikeInvoiceEmailContent(subject, body) {
   // Allow optional whitespace after "#": "Invoice # 981 …"
   if (/^(?:fw:\s*)?invoice\s+#?\s*\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
+  // Hyphenated invoice ids: "RE: Invoice-0003138, …"
+  if (/^(?:(?:re|fw|fwd):\s*)*(?:\[(?:external|secure)\]\s*)?invoice-\d+/i
+      .test(sub)) {
+    return true;
+  }
   // "Re: Invoice for BOL#265028" and "Re: Invoice #28415 for BOL #267130"
   if (INVOICE_FOR_BOL_REPLY_RE.test(sub)) {
+    return true;
+  }
+  // CHB / customs-broker style: Invoice-0003138 + CR# / BOL#
+  if (INVOICE_CR_BOL_THREAD_RE.test(sub)) {
     return true;
   }
   // Compass FS factored invoices: PO # in subject is the broker load.
@@ -1122,8 +1141,10 @@ function looksLikeInvoiceEmailContent(subject, body) {
  */
 function shouldIgnoreAsPaymentNotification(
     subject, from, body, attachments) {
-  if (!isPaymentNotificationEmail(subject, from, body)) return false;
+  // Invoice / BOL / CR# threads (incl. innovativechb.com) are never bank alerts.
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  if (subjectLooksLikeInvoiceForBolReply(subject)) return false;
+  if (!isPaymentNotificationEmail(subject, from, body)) return false;
   const list = Array.isArray(attachments) ? attachments : [];
   if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
     return false;
