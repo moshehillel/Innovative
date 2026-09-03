@@ -202,6 +202,37 @@ async function lookupIssuedUiCustomerInvoice(loadNumber) {
 }
 
 /**
+ * Issued customer invoice for a load (UI manage.php id, else REST invoiceId).
+ * @param {string} loadNumber Load/BOL number.
+ * @return {Promise<{id:number, invoiceNumber:string}|null>}
+ */
+async function lookupIssuedCustomerInvoice(loadNumber) {
+  const ui = await lookupIssuedUiCustomerInvoice(loadNumber);
+  if (ui && ui.id) return ui;
+  if (!loadNumber) return null;
+  try {
+    const invData = await primusRequest(
+        "GET",
+        `/invoice/bolnumber/${encodeURIComponent(loadNumber)}`,
+    );
+    const results = invData && invData.data && invData.data.results;
+    const list = Array.isArray(results) ?
+      results : (results ? [results] : []);
+    const issued = list.find((inv) =>
+      inv && inv.status && inv.status.generated);
+    if (!issued || issued.invoiceId == null) return null;
+    return {
+      id: Number(issued.invoiceId),
+      invoiceNumber: String(
+          issued.invoiceNumber || issued.number || issued.invoiceId || "",
+      ),
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
  * Confirms billing is already done in Primus (carrier bill + customer invoice).
  * @param {object} invoice Invoice document.
  * @param {object} primusSteps Completed-step flags.
@@ -218,8 +249,21 @@ async function confirmBillingCompleteInPrimus(invoice, primusSteps) {
 }
 
 /**
+ * True when customer invoice is issued in Primus but carrier bill is not entered.
+ * Carrier-bill-only: enter bill + broker swap; no QB push or customer email.
+ * @param {boolean} customerInvoiceIssued Issued customer invoice in Primus.
+ * @param {boolean} carrierBillEntered Carrier bill already entered in Primus.
+ * @return {boolean}
+ */
+function isCarrierBillOnlyScenario(
+    customerInvoiceIssued, carrierBillEntered) {
+  return !!(customerInvoiceIssued && !carrierBillEntered);
+}
+
+/**
  * Decides whether to skip intake/billing and only run the customer-email phase,
- * or skip the workflow entirely when billing is already done.
+ * skip the workflow entirely when billing is already done, or enter carrier bill
+ * only when customer invoice was pre-issued.
  * @param {object} invoice Invoice document.
  * @param {object} primusSteps Completed-step flags.
  * @param {string|null} resumeFrom Resume step, if any.
@@ -230,6 +274,15 @@ async function resolveBillingSkipAction(invoice, primusSteps, resumeFrom) {
   const inPrimus = inFirestore ||
     await confirmBillingCompleteInPrimus(invoice, primusSteps);
   if (!inPrimus) {
+    if (invoice.loadNumber && isCarrierBillAlreadyEnteredInPrimus) {
+      const carrierEntered =
+        await isCarrierBillAlreadyEnteredInPrimus(invoice);
+      const customerInvoiceIssued =
+        await hasIssuedCustomerInvoiceInPrimus(invoice.loadNumber);
+      if (isCarrierBillOnlyScenario(customerInvoiceIssued, carrierEntered)) {
+        return {action: "carrier_bill_only", source: "primus"};
+      }
+    }
     return {action: "continue"};
   }
 
@@ -1244,6 +1297,39 @@ exports.processPrimusWorkflow = onRequest(
         const billingSkip = await resolveBillingSkipAction(
             invoice, primusSteps, currentStep);
         let skipToCustomerEmail = false;
+        const carrierBillOnlyMode =
+            billingSkip.action === "carrier_bill_only";
+        if (carrierBillOnlyMode) {
+          await writeLog("info", "workflow",
+              "Carrier-bill-only — customer invoice pre-issued in Primus", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                source: billingSkip.source || "primus",
+              });
+          if (invoice.loadNumber) {
+            const issuedUi =
+              await lookupIssuedCustomerInvoice(invoice.loadNumber);
+            if (issuedUi && issuedUi.id) {
+              invoice.customerInvoiceId = issuedUi.id;
+              invoice.issuedInvoiceNumber = issuedUi.invoiceNumber ||
+                invoice.issuedInvoiceNumber || null;
+              primusSteps.uiInvoiceIssued = true;
+              primusSteps.customerInvoiceGenerated = true;
+              await invoiceDoc.ref.update({
+                customerInvoiceId: issuedUi.id,
+                issuedInvoiceNumber: invoice.issuedInvoiceNumber || null,
+                primusSteps,
+                carrierBillOnlyMode: true,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            } else {
+              await invoiceDoc.ref.update({
+                carrierBillOnlyMode: true,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+            }
+          }
+        }
         if (billingSkip.action === "skip_entirely") {
           await writeLog("info", "workflow",
               "Workflow skipped — carrier bill and invoice already in Primus",
@@ -3005,16 +3091,58 @@ exports.processPrimusWorkflow = onRequest(
                 });
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_exists");
-                // Backfill QB if issued before sync moved earlier.
-                await pushCarrierBillToQuickBooks({
-                  req,
-                  invoiceDoc,
+                if (!carrierBillOnlyMode) {
+                  // Backfill QB if issued before sync moved earlier.
+                  await pushCarrierBillToQuickBooks({
+                    req,
+                    invoiceDoc,
+                    invoiceId,
+                    invoice,
+                    primusSteps,
+                    customerInvoiceId: invoice.customerInvoiceId,
+                    invoiceNumber: invoice.issuedInvoiceNumber,
+                  });
+                }
+              } else if (carrierBillOnlyMode) {
+                await writeLog("info", "workflow",
+                    "Carrier-bill-only — skipping customer invoice generation", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      customerInvoiceId: invoice.customerInvoiceId || null,
+                    });
+                await logWorkflowStep({
                   invoiceId,
-                  invoice,
-                  primusSteps,
-                  customerInvoiceId: invoice.customerInvoiceId,
-                  invoiceNumber: invoice.issuedInvoiceNumber,
+                  stepName: "customer_invoice_generation_completed",
+                  stepStatus: "skipped",
+                  reason:
+                    "Customer invoice pre-issued — carrier bill entry only",
+                  output: {
+                    customerInvoiceId: invoice.customerInvoiceId || null,
+                    issuedInvoiceNumber: invoice.issuedInvoiceNumber || null,
+                  },
                 });
+                const issuedUi =
+                  await lookupIssuedCustomerInvoice(invoice.loadNumber);
+                invoiceGenerationResult = {
+                  ok: true,
+                  customerInvoiceId: (issuedUi && issuedUi.id) ||
+                    invoice.customerInvoiceId || null,
+                  invoiceNumber: (issuedUi && issuedUi.invoiceNumber) ||
+                    invoice.issuedInvoiceNumber || null,
+                  generated: false,
+                  reused: true,
+                  invoiceTotal: customerRate + customerBillAccessorialTotal,
+                };
+                if (issuedUi && issuedUi.id) {
+                  primusSteps.uiInvoiceIssued = true;
+                  primusSteps.customerInvoiceGenerated = true;
+                  await invoiceDoc.ref.update({
+                    primusSteps,
+                    customerInvoiceId: issuedUi.id,
+                    issuedInvoiceNumber: issuedUi.invoiceNumber || null,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  });
+                }
               } else {
                 const bk = await fetchPrimusBooking(invoice.loadNumber);
                 const podPath =
@@ -3173,17 +3301,59 @@ exports.processPrimusWorkflow = onRequest(
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_generated");
 
-                // Push carrier bill to QB immediately — do not wait for
-                // customer-email approval (loads parked at that gate never
-                // reached the old end-of-workflow QB call).
-                await pushCarrierBillToQuickBooks({
-                  req,
-                  invoiceDoc,
-                  invoiceId,
-                  invoice,
+                if (!carrierBillOnlyMode) {
+                  // Push carrier bill to QB immediately — do not wait for
+                  // customer-email approval (loads parked at that gate never
+                  // reached the old end-of-workflow QB call).
+                  await pushCarrierBillToQuickBooks({
+                    req,
+                    invoiceDoc,
+                    invoiceId,
+                    invoice,
+                    primusSteps,
+                    customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+                    invoiceNumber: invoiceGenerationResult.invoiceNumber,
+                  });
+                }
+              }
+            } else if (carrierBillOnlyMode) {
+              const issuedInv =
+                await lookupIssuedCustomerInvoice(invoice.loadNumber);
+              await writeLog("info", "workflow",
+                  "Carrier-bill-only — skipping REST customer invoice gen", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerInvoiceId: (issuedInv && issuedInv.id) ||
+                      invoice.customerInvoiceId || null,
+                  });
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "customer_invoice_generation_completed",
+                stepStatus: "skipped",
+                reason:
+                  "Customer invoice pre-issued — carrier bill entry only",
+                output: {
+                  customerInvoiceId: (issuedInv && issuedInv.id) ||
+                    invoice.customerInvoiceId || null,
+                },
+              });
+              invoiceGenerationResult = {
+                ok: true,
+                customerInvoiceId: (issuedInv && issuedInv.id) ||
+                  invoice.customerInvoiceId || null,
+                invoiceNumber: (issuedInv && issuedInv.invoiceNumber) ||
+                  invoice.issuedInvoiceNumber || null,
+                generated: false,
+                reused: true,
+                invoiceTotal: customerRate + customerBillAccessorialTotal,
+              };
+              primusSteps.customerInvoiceGenerated = true;
+              if (issuedInv && issuedInv.id) {
+                await invoiceDoc.ref.update({
                   primusSteps,
-                  customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
-                  invoiceNumber: invoiceGenerationResult.invoiceNumber,
+                  customerInvoiceId: issuedInv.id,
+                  issuedInvoiceNumber: issuedInv.invoiceNumber || null,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 });
               }
             } else if (invoice.customerInvoiceId) {
@@ -3209,15 +3379,17 @@ exports.processPrimusWorkflow = onRequest(
 
               await setWorkflowHeartbeat(
                   invoiceDoc.ref, "customer_invoice_exists");
-              await pushCarrierBillToQuickBooks({
-                req,
-                invoiceDoc,
-                invoiceId,
-                invoice,
-                primusSteps,
-                customerInvoiceId: invoice.customerInvoiceId,
-                invoiceNumber: invoice.issuedInvoiceNumber,
-              });
+              if (!carrierBillOnlyMode) {
+                await pushCarrierBillToQuickBooks({
+                  req,
+                  invoiceDoc,
+                  invoiceId,
+                  invoice,
+                  primusSteps,
+                  customerInvoiceId: invoice.customerInvoiceId,
+                  invoiceNumber: invoice.issuedInvoiceNumber,
+                });
+              }
             } else {
               invoiceGenerationResult =
           await generateCustomerInvoice(customerInvoiceData);
@@ -3308,15 +3480,17 @@ exports.processPrimusWorkflow = onRequest(
               await setWorkflowHeartbeat(
                   invoiceDoc.ref, "customer_invoice_generated");
 
-              await pushCarrierBillToQuickBooks({
-                req,
-                invoiceDoc,
-                invoiceId,
-                invoice,
-                primusSteps,
-                customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
-                invoiceNumber: invoiceGenerationResult.invoiceNumber,
-              });
+              if (!carrierBillOnlyMode) {
+                await pushCarrierBillToQuickBooks({
+                  req,
+                  invoiceDoc,
+                  invoiceId,
+                  invoice,
+                  primusSteps,
+                  customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
+                  invoiceNumber: invoiceGenerationResult.invoiceNumber,
+                });
+              }
             }
           } // end runBillingPipeline
 
@@ -3328,6 +3502,71 @@ exports.processPrimusWorkflow = onRequest(
           // they're held for human review earlier in the workflow (see
           // "extra_charges_pending_review"), so finalCustomerInvoiceId only
           // ever reflects the base freight amount.
+
+          if (carrierBillOnlyMode) {
+            const issuedInvoiceNumberOnly =
+              (invoiceGenerationResult &&
+                invoiceGenerationResult.invoiceNumber) ||
+              invoice.issuedInvoiceNumber || null;
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "final_email_sent",
+              stepStatus: "skipped",
+              reason:
+                "Carrier-bill-only — customer invoice pre-issued; no email",
+              output: {customerInvoiceId: finalCustomerInvoiceId},
+            });
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "qb_billing_sync",
+              stepStatus: "skipped",
+              reason: "Carrier-bill-only — QuickBooks sync skipped",
+              output: {customerInvoiceId: finalCustomerInvoiceId},
+            });
+            await invoiceDoc.ref.update({
+              decisionStage: "completed_carrier_bill_only",
+              decisionReason:
+                "Carrier bill entered; customer invoice already issued",
+              customerName: customerName,
+              customerRate: customerRate,
+              profit: profit,
+              primusSteps: primusSteps,
+              finalWorkflowStatus: "completed_carrier_bill_only",
+              customerInvoiceId: finalCustomerInvoiceId,
+              issuedInvoiceNumber: issuedInvoiceNumberOnly || null,
+              processingLock: false,
+              carrierBillOnlyMode: true,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await writeLog("info", "workflow",
+                "Carrier-bill-only completed — no QB, no customer email", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerInvoiceId: finalCustomerInvoiceId,
+                });
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "workflow_completed",
+              stepStatus: "success",
+              output: {
+                customerName,
+                profit,
+                customerInvoiceId: finalCustomerInvoiceId,
+                mode: "carrier_bill_only",
+              },
+            });
+            if (typeof scheduleFlowSummary === "function") {
+              scheduleFlowSummary(
+                  invoice.flowId || invoice.gmailMessageId || invoiceId);
+            }
+            return res.json({
+              ok: true,
+              message: "Carrier bill entered; customer invoice pre-issued",
+              workflowStatus: "completed_carrier_bill_only",
+              customerInvoiceId: finalCustomerInvoiceId,
+              qbBillingSynced: false,
+            });
+          }
 
           // Customer email: Primus manage.php emailBOLDocs only (no Gmail).
           const uiIssued = !!primusSteps.uiInvoiceIssued;
@@ -3656,7 +3895,8 @@ exports.processPrimusWorkflow = onRequest(
 
           // Backstop: push to QB if early sync was skipped (older invoices)
           // or failed transiently. Idempotent via primusSteps.qbBillingSynced.
-          if (finalCustomerInvoiceId && !primusSteps.qbBillingSynced) {
+          if (finalCustomerInvoiceId && !primusSteps.qbBillingSynced &&
+              !carrierBillOnlyMode) {
             await pushCarrierBillToQuickBooks({
               req,
               invoiceDoc,
@@ -3740,3 +3980,7 @@ exports.processPrimusWorkflow = onRequest(
       }
     },
 );
+exports._internal = {
+  isCarrierBillOnlyScenario,
+  isBillingCompleteInFirestore,
+};

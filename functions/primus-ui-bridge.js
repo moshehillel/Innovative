@@ -4755,6 +4755,15 @@ async function runPrimusUiBillingFlow(args) {
     if (bookingDocData && Array.isArray(bookingDocData.invoices)) {
       const issued = bookingDocData.invoices.find(isIssuedUiInvoice);
       if (issued) {
+        const carrierBillUpload = await maybeUploadBookingPdf({
+          docData: bookingDocData,
+          bookingId,
+          bookingBOL: loadNumber || bookingId,
+          fileType: uploadFileTypes.carrierBill.id,
+          fileTypeName: uploadFileTypes.carrierBill.name,
+          file: args.carrierBillPdf,
+          skip: args.skipCarrierBillUpload,
+        });
         const podUpload = await maybeUploadBookingPdf({
           docData: bookingDocData,
           bookingId,
@@ -4773,6 +4782,9 @@ async function runPrimusUiBillingFlow(args) {
           generated: true,
           customerInvoiceId: Number(issued.id),
           invoiceNumber: String(issued.invoiceNumber),
+          carrierBillUpload,
+          carrierBillUploaded: !!(
+            carrierBillUpload.uploaded || carrierBillUpload.skipped),
           podUpload,
           podUploaded: !!(podUpload.uploaded || podUpload.skipped),
         };
