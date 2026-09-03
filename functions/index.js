@@ -5553,7 +5553,6 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         Number(lastKnownLoadNumber) : null,
       allowedStatuses: [
         "ready_for_primus_validation",
-        "unmatched_amount",
         "unrecognized_charges",
         "charges_no_proof",
         "error",
@@ -5603,6 +5602,11 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "the billing reference is often the broker Primus load — if it is " +
         "exactly 6 digits and no separate broker load field is shown, also " +
         "set loadNumber to that value. " +
+        "On regular carrier invoices (Amfast, truckload, LTL, etc.): when " +
+        "BOL # / Bill of Lading is exactly 6 digits in the Innovative " +
+        "Primus range (typically 26xxxx) and no separate broker Load # / " +
+        "Customer Ref is shown, ALSO set loadNumber to that BOL value. " +
+        "Always still populate carrierBolNumber. " +
         "Do NOT put carrier BOL in proNumber unless it is a true PRO / " +
         "freight bill number.",
         "carrierOrderNumber is the carrier's order / shipment ID when " +
@@ -5627,8 +5631,14 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "like 'Provided', 'vided', or 'N/A' as the PRO.",
         "proNumber must be a numeric freight bill / tracking / PRO value " +
         "(typically 4+ digits), not descriptive label text.",
-        "If you cannot find a broker loadNumber using labeled broker fields, " +
-        "leave loadNumber empty — do not guess from unlabeled numbers.",
+        "If you cannot find a broker loadNumber using labeled broker fields " +
+        "(and no 6-digit Primus-range BOL as above), leave loadNumber empty " +
+        "— do not guess from unlabeled numbers. Still use status " +
+        "ready_for_primus_validation for a normal freight invoice.",
+        "Never use status unmatched_amount. Amount matching is done by " +
+        "Primus after extraction — always use ready_for_primus_validation " +
+        "for a regular carrier freight invoice (even when loadNumber is " +
+        "empty or you are unsure the amount will match).",
         "If lastKnownLoadNumber is provided, prefer a 6-digit broker " +
         "candidate where abs(candidate - lastKnownLoadNumber) <= 100000.",
         "If no valid 6-digit broker loadNumber candidate is found, return " +
@@ -10373,6 +10383,23 @@ async function processGmailMessage(
             });
         aiResult.status = "ready_for_primus_validation";
       }
+      // Amfast 174738: Claude returned unmatched_amount because BOL #266922
+      // was not labeled as broker Load #. Load resolution already promoted
+      // the BOL; amount matching belongs to Primus — never Lisa-dump as
+      // "unexpected invoice status".
+      if (aiResult.status === "unmatched_amount") {
+        const coerced = loadResolution.coerceClassifierInvoiceStatus(
+            aiResult.status);
+        await writeLog("warn", "ai",
+            "Coercing AI unmatched_amount to ready_for_primus_validation", {
+              messageId,
+              loadNumber: aiResult.loadNumber || null,
+              invoiceAmount: aiResult.invoiceAmount,
+              reason: aiResult.reason || null,
+              coercedStatus: coerced,
+            });
+        aiResult.status = coerced;
+      }
 
       // Extra charges must not stop processing when the invoice total is
       // within $10 of Primus OR at/under Primus's recorded carrier cost
@@ -10875,9 +10902,9 @@ async function processGmailMessage(
           }
         }
       } else {
-        // Claude returned a status we don't have a rule for (e.g. "error",
-        // "unmatched_amount" returned directly). Forward with AI note so a
-        // human can handle it, and label ERROR.
+        // Claude returned a status we don't have a rule for (e.g. "error").
+        // unmatched_amount is coerced to ready_for_primus_validation above.
+        // Forward with AI note so a human can handle it, and label ERROR.
         finalStatus = "error";
         await writeLog("warn", "ai", "Unexpected AI classification status", {
           messageId, status: aiResult.status,

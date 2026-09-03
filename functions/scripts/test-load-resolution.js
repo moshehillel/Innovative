@@ -135,6 +135,28 @@ check("review shows BOL not PRO",
 check("review shows carrier BOL",
     review["Carrier BOL #"], "263645");
 
+// Amfast-style: 6-digit BOL promoted to broker load when loadNumber empty
+const amfast = lr.normalizeCarrierReferenceFields({
+  loadNumber: "",
+  proNumber: "",
+  carrierBolNumber: "266922",
+  carrierName: "Amfast Freight, Inc.",
+  invoiceAmount: 289.8,
+  status: "unmatched_amount",
+});
+check("Amfast BOL promoted to loadNumber",
+    amfast.loadNumber, "266922");
+check("Amfast BOL kept on carrierBolNumber",
+    amfast.carrierBolNumber, "266922");
+check("Amfast unmatched_amount coerced to ready",
+    lr.coerceClassifierInvoiceStatus("unmatched_amount"),
+    "ready_for_primus_validation");
+check("other statuses pass through coerce",
+    lr.coerceClassifierInvoiceStatus("ready_for_primus_validation"),
+    "ready_for_primus_validation");
+check("error status passes through coerce",
+    lr.coerceClassifierInvoiceStatus("error"), "error");
+
 const batchSubject = lr.extractLoadHintsFromEmailText(
     "Batch 24673", "");
 check("Batch subject does not extract load",

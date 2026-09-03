@@ -331,6 +331,25 @@ function carrierReferenceReviewFields(refs) {
   };
 }
 
+/**
+ * Maps classifier statuses that the intake handler does not execute on
+ * into statuses that continue the normal Primus path.
+ *
+ * Claude sometimes returns "unmatched_amount" when it cannot find a labeled
+ * broker load (Amfast 174738 / BOL 266922). Amount matching is Primus's job
+ * after load resolution — never treat that as an opaque ACTION REQUIRED.
+ *
+ * @param {string|null|undefined} status Classifier status.
+ * @return {string} Status to use for routing.
+ */
+function coerceClassifierInvoiceStatus(status) {
+  const raw = String(status || "").trim();
+  if (raw === "unmatched_amount") {
+    return "ready_for_primus_validation";
+  }
+  return raw;
+}
+
 module.exports = {
   normalizeLoadNumber,
   isValidLoadNumber,
@@ -345,4 +364,5 @@ module.exports = {
   extractLoadHintsFromEmailText,
   applyEmailLoadHintsToInvoice,
   carrierReferenceReviewFields,
+  coerceClassifierInvoiceStatus,
 };
