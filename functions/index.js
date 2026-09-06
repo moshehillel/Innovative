@@ -8581,6 +8581,8 @@ async function processGmailMessage(
         attachments = await invoiceZipAttachments.expandZipAttachments(
             gmail, messageId, attachments, resolveAttachmentBuffer);
         const fromZip = attachments.filter((a) => a && a.fromZip);
+        const zipShells = attachments.filter((a) =>
+          a && invoiceZipAttachments.isZipAttachment(a, a.buffer));
         if (fromZip.length > 0) {
           await writeLog("info", "mail",
               "Extracted invoice file(s) from ZIP attachment(s)", {
@@ -8592,6 +8594,20 @@ async function processGmailMessage(
                   mimeType: a.mimeType,
                   zipFilename: a.zipFilename || null,
                   bytes: a.buffer && a.buffer.length || 0,
+                })),
+              });
+        } else if (zipShells.length > 0) {
+          await writeLog("warn", "mail",
+              "ZIP attachment(s) present but no invoice files extracted", {
+                messageId,
+                beforeCount: beforeZipCount,
+                zips: zipShells.map((a) => ({
+                  filename: a.filename,
+                  mimeType: a.mimeType,
+                  bytes: a.buffer && a.buffer.length || null,
+                  zipExpanded: Boolean(a.zipExpanded),
+                  zipWarnings: a.zipWarnings || null,
+                  zipSkipped: a.zipSkipped || null,
                 })),
               });
         }

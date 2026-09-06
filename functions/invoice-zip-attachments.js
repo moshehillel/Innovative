@@ -361,10 +361,22 @@ async function expandZipAttachments(
     let buf = null;
     try {
       buf = await resolveBuffer(gmail, messageId, att);
-    } catch (_err) {
+    } catch (err) {
+      att.zipExpanded = false;
+      att.zipWarnings = ["resolve_buffer_failed"];
+      att.zipSkipped = [{
+        filename: att.filename || null,
+        reason: `resolve_buffer_failed:${err && err.message || err}`,
+      }];
       continue;
     }
-    if (!buf || !buf.length) continue;
+    if (!buf || !buf.length) {
+      if (isZipAttachment(att, buf)) {
+        att.zipExpanded = false;
+        att.zipWarnings = ["empty_buffer"];
+      }
+      continue;
+    }
     if (!isZipAttachment(att, buf)) continue;
 
     const result = extractInvoiceFilesFromZip(buf, {
@@ -379,6 +391,18 @@ async function expandZipAttachments(
     } else {
       att.zipExpanded = false;
       att.zipWarnings = result.warnings;
+      att.zipSkipped = result.skipped;
+      if (typeof console !== "undefined" && console.warn) {
+        console.warn(
+            "[expandZipAttachments] no invoice files from ZIP",
+            JSON.stringify({
+              messageId,
+              filename: att.filename || null,
+              bytes: buf.length,
+              warnings: result.warnings,
+              skipped: result.skipped,
+            }));
+      }
     }
   }
 
