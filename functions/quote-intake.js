@@ -1134,14 +1134,42 @@ function matchLabeledNumber(text, re) {
 }
 
 /**
- * Number from a capture that may include thousands commas.
+ * Number from a capture that may include thousands commas or spaced
+ * groups ("6 245", "6 245" narrow nbsp). HTML/PDF→text often uses spaces
+ * instead of commas; without this, Total weight becomes 6 and every
+ * pallet line inherits that absurd weight.
  * @param {*} raw Raw capture.
  * @return {number|null}
  */
 function parseLooseNumber(raw) {
   if (raw == null || raw === "") return null;
-  const n = Number(String(raw).replace(/,/g, "").trim());
+  let s = String(raw).trim();
+  // Drop currency / unit tails accidentally captured.
+  s = s.replace(/(?:lbs?|pounds?|kg|kgs)\b.*$/i, "").trim();
+  // Keep digits, dots, commas, and space-like thousands separators.
+  s = s.replace(/[^\d.,\s\u00A0\u202F\u2007\u2009\u200A]/g, "");
+  // "6 245" / "6,245" / "6.245.000" (EU) → strip grouping, keep decimal.
+  if (/^\d{1,3}([.,\s\u00A0\u202F\u2007\u2009\u200A]\d{3})+$/.test(s)) {
+    s = s.replace(/[.,\s\u00A0\u202F\u2007\u2009\u200A]/g, "");
+  } else {
+    s = s.replace(/,/g, "");
+    s = s.replace(/[\s\u00A0\u202F\u2007\u2009\u200A]/g, "");
+  }
+  const n = Number(s);
   return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * True when a parsed shipment total is too light for the pallet count
+ * (e.g. space-thousands bug: "6 245" → 6 on 12 pallets).
+ * @param {number|null} weight Lbs.
+ * @param {number|null} palletCount Pieces.
+ * @return {boolean}
+ */
+function isImplausibleShipmentWeight(weight, palletCount) {
+  if (!(weight > 0) || !Number.isFinite(weight)) return true;
+  const pcs = palletCount != null && palletCount > 0 ? palletCount : 1;
+  return (weight / pcs) < 25;
 }
 
 /**
@@ -1186,16 +1214,36 @@ function parseLabeledFreightTotals(body) {
     cartonCount = matchLabeledNumber(text,
         /\bCTNS?\s*[-–—:=]\s*(\d+)\b/i);
   }
+  // Allow space / nbsp thousands: "Total weight – 6 245" → 6245.
+  const weightNum =
+      "([\\d,][\\d,\\s\\u00A0\\u202F\\u2007\\u2009\\u200A]*(?:\\.\\d+)?)";
   let weight = matchLabeledNumber(text,
-      /Total\s+[Ww]eight\s*[-–—:=]?\s*([\d,]+(?:\.\d+)?)/i);
+      new RegExp("Total\\s+[Ww]eight\\s*[-–—:=]?\\s*" + weightNum, "i"));
   if (weight == null) {
     weight = matchLabeledNumber(text,
-        /\bWEIGHT\s*[-–—:=]\s*([\d,]+(?:\.\d+)?)\b/i);
+        new RegExp("\\bWEIGHT\\s*[-–—:=]\\s*" + weightNum + "\\b", "i"));
   }
   if (weight == null) {
     const tableWeights = extractNumberedPalletWeightTable(text);
     if (tableWeights.length >= 2) {
       weight = tableWeights.reduce((sum, w) => sum + w, 0);
+    }
+  }
+  // Reject "6" from "Total weight – 6 245" when spaces were lost mid-parse,
+  // or "Total weight – 6 pallets totaling 6245".
+  if (weight != null && isImplausibleShipmentWeight(weight, palletCount)) {
+    const totaling = text.match(
+        /Total\s+[Ww]eight[^.\n]{0,40}?(?:totaling|totalling|=)\s*([\d,]+(?:\.\d+)?)/i);
+    if (totaling) {
+      const alt = parseLooseNumber(totaling[1]);
+      if (alt != null &&
+          !isImplausibleShipmentWeight(alt, palletCount)) {
+        weight = alt;
+      } else {
+        weight = null;
+      }
+    } else {
+      weight = null;
     }
   }
   const dim = text.match(new RegExp(
@@ -2872,11 +2920,38 @@ function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
       } else {
         next.weightType = weightType;
       }
-      return freightDims.sanitizeImplausiblePalletWeight(next);
+      return clearImplausibleLowPalletWeight(
+          freightDims.sanitizeImplausiblePalletWeight(next));
     });
   }
   if (defaultedDims) pushExtractWarning(extracted, "defaulted dims");
   return extracted;
+}
+
+/**
+ * Clear absurdly low per-pallet lbs (GPA/LBE1 screenshot: every line
+ * "6 total" → Primus class 400). redistributeEvenTotalWeight refills
+ * from a real Total weight afterward.
+ * @param {object} row Freight row.
+ * @return {object}
+ */
+function clearImplausibleLowPalletWeight(row) {
+  if (!row || typeof row !== "object") return row;
+  if (!freightDims.isPalletPackaging(row)) return row;
+  const qty = Math.max(1, Number(row.qty) || 1);
+  const w = Number(row.weight);
+  if (!(w > 0) || !Number.isFinite(w)) return row;
+  const wt = String(row.weightType || "total").trim().toLowerCase();
+  const isEach = wt === "each" || wt === "perpiece" || wt === "per-piece";
+  const total = isEach ? w * qty : w;
+  const per = total / qty;
+  const h = Number(row.height) || 0;
+  const substantial = h >= 24 ||
+    freightDims.isStandardPalletFootprint(row.length, row.width);
+  if (substantial && per > 0 && per < 25) {
+    return {...row, weight: null};
+  }
+  return row;
 }
 
 /**
@@ -3141,6 +3216,8 @@ module.exports = {
   normalizeExtractedQuote,
   pushExtractWarning,
   parseLabeledFreightTotals,
+  parseLooseNumber,
+  isImplausibleShipmentWeight,
   applyLabeledFreightTotals,
   correctCartonVsPalletFreight,
   extractCompactPalletBlocks,

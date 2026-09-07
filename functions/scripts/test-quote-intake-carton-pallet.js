@@ -1240,6 +1240,86 @@ check("Waco uses SI total 679 → 339.5 each not 540.5",
 check("FL keeps first-lane total 1081 → 540.5 each",
     wacoBleed.lanes[0].freightInfo.map((r) => r.weight), [540.5, 540.5]);
 
+// GPA → LBE1 style: space/nbsp thousands must not parse as weight 6.
+// Screenshot bug: every PLT line showed "6 total" → Primus class 400.
+check("space thousands Total weight 6 245 → 6245",
+    intake.parseLabeledFreightTotals("Total weight – 6 245 with pallets").weight,
+    6245);
+check("nbsp thousands Total weight 6 245 → 6245",
+    intake.parseLabeledFreightTotals(
+        "Total weight – 6\u202F245 with pallets").weight,
+    6245);
+check("implausible lone Total weight 6 rejected",
+    intake.parseLabeledFreightTotals(
+        "Total weight – 6\nNumber of Pallets - 12").weight,
+    null);
+
+const GPA_LBE1_BODY = [
+  "Ship From: GPA",
+  "100 W. Walnut Avenue, Perris, CA 92571",
+  "Ship To: LBE1",
+  "165 Glenn Fox Rd, New Stanton, PA 15672",
+  "Total weight – 6 245 with pallets",
+  "Number of Pallets - 12",
+  "Pallet dimensions (L *W *H) – 1 plt @ 40x48x62, 2 plts @ 40x48x63, " +
+    "1 plt @ 40x48x69.5, 1 plt @ 40x48x67, 1 plt @ 40x48x69, " +
+    "2 plts @ 40x48x66, 1 plt @ 40x48x71, 1 plt @ 40x48x67.5, " +
+    "1 plt @ 40x48x64, 1 plt @ 40x48x65.5",
+].join("\n");
+const gpaAi = {
+  lanes: [{
+    freightInfo: [
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 62},
+      {qty: 2, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 63},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 69.5},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 67},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 69},
+      {qty: 2, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 66},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 71},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 67.5},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 64},
+      {qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+        length: 40, width: 48, height: 65.5},
+    ],
+  }],
+};
+intake.normalizeExtractedQuote(gpaAi, {
+  body: GPA_LBE1_BODY,
+  subject: "Quote Request LBE1",
+});
+const gpaWeights = gpaAi.lanes[0].freightInfo.map((r) => r.weight);
+const gpaTypes = gpaAi.lanes[0].freightInfo.map((r) => r.weightType);
+check("GPA LBE1 not stuck at 6 total",
+    gpaWeights.every((w) => w !== 6 && w > 100), true);
+check("GPA LBE1 even split ~520 each",
+    gpaWeights.every((w) => Math.abs(w - 520.42) < 0.01), true);
+check("GPA LBE1 weightType each",
+    gpaTypes.every((t) => t === "each"), true);
+
+// AI invents weight 6 with no Total weight → clear junk (don't rate class 400).
+const gpaNoTotal = {
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 6, weightType: "total", dimType: "PLT",
+      length: 40, width: 48, height: 62,
+    }],
+  }],
+};
+intake.normalizeExtractedQuote(gpaNoTotal, {
+  body: "Ship From GPA Perris\nShip To LBE1\n1 plt @ 40x48x62",
+});
+check("junk weight 6 cleared without Total weight",
+    gpaNoTotal.lanes[0].freightInfo[0].weight, null);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
