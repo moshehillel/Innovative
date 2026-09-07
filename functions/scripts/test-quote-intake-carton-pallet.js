@@ -1553,8 +1553,62 @@ check("shouldOverwrite keeps complete AI over incomplete cand",
         {palletCount: 2, weight: 1000}),
     false);
 
-if (failures) {
-  console.log(`\n${failures} failed`);
+// Complete 1-plt AI must not be bumped by informal "5 pallets" noise.
+const informalKeepAi = {
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 500, weightType: "total",
+      length: 40, width: 48, height: 60, dimType: "PLT",
+    }],
+  }],
+};
+intake.applyEmailPalletBlocks(informalKeepAi, {
+  subject: "RFQ",
+  body: "Please quote 5 pallets when ready\nNo pallet dims listed as blocks",
+});
+check("informal N pallets does not bump complete 1-plt AI",
+    informalKeepAi.lanes[0].freightInfo[0].qty, 1);
+
+// Coherent single-line AI kept by carton/pallet corrector (fill only).
+const coherentOneLine = {
+  lanes: [{
+    freightInfo: [{
+      qty: 2, weight: 1000, weightType: "total",
+      length: 40, width: 48, height: 55, dimType: "PLT",
+    }],
+  }],
+};
+const coherentOneSnap = JSON.stringify(coherentOneLine.lanes[0].freightInfo);
+intake.correctCartonVsPalletFreight(coherentOneLine,
+    "Number of Pallets - 2\nTotal weight – 1000\nPallet Dimensions: 40x48x55");
+check("coherent single-line AI not collapsed by labeled totals",
+    JSON.stringify(coherentOneLine.lanes[0].freightInfo), coherentOneSnap);
+
+// maybeRepairFreightExtract: max one attempt (early return, no model call).
+const repairOnceEx = {
+  _freightRepairAttempted: true,
+  extractModel: "grok-4.5",
+  extractionWarnings: [],
+  lanes: [{
+    freightInfo: [
+      {qty: 1, weight: 10, length: 40, width: 48, height: 60, dimType: "PLT"},
+    ],
+  }],
+};
+intake.maybeRepairFreightExtract(repairOnceEx, {
+  subject: "x",
+  body: CONFLICT_BODY,
+  from: "a@b.com",
+}).then((ran) => {
+  check("maybeRepairFreightExtract skips when already attempted", ran, false);
+  check("repair-once flag stays set",
+      repairOnceEx._freightRepairAttempted, true);
+  if (failures) {
+    console.log(`\n${failures} failed`);
+    process.exit(1);
+  }
+  console.log("\nAll carton-vs-pallet checks passed");
+}).catch((err) => {
+  console.log("FAIL maybeRepair once:", err && err.message);
   process.exit(1);
-}
-console.log("\nAll carton-vs-pallet checks passed");
+});

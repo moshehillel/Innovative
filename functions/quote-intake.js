@@ -1266,7 +1266,10 @@ function applyEmailPalletBlocks(extracted, opts) {
       const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
       const qty = rows.reduce((sum, r) =>
         sum + (Math.max(0, Number(r.qty) || 0)), 0);
-      if (qty <= 1 && rows.length <= 1) {
+      // AI-primary: only expand collapsed qty≤1 when AI lacks dims /
+      // is empty — never bump a complete 1-plt AI extract from informal
+      // "N pallets" noise in the email thread.
+      if (qty <= 1 && rows.length <= 1 && !aiFreightLooksComplete(rows)) {
         const base = rows[0] && typeof rows[0] === "object" ? rows[0] : {};
         lane.freightInfo = [freightDims.normalizePalletDims({
           ...base,
@@ -2140,8 +2143,9 @@ function correctCartonVsPalletFreight(extracted, body) {
       lane.freightInfo.map((r) => ({...r})) : [];
     const after = applyLabeledFreightTotals(before, labeled);
     // AI-first: when AI freight already matches labeled pallet count +
-    // weight, only fill missing fields — do not collapse/replace rows.
-    if (before.length >= 2 &&
+    // weight, only fill missing fields — do not collapse/replace rows
+    // (multi-line or a single coherent lumped line).
+    if (before.length >= 1 &&
         freightCoherentWithLabels(before, labeled) &&
         freightInfoQty(before) === freightInfoQty(after) &&
         before.length === after.length) {
