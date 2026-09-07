@@ -7,6 +7,7 @@
 
 const quoteOutput = require("./quote-output");
 const freightDims = require("./quote-freight-dims");
+const customerNameUtil = require("./quote-customer-name");
 
 let getPrimusToken = null;
 
@@ -981,17 +982,30 @@ async function resolveCustomerForQuote(opts = {}) {
   addSearch(opts.customerName || opts.name || "");
 
   if (email.includes("@")) {
-    const local = email.split("@")[0];
-    const domain = email.split("@")[1];
-    const domainStem = domain.split(".")[0];
-    if (domainStem.length > 2) addSearch(domainStem);
-    if (local.length > 2) addSearch(local);
+    const domain = email.split("@")[1] || "";
+    // Never search Primus using the mailbox local-part (gershon@… →
+    // "Gerson"). Company domains may contribute their org stem.
+    if (domain && !customerNameUtil.isFreemailDomain(domain)) {
+      const stem = customerNameUtil.registrableOrgStem(domain) ||
+        domain.split(".")[0];
+      if (stem && stem.length > 2 &&
+          !customerNameUtil.isFreemailBrandName(stem)) {
+        addSearch(stem);
+      }
+    }
   }
 
   const domainMatch = from.match(/@([\w.-]+)/);
   if (domainMatch) {
-    const stem = domainMatch[1].split(".")[0];
-    if (stem.length > 2) addSearch(stem);
+    const host = domainMatch[1];
+    if (host && !customerNameUtil.isFreemailDomain(host)) {
+      const stem = customerNameUtil.registrableOrgStem(host) ||
+        host.split(".")[0];
+      if (stem && stem.length > 2 &&
+          !customerNameUtil.isFreemailBrandName(stem)) {
+        addSearch(stem);
+      }
+    }
   }
 
   for (const term of opts.searchTerms || []) {

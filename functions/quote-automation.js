@@ -17,6 +17,7 @@ const quoteAccCatalog = require("./quote-accessorial-catalog");
 const quoteEmailAcc = require("./quote-email-accessorials");
 const freightDims = require("./quote-freight-dims");
 const senderRules = require("./quote-sender-rules");
+const customerNameUtil = require("./quote-customer-name");
 
 let deps = {};
 
@@ -57,8 +58,16 @@ async function resolveCustomerMatch(opts) {
   const ref = String(opts.customerRef || "");
   const customerName = String(
       (senderRule && senderRule.customerName) ||
-      opts.customerName || opts.shippingLocationName || "").trim();
-  const shipperName = String(opts.shipperName || "").trim();
+      customerNameUtil.pickUsableCustomerName(
+          opts.from || "",
+          opts.customerName,
+          opts.shippingLocationName) ||
+      "").trim();
+  const shipperNameRaw = String(opts.shipperName || "").trim();
+  const shipperName = customerNameUtil.isUnusableCustomerName(
+      shipperNameRaw, opts.from || "") ?
+    "" :
+    shipperNameRaw;
   const hay = `${ref} ${customerName} ${shipperName} ${opts.from || ""}`;
   const searchTerms = [];
   if (customerName) searchTerms.push(customerName);
@@ -206,8 +215,10 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
   const match = await resolveCustomerMatch({
     from: senderFrom,
     customerRef,
-    customerName: customerName || shipperName,
-    shipperName,
+    customerName: customerNameUtil.pickUsableCustomerName(
+        senderFrom, customerName, shipperName),
+    shipperName: customerNameUtil.isUnusableCustomerName(
+        shipperName, senderFrom) ? "" : shipperName,
     allowDefault: false,
     quoteRules: opts.quoteRules || [],
     cc: opts.cc != null ? opts.cc : data.cc,
@@ -1054,15 +1065,21 @@ async function processQuoteEmail(opts) {
     String(senderRuleForBillTo.customerName).trim() : "";
   const extractedCustomerName = String(
       billToFromSender ||
-      extracted.customerName ||
-      extracted.shippingLocationName ||
-      (extracted.shipper && extracted.shipper.name) ||
+      customerNameUtil.pickUsableCustomerName(
+          senderFrom,
+          extracted.customerName,
+          extracted.shippingLocationName,
+          extracted.shipper && extracted.shipper.name) ||
       "").trim();
+  const usableShipperName = customerNameUtil.isUnusableCustomerName(
+      extracted.shipper && extracted.shipper.name, senderFrom) ?
+    "" :
+    String((extracted.shipper && extracted.shipper.name) || "").trim();
   const customerMatch = await resolveCustomerMatch({
     from: senderFrom,
     customerRef: extracted.customerRef,
     customerName: extractedCustomerName,
-    shipperName: extracted.shipper && extracted.shipper.name,
+    shipperName: usableShipperName,
     quoteRules: rules,
     cc,
     to,
