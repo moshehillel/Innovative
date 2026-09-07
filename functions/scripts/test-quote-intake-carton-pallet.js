@@ -1441,6 +1441,118 @@ check("flagFreightConsistencyIssues qty mismatch direct", (() => {
     (ex.extractionWarnings || []).some((w) => /freight qty/i.test(w)));
 })(), true);
 
+// --- AI-primary + repair pass unit coverage ---
+
+check("aiFreightLooksComplete true with dims+qty",
+    intake.aiFreightLooksComplete([
+      {qty: 2, length: 40, width: 48, height: 60, weight: 500},
+    ]), true);
+check("aiFreightLooksComplete false without dims",
+    intake.aiFreightLooksComplete([{qty: 2, weight: 500}]), false);
+
+// Coherent AI uneven weights within tolerance → do not even-split.
+const INTENTIONAL_WEIGHT_BODY = [
+  "Number of Pallets - 3",
+  "Total weight – 1000",
+  "Pallet dimensions (L *W *H) – 40x48x60, 40x48x70, 40x48x50",
+].join("\n");
+const intentionalAi = {
+  lanes: [{
+    freightInfo: [
+      {qty: 1, weight: 400, weightType: "each",
+        length: 40, width: 48, height: 60, dimType: "PLT"},
+      {qty: 1, weight: 350, weightType: "each",
+        length: 40, width: 48, height: 70, dimType: "PLT"},
+      {qty: 1, weight: 250, weightType: "each",
+        length: 40, width: 48, height: 50, dimType: "PLT"},
+    ],
+  }],
+};
+const intentionalSnap = JSON.stringify(intentionalAi.lanes[0].freightInfo);
+intake.redistributeEvenTotalWeight(intentionalAi, INTENTIONAL_WEIGHT_BODY);
+check("intentional AI weights not even-split when sum≈total",
+    JSON.stringify(intentionalAi.lanes[0].freightInfo), intentionalSnap);
+check("shouldEvenSplitTotalWeight false for intentional AI",
+    intake.shouldEvenSplitTotalWeight(
+        intentionalAi.lanes[0].freightInfo,
+        INTENTIONAL_WEIGHT_BODY,
+        {palletCount: 3, weight: 1000}),
+    false);
+
+// freightNeedsAiRepair / collectFreightConsistencyIssues pure decision.
+const repairNeededEx = {
+  lanes: [{
+    freightInfo: [
+      {qty: 1, weight: 100, weightType: "total",
+        length: 40, width: 48, height: 60, dimType: "PLT"},
+      {qty: 1, weight: 100, weightType: "total",
+        length: 40, width: 48, height: 60, dimType: "PLT"},
+    ],
+  }],
+};
+const repairIssues = intake.collectFreightConsistencyIssues(
+    repairNeededEx, CONFLICT_BODY);
+check("collectFreightConsistencyIssues finds weight mismatch",
+    repairIssues.length >= 1 &&
+      repairIssues[0].reasons.some((r) => /freight weight/i.test(r)),
+    true);
+check("freightNeedsAiRepair true on mismatch",
+    intake.freightNeedsAiRepair(repairNeededEx, CONFLICT_BODY), true);
+check("freightNeedsAiRepair false when coherent",
+    intake.freightNeedsAiRepair({
+      lanes: [{
+        freightInfo: [
+          {qty: 1, weight: 1000, weightType: "each",
+            length: 40, width: 48, height: 60, dimType: "PLT"},
+          {qty: 1, weight: 1000, weightType: "each",
+            length: 40, width: 48, height: 60, dimType: "PLT"},
+        ],
+      }],
+    }, "Number of Pallets - 2\nTotal weight – 2000"), false);
+
+// mergeRepairedFreightLanes + buildFreightRepairPayload (no live AI call).
+const mergeTarget = {
+  extractModel: "grok-4.5",
+  lanes: [
+    {freightInfo: [{qty: 1, weight: 10, length: 40, width: 48, height: 60}]},
+    {freightInfo: [{qty: 2, weight: 500, length: 40, width: 48, height: 70}]},
+  ],
+};
+const repairPayload = intake.buildFreightRepairPayload(
+    mergeTarget, {subject: "RFQ", body: CONFLICT_BODY, from: "a@b.com"},
+    repairIssues);
+check("buildFreightRepairPayload includes failing laneIndex",
+    Array.isArray(repairPayload.lanes) &&
+      repairPayload.lanes[0].laneIndex === 0, true);
+check("mergeRepairedFreightLanes replaces failing freight",
+    intake.mergeRepairedFreightLanes(mergeTarget, {
+      lanes: [{
+        laneIndex: 0,
+        freightInfo: [
+          {qty: 1, weight: 1000, weightType: "each",
+            length: 40, width: 48, height: 60, dimType: "PLT"},
+          {qty: 1, weight: 1000, weightType: "each",
+            length: 40, width: 48, height: 60, dimType: "PLT"},
+        ],
+      }],
+    }), true);
+check("merge kept other lane untouched",
+    mergeTarget.lanes[1].freightInfo[0].qty, 2);
+check("merged lane qty 2 after repair",
+    mergeTarget.lanes[0].freightInfo.reduce(
+        (s, r) => s + (Number(r.qty) || 0), 0), 2);
+
+// Complete AI kept when regex candidate is worse (dims+qty present).
+check("shouldOverwrite keeps complete AI over incomplete cand",
+    intake.shouldOverwriteAiFreight(
+        [
+          {qty: 1, weight: 500, length: 40, width: 48, height: 60},
+          {qty: 1, weight: 500, length: 40, width: 48, height: 70},
+        ],
+        [{qty: 1, weight: 500, length: 40, width: 48, height: 60}],
+        {palletCount: 2, weight: 1000}),
+    false);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

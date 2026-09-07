@@ -10,6 +10,7 @@ const {DEFAULT_OPENAI_MODEL} = require("./openai-models");
 const emailAccessorials = require("./quote-email-accessorials");
 const freightDims = require("./quote-freight-dims");
 const freightRules = require("./quote-freight-rules");
+const customerNameUtil = require("./quote-customer-name");
 const senderRules = require("./quote-sender-rules");
 
 const QUOTE_CLASSIFY_BODY_MAX = 12000;
@@ -87,11 +88,12 @@ function pushExtractWarning(extracted, msg) {
 }
 
 /**
- * Deterministic post-processor that ALWAYS runs after AI (and heuristic)
- * extract. Does not trust the LLM for cartons vs pallets, Pallet N
- * blocks, 40×48 dims, total-weight, or accessorial negation.
+ * Deterministic traffic-cop after AI (and heuristic) extract.
+ * AI owns freight lines / dims / weights; code validates consistency,
+ * fills truly missing fields, and may expand collapsed AI into labeled
+ * mixed-dim detail. Does not blindly rewrite coherent AI freight.
  * @param {object} extracted extractQuoteRequest result.
- * @param {object} [opts] subject, body, from.
+ * @param {object} [opts] subject, body, from, deferConsistencyFlags.
  * @return {object}
  */
 function normalizeExtractedQuote(extracted, opts) {
@@ -109,6 +111,9 @@ function normalizeExtractedQuote(extracted, opts) {
   const from = opts && opts.from != null ? String(opts.from) : "";
   const senderFrom = senderRules.resolveQuoteSenderFrom(
       from, opts && opts.body);
+  // Strip mailbox local-part guesses (gershon@gmail → "Gerson") before
+  // sender rules can supply a real Primus customer name.
+  customerNameUtil.sanitizeExtractedCustomerName(next, senderFrom || from);
   const recipientOpts = {
     cc: opts && opts.cc,
     to: opts && opts.to,
@@ -143,7 +148,9 @@ function normalizeExtractedQuote(extracted, opts) {
     pushExtractWarning(next, w);
   }
   stampAlternateQuantityQuoteFlags(next, opts);
-  flagFreightConsistencyIssues(next, opts && opts.body);
+  if (!(opts && opts.deferConsistencyFlags)) {
+    flagFreightConsistencyIssues(next, opts && opts.body);
+  }
   return next;
 }
 
@@ -204,12 +211,32 @@ function palletRowsMissingDims(extracted) {
 
 /**
  * Normalize sole-address + stamp email-requested accessorial codes.
+ * Sync path (tests / callers that skip AI repair). Prefer
+ * finishExtractAsync when extract API keys are available so a single
+ * freight repair pass can run on consistency failure.
  * @param {object} extracted Intake payload.
  * @param {object} opts subject, body, from.
  * @return {object}
  */
 function finishExtract(extracted, opts) {
   return normalizeExtractedQuote(extracted, opts);
+}
+
+/**
+ * Normalize, optionally run one AI freight repair pass on failing lanes,
+ * then flag consistency. Max one repair attempt per quote.
+ * @param {object} extracted Intake payload.
+ * @param {object} opts subject, body, from.
+ * @return {Promise<object>}
+ */
+async function finishExtractAsync(extracted, opts) {
+  const next = normalizeExtractedQuote(extracted, {
+    ...(opts || {}),
+    deferConsistencyFlags: true,
+  });
+  await maybeRepairFreightExtract(next, opts);
+  flagFreightConsistencyIssues(next, opts && opts.body);
+  return next;
 }
 
 /**
@@ -373,7 +400,15 @@ function quoteExtractSystemPrompt() {
     "Keys:",
     "- format: multi_lane_table | single_shipment | unknown",
     "- customerRef: PO / sales order / subject reference",
-    "- customerName: bill-to / account / company requesting the quote",
+    "- customerName: bill-to / account / company requesting the quote.",
+    "  Prefer signature company, body bill-to / account, or letterhead.",
+    "  NEVER invent customerName from the email local-part (before @).",
+    "  Example: gershon@gmail.com → customerName null (not Gerson,",
+    "  Gershon, or Gmail). Freemail hosts (gmail/yahoo/hotmail/",
+    "  outlook/icloud/aol/me.com/etc.) are never company names.",
+    "  Company domains only: when no better signal exists, the org",
+    "  label after @ may be used (jane@acme.com → Acme;",
+    "  ops@mail.acme.com → Acme).",
     "- readyDate: YYYY-MM-DD or null",
     "- shipper: {name, address1, city, state, zipCode, country, phone}",
     "- lanes: array of {",
@@ -592,15 +627,16 @@ function quoteExtractSystemPrompt() {
 /**
  * @param {object} payload subject/from/body.
  * @param {string} model Claude model slug.
+ * @param {string} [systemPrompt] Override system prompt.
  * @return {Promise<string>} Raw model text.
  */
-async function callClaudeQuoteExtraction(payload, model) {
+async function callClaudeQuoteExtraction(payload, model, systemPrompt) {
   const client = new Anthropic({apiKey: process.env.ANTHROPIC_API_KEY});
   const res = await client.messages.create({
     model,
     // Multi-lane Target/table RFQs need headroom; 4k truncates mid-JSON.
     max_tokens: 16000,
-    system: quoteExtractSystemPrompt(),
+    system: systemPrompt || quoteExtractSystemPrompt(),
     messages: [{
       role: "user",
       content: JSON.stringify(payload),
@@ -616,9 +652,10 @@ async function callClaudeQuoteExtraction(payload, model) {
 /**
  * @param {object} payload subject/from/body.
  * @param {string} model OpenAI model slug.
+ * @param {string} [systemPrompt] Override system prompt.
  * @return {Promise<string>} Raw model text.
  */
-async function callOpenAiQuoteExtraction(payload, model) {
+async function callOpenAiQuoteExtraction(payload, model, systemPrompt) {
   const apiKey = getQuoteClassifyOpenAiKey();
   if (!apiKey) throw new Error("OpenAI API key not configured");
   const client = new OpenAI({apiKey});
@@ -627,7 +664,7 @@ async function callOpenAiQuoteExtraction(payload, model) {
     max_completion_tokens: 16000,
     response_format: {type: "json_object"},
     messages: [
-      {role: "system", content: quoteExtractSystemPrompt()},
+      {role: "system", content: systemPrompt || quoteExtractSystemPrompt()},
       {role: "user", content: JSON.stringify(payload)},
     ],
   });
@@ -643,9 +680,10 @@ async function callOpenAiQuoteExtraction(payload, model) {
  * Cursor Agent SDK extract (same path as bake-off winner grok-4.5).
  * @param {object} payload subject/from/body.
  * @param {string} model Cursor model id (e.g. grok-4.5).
+ * @param {string} [systemPrompt] Override system prompt.
  * @return {Promise<string>} Raw model text.
  */
-async function callCursorQuoteExtraction(payload, model) {
+async function callCursorQuoteExtraction(payload, model, systemPrompt) {
   const apiKey = getCursorApiKey();
   if (!apiKey) throw new Error("CRSR_API_KEY not configured");
   let Agent;
@@ -674,7 +712,7 @@ async function callCursorQuoteExtraction(payload, model) {
   try {
     spawnSync("git", ["init"], {cwd: scratch, stdio: "ignore"});
     const prompt = [
-      quoteExtractSystemPrompt(),
+      systemPrompt || quoteExtractSystemPrompt(),
       "",
       "Return ONLY the extract JSON object. Do not edit files. Do not use tools.",
       "No markdown fences. No explanation.",
@@ -735,19 +773,20 @@ async function callCursorQuoteExtraction(payload, model) {
 }
 
 /**
- * @param {object} payload subject/from/body.
+ * @param {object} payload subject/from/body or repair payload.
  * @param {string} [model] Override model slug.
+ * @param {string} [systemPrompt] Override system prompt.
  * @return {Promise<string>} Raw model text.
  */
-async function callQuoteExtractionModel(payload, model) {
+async function callQuoteExtractionModel(payload, model, systemPrompt) {
   const slug = model || getQuoteExtractModel();
   if (isCursorExtractModel(slug)) {
-    return callCursorQuoteExtraction(payload, slug);
+    return callCursorQuoteExtraction(payload, slug, systemPrompt);
   }
   if (isOpenAiExtractModel(slug)) {
-    return callOpenAiQuoteExtraction(payload, slug);
+    return callOpenAiQuoteExtraction(payload, slug, systemPrompt);
   }
-  return callClaudeQuoteExtraction(payload, slug);
+  return callClaudeQuoteExtraction(payload, slug, systemPrompt);
 }
 
 /**
@@ -1060,6 +1099,16 @@ function freightRowsHaveDims(rows) {
 }
 
 /**
+ * True when AI freight already has usable dims + qty ≥ 1 (default keep).
+ * @param {Array<object>} rows Freight lines.
+ * @return {boolean}
+ */
+function aiFreightLooksComplete(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return freightInfoQty(list) >= 1 && freightRowsHaveDims(list);
+}
+
+/**
  * True when AI (or candidate) freight is consistent with labeled
  * Number of Pallets + Total weight (within tolerance). Empty AI is never
  * coherent.
@@ -1095,9 +1144,9 @@ function freightCoherentWithLabels(rows, labeled) {
 
 /**
  * AI-first overwrite policy for deterministic post-processors.
- * Fill missing freight; correct only when labeled totals clearly conflict
- * with AI and the deterministic parse matches labels better. Never replace
- * a coherent AI freight table with a partial/worse regex match.
+ * Default: keep AI freight when it has dims + qty ≥ 1. Deterministic
+ * overwrite only when AI is empty/incomplete OR candidate clearly matches
+ * labeled totals better (never replace coherent AI with a partial regex).
  * @param {Array<object>} aiRows Existing (usually AI) freight.
  * @param {Array<object>} candidateRows Deterministic parse.
  * @param {object} labeled parseLabeledFreightTotals for this lane scope.
@@ -1112,6 +1161,7 @@ function shouldOverwriteAiFreight(aiRows, candidateRows, labeled) {
   if (!(candQty > 0) || !cand.length) return false;
   if (!(aiQty > 0) || !ai.length) return true;
 
+  const aiComplete = aiFreightLooksComplete(ai);
   const aiCoherent = freightCoherentWithLabels(ai, lab);
   const candCoherent = freightCoherentWithLabels(cand, lab);
 
@@ -1122,7 +1172,8 @@ function shouldOverwriteAiFreight(aiRows, candidateRows, labeled) {
     return false;
   }
 
-  if (aiCoherent) {
+  if (aiCoherent || (aiComplete && !candCoherent &&
+      (lab.palletCount == null || aiQty === lab.palletCount))) {
     // Expand collapsed AI (one lumped line) into mixed dim detail when
     // the deterministic parse matches labeled pallet count.
     if (ai.length <= 1 && cand.length >= 2 &&
@@ -1136,8 +1187,10 @@ function shouldOverwriteAiFreight(aiRows, candidateRows, labeled) {
         ai.some((r) => Math.max(0, Number(r.qty) || 0) > 1)) {
       return true;
     }
-    // Keep coherent AI — never replace with a partial/worse regex match.
-    return false;
+    // Keep coherent / complete AI — never replace with a worse regex.
+    if (aiCoherent) return false;
+    // Complete AI matching labeled qty: keep unless candidate is better.
+    if (aiComplete && !candCoherent) return false;
   }
 
   if (candCoherent) return true;
@@ -1150,6 +1203,8 @@ function shouldOverwriteAiFreight(aiRows, candidateRows, labeled) {
     }
   }
   if (!freightRowsHaveDims(ai) && freightRowsHaveDims(cand)) return true;
+  // Default AI-primary: do not overwrite complete AI with incomplete cand.
+  if (aiComplete) return false;
   return false;
 }
 
@@ -1686,6 +1741,8 @@ function assignEvenWeightPerPallet(rows, totalWeight) {
 /**
  * When Total weight + mixed dim lines (no per-line lbs), divide total
  * evenly per pallet with weightType "each".
+ * Prefer skipping when AI per-line weights already look intentional and
+ * consistent with the lane-scoped total (within tolerance).
  * @param {Array<object>} rows Freight lines.
  * @param {string} body Email body.
  * @param {object} [labeled] parseLabeledFreightTotals result.
@@ -1717,6 +1774,10 @@ function shouldEvenSplitTotalWeight(rows, body, labeled) {
 
   const implied = list.map(lineImpliedTotalWeight);
   const sum = implied.reduce((a, b) => a + b, 0);
+  const anyMissing = implied.some((w) => !(w > 0));
+  // Missing/junk-cleared weights → fill from labeled total.
+  if (anyMissing) return true;
+
   const anyHoldsFullTotal = list.some((r) => {
     const w = Number(r.weight);
     const qty = Math.max(0, Number(r.qty) || 0);
@@ -1730,7 +1791,10 @@ function shouldEvenSplitTotalWeight(rows, body, labeled) {
   const stubMax = Math.max(5, per * 0.05);
   const anyStub = implied.some((w) => w > 0 && w <= stubMax);
   if (anyHoldsFullTotal || anyStub) return true;
-  if (Math.abs(sum - lab.weight) < 1 && implied.every((w) => w > stubMax)) {
+
+  // Intentional AI per-line weights already consistent with labeled total.
+  if (Math.abs(sum - lab.weight) <= labeledWeightTolerance(lab.weight) &&
+      implied.every((w) => w > stubMax)) {
     return false;
   }
   return true;
@@ -1815,23 +1879,29 @@ function applyPerPalletWeightTable(extracted, body) {
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     const flat = flattenFreightToUnitQty(rows);
     if (flat.length === weights.length) {
-      lane.freightInfo = flat.map((row, i) =>
+      const expanded = flat.map((row, i) =>
         freightDims.normalizePalletDims({
           ...row,
           qty: 1,
           weight: weights[i],
           weightType: "each",
         }));
+      if (shouldOverwriteAiFreight(rows, expanded, labeled)) {
+        lane.freightInfo = expanded;
+      }
     } else if (rows.length === 1 &&
         Math.max(0, Number(rows[0].qty) || 0) === weights.length) {
       const base = rows[0];
-      lane.freightInfo = weights.map((w) =>
+      const expanded = weights.map((w) =>
         freightDims.normalizePalletDims({
           ...base,
           qty: 1,
           weight: w,
           weightType: "each",
         }));
+      if (shouldOverwriteAiFreight(rows, expanded, labeled)) {
+        lane.freightInfo = expanded;
+      }
     }
   }
   return extracted;
@@ -3154,38 +3224,38 @@ function clearImplausibleLowPalletWeight(row) {
 }
 
 /**
- * After normalize: flag qty/weight/density mismatches for dispatcher
- * review instead of silently shipping bad freight.
+ * Pure: collect per-lane freight consistency problems vs labeled totals.
+ * Used by flagging and to decide whether an AI repair pass is needed.
  * @param {object} extracted Parsed quote.
  * @param {string} body Email body.
- * @return {object}
+ * @return {Array<{laneIndex: number, reasons: string[], labeled: object,
+ *   qty: number, weightSum: number}>}
  */
-function flagFreightConsistencyIssues(extracted, body) {
-  if (!extracted || typeof extracted !== "object") return extracted;
-  if (!Array.isArray(extracted.lanes)) return extracted;
+function collectFreightConsistencyIssues(extracted, body) {
+  const issues = [];
+  if (!extracted || !Array.isArray(extracted.lanes)) return issues;
   const sections = extractNumberedShipmentSections(body);
-  let needsReview = false;
-  for (const lane of extracted.lanes) {
+  for (let laneIndex = 0; laneIndex < extracted.lanes.length; laneIndex++) {
+    const lane = extracted.lanes[laneIndex];
     if (!lane || typeof lane !== "object") continue;
     const scope = resolveLaneFreightScope(lane, body, sections);
     const labeled = scope.labeled;
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     const qty = freightInfoQty(rows);
     const sum = freightInfoWeightSum(rows);
+    const reasons = [];
 
     if (labeled.palletCount != null && qty > 0 &&
         qty !== labeled.palletCount) {
-      pushExtractWarning(extracted,
+      reasons.push(
           `freight qty ${qty} ≠ labeled ${labeled.palletCount} pallets`);
-      needsReview = true;
     }
     if (labeled.weight != null && labeled.weight > 0 && sum > 0 &&
         Math.abs(sum - labeled.weight) >
           labeledWeightTolerance(labeled.weight)) {
-      pushExtractWarning(extracted,
+      reasons.push(
           `freight weight ${Math.round(sum)} ≠ labeled total ` +
           `${labeled.weight}`);
-      needsReview = true;
     }
     for (const r of rows) {
       if (!freightDims.isPalletPackaging(r)) continue;
@@ -3195,20 +3265,15 @@ function flagFreightConsistencyIssues(extracted, body) {
       const substantial = h >= 24 ||
         freightDims.isStandardPalletFootprint(r.length, r.width);
       if (substantial && per > 0 && per < 25) {
-        pushExtractWarning(extracted,
-            "implausible pallet weight < 25 lb with normal dims");
-        needsReview = true;
+        reasons.push("implausible pallet weight < 25 lb with normal dims");
         break;
       }
     }
-    // Near-zero / cleared weights with labeled total still missing →
-    // density would force class 400 if rated as-is.
     if (labeled.weight != null && labeled.weight > 0 &&
         rows.some((r) => freightDims.isPalletPackaging(r) &&
           !(lineImpliedTotalWeight(r) > 0))) {
-      pushExtractWarning(extracted,
+      reasons.push(
           "missing pallet weight vs labeled total (class 400 risk)");
-      needsReview = true;
     }
     if (!(labeled.weight > 0) && rows.some((r) => {
       if (!freightDims.isPalletPackaging(r)) return false;
@@ -3218,17 +3283,189 @@ function flagFreightConsistencyIssues(extracted, body) {
       const w = Number(r.weight);
       return substantial && Number.isFinite(w) && w > 0 && w < 25;
     })) {
-      pushExtractWarning(extracted,
-          "near-zero pallet weight may force class 400");
-      needsReview = true;
+      reasons.push("near-zero pallet weight may force class 400");
+    }
+    if (reasons.length) {
+      issues.push({laneIndex, reasons, labeled, qty, weightSum: sum});
     }
   }
-  if (needsReview) {
-    extracted.flags = extracted.flags && typeof extracted.flags === "object" ?
-      {...extracted.flags} : {};
-    extracted.flags.needsDispatcherReview = true;
+  return issues;
+}
+
+/**
+ * True when collectFreightConsistencyIssues found failing lanes.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function freightNeedsAiRepair(extracted, body) {
+  return collectFreightConsistencyIssues(extracted, body).length > 0;
+}
+
+/**
+ * After normalize: flag qty/weight/density mismatches for dispatcher
+ * review instead of silently shipping bad freight.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function flagFreightConsistencyIssues(extracted, body) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  const issues = collectFreightConsistencyIssues(extracted, body);
+  if (!issues.length) return extracted;
+  for (const issue of issues) {
+    for (const reason of issue.reasons) {
+      pushExtractWarning(extracted, reason);
+    }
   }
+  extracted.flags = extracted.flags && typeof extracted.flags === "object" ?
+    {...extracted.flags} : {};
+  extracted.flags.needsDispatcherReview = true;
   return extracted;
+}
+
+/**
+ * Short system prompt for a single freight repair pass (failing lanes only).
+ * @return {string}
+ */
+function quoteFreightRepairSystemPrompt() {
+  return [
+    "You repair LTL freightInfo for a freight broker quote extract.",
+    "Return ONLY valid JSON (no markdown):",
+    "{\"lanes\":[{\"laneIndex\":0,\"freightInfo\":[{qty,weight,weightType,",
+    "class,length,width,height,dimType}]}]}",
+    "",
+    "Rules:",
+    "- Fix ONLY the listed failing lanes. Match labeled Number of Pallets",
+    "  and Total weight exactly (sum of line weights = Total weight).",
+    "- Preserve pallet dims from the email / current freight when sane.",
+    "- Cartons ≠ pallets. qty is pallet pieces, not carton count.",
+    "- Never invent <25 lb/pallet on normal 40x48 dims.",
+    "- Prefer weightType \"each\" when dividing a shipment total across",
+    "  multiple pallet lines; use \"total\" for a single lumped line.",
+    "- Do not invent shipper/consignee/accessorials — freightInfo only.",
+  ].join("\n");
+}
+
+/**
+ * Build repair user payload for failing lanes only.
+ * @param {object} extracted Normalized extract.
+ * @param {object} opts subject, from, body.
+ * @param {Array<object>} issues collectFreightConsistencyIssues result.
+ * @return {object}
+ */
+function buildFreightRepairPayload(extracted, opts, issues) {
+  const lanes = (issues || []).map((issue) => {
+    const lane = extracted.lanes[issue.laneIndex] || {};
+    return {
+      laneIndex: issue.laneIndex,
+      problems: issue.reasons,
+      labeled: issue.labeled,
+      consignee: lane.consignee || null,
+      specialInstructions: lane.specialInstructions || "",
+      currentFreightInfo: Array.isArray(lane.freightInfo) ?
+        lane.freightInfo : [],
+    };
+  });
+  return {
+    repair: true,
+    subject: opts && opts.subject || "",
+    from: opts && opts.from || "",
+    body: String(opts && opts.body || "").slice(0, 8000),
+    lanes,
+  };
+}
+
+/**
+ * Merge repaired freightInfo into extracted lanes by laneIndex.
+ * @param {object} extracted Mutated extract.
+ * @param {object} repairedParsed {lanes:[{laneIndex, freightInfo}]}.
+ * @return {boolean} True when at least one lane freight was replaced.
+ */
+function mergeRepairedFreightLanes(extracted, repairedParsed) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return false;
+  const repairs = repairedParsed && Array.isArray(repairedParsed.lanes) ?
+    repairedParsed.lanes : [];
+  let merged = false;
+  for (const entry of repairs) {
+    if (!entry || typeof entry !== "object") continue;
+    const idx = Number(entry.laneIndex);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= extracted.lanes.length) {
+      continue;
+    }
+    const freight = Array.isArray(entry.freightInfo) ? entry.freightInfo : [];
+    if (!freight.length) continue;
+    const lane = extracted.lanes[idx];
+    if (!lane || typeof lane !== "object") continue;
+    lane.freightInfo = freight.map((r) =>
+      freightDims.normalizePalletDims(
+          r && typeof r === "object" ? {...r} : {}));
+    merged = true;
+  }
+  return merged;
+}
+
+/**
+ * Whether extract API keys allow a model call for the given slug.
+ * @param {string} model Model slug.
+ * @return {boolean}
+ */
+function canCallQuoteExtractModel(model) {
+  const slug = model || getQuoteExtractModel();
+  if (isCursorExtractModel(slug)) return Boolean(getCursorApiKey());
+  if (isOpenAiExtractModel(slug)) return Boolean(getQuoteClassifyOpenAiKey());
+  return Boolean(process.env.ANTHROPIC_API_KEY);
+}
+
+/**
+ * Optional second AI pass: re-extract freight for failing lanes only.
+ * Max one attempt per quote. On failure / unavailable model, keep AI +
+ * existing warnings (do not Haiku-overwrite blindly).
+ * @param {object} extracted Mutated extract (post first normalize).
+ * @param {object} opts subject, body, from.
+ * @return {Promise<boolean>} True when repair merged and re-normalized.
+ */
+async function maybeRepairFreightExtract(extracted, opts) {
+  if (!extracted || typeof extracted !== "object") return false;
+  if (extracted._freightRepairAttempted) return false;
+  extracted._freightRepairAttempted = true;
+  const body = opts && opts.body;
+  const issues = collectFreightConsistencyIssues(extracted, body);
+  if (!issues.length) return false;
+
+  const primaryModel = extracted.extractModel &&
+    !String(extracted.extractModel).includes("heuristic") ?
+    String(extracted.extractModel).split("+")[0] :
+    getQuoteExtractModel();
+  if (!canCallQuoteExtractModel(primaryModel)) {
+    pushExtractWarning(extracted,
+        "freight repair skipped (extract model unavailable)");
+    return false;
+  }
+
+  try {
+    const payload = buildFreightRepairPayload(extracted, opts, issues);
+    const raw = await callQuoteExtractionModel(
+        payload, primaryModel, quoteFreightRepairSystemPrompt());
+    const parsed = parseQuoteExtractJson(raw);
+    if (!parsed || !mergeRepairedFreightLanes(extracted, parsed)) {
+      pushExtractWarning(extracted, "AI freight repair returned no usable lanes");
+      return false;
+    }
+    normalizeExtractedQuote(extracted, {
+      ...(opts || {}),
+      deferConsistencyFlags: true,
+    });
+    const base = String(extracted.extractModel || primaryModel)
+        .replace(/\+repair$/, "");
+    extracted.extractModel = `${base}+repair`;
+    pushExtractWarning(extracted, "AI freight repair pass ran");
+    return true;
+  } catch (err) {
+    pushExtractWarning(extracted,
+        `AI freight repair failed (${(err && err.message) || "unknown"})`);
+    return false;
+  }
 }
 
 /**
@@ -3251,23 +3488,20 @@ async function extractQuoteRequest(opts) {
   };
 
   const extractModel = getQuoteExtractModel();
-  let canCallModel = false;
+  let canCallModel = canCallQuoteExtractModel(extractModel);
   let missingKeyError = "extract API key not configured";
   if (isCursorExtractModel(extractModel)) {
-    canCallModel = Boolean(getCursorApiKey());
     missingKeyError = "CRSR_API_KEY not configured";
   } else if (isOpenAiExtractModel(extractModel)) {
-    canCallModel = Boolean(getQuoteClassifyOpenAiKey());
     missingKeyError = "OpenAI API key not configured";
   } else {
-    canCallModel = Boolean(process.env.ANTHROPIC_API_KEY);
     missingKeyError = "ANTHROPIC_API_KEY not configured";
   }
   if (!canCallModel) {
     const heuristic = heuristicExtractQuote({subject, from, body});
     if (heuristic) {
       heuristic.extractModel = "heuristic";
-      return finishExtract(heuristic, {subject, body, from});
+      return finishExtractAsync(heuristic, {subject, body, from});
     }
     fallback.error = missingKeyError;
     fallback.extractModel = extractModel;
@@ -3288,7 +3522,7 @@ async function extractQuoteRequest(opts) {
       if (!parsed.flags) parsed.flags = {};
       parsed.extractModel = extractModel;
       if (parsed.lanes.length) {
-        return finishExtract(parsed, {subject, body, from});
+        return finishExtractAsync(parsed, {subject, body, from});
       }
       lastErr = new Error("model returned zero lanes");
     } catch (err) {
@@ -3307,7 +3541,7 @@ async function extractQuoteRequest(opts) {
         parsed.extractModel = FALLBACK_QUOTE_EXTRACT_MODEL;
         pushExtractWarning(parsed,
             `Cursor extract failed (${(lastErr && lastErr.message) || "unknown"}); used Haiku fallback`);
-        return finishExtract(parsed, {subject, body, from});
+        return finishExtractAsync(parsed, {subject, body, from});
       }
     } catch (fallbackErr) {
       lastErr = fallbackErr;
@@ -3321,7 +3555,7 @@ async function extractQuoteRequest(opts) {
       pushExtractWarning(heuristic,
           `AI extract failed (${lastErr.message}); used heuristic`);
     }
-    return finishExtract(heuristic, {subject, body, from});
+    return finishExtractAsync(heuristic, {subject, body, from});
   }
 
   fallback.error = `Parse failed: ${(lastErr && lastErr.message) || "unknown"}`;
@@ -3473,6 +3707,7 @@ module.exports = {
   isOpenAiExtractModel,
   isCursorExtractModel,
   quoteExtractSystemPrompt,
+  quoteFreightRepairSystemPrompt,
   callQuoteExtractionModel,
   extractJsonObject,
   parseQuoteExtractJson,
@@ -3490,7 +3725,10 @@ module.exports = {
   applyCoreHomePoTableFreight,
   partyHasPhysicalAddress,
   finishExtract,
+  finishExtractAsync,
   normalizeExtractedQuote,
+  sanitizeExtractedCustomerName:
+    customerNameUtil.sanitizeExtractedCustomerName,
   pushExtractWarning,
   parseLabeledFreightTotals,
   parseLooseNumber,
@@ -3512,10 +3750,17 @@ module.exports = {
   resolveLaneFreightScope,
   extractDestinationLocalSlice,
   shouldOverwriteAiFreight,
+  aiFreightLooksComplete,
   freightCoherentWithLabels,
+  collectFreightConsistencyIssues,
+  freightNeedsAiRepair,
   flagFreightConsistencyIssues,
+  buildFreightRepairPayload,
+  mergeRepairedFreightLanes,
+  maybeRepairFreightExtract,
   redistributeEvenTotalWeight,
   assignEvenWeightPerPallet,
+  shouldEvenSplitTotalWeight,
   parseInformalPalletCount,
   heuristicExtractQuote,
   heuristicPickUpAt,
