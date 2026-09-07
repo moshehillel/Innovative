@@ -1320,6 +1320,127 @@ intake.normalizeExtractedQuote(gpaNoTotal, {
 check("junk weight 6 cleared without Total weight",
     gpaNoTotal.lanes[0].freightInfo[0].weight, null);
 
+// --- Long-term hardening: AI-first + lane scope + consistency flags ---
+
+check("normalizeDirtyFreightText flattens curly dash + nbsp",
+    intake.normalizeDirtyFreightText("Total weight \u2013 6\u202F245"),
+    "Total weight - 6 245");
+
+// Coherent AI must NOT be overwritten by a partial regex (3 of 5 lines).
+const AI_KEEP_BODY = [
+  "Shipment 1:",
+  "DEST CITY CA 90210",
+  "Number of Pallets – 5",
+  "Total weight – 2000",
+  "(x2) 48*40*54 – 30ctns – 800lbs",
+  "48*40*35 – 13ctns – 400lbs",
+  "48*42*59 – 37tns – 400lbs",
+  "48*42*60 – 39ctns – 400lbs",
+  "Shipment 2:",
+  "OTHER DEST FL 32220",
+].join("\n");
+const aiKeepPartialRegex = {
+  lanes: [{
+    consignee: {city: "DEST CITY", state: "CA", zipCode: "90210"},
+    freightInfo: [
+      {qty: 2, weight: 800, length: 40, width: 48, height: 54, dimType: "PLT"},
+      {qty: 1, weight: 400, length: 40, width: 48, height: 35, dimType: "PLT"},
+      {qty: 1, weight: 400, length: 48, width: 42, height: 59, dimType: "PLT"},
+      {qty: 1, weight: 400, length: 48, width: 42, height: 60, dimType: "PLT"},
+    ],
+  }],
+};
+const aiKeepSnapshot = JSON.stringify(aiKeepPartialRegex.lanes[0].freightInfo);
+intake.applyEmailPalletBlocks(aiKeepPartialRegex, {body: AI_KEEP_BODY});
+check("coherent AI freight not overwritten by partial regex",
+    JSON.stringify(aiKeepPartialRegex.lanes[0].freightInfo), aiKeepSnapshot);
+check("shouldOverwriteAiFreight false when AI matches labels",
+    intake.shouldOverwriteAiFreight(
+        aiKeepPartialRegex.lanes[0].freightInfo,
+        [{qty: 2, weight: 800, length: 40, width: 48, height: 54},
+          {qty: 1, weight: 400, length: 40, width: 48, height: 35}],
+        {palletCount: 5, weight: 2000}),
+    false);
+
+// Destination-local "TO WACO" slice without SI on the lane.
+const wacoNoSi = {
+  lanes: [
+    {
+      consignee: {city: "JACKSONVILLE", state: "FL", zipCode: "32220"},
+      freightInfo: [
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 70, dimType: "PLT"},
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 50, dimType: "PLT"},
+      ],
+    },
+    {
+      consignee: {city: "WACO", state: "TX", zipCode: "76712"},
+      freightInfo: [
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 80, dimType: "PLT"},
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 63, dimType: "PLT"},
+      ],
+    },
+  ],
+};
+const wacoScope = intake.resolveLaneFreightScope(
+    wacoNoSi.lanes[1], MULTI_DEST_NO_SHIPMENT_HEADERS, []);
+check("TO WACO dest slice scopes Total weight 679",
+    wacoScope.labeled.weight, 679);
+intake.normalizeExtractedQuote(wacoNoSi, {
+  body: MULTI_DEST_NO_SHIPMENT_HEADERS,
+  subject: "LFW AAFES WACO no SI",
+});
+check("Waco dest-slice redistribute 679 → 339.5 each",
+    wacoNoSi.lanes[1].freightInfo.map((r) => r.weight), [339.5, 339.5]);
+
+// Consistency → needsDispatcherReview when freight weight conflicts labels
+// and explicit per-line lbs block even-split redistribution.
+const CONFLICT_BODY = [
+  "Number of Pallets - 2",
+  "Total weight – 2000",
+  "Pallet 1: 48x40x60, 100lbs",
+  "Pallet 2: 48x40x60, 150lbs",
+].join("\n");
+const conflictExtract = {
+  flags: {},
+  lanes: [{
+    consignee: {city: "PERRIS", state: "CA", zipCode: "92571"},
+    freightInfo: [
+      {qty: 1, weight: 100, weightType: "total",
+        length: 48, width: 40, height: 60, dimType: "PLT"},
+      {qty: 1, weight: 150, weightType: "total",
+        length: 48, width: 40, height: 60, dimType: "PLT"},
+    ],
+  }],
+};
+intake.normalizeExtractedQuote(conflictExtract, {body: CONFLICT_BODY});
+check("bad AI vs labels sets needsDispatcherReview",
+    !!(conflictExtract.flags && conflictExtract.flags.needsDispatcherReview),
+    true);
+check("bad AI vs labels pushes extractionWarnings",
+    (conflictExtract.extractionWarnings || []).some((w) =>
+      /freight qty|freight weight|labeled|implausible|class 400/i.test(w)),
+    true);
+check("flagFreightConsistencyIssues qty mismatch direct", (() => {
+  const ex = {
+    flags: {},
+    extractionWarnings: [],
+    lanes: [{
+      freightInfo: [
+        {qty: 3, weight: 500, weightType: "each",
+          length: 40, width: 48, height: 60, dimType: "PLT"},
+      ],
+    }],
+  };
+  intake.flagFreightConsistencyIssues(ex,
+      "Number of Pallets - 12\nTotal weight – 6245");
+  return !!(ex.flags.needsDispatcherReview &&
+    (ex.extractionWarnings || []).some((w) => /freight qty/i.test(w)));
+})(), true);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
