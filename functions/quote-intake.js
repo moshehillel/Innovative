@@ -844,12 +844,14 @@ function extractCompactPalletBlocks(body) {
   }
   // Coreforce dim lines: "48*40*50 – 32ctns – 327lbs", optional second
   // dash ("32ctns 327lbs"), optional "(x2) … 30ctns each – 1020lbs each".
+  // Also accept "tns" / "tn" (missing leading c) — common Coreforce typo
+  // that used to drop a pallet line and overwrite a correct AI extract.
   const cartonPattern = new RegExp(
       "(?:\\(\\s*x\\s*(\\d+)\\s*\\)\\s*)?" +
       "([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*[x×*]\\s*([\\d.]+)\\s*" +
-      "[–\\-—]\\s*(\\d+)\\s*ctns?\\s*" +
+      "[–\\-—]\\s*(\\d+)\\s*c?tns?\\s*" +
       "(?:each\\s*)?" +
-      "[–\\-—]?\\s*([\\d.,]+)\\s*(?:lbs|ctns)\\b" +
+      "[–\\-—]?\\s*([\\d.,]+)\\s*(?:lbs|c?tns?)\\b" +
       "(?:\\s*each\\b)?",
       "gi");
   let cm;
@@ -1014,6 +1016,18 @@ function laneMatchesShipmentSection(lane, section) {
  * @param {string} body Plain text body.
  * @return {boolean} True when per-shipment assignment ran.
  */
+function freightInfoQty(rows) {
+  return (Array.isArray(rows) ? rows : []).reduce((sum, r) =>
+    sum + (Math.max(0, Number(r && r.qty) || 0)), 0);
+}
+
+/**
+ * Assign carton/pallet dim rows from numbered shipment sections to lanes.
+ * Prevents Shipment 2 freight from bleeding into Shipment 1 lanes.
+ * @param {object} extracted Parsed quote request.
+ * @param {string} body Plain text body.
+ * @return {boolean} True when per-shipment assignment ran.
+ */
 function applyNumberedShipmentPalletBlocks(extracted, body) {
   if (!extracted || !Array.isArray(extracted.lanes)) return false;
   const sections = extractNumberedShipmentSections(body);
@@ -1024,6 +1038,17 @@ function applyNumberedShipmentPalletBlocks(extracted, body) {
     if (!lane || typeof lane !== "object") continue;
     const section = sections.find((s) => laneMatchesShipmentSection(lane, s));
     if (!section || !section.blocks.length) continue;
+    const labeled = parseLabeledFreightTotals(section.text);
+    const blockQty = freightInfoQty(section.blocks);
+    const existingQty = freightInfoQty(lane.freightInfo);
+    // Keep AI freight when it already matches "Npallets" and regex
+    // under-counted (typo / unparsed dim line).
+    if (labeled.palletCount != null &&
+        existingQty === labeled.palletCount &&
+        blockQty < labeled.palletCount) {
+      matched++;
+      continue;
+    }
     lane.freightInfo = section.blocks.map((row) => ({...row}));
     matched++;
   }
@@ -1084,6 +1109,12 @@ function applyEmailPalletBlocks(extracted, opts) {
       sum + (Math.max(0, Number(r.qty) || 0)), 0);
     const sameCount = rows.length === blocks.length && qty === emailQty;
     if (sameCount) continue;
+    const labeled = parseLabeledFreightTotals(body);
+    if (labeled.palletCount != null &&
+        qty === labeled.palletCount &&
+        emailQty < labeled.palletCount) {
+      continue;
+    }
     lane.freightInfo = blocks.map((row) => ({...row}));
   }
   return extracted;

@@ -1148,6 +1148,53 @@ const shelbyTotal = shelbyRows.reduce((sum, r) => {
 }, 0);
 check("Menards Shelby lane total 1419 lbs", shelbyTotal, 1419);
 
+// BJS Burlington: Coreforce typo "37tns" (missing c) must still parse the
+// 48*42*59 / 362lbs line so we don't overwrite a correct 5-plt AI extract.
+const BJS_NJ_SECTION = [
+  "Shipment 2:",
+  "BJS WHOLESALES CLUB 0820",
+  "309 DULTY'S LANE",
+  "BURLINGTON NJ 08016",
+  "149ctns – 5pallets",
+  "(x2) 48*40*54 – 30ctns – 1020lbs (canned air)",
+  "48*40*35 – 13ctns – 423lbs (canned air)",
+  "48*42*59 – 37tns – 362lbs (charging cables)",
+  "48*42*60 – 39ctns – 335lbs (charging cables)",
+  "3160lbs",
+  "",
+  "Shipment 3:",
+  "OTHER DEST FL 32220",
+].join("\n");
+const bjsBlocks = intake.extractCompactPalletBlocks(BJS_NJ_SECTION);
+check("BJS NJ tns typo yields 4 dim lines", bjsBlocks.length, 4);
+check("BJS NJ tns typo qty 5",
+    bjsBlocks.reduce((s, r) => s + (Number(r.qty) || 0), 0), 5);
+check("BJS NJ includes 59in / 362lbs line",
+    bjsBlocks.some((r) => Number(r.height) === 59 && Number(r.weight) === 362),
+    true);
+const bjsAiCorrect = {
+  lanes: [{
+    consignee: {city: "BURLINGTON", state: "NJ", zipCode: "08016"},
+    freightInfo: [
+      {qty: 2, weight: 1020, length: 40, width: 48, height: 54, dimType: "PLT"},
+      {qty: 1, weight: 423, length: 40, width: 48, height: 35, dimType: "PLT"},
+      {qty: 1, weight: 362, length: 48, width: 42, height: 59, dimType: "PLT"},
+      {qty: 1, weight: 335, length: 48, width: 42, height: 60, dimType: "PLT"},
+    ],
+  }],
+};
+intake.applyEmailPalletBlocks(bjsAiCorrect, {
+  subject: "LFW-BJS",
+  body: BJS_NJ_SECTION,
+});
+check("BJS NJ keeps 5 plt after email blocks",
+    bjsAiCorrect.lanes[0].freightInfo.reduce(
+        (s, r) => s + (Number(r.qty) || 0), 0), 5);
+check("BJS NJ still has 59in line after blocks",
+    bjsAiCorrect.lanes[0].freightInfo.some(
+        (r) => Number(r.height) === 59 && Number(r.weight) === 362),
+    true);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);
