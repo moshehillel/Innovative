@@ -105,7 +105,7 @@ async function resolveCustomerMatch(opts) {
   });
 
   /**
-   * Fill Primus location name when search returned an id only.
+   * Fill Primus location name / remarks when search returned an id only.
    * @param {object} row Match or fallback.
    * @param {string} status matched|default|no_match.
    * @return {Promise<object>}
@@ -113,18 +113,24 @@ async function resolveCustomerMatch(opts) {
   async function withName(row, status) {
     const id = row && row.id ? String(row.id) : null;
     let name = (row && row.name) || null;
-    if (id && !name) {
+    let remarks = (row && row.remarks) || null;
+    if (id && (!name || remarks == null || remarks === "")) {
       try {
         const loc = await rateShop.getShippingLocationById(id);
-        if (loc && loc.name) name = loc.name;
+        if (loc && loc.name && !name) name = loc.name;
+        if (loc && loc.remarks != null &&
+            (remarks == null || remarks === "")) {
+          remarks = loc.remarks;
+        }
       } catch (_) {
-        // keep id without name
+        // keep id without name / remarks
       }
     }
     return {
       id,
       name,
       code: (row && row.code) || null,
+      remarks: remarks != null ? String(remarks) : null,
       searchTerm: (row && row.searchTerm) || null,
       searchesTried: (row && row.searchesTried) || [],
       lookupStatus: status,
@@ -215,10 +221,21 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
     patch.customerLookupQuery = customerName || shipperName ||
       customerRef || null;
     patch.customerLookupQueries = match.searchesTried || [];
+    if (match.remarks) {
+      const baseSi = patch.specialInstructionsGlobal != null ?
+        patch.specialInstructionsGlobal :
+        (data.specialInstructionsGlobal || "");
+      patch.specialInstructionsGlobal =
+        rateShop.mergeProtocolRemarksIntoInstructions(
+            baseSi, match.remarks);
+      patch.customerProtocolRemarks =
+        rateShop.formatShippingLocationRemarks(match.remarks);
+    }
     const customerMatch = {
       id: String(match.id),
       name: match.name || null,
       code: match.code || null,
+      remarks: match.remarks || null,
     };
     return {customerMatch, customerMatchMessage: null};
   }
@@ -1056,6 +1073,12 @@ async function processQuoteEmail(opts) {
     extractedCustomerName || null;
   const customerLookupStatus = customerMatch.lookupStatus ||
     (shippingLocationId ? "matched" : "no_match");
+  if (customerMatch.remarks) {
+    extracted.specialInstructionsGlobal =
+      rateShop.mergeProtocolRemarksIntoInstructions(
+          extracted.specialInstructionsGlobal || "",
+          customerMatch.remarks);
+  }
 
   const enrichLog = (level, category, message, data) =>
     deps.writeLog(level, category, message, data);
@@ -1137,6 +1160,8 @@ async function processQuoteEmail(opts) {
     customerLookupQuery: extractedCustomerName ||
       customerMatch.searchTerm || null,
     customerLookupQueries: customerMatch.searchesTried || [],
+    customerProtocolRemarks: customerMatch.remarks ?
+      rateShop.formatShippingLocationRemarks(customerMatch.remarks) : null,
     customerDeclinedAccessorials: extracted.customerDeclinedAccessorials ||
       [],
     extractModel: extracted.extractModel || null,

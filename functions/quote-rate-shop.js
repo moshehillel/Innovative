@@ -1022,6 +1022,7 @@ async function resolveCustomerForQuote(opts = {}) {
           code: best.code || null,
           customer: best.customer === true,
           email: best.email || null,
+          remarks: best.remarks != null ? String(best.remarks) : null,
           searchTerm: term,
           searchesTried,
         };
@@ -1767,6 +1768,43 @@ function pickTopOptions(rates, n = 4, opts = {}) {
   return out;
 }
 
+/**
+ * Normalize Primus shipping-location remarks (customer protocol text).
+ * @param {string|null|undefined} remarks Raw Primus remarks.
+ * @return {string} Trimmed protocol text, or "".
+ */
+function formatShippingLocationRemarks(remarks) {
+  return String(remarks || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+}
+
+/**
+ * Merge Primus customer protocol remarks into quote special instructions.
+ * Does not duplicate when the protocol is already present.
+ * @param {string|null|undefined} existing Current special instructions.
+ * @param {string|null|undefined} remarks Primus location remarks.
+ * @return {string}
+ */
+function mergeProtocolRemarksIntoInstructions(existing, remarks) {
+  const protocol = formatShippingLocationRemarks(remarks);
+  const current = String(existing || "").trim();
+  if (!protocol) return current;
+  if (!current) return protocol;
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  if (norm(current).includes(norm(protocol))) return current;
+  // Short distinctive line already present → treat as already attached.
+  const lines = protocol.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const distinctive = lines.filter((l) => l.length >= 24);
+  if (distinctive.some((l) => norm(current).includes(norm(l)))) {
+    return current;
+  }
+  return `${current}\n\n${protocol}`;
+}
+
 module.exports = {
   init,
   fetchMultipleRates,
@@ -1778,6 +1816,8 @@ module.exports = {
   pickBestCustomerMatch,
   expandCustomerSearchTerms,
   normalizeCustomerName,
+  formatShippingLocationRemarks,
+  mergeProtocolRemarksIntoInstructions,
   fetchVendorsByCustomer,
   fetchRateTypes,
   searchCostQuotes,
