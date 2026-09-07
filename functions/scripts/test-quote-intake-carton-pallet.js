@@ -1195,6 +1195,51 @@ check("BJS NJ still has 59in line after blocks",
         (r) => Number(r.height) === 59 && Number(r.weight) === 362),
     true);
 
+// Multi-dest without Shipment N: headers — first Total weight must not
+// bleed onto a later lane whose specialInstructions has its own total.
+const WACO_SI = "INDC-09/14/2026; PO# 0069781084//PT# 2359764; " +
+  "Total Cartons – 177; Total weight – 679; Number of Pallets – 2; " +
+  "Pallet dimensions (L *W *H) – 48x40x80, 48x40x63";
+const MULTI_DEST_NO_SHIPMENT_HEADERS = [
+  "TO JACKSONVILLE FL:",
+  "Total Cartons – 200; Total weight – 1081; Number of Pallets – 2; " +
+    "Pallet dimensions (L *W *H) – 48x40x70, 48x40x50",
+  "",
+  "TO WACO TX:",
+  WACO_SI,
+].join("\n");
+const wacoBleed = {
+  lanes: [
+    {
+      consignee: {city: "JACKSONVILLE", state: "FL", zipCode: "32220"},
+      freightInfo: [
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 70, dimType: "PLT"},
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 50, dimType: "PLT"},
+      ],
+    },
+    {
+      consignee: {city: "WACO", state: "TX", zipCode: "76712"},
+      specialInstructions: WACO_SI,
+      freightInfo: [
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 80, dimType: "PLT"},
+        {qty: 1, weight: 540.5, weightType: "each",
+          length: 40, width: 48, height: 63, dimType: "PLT"},
+      ],
+    },
+  ],
+};
+intake.normalizeExtractedQuote(wacoBleed, {
+  body: MULTI_DEST_NO_SHIPMENT_HEADERS,
+  subject: "LFW AAFES WACO",
+});
+check("Waco uses SI total 679 → 339.5 each not 540.5",
+    wacoBleed.lanes[1].freightInfo.map((r) => r.weight), [339.5, 339.5]);
+check("FL keeps first-lane total 1081 → 540.5 each",
+    wacoBleed.lanes[0].freightInfo.map((r) => r.weight), [540.5, 540.5]);
+
 if (failures) {
   console.log(`\n${failures} failed`);
   process.exit(1);

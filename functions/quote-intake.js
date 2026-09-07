@@ -1637,6 +1637,42 @@ function applyPerPalletWeightTable(extracted, body) {
 }
 
 /**
+ * Body text + labeled totals scoped to one lane.
+ * Prefer Shipment N sections, else lane specialInstructions when it has
+ * its own Total weight (multi-dest RFQs without Shipment headers otherwise
+ * bleed the first Total weight onto every lane — e.g. 1081 → 540.5 each
+ * on a Waco lane whose SI says Total weight – 679).
+ * @param {object} lane Extracted lane.
+ * @param {string} body Full email body.
+ * @param {Array<object>} sections Numbered shipment sections.
+ * @return {{text: string, labeled: object}}
+ */
+function resolveLaneFreightScope(lane, body, sections) {
+  const useSections = Array.isArray(sections) && sections.length >= 2;
+  if (useSections) {
+    const section = sections.find((s) =>
+      laneMatchesShipmentSection(lane, s));
+    if (section) {
+      return {
+        text: section.text,
+        labeled: parseLabeledFreightTotals(section.text),
+      };
+    }
+  }
+  const si = String((lane && lane.specialInstructions) || "").trim();
+  if (si && /total\s+weight/i.test(si)) {
+    const labeled = parseLabeledFreightTotals(si);
+    if (labeled.weight != null && labeled.weight > 0) {
+      return {text: si, labeled};
+    }
+  }
+  return {
+    text: String(body || ""),
+    labeled: parseLabeledFreightTotals(body),
+  };
+}
+
+/**
  * Deterministic: Total weight + mixed PLT lines → even lbs each.
  * Per-Shipment labeled totals when the RFQ has Shipment 1 / 2 blocks.
  * @param {object} extracted Parsed quote.
@@ -1647,20 +1683,11 @@ function redistributeEvenTotalWeight(extracted, body) {
   if (!extracted || typeof extracted !== "object") return extracted;
   if (!Array.isArray(extracted.lanes)) return extracted;
   const sections = extractNumberedShipmentSections(body);
-  const useSections = sections.length >= 2;
-  const globalLabeled = parseLabeledFreightTotals(body);
   for (const lane of extracted.lanes) {
     if (!lane || typeof lane !== "object") continue;
-    let labeled = globalLabeled;
-    let sectionBody = body;
-    if (useSections) {
-      const section = sections.find((s) =>
-        laneMatchesShipmentSection(lane, s));
-      if (section) {
-        labeled = parseLabeledFreightTotals(section.text);
-        sectionBody = section.text;
-      }
-    }
+    const scope = resolveLaneFreightScope(lane, body, sections);
+    const labeled = scope.labeled;
+    const sectionBody = scope.text;
     if (labeled.weight == null || !(labeled.weight > 0)) continue;
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     if (!shouldEvenSplitTotalWeight(rows, sectionBody, labeled)) continue;
@@ -3127,6 +3154,7 @@ module.exports = {
   applyPerPalletWeightTable,
   extractNumberedPalletWeightTable,
   expandFreightWithPerPalletWeights,
+  resolveLaneFreightScope,
   redistributeEvenTotalWeight,
   assignEvenWeightPerPallet,
   parseInformalPalletCount,
