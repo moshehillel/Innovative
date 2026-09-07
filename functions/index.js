@@ -15666,6 +15666,8 @@ exports.approveQuoteEmail = onRequest({invoker: "public"},
     quoteDashboard.handleApproveQuoteEmail);
 exports.dismissQuote = onRequest({invoker: "public"},
     quoteDashboard.handleDismissQuote);
+exports.completeQuote = onRequest({invoker: "public"},
+    quoteDashboard.handleCompleteQuote);
 exports.markQuoteForReview = onRequest({invoker: "public"},
     quoteDashboard.handleMarkQuoteForReview);
 exports.exportQuoteDispatcherReport = onRequest({

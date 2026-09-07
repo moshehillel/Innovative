@@ -395,9 +395,7 @@ async function updateQuoteDetails(tenant, quoteId, details = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const data = snap.data();
-  if (isDismissedQuote(data)) {
-    throw new Error("Quote was dismissed");
-  }
+  assertQuoteActive(data);
 
   const quoteRulesList = await quoteRules.loadActiveRules(tenant);
   const senderFrom = senderRules.resolveQuoteSenderFrom(
@@ -1272,12 +1270,45 @@ function isDismissedQuote(row) {
 }
 
 /**
- * Pending = still needs dispatcher action. Never includes dismissed.
+ * Completed quotes leave active inbox tabs (Pending / Sent / For review / All).
+ * @param {object} row Quote doc or inbox item.
+ * @return {boolean}
+ */
+function isCompletedQuote(row) {
+  if (!row) return false;
+  if (normalizeQuoteStatus(row.status) === "completed") return true;
+  return !!row.completedAt;
+}
+
+/**
+ * Dismissed or completed — not actionable inbox work.
+ * @param {object} row Quote doc or inbox item.
+ * @return {boolean}
+ */
+function isInactiveQuote(row) {
+  return isDismissedQuote(row) || isCompletedQuote(row);
+}
+
+/**
+ * Throw when quote cannot be mutated (dismissed / completed).
+ * @param {object} data Quote fields.
+ */
+function assertQuoteActive(data) {
+  if (isDismissedQuote(data)) {
+    throw new Error("Quote was dismissed");
+  }
+  if (isCompletedQuote(data)) {
+    throw new Error("Quote was completed");
+  }
+}
+
+/**
+ * Pending = still needs dispatcher action. Never includes dismissed/completed.
  * @param {object} row Quote doc or inbox item.
  * @return {boolean}
  */
 function isPendingQuote(row) {
-  if (isDismissedQuote(row)) return false;
+  if (isInactiveQuote(row)) return false;
   const status = normalizeQuoteStatus(row && row.status);
   return status === "awaiting_dispatcher" || status === "draft_ready";
 }
@@ -1287,25 +1318,26 @@ function isPendingQuote(row) {
  * @return {boolean}
  */
 function isForReviewQuote(row) {
-  if (!row || isDismissedQuote(row)) return false;
+  if (!row || isInactiveQuote(row)) return false;
   return row.forReview === true || row.forReview === "true" ||
     row.forReview === 1;
 }
 
 /**
  * @param {object} row Quote doc.
- * @param {string} [statusFilter] pending | dismissed | for_review | exact.
+ * @param {string} [statusFilter] pending | dismissed | completed | for_review | exact.
  * @return {boolean}
  */
 function matchesInboxStatus(row, statusFilter) {
   const want = normalizeQuoteStatus(statusFilter);
-  if (!want) return !isDismissedQuote(row);
+  if (!want) return !isInactiveQuote(row);
   if (want === "dismissed") return isDismissedQuote(row);
+  if (want === "completed") return isCompletedQuote(row);
   if (want === "pending") return isPendingQuote(row);
   if (want === "for_review" || want === "review") {
     return isForReviewQuote(row);
   }
-  if (isDismissedQuote(row)) return false;
+  if (isInactiveQuote(row)) return false;
   return normalizeQuoteStatus(row.status) === want;
 }
 
@@ -1324,6 +1356,7 @@ function serializeInboxQuote(doc, data) {
     forReview: isForReviewQuote(data),
     forReviewAt: data.forReviewAt || null,
     dismissedAt: data.dismissedAt || null,
+    completedAt: data.completedAt || null,
     laneCount: (data.lanes || []).length,
     createdAt: data.createdAt,
     assignedDispatcherEmail: data.assignedDispatcherEmail,
@@ -1392,7 +1425,8 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
   const snap = await col(tenant, "quoteRequests")
       .where("assignedDispatcherId", "==", dispatcherId)
       .select(
-          "status", "dismissedAt", "assignedDispatcherEmail", "forReview")
+          "status", "dismissedAt", "completedAt",
+          "assignedDispatcherEmail", "forReview")
       .get();
   const counts = {
     total: 0,
@@ -1402,6 +1436,7 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
     sent: 0,
     forReview: 0,
     dismissed: 0,
+    completed: 0,
   };
   for (const doc of snap.docs) {
     const data = doc.data();
@@ -1411,6 +1446,10 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
     counts.total += 1;
     if (isDismissedQuote(data)) {
       counts.dismissed += 1;
+      continue;
+    }
+    if (isCompletedQuote(data)) {
+      counts.completed += 1;
       continue;
     }
     if (isForReviewQuote(data)) counts.forReview += 1;
@@ -1545,9 +1584,7 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const quote = {id: snap.id, ...snap.data()};
-  if (isDismissedQuote(quote)) {
-    throw new Error("Quote was dismissed");
-  }
+  assertQuoteActive(quote);
 
   if (Array.isArray(opts.selections) && opts.selections.length) {
     await saveLaneSelections(tenant, quoteId, opts.selections);
@@ -1620,9 +1657,7 @@ async function setQuoteForReview(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const data = snap.data();
-  if (isDismissedQuote(data)) {
-    throw new Error("Quote was dismissed");
-  }
+  assertQuoteActive(data);
   const want = opts.forReview === false || opts.forReview === "false" ||
     opts.forReview === 0 || opts.forReview === "0" ?
     false : opts.forReview != null ? !!opts.forReview : true;
@@ -1802,9 +1837,70 @@ async function dismissQuote(tenant, quoteId, opts = {}) {
     dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
     dismissedBy: opts.dismissedBy || null,
     dismissReason: opts.reason || null,
+    completedAt: null,
+    completedBy: null,
+    statusBeforeCompleted: null,
+    forReview: false,
+    forReviewAt: null,
+    forReviewBy: null,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
   return {ok: true, status: "dismissed"};
+}
+
+/**
+ * Mark / unmark quote completed (leaves active tabs; undo restores prior status).
+ * @param {object} tenant Tenant.
+ * @param {string} quoteId Quote id.
+ * @param {object} [opts] completed (bool), completedBy.
+ * @return {Promise<object>}
+ */
+async function setQuoteCompleted(tenant, quoteId, opts = {}) {
+  const ref = col(tenant, "quoteRequests").doc(quoteId);
+  const snap = await ref.get();
+  if (!snap.exists) throw new Error("Quote not found");
+  const data = snap.data();
+  if (isDismissedQuote(data)) {
+    throw new Error("Quote was dismissed");
+  }
+  const want = opts.completed === false || opts.completed === "false" ||
+    opts.completed === 0 || opts.completed === "0" ?
+    false : opts.completed != null ? !!opts.completed : true;
+
+  if (!want) {
+    if (!isCompletedQuote(data)) {
+      return {ok: true, completed: false, status: data.status || null};
+    }
+    let restore = normalizeQuoteStatus(data.statusBeforeCompleted) ||
+      "draft_ready";
+    if (restore === "completed" || restore === "dismissed") {
+      restore = "draft_ready";
+    }
+    await ref.update({
+      status: restore,
+      completedAt: null,
+      completedBy: null,
+      statusBeforeCompleted: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return {ok: true, completed: false, status: restore};
+  }
+
+  if (isCompletedQuote(data)) {
+    return {ok: true, completed: true, status: "completed"};
+  }
+  const prev = normalizeQuoteStatus(data.status) || "draft_ready";
+  await ref.update({
+    status: "completed",
+    statusBeforeCompleted: prev === "completed" ? "draft_ready" : prev,
+    completedAt: admin.firestore.FieldValue.serverTimestamp(),
+    completedBy: opts.completedBy || null,
+    forReview: false,
+    forReviewAt: null,
+    forReviewBy: null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return {ok: true, completed: true, status: "completed"};
 }
 
 /**
@@ -1819,9 +1915,7 @@ async function rerunQuoteRates(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const data = snap.data();
-  if (isDismissedQuote(data)) {
-    throw new Error("Quote was dismissed");
-  }
+  assertQuoteActive(data);
   const rules = await quoteRules.loadActiveRules(tenant);
   const accessorialOverride = opts.accessorials != null ?
     quoteAccCatalog.normalizeRerunAccessorialCodes(opts.accessorials) :
@@ -1994,9 +2088,7 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
   const quote = {id: snap.id, ...snap.data()};
-  if (isDismissedQuote(quote)) {
-    throw new Error("Quote was dismissed");
-  }
+  assertQuoteActive(quote);
   const dispatcher = opts.dispatcher;
   if (!dispatcher || !dispatcher.id) {
     throw new Error("Dispatcher required to send email");
@@ -2085,12 +2177,14 @@ module.exports = {
   generateQuoteEmail,
   approveQuoteEmail,
   dismissQuote,
+  setQuoteCompleted,
   setQuoteForReview,
   listQuotesForDispatcherReport,
   rerunQuoteRates,
   getQuoteRequest,
   listQuotesForDispatcher,
   isDismissedQuote,
+  isCompletedQuote,
   isPendingQuote,
   isForReviewQuote,
   resolveShippingLocationId,

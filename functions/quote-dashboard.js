@@ -761,6 +761,52 @@ async function handleMarkQuoteForReview(req, res) {
 }
 
 /**
+ * POST mark / unmark quote completed (moves to Completed tab).
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<void>}
+ */
+async function handleCompleteQuote(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Use POST"});
+  }
+  try {
+    let body = req.body || {};
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body || "{}");
+      } catch (_) {
+        body = {};
+      }
+    }
+    const quoteId = body.quoteId || body.id ||
+      (req.query && (req.query.quoteId || req.query.id));
+    if (!quoteId) {
+      return res.status(400).json({ok: false, error: "quoteId required"});
+    }
+    const auth = await authorizeQuoteAccess(req, String(quoteId));
+    if (!auth.ok) {
+      return res.status(auth.status || 401).json({
+        ok: false,
+        error: auth.error,
+      });
+    }
+    const completed = body.completed != null ? body.completed :
+      (req.query && req.query.completed != null ? req.query.completed : true);
+    const result = await quoteAutomation.setQuoteCompleted(
+        auth.tenant, String(quoteId), {
+          completed,
+          completedBy: (auth.dispatcher && auth.dispatcher.email) ||
+            auth.email || auth.dispatcherId,
+        });
+    return res.json(result);
+  } catch (err) {
+    return res.status(500).json({ok: false, error: err.message});
+  }
+}
+
+/**
  * Escape one CSV cell.
  * @param {*} value Cell value.
  * @return {string}
@@ -1000,6 +1046,7 @@ async function handleGetQuoteDispatcherInbox(req, res) {
       sent: 0,
       forReview: 0,
       dismissed: 0,
+      completed: 0,
     };
     const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
       "https://us-central1-tai-invoice-automation.cloudfunctions.net";
@@ -1566,6 +1613,7 @@ module.exports = {
   handleGenerateQuoteEmail,
   handleApproveQuoteEmail,
   handleDismissQuote,
+  handleCompleteQuote,
   handleMarkQuoteForReview,
   handleExportQuoteDispatcherReport,
   handleRerunQuoteRates,

@@ -309,6 +309,11 @@
       color: #6d28d9;
       border-color: #ddd6fe;
     }
+    .badge.completed {
+      background: var(--success-bg);
+      color: var(--success);
+      border-color: #6ee7b7;
+    }
     .badge.sent {
       background: var(--success-bg);
       color: var(--success);
@@ -512,7 +517,8 @@
       max-width: 100%;
     }
     .quote-card-head .btn-dismiss-card,
-    .quote-card-head .btn-review-card {
+    .quote-card-head .btn-review-card,
+    .quote-card-head .btn-complete-card {
       padding: 8px 12px;
       font-size: 0.8125rem;
       align-self: start;
@@ -638,60 +644,24 @@
     }
 
     .bulk-panel {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 14px 16px;
-      margin-bottom: 24px;
-      box-shadow: var(--shadow-sm);
+      margin-bottom: 16px;
     }
-    .bulk-compact {
+    .bulk-launch-row {
       display: flex;
       flex-wrap: wrap;
+      gap: 10px;
       align-items: center;
-      gap: 10px 14px;
     }
-    .bulk-compact-copy {
-      flex: 1 1 220px;
-      min-width: 0;
-    }
-    .bulk-panel h2 {
-      margin: 0 0 2px;
-      font-size: 1.05rem;
-      font-weight: 700;
-      color: var(--primary-dark);
-      letter-spacing: -0.02em;
-    }
-    .bulk-panel .bulk-desc {
-      margin: 0;
+    .bulk-launch-row .bulk-hint {
       font-size: 0.8125rem;
       color: var(--muted);
     }
-    .bulk-compact-actions {
+    .bulk-modal-actions {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
       align-items: center;
-    }
-    .bulk-file-inline {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      font-size: 0.75rem;
-      font-weight: 600;
-      color: var(--muted);
-    }
-    .bulk-file-inline input[type="file"] {
-      max-width: 220px;
-      font-size: 0.8125rem;
-      font-weight: 500;
-      color: var(--text);
-    }
-    .bulk-opts-summary {
-      width: 100%;
-      font-size: 0.75rem;
-      color: var(--muted);
-      margin-top: 2px;
+      margin-top: 4px;
     }
     .bulk-cols {
       background: var(--surface-muted);
@@ -913,23 +883,11 @@
       </div>
 
       <section class="bulk-panel" id="bulk-panel" aria-labelledby="bulk-title">
-        <div class="bulk-compact">
-          <div class="bulk-compact-copy">
-            <h2 id="bulk-title">Bulk rate shop</h2>
-            <p class="bulk-desc">
-              Upload destinations — results include carrier cost + quote numbers.
-            </p>
-          </div>
-          <div class="bulk-compact-actions">
-            <label class="bulk-file-inline">File
-              <input type="file" id="bulk-file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
-            </label>
-            <button type="button" class="ghost" id="btn-bulk-options">Options</button>
-            <button type="button" id="btn-bulk-start">Start bulk rate shop</button>
-            <button type="button" class="ghost hidden" id="btn-bulk-download">Download XLSX</button>
-            <button type="button" class="ghost hidden" id="btn-bulk-download-csv">Download CSV</button>
-          </div>
-          <div class="bulk-opts-summary" id="bulk-opts-summary">Origin not set · no accessorials</div>
+        <div class="bulk-launch-row">
+          <button type="button" id="btn-bulk-open">Bulk rate shop</button>
+          <span class="bulk-hint" id="bulk-title">Upload destinations in a compact dialog</span>
+          <button type="button" class="ghost hidden" id="btn-bulk-download">Download XLSX</button>
+          <button type="button" class="ghost hidden" id="btn-bulk-download-csv">Download CSV</button>
         </div>
         <div class="bulk-progress hidden" id="bulk-progress">
           <div id="bulk-progress-text">Ready</div>
@@ -938,14 +896,14 @@
         <div class="bulk-msg hidden" id="bulk-msg"></div>
       </section>
 
-      <div class="bulk-modal-backdrop hidden" id="bulk-options-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-options-title">
+      <div class="bulk-modal-backdrop hidden" id="bulk-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-modal-title">
         <div class="bulk-modal">
           <div class="bulk-modal-head">
             <div>
-              <h3 id="bulk-options-title">Bulk rate options</h3>
-              <p>Origin address, accessorials, and rate modes for the spreadsheet job.</p>
+              <h3 id="bulk-modal-title">Bulk rate shop</h3>
+              <p>Upload destinations — results include carrier cost + quote numbers.</p>
             </div>
-            <button type="button" class="ghost" id="btn-bulk-options-close" aria-label="Close options">Close</button>
+            <button type="button" class="ghost" id="btn-bulk-close" aria-label="Close bulk rate shop">Close</button>
           </div>
           <div class="bulk-cols">
             <strong>Required columns</strong> (Book5-style preferred):<br>
@@ -956,6 +914,11 @@
             Also accepted (Book4-style): <code>city</code>, <code>st</code>,
             <code>zip</code>, <code>PALLET</code>, <code>WEIGHT</code>
             (optional second weight column), <code>dims</code>
+          </div>
+          <div class="bulk-field">
+            <label>File *
+              <input type="file" id="bulk-file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+            </label>
           </div>
           <div class="bulk-grid">
             <label>From street (optional)
@@ -991,8 +954,9 @@
               Include Guaranteed + ERG
             </label>
           </div>
-          <div class="bulk-modal-foot">
-            <button type="button" id="btn-bulk-options-done">Done</button>
+          <div class="bulk-modal-actions">
+            <button type="button" id="btn-bulk-start">Start bulk rate shop</button>
+            <button type="button" class="ghost" id="btn-bulk-done">Done</button>
           </div>
         </div>
       </div>
@@ -1003,12 +967,14 @@
         <div class="stat"><div class="num" id="stat-draft">—</div><div class="lbl">Draft ready</div></div>
         <div class="stat"><div class="num" id="stat-sent">—</div><div class="lbl">Sent</div></div>
         <div class="stat"><div class="num" id="stat-review">—</div><div class="lbl">For review</div></div>
+        <div class="stat"><div class="num" id="stat-completed">—</div><div class="lbl">Completed</div></div>
         <div class="stat"><div class="num muted" id="stat-dismissed">—</div><div class="lbl">Dismissed</div></div>
       </div>
       <div class="filter-bar">
         <button type="button" id="filter-pending" class="ghost active">Pending</button>
         <button type="button" id="filter-sent" class="ghost">Sent</button>
         <button type="button" id="filter-review" class="ghost">For review</button>
+        <button type="button" id="filter-completed" class="ghost">Completed</button>
         <button type="button" id="filter-all" class="ghost">All</button>
       </div>
       <div class="report-bar" id="report-bar">
@@ -1172,19 +1138,29 @@
       return !!item.dismissedAt;
     }
 
+    function isCompletedItem(item) {
+      if (!item) return false;
+      if (quoteStatusOf(item) === "completed") return true;
+      return !!item.completedAt;
+    }
+
+    function isInactiveItem(item) {
+      return isDismissedItem(item) || isCompletedItem(item);
+    }
+
     function isPendingItem(item) {
-      if (isDismissedItem(item)) return false;
+      if (isInactiveItem(item)) return false;
       const status = quoteStatusOf(item);
       return status === "awaiting_dispatcher" || status === "draft_ready";
     }
 
     function isForReviewItem(item) {
-      if (isDismissedItem(item)) return false;
+      if (isInactiveItem(item)) return false;
       return !!(item && item.forReview);
     }
 
     function isSentItem(item) {
-      if (isDismissedItem(item)) return false;
+      if (isInactiveItem(item)) return false;
       return quoteStatusOf(item) === "sent";
     }
 
@@ -1205,6 +1181,7 @@
       writeStat("stat-draft", Number(c.draftReady) || 0);
       writeStat("stat-sent", Number(c.sent) || 0);
       writeStat("stat-review", Number(c.forReview) || 0);
+      writeStat("stat-completed", Number(c.completed) || 0);
       writeStat("stat-dismissed", Number(c.dismissed) || 0);
     }
 
@@ -1213,6 +1190,7 @@
         pending: "filter-pending",
         sent: "filter-sent",
         for_review: "filter-review",
+        completed: "filter-completed",
         "": "filter-all",
       };
       Object.keys(map).forEach((key) => {
@@ -1272,6 +1250,24 @@
               quoteId: id,
               id: id,
               forReview: !!forReview,
+            }),
+          });
+      if (!res2.ok) throw new Error(res2.error || "Update failed");
+      return res2;
+    }
+
+    async function completeQuoteById(quoteId, completed) {
+      const id = String(quoteId || "").trim();
+      if (!id) throw new Error("Missing quote id");
+      const res2 = await apiFetch(
+          "/completeQuote?tenantId=" + encodeURIComponent(TENANT_ID) +
+          "&quoteId=" + encodeURIComponent(id), {
+            method: "POST",
+            body: JSON.stringify({
+              tenantId: TENANT_ID,
+              quoteId: id,
+              id: id,
+              completed: completed !== false,
             }),
           });
       if (!res2.ok) throw new Error(res2.error || "Update failed");
@@ -1341,7 +1337,8 @@
     }
 
     function setFilterBarBusy(busy) {
-      ["filter-pending", "filter-sent", "filter-review", "filter-all"]
+      ["filter-pending", "filter-sent", "filter-review", "filter-completed",
+        "filter-all"]
           .forEach((id) => {
             const el = document.getElementById(id);
             if (el) el.disabled = !!busy;
@@ -1363,6 +1360,7 @@
       if (filterStatus === "pending") path += "&status=pending";
       else if (filterStatus === "sent") path += "&status=sent";
       else if (filterStatus === "for_review") path += "&status=for_review";
+      else if (filterStatus === "completed") path += "&status=completed";
       syncFilterButtons();
       if (!silent) {
         showInboxThinking(true);
@@ -1376,16 +1374,23 @@
         root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
         return;
       }
-      const visible = (res.items || []).filter((i) => !isDismissedItem(i));
+      const raw = res.items || [];
       const counts = res.counts || {};
       applyCounts(counts);
-      let items = visible;
-      if (filterStatus === "pending") {
-        items = visible.filter(isPendingItem);
-      } else if (filterStatus === "sent") {
-        items = visible.filter(isSentItem);
-      } else if (filterStatus === "for_review") {
-        items = visible.filter(isForReviewItem);
+      let items = raw;
+      if (filterStatus === "completed") {
+        items = raw.filter(isCompletedItem);
+      } else {
+        const visible = raw.filter((i) => !isInactiveItem(i));
+        if (filterStatus === "pending") {
+          items = visible.filter(isPendingItem);
+        } else if (filterStatus === "sent") {
+          items = visible.filter(isSentItem);
+        } else if (filterStatus === "for_review") {
+          items = visible.filter(isForReviewItem);
+        } else {
+          items = visible;
+        }
       }
       if (!items.length) {
         root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
@@ -1394,6 +1399,7 @@
       root.innerHTML = items.map((item) => {
         const pending = isPendingItem(item);
         const forReview = isForReviewItem(item);
+        const completed = isCompletedItem(item);
         const status = quoteStatusOf(item);
         const lanes = item.lanesPreview || [];
         const lanesHtml = lanes.map((lane) => {
@@ -1462,9 +1468,10 @@
           '<div class="quote-card-warn">' +
             esc(warnBits.join(" · ")) + "</div>" : "";
 
-        const badgeClass = pending ? "pending" :
-          (status === "sent" ? "sent" :
-            (status === "draft_ready" ? "draft_ready" : ""));
+        const badgeClass = completed ? "completed" :
+          (pending ? "pending" :
+            (status === "sent" ? "sent" :
+              (status === "draft_ready" ? "draft_ready" : "")));
         const reviewBadge = forReview ?
           '<span class="badge for-review">For review</span>' : "";
 
@@ -1482,8 +1489,9 @@
               ${reviewBadge}
             </div>
             <div class="quote-card-actions">
-              <button type="button" class="ghost btn-review-card${forReview ? " is-on" : ""}" data-id="${esc(item.id)}" data-on="${forReview ? "1" : "0"}">${forReview ? "Unmark review" : "For review"}</button>
-              <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}">Dismiss</button>
+              <button type="button" class="ghost btn-complete-card" data-id="${esc(item.id)}" data-completed="${completed ? "1" : "0"}">${completed ? "Undo complete" : "Complete"}</button>
+              <button type="button" class="ghost btn-review-card${forReview ? " is-on" : ""}" data-id="${esc(item.id)}" data-on="${forReview ? "1" : "0"}"${completed ? " disabled" : ""}>${forReview ? "Unmark review" : "For review"}</button>
+              <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}"${completed ? " disabled" : ""}>Dismiss</button>
             </div>
           </div>
           <div class="quote-card-body">
@@ -1499,7 +1507,27 @@
         el.addEventListener("click", (e) => {
           if (e.target.closest(".btn-dismiss-card")) return;
           if (e.target.closest(".btn-review-card")) return;
+          if (e.target.closest(".btn-complete-card")) return;
           el.parentElement.classList.toggle("open");
+        });
+      });
+      root.querySelectorAll(".btn-complete-card").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+          const currentlyDone = btn.getAttribute("data-completed") === "1";
+          const prevLabel = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = currentlyDone ? "Restoring…" : "Completing…";
+          try {
+            await completeQuoteById(quoteId, !currentlyDone);
+            await loadInbox({sync: false});
+          } catch (err) {
+            btn.disabled = false;
+            btn.textContent = prevLabel;
+            alert(err.message || "Could not update completed state");
+          }
         });
       });
       root.querySelectorAll(".btn-review-card").forEach((btn) => {
@@ -1725,6 +1753,9 @@
     document.getElementById("filter-review").addEventListener("click", () => {
       filterStatus = "for_review"; loadInbox({sync: false});
     });
+    document.getElementById("filter-completed").addEventListener("click", () => {
+      filterStatus = "completed"; loadInbox({sync: false});
+    });
     document.getElementById("filter-all").addEventListener("click", () => {
       filterStatus = ""; loadInbox({sync: false});
     });
@@ -1749,27 +1780,10 @@
     let bulkJobId = null;
     let bulkRunning = false;
 
-    function updateBulkOptsSummary() {
-      const summary = document.getElementById("bulk-opts-summary");
-      if (!summary) return;
-      const city = (document.getElementById("bulk-from-city").value || "").trim();
-      const state = (document.getElementById("bulk-from-state").value || "").trim();
-      const zip = (document.getElementById("bulk-from-zip").value || "").trim();
-      const acc = selectedAccessorials();
-      const gtd = document.getElementById("bulk-guaranteed").checked;
-      const origin = (city && state && zip) ?
-        (city + ", " + state + " " + zip) : "Origin not set";
-      const accTxt = acc.length ? (acc.length + " accessorial" +
-        (acc.length === 1 ? "" : "s")) : "no accessorials";
-      const mode = gtd ? "Standard + Guaranteed/ERG" : "Estes Standard";
-      summary.textContent = origin + " · " + accTxt + " · " + mode;
-    }
-
-    function setBulkOptionsOpen(open) {
-      const modal = document.getElementById("bulk-options-modal");
+    function setBulkModalOpen(open) {
+      const modal = document.getElementById("bulk-modal");
       if (!modal) return;
       modal.classList.toggle("hidden", !open);
-      if (!open) updateBulkOptsSummary();
     }
 
 
@@ -1870,7 +1884,6 @@
           encodeURIComponent(TENANT_ID));
         if (res && (res.origin || res.destination || res.other)) {
           fillAccessorialSelect(res);
-          updateBulkOptsSummary();
           return;
         }
       } catch (_) { /* fallback below */ }
@@ -1887,7 +1900,6 @@
         ],
         other: [],
       });
-      updateBulkOptsSummary();
     }
 
     async function downloadBulkResults(format) {
@@ -1971,27 +1983,19 @@
       }
     }
 
-    document.getElementById("btn-bulk-options").addEventListener("click", () => {
-      setBulkOptionsOpen(true);
+    document.getElementById("btn-bulk-open").addEventListener("click", () => {
+      setBulkModalOpen(true);
     });
-    document.getElementById("btn-bulk-options-close").addEventListener("click", () => {
-      setBulkOptionsOpen(false);
+    document.getElementById("btn-bulk-close").addEventListener("click", () => {
+      setBulkModalOpen(false);
     });
-    document.getElementById("btn-bulk-options-done").addEventListener("click", () => {
-      setBulkOptionsOpen(false);
+    document.getElementById("btn-bulk-done").addEventListener("click", () => {
+      setBulkModalOpen(false);
     });
-    document.getElementById("bulk-options-modal").addEventListener("click", (ev) => {
-      if (ev.target && ev.target.id === "bulk-options-modal") setBulkOptionsOpen(false);
+    document.getElementById("bulk-modal").addEventListener("click", (ev) => {
+      if (ev.target && ev.target.id === "bulk-modal") setBulkModalOpen(false);
     });
-    ["bulk-from-city", "bulk-from-state", "bulk-from-zip", "bulk-guaranteed",
-      "bulk-estes-only", "bulk-accessorials"].forEach((id) => {
-      const el = document.getElementById(id);
-      if (!el) return;
-      el.addEventListener("change", updateBulkOptsSummary);
-      el.addEventListener("input", updateBulkOptsSummary);
-    });
-    updateBulkOptsSummary();
-
+    
     document.getElementById("btn-bulk-start").addEventListener("click", async () => {
       if (bulkRunning) return;
       setBulkMsg("");
@@ -2005,8 +2009,8 @@
       const state = document.getElementById("bulk-from-state").value.trim();
       const zip = document.getElementById("bulk-from-zip").value.trim();
       if (!city || !state || !zip) {
-        setBulkMsg("From city, state, and zip are required — open Options.", "err");
-        setBulkOptionsOpen(true);
+        setBulkMsg("From city, state, and zip are required.", "err");
+        setBulkModalOpen(true);
         return;
       }
       const startBtn = document.getElementById("btn-bulk-start");

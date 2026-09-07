@@ -601,6 +601,8 @@ function serializeForDispatcherPage(quote) {
     forReview: quote.forReview === true || quote.forReview === "true" ||
       quote.forReview === 1,
     forReviewAt: quote.forReviewAt || null,
+    completedAt: quote.completedAt || null,
+    dismissedAt: quote.dismissedAt || null,
     shipper: quoteShipper,
     originSiteType: quote.originSiteType ||
       (quote.lanes && quote.lanes[0] && quote.lanes[0].originSiteType) ||

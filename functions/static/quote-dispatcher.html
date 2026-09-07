@@ -738,6 +738,7 @@
     }
     .badge.sent { background: var(--success-bg); color: var(--success); border-color: #6ee7b7; }
     .badge.dismissed { background: var(--surface-muted); color: var(--muted); border-color: var(--border); }
+    .badge.completed { background: var(--success-bg); color: var(--success); border-color: #6ee7b7; }
     .badge.draft_ready { background: var(--primary-light); color: var(--primary-dark); border-color: #c7d2fe; }
     .badge.for-review { background: #f5f3ff; color: #6d28d9; border-color: #ddd6fe; margin-left: 6px; }
     #btn-for-review.is-on {
@@ -1027,6 +1028,7 @@
       <div class="toolbar">
         <button type="button" id="btn-generate">Save rate and generate draft email</button>
         <button type="button" class="ghost" id="btn-for-review">For review</button>
+        <button type="button" class="ghost" id="btn-complete">Complete</button>
         <button type="button" class="danger ghost" id="btn-dismiss">Dismiss</button>
         <span style="flex:1"></span>
         <button type="button" class="ghost" id="btn-copy" disabled>Copy draft</button>
@@ -1445,20 +1447,31 @@
       if (reviewBtn) {
         reviewBtn.textContent = forReview ? "Unmark review" : "For review";
         reviewBtn.classList.toggle("is-on", forReview);
-        reviewBtn.disabled = quote.status === "dismissed";
+        reviewBtn.disabled = quote.status === "dismissed" ||
+          quote.status === "completed";
+      }
+      const completeBtn = document.getElementById("btn-complete");
+      if (completeBtn) {
+        const isCompleted = quote.status === "completed" || !!quote.completedAt;
+        completeBtn.textContent = isCompleted ? "Undo complete" : "Complete";
+        completeBtn.disabled = quote.status === "dismissed";
+        completeBtn.setAttribute("data-completed", isCompleted ? "1" : "0");
       }
       draftReady = quote.status === "draft_ready" || quote.status === "sent" ||
         !!(quote.customerEmailText);
       document.getElementById("draft-text").value =
         quote.customerEmailText || quote.customerDraftText || "";
       document.getElementById("btn-approve").disabled =
-        !draftReady || quote.status === "sent" || quote.status === "dismissed";
+        !draftReady || quote.status === "sent" ||
+        quote.status === "dismissed" || quote.status === "completed";
       document.getElementById("btn-copy").disabled =
         !document.getElementById("draft-text").value;
       document.getElementById("btn-generate").disabled =
-        quote.status === "sent" || quote.status === "dismissed";
+        quote.status === "sent" || quote.status === "dismissed" ||
+        quote.status === "completed";
       document.getElementById("btn-dismiss").disabled =
-        quote.status === "sent" || quote.status === "dismissed";
+        quote.status === "sent" || quote.status === "dismissed" ||
+        quote.status === "completed";
 
       (quote.lanes || []).forEach((lane) => {
         selections[lane.laneKey] = (lane.selectedRateIds || []).slice();
@@ -2798,7 +2811,54 @@
         btn.textContent = prevLabel;
         showMsg(err.message || "Could not update review flag", false);
       } finally {
-        btn.disabled = quote && quote.status === "dismissed";
+        btn.disabled = quote && (quote.status === "dismissed" ||
+          quote.status === "completed");
+      }
+    });
+
+    document.getElementById("btn-complete").addEventListener("click", async () => {
+      const btn = document.getElementById("btn-complete");
+      if (btn.disabled) return;
+      const currentlyDone = btn.getAttribute("data-completed") === "1" ||
+        (quote && (quote.status === "completed" || quote.completedAt));
+      const prevLabel = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = currentlyDone ? "Restoring…" : "Completing…";
+      try {
+        const res = await apiFetch(
+            "/completeQuote?tenantId=" + encodeURIComponent(TENANT_ID) +
+            "&quoteId=" + encodeURIComponent(QUOTE_ID), {
+              method: "POST",
+              body: JSON.stringify({
+                tenantId: TENANT_ID,
+                quoteId: QUOTE_ID,
+                id: QUOTE_ID,
+                completed: !currentlyDone,
+                dispatcherId: DISPATCHER_ID || undefined,
+                token: TOKEN || undefined,
+              }),
+            });
+        if (!res.ok) throw new Error(res.error || "Update failed");
+        if (quote) {
+          quote.status = res.status ||
+            (currentlyDone ? "draft_ready" : "completed");
+          quote.completedAt = currentlyDone ? null : true;
+          if (!currentlyDone) quote.forReview = false;
+        }
+        applyQuote(quote);
+        showMsg(currentlyDone ?
+          "Quote restored to your active list." :
+          "Quote marked completed. Returning to inbox…", true);
+        if (!currentlyDone) {
+          setTimeout(() => {
+            window.location.href = API + "/quoteDispatcherHomePage?tenantId=" +
+              encodeURIComponent(TENANT_ID);
+          }, 700);
+        }
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = prevLabel;
+        showMsg(err.message || "Update failed", false);
       }
     });
 
