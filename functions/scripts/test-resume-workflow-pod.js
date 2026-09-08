@@ -30,6 +30,8 @@ check("mark_delivered resume runs billing pipeline",
     shouldRunBillingPipelineOnResume("mark_delivered"), true);
 check("carrier_invoice_number resume runs billing pipeline",
     shouldRunBillingPipelineOnResume("carrier_invoice_number"), true);
+// Hard pause must wait until after billing (manage.php invoice exists).
+// Early verify uses pauseOnMissing:false so resume can reach UI billing.
 check("send_customer_email resume does not run billing alone",
     shouldRunBillingPipelineOnResume("send_customer_email"), false);
 

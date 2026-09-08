@@ -2959,7 +2959,11 @@ exports.processPrimusWorkflow = onRequest(
 
             await setWorkflowHeartbeat(invoiceDoc.ref, "bill_approved");
 
-            const carrierInvNumVerify =
+            // Soft attempt only — manage.php invoice usually does not exist
+            // yet (created later by runUiBillingFlow). Pausing here caused a
+            // wave of CARRIER_INVOICE_NUMBER_MISSING with fixAttempts
+            // "No manage.php invoice on booking" before bill entry ran.
+            const carrierInvNumVerifyEarly =
               await verifyAndEnsureCarrierInvoiceNumberInPrimus({
                 invoice,
                 invoiceId,
@@ -2967,15 +2971,18 @@ exports.processPrimusWorkflow = onRequest(
                 req,
                 booking: bookingForMode,
                 proNumber: workingProNumber,
+                pauseOnMissing: false,
               });
-            if (!carrierInvNumVerify.ok &&
-                carrierInvNumVerify.workflowStatus) {
-              return res.json({
-                ok: false,
-                error: "CARRIER_INVOICE_NUMBER_MISSING_IN_PRIMUS",
-                workflowStatus: carrierInvNumVerify.workflowStatus,
-                details: carrierInvNumVerify,
-              });
+            if (carrierInvNumVerifyEarly &&
+                carrierInvNumVerifyEarly.present) {
+              await writeLog("info", "workflow",
+                  "Carrier invoice number already present in Primus " +
+                  "before billing", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    source: carrierInvNumVerifyEarly.source || null,
+                    fixed: !!carrierInvNumVerifyEarly.fixed,
+                  });
             }
 
             await logWorkflowStep({
@@ -3765,6 +3772,41 @@ exports.processPrimusWorkflow = onRequest(
               }
             }
           } // end runBillingPipeline
+
+          // Hard verify after real bill/invoice work (UI billing or
+          // carrier-bill-only on a pre-issued invoice). This is when
+          // writeCarrierInvoiceNumberToPrimus can actually succeed.
+          if (runBillingPipeline) {
+            let bookingAfterBilling = bookingForMode;
+            if (invoice.loadNumber) {
+              try {
+                bookingAfterBilling =
+                  await fetchPrimusBooking(invoice.loadNumber) ||
+                  bookingForMode;
+              } catch (_) {
+                // Keep prior booking snapshot.
+              }
+            }
+            const carrierInvNumVerify =
+              await verifyAndEnsureCarrierInvoiceNumberInPrimus({
+                invoice,
+                invoiceId,
+                invoiceDoc,
+                req,
+                booking: bookingAfterBilling,
+                proNumber: workingProNumber,
+                pauseOnMissing: true,
+              });
+            if (!carrierInvNumVerify.ok &&
+                carrierInvNumVerify.workflowStatus) {
+              return res.json({
+                ok: false,
+                error: "CARRIER_INVOICE_NUMBER_MISSING_IN_PRIMUS",
+                workflowStatus: carrierInvNumVerify.workflowStatus,
+                details: carrierInvNumVerify,
+              });
+            }
+          }
 
           const finalCustomerInvoiceId =
       (invoiceGenerationResult && invoiceGenerationResult.customerInvoiceId) ||
