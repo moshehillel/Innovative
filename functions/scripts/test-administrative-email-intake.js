@@ -138,6 +138,25 @@ check("invoice email with OOO mention not ignored",
         "Invoice # 28415 for BOL #264557",
         oooFrom,
         "I am out of the office next week but your invoice is attached."));
+check("Automatic reply quoting Invoice/BOL subject is still OOO",
+    adm.isOutOfOfficeAutoReply(
+        "Automatic reply: Invoice #29558 for BOL #266916",
+        "Baila <baila@fivestarcorr.com>",
+        "I will return on Tuesday, 09/08."));
+check("Automatic reply + Invoice/BOL evaluates to OOO ignore",
+    adm.evaluateAdministrativeIgnore(
+        "Automatic reply: Invoice #29558 for BOL #266916",
+        "Chanie <chanie@fivestarcorr.com>",
+        "I will return on Tuesday, 9/8.",
+        []).status === "out_of_office_ignored");
+check("Automatic reply + Invoice/BOL is not blocked by invoice veto",
+    !adm.hasInvoiceVeto({
+      subject: "Automatic reply: Invoice #29558 for BOL #266916",
+      body: "I will return Tuesday, 9/8.",
+      from: "Miriam <miriam@fivestarcorr.com>",
+      attachments: [],
+      invoicePdfCount: 0,
+    }));
 
 const dnbPromoSubject =
   "No Hidden Fees. No Overdrafts. Smarter Business Banking Starts Here";

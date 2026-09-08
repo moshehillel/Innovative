@@ -237,8 +237,10 @@ function isOutOfOfficeAutoReply(subject, from, body) {
   const subL = sub.toLowerCase();
   const bodyL = String(body || "").toLowerCase();
   if (!subL && !bodyL.trim()) return false;
-  if (looksLikeInvoiceEmailContent(subject, body)) return false;
 
+  // Strong auto-reply subject prefixes always win — even when the rest of
+  // the subject quotes "Invoice #… for BOL #…" from the original thread
+  // (Exchange/Outlook: "Automatic reply: Invoice #29558 for BOL #266916").
   const subjectPatterns = [
     /^out of office\b/i,
     /^automatic reply\b/i,
@@ -252,6 +254,9 @@ function isOutOfOfficeAutoReply(subject, from, body) {
     /\b(?:away|out)\s+message\b/i,
   ];
   if (subjectPatterns.some((re) => re.test(sub))) return true;
+
+  // Real invoice/BOL threads that merely mention someone is away are not OOO.
+  if (looksLikeInvoiceEmailContent(subject, body)) return false;
 
   const strongBodyPatterns = [
     /\bi am currently out of (?:the )?office\b/,
@@ -1446,6 +1451,12 @@ function hasInvoiceVeto(signals = {}) {
 
   // Remittances forward to Abe even when subject/body cite invoice/BOL #s.
   if (isCustomerPaymentRemittanceEmail(subject, from, body)) {
+    return false;
+  }
+
+  // OOO auto-replies are always ignore — even when subject quotes an
+  // Invoice # / BOL # from the thread that triggered the auto-reply.
+  if (isOutOfOfficeAutoReply(subject, from, body)) {
     return false;
   }
 
