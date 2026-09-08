@@ -1362,4 +1362,32 @@ check("CHB 266272-style never regex quiet-ignores",
     !adm.shouldIgnoreAsPaymentNotification(
         chbSubject, chbFrom, chbBody, []));
 check("quoted Zelle from random Gmail is ambiguous (AI path), not regex ignore",
-    adm.isAmbiguousPa
+    adm.isAmbiguousPaymentNotificationCandidate(
+        "Payment update",
+        "random.person@gmail.com",
+        "Just FYI about Zelle — not sure if this is the right inbox.",
+        []) &&
+    !adm.shouldIgnoreAsPaymentNotification(
+        "Payment update",
+        "random.person@gmail.com",
+        "Just FYI about Zelle — not sure if this is the right inbox.",
+        []));
+check("BoA Zelle is known bank sender, not ambiguous",
+    adm.isKnownBankPaymentAlertSender(
+        "Bank of America <customerservice@ealerts.bankofamerica.com>") &&
+    !adm.isAmbiguousPaymentNotificationCandidate(
+        "Goldengate Logistics Llc sent you $36.00",
+        "Bank of America <customerservice@ealerts.bankofamerica.com>",
+        "You received a Zelle payment of $500",
+        []));
+check("Chase alerts@ is known bank-alert sender",
+    adm.isKnownBankPaymentAlertSender("Chase <alerts@chase.com>"));
+check("payment alert language detects Zelle",
+    adm.hasPaymentAlertLanguage(
+        "hi", "Quickpay/Zelle accounting@innovativecarriers.com"));
+
+if (failures) {
+  console.error(`\n${failures} test(s) failed`);
+  process.exit(1);
+}
+console.log("\nAll administrative email tests passed");
