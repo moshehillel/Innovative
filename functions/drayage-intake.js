@@ -1,6 +1,7 @@
 /**
- * Drayage invoice intake — carrier identity (Primus vendor type or
- * configured carrier name). Container # is metadata only, not a route trigger.
+ * Drayage invoice intake — Primus vendor type for the invoice carrier name.
+ * Container # is metadata only, never a route trigger. Sender email / freemail
+ * domains are never used to pick the Primus vendor (customers forward invoices).
  * Inbound → forward to Leo; Leo returns instructions → process per email
  * (never forward Leo returns back to Leo). Missing fields → email Lisa.
  */
@@ -19,14 +20,6 @@ const DRAYAGE_RETURN_EMAIL_DEFAULT = "accounting@innovativecarriers.com";
 const DRAYAGE_OPS_EMAIL_DEFAULT = podFollowup.LISA_EMAIL;
 
 /**
- * Carriers explicitly treated as drayage when Primus vendor lookup is
- * ambiguous (e.g. duplicate vendor names).
- */
-const DRAYAGE_CARRIER_NAME_OVERRIDES = [
-  /^mark evans( delivery)?$/,
-];
-
-/**
  * @param {string|null|undefined} value Raw container text.
  * @return {string}
  */
@@ -38,18 +31,15 @@ function normalizeContainerNumber(value) {
 }
 
 /**
- * ISO 6346-style container id (4 letters + 7 digits).
+ * ISO 6346 container id: 3-letter owner + category U/J/Z + 7 digits.
+ * Rejects LTL PRO / account-code lookalikes (e.g. AVRT1467163, CODE1236247).
  * @param {string|null|undefined} value Raw container text.
  * @return {boolean}
  */
 function isPlausibleContainerNumber(value) {
   const compact = normalizeContainerNumber(value);
   if (!compact) return false;
-  if (/^[A-Z]{4}\d{7}$/.test(compact)) return true;
-  if (/^[A-Z]{3,4}\d{6,7}$/.test(compact) && compact.length >= 9) {
-    return true;
-  }
-  return false;
+  return /^[A-Z]{3}[UJZ]\d{7}$/.test(compact);
 }
 
 /**
@@ -129,27 +119,27 @@ function isDrayageVendorType(type) {
 }
 
 /**
- * @param {string|null|undefined} name Raw carrier name from invoice.
- * @return {string}
- */
-function normalizeCarrierNameForMatch(name) {
-  return String(name || "")
-      .trim()
-      .toLowerCase()
-      .replace(/[.,]/g, "")
-      .replace(/\s+/g, " ")
-      .replace(/\b(inc|llc|corp|corporation|company|co|ltd)\b\.?$/g, "")
-      .trim();
-}
-
-/**
+ * Looks up the Primus master vendor by invoice carrier name only.
+ * Never uses the email From header — forwards often come from customers
+ * (e.g. *@gmail.com) and would match the wrong vendor.
  * @param {string|null|undefined} carrierName Invoice carrier name.
- * @return {boolean}
+ * @return {Promise<object|null>}
  */
-function isConfiguredDrayageCarrierName(carrierName) {
-  const normalized = normalizeCarrierNameForMatch(carrierName);
-  if (!normalized) return false;
-  return DRAYAGE_CARRIER_NAME_OVERRIDES.some((re) => re.test(normalized));
+async function lookupPrimusVendorByCarrierName(carrierName) {
+  const name = String(carrierName || "").trim();
+  if (!name) return null;
+  try {
+    const bridge = require("./primus-ui-bridge");
+    if (!bridge.isManagePhpEnabled || !bridge.isManagePhpEnabled()) {
+      return null;
+    }
+    return await bridge.lookupVendorByCarrierHint({
+      carrierName: name,
+      // Intentionally omit fromEmail — freemail/customer domains mis-route.
+    });
+  } catch (_) {
+    return null;
+  }
 }
 
 /**
@@ -475,9 +465,11 @@ async function probeContainerOnPdfs(pdfAttachments) {
     text: JSON.stringify({
       task: "Find the intermodal/ocean container number on these documents.",
       rules: [
-        "Only drayage freight documents include a container number.",
+        "Look for ISO 6346 intermodal/ocean container numbers only.",
         "Look for Container #, Container No, CNTR, Unit #, or similar labels.",
-        "ISO format is 4 letters + 7 digits (e.g. MSCU1234567).",
+        "ISO 6346 is 3 letters + U/J/Z + 7 digits (e.g. MSCU1234567).",
+        "Do not treat LTL PRO numbers or account codes as containers.",
+        "A container number does not mean the shipment is drayage.",
         "Return containerNumber as empty string when none is present.",
       ],
       requiredJsonShape: {containerNumber: ""},
@@ -515,71 +507,70 @@ async function probeContainerOnPdfs(pdfAttachments) {
 function resolveInboundDrayageContainer(
     from, invoiceItems, probedContainer, subject, body) {
   if (isDrayageValidatorEmail(from)) return null;
-  const carrierName = carrierNameFromInvoiceItems(invoiceItems);
-  if (!isConfiguredDrayageCarrierName(carrierName)) return null;
-  return resolveContainerNumber(
-      invoiceItems, probedContainer, subject, body);
+  // Container alone never routes to Leo — Primus vendor type decides.
+  return null;
 }
 
 /**
- * Classifies inbound freight as drayage using configured carrier names or
- * Primus vendor type — not container numbers (intermodal invoices like Loup
- * also carry container #s but are not drayage).
+ * Classifies inbound freight as drayage from the Primus vendor for that
+ * carrier name only. Container numbers and sender email never trigger routing.
  *
- * @param {object} args from, invoiceItems, probedContainer, subject, body.
+ * @param {object} args from, invoiceItems, probedContainer, subject, body,
+ *   lookupVendor (optional test inject).
  * @return {Promise<object>} {isDrayage, reason, containerNumber, carrierName,
  *   vendorType, primusVendorId}
  */
 async function resolveInboundDrayageSignal(args) {
   const {
-    from, invoiceItems, probedContainer, subject, body,
+    from, invoiceItems, probedContainer, subject, body, lookupVendor,
   } = args || {};
   if (isDrayageValidatorEmail(from)) {
     return {isDrayage: false};
   }
 
   const carrierName = carrierNameFromInvoiceItems(invoiceItems);
-  let vendorType = null;
   const containerNumber = resolveContainerNumber(
       invoiceItems, probedContainer, subject, body);
 
-  if (isConfiguredDrayageCarrierName(carrierName)) {
+  if (!carrierName) {
     return {
-      isDrayage: true,
-      reason: `Drayage invoice — configured carrier ${carrierName}`,
+      isDrayage: false,
+      carrierName: null,
+      vendorType: null,
       containerNumber,
-      carrierName,
-      drayageByConfiguredCarrier: true,
     };
   }
 
+  const lookup = typeof lookupVendor === "function" ?
+    lookupVendor : lookupPrimusVendorByCarrierName;
+  let vendor = null;
   try {
-    const bridge = require("./primus-ui-bridge");
-    if (bridge.isManagePhpEnabled && bridge.isManagePhpEnabled()) {
-      const vendor = await bridge.lookupVendorByCarrierHint({
-        carrierName,
-        fromEmail: from,
-      });
-      if (vendor) {
-        vendorType = vendor.type || null;
-        if (isDrayageVendorType(vendorType)) {
-          return {
-            isDrayage: true,
-            reason: `Drayage invoice — Primus vendor type ${vendorType}`,
-            containerNumber,
-            carrierName: carrierName || vendor.name || null,
-            vendorType,
-            primusVendorId: vendor.id || null,
-            drayageByVendorType: true,
-          };
-        }
-      }
-    }
+    vendor = await lookup(carrierName, from);
   } catch (_) {
-    // Primus lookup is best-effort; non-drayage carriers continue as invoices.
+    vendor = null;
   }
 
-  return {isDrayage: false, carrierName, vendorType, containerNumber};
+  const vendorType = vendor && vendor.type || null;
+  if (vendor && isDrayageVendorType(vendorType)) {
+    return {
+      isDrayage: true,
+      reason: `Drayage invoice — Primus vendor ` +
+        `${vendor.name || carrierName} (${vendorType})`,
+      containerNumber,
+      carrierName: carrierName || vendor.name || null,
+      vendorType,
+      primusVendorId: vendor.id || null,
+      drayageByVendorType: true,
+    };
+  }
+
+  return {
+    isDrayage: false,
+    carrierName,
+    vendorType,
+    containerNumber,
+    primusVendorId: vendor && vendor.id || null,
+  };
 }
 
 module.exports = {
@@ -595,8 +586,6 @@ module.exports = {
   containerFromInvoiceItem,
   findContainerOnInvoiceItems,
   isDrayageVendorType,
-  isConfiguredDrayageCarrierName,
-  normalizeCarrierNameForMatch,
   carrierNameFromInvoiceItems,
   resolveContainerNumber,
   parseLeoReturnInstructions,
@@ -609,4 +598,5 @@ module.exports = {
   probeContainerOnPdfs,
   resolveInboundDrayageContainer,
   resolveInboundDrayageSignal,
+  lookupPrimusVendorByCarrierName,
 };

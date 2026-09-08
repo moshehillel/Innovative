@@ -20,12 +20,26 @@ check("container normalized",
     dray.sanitizeContainerNumber("mscu 1234567"), "MSCU1234567");
 check("random load rejected",
     dray.isPlausibleContainerNumber("265551"), false);
+check("Averitt PRO is not a container",
+    dray.isPlausibleContainerNumber("AVRT1467163"), false);
+check("account-code lookalike CODE1236247 rejected",
+    dray.sanitizeContainerNumber("CODE1236247"), null);
+check("SCAC+digits without U/J/Z rejected",
+    dray.sanitizeContainerNumber("SAIA1236247"), null);
 check("extract labeled container",
-    dray.extractContainerFromText("", "Container # ABCD1234567"),
-    "ABCD1234567");
+    dray.extractContainerFromText("", "Container # ABDU1234567"),
+    "ABDU1234567");
+check("acct code subject not extracted as container",
+    dray.extractContainerFromText(
+        "Fwd: Invoices / J I Distributors Acct code 1236247",
+        ""),
+    null);
 check("find on invoice item",
     dray.findContainerOnInvoiceItems([{containerNumber: "HLCU7654321"}]),
     "HLCU7654321");
+check("fake CODE container on invoice item rejected",
+    dray.findContainerOnInvoiceItems([{containerNumber: "CODE1236247"}]),
+    null);
 check("no container on truckload item",
     dray.findContainerOnInvoiceItems([{loadNumber: "265551"}]), null);
 check("Leo is validator",
@@ -33,16 +47,23 @@ check("Leo is validator",
     true);
 check("carrier not validator",
     dray.isDrayageValidatorEmail("Billing@EvansDelivery.com"), false);
-check("Mark Evans inbound container",
+
+check("drayage vendor type DRAYAGE",
+    dray.isDrayageVendorType("DRAYAGE"), true);
+check("drayage vendor type Drayage Broker",
+    dray.isDrayageVendorType("Drayage Broker"), true);
+check("LTL vendor type not drayage",
+    dray.isDrayageVendorType("LTL"), false);
+check("carrier name from invoice items",
+    dray.carrierNameFromInvoiceItems(
+        [{carrierName: "Saia Motor Freight Line, LLC"}]),
+    "Saia Motor Freight Line, LLC");
+
+// Container alone never returns a routing container anymore.
+check("Mark Evans inbound container alone does not route",
     dray.resolveInboundDrayageContainer(
         "Billing@EvansDelivery.com",
         [{containerNumber: "EGSU9876543", carrierName: "Mark Evans Delivery"}],
-        null, "", ""),
-    "EGSU9876543");
-check("Evans Delivery Company not configured drayage container",
-    dray.resolveInboundDrayageContainer(
-        "Billing@EvansDelivery.com",
-        [{containerNumber: "EGSU9876543", carrierName: "Evans Delivery Company"}],
         null, "", ""),
     null);
 check("Leo return not forwarded again",
@@ -51,27 +72,6 @@ check("Leo return not forwarded again",
         [{containerNumber: "EGSU9876543", carrierName: "Mark Evans Delivery"}],
         null, "", ""),
     null);
-
-check("drayage vendor type DRAYAGE",
-    dray.isDrayageVendorType("DRAYAGE"), true);
-check("drayage vendor type Drayage Broker",
-    dray.isDrayageVendorType("Drayage Broker"), true);
-check("LTL vendor type not drayage",
-    dray.isDrayageVendorType("LTL"), false);
-check("Mark Evans Delivery is configured drayage",
-    dray.isConfiguredDrayageCarrierName("Mark Evans Delivery"), true);
-check("Mark Evans variant is configured drayage",
-    dray.isConfiguredDrayageCarrierName("Mark Evans"), true);
-check("MARK EVANS DELIVERY uppercase",
-    dray.isConfiguredDrayageCarrierName("MARK EVANS DELIVERY"), true);
-check("Mark Evans Delivery LLC",
-    dray.isConfiguredDrayageCarrierName("Mark Evans Delivery LLC"), true);
-check("Evans Delivery Company not Mark Evans",
-    dray.isConfiguredDrayageCarrierName("Evans Delivery Company"), false);
-check("carrier name from invoice items",
-    dray.carrierNameFromInvoiceItems(
-        [{carrierName: "Evans Delivery Company"}]),
-    "Evans Delivery Company");
 
 async function runAsyncChecks() {
   const loupSignal = await dray.resolveInboundDrayageSignal({
@@ -84,6 +84,7 @@ async function runAsyncChecks() {
     probedContainer: "MSCU1234567",
     subject: "Loup - ORIGINAL BILL",
     body: "Please see attached original bill.",
+    lookupVendor: async () => ({id: "1", name: "Loup", type: "Intermodal"}),
   });
   check("Loup ORIGINAL BILL not drayage", loupSignal.isDrayage, false);
   check("Loup still extracts container metadata",
@@ -95,6 +96,7 @@ async function runAsyncChecks() {
     probedContainer: null,
     subject: "Invoice attached",
     body: "Container HLCU7654321",
+    lookupVendor: async () => null,
   });
   check("container alone does not trigger drayage",
       containerOnlySignal.isDrayage, false);
@@ -108,11 +110,68 @@ async function runAsyncChecks() {
     probedContainer: null,
     subject: "Invoice",
     body: "",
+    lookupVendor: async (name) => ({
+      id: "99",
+      name: name,
+      type: "DRAYAGE",
+    }),
   });
-  check("Mark Evans configured carrier is drayage",
+  check("Mark Evans Primus DRAYAGE vendor is drayage",
       markEvansSignal.isDrayage, true);
-  check("Mark Evans drayage reason mentions carrier",
-      /configured carrier/i.test(markEvansSignal.reason || ""), true);
+  check("Mark Evans drayage reason mentions Primus vendor",
+      /Primus vendor/i.test(markEvansSignal.reason || ""), true);
+
+  // Saia LTL forwarded by customer from gmail — must NOT use From domain.
+  let lookupArgs = null;
+  const saiaSignal = await dray.resolveInboundDrayageSignal({
+    from: "J&I Distributers <jidistributors72@gmail.com>",
+    invoiceItems: [{
+      carrierName: "Saia Motor Freight Line, LLC",
+      containerNumber: "CODE1236247",
+      invoiceAmount: 412.5,
+    }],
+    probedContainer: null,
+    subject: "Fwd: Invoices / J I Distributors Acct code 1236247",
+    body: "",
+    lookupVendor: async (name, from) => {
+      lookupArgs = {name, from};
+      return {id: "saia", name: "Saia Motor Freight Line", type: "LTL"};
+    },
+  });
+  check("Saia LTL not drayage even with fake CODE container",
+      saiaSignal.isDrayage, false);
+  check("Saia fake CODE container stripped from metadata",
+      saiaSignal.containerNumber, null);
+  check("Saia lookup used carrier name",
+      lookupArgs && lookupArgs.name, "Saia Motor Freight Line, LLC");
+
+  // If Primus wrongly matched a gmail drayage vendor, name-only LTL wins.
+  const gmailPoison = await dray.resolveInboundDrayageSignal({
+    from: "J&I Distributers <jidistributors72@gmail.com>",
+    invoiceItems: [{carrierName: "Saia Motor Freight Line, LLC"}],
+    subject: "Fwd: Invoices",
+    body: "",
+    lookupVendor: async (name) => {
+      if (/saia/i.test(name || "")) {
+        return {id: "saia", name: "Saia", type: "LTL"};
+      }
+      // Would be wrong: matching a random gmail.com DRAYAGE vendor
+      return {id: "bad", name: "Some Drayage Co", type: "DRAYAGE"};
+    },
+  });
+  check("Saia name match LTL beats gmail poison vendor",
+      gmailPoison.isDrayage, false);
+
+  const missingCarrier = await dray.resolveInboundDrayageSignal({
+    from: "J&I Distributers <jidistributors72@gmail.com>",
+    invoiceItems: [{containerNumber: "CODE1236247"}],
+    subject: "Acct code 1236247",
+    body: "",
+    lookupVendor: async () =>
+      ({id: "bad", name: "Random Gmail Dray", type: "DRAYAGE"}),
+  });
+  check("no carrier name + fake container is not drayage",
+      missingCarrier.isDrayage, false);
 }
 
 runAsyncChecks().then(() => {

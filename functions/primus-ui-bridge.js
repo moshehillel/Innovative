@@ -3631,7 +3631,14 @@ function findVendorByCarrierHint(vendors, hints = {}) {
     const byName = findMasterVendorByName(vendors, carrierName);
     if (byName) return byName;
   }
-  if (emailDomain) {
+  // Freemail / consumer domains must never match a vendor — invoice forwards
+  // often come from customers (e.g. gmail), not the carrier.
+  const freemail = new Set([
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com",
+    "hotmail.com", "outlook.com", "live.com", "msn.com", "aol.com",
+    "icloud.com", "me.com", "mac.com", "protonmail.com", "proton.me",
+  ]);
+  if (emailDomain && !freemail.has(emailDomain)) {
     const byEmail = vendors.find((v) => {
       const domain = normalizeEmailDomain(v.vendorEmail || "");
       return domain && domain === emailDomain;
