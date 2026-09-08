@@ -187,24 +187,56 @@ function dedupeTrackingRows(rows) {
  */
 async function resolveDispatcherForRow(row, cache) {
   const bridge = deps.primusUiBridge;
-  if (!bridge || typeof bridge.resolveDispatcherEmail !== "function") {
-    return {ok: false, error: "dispatcher lookup not configured"};
-  }
   const userName = String(row.dispatcherUser || "").trim();
   if (!userName) {
     return lisaFallbackDispatcher();
+  }
+  if (!bridge || typeof bridge.lookupPrimusUsers !== "function") {
+    return {ok: false, error: "dispatcher lookup not configured"};
   }
   const cacheKey = userName.toLowerCase();
   if (cache && cache.has(cacheKey)) {
     return cache.get(cacheKey);
   }
-  const result = await bridge.resolveDispatcherEmail({
-    booking: {
-      dispatchedByUser: row.dispatchedByUser || userName,
-      controlledBy: row.controlledBy,
-    },
-  });
-  const resolved = (result.ok && result.email) ? result : lisaFallbackDispatcher();
+
+  // Lookup by Primus dispatchedByUser only — never Controlled by / CreatedBy.
+  // Controlled-by is often Leo (ops), which is why Leo was getting these.
+  let resolved = {ok: false, error: "dispatcher user not found"};
+  try {
+    const looked = await bridge.lookupPrimusUsers(userName);
+    const users = (looked && looked.ok && looked.users) || [];
+    const want = userName.toLowerCase();
+    const matched = users.find((u) =>
+      String(u.userName || "").toLowerCase() === want,
+    ) || (users.length === 1 ? users[0] : null);
+    if (matched) {
+      const email = String(matched.email || matched.mailEmail || "").trim();
+      if (email && email.includes("@")) {
+        resolved = {
+          ok: true,
+          email,
+          userName: matched.userName || userName,
+          displayName: matched.displayName ||
+            `${matched.firstName || ""} ${matched.lastName || ""}`.trim() ||
+            userName,
+          userId: matched.id || null,
+        };
+      } else {
+        resolved = {
+          ok: false,
+          userName: matched.userName || userName,
+          error: "dispatcher user found but has no email",
+        };
+      }
+    }
+  } catch (err) {
+    resolved = {ok: false, error: err.message};
+  }
+
+  // Missing / unresolvable dispatcher → Lisa (not Leo, not CreatedBy).
+  if (!resolved.ok || !resolved.email) {
+    resolved = lisaFallbackDispatcher();
+  }
   if (cache) cache.set(cacheKey, resolved);
   return resolved;
 }
@@ -433,6 +465,7 @@ exports._internal = {
   readPickupDate,
   readDispatcherUser,
   lisaFallbackDispatcher,
+  resolveDispatcherForRow,
   dedupeTrackingRows,
   buildDispatcherReportEmail,
 };
