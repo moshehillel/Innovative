@@ -5415,8 +5415,10 @@ async function lookupPrimusUsers(query) {
 exports.lookupPrimusUsers = lookupPrimusUsers;
 
 /**
- * Ordered Primus user hints for the load dispatcher (UI "Controlled by").
- * Falls back to dispatchedByUser only when control fields are absent.
+ * Ordered Primus user hints for the load dispatcher.
+ * Prefer dispatchedByUser (actual dispatcher). Do not lead with booking.userName
+ * / Controlled-by — that field is often an ops user (e.g. Leo) who opened the
+ * file, which incorrectly CC'd them on additional-charge / low-profit alerts.
  * @param {object} booking Primus booking.
  * @return {string[]}
  */
@@ -5432,22 +5434,24 @@ function dispatcherQueriesFromBooking(booking) {
     queries.push(text);
   };
 
-  add(booking.userName);
+  // Actual load dispatcher first (matches undelivered-shipment-report).
+  add(booking.dispatchedByUser);
   const control = booking.contactInformation &&
     booking.contactInformation.controlUser;
   if (control && control.name) add(control.name);
   add(booking.controlledByName);
   const controlledBy = String(booking.controlledBy || "").trim();
   if (controlledBy && !/^\d+$/.test(controlledBy)) add(controlledBy);
-  add(booking.dispatchedByUser);
+  // CreatedBy before userName — userName is often current ops control.
   add(booking.CreatedBy);
+  add(booking.userName);
 
   return queries;
 }
 
 /**
  * Resolves the load dispatcher contact (username + email) from a booking.
- * Uses Primus "Controlled by" (userName / controlUser) before dispatchedByUser.
+ * Prefers Primus dispatchedByUser over Controlled-by / userName.
  * @param {object} args Args.
  * @param {object} [args.booking] Primus booking (optional if loadNumber set).
  * @param {string|number} [args.loadNumber] BOL / load number.
@@ -6075,4 +6079,5 @@ exports._internal = {
   defaultCustomerInvoiceEmailSubject,
   isClosedPriorInsuranceBill,
   ensureDraftInvoiceForInsurance,
+  dispatcherQueriesFromBooking,
 };

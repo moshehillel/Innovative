@@ -2576,6 +2576,43 @@ exports.processPrimusWorkflow = onRequest(
                 approver.toLowerCase()) ?
                 dispatcherForEmail.email : undefined,
             });
+              // Full carrier packet (invoice + W&I), same as processGmailQueue.
+              try {
+                const attachmentHints = {
+                  proNumber: invoice.proNumber,
+                  attachmentFilename: invoice.attachmentFilename,
+                };
+                const attachmentMetas =
+              additionalChargesMod.listAdditionalChargeApprovalAttachments(
+                  invoice.attachments, attachmentHints);
+                const emailAttachments = [];
+                for (const attachmentMeta of (attachmentMetas || [])) {
+                  if (!attachmentMeta || !attachmentMeta.storagePath) continue;
+                  const isWeightCert = /WEIGHT_INSPECTION_CERT/i.test(
+                      String(attachmentMeta.docType || ""));
+                  if (!isWeightCert) {
+                    const validation =
+                  additionalChargesMod.validateCarrierInvoiceAttachment(
+                      attachmentMeta, attachmentHints);
+                    if (!validation.ok) continue;
+                  }
+                  if (!downloadStorageFileBase64) continue;
+                  const contentBase64 = await downloadStorageFileBase64(
+                      attachmentMeta.storagePath);
+                  if (!contentBase64) continue;
+                  emailAttachments.push({
+                    filename: attachmentMeta.filename ||
+                      `carrier-invoice-${invoiceId}.pdf`,
+                    contentType: attachmentMeta.mimeType || "application/pdf",
+                    contentBase64,
+                  });
+                }
+                if (emailAttachments.length) {
+                  approvalPayload.attachments = emailAttachments;
+                }
+              } catch (_) {
+                // Non-fatal — approval email still goes out.
+              }
               await saveOutboundEmail(approvalPayload);
 
               await additionalChargesMod.createFollowUp(db, {
