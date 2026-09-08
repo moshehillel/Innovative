@@ -777,6 +777,84 @@ async function verifyAndEnsureCarrierInvoiceNumberInPrimus(args) {
 }
 
 /**
+ * Seeds carrier invoice # into Primus during bill entry (same step as
+ * entering/closing costs) — not only as a post-billing safety-net fix.
+ * Used for carrier-bill-only (pre-issued customer invoice) and as a
+ * reinforcement when UI billing skipped full saveInvoice.
+ * @param {object} args Workflow context.
+ * @return {Promise<object>}
+ */
+async function seedCarrierInvoiceNumberDuringBillEntry(args) {
+  const {invoice, invoiceId, booking, proNumber} = args || {};
+  const vendorInvoiceNumber = String(
+      (invoice && (invoice.invoiceNumber || invoice.carrierInvoiceNumber)) ||
+      "").trim();
+  if (!invoice || !invoice.loadNumber || !vendorInvoiceNumber) {
+    return {ok: true, skipped: true, reason: "no_carrier_invoice_number"};
+  }
+  let bookingToUse = booking || null;
+  if (!bookingToUse) {
+    try {
+      bookingToUse = await fetchPrimusBooking(invoice.loadNumber);
+    } catch (_) {
+      bookingToUse = null;
+    }
+  }
+  if (!bookingToUse) {
+    return {ok: false, error: "booking required for invoice # seed"};
+  }
+  try {
+    const bridge = require("./primus-ui-bridge");
+    if (!bridge.writeCarrierInvoiceNumberToPrimus) {
+      return {ok: false, error: "writeCarrierInvoiceNumberToPrimus unavailable"};
+    }
+    const result = await bridge.writeCarrierInvoiceNumberToPrimus({
+      booking: bookingToUse,
+      loadNumber: invoice.loadNumber,
+      vendorInvoiceNumber,
+      carrierInvoiceAmount: invoice.invoiceAmount,
+      proNumber: proNumber || invoice.proNumber,
+      billDate: invoice.invoiceDate || invoice.receivedAt,
+      billDueDate: invoice.dueDate,
+      carrierName: invoice.carrierName,
+    });
+    await writeLog(
+        result.ok ? "info" : "warn",
+        "workflow",
+        result.ok ?
+          "Carrier invoice # seeded during bill entry" :
+          "Carrier invoice # seed during bill entry failed",
+        {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          vendorInvoiceNumber,
+          result,
+        });
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "carrier_invoice_number_seeded_on_bill_entry",
+      stepStatus: result.ok ? "success" : "failed",
+      output: {
+        vendorInvoiceNumber,
+        method: result.method || "writeCarrierInvoiceNumberToPrimus",
+        skipped: !!result.skipped,
+      },
+      error: result.ok ? null : (result.error || "seed failed"),
+    });
+    return result;
+  } catch (err) {
+    await writeLog("warn", "workflow",
+        "Carrier invoice # seed during bill entry error", {
+          invoiceId,
+          loadNumber: invoice.loadNumber,
+          vendorInvoiceNumber,
+          error: err.message || String(err),
+        });
+    return {ok: false, error: err.message || String(err)};
+  }
+}
+
+/**
  * Loads prior cannot-email / missing-POD outbound rows for one invoice.
  * @param {string} invoiceId Firestore invoice id.
  * @param {string} code Alert catalog code.
@@ -3422,6 +3500,13 @@ exports.processPrimusWorkflow = onRequest(
                     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                   });
                 }
+                // Moshe: enter bill + invoice # together (pre-issued path).
+                await seedCarrierInvoiceNumberDuringBillEntry({
+                  invoice,
+                  invoiceId,
+                  booking: bookingForMode,
+                  proNumber: workingProNumber,
+                });
               } else {
                 const bk = await fetchPrimusBooking(invoice.loadNumber);
                 const podPath =
@@ -3448,6 +3533,8 @@ exports.processPrimusWorkflow = onRequest(
                   carrierInvoiceAmount: invoice.invoiceAmount,
                   carrierName: invoice.carrierName || null,
                   proNumber: workingProNumber || invoice.proNumber,
+                  // Moshe: bill entry must include carrier invoice # in the
+                  // same step (billsInfo / actualCosts / addVendorRefNumber).
                   vendorInvoiceNumber: invoice.invoiceNumber ||
                   invoice.carrierInvoiceNumber ||
                   workingProNumber || invoice.proNumber,
@@ -3473,6 +3560,8 @@ exports.processPrimusWorkflow = onRequest(
                     customerInvoiceId: uiResult.customerInvoiceId ||
                   invoice.customerInvoiceId,
                     invoiceNumber: uiResult.invoiceNumber || null,
+                    vendorInvoiceNumber: uiResult.vendorInvoiceNumber ||
+                      invoice.invoiceNumber || null,
                     via: "manage.php",
                   } : null,
                   error: uiOk ? null :
@@ -3635,6 +3724,13 @@ exports.processPrimusWorkflow = onRequest(
                   updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 });
               }
+              // Moshe: enter bill + invoice # together (pre-issued path).
+              await seedCarrierInvoiceNumberDuringBillEntry({
+                invoice,
+                invoiceId,
+                booking: bookingForMode,
+                proNumber: workingProNumber,
+              });
             } else if (invoice.customerInvoiceId) {
               await writeLog(
                   "info", "workflow", "Customer invoice already exists", {

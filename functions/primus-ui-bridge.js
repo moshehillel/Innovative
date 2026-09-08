@@ -4777,6 +4777,36 @@ async function runPrimusUiBillingFlow(args) {
           forbiddenBuffer: args.carrierBillPdf &&
             args.carrierBillPdf.buffer,
         });
+        // Customer invoice already issued — still seed carrier invoice #
+        // onto actual costs / vendor ref (Moshe: enter bill + # together).
+        const seedRefs = resolveVendorBillRefs(args, booking.vendor || {});
+        let vendorInvoiceSeed = null;
+        if (seedRefs.vendorInvoiceNumber) {
+          vendorInvoiceSeed = await writeCarrierInvoiceNumberToPrimus({
+            booking,
+            loadNumber,
+            vendorInvoiceNumber: seedRefs.vendorInvoiceNumber,
+            carrierInvoiceAmount: args.carrierInvoiceAmount,
+            proNumber: seedRefs.proNumber,
+            billDate: args.billDate,
+            billDueDate: args.billDueDate,
+            carrierName: args.carrierName,
+          });
+          if (writeLog) {
+            await writeLog(
+                vendorInvoiceSeed.ok ? "info" : "warn",
+                "primus",
+                vendorInvoiceSeed.ok ?
+                  "Carrier invoice # seeded on already-issued invoice" :
+                  "Carrier invoice # seed on already-issued invoice failed",
+                {
+                  loadNumber,
+                  bookingId,
+                  vendorInvoiceNumber: seedRefs.vendorInvoiceNumber,
+                  result: vendorInvoiceSeed,
+                });
+          }
+        }
         return {
           ok: true,
           skipped: true,
@@ -4784,6 +4814,8 @@ async function runPrimusUiBillingFlow(args) {
           generated: true,
           customerInvoiceId: Number(issued.id),
           invoiceNumber: String(issued.invoiceNumber),
+          vendorInvoiceNumber: seedRefs.vendorInvoiceNumber || null,
+          vendorInvoiceSeed,
           carrierBillUpload,
           carrierBillUploaded: !!(
             carrierBillUpload.uploaded || carrierBillUpload.skipped),
@@ -4946,6 +4978,22 @@ async function runPrimusUiBillingFlow(args) {
         "No PRO or carrier bill number — using load number as vendor ref", {
           loadNumber,
           bookingId,
+        });
+  }
+  if (!vendorInvoiceNumber) {
+    return {
+      ok: false,
+      step: "vendorInvoiceNumber",
+      error: "Carrier invoice number required when entering bill",
+    };
+  }
+  if (writeLog) {
+    await writeLog("info", "primus",
+        "Entering carrier bill with vendor invoice number", {
+          loadNumber,
+          bookingId,
+          vendorInvoiceNumber,
+          proNumber,
         });
   }
   const carrierTotal = roundMoney(
@@ -5268,6 +5316,8 @@ async function runPrimusUiBillingFlow(args) {
     generated: true,
     customerInvoiceId: Number(uiInvoiceId),
     invoiceNumber,
+    vendorInvoiceNumber,
+    proNumber,
     billtoId,
     billtoSource,
     billtoPartyName: billtoResolution.partyName || null,
@@ -5289,6 +5339,7 @@ async function runPrimusUiBillingFlow(args) {
       podUpload: podUpload.skipped ?
         (podUpload.reason || "skipped") :
         (podUpload.uploaded ? "uploaded" : (podUpload.error || "failed")),
+      vendorInvoiceNumberSeeded: vendorInvoiceNumber,
     },
   };
 }
