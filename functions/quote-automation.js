@@ -1749,8 +1749,29 @@ function selectedCarrierReportFields(data) {
   };
 }
 
+/** Default CSV report statuses: drafts, sent, and completed. */
+const REPORT_DEFAULT_STATUSES = ["draft_ready", "sent", "completed"];
+
 /**
- * Lists draft_ready / sent quotes for CSV report pull.
+ * Pick the date used for CSV report range filtering.
+ * Sent → sentAt; completed → completedAt (else sentAt); else createdAt.
+ * @param {string} status Normalized status.
+ * @param {object} data Quote fields.
+ * @return {Date|null}
+ */
+function reportAnchorDate(status, data) {
+  const created = coerceDate(data && data.createdAt);
+  const sent = coerceDate(data && data.sentAt);
+  const completed = coerceDate(data && data.completedAt);
+  if (status === "completed") {
+    return completed || sent || created;
+  }
+  if (status === "sent" && sent) return sent;
+  return created;
+}
+
+/**
+ * Lists draft_ready / sent / completed quotes for CSV report pull.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {object} [opts] fromDate, toDate (YYYY-MM-DD), statuses[], limit.
@@ -1762,9 +1783,9 @@ async function listQuotesForDispatcherReport(tenant, dispatcher, opts = {}) {
   const dispatcherEmail = quoteDispatchers.normalizeEmail(
       dispatcher.email || "");
   let statuses = Array.isArray(opts.statuses) ? opts.statuses :
-    String(opts.status || "draft_ready,sent").split(",");
+    String(opts.status || REPORT_DEFAULT_STATUSES.join(",")).split(",");
   statuses = statuses.map((s) => normalizeQuoteStatus(s)).filter(Boolean);
-  if (!statuses.length) statuses = ["draft_ready", "sent"];
+  if (!statuses.length) statuses = REPORT_DEFAULT_STATUSES.slice();
   const statusSet = new Set(statuses);
 
   const fromDate = opts.fromDate ? coerceDate(opts.fromDate) : null;
@@ -1794,7 +1815,7 @@ async function listQuotesForDispatcherReport(tenant, dispatcher, opts = {}) {
     if (!statusSet.has(status)) continue;
     const created = coerceDate(data.createdAt);
     const sent = coerceDate(data.sentAt);
-    const anchor = status === "sent" && sent ? sent : created;
+    const anchor = reportAnchorDate(status, data);
     if (fromDate && anchor && anchor < fromDate) continue;
     if (toDate && anchor && anchor > toDate) continue;
     if (rows.length >= limit) continue;
@@ -2180,6 +2201,8 @@ module.exports = {
   setQuoteCompleted,
   setQuoteForReview,
   listQuotesForDispatcherReport,
+  REPORT_DEFAULT_STATUSES,
+  reportAnchorDate,
   rerunQuoteRates,
   getQuoteRequest,
   listQuotesForDispatcher,

@@ -985,7 +985,7 @@
           <input type="date" id="report-to" />
         </label>
         <button type="button" id="btn-report-pull">Report pull (CSV)</button>
-        <span class="report-note">Saved drafts + sent quotes</span>
+        <span class="report-note">Saved drafts + sent + completed</span>
       </div>
       <div id="page-thinking" class="page-thinking hidden" aria-live="polite" aria-busy="false">
         <div class="thinking-panel">
@@ -1280,7 +1280,7 @@
       const to = document.getElementById("report-to").value || "";
       let path = "/exportQuoteDispatcherReport?tenantId=" +
         encodeURIComponent(TENANT_ID) +
-        "&status=" + encodeURIComponent("draft_ready,sent");
+        "&status=" + encodeURIComponent("draft_ready,sent,completed");
       if (from) path += "&fromDate=" + encodeURIComponent(from);
       if (to) path += "&toDate=" + encodeURIComponent(to);
       let authHeaders = {};

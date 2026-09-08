@@ -851,8 +851,8 @@ function buildQuoteReportCsv(rows) {
 }
 
 /**
- * GET CSV report of draft_ready / sent quotes for the signed-in dispatcher.
- * Query: fromDate, toDate (YYYY-MM-DD), status=draft_ready,sent
+ * GET CSV report of draft_ready / sent / completed quotes for the dispatcher.
+ * Query: fromDate, toDate (YYYY-MM-DD), status=draft_ready,sent,completed
  * @param {object} req Request.
  * @param {object} res Response.
  * @return {Promise<void>}
@@ -869,7 +869,7 @@ async function handleExportQuoteDispatcherReport(req, res) {
     }
     const fromDate = req.query.fromDate || req.query.from || "";
     const toDate = req.query.toDate || req.query.to || "";
-    const status = req.query.status || "draft_ready,sent";
+    const status = req.query.status || "draft_ready,sent,completed";
     const listed = await quoteAutomation.listQuotesForDispatcherReport(
         user.tenant, user.dispatcher, {
           fromDate: fromDate || undefined,
