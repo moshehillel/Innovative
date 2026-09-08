@@ -750,8 +750,12 @@ async function verifyAndEnsureCarrierInvoiceNumberInPrimus(args) {
       type: "carrier_invoice_number_missing",
       context: {
         loadNumber: invoice.loadNumber,
+        carrierName: invoice.carrierName,
         carrierInvoiceNumber: evidence.carrierInvoiceNumber,
+        invoiceAmount: invoice.invoiceAmount,
         hasCarrierBillFileType: evidence.hasCarrierBillFileType,
+        errorMessage: "Carrier bill uploaded but carrier invoice number " +
+          "not in Primus",
         fixAttempts,
       },
     });

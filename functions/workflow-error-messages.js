@@ -17,6 +17,7 @@ const BILLING_PIPELINE_RESUME_STEPS = new Set([
   "mark_delivered",
   "check_customer",
   "approve_bill",
+  "carrier_invoice_number",
   "get_rate",
   "generate_invoice",
   "pod_extraction",
@@ -57,6 +58,16 @@ function interpretWorkflowResumeResult(httpOk, payload) {
         "ShipPrimus (POD file type on the booking), then click Resume " +
         "Workflow again.",
       code: "MISSING_POD",
+    };
+  }
+  if (p.error === "CARRIER_INVOICE_NUMBER_MISSING_IN_PRIMUS" ||
+      p.workflowStatus === "carrier_invoice_number_missing_in_primus") {
+    return {
+      ok: false,
+      userMessage: "The carrier invoice number is still not in ShipPrimus " +
+        "on this load. Enter it on the carrier bill / vendor invoice " +
+        "fields, then click Resume Workflow again.",
+      code: "CARRIER_INVOICE_NUMBER_MISSING",
     };
   }
   if (p.error === "ALREADY_PROCESSING") {
@@ -346,6 +357,21 @@ function buildWorkflowAlertEmail(opts) {
       action = ACTION.RESUME;
       break;
 
+    case "CARRIER_INVOICE_NUMBER_MISSING":
+      subject = `Action needed — Carrier invoice # missing in Primus — ` +
+        `Load ${loadNumber}`;
+      title = "Carrier invoice number not in ShipPrimus";
+      summary = "Jerry uploaded/approved the carrier bill, but the carrier " +
+        "invoice number is still not showing on the load in ShipPrimus.";
+      explanation = "Open the load in ShipPrimus and enter the carrier " +
+        "invoice number" +
+        (ctx.carrierInvoiceNumber ?
+          ` (${esc(ctx.carrierInvoiceNumber)})` : "") +
+        " on the carrier bill / vendor invoice fields, then resume. " +
+        "Jerry will re-check Primus and continue billing.";
+      action = ACTION.RESUME;
+      break;
+
     case "INVOICE_GENERATION_FAILED":
       subject = `System issue — Invoice generation failed — Load ${loadNumber}`;
       title = "Invoice generation failed";
@@ -507,6 +533,9 @@ function buildWorkflowAlertEmail(opts) {
   if (carrier && carrier !== "—") extraRows.push(["Carrier", carrier]);
   if (customer && customer !== "—") extraRows.push(["Customer", customer]);
   if (ctx.proNumber) extraRows.push(["PRO", ctx.proNumber]);
+  if (ctx.carrierInvoiceNumber) {
+    extraRows.push(["Carrier invoice #", String(ctx.carrierInvoiceNumber)]);
+  }
   if (ctx.invoiceAmount != null) {
     extraRows.push(
         ["Carrier bill", `$${Number(ctx.invoiceAmount).toFixed(2)}`]);

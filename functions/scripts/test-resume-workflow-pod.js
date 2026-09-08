@@ -28,6 +28,8 @@ check("customer_invoice resume runs billing pipeline",
     shouldRunBillingPipelineOnResume("customer_invoice"), true);
 check("mark_delivered resume runs billing pipeline",
     shouldRunBillingPipelineOnResume("mark_delivered"), true);
+check("carrier_invoice_number resume runs billing pipeline",
+    shouldRunBillingPipelineOnResume("carrier_invoice_number"), true);
 check("send_customer_email resume does not run billing alone",
     shouldRunBillingPipelineOnResume("send_customer_email"), false);
 
@@ -58,6 +60,39 @@ check("interpret MISSING_POD is failure", podStillMissing.ok, false);
 check("interpret MISSING_POD code", podStillMissing.code, "MISSING_POD");
 check("interpret MISSING_POD mentions ShipPrimus",
     podStillMissing.userMessage.includes("ShipPrimus"), true);
+
+const carrierInvMissingAlert = buildWorkflowAlertEmail({
+  code: "CARRIER_INVOICE_NUMBER_MISSING",
+  invoiceId: "inv-267009",
+  baseUrl: "https://example.com",
+  context: {
+    loadNumber: "267009",
+    carrierName: "Amfast Freight, Inc.",
+    carrierInvoiceNumber: "175128",
+  },
+});
+check("CARRIER_INVOICE_NUMBER_MISSING uses RESUME action",
+    carrierInvMissingAlert.action, ACTION.RESUME);
+check("CARRIER_INVOICE_NUMBER_MISSING subject is specific",
+    carrierInvMissingAlert.subject.includes("Carrier invoice # missing"),
+    true);
+check("CARRIER_INVOICE_NUMBER_MISSING includes invoice number",
+    carrierInvMissingAlert.html.includes("175128"), true);
+check("CARRIER_INVOICE_NUMBER_MISSING is not generic unexpected",
+    !carrierInvMissingAlert.html.includes(
+        "unexpected condition stopped automatic"), true);
+
+const carrierInvStillMissing = interpretWorkflowResumeResult(true, {
+  ok: false,
+  error: "CARRIER_INVOICE_NUMBER_MISSING_IN_PRIMUS",
+  workflowStatus: "carrier_invoice_number_missing_in_primus",
+});
+check("interpret carrier invoice missing is failure",
+    carrierInvStillMissing.ok, false);
+check("interpret carrier invoice missing code",
+    carrierInvStillMissing.code, "CARRIER_INVOICE_NUMBER_MISSING");
+check("interpret carrier invoice missing mentions ShipPrimus",
+    carrierInvStillMissing.userMessage.includes("ShipPrimus"), true);
 
 const podFound = interpretWorkflowResumeResult(true, {
   ok: true,
