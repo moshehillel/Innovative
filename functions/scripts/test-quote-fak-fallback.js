@@ -130,7 +130,7 @@ async function withStubbedRates(fn) {
         plain.options && plain.options[0] && plain.options[0].sellRate, 330);
     check("Unknown customer warning is market tariffs text",
         String(plain.rateWarning || "")
-            .startsWith("Primus customer matched but no customer tariffs"),
+            .startsWith("Showing market rates"),
         true);
   });
   rateShop.setFetchFakPricingImplForTest(null);

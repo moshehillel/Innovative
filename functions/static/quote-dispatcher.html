@@ -2411,8 +2411,8 @@
         if ((lane.rateSource === "market_fallback" ||
               lane.rateSource === "market_fallback_fak") &&
             !lane.rateWarning) {
-          optsHtml += "<div class='warn'>Primus customer matched but no " +
-            "customer tariffs — showing market rates.</div>";
+          optsHtml += "<div class='warn'>Showing market rates — no " +
+            "customer carrier tariffs on this Primus profile.</div>";
         }
         uniqueWarns(lane.extractionWarnings).forEach((w) => {
           if (lane.rateWarning && lane.rateWarning.indexOf(w) >= 0) return;

@@ -190,12 +190,11 @@ function summarizeNoRateErrors(noRates) {
 /**
  * Dispatcher-visible warning when customer tariffs are empty and we
  * show market rates instead. Never imply those are contract rates.
+ * Keep this short — protocol-only / FAK accounts often have no carrier
+ * tariffs on purpose; FAK markup uses marketFallbackFakWarning instead.
  */
 const MARKET_FALLBACK_WARNING =
-  "Primus customer matched but no customer tariffs — showing market rates. " +
-  "If this account is protocol-only / FAK, confirm the Primus customer " +
-  "profile has active carrier tariffs (Customer Profile not found usually " +
-  "means Primus config, not Jerry).";
+  "Showing market rates — no customer carrier tariffs on this Primus profile.";
 
 /**
  * Warning when market costs are re-marked with the customer's Primus FAK
@@ -227,7 +226,13 @@ const CUSTOMER_FAK_BY_ID = {
 
 /** In-memory FAK cache: restId → {expiresAt, value}. */
 const fakPricingLiveCache = new Map();
+/** Cache hits (FAK found) for an hour. */
 const FAK_LIVE_CACHE_TTL_MS = 60 * 60 * 1000;
+/**
+ * Cache misses briefly only — a long null TTL caused protocol/FAK
+ * customers to stick on plain market rates after one manage.php blip.
+ */
+const FAK_MISS_CACHE_TTL_MS = 45 * 1000;
 
 /** Optional test double for live Primus FAK fetch. */
 let fetchFakPricingImplForTest = null;
@@ -579,7 +584,7 @@ async function fetchCustomerFakPricingFromPrimus(customerId, opts = {}) {
   }
 
   let value = null;
-  try {
+  const loadOnce = async () => {
     const fetchOpts = {...opts};
     if (!fetchOpts.customerName && !fetchOpts.shippingLocationName &&
         !(fetchOpts.shippingLocation && fetchOpts.shippingLocation.name)) {
@@ -594,23 +599,44 @@ async function fetchCustomerFakPricingFromPrimus(customerId, opts = {}) {
       }
     }
     const manageId = await resolveManageShippingLocationId(restId, fetchOpts);
-    if (manageId) {
-      const detail = await fakManagePost({
-        action: "getShippingLocation",
-        recordId: manageId,
-      });
-      const ratingType = String(
-          (detail && detail.data && detail.data.ratingType) || "FAK");
-      const profileId = String(
-          (detail && detail.data && detail.data.profileId) || "0");
+    if (!manageId) return null;
+    const detail = await fakManagePost({
+      action: "getShippingLocation",
+      recordId: manageId,
+    });
+    const ratingType = String(
+        (detail && detail.data && detail.data.ratingType) || "FAK");
+    const profileId = String(
+        (detail && detail.data && detail.data.profileId) || "0");
+    // Prefer the location's rating type, but always try FAK markups when
+    // the primary type returns nothing (common for protocol-only accounts).
+    const typesToTry = [];
+    for (const t of [ratingType, "FAK"]) {
+      const key = String(t || "").trim() || "FAK";
+      if (!typesToTry.includes(key)) typesToTry.push(key);
+    }
+    for (const masterBillingType of typesToTry) {
       const markupsJson = await fakManagePost({
         action: "getShippingLocationsCarrierMarkups",
         shippingLocationId: manageId,
-        masterBillingType: ratingType || "FAK",
+        masterBillingType,
         profileId: profileId || "0",
       });
-      value = pickFakPricingFromCarrierMarkups(
+      const picked = pickFakPricingFromCarrierMarkups(
           markupsJson && markupsJson.markups);
+      if (picked) return picked;
+    }
+    return null;
+  };
+
+  try {
+    value = await loadOnce();
+    if (!value) {
+      // One retry with a fresh manage session — cold/expired PHPSESSID
+      // otherwise leaves FAK customers on plain market rates.
+      fakManageSession = null;
+      fakManageSessionAt = 0;
+      value = await loadOnce();
     }
   } catch (err) {
     console.warn("fetchCustomerFakPricingFromPrimus failed",
@@ -619,7 +645,8 @@ async function fetchCustomerFakPricingFromPrimus(customerId, opts = {}) {
   }
 
   fakPricingLiveCache.set(restId, {
-    expiresAt: Date.now() + FAK_LIVE_CACHE_TTL_MS,
+    expiresAt: Date.now() +
+      (value ? FAK_LIVE_CACHE_TTL_MS : FAK_MISS_CACHE_TTL_MS),
     value,
   });
   return value;

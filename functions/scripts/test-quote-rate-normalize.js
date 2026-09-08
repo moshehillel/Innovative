@@ -219,9 +219,7 @@ check("any empty rates retries market",
     ]), true);
 check("market fallback warning text",
     String(rateShop.MARKET_FALLBACK_WARNING || "")
-        .startsWith(
-            "Primus customer matched but no customer tariffs — showing " +
-            "market rates."),
+        .startsWith("Showing market rates"),
     true);
 
 check("market sell uses min($55, 10%) — low cost",
