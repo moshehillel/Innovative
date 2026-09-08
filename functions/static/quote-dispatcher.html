@@ -1588,8 +1588,15 @@
         "<th>Qty</th><th>Weight</th><th>Class</th><th>L×W×H</th><th>Type</th>" +
         "</tr></thead><tbody>";
       rows.forEach((f) => {
-        const wt = [f.weight, f.weightType].filter((v) =>
-          v != null && v !== "").join(" ");
+        // Never show orphan weightType ("total") as the Weight cell —
+        // that looks like lbs were parsed as the word "total".
+        const numW = Number(f.weight);
+        const hasLbs = f.weight != null && f.weight !== "" &&
+          Number.isFinite(numW) && numW > 0;
+        const wtType = String(f.weightType || "").trim().toLowerCase();
+        const wtTypeOk = wtType === "each" || wtType === "total";
+        const wt = hasLbs ?
+          (String(f.weight) + (wtTypeOk ? " " + wtType : "")) : "";
         const dims = [f.length, f.width, f.height]
             .filter((v) => v != null && v !== "").join("×");
         const dimType = f.dimType || f.packaging || "";

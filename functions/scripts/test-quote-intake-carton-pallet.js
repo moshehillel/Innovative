@@ -1584,6 +1584,36 @@ intake.correctCartonVsPalletFreight(coherentOneLine,
 check("coherent single-line AI not collapsed by labeled totals",
     JSON.stringify(coherentOneLine.lanes[0].freightInfo), coherentOneSnap);
 
+// AI puts weightType word into weight → clear + fill labeled Total weight.
+check("coerceFreightWeight clears word total",
+    intake.coerceFreightWeight({qty: 7, weight: "total", weightType: "total"})
+        .weight,
+    null);
+check("coerceFreightWeight keeps numeric",
+    intake.coerceFreightWeight({qty: 1, weight: "1,522"}).weight, 1522);
+
+const weightWordTotal = {
+  lanes: [{
+    freightInfo: [{
+      qty: 7, weight: "total", weightType: "total",
+      length: 40, width: 48, height: 60, dimType: "PLT",
+    }],
+  }],
+};
+intake.normalizeExtractedQuote(weightWordTotal, {
+  subject: "ienjoy → iRedeem 7 PLT",
+  body: [
+    "Number of Pallets - 7",
+    "Total weight – 1522",
+    "Pallet Dimensions: 40x48x60",
+    "All 48x40; We are open 8 until 4:30",
+  ].join("\n"),
+});
+check("weight word total → labeled lbs",
+    weightWordTotal.lanes[0].freightInfo[0].weight, 1522);
+check("weight word total → numeric not string",
+    typeof weightWordTotal.lanes[0].freightInfo[0].weight, "number");
+
 // maybeRepairFreightExtract: max one attempt (early return, no model call).
 const repairOnceEx = {
   _freightRepairAttempted: true,

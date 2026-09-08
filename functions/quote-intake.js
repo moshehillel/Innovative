@@ -2012,6 +2012,49 @@ function redistributeEvenTotalWeight(extracted, body) {
 }
 
 /**
+ * Coerce freight weight to a positive number, or null.
+ * AI sometimes puts weightType into weight ("total" / "each") — that is
+ * not lbs; clear it so labeled Total weight can fill and rating works.
+ * @param {object} row Freight row.
+ * @return {object}
+ */
+function coerceFreightWeight(row) {
+  if (!row || typeof row !== "object") return row;
+  const next = {...row};
+  const raw = next.weight;
+  if (raw == null || raw === "") {
+    next.weight = null;
+    return next;
+  }
+  const s = String(raw).trim().toLowerCase();
+  if (s === "total" || s === "each" || s === "perpiece" ||
+      s === "per-piece" || s === "per piece") {
+    if (!next.weightType) {
+      next.weightType = (s === "total") ? "total" : "each";
+    }
+    next.weight = null;
+    return next;
+  }
+  const n = typeof raw === "number" ? raw : parseLooseNumber(raw);
+  if (n == null || !(n > 0) || !Number.isFinite(n)) {
+    next.weight = null;
+    return next;
+  }
+  next.weight = n;
+  return next;
+}
+
+/**
+ * True when the row has a usable numeric weight in lbs.
+ * @param {object} row Freight row.
+ * @return {boolean}
+ */
+function hasNumericFreightWeight(row) {
+  const w = Number(row && row.weight);
+  return Number.isFinite(w) && w > 0;
+}
+
+/**
  * Fill missing weight/dims on a freight row from labeled totals.
  * @param {object} row Freight row.
  * @param {object} labeled Parsed labeled totals.
@@ -2019,10 +2062,12 @@ function redistributeEvenTotalWeight(extracted, body) {
  * @return {object}
  */
 function fillLabeledFreightFields(row, labeled, opts) {
-  const next = row && typeof row === "object" ? {...row} : {};
+  const next = coerceFreightWeight(
+      row && typeof row === "object" ? {...row} : {});
   const lab = labeled || {};
   const skipWeight = opts && opts.skipWeight;
-  if (!skipWeight && next.weight == null && lab.weight != null) {
+  // Treat non-numeric junk ("total") as missing so labeled lbs can fill.
+  if (!skipWeight && !hasNumericFreightWeight(next) && lab.weight != null) {
     next.weight = lab.weight;
   }
   if (next.length == null && lab.length != null) next.length = lab.length;
@@ -3173,7 +3218,8 @@ function normalizeFreightOnExtract(extracted, body, dimOpts = {}) {
     if (!lane || typeof lane !== "object") continue;
     const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
     lane.freightInfo = rows.map((row) => {
-      const base = row && typeof row === "object" ? {...row} : {};
+      const base = coerceFreightWeight(
+          row && typeof row === "object" ? {...row} : {});
       const withLegend = freightDims.applyEmailDimOrderLegend(base, body);
       const next = freightDims.normalizePalletDims(withLegend, dimOpts);
       if (freightDims.palletDimsWereDefaulted(base, next)) {
@@ -3738,6 +3784,8 @@ module.exports = {
   parseLooseNumber,
   normalizeDirtyFreightText,
   isImplausibleShipmentWeight,
+  coerceFreightWeight,
+  hasNumericFreightWeight,
   applyLabeledFreightTotals,
   correctCartonVsPalletFreight,
   extractCompactPalletBlocks,
