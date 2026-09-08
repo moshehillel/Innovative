@@ -1256,6 +1256,103 @@ check("ArcBest eInvoice is not carrier statement follow-up",
         arcBestBody,
         arcBestAttachments));
 
+const tforceSubject =
+  "STATEMENT OF OPEN INVOICES - INNOVATIVE CARRIERS INC " +
+  "(08967319-20250306) - 2026-09-30.";
+const tforceFrom =
+  "TForce Freight Inc – Accounts Receivables " +
+  "<collections@oracle.ar.tforcefreight.com>";
+const tforceBody =
+  "Accounts Receivable is sending a statement of open invoices and " +
+  "requesting payment of the outstanding balance. Use the online " +
+  "payment portal for billing questions.";
+const tforceAtt = [
+  {
+    filename: "INNOVATIVE CARRIERS INC_08967319-20250306.xlsx",
+    mimeType: "application/octet-stream",
+  },
+];
+check("TForce STATEMENT OF OPEN INVOICES subject is definitive",
+    adm.subjectIsDefinitiveCarrierAccountStatement(tforceSubject));
+check("TForce open-invoices subject recognized as account statement",
+    adm.subjectLooksLikeCarrierAccountStatement(tforceSubject));
+check("TForce account XLSX filename looks like statement list",
+    adm.attachmentFilenameLooksLikeStatementList(
+        "INNOVATIVE CARRIERS INC_08967319-20250306.xlsx"));
+check("TForce AR statement follow-up detected with XLSX",
+    adm.isCarrierStatementFollowUpEmail(
+        tforceSubject, tforceFrom, tforceBody, tforceAtt));
+check("TForce AR statement follow-up detected with no attachments",
+    adm.isCarrierStatementFollowUpEmail(
+        tforceSubject, tforceFrom, tforceBody, []));
+check("TForce should handle when no invoice PDF",
+    adm.shouldHandleCarrierStatementFollowUp(
+        tforceSubject, tforceFrom, tforceBody, tforceAtt, 0));
+check("TForce skipped when invoice PDF present",
+    !adm.shouldHandleCarrierStatementFollowUp(
+        tforceSubject, tforceFrom, tforceBody, tforceAtt, 1));
+check("TForce with freight PDF is not statement follow-up (process invoice)",
+    !adm.shouldHandleCarrierStatementFollowUp(
+        tforceSubject,
+        tforceFrom,
+        tforceBody,
+        [
+          ...tforceAtt,
+          {filename: "invoice.pdf", mimeType: "application/pdf"},
+        ],
+        0));
+check("TForce definitive+PDF is not Abe statement email",
+    !adm.isCarrierStatementFollowUpEmail(
+        tforceSubject,
+        tforceFrom,
+        tforceBody,
+        [{filename: "open-invoices.pdf", mimeType: "application/pdf"}]));
+check("TForce definitive statement does not invoice-veto to Moshe",
+    !adm.hasInvoiceVeto({
+      subject: tforceSubject,
+      body: tforceBody,
+      from: tforceFrom,
+      attachments: tforceAtt,
+      emailClassification: {intent: "carrier_invoice", confidence: "high"},
+      invoicePdfCount: 0,
+    }));
+check("TForce XLSX-only is not PDF-like",
+    !adm.attachmentsIncludePdfLike(tforceAtt));
+check("Saia-style invoice subject is not definitive AR statement",
+    !adm.subjectIsDefinitiveCarrierAccountStatement(
+        "Your Invoice From Saia LTL Freight"));
+
+const xpoSubject =
+  "INNOVATIVE CARRIERS INORNCTS900 Statement of Account";
+const xpoFrom = "XPO Financial Services <collections@xpo.com>";
+const xpoBody =
+  "Statement of account showing outstanding balances in aging " +
+  "categories. Review and payment; invoice copies via portal.";
+const xpoAtt = [
+  {
+    filename: "INNOVATIVE-CARRIERS-INORNCTS900-Statement-of-Account.xls",
+    mimeType: "application/vnd.ms-excel",
+  },
+  {
+    filename: "logo.jpeg",
+    mimeType: "image/jpeg",
+  },
+];
+check("XPO Statement of Account subject is definitive",
+    adm.subjectIsDefinitiveCarrierAccountStatement(xpoSubject));
+check("XPO statement XLS + logo image still statement follow-up",
+    adm.isCarrierStatementFollowUpEmail(
+        xpoSubject, xpoFrom, xpoBody, xpoAtt));
+check("XPO statement should handle (no PDF) → Abe ignore/forward path",
+    adm.shouldHandleCarrierStatementFollowUp(
+        xpoSubject, xpoFrom, xpoBody, xpoAtt, 0));
+check("XPO Abe on To is detected for ignore",
+    adm.isAbeCopiedOnEmailHeaders([
+      {name: "To", value:
+        "Abe <abe@innovativecarriers.com>, " +
+        "Innovative Accounting <accounting@innovativecarriers.com>"},
+    ]));
+
 // Ambiguous Zelle language (non-bank from) must NOT regex quiet-ignore —
 // AI owns that path. Clear bank alerts still ignore.
 check("CHB 266272-style subject+quoted Zelle is NOT ambiguous candidate",
@@ -1265,32 +1362,4 @@ check("CHB 266272-style never regex quiet-ignores",
     !adm.shouldIgnoreAsPaymentNotification(
         chbSubject, chbFrom, chbBody, []));
 check("quoted Zelle from random Gmail is ambiguous (AI path), not regex ignore",
-    adm.isAmbiguousPaymentNotificationCandidate(
-        "Payment update",
-        "random.person@gmail.com",
-        "Just FYI about Zelle — not sure if this is the right inbox.",
-        []) &&
-    !adm.shouldIgnoreAsPaymentNotification(
-        "Payment update",
-        "random.person@gmail.com",
-        "Just FYI about Zelle — not sure if this is the right inbox.",
-        []));
-check("BoA Zelle is known bank sender, not ambiguous",
-    adm.isKnownBankPaymentAlertSender(
-        "Bank of America <customerservice@ealerts.bankofamerica.com>") &&
-    !adm.isAmbiguousPaymentNotificationCandidate(
-        "Goldengate Logistics Llc sent you $36.00",
-        "Bank of America <customerservice@ealerts.bankofamerica.com>",
-        "You received a Zelle payment of $500",
-        []));
-check("Chase alerts@ is known bank-alert sender",
-    adm.isKnownBankPaymentAlertSender("Chase <alerts@chase.com>"));
-check("payment alert language detects Zelle",
-    adm.hasPaymentAlertLanguage(
-        "hi", "Quickpay/Zelle accounting@innovativecarriers.com"));
-
-if (failures) {
-  console.error(`\n${failures} test(s) failed`);
-  process.exit(1);
-}
-console.log("\nAll administrative email tests passed");
+    adm.isAmbiguousPa

@@ -975,6 +975,31 @@ function attachmentFilenameLooksLikeStatementList(filename) {
   }
   // e.g. overdue_invoices.xls — list workbook, not a carrier freight bill.
   if (/invoices?\.(?:xlsx?|xlsm|csv)$/i.test(name)) return true;
+  // TForce / Oracle AR style: "INNOVATIVE CARRIERS INC_08967319-20250306.xlsx"
+  if (/_[0-9]{6,}(?:-\d{6,})?\.(?:xlsx?|xlsm|csv)$/i.test(name) &&
+      /inc|llc|corp|carriers|logistics|transport/i.test(name)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Subject alone is enough to treat as AR account statement (not a freight
+ * Stmt packet). Example: TForce "STATEMENT OF OPEN INVOICES - …".
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectIsDefinitiveCarrierAccountStatement(subject) {
+  const stripped = String(subject || "").trim()
+      .replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  if (/\bstatement\s+of\s+open\s+invoices?\b/i.test(stripped)) return true;
+  if (/\bopen\s+invoices?\s+statement\b/i.test(stripped)) return true;
+  if (/\bstatement\s+of\s+account\b/i.test(stripped)) return true;
+  if (/\baccount\s+statement\b/i.test(stripped)) return true;
+  if (/\baging\s+(?:report|statement|of\s+open\s+invoices?)\b/i
+      .test(stripped)) {
+    return true;
+  }
   return false;
 }
 
@@ -990,8 +1015,7 @@ function subjectLooksLikeCarrierAccountStatement(subject) {
       .test(stripped)) {
     return true;
   }
-  if (/\bstatement\s+of\s+account\b/i.test(stripped)) return true;
-  if (/\baccount\s+statement\b/i.test(stripped)) return true;
+  if (subjectIsDefinitiveCarrierAccountStatement(stripped)) return true;
   if (/\boverdue\s+(?:invoice|account|balance)\b/i.test(stripped)) {
     return true;
   }
@@ -1008,9 +1032,11 @@ function bodyLooksLikeOverdueInvoiceFollowUp(body) {
   const patterns = [
     /\boverdue\s+invoices?\b/,
     /\boutstanding\s+invoices?\b/,
+    /\boutstanding\s+balance\b/,
     /\bunpaid\s+invoices?\b/,
     /\bpast[\s-]due\s+invoices?\b/,
     /\bfollow(?:ing)?\s+up\s+on\s+(?:overdue|outstanding|unpaid|past[\s-]due)\b/,
+    /\bstatement\s+of\s+open\s+invoices?\b/,
     /\bstatement\s+of\s+account\b/,
     /\baccount\s+statement\b/,
     /\battached\s+(?:is\s+)?(?:your\s+)?statement\b/,
@@ -1020,6 +1046,20 @@ function bodyLooksLikeOverdueInvoiceFollowUp(body) {
     /\bamount\s+(?:due|overdue|outstanding)\b/,
   ];
   return patterns.some((re) => re.test(hay));
+}
+
+/**
+ * True when any attachment looks like a PDF freight document.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function attachmentsIncludePdfLike(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.some((a) => {
+    const name = String(a && a.filename || "");
+    const mime = String(a && a.mimeType || "");
+    return /\.pdf$/i.test(name) || /application\/pdf/i.test(mime);
+  });
 }
 
 /**
@@ -1043,12 +1083,20 @@ function isCarrierStatementFollowUpEmail(subject, from, body, attachments) {
   }
 
   const list = Array.isArray(attachments) ? attachments : [];
+  // Freight / statement PDFs are processed as invoices — not Abe-forwarded.
+  if (attachmentsIncludePdfLike(list)) return false;
+
   const hasSpreadsheet = list.some((a) =>
     attachmentLooksLikeStatementSpreadsheet(a.filename, a.mimeType));
   const hasStatementListFile = list.some((a) =>
     attachmentFilenameLooksLikeStatementList(a.filename));
   const subMatch = subjectLooksLikeCarrierAccountStatement(subject);
   const bodyMatch = bodyLooksLikeOverdueInvoiceFollowUp(body);
+  const definitiveSubject = subjectIsDefinitiveCarrierAccountStatement(subject);
+
+  // "STATEMENT OF OPEN INVOICES" (portal and/or aging XLSX) is always Abe —
+  // do not wait for body keywords or AI intent.
+  if (definitiveSubject) return true;
 
   if (hasSpreadsheet && (subMatch || bodyMatch || hasStatementListFile)) {
     return true;
@@ -1062,6 +1110,7 @@ function isCarrierStatementFollowUpEmail(subject, from, body, attachments) {
 
 /**
  * Statement follow-up handler — only when no freight invoice PDF to process.
+ * Any PDF attachment means: process as invoice, do not forward to Abe.
  * @param {string} subject Email subject.
  * @param {string} from From header.
  * @param {string} body Plain body.
@@ -1072,6 +1121,7 @@ function isCarrierStatementFollowUpEmail(subject, from, body, attachments) {
 function shouldHandleCarrierStatementFollowUp(
     subject, from, body, attachments, invoicePdfCount) {
   if (Number(invoicePdfCount) > 0) return false;
+  if (attachmentsIncludePdfLike(attachments)) return false;
   return isCarrierStatementFollowUpEmail(subject, from, body, attachments);
 }
 
@@ -1399,6 +1449,14 @@ function hasInvoiceVeto(signals = {}) {
     return false;
   }
 
+  // Definitive AR subjects (e.g. STATEMENT OF OPEN INVOICES) go to Abe —
+  // do not invoice-veto to Moshe when there is no freight PDF.
+  if (subjectIsDefinitiveCarrierAccountStatement(subject) &&
+      !attachmentsIncludePdfLike(attachments) &&
+      !(Number(invoicePdfCount) > 0)) {
+    return false;
+  }
+
   // Never block intentional D&B marketing / Credit Insights noise ignores.
   if (isDnbPromotionalEmail(subject, from, body)) {
     return false;
@@ -1553,8 +1611,10 @@ module.exports = {
   shouldHandlePaymentInquiry,
   attachmentLooksLikeStatementSpreadsheet,
   attachmentFilenameLooksLikeStatementList,
+  subjectIsDefinitiveCarrierAccountStatement,
   subjectLooksLikeCarrierAccountStatement,
   bodyLooksLikeOverdueInvoiceFollowUp,
+  attachmentsIncludePdfLike,
   isCarrierStatementFollowUpEmail,
   shouldHandleCarrierStatementFollowUp,
   looksLikeInvoiceEmailContent,

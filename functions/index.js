@@ -8269,7 +8269,11 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  NOT carrier_invoice even if PDF attached unless it is clearly a",
       "  freight bill to pay.",
       "- statement: account summary or pay-online notice only — no freight",
-      "  invoice PDF to extract (not a carrier Stmt packet of bills)",
+      "  invoice PDF to extract (not a carrier Stmt packet of bills).",
+      "  Includes AR 'STATEMENT OF OPEN INVOICES' / aging / collections",
+      "  emails (e.g. TForce collections@…) with only an Excel open-invoice",
+      "  list or a payment portal link and NO freight bill PDF. Those are",
+      "  statement, NOT carrier_invoice.",
       "- unknown: marketing, unrelated, or unclear",
       "",
       "NOT carrier_invoice (treat as unknown; inbox rules may ignore):",
@@ -8724,6 +8728,23 @@ async function processGmailMessage(
           return;
         }
 
+        // Deterministic AR open-invoice / aging statement (e.g. TForce
+        // "STATEMENT OF OPEN INVOICES" + XLSX list). Do this even when AI
+        // mislabels as carrier_invoice — but never when a PDF bill may exist.
+        if (!administrativeEmailIntake.attachmentsIncludePdfLike(attachments) &&
+            administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
+                subject, from, emailBody, attachments, 0)) {
+          await handleStatementOnlyEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason:
+              "Carrier AR statement / open-invoice list — " +
+              "no freight invoice PDF to enter",
+          });
+          return;
+        }
+
         if (emailClassification.intent === "insurance_premium") {
           try {
             const resolved =
@@ -9157,6 +9178,17 @@ async function processGmailMessage(
             emailClassification,
             queueDocId,
             reason: "Customer payment remittance with no attachments",
+          });
+          return;
+        }
+        if (administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
+            subject, from, emailBody, attachments, 0)) {
+          await handleStatementOnlyEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason:
+              "Carrier AR statement / open invoices with no attachments",
           });
           return;
         }
