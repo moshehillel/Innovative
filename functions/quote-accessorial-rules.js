@@ -1094,6 +1094,94 @@ function formatAccessorialLabels(codes) {
 }
 
 /**
+ * Carrier-name needles for customer-email advisory notes.
+ * @param {object} rule Rule document.
+ * @return {Array<string>}
+ */
+function carrierNameContainsNeedles(rule) {
+  const match = (rule && rule.match) || {};
+  const needles = match.carrierNameContains;
+  if (!Array.isArray(needles)) return [];
+  return needles.map((n) => String(n || "").trim()).filter(Boolean);
+}
+
+/**
+ * Rules that only match selected rate carrier names (not lane addresses).
+ * These never fire in applyRulesToLane — they attach Notes: lines when a
+ * matching carrier is selected into the customer email draft.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isCarrierNoteRule(rule) {
+  const needles = carrierNameContainsNeedles(rule);
+  if (!needles.length) return false;
+  const match = rule.match || {};
+  const otherKeys = Object.keys(match).filter((k) => {
+    if (k === "carrierNameContains") return false;
+    const v = match[k];
+    if (v == null || v === "") return false;
+    if (Array.isArray(v) && !v.length) return false;
+    return true;
+  });
+  if (otherKeys.length) return false;
+  const hasAcc = (rule.addAccessorials || []).length > 0 ||
+    (rule.removeAccessorials || []).length > 0 ||
+    (rule.filterCarrierWarnings || []).length > 0 ||
+    !!rule.customerName ||
+    !!rule.fillZipCode;
+  return !hasAcc;
+}
+
+/**
+ * Plain customer-email note body from a rule.notes field.
+ * Strips "Add note:" prefixes and a leading carrier name so the email
+ * line reads like hardcoded advisories ("has lots of delays…").
+ * @param {string} raw Notes field.
+ * @param {Array<string>} [carrierNeedles] match.carrierNameContains.
+ * @return {string}
+ */
+function customerEmailNoteText(raw, carrierNeedles) {
+  let note = String(raw || "").trim();
+  note = note.replace(/^add\s+notes?:\s*/i, "").trim();
+  note = note.replace(/^["']|["']$/g, "").trim();
+  for (const needle of carrierNeedles || []) {
+    const n = String(needle || "").trim();
+    if (!n) continue;
+    const re = new RegExp(
+        `^${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b[:\\s-]*`,
+        "i");
+    note = note.replace(re, "").trim();
+  }
+  return note;
+}
+
+/**
+ * Builds email advisory rules from quoteRules with carrierNameContains.
+ * @param {Array<object>} rules Active quote rules.
+ * @return {Array<{id: string, test: Function, note: string}>}
+ */
+function toCustomerEmailCarrierNoteRules(rules) {
+  const out = [];
+  for (const rule of rules || []) {
+    if (!rule || rule.active === false) continue;
+    const needles = carrierNameContainsNeedles(rule);
+    if (!needles.length) continue;
+    const note = customerEmailNoteText(rule.notes, needles);
+    if (!note) continue;
+    const lower = needles.map((n) => n.toLowerCase());
+    out.push({
+      id: String(rule.id || `carrier_note_${out.length}`),
+      test: (name) => {
+        const hay = String(name || "").toLowerCase();
+        return lower.some((n) => hay.includes(n));
+      },
+      note,
+    });
+  }
+  return out;
+}
+
+/**
  * Applies rules to a lane; returns accessorial codes and filter hints.
  *
  * Order (all matching accessorial rules, in priority order):
@@ -1128,6 +1216,9 @@ function applyRulesToLane(lane, rules, context = {}) {
     // they must not invent site accessorials here.
     if (isSenderCustomerRule(rule)) continue;
     if (isZipFillRule(rule)) continue;
+    // Carrier-name notes attach at email-draft time (selected rates), not
+    // during lane accessorial matching.
+    if (isCarrierNoteRule(rule)) continue;
     for (const side of ruleSides(rule)) {
       const via = ruleMatchVia(lane, context, rule, side);
       if (!via) continue;
@@ -1314,6 +1405,10 @@ module.exports = {
   ACCESSORIAL_LABELS,
   isSenderCustomerRule,
   isZipFillRule,
+  isCarrierNoteRule,
+  carrierNameContainsNeedles,
+  customerEmailNoteText,
+  toCustomerEmailCarrierNoteRules,
   applyZipFillRules,
   zipFillRuleMatchesParty,
   zipFillRuleMatchesContext,

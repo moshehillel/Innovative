@@ -765,6 +765,11 @@
           applyTo === "both" ? "Pickup or delivery site" : "Delivery site";
         lines.push(`${kind} is identified as ${SITE_TYPE_LABELS[match.siteType] || match.siteType.replace(/_/g, " ")}`);
       }
+      if (match.carrierNameContains && match.carrierNameContains.length) {
+        lines.push(
+            `Selected rate carrier name includes ${quoteList(match.carrierNameContains)} ` +
+            `(adds a Notes line on the customer email when that carrier is selected)`);
+      }
       const fromEmails = [].concat(match.fromEmails || []).concat(match.senderEmails || []);
       if (fromEmails.length) {
         lines.push(`Sender From email is ${quoteList(fromEmails)}`);
@@ -823,7 +828,17 @@
       if (filters.length) {
         lines.push(`Do not use carriers that warn about: ${filters.map(f => `"${f}"`).join(", ")}`);
       }
-      if (!acc.length && !rem.length && !filters.length && !rule.customerName && !rule.defaultDims) {
+      const carrierNeedles = (rule.match && rule.match.carrierNameContains) || [];
+      if (carrierNeedles.length && rule.notes) {
+        const noteBody = String(rule.notes || "")
+            .replace(/^add\s+notes?:\s*/i, "")
+            .trim();
+        if (noteBody) {
+          lines.push(`Add customer email note when selected: ${noteBody}`);
+        }
+      }
+      if (!acc.length && !rem.length && !filters.length && !rule.customerName && !rule.defaultDims &&
+          !(carrierNeedles.length && rule.notes)) {
         lines.push("No accessorials or carrier filters — rule may only set flags or notes.");
       }
       if (rule.requiresConfirm) {
@@ -858,6 +873,10 @@
       const filters = rule.filterCarrierWarnings || [];
       if (filters.length) {
         parts.push("filter " + filters.join(", "));
+      }
+      const carrierNeedles = (rule.match && rule.match.carrierNameContains) || [];
+      if (carrierNeedles.length && rule.notes) {
+        parts.push("carrier email note");
       }
       if (!parts.length) return "No accessorials";
       return parts.join(" · ");
@@ -897,6 +916,12 @@
         badges.push('<span class="badge confirm">Needs confirmation</span>');
       }
 
+      const isCarrierEmailNote =
+        !!(rule.match && Array.isArray(rule.match.carrierNameContains) &&
+          rule.match.carrierNameContains.length);
+      const identifyMeta = isCarrierEmailNote ? "" :
+        `<div class="rule-meta" style="margin-top:6px">Identified via: ${esc(formatIdentifyVia(rule))}</div>`;
+
       card.innerHTML = `
         <button type="button" class="rule-toggle" data-rule-toggle="1" aria-expanded="false">
           <span class="rule-chevron" aria-hidden="true">▶</span>
@@ -910,13 +935,13 @@
           <div class="rule-section">
             <div class="rule-section-label">When this happens</div>
             <ul>${whenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
-            <div class="rule-meta" style="margin-top:6px">Identified via: ${esc(formatIdentifyVia(rule))}</div>
+            ${identifyMeta}
           </div>
           <div class="rule-section">
             <div class="rule-section-label">Then do this</div>
             <ul>${thenLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>
           </div>
-          ${rule.notes ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
+          ${rule.notes && !isCarrierEmailNote ? `<div class="rule-notes">${esc(rule.notes)}</div>` : ""}
           <details class="rule-advanced">
             <summary>Advanced (rule ID &amp; technical data)</summary>
             <pre>${esc(JSON.stringify({ id: rule.id, ruleKind: rule.ruleKind || null, identifyVia: rule.identifyVia || "both", applyTo: rule.applyTo || "dest", match: rule.match, customerName: rule.customerName || null, protocolOnly: !!rule.protocolOnly, defaultDims: rule.defaultDims || null, addAccessorials: rule.addAccessorials, removeAccessorials: rule.removeAccessorials || [], filterCarrierWarnings: rule.filterCarrierWarnings, priority: rule.priority, autoApply: rule.autoApply, requiresConfirm: rule.requiresConfirm }, null, 2))}</pre>

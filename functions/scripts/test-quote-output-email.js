@@ -2,6 +2,7 @@
 "use strict";
 
 const quoteOutput = require("../quote-output");
+const quoteRules = require("../quote-accessorial-rules");
 
 let failures = 0;
 const check = (name, got, exp) => {
@@ -173,6 +174,49 @@ checkIncludes(
     "AAA Cooper pickup delay note",
     advisoryEmail,
     "• AAA Cooper Transportation: often has delays at pickup.",
+);
+
+const roadrunnerEmail = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#D8888",
+  lanes: [{
+    selectedOptions: [
+      {name: "Roadrunner J&I", sellRate: 500, transitDays: 3, quoteNumber: "R1"},
+      {name: "Estes Express", sellRate: 510, transitDays: 3, quoteNumber: "E1"},
+    ],
+  }],
+}, {
+  style: "bullet",
+  carrierNoteRules: quoteRules.toCustomerEmailCarrierNoteRules([{
+    id: "roadrunner_transit_delay_note",
+    active: true,
+    match: {carrierNameContains: ["roadrunner"]},
+    notes: "Add note: Roadrunner has lots of delays in transit.",
+  }]),
+});
+checkIncludes(
+    "Roadrunner Firestore carrier note on selected rate",
+    roadrunnerEmail,
+    "• Roadrunner J&I: has lots of delays in transit.",
+);
+checkNotIncludes(
+    "Roadrunner note omitted when not selected",
+    quoteOutput.buildCustomerEmailFromSelections({
+      batchQuoteId: "Q#D8889",
+      lanes: [{
+        selectedOptions: [
+          {name: "Estes Express", sellRate: 510, transitDays: 3, quoteNumber: "E1"},
+        ],
+      }],
+    }, {
+      style: "bullet",
+      carrierNoteRules: quoteRules.toCustomerEmailCarrierNoteRules([{
+        id: "roadrunner_transit_delay_note",
+        active: true,
+        match: {carrierNameContains: ["roadrunner"]},
+        notes: "has lots of delays in transit.",
+      }]),
+    }),
+    "Notes:",
 );
 
 const page = quoteOutput.serializeForDispatcherPage({

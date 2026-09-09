@@ -1610,9 +1610,15 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
   Object.assign(quote, afterSave.data());
 
   const style = opts.style || "bullet";
+  const activeRules = await quoteRules.loadActiveRules(tenant);
+  const carrierNoteRules =
+    quoteRules.toCustomerEmailCarrierNoteRules(activeRules);
   const text = opts.bodyText != null ?
     String(opts.bodyText) :
-    quoteOutput.buildCustomerEmailFromSelections(quote, {style});
+    quoteOutput.buildCustomerEmailFromSelections(quote, {
+      style,
+      carrierNoteRules,
+    });
   const html = quoteOutput.textToEmailHtml(text);
 
   await ref.update({
@@ -2119,8 +2125,12 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
     String(opts.bodyText) :
     (quote.customerEmailText || quote.customerDraftText || "");
   if (!text.trim()) {
+    const activeRules = await quoteRules.loadActiveRules(tenant);
+    const carrierNoteRules =
+      quoteRules.toCustomerEmailCarrierNoteRules(activeRules);
     text = quoteOutput.buildCustomerEmailFromSelections(quote, {
       style: quote.emailStyle || "bullet",
+      carrierNoteRules,
     });
   }
   const html = opts.bodyHtml != null ?

@@ -299,6 +299,8 @@ function effectiveCustomerRate(opt) {
 /**
  * Carrier advisory notes for selected rates in the customer email draft.
  * Match is flexible (name contains); one note line per advisory group.
+ * Firestore quoteRules with match.carrierNameContains are merged in via
+ * opts.carrierNoteRules (see toCustomerEmailCarrierNoteRules).
  * @type {Array<{id: string, test: Function, note: string}>}
  */
 const CUSTOMER_EMAIL_CARRIER_NOTE_RULES = [
@@ -320,17 +322,39 @@ const CUSTOMER_EMAIL_CARRIER_NOTE_RULES = [
 ];
 
 /**
+ * Merges built-in + dynamic carrier note rules (dynamic wins on same id).
+ * @param {Array<{id: string, test: Function, note: string}>} [extra]
+ * @return {Array<{id: string, test: Function, note: string}>}
+ */
+function resolveCarrierNoteRules(extra) {
+  const byId = new Map();
+  for (const rule of CUSTOMER_EMAIL_CARRIER_NOTE_RULES) {
+    byId.set(rule.id, rule);
+  }
+  for (const rule of extra || []) {
+    if (!rule || !rule.id || typeof rule.test !== "function") continue;
+    const note = String(rule.note || "").trim();
+    if (!note) continue;
+    byId.set(String(rule.id), {id: String(rule.id), test: rule.test, note});
+  }
+  return [...byId.values()];
+}
+
+/**
  * Builds Notes lines for carriers selected into the customer email.
  * @param {Array<object>} lanes Quote lanes with selections.
+ * @param {Array<{id: string, test: Function, note: string}>} [extraRules]
+ *   Dynamic rules (e.g. Firestore carrierNameContains notes).
  * @return {Array<string>} Empty if none of the advisory carriers are selected.
  */
-function buildSelectedCarrierNoteLines(lanes) {
+function buildSelectedCarrierNoteLines(lanes, extraRules) {
+  const rules = resolveCarrierNoteRules(extraRules);
   const byRule = new Map();
   for (const lane of lanes || []) {
     for (const opt of resolveSelectedOptions(lane)) {
       const name = String(opt.name || opt.SCAC || "").trim();
       if (!name) continue;
-      for (const rule of CUSTOMER_EMAIL_CARRIER_NOTE_RULES) {
+      for (const rule of rules) {
         if (!rule.test(name)) continue;
         let entry = byRule.get(rule.id);
         if (!entry) {
@@ -342,7 +366,7 @@ function buildSelectedCarrierNoteLines(lanes) {
     }
   }
   const lines = [];
-  for (const rule of CUSTOMER_EMAIL_CARRIER_NOTE_RULES) {
+  for (const rule of rules) {
     const entry = byRule.get(rule.id);
     if (!entry) continue;
     lines.push(`• ${entry.names.join(" / ")}: ${entry.note}`);
@@ -493,7 +517,8 @@ function buildCustomerEmailFromSelections(quote, opts = {}) {
     lines.push("");
   }
 
-  const carrierNotes = buildSelectedCarrierNoteLines(quote.lanes);
+  const carrierNotes = buildSelectedCarrierNoteLines(
+      quote.lanes, opts.carrierNoteRules);
   if (carrierNotes.length) {
     lines.push(...carrierNotes);
     lines.push("");
@@ -690,6 +715,7 @@ module.exports = {
   buildCustomerDraftHtml,
   buildCustomerEmailFromSelections,
   buildSelectedCarrierNoteLines,
+  resolveCarrierNoteRules,
   textToEmailHtml,
   serializeForDispatcherPage,
   effectiveCustomerRate,
