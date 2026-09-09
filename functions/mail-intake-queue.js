@@ -183,11 +183,15 @@ function buildIntakeSummary(data) {
       emodal_broadcast_ignored: "Ignored — eModal/terminal broadcast",
       cardknox_batch_report_ignored:
         "Ignored — Cardknox daily batch report",
+      cardknox_ignored:
+        "Ignored — Cardknox payment notification",
       amex_merchant_survey_ignored:
         "Ignored — AmEx merchant satisfaction survey",
       dnb_promotional_ignored:
         "Ignored — D&B promotional / marketing email",
       coface_ignored: "Ignored — Coface newsletter/marketing",
+      internal_auto_reply_ignored:
+        "Ignored — internal team automatic reply",
       out_of_office_ignored: "Ignored — out of office auto-reply",
       noa_ignored: "Ignored — notice of assignment, no invoice",
       carrier_portal_notification_ignored:

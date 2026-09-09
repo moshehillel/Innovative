@@ -21,19 +21,43 @@ function isEmodalBroadcast(subject, from, body) {
 }
 
 /**
- * Cardknox daily batch settlement reports — informational only (Lisa: ignore).
- * Example: From noreply@cardknox.com, Subject "Innovative Carriers Batch 52094836".
+ * True when the sender domain is cardknox.com (Lisa: ignore all Cardknox).
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isCardknoxDomain(from) {
+  const addr = emailAddressFromHeader(from);
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1).replace(/[^a-z0-9.-]/g, "");
+  return domain === "cardknox.com" || domain.endsWith(".cardknox.com");
+}
+
+/**
+ * Cardknox payment-processor notifications — informational only (Lisa: ignore).
+ * Covers batch settlement reports, receipts, and other *@cardknox.com mail
+ * (e.g. noreply@cardknox.com, secure.cardknox.com).
+ * @param {string} from From header.
+ * @param {string} [subject] Email subject (unused; domain match only).
+ * @param {string} [body] Plain body (unused; domain match only).
+ * @return {boolean}
+ */
+function isCardknoxEmail(from, subject, body) {
+  void subject;
+  void body;
+  return isCardknoxDomain(from);
+}
+
+/**
+ * Cardknox daily batch settlement reports (subset of isCardknoxEmail).
+ * Kept for callers/tests that check batch subjects specifically.
  * @param {string} subject Email subject.
  * @param {string} from From header.
  * @return {boolean}
  */
 function isCardknoxBatchReport(subject, from) {
-  const fromL = String(from || "").toLowerCase();
-  if (!fromL.includes("cardknox.com")) return false;
-  const sub = String(subject || "");
-  // "Innovative Carriers Batch 52094836" or any Cardknox "… Batch …" notice.
-  if (/\bbatch\b/i.test(sub)) return true;
-  return false;
+  if (!isCardknoxDomain(from)) return false;
+  return /\bbatch\b/i.test(String(subject || ""));
 }
 
 /**
@@ -223,6 +247,78 @@ function isCofaceEmail(from, subject, body) {
 }
 
 /**
+ * Innovative internal mailbox domains (team + CHB).
+ * Used only with auto-reply detection — normal human mail is never ignored.
+ * @type {Set<string>}
+ */
+const INTERNAL_INNOVATIVE_DOMAINS = new Set([
+  "innovativecarriers.com",
+  "innovativechb.com",
+]);
+
+/**
+ * True when From is an Innovative internal team / CHB address.
+ * @param {string} from From header.
+ * @return {boolean}
+ */
+function isInternalInnovativeSender(from) {
+  const addr = emailAddressFromHeader(from);
+  const at = addr.lastIndexOf("@");
+  if (at < 0) return false;
+  const domain = addr.slice(at + 1).replace(/[^a-z0-9.-]/g, "");
+  if (INTERNAL_INNOVATIVE_DOMAINS.has(domain)) return true;
+  for (const root of INTERNAL_INNOVATIVE_DOMAINS) {
+    if (domain.endsWith(`.${root}`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Read a header value (case-insensitive name) from Gmail payload headers.
+ * @param {Array<object>|null|undefined} headers Gmail headers.
+ * @param {string} name Header name.
+ * @return {string}
+ */
+function headerValueIgnoreCase(headers, name) {
+  const list = Array.isArray(headers) ? headers : [];
+  const want = String(name || "").toLowerCase();
+  for (const header of list) {
+    if (String(header && header.name || "").toLowerCase() === want) {
+      return String(header.value || "").trim();
+    }
+  }
+  return "";
+}
+
+/**
+ * True when RFC/Exchange auto-reply headers mark the message as automatic.
+ * @param {Array<object>|null|undefined} headers Gmail payload headers.
+ * @return {boolean}
+ */
+function hasAutoReplyHeaders(headers) {
+  const autoSubmitted = headerValueIgnoreCase(headers, "Auto-Submitted")
+      .toLowerCase();
+  // RFC 3834: anything other than "no" means automatic.
+  if (autoSubmitted && autoSubmitted !== "no") return true;
+
+  const precedence = headerValueIgnoreCase(headers, "Precedence").toLowerCase();
+  if (precedence === "auto_reply") return true;
+
+  const xAutoreply = headerValueIgnoreCase(headers, "X-Autoreply").toLowerCase();
+  if (xAutoreply === "yes" || xAutoreply === "true" || xAutoreply === "1") {
+    return true;
+  }
+  if (headerValueIgnoreCase(headers, "X-Autorespond")) return true;
+
+  const xAutoResponse =
+    headerValueIgnoreCase(headers, "X-Auto-Response-Suppress").toLowerCase();
+  // Present on many Outlook auto-replies; alone is weak — require with
+  // other signals at the call site. Not sufficient by itself.
+  void xAutoResponse;
+  return false;
+}
+
+/**
  * Out-of-office / vacation automatic reply emails (Lisa: ignore).
  * Uses subject and first-person auto-reply body phrasing; avoids casual
  * third-party mentions of someone being away.
@@ -287,6 +383,32 @@ function isOutOfOfficeAutoReply(subject, from, body) {
       weakBodyPatterns.some((re) => re.test(bodyL))) {
     return true;
   }
+  return false;
+}
+
+/**
+ * Automatic replies from Innovative internal team / CHB only (Moshe/Lisa).
+ * Requires internal From AND clear auto-reply signals (subject/body/headers).
+ * Does not ignore normal human mail from Lisa/Abe/Sarah/dispatchers or
+ * ordinary CHB invoice threads (e.g. ir@innovativechb.com).
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [headers] Optional Gmail payload headers.
+ * @return {boolean}
+ */
+function isInternalTeamAutoReply(subject, from, body, headers) {
+  if (!isInternalInnovativeSender(from)) return false;
+
+  if (isOutOfOfficeAutoReply(subject, from, body)) return true;
+
+  const sub = String(subject || "").trim();
+  // Outlook/Exchange often uses "Auto:" for internal mailbox auto-replies.
+  if (/^auto\s*:/i.test(sub)) return true;
+  if (/^ooo\b/i.test(sub)) return true;
+
+  if (hasAutoReplyHeaders(headers)) return true;
+
   return false;
 }
 
@@ -1435,6 +1557,7 @@ function shouldIgnoreNoaOnlyPackage(
  * @param {string} [signals.body] Plain email body.
  * @param {string} [signals.from] From header.
  * @param {Array<object>} [signals.attachments] Attachment metadata.
+ * @param {Array<object>} [signals.headers] Gmail payload headers.
  * @param {object} [signals.emailClassification] Incoming email classifier.
  * @param {number} [signals.invoicePdfCount] Classified invoice PDF count.
  * @return {boolean}
@@ -1445,6 +1568,7 @@ function hasInvoiceVeto(signals = {}) {
     body = "",
     from = "",
     attachments = [],
+    headers = null,
     emailClassification = null,
     invoicePdfCount,
   } = signals;
@@ -1454,9 +1578,10 @@ function hasInvoiceVeto(signals = {}) {
     return false;
   }
 
-  // OOO auto-replies are always ignore — even when subject quotes an
-  // Invoice # / BOL # from the thread that triggered the auto-reply.
-  if (isOutOfOfficeAutoReply(subject, from, body)) {
+  // OOO / internal-team auto-replies are always ignore — even when subject
+  // quotes an Invoice # / BOL # from the thread that triggered the reply.
+  if (isInternalTeamAutoReply(subject, from, body, headers) ||
+      isOutOfOfficeAutoReply(subject, from, body)) {
     return false;
   }
 
@@ -1518,9 +1643,11 @@ function hasInvoiceVeto(signals = {}) {
  * @param {string} from From.
  * @param {string} body Body.
  * @param {Array<object>} attachments Attachments.
+ * @param {Array<object>} [headers] Optional Gmail payload headers.
  * @return {object} ignore flag with reason and status fields.
  */
-function evaluateAdministrativeIgnore(subject, from, body, attachments) {
+function evaluateAdministrativeIgnore(
+    subject, from, body, attachments, headers) {
   if (isEmodalBroadcast(subject, from, body)) {
     return {
       ignore: true,
@@ -1528,11 +1655,11 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
       status: "emodal_broadcast_ignored",
     };
   }
-  if (isCardknoxBatchReport(subject, from)) {
+  if (isCardknoxEmail(from, subject, body)) {
     return {
       ignore: true,
-      reason: "Cardknox batch report — no action needed",
-      status: "cardknox_batch_report_ignored",
+      reason: "Cardknox payment notification — no action needed",
+      status: "cardknox_ignored",
     };
   }
   if (isAmexMerchantSurveyEmail(subject, from, body)) {
@@ -1554,6 +1681,14 @@ function evaluateAdministrativeIgnore(subject, from, body, attachments) {
       ignore: true,
       reason: "Coface newsletter/marketing — no action needed",
       status: "coface_ignored",
+    };
+  }
+  // Prefer specific status for Innovative-team auto-replies (headers + OOO).
+  if (isInternalTeamAutoReply(subject, from, body, headers)) {
+    return {
+      ignore: true,
+      reason: "Internal team automatic reply — no action needed",
+      status: "internal_auto_reply_ignored",
     };
   }
   if (isOutOfOfficeAutoReply(subject, from, body)) {
@@ -1590,6 +1725,8 @@ module.exports = {
   resolveStatementAbeEmail,
   isAbeCopiedOnEmailHeaders,
   isEmodalBroadcast,
+  isCardknoxDomain,
+  isCardknoxEmail,
   isCardknoxBatchReport,
   looksLikeDnbCreditAlert,
   isDnbCreditInsightsDigest,
@@ -1597,6 +1734,9 @@ module.exports = {
   isPromotionalMarketingEmail,
   isCofaceEmail,
   isCofaceDomain,
+  isInternalInnovativeSender,
+  hasAutoReplyHeaders,
+  isInternalTeamAutoReply,
   isOutOfOfficeAutoReply,
   isAmexMerchantSurveyEmail,
   isHafstaffSender,

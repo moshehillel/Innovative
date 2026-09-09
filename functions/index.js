@@ -9096,12 +9096,14 @@ async function processGmailMessage(
       if (!isTai) {
         const adminIgnore =
           administrativeEmailIntake.evaluateAdministrativeIgnore(
-              subject, from, emailBody, attachments);
+              subject, from, emailBody, attachments, headers);
         if (adminIgnore.ignore &&
           !administrativeEmailIntake.hasInvoiceVeto({
             subject,
             body: emailBody,
+            from,
             attachments,
+            headers,
             emailClassification,
           })) {
           await completeAdministrativeIgnore({

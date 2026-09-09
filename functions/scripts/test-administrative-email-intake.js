@@ -51,17 +51,28 @@ const cardknoxSubject = "Innovative Carriers Batch 52094836";
 const cardknoxFrom = "Cardknox <noreply@cardknox.com>";
 check("Cardknox batch report detected",
     adm.isCardknoxBatchReport(cardknoxSubject, cardknoxFrom));
+check("Cardknox domain sender detected",
+    adm.isCardknoxEmail(cardknoxFrom));
 check("Cardknox batch report evaluate quiet-ignore",
     adm.evaluateAdministrativeIgnore(
         cardknoxSubject, cardknoxFrom, "", []).status ===
-    "cardknox_batch_report_ignored");
-check("Cardknox non-batch subject not ignored",
-    !adm.isCardknoxBatchReport(
-        "Cardknox payment receipt", cardknoxFrom));
+    "cardknox_ignored");
+check("Cardknox payment receipt quiet-ignore",
+    adm.isCardknoxEmail(cardknoxFrom) &&
+    adm.evaluateAdministrativeIgnore(
+        "Cardknox payment receipt", cardknoxFrom, "", []).status ===
+    "cardknox_ignored");
+check("Cardknox secure subdomain quiet-ignore",
+    adm.evaluateAdministrativeIgnore(
+        "Transaction notification",
+        "Cardknox <alerts@secure.cardknox.com>",
+        "Your batch settled.",
+        []).status === "cardknox_ignored");
 check("non-Cardknox Batch subject not ignored",
     !adm.isCardknoxBatchReport(
         "Innovative Carriers Batch 52094836",
-        "alerts@otherprocessor.com"));
+        "alerts@otherprocessor.com") &&
+    !adm.isCardknoxEmail("alerts@otherprocessor.com"));
 
 const amexSurveySubject =
   "INNOVATIVE CARRIERS, We want to hear from you on September 9";
@@ -157,6 +168,62 @@ check("Automatic reply + Invoice/BOL is not blocked by invoice veto",
       attachments: [],
       invoicePdfCount: 0,
     }));
+
+// Internal Innovative team auto-replies (Moshe: ignore) vs normal human mail.
+const internalOooFrom = "Lisa <lisa@innovativecarriers.com>";
+check("Internal automatic reply detected",
+    adm.isInternalTeamAutoReply(
+        "Automatic reply: Re: Payment question",
+        internalOooFrom,
+        "I am currently out of the office until Monday."));
+check("Internal automatic reply evaluate quiet-ignore",
+    adm.evaluateAdministrativeIgnore(
+        "Automatic reply: Re: Payment question",
+        internalOooFrom,
+        "I am currently out of the office until Monday.",
+        []).status === "internal_auto_reply_ignored");
+check("Internal Auto: subject quiet-ignore",
+    adm.evaluateAdministrativeIgnore(
+        "Auto: Invoice follow-up",
+        "Abe <abe@innovativecarriers.com>",
+        "",
+        []).status === "internal_auto_reply_ignored");
+check("Internal Auto-Submitted header quiet-ignore",
+    adm.isInternalTeamAutoReply(
+        "Re: Load status",
+        "Sarah <sarah@innovativecarriers.com>",
+        "Thanks for your email.",
+        [{name: "Auto-Submitted", value: "auto-replied"}]));
+check("Normal internal human email NOT ignored",
+    !adm.isInternalTeamAutoReply(
+        "Re: Invoice #29558 for BOL #266916",
+        "Lisa <lisa@innovativecarriers.com>",
+        "Please process this invoice when you can.") &&
+    !adm.evaluateAdministrativeIgnore(
+        "Re: Invoice #29558 for BOL #266916",
+        "Lisa <lisa@innovativecarriers.com>",
+        "Please process this invoice when you can.",
+        []).ignore);
+check("CHB invoice thread NOT ignored as auto-reply",
+    !adm.isInternalTeamAutoReply(
+        "Invoice #29558 for BOL #266916",
+        "Isreal Rosenfeld <ir@innovativechb.com>",
+        "Please see attached customs invoice for this shipment.") &&
+    !adm.evaluateAdministrativeIgnore(
+        "Invoice #29558 for BOL #266916",
+        "Isreal Rosenfeld <ir@innovativechb.com>",
+        "Please see attached customs invoice for this shipment.",
+        []).ignore);
+check("CHB automatic reply IS ignored",
+    adm.evaluateAdministrativeIgnore(
+        "Automatic reply: Invoice #29558 for BOL #266916",
+        "Isreal Rosenfeld <ir@innovativechb.com>",
+        "I will return on Tuesday.",
+        []).status === "internal_auto_reply_ignored");
+check("external OOO still quiet-ignored (legacy)",
+    adm.evaluateAdministrativeIgnore(
+        oooSubject, oooFrom, oooBody, []).status ===
+    "out_of_office_ignored");
 
 const dnbPromoSubject =
   "No Hidden Fees. No Overdrafts. Smarter Business Banking Starts Here";
