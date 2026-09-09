@@ -498,6 +498,7 @@ function isCarrierOrFactorSender(from) {
     "rtsinc.com",
     "rtsfinancial.com",
     "cjfinancing.com",
+    "sunbeltfinance.com",
     "vtflog.com",
     "abf.com",
     "arcb.com",
@@ -1262,7 +1263,8 @@ function looksLikeInvoiceEmailContent(subject, body) {
   const sub = String(subject || "").trim().toLowerCase();
   const content = `${subject || ""}\n${body || ""}`.toLowerCase();
   // Allow optional whitespace after "#": "Invoice # 981 …"
-  if (/^(?:fw:\s*)?invoice\s+#?\s*\d+/.test(sub)) return true;
+  // Alphanumeric factor invoice ids: "Invoice R3669", "Invoice #AB123"
+  if (/^(?:fw:\s*)?invoice\s+#?\s*[a-z]{0,4}\d+/.test(sub)) return true;
   if (/^(?:fw:\s*)?invoice\s+\d+\s+from\b/.test(sub)) return true;
   // Hyphenated invoice ids: "RE: Invoice-0003138, …"
   if (/^(?:(?:re|fw|fwd):\s*)*(?:\[(?:external|secure)\]\s*)?invoice-\d+/i
@@ -1277,6 +1279,15 @@ function looksLikeInvoiceEmailContent(subject, body) {
   if (INVOICE_CR_BOL_THREAD_RE.test(sub)) {
     return true;
   }
+  // Sunbelt Finance / similar: "Load 266551 Invoice R3669 for DNG Transport"
+  if (/\bload\s+#?\s*\d{5,9}\b/i.test(sub) &&
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
+    return true;
+  }
+  if (/sunbeltfinance\.com/i.test(content) &&
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
+    return true;
+  }
   // Compass FS factored invoices: PO # in subject is the broker load.
   if (/^purchase\s+order\s+number\s*[;:]\s*purchase\s+order\s*#\s*\d{5,9}/i
       .test(sub)) {
@@ -1287,46 +1298,46 @@ function looksLikeInvoiceEmailContent(subject, body) {
     return true;
   }
   // FactorView / BP Financing: "Invoice # 981 Your PO # 265543"
-  if (/invoice\s+#?\s*\d+/i.test(sub) &&
+  if (/invoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub) &&
       /(?:your\s+)?po\s*#?\s*\d{5,9}/i.test(sub) &&
       /factorview/i.test(content)) {
     return true;
   }
-  if (/invoice\s+#?\s*\d+/i.test(sub) &&
+  if (/invoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub) &&
       /(?:your\s+)?(?:po|purchase\s+order)\s*#?\s*\d{5,9}/i.test(sub)) {
     return true;
   }
   // Thunder Funding and similar factors: "Invoice for processing; Invoice #299 …"
   if (/invoice\s+for\s+processing/i.test(sub) &&
-      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
     return true;
   }
   // Single Point Capital: "Single Point Capital; Invoice #265914"
   if (/singlepointgroup\.com/i.test(content) &&
-      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
     return true;
   }
   if (/single\s+point\s+capital/i.test(content) &&
-      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
     return true;
   }
   // RM Capital / similar factors: "REF# 266111" — REF # is the broker load.
   if (/^ref\s*#\s*\d{5,9}\b/i.test(sub)) return true;
   // REV Capital: "REV CAPITAL/CARRIER, Invoice # 6672 Part 1 of 1"
   if (/revinc\.com/i.test(content) &&
-      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
     return true;
   }
   if (/rev\s*capital/i.test(content) &&
-      /\binvoice\s+#?\s*\d+/i.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
     return true;
   }
   // Factor-name prefix subjects: "Factor Name; Invoice #123"
   // or "FACTOR/CARRIER, Invoice # 6672 Part 1 of 1"
-  if (/[;,]\s*invoice\s+#?\s*\d+/i.test(sub)) {
+  if (/[;,]\s*invoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {
     return true;
   }
-  if (/\binvoice\s+#?\s*\d+\s+part\s+\d+\s+of\s+\d+/i.test(sub)) {
+  if (/\binvoice\s+#?\s*[a-z]{0,4}\d+\s+part\s+\d+\s+of\s+\d+/i.test(sub)) {
     return true;
   }
   // Carrier portals (ArcBest/ABF, etc.): "eInvoice(s) - 760981 ..."
@@ -1334,22 +1345,22 @@ function looksLikeInvoiceEmailContent(subject, body) {
   // QuickBooks: "New payment request from X - invoice 173867"
   // (body often has Zelle/ACH remittance tips — not a bank payment alert)
   if (/\bpayment\s+request\b/.test(sub) &&
-      /\binvoice\s+#?\s*\d+\b/.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+\b/.test(sub)) {
     return true;
   }
   if (/your invoice is ready/i.test(content) &&
-      /\binvoice\s+#?\s*\d+\b/.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+\b/.test(sub)) {
     return true;
   }
   if (/your invoice is attached/i.test(content) &&
-      /\binvoice\s+#?\s*\d+\b/.test(sub)) {
+      /\binvoice\s+#?\s*[a-z]{0,4}\d+\b/.test(sub)) {
     return true;
   }
-  if (/\binvoice\s+#?\s*\d+[\s-]+(?:for\s+)?(?:bol|load)\s+#?\s*\d{5,9}/i
+  if (/\binvoice\s+#?\s*[a-z]{0,4}\d+[\s-]+(?:for\s+)?(?:bol|load)\s+#?\s*\d{5,9}/i
       .test(content)) {
     return true;
   }
-  if (/\binvoice\s+#?\s*\d+[\s-]+load\s+\d{5,9}/i.test(content)) {
+  if (/\binvoice\s+#?\s*[a-z]{0,4}\d+[\s-]+load\s+\d{5,9}/i.test(content)) {
     return true;
   }
   if (/\bfreight invoice\b/.test(content) &&

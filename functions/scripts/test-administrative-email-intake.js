@@ -977,6 +977,28 @@ check("REV Capital OTHER attachment would veto (not forward)",
       invoicePdfCount: 0,
     }));
 
+const sunbeltSubject =
+  "Load 266551 Invoice R3669 for DNG Transport LLC";
+const sunbeltFrom =
+  "lisa@sunbeltfinance.com <lisa@sunbeltfinance.com>";
+const sunbeltBody =
+  "Please process and pay the attached invoice R3669 for load 266551.";
+const sunbeltPdf = [{filename: "R3669.pdf", mimeType: "application/pdf"}];
+check("Sunbelt Load+Invoice R# subject recognized as invoice",
+    adm.looksLikeInvoiceEmailContent(sunbeltSubject, sunbeltBody));
+check("Sunbelt Finance factor domain recognized",
+    adm.isCarrierOrFactorSender(sunbeltFrom));
+check("Sunbelt not payment inquiry",
+    !adm.isPaymentInquiryEmail(sunbeltSubject, sunbeltFrom, sunbeltBody));
+check("Sunbelt has invoice veto when PDF present",
+    adm.hasInvoiceVeto({
+      subject: sunbeltSubject,
+      body: sunbeltBody,
+      from: sunbeltFrom,
+      attachments: sunbeltPdf,
+      invoicePdfCount: 0,
+    }));
+
 const hstileSubject = "Payment 08/25/26";
 const hstileFrom = "Michel Schwartz <michel@hstile.com>";
 const hstileBody =
