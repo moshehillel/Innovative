@@ -25,7 +25,7 @@ steps:
         # Deploy lightweight public action endpoints (minInstances=1).
         firebase deploy --config=_firebase-deploy-nolint.json \
           --only=functions:email-actions \
-          --project=tai-invoice-automation --non-interactive
+          --project=tai-invoice-automation --non-interactive --force
 timeout: '3600s'
 options:
   logging: CLOUD_LOGGING_ONLY
