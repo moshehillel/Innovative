@@ -347,15 +347,18 @@ function resolveCarrierNoteRules(extra) {
  *   Dynamic rules (e.g. Firestore carrierNameContains notes).
  * @return {Array<string>} Empty if none of the advisory carriers are selected.
  */
-function buildSelectedCarrierNoteLines(lanes, extraRules) {
+function buildSelectedCarrierNoteLines(lanes, extraRules, cleanRules) {
   const rules = resolveCarrierNoteRules(extraRules);
   const byRule = new Map();
   for (const lane of lanes || []) {
     for (const opt of resolveSelectedOptions(lane)) {
-      const name = String(opt.name || opt.SCAC || "").trim();
-      if (!name) continue;
+      const rawName = String(opt.name || opt.SCAC || "").trim();
+      if (!rawName) continue;
+      const name = quoteRules.cleanCustomerEmailCarrierName(
+          rawName, cleanRules);
       for (const rule of rules) {
-        if (!rule.test(name)) continue;
+        // Match advisory on Primus name; display cleaned name in Notes.
+        if (!rule.test(rawName) && !rule.test(name)) continue;
         let entry = byRule.get(rule.id);
         if (!entry) {
           entry = {note: rule.note, names: []};
@@ -403,15 +406,27 @@ function customerNoteFromOption(opt) {
 }
 
 /**
+ * Customer-facing carrier label (optional clean rules strip broker suffixes).
+ * @param {object} opt Rate option.
+ * @param {Array<object>} [cleanRules] Display cleaners.
+ * @return {string}
+ */
+function customerFacingCarrierName(opt, cleanRules) {
+  const raw = String((opt && (opt.name || opt.SCAC)) || "").trim() || "Carrier";
+  return quoteRules.cleanCustomerEmailCarrierName(raw, cleanRules) || raw;
+}
+
+/**
  * Formats one pricing line — bullet style (Coreforce / Diego pattern).
  * Note text is appended by the email builder on its own line.
  * @param {object} opt Selected option.
+ * @param {Array<object>} [cleanRules] Display cleaners.
  * @return {string}
  */
-function formatCustomerPricingLineBullet(opt) {
+function formatCustomerPricingLineBullet(opt, cleanRules) {
   const amount = money(effectiveCustomerRate(opt));
   const priceBit = amount ? `$${amount}` : "$TBD";
-  const carrier = opt.name || opt.SCAC || "Carrier";
+  const carrier = customerFacingCarrierName(opt, cleanRules);
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const days = opt.transitDays || "?";
   const svc = opt.guaranteed ? "guaranteed" : "estimated";
@@ -421,12 +436,13 @@ function formatCustomerPricingLineBullet(opt) {
 /**
  * Formats one pricing line — inline style (Ruelily / Hanna pattern).
  * @param {object} opt Selected option.
+ * @param {Array<object>} [cleanRules] Display cleaners.
  * @return {string}
  */
-function formatCustomerPricingLineSimple(opt) {
+function formatCustomerPricingLineSimple(opt, cleanRules) {
   const amount = money(effectiveCustomerRate(opt));
   const priceBit = amount ? `$${amount}` : "$TBD";
-  const carrier = opt.name || opt.SCAC || "Carrier";
+  const carrier = customerFacingCarrierName(opt, cleanRules);
   const q = opt.quoteNumber || opt.savedQuoteNumber || "";
   const days = opt.transitDays || "?";
   let line =
@@ -438,12 +454,13 @@ function formatCustomerPricingLineSimple(opt) {
 /**
  * Formats one pricing line — standard Innovative style (CTA / Izzy).
  * @param {object} opt Selected option.
+ * @param {Array<object>} [cleanRules] Display cleaners.
  * @return {string}
  */
-function formatCustomerPricingLine(opt) {
+function formatCustomerPricingLine(opt, cleanRules) {
   const amount = money(effectiveCustomerRate(opt));
   const priceBit = amount ? `$${amount}` : "$TBD";
-  const carrier = opt.name || opt.SCAC || "Carrier";
+  const carrier = customerFacingCarrierName(opt, cleanRules);
   const q = opt.quoteNumber || opt.savedQuoteNumber || "_____";
   const transit = opt.transitDays ? `${opt.transitDays}` : "?";
   return (
@@ -454,12 +471,14 @@ function formatCustomerPricingLine(opt) {
 
 /**
  * @param {string} style bullet|simple|standard.
+ * @param {Array<object>} [cleanRules] Display cleaners.
  * @return {Function}
  */
-function pricingFormatter(style) {
-  if (style === "simple") return formatCustomerPricingLineSimple;
-  if (style === "standard") return formatCustomerPricingLine;
-  return formatCustomerPricingLineBullet;
+function pricingFormatter(style, cleanRules) {
+  const fmt = style === "simple" ? formatCustomerPricingLineSimple :
+    style === "standard" ? formatCustomerPricingLine :
+    formatCustomerPricingLineBullet;
+  return (opt) => fmt(opt, cleanRules);
 }
 
 /**
@@ -502,7 +521,8 @@ function resolveSelectedOptions(lane) {
  */
 function buildCustomerEmailFromSelections(quote, opts = {}) {
   const batchId = quote.batchQuoteId || "Q#????";
-  const formatLine = pricingFormatter(opts.style || "bullet");
+  const cleanRules = opts.carrierCleanRules || [];
+  const formatLine = pricingFormatter(opts.style || "bullet", cleanRules);
   const lines = [
     "Hi,",
     "",
@@ -535,7 +555,7 @@ function buildCustomerEmailFromSelections(quote, opts = {}) {
   }
 
   const carrierNotes = buildSelectedCarrierNoteLines(
-      quote.lanes, opts.carrierNoteRules);
+      quote.lanes, opts.carrierNoteRules, cleanRules);
   if (carrierNotes.length) {
     lines.push(...carrierNotes);
     lines.push("");

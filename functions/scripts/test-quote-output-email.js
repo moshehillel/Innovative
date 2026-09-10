@@ -219,6 +219,80 @@ checkNotIncludes(
     "Notes:",
 );
 
+const jiCleanRules = quoteRules.toCustomerEmailCarrierCleanRules([{
+  id: "clean_carrier_name_remove_ji_distributors",
+  active: true,
+  name: "Clean carrier names — remove J&I Distributors wording",
+  match: {
+    carrierNameContains: [
+      "j&i distributors",
+      "j - i distributors",
+      "j and i distributors",
+      "ji distributors",
+      "j&i",
+      "j - i",
+    ],
+  },
+  notes: "When a customer email shows a carrier name with added " +
+    "J&I Distributors wording or similar variations, provide only " +
+    "the actual carrier name and omit the added company wording.",
+}]);
+check(
+    "J&I clean rule detected from notes",
+    jiCleanRules.length > 0,
+    true,
+);
+check(
+    "Roadrunner J&I → Roadrunner",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "Roadrunner J&I", jiCleanRules),
+    "Roadrunner",
+);
+check(
+    "Central Transport J-I DISTRIBUTORS cleaned",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "Central Transport - J - I DISTRIBUTORS", jiCleanRules),
+    "Central Transport",
+);
+checkNotIncludes(
+    "J&I clean rule is not a Notes advisory",
+    JSON.stringify(quoteRules.toCustomerEmailCarrierNoteRules([{
+      id: "clean_carrier_name_remove_ji_distributors",
+      active: true,
+      name: "Clean carrier names — remove J&I Distributors wording",
+      match: {carrierNameContains: ["j&i", "j&i distributors"]},
+      notes: "When a customer email shows a carrier name with added " +
+        "J&I Distributors wording, omit the added company wording.",
+    }])),
+    "clean_carrier_name_remove_ji_distributors",
+);
+const cleanedDraft = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#D1013",
+  lanes: [{
+    selectedOptions: [
+      {name: "EDI Express", sellRate: 489, transitDays: 4, quoteNumber: "81537"},
+      {name: "Roadrunner J&I", sellRate: 505, transitDays: 3, quoteNumber: "81538"},
+      {name: "Forward Air", sellRate: 545, transitDays: 4, quoteNumber: "81539"},
+    ],
+  }],
+}, {
+  style: "bullet",
+  carrierCleanRules: jiCleanRules,
+  carrierNoteRules: quoteRules.toCustomerEmailCarrierNoteRules([{
+    id: "roadrunner_transit_delay_note",
+    active: true,
+    match: {carrierNameContains: ["roadrunner"]},
+    notes: "has lots of delays in transit.",
+  }]),
+});
+checkIncludes("draft shows cleaned Roadrunner", cleanedDraft, "– Roadrunner · Q# 81538");
+checkNotIncludes("draft omits J&I suffix", cleanedDraft, "Roadrunner J&I");
+checkIncludes(
+    "Notes uses cleaned carrier label",
+    cleanedDraft,
+    "• Roadrunner: has lots of delays in transit.",
+);
+
 const page = quoteOutput.serializeForDispatcherPage({
   id: "q1",
   lanes: [{

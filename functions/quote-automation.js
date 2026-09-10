@@ -1613,11 +1613,14 @@ async function generateQuoteEmail(tenant, quoteId, opts = {}) {
   const activeRules = await quoteRules.loadActiveRules(tenant);
   const carrierNoteRules =
     quoteRules.toCustomerEmailCarrierNoteRules(activeRules);
+  const carrierCleanRules =
+    quoteRules.toCustomerEmailCarrierCleanRules(activeRules);
   const text = opts.bodyText != null ?
     String(opts.bodyText) :
     quoteOutput.buildCustomerEmailFromSelections(quote, {
       style,
       carrierNoteRules,
+      carrierCleanRules,
     });
   const html = quoteOutput.textToEmailHtml(text);
 
@@ -2128,9 +2131,12 @@ async function approveQuoteEmail(tenant, quoteId, opts = {}) {
     const activeRules = await quoteRules.loadActiveRules(tenant);
     const carrierNoteRules =
       quoteRules.toCustomerEmailCarrierNoteRules(activeRules);
+    const carrierCleanRules =
+      quoteRules.toCustomerEmailCarrierCleanRules(activeRules);
     text = quoteOutput.buildCustomerEmailFromSelections(quote, {
       style: quote.emailStyle || "bullet",
       carrierNoteRules,
+      carrierCleanRules,
     });
   }
   const html = opts.bodyHtml != null ?

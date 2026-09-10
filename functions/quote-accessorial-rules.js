@@ -1106,13 +1106,11 @@ function carrierNameContainsNeedles(rule) {
 }
 
 /**
- * Rules that only match selected rate carrier names (not lane addresses).
- * These never fire in applyRulesToLane — they attach Notes: lines when a
- * matching carrier is selected into the customer email draft.
+ * True when rule.match is only carrierNameContains (no address/site keys).
  * @param {object} rule Rule document.
  * @return {boolean}
  */
-function isCarrierNoteRule(rule) {
+function isCarrierNameOnlyMatch(rule) {
   const needles = carrierNameContainsNeedles(rule);
   if (!needles.length) return false;
   const match = rule.match || {};
@@ -1123,13 +1121,125 @@ function isCarrierNoteRule(rule) {
     if (Array.isArray(v) && !v.length) return false;
     return true;
   });
-  if (otherKeys.length) return false;
+  return otherKeys.length === 0;
+}
+
+/**
+ * Carrier display rename for customer email (strip broker suffixes like
+ * "J&I" / "J&I Distributors") — not a Notes: advisory.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isCarrierDisplayCleanRule(rule) {
+  if (!rule || rule.active === false) return false;
+  if (!isCarrierNameOnlyMatch(rule)) return false;
+  const hasAcc = (rule.addAccessorials || []).length > 0 ||
+    (rule.removeAccessorials || []).length > 0 ||
+    (rule.filterCarrierWarnings || []).length > 0 ||
+    !!rule.customerName ||
+    !!rule.fillZipCode;
+  if (hasAcc) return false;
+  const blob = `${rule.name || ""} ${rule.notes || ""}`.toLowerCase();
+  return /clean\s+carrier|omit\s+the|remove\s+.+\s+wording|only\s+the\s+actual\s+carrier|provide\s+only\s+the\s+actual|omit\s+the\s+added/i
+      .test(blob);
+}
+
+/**
+ * Rules that only match selected rate carrier names (not lane addresses).
+ * These never fire in applyRulesToLane — they attach Notes: lines when a
+ * matching carrier is selected into the customer email draft.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isCarrierNoteRule(rule) {
+  if (isCarrierDisplayCleanRule(rule)) return false;
+  if (!isCarrierNameOnlyMatch(rule)) return false;
   const hasAcc = (rule.addAccessorials || []).length > 0 ||
     (rule.removeAccessorials || []).length > 0 ||
     (rule.filterCarrierWarnings || []).length > 0 ||
     !!rule.customerName ||
     !!rule.fillZipCode;
   return !hasAcc;
+}
+
+/**
+ * Flexible carrier-name haystack match for clean / note needles.
+ * Treats &, "and", and hyphen variants between tokens as equivalent.
+ * @param {string} hay Carrier name.
+ * @param {string} needle Match phrase.
+ * @return {boolean}
+ */
+function carrierNameMatchesNeedle(hay, needle) {
+  const h = String(hay || "").toLowerCase();
+  const n = String(needle || "").toLowerCase().trim();
+  if (!h || !n) return false;
+  if (h.includes(n)) return true;
+  const norm = (s) => String(s || "").toLowerCase()
+      .replace(/&/g, " and ")
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  const hn = norm(h);
+  const nn = norm(n);
+  return !!(hn && nn && hn.includes(nn));
+}
+
+/**
+ * Strip matched broker / distributor wording from a carrier display name.
+ * @param {string} rawName Primus / rate carrier name.
+ * @param {Array<{id: string, test: Function, needles: Array<string>}>} [rules]
+ * @return {string}
+ */
+function cleanCustomerEmailCarrierName(rawName, rules) {
+  let name = String(rawName || "").trim();
+  if (!name || !Array.isArray(rules) || !rules.length) return name;
+  let matched = false;
+  for (const rule of rules) {
+    if (!rule || typeof rule.test !== "function") continue;
+    if (!rule.test(name)) continue;
+    matched = true;
+    for (const needle of rule.needles || []) {
+      const n = String(needle || "").trim();
+      if (!n) continue;
+      const flex = n
+          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+          .replace(/\\?\s+/g, "[\\s\\-–—/]*")
+          .replace(/\\?&/g, "(?:&|and|\\-)");
+      name = name.replace(
+          new RegExp(`[\\s\\-–—/]*${flex}`, "ig"), " ");
+    }
+  }
+  if (matched) {
+    // Common Primus J&I / J-I DISTRIBUTORS suffixes left after partial strip.
+    name = name.replace(
+        /\s*[-–—/]*\s*j\s*[&and\-–—]+\s*i(?:\s*distributors?)?\b/ig, "");
+    name = name.replace(/\s*[-–—/]*\s*ji\s*distributors?\b/ig, "");
+  }
+  return name
+      .replace(/\s+/g, " ")
+      .replace(/\s*[-–—/,]+$/g, "")
+      .trim() || String(rawName || "").trim();
+}
+
+/**
+ * Builds carrier display-name cleaners from quoteRules.
+ * @param {Array<object>} rules Active quote rules.
+ * @return {Array<{id: string, test: Function, needles: Array<string>}>}
+ */
+function toCustomerEmailCarrierCleanRules(rules) {
+  const out = [];
+  for (const rule of rules || []) {
+    if (!isCarrierDisplayCleanRule(rule)) continue;
+    const needles = carrierNameContainsNeedles(rule);
+    if (!needles.length) continue;
+    out.push({
+      id: String(rule.id || `carrier_clean_${out.length}`),
+      needles,
+      test: (name) => needles.some(
+          (n) => carrierNameMatchesNeedle(name, n)),
+    });
+  }
+  return out;
 }
 
 /**
@@ -1164,17 +1274,16 @@ function toCustomerEmailCarrierNoteRules(rules) {
   const out = [];
   for (const rule of rules || []) {
     if (!rule || rule.active === false) continue;
+    // Display-name cleaners are not customer-facing Notes: lines.
+    if (isCarrierDisplayCleanRule(rule)) continue;
     const needles = carrierNameContainsNeedles(rule);
     if (!needles.length) continue;
     const note = customerEmailNoteText(rule.notes, needles);
     if (!note) continue;
-    const lower = needles.map((n) => n.toLowerCase());
     out.push({
       id: String(rule.id || `carrier_note_${out.length}`),
-      test: (name) => {
-        const hay = String(name || "").toLowerCase();
-        return lower.some((n) => hay.includes(n));
-      },
+      test: (name) => needles.some(
+          (n) => carrierNameMatchesNeedle(name, n)),
       note,
     });
   }
@@ -1406,9 +1515,14 @@ module.exports = {
   isSenderCustomerRule,
   isZipFillRule,
   isCarrierNoteRule,
+  isCarrierDisplayCleanRule,
+  isCarrierNameOnlyMatch,
   carrierNameContainsNeedles,
+  carrierNameMatchesNeedle,
   customerEmailNoteText,
+  cleanCustomerEmailCarrierName,
   toCustomerEmailCarrierNoteRules,
+  toCustomerEmailCarrierCleanRules,
   applyZipFillRules,
   zipFillRuleMatchesParty,
   zipFillRuleMatchesContext,
