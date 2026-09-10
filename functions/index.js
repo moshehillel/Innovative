@@ -2469,248 +2469,98 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
   }
 });
 
-exports.continueWorkflow = onRequest(async (req, res) => {
-  try {
-    const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
-
-    if (!invoiceId) {
-      return res.status(400).json({
-        ok: false,
-        error: "invoiceId is required.",
-      });
-    }
-
-    const tenant = await tenantFromRequest(req);
-    const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
-    const snap = await invoiceRef.get();
-
-    if (!snap.exists) {
-      return res.status(404).json({
-        ok: false,
-        error: "Invoice not found.",
-      });
-    }
-
-    const invoice = snap.data();
-    const paused = invoice.workflowPausedAtStep;
-    const loadNumber = invoice.loadNumber || "—";
-    const wantsJson = req.query.format === "json" ||
-      String(req.get("accept") || "").includes("application/json");
-
-    await invoiceRef.update({
-      workflowPausedAtStep: null,
-      workflowPausedAt: null,
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-
-    // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
-    // hardcoded Primus default.
-    const workflowUrl = workflowUrlForTenant(tenant);
-    if (!workflowUrl) {
-      return res.status(400).json({
-        ok: false,
-        error: `No workflow configured for tenant ${tenant.tenantId}.`,
-      });
-    }
-
-    await writeLog("info", "workflow", "Resume Workflow clicked", {
-      invoiceId,
-      tenantId: tenant.tenantId,
-      loadNumber: invoice.loadNumber || null,
-      resumedFrom: paused || null,
-    });
-
-    const response = await fetch(
-        workflowUrl,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            invoiceId: invoiceId,
-            tenantId: tenant.tenantId,
-            resumeFrom: paused || null,
-          }),
-        },
-    );
-
-    const payload = await response.json().catch(() => ({}));
-    const result = workflowErrors.interpretWorkflowResumeResult(
-        response.ok, payload);
-    const body = {
-      ok: result.ok,
-      resumedFrom: paused || null,
-      workflow: payload,
-      message: result.userMessage,
-      code: result.code || null,
-    };
-
-    if (!wantsJson && req.method === "GET") {
-      const color = result.ok ? "#16a34a" : "#dc2626";
-      const title = result.ok ? "Workflow resumed" : "Could not resume";
-      return res.status(result.ok ? 200 : 422).send(
-          `<!doctype html><html><head><meta charset="utf-8">` +
-          `<meta name="viewport" content="width=device-width,` +
-          `initial-scale=1"><title>${escapeHtml(title)}</title></head>` +
-          `<body style="font-family:Arial,sans-serif;text-align:center;` +
-          `padding:48px;color:#111827">` +
-          `<h1 style="color:${color};margin-bottom:12px">` +
-          `${escapeHtml(title)}</h1>` +
-          `<p style="font-size:16px;color:#374151;max-width:520px;` +
-          `margin:0 auto 16px;line-height:1.5">` +
-          `${escapeHtml(result.userMessage)}</p>` +
-          `<p style="font-size:13px;color:#9ca3af">Load ` +
-          `${escapeHtml(String(loadNumber))}</p>` +
-          `</body></html>`);
-    }
-
-    return res.status(result.ok ? 200 : 422).json(body);
-  } catch (error) {
-    console.error("continueWorkflow error:", error);
-    return res.status(500).json({
-      ok: false,
-      error: "Internal server error.",
-      details: error.message,
-    });
-  }
-});
+// continueWorkflow lives in the lightweight functions-email-actions codebase
+// so confirmation GETs are not blocked by this fat index.js cold start (~35s).
 
 /**
- * Lisa enters a Primus load # for a regular invoice that had no load/PRO match.
- * GET shows form; POST saves load and reprocesses the Gmail message.
+ * Fat worker for enterInvoiceLoadNumber (public GET/POST UI lives in
+ * functions-email-actions). Validates Primus load + reprocesses Gmail.
  */
-exports.enterInvoiceLoadNumber = onRequest(async (req, res) => {
-  try {
-    const messageId = (req.body && req.body.messageId) ||
-      (req.body && req.body.invoiceId) ||
-      req.query.messageId || req.query.invoiceId;
-    const itemIndex = String(
-        (req.body && req.body.itemIndex) ||
-        (req.body && req.body.option) ||
-        req.query.itemIndex || req.query.option || "0",
-    );
-    const tenantId = (req.body && req.body.tenantId) || req.query.tenantId ||
-      null;
-    const exp = (req.body && req.body.exp) || req.query.exp;
-    const sig = (req.body && req.body.sig) || req.query.sig;
+exports.executeEnterInvoiceLoadNumber = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "1GiB"},
+    async (req, res) => {
+      try {
+        if (!emailActionWorkerAuthOk(req)) {
+          return res.status(403).json({ok: false, error: "Forbidden"});
+        }
+        const body = req.body || {};
+        const messageId = body.messageId || body.invoiceId;
+        const itemIndex = String(body.itemIndex || body.option || "0");
+        const tenantId = body.tenantId || null;
+        const exp = body.exp;
+        const sig = body.sig;
+        const normalizedLoad = invoiceLoadEntry.normalizeManualLoadNumber(
+            body.loadNumber || "");
 
-    if (!messageId) {
-      return res.status(400).send("Missing messageId.");
-    }
-
-    const tokenOk = emailActionTokens.verify({
-      action: "invoiceLoadEntry",
-      invoiceId: String(messageId),
-      option: itemIndex,
-      tenantId,
-      exp,
-      sig,
-    });
-    if (!tokenOk) {
-      return res.status(403).send(
-          "This link is invalid or expired. Ask Jerry to resend the request.");
-    }
-
-    const tenant = await tenantFromRequest(req);
-    const intakeRef = tcol(tenant, "emailIntake").doc(String(messageId));
-    const intakeSnap = await intakeRef.get();
-    const intake = intakeSnap.exists ? intakeSnap.data() : null;
-
-    if (req.method !== "POST") {
-      const carrier = intake && intake.pendingLoadEntry ?
-        intake.pendingLoadEntry.carrierName : null;
-      const amount = intake && intake.pendingLoadEntry ?
-        intake.pendingLoadEntry.invoiceAmount : null;
-      const desc =
-        `Carrier invoice${carrier ? ` from ${carrier}` : ""}` +
-        `${amount != null ? ` ($${amount})` : ""} — enter the Primus ` +
-        `load number so Jerry can process it.`;
-      return res.status(200).send(buildEmailActionConfirmPage({
-        title: "Enter load number",
-        description: desc,
-        confirmLabel: "Process invoice",
-        confirmColor: "#2563eb",
-        actionPath: "enterInvoiceLoadNumber",
-        inputFields: [{
-          name: "loadNumber",
-          label: "Primus load number (6 digits)",
-          type: "text",
-          required: true,
-          placeholder: "265551",
-        }],
-        fields: {
-          messageId: String(messageId),
+        if (!messageId) {
+          return res.status(400).json({ok: false, error: "Missing messageId"});
+        }
+        const tokenOk = emailActionTokens.verify({
+          action: "invoiceLoadEntry",
           invoiceId: String(messageId),
-          itemIndex,
           option: itemIndex,
-          tenantId: tenantId || "",
-          exp: String(exp),
-          sig: String(sig),
-        },
-      }));
-    }
+          tenantId,
+          exp,
+          sig,
+        });
+        if (!tokenOk) {
+          return res.status(403).json({ok: false, error: "Invalid token"});
+        }
+        if (!invoiceLoadEntry.isValidManualLoadNumber(normalizedLoad)) {
+          return res.status(400).json({ok: false, error: "Invalid load"});
+        }
 
-    const rawLoad = (req.body && req.body.loadNumber) || "";
-    const normalizedLoad =
-      invoiceLoadEntry.normalizeManualLoadNumber(rawLoad);
-    if (!invoiceLoadEntry.isValidManualLoadNumber(normalizedLoad)) {
-      return res.status(400).send(
-          "Enter a valid 6-digit Primus load number (5-digit ok if missing " +
-          "leading 2).");
-    }
+        const tenant = await getTenant(tenantId);
+        const intakeRef = tcol(tenant, "emailIntake").doc(String(messageId));
+        const intakeSnap = await intakeRef.get();
+        const intake = intakeSnap.exists ? intakeSnap.data() : null;
 
-    let booking = null;
-    try {
-      booking = await fetchPrimusBooking(normalizedLoad);
-    } catch (_) {
-      booking = null;
-    }
-    if (!booking) {
-      return res.status(400).send(
-          `Load ${normalizedLoad} was not found in Primus. Check the number ` +
-          `and try again.`);
-    }
+        let booking = null;
+        try {
+          booking = await fetchPrimusBooking(normalizedLoad);
+        } catch (_) {
+          booking = null;
+        }
+        if (!booking) {
+          await writeLog("error", "workflow",
+              "executeEnterInvoiceLoadNumber: Primus load not found", {
+                messageId, loadNumber: normalizedLoad,
+              });
+          return res.status(400).json({
+            ok: false, error: `Load ${normalizedLoad} not found in Primus`,
+          });
+        }
 
-    const prior = intake && intake.manualLoadNumber ?
-      String(intake.manualLoadNumber) : null;
-    if (prior === normalizedLoad && intake.status === "processed") {
-      return res.status(200).send(
-          `<!doctype html><html><body style="font-family:Arial,sans-serif;` +
-          `text-align:center;padding:48px"><h1 style="color:#16a34a">` +
-          `Already submitted</h1><p>Load ${normalizedLoad} was already ` +
-          `entered for this invoice.</p></body></html>`);
-    }
+        const prior = intake && intake.manualLoadNumber ?
+          String(intake.manualLoadNumber) : null;
+        if (prior === normalizedLoad && intake.status === "processed") {
+          return res.json({ok: true, already: true});
+        }
 
-    await intakeRef.set({
-      manualLoadNumber: normalizedLoad,
-      manualLoadItemIndex: Number(itemIndex) || 0,
-      manualLoadEnteredBy: invoiceLoadEntry.LISA_EMAIL_DEFAULT,
-      manualLoadEnteredAt: admin.firestore.FieldValue.serverTimestamp(),
-      pendingLoadEntry: {
-        status: "submitted",
-        loadNumber: normalizedLoad,
-        itemIndex: Number(itemIndex) || 0,
-      },
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, {merge: true});
+        await intakeRef.set({
+          manualLoadNumber: normalizedLoad,
+          manualLoadItemIndex: Number(itemIndex) || 0,
+          manualLoadEnteredBy: invoiceLoadEntry.LISA_EMAIL_DEFAULT,
+          manualLoadEnteredAt: admin.firestore.FieldValue.serverTimestamp(),
+          pendingLoadEntry: {
+            status: "submitted",
+            loadNumber: normalizedLoad,
+            itemIndex: Number(itemIndex) || 0,
+          },
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
 
-    const inboxFlowId = (intake && intake.inboxFlowId) ||
-      (crypto.randomUUID && crypto.randomUUID()) ||
-      String(Date.now());
-    await reprocessGmailMessageForTenant(
-        tenant, String(messageId), inboxFlowId);
-
-    return res.status(200).send(
-        `<!doctype html><html><body style="font-family:Arial,sans-serif;` +
-        `text-align:center;padding:48px"><h1 style="color:#16a34a">` +
-        `Load saved</h1><p>Jerry is reprocessing this invoice with load ` +
-        `<strong>${escapeHtml(normalizedLoad)}</strong>.</p></body></html>`);
-  } catch (error) {
-    console.error("enterInvoiceLoadNumber error:", error);
-    return res.status(500).send("Something went wrong. Please try again.");
-  }
-});
+        const inboxFlowId = (intake && intake.inboxFlowId) ||
+          (crypto.randomUUID && crypto.randomUUID()) ||
+          String(Date.now());
+        await reprocessGmailMessageForTenant(
+            tenant, String(messageId), inboxFlowId);
+        return res.json({ok: true, loadNumber: normalizedLoad});
+      } catch (error) {
+        console.error("executeEnterInvoiceLoadNumber error:", error);
+        return res.status(500).json({ok: false, error: error.message});
+      }
+    });
 
 // Kept as a stub so Cloud Functions overwrites the old Approve/Reject handler
 // instead of leaving it live. Customer invoice emails send automatically.
@@ -2849,6 +2699,27 @@ async function resolveCurrentCustomerRate(invoice, booking) {
 }
 
 /**
+ * Auth for slim email-action → fat worker calls.
+ * @param {object} req Request.
+ * @return {boolean}
+ */
+function emailActionWorkerAuthOk(req) {
+  const expected = String(
+      process.env.EMAIL_ACTION_SECRET ||
+      process.env.PRIMUS_PASSWORD ||
+      process.env.GMAIL_CLIENT_ID ||
+      "");
+  const got = String(req.get("X-Email-Action-Worker-Secret") || "");
+  if (!expected || !got || got.length !== expected.length) return false;
+  try {
+    return crypto.timingSafeEqual(
+        Buffer.from(got), Buffer.from(expected));
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
  * Atomically claims an additional-charge decision (blocks double-execute).
  * @param {object} invoiceRef Firestore invoice document reference.
  * @param {string} decision Decision letter A, B, C, D, or E.
@@ -2875,532 +2746,71 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
 }
 
 /**
- * Handles the A/B/C/D/E decision buttons from the additional-charge approval
- * email:
- *   a — pay carrier + bill customer (enter customer charge amount;
- *       auto-email the customer contact).
- *   b — pay carrier + bill customer (enter accessorial amounts / updated
- *       rate; dispatcher gets a ready customer-notification template).
- *   c — pay carrier only; customer rate unchanged.
- *   d — not approved; dispute draft generated for manual submission.
- *   e - pay carrier + bill customer (enter amount; bump rate; no separate
- *       customer notification - charge rides on the customer invoice).
+ * Fat worker for additional-charge decisions. The public confirmation UI lives
+ * in functions-email-actions (fast cold start). Slim claims the decision and
+ * kicks this worker for emails / rate bump / workflow resume.
  */
-exports.additionalChargeAction = onRequest(
-    {invoker: "public"}, handleAdditionalChargeAction);
+exports.executeAdditionalChargeDecision = onRequest(
+    {invoker: "public", timeoutSeconds: 300, memory: "512MiB"},
+    handleExecuteAdditionalChargeDecision);
 
 /**
- * Implementation for the additionalChargeAction endpoint.
  * @param {object} req HTTPS request.
  * @param {object} res HTTPS response.
- * @return {Promise<object>} Express response.
+ * @return {Promise<object>}
  */
-async function handleAdditionalChargeAction(req, res) {
+async function handleExecuteAdditionalChargeDecision(req, res) {
+  if (!emailActionWorkerAuthOk(req)) {
+    return res.status(403).json({ok: false, error: "Forbidden"});
+  }
   try {
-    const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
-    const option = String(
-        (req.body && req.body.option) || req.query.option || "",
-    ).toLowerCase();
-    const tenantId = (req.body && req.body.tenantId) || req.query.tenantId ||
-      null;
-    const exp = (req.body && req.body.exp) || req.query.exp;
-    const sig = (req.body && req.body.sig) || req.query.sig;
+    const body = req.body || {};
+    const invoiceId = body.invoiceId;
+    const option = String(body.option || "").toLowerCase();
+    const tenantId = body.tenantId || null;
+    const optionACustomerChargeAmount = body.optionACustomerChargeAmount;
+    const optionBCustomerBillLines = body.optionBCustomerBillLines;
 
     if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
-      return res.status(400).send(
-          "Missing invoiceId or a valid option (a|b|c|d|e).");
+      return res.status(400).json({ok: false, error: "Bad request"});
     }
 
-    const tokenOk = emailActionTokens.verify({
-      action: "additionalCharge",
-      invoiceId: String(invoiceId),
-      option,
-      tenantId,
-      exp,
-      sig,
-    });
-    if (!tokenOk) {
-      return res.status(403).send(
-          "This decision link is invalid or expired. Ask Jerry to resend " +
-          "the approval email.");
-    }
-
-    const tenant = await tenantFromRequest(req);
+    const tenant = await getTenant(tenantId);
     const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
     const snap = await invoiceRef.get();
     if (!snap.exists) {
-      return res.status(404).send("Invoice not found.");
+      return res.status(404).json({ok: false, error: "Invoice not found"});
     }
     const invoice = snap.data();
     const charge = invoice.additionalCharge;
     if (!charge) {
-      return res.status(400).send(
-          "This invoice has no additional charge awaiting a decision.");
+      return res.status(400).json({ok: false, error: "No additional charge"});
     }
-
-    const htmlPage = (title, color, message) => res.status(200).send(
-        `<!doctype html><html><head><meta charset="utf-8">` +
-        `<meta name="viewport" content="width=device-width,` +
-        `initial-scale=1"><title>${title}</title></head>` +
-        `<body style="font-family:Arial,sans-serif;text-align:center;` +
-        `padding:48px;color:#111827">` +
-        `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
-        `<p style="font-size:16px;color:#374151">${message}</p>` +
-        `<p style="font-size:13px;color:#9ca3af">Load ` +
-        `${escapeHtml(String(invoice.loadNumber || invoiceId))}</p>` +
-        `</body></html>`);
-
-    if (charge.decision) {
-      return htmlPage("Already decided", "#6b7280",
-          `This charge was already handled (option ` +
-          `${escapeHtml(String(charge.decision).toUpperCase())}).`);
-    }
-
-    const optionLabels = {
-      a: "A - Pay carrier + bill customer (auto-email customer)",
-      b: "B - Pay carrier + bill customer (enter updated rate; " +
-        "dispatcher notifies customer)",
-      c: "C - Pay carrier only (customer rate unchanged)",
-      d: "D - Not approved (dispute with carrier)",
-      e: "E - Pay carrier + bill customer (enter amount; apply rate; " +
-        "no separate customer notification)",
-    };
-
-    if (req.method !== "POST") {
-      const confirmOpts = {
-        title: `Confirm option ${option.toUpperCase()}`,
-        description:
-          `Load ${invoice.loadNumber || invoiceId}: ` +
-          `${optionLabels[option]}. Nothing is sent until you click Confirm.`,
-        confirmLabel: `Confirm option ${option.toUpperCase()}`,
-        confirmColor: option === "d" ? "#dc2626" :
-          (option === "c" ? "#2563eb" :
-            (option === "e" ? "#7c3aed" : "#16a34a")),
-        actionPath: "additionalChargeAction",
-        fields: {
-          invoiceId: String(invoiceId),
-          option,
-          tenantId: tenantId || "",
-          exp: String(exp),
-          sig: String(sig),
-        },
-      };
-      if (option === "a" || option === "e") {
-        const currentRate = Number(invoice.customerRate) || 0;
-        const defaultCharge = Number(charge.amount) || 0;
-        const rateNote = currentRate > 0 ?
-          ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
-        const isE = option === "e";
-        confirmOpts.title = isE ? "Confirm option E" : "Confirm option A";
-        confirmOpts.description =
-          `Load ${invoice.loadNumber || invoiceId}: ` +
-          `${optionLabels[option]}. Enter how much to charge the customer ` +
-          `for this additional charge. The customer rate will be bumped by ` +
-          `that amount` +
-          (isE ?
-            `; no separate customer notification is sent - the charge is ` +
-            `included when the customer invoice goes out.` :
-            ` and the customer will be emailed.`) +
-          rateNote +
-          ` Nothing is sent until you click Confirm.`;
-        confirmOpts.confirmLabel = isE ?
-          "Confirm option E" : "Confirm option A";
-        confirmOpts.confirmColor = isE ? "#7c3aed" : "#16a34a";
-        confirmOpts.inputFields = [{
-          name: "customerChargeAmount",
-          label: "Amount to charge the customer ($)",
-          type: "number",
-          required: true,
-          min: "0.01",
-          step: "0.01",
-          placeholder: "0.00",
-          value: defaultCharge > 0 ? defaultCharge.toFixed(2) : "",
-        }];
-        return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
-      }
-      if (option === "b") {
-        const currentRate = Number(invoice.customerRate) || 0;
-        return res.status(200).send(
-            additionalCharges.buildOptionBAccessorialConfirmPage({
-              title: "Confirm option B",
-              description:
-                `Load ${invoice.loadNumber || invoiceId}: ` +
-                `${optionLabels[option]}. Enter each accessorial and the ` +
-                `amount to bill the customer. The base customer rate stays ` +
-                `the same; each accessorial is added as a separate invoice ` +
-                `line. The dispatcher will get a ready customer-notification ` +
-                `template.`,
-              confirmLabel: "Confirm option B",
-              confirmColor: "#0d9488",
-              actionPath: "additionalChargeAction",
-              baseUrl: functionsBaseUrl(),
-              baseCustomerRate: currentRate,
-              carrierCharges: Array.isArray(charge.charges) ?
-                charge.charges : [],
-              fields: {
-                invoiceId: String(invoiceId),
-                option,
-                tenantId: tenantId || "",
-                exp: String(exp),
-                sig: String(sig),
-              },
-            }));
-      }
-      return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
-    }
-
     const decision = option.toUpperCase();
-    let optionBCustomerBillLines = null;
-    let optionACustomerChargeAmount = null;
-    if (option === "a" || option === "e") {
-      const parsedAmount =
-        additionalCharges.parseCustomerChargeAmountFromRequest(req.body || {});
-      if (!parsedAmount.ok) {
-        return res.status(400).send(parsedAmount.error ||
-            `Option ${decision} requires a customer charge amount ` +
-            `greater than 0.`);
-      }
-      optionACustomerChargeAmount = parsedAmount.amount;
-    }
-    if (option === "b") {
-      const parsedLines = additionalCharges.parseCustomerBillLinesFromRequest(
-          req.body || {});
-      if (!parsedLines.ok) {
-        return res.status(400).send(parsedLines.error ||
-            "Option B requires valid accessorial billing lines.");
-      }
-      optionBCustomerBillLines = parsedLines.lines;
+    if (String(charge.decision || "").toUpperCase() !== decision) {
+      return res.status(409).json({
+        ok: false,
+        error: "Decision not claimed or mismatch",
+        decision: charge.decision || null,
+      });
     }
 
-    const claim = await claimAdditionalChargeDecision(invoiceRef, decision);
-    if (!claim.ok) {
-      if (claim.reason === "already") {
-        return htmlPage("Already decided", "#6b7280",
-            `This charge was already handled (option ` +
-            `${escapeHtml(String(claim.decision).toUpperCase())}).`);
-      }
-      return res.status(400).send("Could not process this decision.");
-    }
-
-    const processingMessages = {
-      a: "Option A recorded. Jerry is billing the customer and resuming " +
-        "the workflow — you can close this page.",
-      b: "Option B recorded. Jerry is updating accessorial billing and " +
-        "resuming the workflow — you can close this page.",
-      c: "Option C recorded. Jerry is paying the carrier and resuming the " +
-        "workflow — you can close this page.",
-      d: "Option D recorded. Jerry is generating the dispute draft — you " +
-        "can close this page.",
-      e: "Option E recorded. Jerry is updating the customer rate and " +
-        "resuming the workflow — you can close this page.",
-    };
-    res.status(200).send(buildEmailActionProcessingPage({
-      title: `Option ${decision} submitted`,
-      message: processingMessages[option],
-      loadNumber: invoice.loadNumber || invoiceId,
-    }));
+    res.status(200).json({ok: true, accepted: true});
 
     try {
-      const chargesTotal = Number(charge.amount) || 0;
-      const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
-
-      let booking = null;
-      try {
-        booking = await fetchPrimusBooking(invoice.loadNumber);
-      } catch (_) {
-        // Booking lookup is best-effort for emails below.
-      }
-      const customerName = invoice.customerName ||
-        customerNameFromPrimusBooking(booking);
-      const primusUiBridge = require("./primus-ui-bridge");
-
-      if (option === "d") {
-        // Not approved — generate the dispute draft for manual submission.
-        const dispute = additionalCharges.buildDisputeEmailDraft({
-          loadNumber: invoice.loadNumber,
-          carrierName: invoice.carrierName,
-          proNumber: invoice.proNumber,
-          invoiceNumber: invoice.invoiceNumber,
-          invoiceAmount: invoice.invoiceAmount,
-          expectedAmount: invoice.primusAmount ||
-            (Number(invoice.invoiceAmount) || 0) - chargesTotal,
-          charges: chargeRows,
-          category: charge.category,
-          freightMismatch: charge.freightMismatch,
-          hasCertificate: charge.hasCertificate,
-          customerRate: invoice.customerRate ||
-            customerRateFromBooking(booking),
-        });
-        await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
-          type: "carrier_dispute_draft",
-          invoiceId: String(invoiceId),
-          subject: dispute.subject,
-          html: dispute.html,
-        }));
-        await invoiceRef.update({
-          "additionalCharge.decision": decision,
-          "additionalCharge.approved": false,
-          "additionalCharge.status": "disputed",
-          "additionalCharge.decidedAt":
-            admin.firestore.FieldValue.serverTimestamp(),
-          "decisionStage": "additional_charge_disputed",
-          "decisionReason": "Charge not approved — dispute draft generated",
-          "finalWorkflowStatus": "failed",
-          "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-        });
-        await additionalCharges.updateFollowUp(db, {
-          invoiceId: String(invoiceId),
-          status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
-          decision,
-          notes: "Dispute draft emailed for manual submission",
-        });
-        await writeLog("info", "workflow",
-            "Additional charge NOT approved — dispute draft generated", {
-              invoiceId, loadNumber: invoice.loadNumber, decision,
-            });
-        return;
-      }
-
-      // Options a/b/c/e — the charge is approved for the carrier side.
-      const billCustomer = option === "a" || option === "b" || option === "e";
-
-      // A/E: approver enters customer charge amount; bump sell rate by that amount.
-      // B: approver itemizes accessorials on the confirm page.
-      let rateBumpNote = "";
-      const approvalUpdate = {
-        "additionalCharge.decision": decision,
-        "additionalCharge.approved": true,
-        "additionalCharge.billCustomer": billCustomer,
-        "additionalCharge.notifyCustomer": option === "a" ? "auto" :
-          (option === "b" ? "dispatcher" :
-            (option === "e" ? "none" : null)),
-        "additionalCharge.status": "approved",
-        "additionalCharge.decidedAt":
-          admin.firestore.FieldValue.serverTimestamp(),
-        // Clear the gates so the workflow can proceed with the full carrier
-        // amount (baseAmount excludes the approved charge).
-        "unrecognizedCharges": [],
-        "chargesNeedProof": [],
-        "decisionStage": "additional_charge_approved",
-        "decisionReason": `Additional charge approved (option ${decision})`,
-        "finalWorkflowStatus": "created",
-        "workflowPausedAtStep": null,
-        "workflowPausedAt": null,
-        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
-      };
-
-      if ((option === "a" || option === "e") &&
-          optionACustomerChargeAmount > 0) {
-        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
-        const billAmount = optionACustomerChargeAmount;
-        approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
-        approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
-        if (baseRate > 0) {
-          const bumpedRate =
-            Math.round((baseRate + billAmount) * 100) / 100;
-          approvalUpdate.customerRate = bumpedRate;
-          approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
-          approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
-          rateBumpNote = ` Customer charged $${billAmount.toFixed(2)}; ` +
-            `rate bumped from $${baseRate.toFixed(2)} to ` +
-            `$${bumpedRate.toFixed(2)}.`;
-          invoice.customerRate = bumpedRate;
-        } else {
-          rateBumpNote = ` Customer charge amount $${billAmount.toFixed(2)} ` +
-            `recorded, but the current customer rate could not be resolved - ` +
-            `please bump it manually before invoicing.`;
-        }
-      } else if (billCustomer && chargesTotal > 0 && option === "b") {
-        const baseRate = await resolveCurrentCustomerRate(invoice, booking);
-        const billLines = optionBCustomerBillLines || [];
-        const billExtra = additionalCharges.sumCustomerBillLines(billLines);
-        approvalUpdate["additionalCharge.customerBillLines"] = billLines;
-        approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
-          billExtra;
-        approvalUpdate["additionalCharge.originalCustomerRate"] =
-          baseRate > 0 ? baseRate : null;
-        rateBumpNote = baseRate > 0 ?
-          ` Base customer rate stays $${baseRate.toFixed(2)}.` :
-          " Base customer rate unchanged.";
-        rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
-          ` ($${billExtra.toFixed(2)}).`;
-      }
-
-      await invoiceRef.update(approvalUpdate);
-
-      let extraNote = rateBumpNote;
-      let skipDispatcherNotify = false;
-      if (option === "a") {
-        // Auto-notify the customer contact on file.
-        let customerEmail = null;
-        try {
-          const emails = await primusUiBridge
-              .resolveCustomerAccountingEmails(booking);
-          customerEmail = emails.emails && emails.emails[0] || null;
-        } catch (_) {
-          customerEmail = null;
-        }
-        if (customerEmail) {
-          const note = additionalCharges.buildCustomerChargeNotificationEmail({
-            customerName,
-            loadNumber: invoice.loadNumber,
-            charges: chargeRows,
-            chargesTotal: optionACustomerChargeAmount != null ?
-              optionACustomerChargeAmount : chargesTotal,
-            category: charge.category,
-            customerRate: invoice.customerRate ||
-              customerRateFromBooking(booking),
-          });
-          await saveOutboundEmail(
-              additionalCharges.applyAdditionalChargeEmailCc({
-                type: "additional_charge_customer_notice",
-                invoiceId: String(invoiceId),
-                forceRecipient: true,
-                to: customerEmail,
-                subject: note.subject,
-                html: note.html,
-                skipAgentGreeting: true,
-              }));
-          extraNote += ` The customer was notified at ${customerEmail}.`;
-        } else {
-          extraNote += " Could not resolve the customer email from Primus — " +
-            "please notify the customer manually.";
-        }
-        await additionalCharges.updateFollowUp(db, {
-          invoiceId: String(invoiceId),
-          status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
-          decision,
-          notes: extraNote.trim(),
-        });
-      } else if (option === "e") {
-        // Same billing as A, but skip the separate customer notification —
-        // the additional charge is included on the customer invoice.
-        extraNote += " No separate customer notification sent; charge will " +
-          "be included on the customer invoice.";
-        await additionalCharges.updateFollowUp(db, {
-          invoiceId: String(invoiceId),
-          status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
-          decision,
-          notes: extraNote.trim(),
-        });
-      } else if (option === "b") {
-        // Dispatcher notifies the customer — unless Primus already reconciles
-        // the carrier total (line item is breakdown only, not a real overage).
-        try {
-          const reCheck = await reconcileUnrecognizedChargesWithPrimus(
-              invoice.loadNumber,
-              invoice.invoiceAmount,
-              chargeRows);
-          if (reCheck.override) {
-            skipDispatcherNotify = true;
-            extraNote += " Carrier invoice total already matches Primus" +
-              (reCheck.totalMatches ? " (within $10)" :
-                reCheck.chargesInPrimus ?
-                  " (charge already in vendor breakdown)" :
-                  " (invoice at/under Primus cost)") +
-              " — dispatcher customer notification skipped.";
-            await writeLog("info", "workflow",
-                "Option B: skipped dispatcher notify — Primus reconciled", {
-                  invoiceId,
-                  loadNumber: invoice.loadNumber,
-                  invoiceAmount: invoice.invoiceAmount,
-                  vendorCost: reCheck.vendorCost,
-                  totalMatches: reCheck.totalMatches,
-                  chargesInPrimus: reCheck.chargesInPrimus,
-                });
-          }
-        } catch (_) {
-          // Best-effort; still notify dispatcher if re-check fails.
-        }
-
-        if (!skipDispatcherNotify) {
-          // Dispatcher must notify the customer — remind them / task it.
-          let dispatcher = {ok: false};
-          try {
-            dispatcher = await primusUiBridge.resolveDispatcherEmail({
-              booking,
-              loadNumber: invoice.loadNumber,
-              fetchBooking: fetchPrimusBooking,
-            });
-          } catch (err) {
-            dispatcher = {ok: false, error: err.message};
-          }
-          const reminder = additionalCharges.buildDispatcherNotifyReminderEmail({
-            dispatcherName: dispatcher.displayName || dispatcher.userName || null,
-            loadNumber: invoice.loadNumber,
-            carrierName: invoice.carrierName,
-            customerName,
-            charges: chargeRows,
-            chargesTotal,
-            customerRate: await resolveCurrentCustomerRate(invoice, booking),
-            customerBillLines:
-              approvalUpdate["additionalCharge.customerBillLines"] || [],
-          });
-          const podFollowup = require("./pod-followup");
-          const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-            podFollowup.SARAH_EMAIL;
-          const reminderPayload = {
-            type: "additional_charge_dispatcher_task",
-            invoiceId: String(invoiceId),
-            subject: reminder.subject,
-            html: reminder.html,
-          };
-          if (dispatcher.ok && dispatcher.email) {
-            reminderPayload.forceRecipient = true;
-            reminderPayload.to = dispatcher.email;
-            if (approver) reminderPayload.cc = approver;
-            extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
-              `to notify the customer.`;
-          } else {
-            extraNote += " Could not resolve the dispatcher email — the " +
-              "reminder went to the ops mailbox instead.";
-          }
-          await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc(
-              additionalCharges.applyAdditionalChargeEmailCc(reminderPayload)));
-        }
-
-        await additionalCharges.updateFollowUp(db, {
-          invoiceId: String(invoiceId),
-          status: skipDispatcherNotify ?
-            additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED :
-            additionalCharges.FOLLOW_UP_STATUS
-                .APPROVED_BILLED_DISPATCHER_NOTIFIES,
-          decision,
-          notes: extraNote.trim(),
-        });
-      } else {
-        // Option c — carrier only, customer rate unchanged.
-        await additionalCharges.updateFollowUp(db, {
-          invoiceId: String(invoiceId),
-          status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_CARRIER_ONLY,
-          decision,
-          notes: "Carrier paid in full; customer not billed",
-        });
-      }
-
-      // Resume the billing workflow with the charge approved.
-      const workflowUrl = workflowUrlForTenant(tenant);
-      if (workflowUrl) {
-        fetch(workflowUrl, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({
-            invoiceId: String(invoiceId),
-            tenantId: tenant.tenantId,
-          }),
-        }).catch((e) =>
-          console.error("additionalChargeAction: resume failed", e.message));
-      }
-
-      await writeLog("info", "workflow",
-          "Additional charge approved — workflow resumed", {
-            invoiceId,
-            loadNumber: invoice.loadNumber,
-            decision,
-            billCustomer,
-          });
+      await runAdditionalChargeDecisionBackground({
+        invoiceId: String(invoiceId),
+        option,
+        decision,
+        tenant,
+        invoiceRef,
+        invoice,
+        charge,
+        optionACustomerChargeAmount,
+        optionBCustomerBillLines,
+      });
     } catch (bgError) {
-      console.error("additionalChargeAction background error:", bgError);
+      console.error("executeAdditionalChargeDecision background:", bgError);
       await writeLog("error", "workflow",
           "Additional charge decision background processing failed", {
             invoiceId: String(invoiceId),
@@ -3411,10 +2821,307 @@ async function handleAdditionalChargeAction(req, res) {
     }
     return;
   } catch (error) {
-    console.error("additionalChargeAction error:", error);
-    return res.status(500).send("Internal server error.");
+    console.error("executeAdditionalChargeDecision error:", error);
+    return res.status(500).json({ok: false, error: error.message});
   }
 }
+
+/**
+ * Background work after an additional-charge decision was claimed.
+ * @param {object} args Work args.
+ * @return {Promise<void>}
+ */
+async function runAdditionalChargeDecisionBackground(args) {
+  const {
+    invoiceId, option, decision, tenant, invoiceRef, invoice, charge,
+    optionACustomerChargeAmount, optionBCustomerBillLines,
+  } = args;
+  const chargesTotal = Number(charge.amount) || 0;
+  const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
+
+  let booking = null;
+  try {
+    booking = await fetchPrimusBooking(invoice.loadNumber);
+  } catch (_) {
+    booking = null;
+  }
+  const customerName = invoice.customerName ||
+    customerNameFromPrimusBooking(booking);
+  const primusUiBridgeMod = require("./primus-ui-bridge");
+
+  if (option === "d") {
+    const dispute = additionalCharges.buildDisputeEmailDraft({
+      loadNumber: invoice.loadNumber,
+      carrierName: invoice.carrierName,
+      proNumber: invoice.proNumber,
+      invoiceNumber: invoice.invoiceNumber,
+      invoiceAmount: invoice.invoiceAmount,
+      expectedAmount: invoice.primusAmount ||
+        (Number(invoice.invoiceAmount) || 0) - chargesTotal,
+      charges: chargeRows,
+      category: charge.category,
+      freightMismatch: charge.freightMismatch,
+      hasCertificate: charge.hasCertificate,
+      customerRate: invoice.customerRate ||
+        customerRateFromBooking(booking),
+    });
+    await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
+      type: "carrier_dispute_draft",
+      invoiceId: String(invoiceId),
+      subject: dispute.subject,
+      html: dispute.html,
+    }));
+    await invoiceRef.update({
+      "additionalCharge.decision": decision,
+      "additionalCharge.approved": false,
+      "additionalCharge.status": "disputed",
+      "additionalCharge.decidedAt":
+        admin.firestore.FieldValue.serverTimestamp(),
+      "decisionStage": "additional_charge_disputed",
+      "decisionReason": "Charge not approved — dispute draft generated",
+      "finalWorkflowStatus": "failed",
+      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await additionalCharges.updateFollowUp(db, {
+      invoiceId: String(invoiceId),
+      status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
+      decision,
+      notes: "Dispute draft emailed for manual submission",
+    });
+    await writeLog("info", "workflow",
+        "Additional charge NOT approved — dispute draft generated", {
+          invoiceId, loadNumber: invoice.loadNumber, decision,
+        });
+    return;
+  }
+
+  const billCustomer = option === "a" || option === "b" || option === "e";
+  let rateBumpNote = "";
+  const approvalUpdate = {
+    "additionalCharge.decision": decision,
+    "additionalCharge.approved": true,
+    "additionalCharge.billCustomer": billCustomer,
+    "additionalCharge.notifyCustomer": option === "a" ? "auto" :
+      (option === "b" ? "dispatcher" :
+        (option === "e" ? "none" : null)),
+    "additionalCharge.status": "approved",
+    "additionalCharge.decidedAt":
+      admin.firestore.FieldValue.serverTimestamp(),
+    "unrecognizedCharges": [],
+    "chargesNeedProof": [],
+    "decisionStage": "additional_charge_approved",
+    "decisionReason": `Additional charge approved (option ${decision})`,
+    "finalWorkflowStatus": "created",
+    "workflowPausedAtStep": null,
+    "workflowPausedAt": null,
+    "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if ((option === "a" || option === "e") &&
+      optionACustomerChargeAmount > 0) {
+    const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+    const billAmount = optionACustomerChargeAmount;
+    approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
+    approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
+    if (baseRate > 0) {
+      const bumpedRate =
+        Math.round((baseRate + billAmount) * 100) / 100;
+      approvalUpdate.customerRate = bumpedRate;
+      approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
+      approvalUpdate["additionalCharge.bumpedCustomerRate"] = bumpedRate;
+      rateBumpNote = ` Customer charged $${billAmount.toFixed(2)}; ` +
+        `rate bumped from $${baseRate.toFixed(2)} to ` +
+        `$${bumpedRate.toFixed(2)}.`;
+      invoice.customerRate = bumpedRate;
+    } else {
+      rateBumpNote = ` Customer charge amount $${billAmount.toFixed(2)} ` +
+        `recorded, but the current customer rate could not be resolved - ` +
+        `please bump it manually before invoicing.`;
+    }
+  } else if (billCustomer && chargesTotal > 0 && option === "b") {
+    const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+    const billLines = optionBCustomerBillLines || [];
+    const billExtra = additionalCharges.sumCustomerBillLines(billLines);
+    approvalUpdate["additionalCharge.customerBillLines"] = billLines;
+    approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
+      billExtra;
+    approvalUpdate["additionalCharge.originalCustomerRate"] =
+      baseRate > 0 ? baseRate : null;
+    rateBumpNote = baseRate > 0 ?
+      ` Base customer rate stays $${baseRate.toFixed(2)}.` :
+      " Base customer rate unchanged.";
+    rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
+      ` ($${billExtra.toFixed(2)}).`;
+  }
+
+  await invoiceRef.update(approvalUpdate);
+
+  let extraNote = rateBumpNote;
+  let skipDispatcherNotify = false;
+  if (option === "a") {
+    let customerEmail = null;
+    try {
+      const emails = await primusUiBridgeMod
+          .resolveCustomerAccountingEmails(booking);
+      customerEmail = emails.emails && emails.emails[0] || null;
+    } catch (_) {
+      customerEmail = null;
+    }
+    if (customerEmail) {
+      const note = additionalCharges.buildCustomerChargeNotificationEmail({
+        customerName,
+        loadNumber: invoice.loadNumber,
+        charges: chargeRows,
+        chargesTotal: optionACustomerChargeAmount != null ?
+          optionACustomerChargeAmount : chargesTotal,
+        category: charge.category,
+        customerRate: invoice.customerRate ||
+          customerRateFromBooking(booking),
+      });
+      await saveOutboundEmail(
+          additionalCharges.applyAdditionalChargeEmailCc({
+            type: "additional_charge_customer_notice",
+            invoiceId: String(invoiceId),
+            forceRecipient: true,
+            to: customerEmail,
+            subject: note.subject,
+            html: note.html,
+            skipAgentGreeting: true,
+          }));
+      extraNote += ` The customer was notified at ${customerEmail}.`;
+    } else {
+      extraNote += " Could not resolve the customer email from Primus — " +
+        "please notify the customer manually.";
+    }
+    await additionalCharges.updateFollowUp(db, {
+      invoiceId: String(invoiceId),
+      status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
+      decision,
+      notes: extraNote.trim(),
+    });
+  } else if (option === "e") {
+    extraNote += " No separate customer notification sent; charge will " +
+      "be included on the customer invoice.";
+    await additionalCharges.updateFollowUp(db, {
+      invoiceId: String(invoiceId),
+      status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
+      decision,
+      notes: extraNote.trim(),
+    });
+  } else if (option === "b") {
+    try {
+      const reCheck = await reconcileUnrecognizedChargesWithPrimus(
+          invoice.loadNumber,
+          invoice.invoiceAmount,
+          chargeRows);
+      if (reCheck.override) {
+        skipDispatcherNotify = true;
+        extraNote += " Carrier invoice total already matches Primus" +
+          (reCheck.totalMatches ? " (within $10)" :
+            reCheck.chargesInPrimus ?
+              " (charge already in vendor breakdown)" :
+              " (invoice at/under Primus cost)") +
+          " — dispatcher customer notification skipped.";
+        await writeLog("info", "workflow",
+            "Option B: skipped dispatcher notify — Primus reconciled", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              invoiceAmount: invoice.invoiceAmount,
+              vendorCost: reCheck.vendorCost,
+              totalMatches: reCheck.totalMatches,
+              chargesInPrimus: reCheck.chargesInPrimus,
+            });
+      }
+    } catch (_) {
+      // Best-effort.
+    }
+
+    if (!skipDispatcherNotify) {
+      let dispatcher = {ok: false};
+      try {
+        dispatcher = await primusUiBridgeMod.resolveDispatcherEmail({
+          booking,
+          loadNumber: invoice.loadNumber,
+          fetchBooking: fetchPrimusBooking,
+        });
+      } catch (err) {
+        dispatcher = {ok: false, error: err.message};
+      }
+      const reminder = additionalCharges.buildDispatcherNotifyReminderEmail({
+        dispatcherName: dispatcher.displayName || dispatcher.userName || null,
+        loadNumber: invoice.loadNumber,
+        carrierName: invoice.carrierName,
+        customerName,
+        charges: chargeRows,
+        chargesTotal,
+        customerRate: await resolveCurrentCustomerRate(invoice, booking),
+        customerBillLines:
+          approvalUpdate["additionalCharge.customerBillLines"] || [],
+      });
+      const podFollowup = require("./pod-followup");
+      const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+        podFollowup.SARAH_EMAIL;
+      const reminderPayload = {
+        type: "additional_charge_dispatcher_task",
+        invoiceId: String(invoiceId),
+        subject: reminder.subject,
+        html: reminder.html,
+      };
+      if (dispatcher.ok && dispatcher.email) {
+        reminderPayload.forceRecipient = true;
+        reminderPayload.to = dispatcher.email;
+        if (approver) reminderPayload.cc = approver;
+        extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
+          `to notify the customer.`;
+      } else {
+        extraNote += " Could not resolve the dispatcher email — the " +
+          "reminder went to the ops mailbox instead.";
+      }
+      await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc(
+          additionalCharges.applyAdditionalChargeEmailCc(reminderPayload)));
+    }
+
+    await additionalCharges.updateFollowUp(db, {
+      invoiceId: String(invoiceId),
+      status: skipDispatcherNotify ?
+        additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED :
+        additionalCharges.FOLLOW_UP_STATUS
+            .APPROVED_BILLED_DISPATCHER_NOTIFIES,
+      decision,
+      notes: extraNote.trim(),
+    });
+  } else {
+    await additionalCharges.updateFollowUp(db, {
+      invoiceId: String(invoiceId),
+      status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_CARRIER_ONLY,
+      decision,
+      notes: "Carrier paid in full; customer not billed",
+    });
+  }
+
+  const workflowUrl = workflowUrlForTenant(tenant);
+  if (workflowUrl) {
+    fetch(workflowUrl, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        invoiceId: String(invoiceId),
+        tenantId: tenant.tenantId,
+      }),
+    }).catch((e) =>
+      console.error("additionalChargeAction: resume failed", e.message));
+  }
+
+  await writeLog("info", "workflow",
+      "Additional charge approved — workflow resumed", {
+        invoiceId,
+        loadNumber: invoice.loadNumber,
+        decision,
+        billCustomer,
+      });
+}
+
+// Public additionalChargeAction UI moved to functions-email-actions.
 
 /**
  * Additional Charges Follow-Up list — open items first, newest first.
@@ -12164,199 +11871,7 @@ exports.gmailDisconnect = onRequest({invoker: "public"}, async (req, res) => {
 
 exports.mailDisconnect = exports.gmailDisconnect;
 
-exports.setCustomerRate = onRequest(async (req, res) => {
-  const invoiceId = req.query.invoiceId || (req.body && req.body.invoiceId);
-  if (!invoiceId) {
-    return res.status(400).send("Missing invoiceId.");
-  }
-
-  const tenant = await tenantFromRequest(req);
-  const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
-  const snap = await invoiceRef.get();
-  if (!snap.exists) {
-    return res.status(404).send("Invoice not found.");
-  }
-  const inv = snap.data();
-
-  // ── GET — show form ──────────────────────────────────────────────────────
-  if (req.method === "GET") {
-    const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Set Customer Rate — Load ${escapeHtml(inv.loadNumber || "")}</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      background:#f5f6fa;margin:0;padding:2rem;color:#1f2430}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;
-      padding:2rem;max-width:480px;margin:0 auto}
-    h2{margin:0 0 1.25rem;font-size:1.15rem}
-    .field{margin-bottom:1rem}
-    label{display:block;font-size:.85rem;font-weight:600;
-      color:#6b7280;margin-bottom:.35rem}
-    .readonly{padding:.5rem .75rem;background:#f5f6fa;border:1px solid #e5e7eb;
-      border-radius:8px;font-size:.95rem}
-    input[type=number],input[type=text]{width:100%;padding:.5rem .75rem;
-      border:1px solid #d1d5db;border-radius:8px;font-size:.95rem;
-      box-sizing:border-box}
-    input:focus{outline:none;border-color:#4f46e5}
-    .btn{width:100%;padding:.65rem;background:#4f46e5;color:#fff;
-      border:none;border-radius:8px;font-size:1rem;font-weight:600;
-      cursor:pointer;margin-top:.5rem}
-    .btn:hover{opacity:.9}
-    .note{font-size:.8rem;color:#6b7280;margin-top:1rem}
-  </style>
-</head>
-<body>
-<div class="card">
-  <h2>Set Customer Rate — Load ${escapeHtml(inv.loadNumber || "—")}</h2>
-  <form method="POST">
-    <input type="hidden" name="invoiceId" value="${escapeHtml(invoiceId)}"/>
-    <input type="hidden" name="tenantId" value="${escapeHtml(
-      tenant.tenantId)}"/>
-    <div class="field">
-      <label>Carrier</label>
-      <div class="readonly">${escapeHtml(inv.carrierName || "—")}</div>
-    </div>
-    <div class="field">
-      <label>Carrier Invoice Amount</label>
-      <div class="readonly">$${escapeHtml(String(
-      inv.invoiceAmount || "—"))}</div>
-    </div>
-    <div class="field">
-      <label>Customer Name</label>
-      <input type="text" name="customerName"
-        value="${escapeHtml(inv.customerName || "")}"
-        placeholder="e.g. S3 Holdings LLC" required/>
-    </div>
-    <div class="field">
-      <label>Customer Rate ($)</label>
-      <input type="number" name="customerRate" min="1" step="0.01"
-        placeholder="e.g. 2100" required/>
-    </div>
-    <button type="submit" class="btn">Save &amp; Continue Workflow</button>
-  </form>
-  <p class="note">This will save the rate and automatically resume
-    the invoice workflow.</p>
-</div>
-</body></html>`;
-    return res.send(html);
-  }
-
-  // ── POST — save rate and resume ──────────────────────────────────────────
-  if (req.method !== "POST") {
-    return res.status(405).send("Method not allowed.");
-  }
-
-  const customerRate = Number(req.body.customerRate);
-  const customerName = String(req.body.customerName || "").trim();
-
-  if (!customerRate || customerRate <= 0) {
-    return res.status(400).send("Invalid customer rate.");
-  }
-
-  const primusSteps = inv.primusSteps || {};
-  const taiSteps = inv.taiSteps || {};
-
-  // The rate reaches the customer invoice when generateCustomerInvoice runs
-  // later in the workflow. We mark customerRateChecked on whichever TMS step
-  // map the invoice carries so the flag is TMS-agnostic.
-  await invoiceRef.update({
-    customerRate,
-    customerName: customerName || inv.customerName || null,
-    primusSteps: {...primusSteps, customerRateChecked: true},
-    taiSteps: {...taiSteps, customerRateChecked: true},
-    workflowPausedAtStep: null,
-    workflowPausedAt: null,
-    decisionStage: "running",
-    decisionReason: null,
-    finalWorkflowStatus: "running",
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  await writeLog("info", "workflow", "Customer rate set manually", {
-    invoiceId,
-    tenantId: tenant.tenantId,
-    loadNumber: inv.loadNumber,
-    customerRate,
-    customerName,
-  });
-
-  // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
-  // hardcoded Primus default.
-  const workflowUrl = workflowUrlForTenant(tenant);
-
-  if (workflowUrl) {
-    try {
-      const response = await fetch(workflowUrl, {
-        method: "POST",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify({
-          invoiceId,
-          tenantId: tenant.tenantId,
-          resumeFrom: "get_rate",
-        }),
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        await writeLog("error", "workflow",
-            "setCustomerRate: workflow resume failed", {
-              invoiceId,
-              tenantId: tenant.tenantId,
-              loadNumber: inv.loadNumber,
-              status: response.status,
-              error: payload.error || null,
-            });
-      } else {
-        await writeLog("info", "workflow",
-            "setCustomerRate: workflow resumed", {
-              invoiceId,
-              tenantId: tenant.tenantId,
-              loadNumber: inv.loadNumber,
-              workflowStatus: payload.workflowStatus || payload.ok || null,
-            });
-      }
-    } catch (e) {
-      await writeLog("error", "workflow", "setCustomerRate: resume failed", {
-        invoiceId,
-        tenantId: tenant.tenantId,
-        loadNumber: inv.loadNumber,
-        error: e.message,
-      });
-    }
-  } else {
-    await writeLog("error", "workflow",
-        "setCustomerRate: no workflow URL for tenant", {
-          invoiceId,
-          tenantId: tenant.tenantId,
-          loadNumber: inv.loadNumber,
-        });
-  }
-
-  return res.send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <title>Rate saved</title>
-  <style>
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      background:#f5f6fa;margin:0;padding:2rem;color:#1f2430}
-    .card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;
-      padding:2rem;max-width:480px;margin:0 auto;text-align:center}
-    h2{color:#16a34a}
-  </style>
-</head>
-<body>
-<div class="card">
-  <h2>✓ Rate saved</h2>
-  <p>Customer rate of <strong>$${customerRate}</strong> saved for
-    Load ${escapeHtml(inv.loadNumber || invoiceId)}.</p>
-  <p>The workflow is resuming — you will receive the customer invoice
-    shortly.</p>
-</div>
-</body></html>`);
-});
+// setCustomerRate lives in functions-email-actions (fast cold start).
 
 exports.getRecentLogs = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;

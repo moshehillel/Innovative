@@ -7,9 +7,6 @@
       "source": "functions",
       "codebase": "default",
       "disallowLegacyRuntimeConfig": true,
-      "predeploy": [
-        "npm --prefix functions run lint:deploy"
-      ],
       "ignore": [
         "node_modules",
         ".git",

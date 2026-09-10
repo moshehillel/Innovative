@@ -1,0 +1,13 @@
+{
+  "name": "functions-email-actions",
+  "description": "Lightweight HTTP endpoints for Jerry email action links",
+  "engines": {
+    "node": "24"
+  },
+  "main": "index.js",
+  "dependencies": {
+    "firebase-admin": "^13.6.0",
+    "firebase-functions": "^7.0.0"
+  },
+  "private": true
+}

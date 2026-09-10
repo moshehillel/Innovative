@@ -1,0 +1,31 @@
+steps:
+  - name: 'node:24'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -euo pipefail
+        npm install -g firebase-tools@15.22.4
+        # Ensure slim codebase has the same project env as default functions.
+        if [ -f functions/.env.tai-invoice-automation ]; then
+          cp functions/.env.tai-invoice-automation \
+            functions-email-actions/.env.tai-invoice-automation
+        fi
+        cd functions && npm ci
+        cd ../functions-email-actions && npm ci
+        cd ..
+        # Deploy fat workers first (new names — no conflict).
+        firebase deploy --config=_firebase-deploy-nolint.json \
+          --only=functions:executeAdditionalChargeDecision,functions:executeEnterInvoiceLoadNumber \
+          --project=tai-invoice-automation --non-interactive
+        # Remove old fat public endpoints so slim codebase can own the names.
+        firebase functions:delete \
+          additionalChargeAction continueWorkflow setCustomerRate enterInvoiceLoadNumber \
+          --region=us-central1 --project=tai-invoice-automation --force --non-interactive || true
+        # Deploy lightweight public action endpoints (minInstances=1).
+        firebase deploy --config=_firebase-deploy-nolint.json \
+          --only=functions:email-actions \
+          --project=tai-invoice-automation --non-interactive
+timeout: '3600s'
+options:
+  logging: CLOUD_LOGGING_ONLY
