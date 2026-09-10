@@ -54,6 +54,20 @@ check("mail.acme.com → Acme",
         "ops@mail.acme.com"), "Acme");
 check("never use Gmail brand",
     customerName.isFreemailBrandName("Gmail"), true);
+check("innovativecarriers.com is internal broker domain",
+    customerName.isInternalCompanyDomain("innovativecarriers.com"), true);
+check("quotes@innovativecarriers.com → no domain customerName",
+    customerName.customerNameFromEmailDomain(
+        "Innovative Quotes <quotes@innovativecarriers.com>"), "");
+check("Innovativecarriers unusable on internal From",
+    customerName.isUnusableCustomerName(
+        "Innovativecarriers", "quotes@innovativecarriers.com"), true);
+check("Innovative Carriers usable on external From",
+    customerName.isUnusableCustomerName(
+        "Innovative Carriers", "buyer@acme.com"), false);
+check("pick skips Innovativecarriers on internal From",
+    customerName.pickUsableCustomerName(
+        "aron@innovativecarriers.com", "Innovativecarriers"), "");
 
 const cleared = customerName.sanitizeExtractedCustomerName({
   customerName: "Gerson",
@@ -75,6 +89,15 @@ const keepCompany = customerName.sanitizeExtractedCustomerName({
 }, "jared@gmail.com");
 check("sanitize keeps explicit company on freemail",
     keepCompany.customerName, "Brumis Imports Inc");
+
+const clearInternal = customerName.sanitizeExtractedCustomerName({
+  customerName: "Innovativecarriers",
+  shippingLocationName: "Innovativecarriers",
+}, "quotes@innovativecarriers.com");
+check("sanitize clears Innovativecarriers from internal From",
+    clearInternal.customerName, null);
+check("sanitize clears Innovativecarriers shippingLocationName",
+    clearInternal.shippingLocationName, null);
 
 check("pick skips Gerson then empty on gmail",
     customerName.pickUsableCustomerName(

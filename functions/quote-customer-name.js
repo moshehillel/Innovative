@@ -41,6 +41,15 @@ const FREEMAIL_DOMAINS = new Set([
   "sbcglobal.net",
 ]);
 
+/**
+ * Broker / mailbox domains — never invent customerName from these.
+ * FW RFQs through quotes@innovativecarriers.com must not become
+ * "Innovativecarriers" in Primus lookup.
+ */
+const INTERNAL_COMPANY_DOMAINS = new Set([
+  "innovativecarriers.com",
+]);
+
 /** Brand stems that must never become customerName. */
 const FREEMAIL_BRANDS = new Set([
   "gmail",
@@ -165,12 +174,49 @@ function isFreemailDomain(domain) {
 }
 
 /**
+ * True for Innovative mailbox / broker domains (not the RFQ customer).
+ * @param {string} domain Host after @.
+ * @return {boolean}
+ */
+function isInternalCompanyDomain(domain) {
+  const d = String(domain || "").toLowerCase().replace(/^\.+|\.+$/g, "");
+  if (!d) return false;
+  if (INTERNAL_COMPANY_DOMAINS.has(d)) return true;
+  const parts = d.split(".").filter(Boolean);
+  if (parts.length >= 2) {
+    const last2 = parts.slice(-2).join(".");
+    if (INTERNAL_COMPANY_DOMAINS.has(last2)) return true;
+  }
+  return false;
+}
+
+/**
+ * Domains that must never supply a Primus customer-name guess.
+ * @param {string} domain Host after @.
+ * @return {boolean}
+ */
+function isNonCustomerEmailDomain(domain) {
+  return isFreemailDomain(domain) || isInternalCompanyDomain(domain);
+}
+
+/**
  * @param {string} name Candidate company name.
  * @return {boolean}
  */
 function isFreemailBrandName(name) {
   const key = nameKey(name);
   return !!(key && FREEMAIL_BRANDS.has(key));
+}
+
+/**
+ * True when name is only the Innovative broker brand (not a real RFQ
+ * customer guessed from quotes@ / aron@innovativecarriers.com).
+ * @param {string} name Candidate.
+ * @return {boolean}
+ */
+function isInternalBrokerBrandName(name) {
+  const key = nameKey(name);
+  return key === "innovativecarriers" || key === "innovativecarrier";
 }
 
 /**
@@ -234,13 +280,13 @@ function isNameFromEmailLocalPart(name, fromOrEmail) {
 }
 
 /**
- * Company guess from email domain only (never freemail / local-part).
+ * Company guess from email domain only (never freemail / internal / local-part).
  * @param {string} fromOrEmail From header or email.
  * @return {string}
  */
 function customerNameFromEmailDomain(fromOrEmail) {
   const {domain} = parseSenderEmail(fromOrEmail);
-  if (!domain || isFreemailDomain(domain)) return "";
+  if (!domain || isNonCustomerEmailDomain(domain)) return "";
   const stem = registrableOrgStem(domain);
   if (!stem || stem.length < 3) return "";
   if (FREEMAIL_BRANDS.has(nameKey(stem))) return "";
@@ -258,6 +304,11 @@ function isUnusableCustomerName(name, fromOrEmail) {
   if (!s) return true;
   if (isFreemailBrandName(s)) return true;
   if (isNameFromEmailLocalPart(s, fromOrEmail)) return true;
+  // "Innovativecarriers" from our own mailbox domain is never the bill-to.
+  if (isInternalBrokerBrandName(s)) {
+    const {domain} = parseSenderEmail(fromOrEmail);
+    if (!domain || isInternalCompanyDomain(domain)) return true;
+  }
   return false;
 }
 
@@ -310,9 +361,13 @@ function sanitizeExtractedCustomerName(extracted, from) {
 
 module.exports = {
   FREEMAIL_DOMAINS,
+  INTERNAL_COMPANY_DOMAINS,
   parseSenderEmail,
   isFreemailDomain,
+  isInternalCompanyDomain,
+  isNonCustomerEmailDomain,
   isFreemailBrandName,
+  isInternalBrokerBrandName,
   registrableOrgStem,
   titleCaseStem,
   isNameFromEmailLocalPart,

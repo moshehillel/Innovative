@@ -598,24 +598,41 @@ async function resolveManageShippingLocationId(restId, opts = {}) {
       "").trim();
   if (!name) return null;
 
-  const listJson = await fakManagePost({
-    action: "getShippingLocations",
-    query: name.slice(0, 80),
-    start: "0",
-    limit: "25",
-  });
-  const rows = (listJson && listJson.shipping_locations) || [];
-  const candidates = rows
-      .filter((r) => r && r.id != null)
-      .sort((a, b) => {
-        // Prefer customer locations over ship-to-only rows.
-        const ac = String(a.customer || "") === "1" ? 0 : 1;
-        const bc = String(b.customer || "") === "1" ? 0 : 1;
-        return ac - bc;
-      })
-      .slice(0, 8);
+  const queries = expandCustomerSearchTerms(name).slice(0, 4);
+  const seenManageIds = new Set();
+  const candidates = [];
 
-  for (const row of candidates) {
+  for (const query of queries) {
+    let listJson = null;
+    try {
+      listJson = await fakManagePost({
+        action: "getShippingLocations",
+        query: query.slice(0, 80),
+        start: "0",
+        limit: "25",
+      });
+    } catch (_) {
+      continue;
+    }
+    const rows = (listJson && listJson.shipping_locations) || [];
+    for (const r of rows) {
+      if (!r || r.id == null) continue;
+      const mid = String(r.id);
+      if (seenManageIds.has(mid)) continue;
+      seenManageIds.add(mid);
+      candidates.push(r);
+    }
+  }
+
+  candidates.sort((a, b) => {
+    // Prefer customer locations over ship-to-only rows.
+    const ac = String(a.customer || "") === "1" ? 0 : 1;
+    const bc = String(b.customer || "") === "1" ? 0 : 1;
+    return ac - bc;
+  });
+
+  const detailChecked = candidates.slice(0, 10);
+  for (const row of detailChecked) {
     const manageId = String(row.id);
     try {
       const detail = await fakManagePost({
@@ -637,6 +654,14 @@ async function resolveManageShippingLocationId(restId, opts = {}) {
     String(r.name || "").trim().toLowerCase() === name.toLowerCase() &&
     String(r.customer || "") === "1");
   if (exact.length === 1) return String(exact[0].id);
+  // Normalized exact (Inc/LLC stripped) when unique customer hit.
+  const wantNorm = normalizeCustomerName(name);
+  if (wantNorm) {
+    const normExact = candidates.filter((r) =>
+      normalizeCustomerName(r.name) === wantNorm &&
+      String(r.customer || "") === "1");
+    if (normExact.length === 1) return String(normExact[0].id);
+  }
   return null;
 }
 
@@ -687,8 +712,9 @@ async function fetchCustomerFakPricingFromPrimus(customerId, opts = {}) {
         (detail && detail.data && detail.data.profileId) || "0");
     // Prefer the location's rating type, but always try FAK markups when
     // the primary type returns nothing (common for protocol-only accounts).
+    // Also try Protocol — some Pricing tabs store the same row under it.
     const typesToTry = [];
-    for (const t of [ratingType, "FAK"]) {
+    for (const t of [ratingType, "FAK", "Protocol"]) {
       const key = String(t || "").trim() || "FAK";
       if (!typesToTry.includes(key)) typesToTry.push(key);
     }
@@ -718,7 +744,16 @@ async function fetchCustomerFakPricingFromPrimus(customerId, opts = {}) {
   } catch (err) {
     console.warn("fetchCustomerFakPricingFromPrimus failed",
         restId, err && err.message);
-    value = null;
+    // Network blip: one more attempt after clearing session.
+    try {
+      fakManageSession = null;
+      fakManageSessionAt = 0;
+      value = await loadOnce();
+    } catch (err2) {
+      console.warn("fetchCustomerFakPricingFromPrimus retry failed",
+          restId, err2 && err2.message);
+      value = null;
+    }
   }
 
   fakPricingLiveCache.set(restId, {
@@ -965,7 +1000,9 @@ const GENERIC_CUSTOMER_NAME_TOKENS = new Set([
   "service", "international", "intl", "usa", "america", "us",
   "united", "american", "national", "global", "general", "first",
   "new", "great", "best", "city", "state", "north", "south", "east",
-  "west",
+  "west", "industries", "industry", "accessories", "accessory",
+  "solutions", "solution", "products", "product", "supply", "supplies",
+  "trading", "enterprises", "enterprise", "holdings", "holding",
 ]);
 
 /**
@@ -995,6 +1032,10 @@ function expandCustomerSearchTerms(term) {
     if (!out.some((s) => s.toLowerCase() === t.toLowerCase())) out.push(t);
   };
   add(term);
+  const spacedAmp = String(term || "").replace(/\s*&\s*/g, " & ").trim();
+  add(spacedAmp);
+  add(String(term || "").replace(/\s*&\s*/g, " and ").trim());
+  add(String(term || "").replace(/\s*&\s*/g, "").trim());
   const tokens = distinctiveCustomerNameTokens(term);
   for (const tok of tokens) {
     if (tok.length >= 4) add(tok);
@@ -1065,6 +1106,29 @@ function pickBestCustomerMatch(results, opts = {}) {
 }
 
 /**
+ * One Primus shipping-location search with a single retry on empty/error.
+ * Transient Primus blips otherwise leave real customers (e.g. LPBS) unmatched.
+ * @param {object} query searchShippingLocations opts.
+ * @return {Promise<Array<object>>}
+ */
+async function searchShippingLocationsWithRetry(query) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await searchShippingLocations(query);
+      const rows = (res && res.results) || [];
+      if (rows.length) return rows;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) continue;
+      throw err;
+    }
+  }
+  if (lastErr) throw lastErr;
+  return [];
+}
+
+/**
  * Resolves Primus customer id (shipping location) for rate shop.
  * @param {object} opts from, customerRef, customerName, searchTerms[].
  * @return {Promise<object|null>} {id, name, code, customer}
@@ -1088,8 +1152,9 @@ async function resolveCustomerForQuote(opts = {}) {
   if (email.includes("@")) {
     const domain = email.split("@")[1] || "";
     // Never search Primus using the mailbox local-part (gershon@… →
-    // "Gerson"). Company domains may contribute their org stem.
-    if (domain && !customerNameUtil.isFreemailDomain(domain)) {
+    // "Gerson"). Skip freemail + Innovative broker domains — those are
+    // not the RFQ customer (quotes@innovativecarriers.com → no stem).
+    if (domain && !customerNameUtil.isNonCustomerEmailDomain(domain)) {
       const stem = customerNameUtil.registrableOrgStem(domain) ||
         domain.split(".")[0];
       if (stem && stem.length > 2 &&
@@ -1102,7 +1167,7 @@ async function resolveCustomerForQuote(opts = {}) {
   const domainMatch = from.match(/@([\w.-]+)/);
   if (domainMatch) {
     const host = domainMatch[1];
-    if (host && !customerNameUtil.isFreemailDomain(host)) {
+    if (host && !customerNameUtil.isNonCustomerEmailDomain(host)) {
       const stem = customerNameUtil.registrableOrgStem(host) ||
         host.split(".")[0];
       if (stem && stem.length > 2 &&
@@ -1113,6 +1178,12 @@ async function resolveCustomerForQuote(opts = {}) {
   }
 
   for (const term of opts.searchTerms || []) {
+    // Drop broker self-name stems that leak in from internal From.
+    if (customerNameUtil.isInternalBrokerBrandName(term) &&
+        customerNameUtil.isNonCustomerEmailDomain(
+            (email.split("@")[1] || ""))) {
+      continue;
+    }
     addSearch(term);
   }
 
@@ -1122,34 +1193,71 @@ async function resolveCustomerForQuote(opts = {}) {
     customerName: opts.customerName || opts.name || "",
   };
 
+  /**
+   * @param {Array<object>} results Primus rows.
+   * @param {string} term Search term used.
+   * @param {Array<string>} searchesTried Accumulator.
+   * @return {object|null}
+   */
+  const packMatch = (results, term, searchesTried) => {
+    const best = pickBestCustomerMatch(results, matchOpts);
+    if (!best || !best.id) return null;
+    return {
+      id: String(best.id),
+      name: best.name || null,
+      code: best.code || null,
+      customer: best.customer === true,
+      email: best.email || null,
+      remarks: best.remarks != null ? String(best.remarks) : null,
+      searchTerm: term,
+      searchesTried,
+    };
+  };
+
   const searchesTried = [];
   for (const term of searches) {
     searchesTried.push(term);
     try {
-      const res = await searchShippingLocations({
+      const rows = await searchShippingLocationsWithRetry({
         name: term,
         limit: 10,
         active: true,
         isCustomer: true,
       });
-      const best = pickBestCustomerMatch(res.results, matchOpts);
-      if (best && best.id) {
-        return {
-          id: String(best.id),
-          name: best.name || null,
-          code: best.code || null,
-          customer: best.customer === true,
-          email: best.email || null,
-          remarks: best.remarks != null ? String(best.remarks) : null,
-          searchTerm: term,
-          searchesTried,
-        };
-      }
+      const hit = packMatch(rows, term, searchesTried);
+      if (hit) return hit;
     } catch (err) {
       console.warn("resolveCustomerForQuote search failed", term,
           err && err.message);
     }
   }
+
+  // Some Primus profiles exist as shipping locations but are not flagged
+  // isCustomer (Greenbeam led, Ibuy). When a real name was supplied, retry
+  // without the customer filter and still require a strong name match.
+  const wantName = String(opts.customerName || opts.name || "").trim();
+  if (wantName &&
+      !customerNameUtil.isUnusableCustomerName(wantName, from)) {
+    for (const term of searches) {
+      try {
+        const rows = await searchShippingLocationsWithRetry({
+          name: term,
+          limit: 10,
+          active: true,
+          customersOnly: false,
+        });
+        const hit = packMatch(rows, term, searchesTried);
+        if (hit) {
+          hit.matchedNonCustomerLocation = hit.customer !== true;
+          return hit;
+        }
+      } catch (err) {
+        console.warn("resolveCustomerForQuote broad search failed", term,
+            err && err.message);
+      }
+    }
+  }
+
   return {id: null, name: null, searchesTried};
 }
 

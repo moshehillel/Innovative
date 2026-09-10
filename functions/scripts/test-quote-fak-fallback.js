@@ -250,6 +250,24 @@ async function withStubbedRates(fn) {
   rateShop.setFetchFakPricingImplForTest(null);
   rateShop.clearFakPricingLiveCacheForTest();
 
+  // Customer-name expand + match helpers (FAK depends on correct Primus id).
+  check("expandCustomerSearchTerms adds & variants",
+      rateShop.expandCustomerSearchTerms("B&C Industries")
+          .some((t) => /B & C Industries/i.test(t)), true);
+  check("expandCustomerSearchTerms adds distinctive token",
+      rateShop.expandCustomerSearchTerms("Greenbeam LED")
+          .some((t) => /^greenbeam$/i.test(t)), true);
+  check("pickBest matches Greenbeam LED → Greenbeam led",
+      !!(rateShop.pickBestCustomerMatch([{
+        id: 1864432496,
+        name: "Greenbeam led ",
+        customer: false,
+      }], {customerName: "Greenbeam LED"})), true);
+  check("pickBest rejects unrelated when wantName set",
+      rateShop.pickBestCustomerMatch([{
+        id: 1, name: "Other Corp", customer: true,
+      }], {customerName: "Greenbeam LED"}), null);
+
   if (failures) {
     console.error(`\n${failures} assertion(s) failed`);
     process.exit(1);
