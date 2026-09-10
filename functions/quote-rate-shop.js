@@ -92,6 +92,93 @@ async function primusFetch(path, opts = {}) {
   return json;
 }
 
+/** Max chars kept for dispatcher/email carrier notes (all distinct parts). */
+const CARRIER_NOTE_MAX_CHARS = 2000;
+
+/**
+ * Flattens one Primus note field into raw string parts.
+ * Handles arrays, JSON-encoded arrays, and {message|text|note} objects.
+ * @param {*} value Raw field value.
+ * @return {Array<string>}
+ */
+function flattenNoteFieldParts(value) {
+  if (value == null || value === "") return [];
+  if (Array.isArray(value)) {
+    return value.flatMap((part) => flattenNoteFieldParts(part));
+  }
+  if (typeof value === "object") {
+    const nested = value.message != null ? value.message :
+      (value.text != null ? value.text :
+        (value.note != null ? value.note :
+          (value.warning != null ? value.warning : null)));
+    if (nested != null) return flattenNoteFieldParts(nested);
+    return [];
+  }
+  let text = String(value).trim();
+  if (!text) return [];
+  // Primus sometimes stores warnings as a JSON array string.
+  if (text.charAt(0) === "[") {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return flattenNoteFieldParts(parsed);
+    } catch (_) {
+      // keep as plain text
+    }
+  }
+  return [text];
+}
+
+/**
+ * Merges all Primus carrier note/warning fields into one cleaned string.
+ * Must union fields — using || drops system notes (e.g. accessorial
+ * limits) that live beside rateRemarks carrier copy.
+ * @param {object} r Raw Primus rate row.
+ * @return {string}
+ */
+function collectCarrierNotes(r) {
+  if (!r || typeof r !== "object") return "";
+  const rawParts = [
+    ...flattenNoteFieldParts(r.warnings),
+    ...flattenNoteFieldParts(r.rateRemarks),
+    ...flattenNoteFieldParts(r.notes),
+    ...flattenNoteFieldParts(r.notesExternal),
+    ...flattenNoteFieldParts(r.carrierNote),
+    ...flattenNoteFieldParts(r.carrierNotes),
+    ...flattenNoteFieldParts(r.warningsActual),
+  ];
+  const seen = new Set();
+  const cleaned = [];
+  for (const part of rawParts) {
+    const text = quoteOutput.cleanCarrierNote(part);
+    if (!text) continue;
+    const key = text.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    cleaned.push(text);
+  }
+  if (!cleaned.length) return "";
+  let joined = cleaned.join(" ");
+  if (joined.length <= CARRIER_NOTE_MAX_CHARS) return joined;
+  // Prefer keeping every distinct note; trim longest tails if needed.
+  const budget = CARRIER_NOTE_MAX_CHARS;
+  const out = [];
+  let used = 0;
+  for (let i = 0; i < cleaned.length; i++) {
+    const sep = out.length ? 1 : 0;
+    const remainingNotes = cleaned.length - i;
+    const minReserve = Math.max(0, (remainingNotes - 1) * 24);
+    const room = budget - used - sep - minReserve;
+    if (room <= 0) break;
+    let piece = cleaned[i];
+    if (piece.length > room) {
+      piece = piece.slice(0, Math.max(12, room - 1)).trimEnd() + "…";
+    }
+    out.push(piece);
+    used += sep + piece.length;
+  }
+  return out.join(" ");
+}
+
 /**
  * Normalizes one rate row from Primus API response.
  * Keeps only dispatcher-facing fields — Primus returns large nested
@@ -100,17 +187,7 @@ async function primusFetch(path, opts = {}) {
  * @return {object}
  */
 function normalizeRateRow(r) {
-  const remarks = Array.isArray(r.rateRemarks) ?
-    r.rateRemarks.join(" ") :
-    (r.rateRemarks || "");
-  const extraNotes = [
-    r.notes,
-    r.notesExternal,
-    r.carrierNote,
-    r.carrierNotes,
-  ].filter(Boolean).join(" ");
-  const rawWarnings = r.warnings || remarks || extraNotes || "";
-  const warnings = quoteOutput.cleanCarrierNote(rawWarnings);
+  const warnings = collectCarrierNotes(r);
   const guaranteed =
     r.guaranteed === true ||
     String(r.rateType || "").toUpperCase() === "GUARANTEED";
@@ -133,7 +210,7 @@ function normalizeRateRow(r) {
     rateId,
     vendorId: r.vendorId || null,
     billTo,
-    warnings: String(warnings || "").slice(0, 500),
+    warnings,
     guaranteed,
   };
 }
@@ -1885,6 +1962,8 @@ module.exports = {
   filterBlockedCarriers,
   pickTopOptions,
   normalizeRateRow,
+  collectCarrierNotes,
+  CARRIER_NOTE_MAX_CHARS,
   parseRatesFromResponse,
   parseNoRatesFromResponse,
   summarizeNoRateErrors,

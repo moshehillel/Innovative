@@ -2075,7 +2075,7 @@
       const note = cleanNote(input);
       if (!note) return "";
       return "<div class='carrier-note'><strong>Carrier note:</strong> " +
-        esc(note.slice(0, 400)) + "</div>";
+        esc(note.slice(0, 2000)) + "</div>";
     }
 
     function selectedCarrierNotesHtml(lane) {
@@ -2092,7 +2092,7 @@
         if (!note) return;
         const label = opt.name || opt.SCAC || "Carrier";
         lines.push("<div class='carrier-note'><strong>" + esc(label) +
-          ":</strong> " + esc(note.slice(0, 400)) + "</div>");
+          ":</strong> " + esc(note.slice(0, 2000)) + "</div>");
       });
       return lines.join("");
     }

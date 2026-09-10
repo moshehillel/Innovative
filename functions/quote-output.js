@@ -382,7 +382,24 @@ function buildSelectedCarrierNoteLines(lanes, extraRules) {
  */
 function customerNoteFromOption(opt) {
   if (!opt || typeof opt !== "object") return "";
-  return cleanCarrierNote(opt.warnings || opt.rateRemarks);
+  // Prefer already-merged warnings from normalizeRateRow; fall back to
+  // joining leftover Primus fields for older stored options.
+  if (opt.warnings) return cleanCarrierNote(opt.warnings);
+  const parts = [opt.rateRemarks, opt.notes, opt.notesExternal,
+    opt.carrierNote, opt.carrierNotes]
+      .flatMap((v) => Array.isArray(v) ? v : (v == null ? [] : [v]))
+      .map((v) => cleanCarrierNote(v))
+      .filter(Boolean);
+  if (!parts.length) return "";
+  const seen = new Set();
+  const uniq = [];
+  for (const p of parts) {
+    const key = p.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniq.push(p);
+  }
+  return uniq.join(" ");
 }
 
 /**
@@ -678,10 +695,10 @@ function serializeForDispatcherPage(quote) {
       rateSource: lane.rateSource || quote.rateSource || null,
       extractionWarnings: lane.extractionWarnings || [],
       options: (lane.options || []).map((o) => {
-        const warningText = cleanCarrierNote(o.warnings || o.rateRemarks);
-        // UI truncates notes to ~400 chars; trim payload for multi-rate lanes.
+        const warningText = customerNoteFromOption(o);
+        // Keep room for multi-note Primus remarks (accessorial + carrier copy).
         const warnings = warningText ?
-          warningText.slice(0, 500) : null;
+          warningText.slice(0, 2000) : null;
         const quoteNumber = o.quoteNumber || o.savedQuoteNumber || null;
         return {
           rateId: optionRateId(o),

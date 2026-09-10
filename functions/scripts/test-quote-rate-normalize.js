@@ -308,6 +308,75 @@ check("slim drops nested junk", slim.hugeNested, undefined);
 check("slim billTo total only",
     JSON.stringify(slim.billTo), "{\"total\":3397.22}");
 
+// Carrier notes: merge ALL Primus fields (do not OR-drop rateRemarks).
+const bestOvernite = rateShop.normalizeRateRow({
+  id: "Rbo1",
+  name: "Best Overnite",
+  SCAC: "BOEX",
+  total: 494.57,
+  transitDays: 4,
+  warnings:
+    "Rates expire after 48 hours. Does NOT deliver to: Amazon, Walmart, " +
+    "Nordstrom, or Menards in Eau Claire, WI. Limited access fees are not " +
+    "included in the quote. An additional $35 fee will apply for limited " +
+    "access deliveries. Please notate the Quote ID number on each bill of " +
+    "lading to ensure proper pricing.",
+  rateRemarks: [
+    "<b>Only the first 1 accessorials were applied.</b>",
+  ],
+});
+check(
+    "merges warnings + rateRemarks accessorial note",
+    bestOvernite.warnings.includes("Only the first 1 accessorials were applied."),
+    true,
+);
+check(
+    "keeps carrier delivery restriction note",
+    bestOvernite.warnings.includes("Does NOT deliver to: Amazon"),
+    true,
+);
+check(
+    "keeps BOL quote-id note",
+    bestOvernite.warnings.includes("Please notate the Quote ID"),
+    true,
+);
+
+const jsonWarnings = rateShop.normalizeRateRow({
+  id: "Rj1",
+  name: "X",
+  warnings: JSON.stringify([
+    "Rates expire after 48 hours.",
+    "Only the first 1 accessorials were applied.",
+  ]),
+  rateRemarks: ["Does NOT deliver to: Menards."],
+});
+check(
+    "parses JSON warnings array string",
+    jsonWarnings.warnings.includes("Only the first 1 accessorials were applied.") &&
+    jsonWarnings.warnings.includes("Does NOT deliver to: Menards."),
+    true,
+);
+
+const longParts = [];
+for (let i = 0; i < 8; i++) {
+  longParts.push(
+      `Note ${i}: ` + ("x".repeat(180)) + ` end-${i}-marker`);
+}
+const longMerged = rateShop.collectCarrierNotes({
+  warnings: longParts[0],
+  rateRemarks: longParts.slice(1),
+});
+check(
+    "long multi-note keeps first and last markers",
+    longMerged.includes("end-0-marker") && longMerged.includes("end-7-marker"),
+    true,
+);
+check(
+    "long multi-note stays within max",
+    longMerged.length <= rateShop.CARRIER_NOTE_MAX_CHARS,
+    true,
+);
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
