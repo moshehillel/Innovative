@@ -1,9 +1,9 @@
 /**
- * Drayage invoice intake — Primus vendor type for the invoice carrier name.
- * Container # is metadata only, never a route trigger. Sender email / freemail
- * domains are never used to pick the Primus vendor (customers forward invoices).
- * Inbound → forward to Leo; Leo returns instructions → process per email
- * (never forward Leo returns back to Leo). Missing fields → email Lisa.
+ * Drayage invoice intake — Primus vendor type for the invoice carrier name
+ * ONLY. Email text ("drayage invoice"), container #s, Loup/UP/intermodal
+ * wording, and sender domains never route to Leo. Container # is metadata
+ * only. Inbound → forward to Leo; Leo returns instructions → process per
+ * email (never forward Leo returns back to Leo). Missing fields → email Lisa.
  */
 "use strict";
 
@@ -135,7 +135,8 @@ async function lookupPrimusVendorByCarrierName(carrierName) {
     }
     return await bridge.lookupVendorByCarrierHint({
       carrierName: name,
-      // Intentionally omit fromEmail — freemail/customer domains mis-route.
+      // Name only — never From domain (Loup/up.com, gmail forwards, etc.).
+      nameOnly: true,
     });
   } catch (_) {
     return null;

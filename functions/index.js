@@ -5620,8 +5620,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "alphanumeric key — NOT the broker Primus load number.",
         "containerNumber is the intermodal/ocean container ID when labeled " +
         "Container #, Container No, CNTR, Unit #, or similar. ISO format is " +
-        "4 letters + 7 digits (e.g. MSCU1234567). ONLY drayage invoices " +
-        "have a container number — leave empty for truckload/LTL freight.",
+        "4 letters + 7 digits (e.g. MSCU1234567). Container numbers appear on " +
+        "intermodal/rail bills too — they do NOT mean the invoice is drayage. " +
+        "Leave empty when no container field is shown.",
         "proNumber is ONLY when the invoice labels PRO #, Carrier PRO, " +
         "Beyond PRO, Advance PRO, or (LTL only) freight bill number. " +
         "Leave proNumber empty when no PRO / freight bill field is shown " +

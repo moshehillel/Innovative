@@ -3619,18 +3619,36 @@ function extractEmailFromFromHeader(from) {
 }
 
 /**
+ * Strips legal suffixes / punctuation so "Foo Transport LLC" ≈ "Foo Transport".
+ * @param {string|null|undefined} value Raw vendor/carrier name.
+ * @return {string}
+ */
+function normalizeVendorNameKey(value) {
+  return String(value || "")
+      .toLowerCase()
+      .replace(/[.,'"`]/g, " ")
+      .replace(/\b(llc|inc|incorporated|corp|corporation|co|ltd|limited|company)\b/g,
+          " ")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
  * Picks a vendor row by invoice carrier name and/or sender email domain.
  * @param {Array<object>} vendors Parsed getVendors list.
- * @param {object} hints carrierName, emailDomain.
+ * @param {object} hints carrierName, emailDomain, nameOnly.
  * @return {object|null}
  */
 function findVendorByCarrierHint(vendors, hints = {}) {
   const carrierName = String(hints.carrierName || "").trim();
   const emailDomain = String(hints.emailDomain || "").trim().toLowerCase();
+  const nameOnly = !!hints.nameOnly;
   if (carrierName) {
     const byName = findMasterVendorByName(vendors, carrierName);
     if (byName) return byName;
   }
+  // Drayage / name-only callers must never fall back to sender domain.
+  if (nameOnly) return null;
   // Freemail / consumer domains must never match a vendor — invoice forwards
   // often come from customers (e.g. gmail), not the carrier.
   const freemail = new Set([
@@ -3652,14 +3670,17 @@ function findVendorByCarrierHint(vendors, hints = {}) {
  * Looks up a Primus master vendor by invoice carrier name and/or sender email.
  * Used for drayage classification via vendor.type (e.g. DRAYAGE).
  *
- * @param {object} hints carrierName, fromEmail/from.
+ * @param {object} hints carrierName, fromEmail/from, nameOnly.
+ *   When nameOnly is true: ignore From email and skip unscoped vendor paging
+ *   (drayage must not match via up.com / gmail / random short name substrings).
  * @return {Promise<object|null>} {id, name, type, vendorEmail} or null.
  */
 async function lookupVendorByCarrierHint(hints = {}) {
   if (!isManagePhpEnabled()) return null;
 
   const carrierName = String(hints.carrierName || "").trim();
-  const fromEmail = extractEmailFromFromHeader(
+  const nameOnly = !!hints.nameOnly;
+  const fromEmail = nameOnly ? "" : extractEmailFromFromHeader(
       hints.fromEmail || hints.from || "",
   );
   const emailDomain = normalizeEmailDomain(fromEmail);
@@ -3688,7 +3709,9 @@ async function lookupVendorByCarrierHint(hints = {}) {
       }
     }
     if (!anyNew) return {done: true, match: null};
-    const match = findVendorByCarrierHint(vendors, {carrierName, emailDomain});
+    const match = findVendorByCarrierHint(vendors, {
+      carrierName, emailDomain, nameOnly,
+    });
     return {done: false, match: match || null};
   };
 
@@ -3700,6 +3723,9 @@ async function lookupVendorByCarrierHint(hints = {}) {
       if (out.match) return out.match;
     }
   }
+
+  // nameOnly (drayage): never page the whole vendor list or match by email.
+  if (nameOnly) return null;
 
   for (let page = 0; page < maxPages; page++) {
     const out = await tryPage(page * 25, null);
@@ -3732,6 +3758,26 @@ function pickVendorByNameHint(vendors, hint) {
 }
 
 /**
+ * Meaningful containment: reject short substrings like "King" matching
+ * "Golden King Transport" (which previously mis-routed invoices to a random
+ * DRAYAGE vendor during unscoped getVendors paging).
+ * @param {string} a Normalized name a.
+ * @param {string} b Normalized name b.
+ * @return {boolean}
+ */
+function vendorNamesMeaningfullyOverlap(a, b) {
+  const left = String(a || "").trim().toLowerCase();
+  const right = String(b || "").trim().toLowerCase();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length <= right.length ? right : left;
+  if (shorter.length < 8) return false;
+  if (shorter.length < longer.length * 0.5) return false;
+  return longer.includes(shorter);
+}
+
+/**
  * Strict name match for master vendor lookup (no fallback to vendors[0]).
  * @param {Array<object>} vendors Parsed getVendors list.
  * @param {string} hint Carrier name.
@@ -3741,13 +3787,19 @@ function findMasterVendorByName(vendors, hint) {
   const query = String(hint || "").trim();
   if (!query || !vendors.length) return null;
   const queryLower = query.toLowerCase();
+  const queryKey = normalizeVendorNameKey(query);
   const firstToken = query.split(/[,\n/]/)[0].trim().toLowerCase();
   return vendors.find((v) => (v.name || "").toLowerCase() === queryLower) ||
+    vendors.find((v) => {
+      const key = normalizeVendorNameKey(v.name);
+      return queryKey && key && key === queryKey;
+    }) ||
     vendors.find((v) => (v.name || "").toLowerCase() === firstToken) ||
     vendors.find((v) => {
       const n = (v.name || "").toLowerCase();
-      return firstToken.length >= 6 &&
-        (n.includes(firstToken) || firstToken.includes(n));
+      const nKey = normalizeVendorNameKey(v.name);
+      return vendorNamesMeaningfullyOverlap(firstToken, n) ||
+        vendorNamesMeaningfullyOverlap(queryKey, nKey);
     }) ||
     null;
 }
@@ -4695,6 +4747,9 @@ exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
 exports.removeInsurancePremiumFromLoad = removeInsurancePremiumFromLoad;
 exports.resolveInsuranceVendor = resolveInsuranceVendor;
 exports.lookupVendorByCarrierHint = lookupVendorByCarrierHint;
+exports.findMasterVendorByName = findMasterVendorByName;
+exports.normalizeVendorNameKey = normalizeVendorNameKey;
+exports.vendorNamesMeaningfullyOverlap = vendorNamesMeaningfullyOverlap;
 exports.isClosedPriorInsuranceBill = isClosedPriorInsuranceBill;
 exports.ensureDraftInvoiceForInsurance = ensureDraftInvoiceForInsurance;
 

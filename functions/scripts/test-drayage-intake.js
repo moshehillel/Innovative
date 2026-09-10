@@ -2,6 +2,7 @@
 "use strict";
 
 const dray = require("../drayage-intake");
+const bridge = require("../primus-ui-bridge");
 
 let failures = 0;
 const check = (name, got, exp) => {
@@ -59,6 +60,24 @@ check("carrier name from invoice items",
         [{carrierName: "Saia Motor Freight Line, LLC"}]),
     "Saia Motor Freight Line, LLC");
 
+// Loose substring "King" / "Transport" must NOT steal Golden King matches.
+check("short King does not match Golden King Transport",
+    (bridge.findMasterVendorByName(
+        [{id: "1", name: "King", type: "DRAYAGE"}],
+        "Golden King Transport") || {}).id || null,
+    null);
+check("exact Golden King wins over short King on same page",
+    (bridge.findMasterVendorByName([
+      {id: "1", name: "King", type: "DRAYAGE"},
+      {id: "2", name: "Golden King Transport", type: "Truckload"},
+    ], "Golden King Transport") || {}).id,
+    "2");
+check("LLC suffix still matches Golden King",
+    (bridge.findMasterVendorByName(
+        [{id: "2", name: "Golden King Transport LLC", type: "Truckload"}],
+        "Golden King Transport") || {}).id,
+    "2");
+
 // Container alone never returns a routing container anymore.
 check("Mark Evans inbound container alone does not route",
     dray.resolveInboundDrayageContainer(
@@ -89,6 +108,72 @@ async function runAsyncChecks() {
   check("Loup ORIGINAL BILL not drayage", loupSignal.isDrayage, false);
   check("Loup still extracts container metadata",
       loupSignal.containerNumber, "MSCU1234567");
+
+  // Regression: Jerry Leo template wording + container + Loup/UP From must NOT
+  // force drayage when Primus vendor profile for the invoice carrier is not.
+  // (User's EMHU642757 is 6 digits / non-ISO — use a valid ISO id for metadata.)
+  const goldenKingSignal = await dray.resolveInboundDrayageSignal({
+    from: "Loup <loupintermodalops@up.com>",
+    invoiceItems: [{
+      carrierName: "Golden King Transport",
+      containerNumber: "EMHU6427571",
+      invoiceAmount: 1200,
+    }],
+    probedContainer: "EMHU6427571",
+    subject: "FW: Loup - ORIGINAL BILL",
+    body: "See attached — drayage invoice. (Container #: EMHU6427571)\n" +
+      "Carrier on invoice: Golden King Transport",
+    lookupVendor: async (name) => {
+      if (/golden\s*king/i.test(name || "")) {
+        return {
+          id: "gk1",
+          name: "Golden King Transport",
+          type: "Truckload",
+        };
+      }
+      // Would be wrong if From domain / Loup matched instead of carrier name.
+      return {id: "loup", name: "Loup Intermodal", type: "DRAYAGE"};
+    },
+  });
+  check("Golden King + drayage wording + container not drayage",
+      goldenKingSignal.isDrayage, false);
+  check("Golden King still keeps container metadata",
+      goldenKingSignal.containerNumber, "EMHU6427571");
+  check("Golden King carrier name preserved",
+      goldenKingSignal.carrierName, "Golden King Transport");
+
+  const goldenKingShortCntr = await dray.resolveInboundDrayageSignal({
+    from: "Loup <loupintermodalops@up.com>",
+    invoiceItems: [{
+      carrierName: "Golden King Transport",
+      containerNumber: "EMHU642757",
+    }],
+    subject: "Loup - ORIGINAL BILL",
+    body: "See attached — drayage invoice. (Container #: EMHU642757)",
+    lookupVendor: async () =>
+      ({id: "gk1", name: "Golden King Transport", type: "Truckload"}),
+  });
+  check("non-ISO EMHU642757 does not force drayage",
+      goldenKingShortCntr.isDrayage, false);
+
+  const goldenKingDrayage = await dray.resolveInboundDrayageSignal({
+    from: "Loup <loupintermodalops@up.com>",
+    invoiceItems: [{
+      carrierName: "Golden King Transport",
+      containerNumber: "EMHU6427571",
+    }],
+    subject: "Loup - ORIGINAL BILL",
+    body: "See attached — drayage invoice.",
+    lookupVendor: async (name) => ({
+      id: "gk-dray",
+      name: name,
+      type: "DRAYAGE",
+    }),
+  });
+  check("Golden King Primus DRAYAGE profile is drayage",
+      goldenKingDrayage.isDrayage, true);
+  check("Golden King drayage reason cites Primus vendor",
+      /Primus vendor/i.test(goldenKingDrayage.reason || ""), true);
 
   const containerOnlySignal = await dray.resolveInboundDrayageSignal({
     from: "Billing@unknowncarrier.com",
