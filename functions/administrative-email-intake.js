@@ -1046,8 +1046,12 @@ function isPaymentInquiryEmail(subject, from, body) {
   if (/outstanding\s+payment\s+reminder/i.test(subStripped)) return true;
   if (/outstanding\s+invoices?/i.test(subStripped)) return true;
   if (/expected\s+payment\s+date/i.test(subStripped)) return true;
-  if (/payment\s+reminder/i.test(subStripped) &&
-      /outstanding|overdue|past\s+due/i.test(subStripped)) return true;
+  // HaulPay / factor AR: "Payment Reminder for Invoices Due"
+  if (/payment\s+reminder/i.test(subStripped)) return true;
+  if (/invoices?\s+due\b/i.test(subStripped) &&
+      /\b(?:payment|pay|remit|past\s+due|overdue)\b/i.test(hay)) {
+    return true;
+  }
   if (subjectLooksLikeLoadNumberReply(sub) &&
       bodyLooksLikeLoadPaymentFollowUp(body)) {
     return true;
@@ -1593,6 +1597,15 @@ function hasInvoiceVeto(signals = {}) {
   // quotes an Invoice # / BOL # from the thread that triggered the reply.
   if (isInternalTeamAutoReply(subject, from, body, headers) ||
       isOutOfOfficeAutoReply(subject, from, body)) {
+    return false;
+  }
+
+  // Payment request/reminder with Abe already on To/Cc — quiet ignore,
+  // never invoice-veto to Moshe (no freight PDF).
+  if (isAbeCopiedOnEmailHeaders(headers) &&
+      isPaymentInquiryEmail(subject, from, body) &&
+      !(Number(invoicePdfCount) > 0) &&
+      !attachmentsIncludePdfLike(attachments)) {
     return false;
   }
 

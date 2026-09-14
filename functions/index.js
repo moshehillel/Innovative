@@ -8459,6 +8459,21 @@ async function processGmailMessage(
           return;
         }
 
+        // Payment request/reminder (e.g. HaulPay) with no freight PDF.
+        // Abe already on To/Cc → quiet ignore; otherwise reply → Abe.
+        if (!administrativeEmailIntake.attachmentsIncludePdfLike(attachments) &&
+            administrativeEmailIntake.shouldHandlePaymentInquiry(
+                subject, from, emailBody, 0)) {
+          await handlePaymentInquiryEmail({
+            gmail, messageId, subject, from, emailBody, tenant, headers,
+            emailClassification,
+            queueDocId,
+            reason:
+              "Carrier/factor payment request — no freight invoice PDF",
+          });
+          return;
+        }
+
         if (emailClassification.intent === "insurance_premium") {
           try {
             const resolved =
@@ -8877,6 +8892,7 @@ async function processGmailMessage(
             subject,
             body: emailBody,
             attachments,
+            headers,
             emailClassification,
           })) {
           await handlePaymentInquiryEmail({
@@ -9532,6 +9548,7 @@ async function processGmailMessage(
             subject,
             body: emailBody,
             attachments,
+            headers,
             emailClassification,
             invoicePdfCount,
           })) {

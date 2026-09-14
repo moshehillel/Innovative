@@ -419,6 +419,55 @@ check("Fleetex body-only outstanding invoices + expected payment date",
         fleetexFrom,
         fleetexBody));
 
+const haulpaySubject = "Payment Reminder for Invoices Due";
+const haulpayFrom = "Abdul Hadee <ar@haulpay.io>";
+const haulpayBody =
+  "Please update payment status for invoices due or past terms and " +
+  "confirm paperwork received.";
+const haulpayAtt = [
+  {
+    filename: "09-11-26 AR Report (1).xlsx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  },
+];
+check("HaulPay Payment Reminder subject alone is payment inquiry",
+    adm.isPaymentInquiryEmail(haulpaySubject, haulpayFrom, ""));
+check("HaulPay payment reminder handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        haulpaySubject, haulpayFrom, haulpayBody, 0));
+check("HaulPay XLSX-only does not invoice-veto when Abe is on To",
+    !adm.hasInvoiceVeto({
+      subject: haulpaySubject,
+      body: haulpayBody,
+      from: haulpayFrom,
+      attachments: haulpayAtt,
+      headers: [
+        {
+          name: "To",
+          value:
+            "Abe <abe@innovativecarriers.com>, " +
+            "Innovative Accounting <accounting@innovativecarriers.com>",
+        },
+      ],
+      emailClassification: {intent: "carrier_invoice", confidence: "high"},
+      invoicePdfCount: 0,
+    }));
+check("HaulPay Abe on To is detected for ignore",
+    adm.isAbeCopiedOnEmailHeaders([
+      {name: "To", value:
+        "Abe <abe@innovativecarriers.com>, " +
+        "Innovative Accounting <accounting@innovativecarriers.com>"},
+    ]));
+check("HaulPay Abe on Cc is detected for ignore",
+    adm.isAbeCopiedOnEmailHeaders([
+      {
+        name: "To",
+        value: "Innovative Accounting <accounting@innovativecarriers.com>",
+      },
+      {name: "Cc", value: "Abe Goldberger <abe@innovativecarriers.com>"},
+    ]));
+
 const fleetexReSubject = "RE: Outstanding Payment Reminder";
 const fleetexLisaBody =
   "following up on outstanding invoices totaling $7,225, " +
