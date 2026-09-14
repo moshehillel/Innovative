@@ -327,16 +327,17 @@ function hasAutoReplyHeaders(headers) {
  * @param {string} body Plain body.
  * @return {boolean}
  */
-function isOutOfOfficeAutoReply(subject, from, body) {
+function isOutOfOfficeAutoReply(subject, from, body, headers) {
   void from;
   const sub = String(subject || "").trim();
   const subL = sub.toLowerCase();
   const bodyL = String(body || "").toLowerCase();
-  if (!subL && !bodyL.trim()) return false;
+  if (!subL && !bodyL.trim() && !hasAutoReplyHeaders(headers)) return false;
 
   // Strong auto-reply subject prefixes always win — even when the rest of
   // the subject quotes "Invoice #… for BOL #…" from the original thread
   // (Exchange/Outlook: "Automatic reply: Invoice #29558 for BOL #266916").
+  // Internal and external senders alike — Invoice/BOL must never veto this.
   const subjectPatterns = [
     /^out of office\b/i,
     /^automatic reply\b/i,
@@ -350,6 +351,10 @@ function isOutOfOfficeAutoReply(subject, from, body) {
     /\b(?:away|out)\s+message\b/i,
   ];
   if (subjectPatterns.some((re) => re.test(sub))) return true;
+
+  // RFC/Exchange auto-reply headers (external or internal) — still OOO even
+  // when subject is a bare "Re: Invoice #… for BOL #…" reply title.
+  if (hasAutoReplyHeaders(headers)) return true;
 
   // Real invoice/BOL threads that merely mention someone is away are not OOO.
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
@@ -400,7 +405,7 @@ function isOutOfOfficeAutoReply(subject, from, body) {
 function isInternalTeamAutoReply(subject, from, body, headers) {
   if (!isInternalInnovativeSender(from)) return false;
 
-  if (isOutOfOfficeAutoReply(subject, from, body)) return true;
+  if (isOutOfOfficeAutoReply(subject, from, body, headers)) return true;
 
   const sub = String(subject || "").trim();
   // Outlook/Exchange often uses "Auto:" for internal mailbox auto-replies.
@@ -638,9 +643,19 @@ function bodyLooksLikeCustomerPaidNotice(body) {
     /\bwired\s+(?:funds|money|\$)/,
     /\bach\s+(?:payment\s+)?(?:was\s+)?(?:sent|made|completed|submitted)\b/,
     /\b(?:payment|invoice)\s+(?:has\s+been|was)\s+paid\b/,
+    // "Invoice #29414 for BOL #266781 has been paid."
+    /\bhas\s+been\s+paid\b/,
+    /\bwas\s+paid\b/,
+    /\bpayment\s+received\b/,
+    /\bconfirm(?:s|ing|ed)?\s+(?:that\s+)?(?:(?:the|this|our)\s+)?(?:invoice|payment|bol)\b.{0,80}\bpaid\b/,
+    /\bconfirm(?:s|ing|ed)?\s+(?:that\s+)?(?:it|invoice|payment)\s+has\s+been\s+paid\b/,
+    /\bzelle\s+payment\s+receipt\b/,
+    /\b(?:payment\s+)?receipt\s+(?:is\s+)?attached\b/,
+    /\battached\s+(?:is\s+)?(?:(?:the|a|our|my)\s+)?(?:zelle\s+)?(?:payment\s+)?receipt\b/,
     /\bproof\s+of\s+payment\b/,
     /\bpayment\s+confirmation\b/,
     /\bwire\s+confirmation\b/,
+    /\bconfirming\s+(?:the\s+)?payment\b/,
     /\bpay(?:s)?(?:\s+\w+){0,2}\s+directly\b/,
     /\bpaid?\s+(?:directly\s+)?(?:upon|at|on)\s+pick(?:\s+|-)?up\b/,
     /\b(?:front|fron)\s+and\s+back\b/,
@@ -648,6 +663,83 @@ function bodyLooksLikeCustomerPaidNotice(body) {
     /\bcheck\s+(?:as\s+)?proof\b/,
   ];
   return patterns.some((re) => re.test(top));
+}
+
+/**
+ * Customer is disputing / questioning an invoice — never quiet-ignore.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeInvoiceDisputeOrQuestion(body) {
+  const top = topOfThreadBody(body).toLowerCase();
+  if (!top.trim()) return false;
+  const patterns = [
+    /\bdisput(?:e|ing)\b/,
+    /\bincorrect\s+(?:amount|invoice|charge|rate)\b/,
+    /\bwrong\s+(?:amount|invoice|charge|rate)\b/,
+    /\bovercharg(?:e|ed|ing)\b/,
+    /\b(?:was\s+)?not\s+paid\b/,
+    /\bnever\s+paid\b/,
+    /\bdid\s+not\s+(?:receive|get)\s+(?:the\s+)?(?:invoice|bol|payment)\b/,
+    /\bwhy\s+(?:was|is|are|did)\b/,
+    /\bplease\s+explain\b/,
+    /\bwhat\s+is\s+this\s+(?:charge|invoice|amount)\b/,
+    /\bquestion\s+about\s+(?:this\s+)?(?:invoice|charge|amount|bol)\b/,
+  ];
+  return patterns.some((re) => re.test(top));
+}
+
+/**
+ * Quiet-ignore: customer reply on our Invoice #… for BOL #… thread that only
+ * confirms the invoice was paid / attaches a Zelle (or similar) payment
+ * receipt — no freight bill to enter, no Lisa ACTION REQUIRED.
+ * Moshe: simple receipt-on-invoice-thread wins over remittance→Abe.
+ * Full remittance-advice / check# / payment-date subjects still go to Abe.
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function isCustomerInvoicePaidConfirmation(
+    subject, from, body, attachments) {
+  if (isCarrierOrFactorSender(from)) return false;
+  if (isOutOfOfficeAutoReply(subject, from, body)) return false;
+
+  const addr = emailAddressFromHeader(from);
+  if (addr.endsWith("@innovativecarriers.com") ||
+      addr.endsWith("@innovativechb.com")) {
+    return false;
+  }
+
+  // Dedicated remittance packages still route to Abe.
+  if (subjectLooksLikeRemittanceAdvice(subject)) return false;
+  if (subjectLooksLikeCustomerPaymentDate(subject)) return false;
+  if (subjectLooksLikeCustomerCheckNumber(subject)) return false;
+  if (subjectLooksLikeCustomerPaymentNotice(subject)) return false;
+
+  if (!subjectLooksLikeInvoiceForBolReply(subject)) return false;
+  if (bodyLooksLikeInvoiceDisputeOrQuestion(body)) return false;
+  if (!bodyLooksLikeCustomerPaidNotice(body)) return false;
+
+  const list = Array.isArray(attachments) ? attachments : [];
+  if (list.some((a) => attachmentFilenameLooksLikeInvoice(a.filename))) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function shouldQuietIgnoreCustomerPaidConfirmation(
+    subject, from, body, attachments) {
+  return isCustomerInvoicePaidConfirmation(
+      subject, from, body, attachments);
 }
 
 /**
@@ -688,11 +780,10 @@ function isCustomerPaymentRemittanceEmail(subject, from, body) {
   if (subjectLooksLikeRemittanceAdvice(subject)) return true;
   if (subjectLooksLikeCustomerPaymentNotice(subject)) return true;
 
-  // Customer reply on "Invoice for BOL#" saying they paid → Abe (not ignore
-  // as bank alert, not process as freight invoice).
-  if (subjectLooksLikeInvoiceForBolReply(subject) &&
-      bodyLooksLikeCustomerPaidNotice(body)) {
-    return true;
+  // Simple "Invoice #… for BOL #… has been paid" / Zelle receipt confirmations
+  // are quiet-ignored (Moshe) — not forwarded to Abe as remittance.
+  if (isCustomerInvoicePaidConfirmation(subject, from, body, [])) {
+    return false;
   }
 
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
@@ -1593,10 +1684,17 @@ function hasInvoiceVeto(signals = {}) {
     return false;
   }
 
+  // Paid confirmations on Invoice/BOL threads are quiet-ignore — never
+  // invoice-veto to Lisa/Moshe (no freight PDF to enter).
+  if (isCustomerInvoicePaidConfirmation(
+      subject, from, body, attachments)) {
+    return false;
+  }
+
   // OOO / internal-team auto-replies are always ignore — even when subject
   // quotes an Invoice # / BOL # from the thread that triggered the reply.
   if (isInternalTeamAutoReply(subject, from, body, headers) ||
-      isOutOfOfficeAutoReply(subject, from, body)) {
+      isOutOfOfficeAutoReply(subject, from, body, headers)) {
     return false;
   }
 
@@ -1715,11 +1813,20 @@ function evaluateAdministrativeIgnore(
       status: "internal_auto_reply_ignored",
     };
   }
-  if (isOutOfOfficeAutoReply(subject, from, body)) {
+  if (isOutOfOfficeAutoReply(subject, from, body, headers)) {
     return {
       ignore: true,
       reason: "Out of office auto-reply — no action needed",
       status: "out_of_office_ignored",
+    };
+  }
+  if (isCustomerInvoicePaidConfirmation(
+      subject, from, body, attachments)) {
+    return {
+      ignore: true,
+      reason:
+        "Customer paid confirmation on invoice/BOL thread — no action needed",
+      status: "customer_paid_confirmation_ignored",
     };
   }
   if (shouldIgnoreAsPaymentReceipt(subject, from, body, attachments)) {
@@ -1771,6 +1878,9 @@ module.exports = {
   subjectLooksLikeCustomerPaymentNotice,
   subjectLooksLikeInvoiceForBolReply,
   bodyLooksLikeCustomerPaidNotice,
+  bodyLooksLikeInvoiceDisputeOrQuestion,
+  isCustomerInvoicePaidConfirmation,
+  shouldQuietIgnoreCustomerPaidConfirmation,
   subjectLooksLikeMcNumberNoa,
   isCustomerPaymentRemittanceEmail,
   shouldHandleCustomerPaymentRemittance,

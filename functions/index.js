@@ -4244,6 +4244,25 @@ async function completeAdministrativeIgnore(args) {
 }
 
 /**
+ * Statuses that must never be blocked by invoice/BOL subject veto.
+ * External Automatic reply on Invoice #… for BOL #… threads previously
+ * leaked to Lisa when hasInvoiceVeto ran after evaluateAdministrativeIgnore.
+ * @param {string|null|undefined} status Ignore status from evaluate.
+ * @return {boolean}
+ */
+function administrativeIgnoreBypassesInvoiceVeto(status) {
+  const s = String(status || "");
+  return s === "out_of_office_ignored" ||
+    s === "internal_auto_reply_ignored" ||
+    s === "customer_paid_confirmation_ignored" ||
+    s === "cardknox_ignored" ||
+    s === "emodal_broadcast_ignored" ||
+    s === "amex_merchant_survey_ignored" ||
+    s === "dnb_promotional_ignored" ||
+    s === "coface_ignored";
+}
+
+/**
  * Forwards an email to the human review address with context notes.
  * @param {object} gmail - Authenticated Gmail client.
  * @param {string} messageId - Original Gmail message ID.
@@ -8390,6 +8409,29 @@ async function processGmailMessage(
         return;
       }
 
+      // Quiet-ignore OOO / paid-confirm / Cardknox etc. BEFORE attachment
+      // classification so Invoice #… for BOL #… subjects never fall through
+      // to Lisa ACTION REQUIRED (invoice veto must not block these).
+      if (!isTai) {
+        const earlyAdminIgnore =
+          administrativeEmailIntake.evaluateAdministrativeIgnore(
+              subject, from, emailBody, attachments, headers);
+        if (earlyAdminIgnore.ignore &&
+            administrativeIgnoreBypassesInvoiceVeto(
+                earlyAdminIgnore.status)) {
+          await completeAdministrativeIgnore({
+            messageId,
+            subject,
+            from,
+            tenant,
+            queueDocId,
+            finalStatus: earlyAdminIgnore.status,
+            reason: earlyAdminIgnore.reason,
+          });
+          return;
+        }
+      }
+
       let emailClassification = {
         intent: "unknown",
         confidence: "low",
@@ -8826,7 +8868,10 @@ async function processGmailMessage(
         const adminIgnore =
           administrativeEmailIntake.evaluateAdministrativeIgnore(
               subject, from, emailBody, attachments, headers);
+        const bypassVeto = administrativeIgnoreBypassesInvoiceVeto(
+            adminIgnore.status);
         if (adminIgnore.ignore &&
+          (bypassVeto ||
           !administrativeEmailIntake.hasInvoiceVeto({
             subject,
             body: emailBody,
@@ -8834,7 +8879,7 @@ async function processGmailMessage(
             attachments,
             headers,
             emailClassification,
-          })) {
+          }))) {
           await completeAdministrativeIgnore({
             messageId,
             subject,

@@ -193,6 +193,8 @@ function buildIntakeSummary(data) {
       internal_auto_reply_ignored:
         "Ignored — internal team automatic reply",
       out_of_office_ignored: "Ignored — out of office auto-reply",
+      customer_paid_confirmation_ignored:
+        "Ignored — customer paid confirmation on invoice/BOL thread",
       noa_ignored: "Ignored — notice of assignment, no invoice",
       carrier_portal_notification_ignored:
         "Ignored — carrier open-invoice portal (link only)",

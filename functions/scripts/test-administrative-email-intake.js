@@ -168,6 +168,36 @@ check("Automatic reply + Invoice/BOL is not blocked by invoice veto",
       attachments: [],
       invoicePdfCount: 0,
     }));
+check("Gemini Sound external Automatic reply on Invoice/BOL is OOO",
+    adm.evaluateAdministrativeIgnore(
+        "Automatic reply: Invoice #29729 for BOL #265909",
+        "Nataliya Mosk <NataliyaM@geminisound.com>",
+        "Thank you for your email. I am currently out of the office " +
+        "and will respond when I return.",
+        []).status === "out_of_office_ignored");
+check("Gemini Sound Automatic reply not blocked by invoice veto",
+    !adm.hasInvoiceVeto({
+      subject: "Automatic reply: Invoice #29729 for BOL #265909",
+      body: "I am currently out of the office until next week.",
+      from: "Nataliya Mosk <NataliyaM@geminisound.com>",
+      attachments: [{filename: "image001.png", mimeType: "image/png"}],
+      emailClassification: {intent: "carrier_invoice"},
+      invoicePdfCount: 0,
+    }));
+check("External Auto-Submitted header on Invoice/BOL is OOO",
+    adm.isOutOfOfficeAutoReply(
+        "Re: Invoice #29729 for BOL #265909",
+        "Nataliya Mosk <NataliyaM@geminisound.com>",
+        "Thanks for your message.",
+        [{name: "Auto-Submitted", value: "auto-replied"}]));
+check("External Auto-Submitted evaluate quiet-ignores",
+    adm.evaluateAdministrativeIgnore(
+        "Re: Invoice #29729 for BOL #265909",
+        "Nataliya Mosk <NataliyaM@geminisound.com>",
+        "Thanks for your message.",
+        [],
+        [{name: "Auto-Submitted", value: "auto-replied"}])
+        .status === "out_of_office_ignored");
 
 // Internal Innovative team auto-replies (Moshe: ignore) vs normal human mail.
 const internalOooFrom = "Lisa <lisa@innovativecarriers.com>";
@@ -1160,16 +1190,20 @@ check("looksLikeInvoiceEmailContent accepts EXTERNAL BOL reply",
         "RE: [EXTERNAL]Invoice #28301 for BOL #265467", ""));
 check("AltaReb paid notice in top-of-thread detected",
     adm.bodyLooksLikeCustomerPaidNotice(altarebBody));
-check("AltaReb remittance reply detected → Abe",
-    adm.isCustomerPaymentRemittanceEmail(
-        altarebSubject, altarebFrom, altarebBody));
-check("AltaReb should handle customer remittance",
-    adm.shouldHandleCustomerPaymentRemittance(
+check("AltaReb paid confirm quiet-ignored (not remittance→Abe)",
+    adm.evaluateAdministrativeIgnore(
+        altarebSubject, altarebFrom, altarebBody, []).status ===
+    "customer_paid_confirmation_ignored");
+check("AltaReb is customer paid confirmation",
+    adm.isCustomerInvoicePaidConfirmation(
+        altarebSubject, altarebFrom, altarebBody, []));
+check("AltaReb is NOT remittance (quiet-ignore wins)",
+    !adm.isCustomerPaymentRemittanceEmail(
         altarebSubject, altarebFrom, altarebBody));
 check("AltaReb not ignored as payment_notification (BoA-only)",
     !adm.shouldIgnoreAsPaymentNotification(
         altarebSubject, altarebFrom, altarebBody, []));
-check("AltaReb remittance does not invoice-veto",
+check("AltaReb paid confirm does not invoice-veto",
     !adm.hasInvoiceVeto({
       subject: altarebSubject,
       body: altarebBody,
@@ -1245,13 +1279,17 @@ check("Veneto Invoice # for BOL reply subject recognized",
     adm.subjectLooksLikeInvoiceForBolReply(venetoSubject));
 check("Veneto check-photo proof of payment detected",
     adm.bodyLooksLikeCustomerPaidNotice(venetoBody));
-check("Veneto remittance reply detected → Abe",
-    adm.isCustomerPaymentRemittanceEmail(
+check("Veneto paid confirm quiet-ignored (not remittance→Abe)",
+    adm.evaluateAdministrativeIgnore(
+        venetoSubject, venetoFrom, venetoBody, []).status ===
+    "customer_paid_confirmation_ignored");
+check("Veneto is customer paid confirmation",
+    adm.isCustomerInvoicePaidConfirmation(
+        venetoSubject, venetoFrom, venetoBody, []));
+check("Veneto is NOT remittance (quiet-ignore wins)",
+    !adm.isCustomerPaymentRemittanceEmail(
         venetoSubject, venetoFrom, venetoBody));
-check("Veneto should handle customer remittance",
-    adm.shouldHandleCustomerPaymentRemittance(
-        venetoSubject, venetoFrom, venetoBody));
-check("Veneto remittance does not invoice-veto",
+check("Veneto paid confirm does not invoice-veto",
     !adm.hasInvoiceVeto({
       subject: venetoSubject,
       body: venetoBody,
@@ -1260,6 +1298,119 @@ check("Veneto remittance does not invoice-veto",
       emailClassification: {intent: "unknown"},
       invoicePdfCount: 0,
     }));
+
+// Best Seller — "has been paid" confirmation (Moshe: quiet-ignore).
+const bestSellerSubject = "Re: Invoice #29414 for BOL #266781";
+const bestSellerFrom = "Best Seller Accounting <faigy@bestsellerus.com>";
+const bestSellerBody =
+  "Best Seller Accounting confirms that Invoice #29414 for BOL #266781 " +
+  "has been paid.\n\nThank you.";
+const bestSellerAtt = [
+  {filename: "image001.png", mimeType: "image/png"},
+];
+check("Best Seller has-been-paid body detected",
+    adm.bodyLooksLikeCustomerPaidNotice(bestSellerBody));
+check("Best Seller paid confirmation detected",
+    adm.isCustomerInvoicePaidConfirmation(
+        bestSellerSubject, bestSellerFrom, bestSellerBody, bestSellerAtt));
+check("Best Seller evaluate quiet-ignores paid confirm",
+    adm.evaluateAdministrativeIgnore(
+        bestSellerSubject, bestSellerFrom, bestSellerBody, bestSellerAtt)
+        .status === "customer_paid_confirmation_ignored");
+check("Best Seller not remittance→Abe",
+    !adm.isCustomerPaymentRemittanceEmail(
+        bestSellerSubject, bestSellerFrom, bestSellerBody));
+check("Best Seller not blocked by invoice veto",
+    !adm.hasInvoiceVeto({
+      subject: bestSellerSubject,
+      body: bestSellerBody,
+      from: bestSellerFrom,
+      attachments: bestSellerAtt,
+      emailClassification: {intent: "unknown"},
+      invoicePdfCount: 0,
+    }));
+
+// isaacchd — Zelle payment receipt on Invoice/BOL thread (Moshe: ignore).
+const isaacSubject = "Re: Invoice #29477 for BOL #267246";
+const isaacFrom = "isaac <isaacchd@gmail.com>";
+const isaacBody =
+  "Hi, the Zelle payment receipt is attached for Invoice #29477 / " +
+  "BOL #267246 confirming payment.\n\nThanks,\nIsaac";
+const isaacAtt = [
+  {filename: "zelle_receipt.pdf", mimeType: "application/pdf"},
+];
+check("isaac Zelle receipt body is paid notice",
+    adm.bodyLooksLikeCustomerPaidNotice(isaacBody));
+check("isaac Zelle receipt is paid confirmation",
+    adm.isCustomerInvoicePaidConfirmation(
+        isaacSubject, isaacFrom, isaacBody, isaacAtt));
+check("isaac evaluate quiet-ignores Zelle receipt confirm",
+    adm.evaluateAdministrativeIgnore(
+        isaacSubject, isaacFrom, isaacBody, isaacAtt)
+        .status === "customer_paid_confirmation_ignored");
+check("isaac Zelle receipt not remittance→Abe",
+    !adm.isCustomerPaymentRemittanceEmail(
+        isaacSubject, isaacFrom, isaacBody));
+check("isaac not blocked by invoice veto",
+    !adm.hasInvoiceVeto({
+      subject: isaacSubject,
+      body: isaacBody,
+      from: isaacFrom,
+      attachments: isaacAtt,
+      emailClassification: {intent: "unknown"},
+      invoicePdfCount: 0,
+    }));
+
+// Dispute / question on Invoice/BOL must NOT silent-ignore.
+const disputeSubject = "Re: Invoice #29414 for BOL #266781";
+const disputeFrom = "AP <ap@customer.com>";
+const disputeBody =
+  "Hi, why was I charged this amount? The invoice looks incorrect " +
+  "and we dispute the rate. Please explain.";
+check("Invoice/BOL dispute is NOT paid confirmation",
+    !adm.isCustomerInvoicePaidConfirmation(
+        disputeSubject, disputeFrom, disputeBody, []));
+check("Invoice/BOL dispute not quiet-ignored",
+    !adm.evaluateAdministrativeIgnore(
+        disputeSubject, disputeFrom, disputeBody, []).ignore);
+check("Invoice/BOL dispute still has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: disputeSubject,
+      body: disputeBody,
+      from: disputeFrom,
+      attachments: [],
+    }));
+
+// Real freight invoice on Invoice/BOL thread must still process.
+check("Freight invoice PDF on Invoice/BOL is NOT paid confirmation",
+    !adm.isCustomerInvoicePaidConfirmation(
+        "Re: Invoice #29414 for BOL #266781",
+        "Carrier Billing <billing@carrier.com>",
+        "Please see attached invoice for this load.",
+        [{filename: "Invoice_29414.pdf", mimeType: "application/pdf"}]));
+check("Carrier freight invoice still has invoice veto",
+    adm.hasInvoiceVeto({
+      subject: "Invoice #99101 for BOL #266000",
+      body: "Please process the attached carrier invoice.",
+      from: "Billing <billing@abf.com>",
+      attachments: [
+        {filename: "carrier_invoice.pdf", mimeType: "application/pdf"},
+      ],
+      invoicePdfCount: 1,
+    }));
+
+// Remittance Advice with wire details still → Abe (not quiet-ignore).
+check("Remittance Advice subject still remittance→Abe",
+    adm.isCustomerPaymentRemittanceEmail(
+        "Remittance Advice #1557",
+        "AP <ap@customer.com>",
+        "Please find remittance advice. Wire confirmation attached."));
+check("Remittance Advice not quiet-ignored as paid confirm",
+    !adm.isCustomerInvoicePaidConfirmation(
+        "Remittance Advice #1557",
+        "AP <ap@customer.com>",
+        "Please find remittance advice. Wire confirmation attached.",
+        [{filename: "wire.pdf", mimeType: "application/pdf"}]));
 
 const sandersSubject = "CK 6706";
 const sandersFrom = "Accounts Payable <ap@sanderscollection.com>";

@@ -976,6 +976,8 @@ const IGNORE_CATEGORY_LABELS = {
   coface_ignored: "Coface newsletter/marketing",
   internal_auto_reply_ignored: "Internal team automatic reply",
   out_of_office_ignored: "Out of office auto-reply",
+  customer_paid_confirmation_ignored:
+    "Customer paid confirmation (invoice/BOL)",
   noa_ignored: "Notice of assignment (NOA)",
   carrier_portal_notification_ignored: "Carrier open-invoice portal",
   credit_agency_notification_ignored: "Credit-agency / trade-credit alert",
