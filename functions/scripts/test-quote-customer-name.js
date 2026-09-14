@@ -59,15 +59,24 @@ check("innovativecarriers.com is internal broker domain",
 check("quotes@innovativecarriers.com → no domain customerName",
     customerName.customerNameFromEmailDomain(
         "Innovative Quotes <quotes@innovativecarriers.com>"), "");
+check("Innovative Carriers unusable on external From",
+    customerName.isUnusableCustomerName(
+        "Innovative Carriers", "buyer@acme.com"), true);
 check("Innovativecarriers unusable on internal From",
     customerName.isUnusableCustomerName(
         "Innovativecarriers", "quotes@innovativecarriers.com"), true);
-check("Innovative Carriers usable on external From",
-    customerName.isUnusableCustomerName(
-        "Innovative Carriers", "buyer@acme.com"), false);
 check("pick skips Innovativecarriers on internal From",
     customerName.pickUsableCustomerName(
         "aron@innovativecarriers.com", "Innovativecarriers"), "");
+check("pick skips Innovative Carriers, keeps shipper",
+    customerName.pickUsableCustomerName(
+        "quotes@innovativecarriers.com",
+        "Innovative Carriers",
+        "Sanders Collection"), "Sanders Collection");
+check("pick skips Innovative Carriers on external From",
+    customerName.pickUsableCustomerName(
+        "buyer@acme.com", "Innovative Carriers", "Sanders Collection"),
+    "Sanders Collection");
 
 const cleared = customerName.sanitizeExtractedCustomerName({
   customerName: "Gerson",

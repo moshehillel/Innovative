@@ -82,7 +82,14 @@ async function resolveCustomerMatch(opts) {
   }
   if (/menards/i.test(hay)) searchTerms.push("menards");
   if (/sleeptone|sanders/i.test(hay)) {
-    searchTerms.push("sanders", "sleeptone");
+    // When bill-to is missing/broker-junk but shipper/ref says Sanders,
+    // search Sanders first so protocol/FAK attach (not Innovative Carriers).
+    if (!customerName || /sleeptone|sanders/i.test(customerName)) {
+      searchTerms.unshift(
+          "Sanders Collection", "sanders", "sleeptone");
+    } else {
+      searchTerms.push("sanders", "sleeptone");
+    }
   }
   if (/ruelily/i.test(hay)) searchTerms.push("ruelily");
   if (/ctadigital|petra/i.test(hay)) {
@@ -90,6 +97,12 @@ async function resolveCustomerMatch(opts) {
   }
   if (/coreforce|isnetusa|lifeworks/i.test(hay)) {
     searchTerms.push("coreforce", "lifeworks");
+  }
+  // Drop broker self-name from search — never bill-to for an RFQ.
+  for (let i = searchTerms.length - 1; i >= 0; i--) {
+    if (customerNameUtil.isInternalBrokerBrandName(searchTerms[i])) {
+      searchTerms.splice(i, 1);
+    }
   }
   // Sender rule customer name is authoritative — search it first.
   // protocolOnly: match only that customer (no shipper/ref heuristics).

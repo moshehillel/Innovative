@@ -1071,18 +1071,23 @@ function pickBestCustomerMatch(results, opts = {}) {
   const ref = String(opts.customerRef || "").toLowerCase();
   const wantName = normalizeCustomerName(
       opts.customerName || opts.name || "");
+  const usable = (row) => row &&
+    !customerNameUtil.isInternalBrokerBrandName(row.name);
 
   if (wantName) {
     for (const row of results) {
+      if (!usable(row)) continue;
       if (normalizeCustomerName(row.name) === wantName) return row;
     }
     for (const row of results) {
+      if (!usable(row)) continue;
       const name = normalizeCustomerName(row.name);
       if (name && (name.includes(wantName) || wantName.includes(name))) {
         return row;
       }
     }
     for (const row of results) {
+      if (!usable(row)) continue;
       if (customerNamesShareDistinctiveToken(wantName, row.name)) {
         return row;
       }
@@ -1090,19 +1095,22 @@ function pickBestCustomerMatch(results, opts = {}) {
   }
 
   for (const row of results) {
+    if (!usable(row)) continue;
     const email = String(row.email || "").toLowerCase();
     if (email && from.includes(email)) return row;
   }
   // Name-driven search: do not pick an unrelated customer:true hit.
   if (wantName) return null;
   for (const row of results) {
+    if (!usable(row)) continue;
     if (row.customer === true) return row;
   }
   for (const row of results) {
+    if (!usable(row)) continue;
     const name = String(row.name || "").toLowerCase();
     if (name && (from.includes(name) || ref.includes(name))) return row;
   }
-  return results[0];
+  return results.find(usable) || null;
 }
 
 /**
@@ -1146,8 +1154,13 @@ async function resolveCustomerForQuote(opts = {}) {
     }
   };
 
-  // Dispatcher-entered customer name is the strongest signal.
-  addSearch(opts.customerName || opts.name || "");
+  // Dispatcher-entered customer name is the strongest signal — but never
+  // the Innovative broker brand (that Primus location is us, not the RFQ).
+  const wantCustomerName = String(opts.customerName || opts.name || "").trim();
+  if (wantCustomerName &&
+      !customerNameUtil.isInternalBrokerBrandName(wantCustomerName)) {
+    addSearch(wantCustomerName);
+  }
 
   if (email.includes("@")) {
     const domain = email.split("@")[1] || "";
@@ -1158,7 +1171,8 @@ async function resolveCustomerForQuote(opts = {}) {
       const stem = customerNameUtil.registrableOrgStem(domain) ||
         domain.split(".")[0];
       if (stem && stem.length > 2 &&
-          !customerNameUtil.isFreemailBrandName(stem)) {
+          !customerNameUtil.isFreemailBrandName(stem) &&
+          !customerNameUtil.isInternalBrokerBrandName(stem)) {
         addSearch(stem);
       }
     }
@@ -1171,19 +1185,16 @@ async function resolveCustomerForQuote(opts = {}) {
       const stem = customerNameUtil.registrableOrgStem(host) ||
         host.split(".")[0];
       if (stem && stem.length > 2 &&
-          !customerNameUtil.isFreemailBrandName(stem)) {
+          !customerNameUtil.isFreemailBrandName(stem) &&
+          !customerNameUtil.isInternalBrokerBrandName(stem)) {
         addSearch(stem);
       }
     }
   }
 
   for (const term of opts.searchTerms || []) {
-    // Drop broker self-name stems that leak in from internal From.
-    if (customerNameUtil.isInternalBrokerBrandName(term) &&
-        customerNameUtil.isNonCustomerEmailDomain(
-            (email.split("@")[1] || ""))) {
-      continue;
-    }
+    // Never search / match the broker's own Primus customer profile.
+    if (customerNameUtil.isInternalBrokerBrandName(term)) continue;
     addSearch(term);
   }
 

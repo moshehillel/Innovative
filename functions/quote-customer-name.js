@@ -304,11 +304,10 @@ function isUnusableCustomerName(name, fromOrEmail) {
   if (!s) return true;
   if (isFreemailBrandName(s)) return true;
   if (isNameFromEmailLocalPart(s, fromOrEmail)) return true;
-  // "Innovativecarriers" from our own mailbox domain is never the bill-to.
-  if (isInternalBrokerBrandName(s)) {
-    const {domain} = parseSenderEmail(fromOrEmail);
-    if (!domain || isInternalCompanyDomain(domain)) return true;
-  }
+  // Broker self-name is never the RFQ bill-to — even on an external From
+  // (AI/signature often injects "Innovative Carriers" and would otherwise
+  // short-circuit Primus lookup before the real shipper/customer).
+  if (isInternalBrokerBrandName(s)) return true;
   return false;
 }
 
