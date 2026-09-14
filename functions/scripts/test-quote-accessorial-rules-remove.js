@@ -123,6 +123,67 @@ const out4 = quoteRules.applyRulesToLane(
     {});
 checkTrue("inactive remove leaves NTD", out4.accessorials.includes("NTD"));
 
+// --- Never-add-insurance: synthetic insuranceRequested flag ---
+const neverIns = {
+  id: "never_add_insurance",
+  active: true,
+  priority: 40,
+  name: "Never add insurance to quotes",
+  identifyVia: "ai",
+  match: {flags: ["insuranceRequested"]},
+  addAccessorials: [],
+  removeAccessorials: ["INS"],
+  applyTo: "dest",
+};
+
+const insLane = {
+  consignee: {name: "Acme", address: "1 Main"},
+  shipper: {},
+  specialInstructions: "Please include insurance",
+  flags: {},
+  siteType: null,
+  // No enrichmentMeta — identifyVia ai must still match synthetic flags.
+  accessorials: ["INS", "LFD"],
+  accessorialsWithData: [{code: "INS"}, {code: "LFD"}],
+};
+const outIns = quoteRules.applyRulesToLane(insLane, [neverIns], {
+  emailBody: "Need cargo insurance on this shipment",
+});
+checkTrue("never-ins removes INS with identifyVia ai + no enrichment",
+    !outIns.accessorials.includes("INS"));
+checkTrue("never-ins keeps LFD", outIns.accessorials.includes("LFD"));
+checkTrue("never-ins records applied rule",
+    (outIns.appliedRules || []).some((r) =>
+      r.ruleId === "never_add_insurance"));
+
+const insLaneCodesOnly = {
+  ...insLane,
+  specialInstructions: "",
+  accessorials: ["INS"],
+  accessorialsWithData: [{code: "INS"}],
+};
+const outIns2 = quoteRules.applyRulesToLane(insLaneCodesOnly, [neverIns], {});
+checkTrue("never-ins matches when INS already on lane (no email text)",
+    !outIns2.accessorials.includes("INS"));
+
+// Email merge re-adds INS → applyRemoveAccessorialRules strips again.
+const afterEmail = {
+  accessorials: ["INS", "LFD"],
+  accessorialsWithData: [{code: "INS"}, {code: "LFD"}],
+  appliedRules: [{ruleId: "email_requested", name: "Requested in email"}],
+};
+const stripped = quoteRules.applyRemoveAccessorialRules(
+    {consignee: {name: "Acme"}, specialInstructions: "insurance please"},
+    afterEmail,
+    [neverIns],
+    {emailBody: "insurance please"});
+checkTrue("post-email remove strips re-added INS",
+    !stripped.accessorials.includes("INS") &&
+    stripped.accessorials.includes("LFD"));
+checkTrue("post-email remove records never_add_insurance",
+    (stripped.appliedRules || []).some((r) =>
+      r.ruleId === "never_add_insurance"));
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);

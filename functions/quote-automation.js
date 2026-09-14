@@ -832,6 +832,10 @@ async function rateLane(lane, ctx) {
         rulesOut.accessorials || []);
     rulesOut = quoteEmailAcc.applyDeclinedAccessorials(
         rulesOut, emailText, declinedCodes);
+    // Email-requested codes merge after applyRulesToLane and would
+    // re-add suppressed accessorials (e.g. INS). Re-apply removes.
+    rulesOut = quoteRules.applyRemoveAccessorialRules(
+        laneForRate, rulesOut, ctx.rules, extractCtx);
   }
   const mergedLane = {
     ...laneForRate,

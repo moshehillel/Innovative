@@ -33,6 +33,24 @@ const DEST_TO_ORIGIN_ACCESSORIAL = {
 };
 
 /**
+ * Chat/UI "request flags" that are never written onto lane.flags by intake.
+ * Runtime treats them as true when the mapped accessorial is present, the
+ * email/instructions mention the service, or lane.flags[flag] is set.
+ * (insuranceRequested was stored Active but never matched — INS stayed on
+ * the Primus rate and Redkik failed with "Commodity is required (53)".)
+ */
+const SYNTHETIC_REQUEST_FLAGS = {
+  insuranceRequested: {
+    codes: ["INS"],
+    textRe: /\binsurance\b/i,
+  },
+  appointmentRequired: {
+    codes: ["APD", "APO"],
+    textRe: /\bappointments?\b|\bappt(\s+required)?\b/i,
+  },
+};
+
+/**
  * Default rule ids whose addAccessorials / name / notes are force-synced
  * from DEFAULT_RULES on load (overrides stale Firestore seed values).
  */
@@ -843,6 +861,70 @@ function flagFromEmail(lane, flag, side = "dest") {
 }
 
 /**
+ * @param {string} flag Flag key.
+ * @return {boolean}
+ */
+function isSyntheticRequestFlag(flag) {
+  return Object.prototype.hasOwnProperty.call(
+      SYNTHETIC_REQUEST_FLAGS, String(flag || ""));
+}
+
+/**
+ * True when a chat/UI request flag should fire for this lane.
+ * @param {object} lane Lane.
+ * @param {object} context Email / extract context.
+ * @param {string} flag Flag key (e.g. insuranceRequested).
+ * @return {boolean}
+ */
+function requestFlagMatches(lane, context, flag) {
+  const key = String(flag || "");
+  if (!key) return false;
+  const flags = (lane && lane.flags) || {};
+  if (flags[key]) return true;
+  const def = SYNTHETIC_REQUEST_FLAGS[key];
+  if (!def) return false;
+  const codes = new Set();
+  for (const c of (lane && lane.accessorials) || []) {
+    codes.add(String(c || "").toUpperCase());
+  }
+  const requested = lane && lane.customerRequest &&
+    Array.isArray(lane.customerRequest.requestedAccessorials) ?
+    lane.customerRequest.requestedAccessorials : [];
+  for (const c of requested) codes.add(String(c || "").toUpperCase());
+  const ctxReq = context && context.customerRequest &&
+    Array.isArray(context.customerRequest.requestedAccessorials) ?
+    context.customerRequest.requestedAccessorials : [];
+  for (const c of ctxReq) codes.add(String(c || "").toUpperCase());
+  if ((def.codes || []).some((c) => codes.has(String(c).toUpperCase()))) {
+    return true;
+  }
+  if (!def.textRe) return false;
+  const text = [
+    lane && lane.specialInstructions,
+    context && context.specialInstructionsGlobal,
+    context && context.emailBody,
+    context && context.subject,
+    context && context.body,
+  ].filter(Boolean).join(" ");
+  return def.textRe.test(text);
+}
+
+/**
+ * Flag match for rule.match.flags (residential + synthetic request flags).
+ * @param {object} lane Lane.
+ * @param {object} context Context.
+ * @param {string} flag Flag key.
+ * @param {"dest"|"origin"} [side] Side.
+ * @return {boolean}
+ */
+function laneFlagMatches(lane, context, flag, side = "dest") {
+  if (isSyntheticRequestFlag(flag)) {
+    return requestFlagMatches(lane, context, flag);
+  }
+  return flagFromEmail(lane, flag, side);
+}
+
+/**
  * Text-only rule match (email-extracted fields).
  * @param {object} lane Lane with consignee, flags, specialInstructions.
  * @param {object} context Global context (specialInstructionsGlobal).
@@ -913,7 +995,9 @@ function ruleMatchViaText(lane, context, rule, side = "dest") {
     if (containsAny(refs, match.referenceContains)) return "reference";
   }
   if (match.flags && Array.isArray(match.flags)) {
-    if (match.flags.some((f) => flagFromEmail(lane, f, side))) return "flags";
+    if (match.flags.some((f) => laneFlagMatches(lane, context, f, side))) {
+      return "flags";
+    }
   }
   if (match.siteType && getEmailSiteType(lane, side) === match.siteType) {
     // chain_store / amazon APD must not win over "no appointment" / FCFS.
@@ -952,6 +1036,8 @@ function addsOnlyDeclinedAccessorials(lane, context, rule) {
 
 /**
  * AI-only rule match (address classification / enrichment).
+ * Synthetic request flags (insuranceRequested) do not need enrichment —
+ * they are derived from lane accessorials / email text.
  * @param {object} lane Lane with enrichmentMeta.
  * @param {object} context Global context (unused).
  * @param {object} rule Rule document.
@@ -961,6 +1047,16 @@ function addsOnlyDeclinedAccessorials(lane, context, rule) {
 function ruleMatchViaAi(lane, context, rule, side = "dest") {
   const match = rule.match || {};
   if (!Object.keys(match).length) return null;
+
+  // Request flags invented by chat/UI (never written by enrichment).
+  if (match.flags && Array.isArray(match.flags) && match.flags.length) {
+    const onlySynthetic = match.flags.every((f) => isSyntheticRequestFlag(f));
+    if (onlySynthetic &&
+        match.flags.some((f) => requestFlagMatches(lane, context, f))) {
+      return "flags";
+    }
+  }
+
   const meta = side === "origin" ?
     lane.originEnrichmentMeta : lane.enrichmentMeta;
   if (!meta) return null;
@@ -1395,6 +1491,77 @@ function applyRulesToLane(lane, rules, context = {}) {
 }
 
 /**
+ * Re-evaluate matching removeAccessorials after email-requested codes are
+ * merged. Email merge runs after applyRulesToLane and would otherwise
+ * re-add suppressed codes (e.g. INS) that a remove rule already stripped.
+ *
+ * @param {object} lane Lane (pre-merge freight / parties).
+ * @param {object} rulesOut Current accessorials result.
+ * @param {Array<object>} rules Active quote rules.
+ * @param {object} [context] Email / extract context.
+ * @return {object} rulesOut with suppressed codes removed.
+ */
+function applyRemoveAccessorialRules(lane, rulesOut, rules, context = {}) {
+  const out = rulesOut && typeof rulesOut === "object" ? {...rulesOut} : {
+    accessorials: [],
+    accessorialsWithData: [],
+    appliedRules: [],
+    filterCarrierWarnings: [],
+    requiresConfirm: false,
+  };
+  const laneView = {
+    ...(lane && typeof lane === "object" ? lane : {}),
+    accessorials: out.accessorials || [],
+    accessorialsWithData: out.accessorialsWithData || [],
+  };
+  const removeCodes = new Set();
+  const applied = Array.isArray(out.appliedRules) ? [...out.appliedRules] : [];
+  const already = new Set(applied.map((r) => String(r && r.ruleId || "")));
+
+  for (const rule of rules || []) {
+    if (!rule || rule.active === false) continue;
+    if (isSenderCustomerRule(rule)) continue;
+    if (isZipFillRule(rule)) continue;
+    if (isCarrierNoteRule(rule)) continue;
+    const removes = rule.removeAccessorials || [];
+    if (!removes.length) continue;
+    for (const side of ruleSides(rule)) {
+      const via = ruleMatchVia(laneView, context, rule, side);
+      if (!via) continue;
+      accessorialsForSide(removes, side)
+          .forEach((c) => removeCodes.add(String(c)));
+      const rid = String(rule.id || "");
+      if (rid && !already.has(rid)) {
+        already.add(rid);
+        applied.push({
+          ruleId: rid,
+          name: rule.name,
+          notes: rule.notes || null,
+          matchVia: via,
+          identifyVia: normalizeIdentifyVia(rule),
+          applyTo: side,
+          fromEnrichment: false,
+        });
+      }
+    }
+  }
+
+  if (!removeCodes.size) {
+    out.appliedRules = applied;
+    return out;
+  }
+  out.accessorials = (out.accessorials || [])
+      .map(String)
+      .filter((c) => !removeCodes.has(c));
+  out.accessorialsWithData = (out.accessorialsWithData || []).filter((row) => {
+    const c = String(row && row.code || "");
+    return c && !removeCodes.has(c);
+  });
+  out.appliedRules = applied;
+  return out;
+}
+
+/**
  * @param {object} tenant Tenant.
  * @return {Promise<Array<object>>}
  */
@@ -1490,12 +1657,14 @@ module.exports = {
   DEST_TO_ORIGIN_ACCESSORIAL,
   RULE_KIND_SENDER_CUSTOMER,
   RULE_KIND_ZIP_FILL,
+  SYNTHETIC_REQUEST_FLAGS,
   MANAGED_DEFAULT_RULE_IDS,
   RETIRED_DEFAULT_RULE_IDS,
   loadActiveRules,
   seedDefaultRules,
   ensureDefaultRulesPresent,
   applyRulesToLane,
+  applyRemoveAccessorialRules,
   listAllRules,
   upsertRule,
   deleteRule,
