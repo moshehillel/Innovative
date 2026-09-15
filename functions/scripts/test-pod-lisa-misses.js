@@ -1,8 +1,7 @@
 "use strict";
 /**
- * POD detection / extraction regression tests for Lisa's misses:
- * - separate_attachment with page must extract that page (not hold whole file)
- * - last-page fallback when classifier leaves pod.found=false
+ * POD extraction regression: paged separate_attachment must extract that page
+ * (not hold the whole multipage scanned file as missing POD).
  */
 const assert = require("assert");
 const podUtils = require("../pod-utils");
@@ -50,43 +49,6 @@ const noPageSeparate = podUtils.resolvePodDocuments({
 }, {pageCount: 1});
 check("separate_attachment without page stays separate_attachment",
     noPageSeparate.documents[0].source, "separate_attachment");
-
-const miss = podUtils.inferLastPagePodIfMissing(
-    {found: false, documents: []},
-    {
-      pageCount: 4,
-      attachmentFilename: "EML-267378_105455281.pdf",
-      lastPageText: null,
-      invoiceAmount: 1250,
-    });
-check("last-page fallback when classifier missed",
-    !!(miss && miss.found));
-check("last-page fallback uses last_page_of_invoice",
-    miss.documents[0].source, "last_page_of_invoice");
-check("last-page fallback page is last",
-    Number(miss.documents[0].page), 4);
-
-const unsafeLast = podUtils.inferLastPagePodIfMissing(
-    {found: false},
-    {
-      pageCount: 3,
-      attachmentFilename: "bill.pdf",
-      lastPageText: "Amount Due $1250.00 Total Carrier Pay",
-      invoiceAmount: 1250,
-    });
-check("last-page fallback skipped when last page is the bill",
-    unsafeLast, null);
-
-const alreadyFound = podUtils.inferLastPagePodIfMissing(
-    {found: true, documents: [{source: "signed_bol", page: 2}]},
-    {
-      pageCount: 3,
-      attachmentFilename: "x.pdf",
-      lastPageText: null,
-      invoiceAmount: 100,
-    });
-check("last-page fallback skipped when pod already found",
-    alreadyFound, null);
 
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

@@ -14,7 +14,6 @@ const {
   normalizePodFromClassification,
   resolvePodDocuments,
   extractPodDocumentPdfBytes,
-  inferLastPagePodIfMissing,
   parseClassificationResponse,
   normalizeClassificationToInvoices,
   preferRevisedInvoicesForSameLoad,
@@ -5456,14 +5455,13 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Use source 'same_page_as_invoice' ONLY when invoice line items " +
         "are on top and a small signature/stamp block is at the bottom. " +
         "Set pod.cropFromBottom to the bottom fraction (e.g. 0.35).",
-        "Multi-page carrier packets almost always put POD / signed BOL / " +
-        "delivery receipt / trailer delivery photos on the LAST page(s). " +
-        "When the last page shows delivery proof and no invoice Amount Due, " +
-        "set pod.found=true — use 'last_page_of_invoice' or 'signed_bol' / " +
-        "'delivery_receipt' with the page number. Do not leave " +
-        "pod.found=false just because earlier pages are the bill.",
-        "When a SEPARATE PDF has the POD/BOL (often page 2+ of a scanned " +
-        "packet), set source 'separate_attachment' AND the 1-based page " +
+        "Only set pod.found=true when you can SEE delivery proof on a page " +
+        "(signature, received stamp, consignee sign-off, trailer delivery " +
+        "photo). Never invent a POD from a page just because it is last or " +
+        "does not look like the invoice. If no delivery proof is visible, " +
+        "leave pod.found=false.",
+        "When a SEPARATE PDF has the POD/BOL on a specific page of a scanned " +
+        "packet, set source 'separate_attachment' AND the 1-based page " +
         "number of the delivery page.",
         "Keep JSON compact: use empty arrays when a list has no items. " +
         "Do not invent placeholder charge objects. Cap pod.documents " +
@@ -6265,51 +6263,9 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
         // page count enrichment is best-effort
       }
     }
-    let {normalized: podNormalized, documents} = resolvePodDocuments(
+    const {normalized: podNormalized, documents} = resolvePodDocuments(
         rawPod, {pageCount: pageCountHint},
     );
-    if ((!podNormalized || podNormalized.found !== true ||
-        documents.length === 0) && attachments.length > 0) {
-      for (const att of attachments) {
-        if (!att || !att.storagePath) continue;
-        const name = String(att.filename || "").toLowerCase();
-        if (!name.endsWith(".pdf") &&
-            !String(att.mimeType || "").includes("pdf")) {
-          continue;
-        }
-        try {
-          const [fileBuffer] = await getBucket()
-              .file(att.storagePath).download();
-          const loaded = await PDFDocument.load(fileBuffer);
-          const pages = loaded.getPageCount();
-          if (pages < 2) continue;
-          const pageTexts = await extractPdfPageTexts(fileBuffer);
-          const lastText = pageTexts ? pageTexts[pages - 1] : null;
-          const inferred = inferLastPagePodIfMissing(rawPod, {
-            pageCount: pages,
-            attachmentFilename: att.filename,
-            lastPageText: lastText,
-            invoiceAmount: invoice.invoiceAmount,
-          });
-          if (!inferred) continue;
-          const resolved = resolvePodDocuments(inferred, {pageCount: pages});
-          if (resolved.documents.length > 0) {
-            podNormalized = resolved.normalized;
-            documents = resolved.documents;
-            await writeLog("info", "workflow",
-                "POD inferred from last page of multipage packet", {
-                  invoiceId,
-                  loadNumber: invoice && invoice.loadNumber,
-                  attachment: att.filename,
-                  pageCount: pages,
-                });
-            break;
-          }
-        } catch (_) {
-          // best-effort fallback
-        }
-      }
-    }
     if (!invoice || !podNormalized || podNormalized.found !== true ||
         documents.length === 0) {
       const fedexPod = await maybeFetchFedExFreightPod(invoiceId, invoice);
