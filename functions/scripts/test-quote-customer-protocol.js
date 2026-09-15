@@ -80,6 +80,50 @@ test("isFedExRateRow detects common FedEx labels", () => {
   assert.strictEqual(rateShop.isFedExRateRow({name: "XPO"}), false);
 });
 
+test("ensureFedExInOptions restores Economy/Priority cut by top-N", () => {
+  const cheap = [];
+  for (let i = 0; i < 20; i++) {
+    cheap.push({
+      id: `c${i}`, name: `Carrier ${i}`, SCAC: `C${i}`,
+      total: 100 + i, sellRate: 110 + i,
+    });
+  }
+  const economy = {
+    id: "fxnl", name: "FEDEX FREIGHT ECONOMY", SCAC: "FXNL",
+    total: 635, sellRate: 691,
+  };
+  const priority = {
+    id: "fxfe", name: "FEDEX FREIGHT PRIORITY", SCAC: "FXFE",
+    total: 713, sellRate: 769,
+  };
+  const ji = {
+    id: "fxji", name: "FedEx J&I ECONOMY", SCAC: "FXFE",
+    total: 900, sellRate: 1010,
+  };
+  const all = [...cheap, economy, priority, ji];
+  const top = rateShop.pickTopOptions(all, 20, {mode: "cheapest"});
+  assert.strictEqual(top.some((r) => rateShop.isFedExRateRow(r)), false);
+  const ensured = rateShop.ensureFedExInOptions(top, all, {maxAdd: 2});
+  assert.ok(ensured.some((r) => r.SCAC === "FXNL"));
+  assert.ok(ensured.some((r) =>
+    r.SCAC === "FXFE" && /PRIORITY/i.test(r.name)));
+  assert.strictEqual(
+      ensured.some((r) => /J&I/i.test(r.name)), false);
+  assert.ok(ensured.length >= 21);
+});
+
+test("isPreferredFedExRateRow skips Spot and J&I tags", () => {
+  assert.strictEqual(rateShop.isPreferredFedExRateRow({
+    name: "FEDEX FREIGHT ECONOMY", SCAC: "FXNL",
+  }), true);
+  assert.strictEqual(rateShop.isPreferredFedExRateRow({
+    name: "FedEx Freight Spot", SCAC: "FXFE",
+  }), false);
+  assert.strictEqual(rateShop.isPreferredFedExRateRow({
+    name: "FedEx J&I ECONOMY", SCAC: "FXFE",
+  }), false);
+});
+
 if (failed) {
   console.error(`\n${failed} test(s) failed`);
   process.exit(1);

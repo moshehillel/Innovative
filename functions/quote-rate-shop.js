@@ -2057,6 +2057,82 @@ function isFedExRateRow(row) {
   return /fed\s*ex|fxfe|fxnl|fxfr/.test(hay);
 }
 
+/**
+ * Preferred customer-facing FedEx LTL rows (Economy / Priority).
+ * Skips Spot/volume and J&I broker-tagged duplicates.
+ * @param {object|null|undefined} row Rate row.
+ * @return {boolean}
+ */
+function isPreferredFedExRateRow(row) {
+  if (!isFedExRateRow(row)) return false;
+  const name = String(row.name || row.carrierName || "").toLowerCase();
+  if (/spot|volume\s*services/.test(name)) return false;
+  if (/\bj\s*[&\-–—/]|j\s*and\s*i|\bji\s*distribut/.test(name)) return false;
+  const scac = String(row.SCAC || row.scac || "").toUpperCase();
+  return /economy|priority/.test(name) ||
+    scac === "FXNL" || scac === "FXFE";
+}
+
+/**
+ * Force FedEx Freight Economy/Priority into the dispatcher option list.
+ * Primus web shows the full carrier grid; Jerry only keeps the cheapest
+ * N (default 20), which routinely drops FedEx (often rank 40+).
+ * @param {Array<object>} options Already-picked top options.
+ * @param {Array<object>} allTagged Full tagged/priced rate list.
+ * @param {object} [opts] maxAdd.
+ * @return {Array<object>}
+ */
+function ensureFedExInOptions(options, allTagged, opts = {}) {
+  const out = Array.isArray(options) ? [...options] : [];
+  if (out.some(isFedExRateRow)) return out;
+  const pool = (Array.isArray(allTagged) ? allTagged : [])
+      .filter(isPreferredFedExRateRow)
+      .sort((a, b) =>
+        (Number(a.sellRate) || Infinity) - (Number(b.sellRate) || Infinity));
+  const fallback = pool.length ? pool :
+    (Array.isArray(allTagged) ? allTagged : [])
+        .filter((r) => isFedExRateRow(r) &&
+          !/spot|volume\s*services/i.test(String(r.name || "")))
+        .filter((r) =>
+          !/\bj\s*[&\-–—/]|j\s*and\s*i|\bji\s*distribut/i
+              .test(String(r.name || "")))
+        .sort((a, b) =>
+          (Number(a.sellRate) || Infinity) -
+          (Number(b.sellRate) || Infinity));
+  if (!fallback.length) return out;
+
+  const economy = fallback.find((r) =>
+    /economy/i.test(String(r.name || "")) ||
+    String(r.SCAC || r.scac || "").toUpperCase() === "FXNL");
+  const priority = fallback.find((r) =>
+    r !== economy &&
+    (/priority/i.test(String(r.name || "")) ||
+      String(r.SCAC || r.scac || "").toUpperCase() === "FXFE"));
+  const maxAdd = Number(opts.maxAdd) > 0 ? Number(opts.maxAdd) : 2;
+  const add = [economy, priority].filter(Boolean).slice(0, maxAdd);
+  const toAdd = add.length ? add : fallback.slice(0, maxAdd);
+
+  const sameRow = (a, b) => {
+    if (!a || !b) return false;
+    const idA = a.rateId != null ? String(a.rateId) :
+      (a.id != null ? String(a.id) : "");
+    const idB = b.rateId != null ? String(b.rateId) :
+      (b.id != null ? String(b.id) : "");
+    if (idA && idB && idA === idB) return true;
+    return String(a.name || "") === String(b.name || "") &&
+      String(a.SCAC || a.scac || "") === String(b.SCAC || b.scac || "") &&
+      Number(a.total) === Number(b.total);
+  };
+
+  for (const row of toAdd) {
+    if (out.some((o) => sameRow(o, row))) continue;
+    out.push(row);
+  }
+  out.sort((a, b) =>
+    (Number(a.sellRate) || Infinity) - (Number(b.sellRate) || Infinity));
+  return out;
+}
+
 module.exports = {
   init,
   fetchMultipleRates,
@@ -2071,6 +2147,8 @@ module.exports = {
   formatShippingLocationRemarks,
   mergeProtocolRemarksIntoInstructions,
   isFedExRateRow,
+  isPreferredFedExRateRow,
+  ensureFedExInOptions,
   fetchVendorsByCustomer,
   fetchRateTypes,
   searchCostQuotes,
