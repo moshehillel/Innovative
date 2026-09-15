@@ -214,6 +214,24 @@ function normalizePodDocEntry(doc) {
     return doc;
   }
 
+  if (source === "separate_attachment") {
+    const pageN = Number(doc.page);
+    // Paged separate POD packets should extract that page, not the whole file.
+    if (Number.isFinite(pageN) && pageN >= 1) {
+      const looksBol = /\b(bol|bill of lading|load)\b/i.test(context);
+      const upgraded = looksBol ? "signed_bol" : "delivery_receipt";
+      const upgradeNote =
+        `[upgraded separate_attachment p${pageN} → ${upgraded}]`;
+      return {
+        ...doc,
+        source: upgraded,
+        page: Math.floor(pageN),
+        reason: reason ? `${reason} ${upgradeNote}` : upgradeNote.trim(),
+      };
+    }
+    return doc;
+  }
+
   if (POD_PACKAGE_SOURCES.has(source) ||
       source === "last_page_of_invoice") {
     return doc;
@@ -972,6 +990,16 @@ function buildPodClassifierRules(options = {}) {
       "are on top and a small signature/stamp block is at the bottom. " +
       "Set cropFromBottom on that document entry to the bottom fraction " +
       "(e.g. 0.35).",
+      "Multi-page carrier packets almost always put POD / signed BOL / " +
+      "delivery receipt / trailer delivery photos on the LAST page(s). " +
+      "When the last page shows delivery proof (signature, received stamp, " +
+      "trailer photo, consignee sign-off) and no invoice Amount Due, set " +
+      "pod.found=true and include that page — use 'last_page_of_invoice' " +
+      "or 'signed_bol' / 'delivery_receipt' with the page number. " +
+      "Do not leave pod.found=false just because earlier pages are the bill.",
+      "When a SEPARATE PDF attachment contains the POD/BOL (often page 2+ " +
+      "of a scanned packet), set source 'separate_attachment' AND the " +
+      "1-based page number of the delivery page — never omit the page.",
   );
 
   return rules;
@@ -1335,6 +1363,45 @@ function findInvoiceAttachment(attachments, hints) {
   return null;
 }
 
+/**
+ * When the classifier leaves pod.found=false on a multipage carrier packet,
+ * synthesize a last-page POD entry if that page does not look like the bill.
+ * Common for Power Only / RTS packets where the last page is trailer photos
+ * or a signed delivery page the model missed.
+ * @param {object|null} pod Existing POD block.
+ * @param {object} options Options.
+ * @param {number} options.pageCount PDF page count.
+ * @param {string} options.attachmentFilename Attachment filename.
+ * @param {string|null} [options.lastPageText] Text from the last PDF page.
+ * @param {number} [options.invoiceAmount] Carrier invoice amount.
+ * @return {object|null} Synthetic pod block or null.
+ */
+function inferLastPagePodIfMissing(pod, options = {}) {
+  if (pod && pod.found === true) return null;
+  const pageCount = Number(options.pageCount || 0);
+  if (!Number.isFinite(pageCount) || pageCount < 2) return null;
+  const filename = String(options.attachmentFilename || "").trim();
+  if (!filename) return null;
+  const verdict = textLooksUnsafeForCustomer(
+      options.lastPageText || null, options.invoiceAmount);
+  if (verdict.unsafe) return null;
+  return {
+    found: true,
+    source: "last_page_of_invoice",
+    page: pageCount,
+    attachmentFilename: filename,
+    reason:
+      "Fallback — last page of multipage packet (classifier missed POD)",
+    documents: [{
+      source: "last_page_of_invoice",
+      page: pageCount,
+      attachmentFilename: filename,
+      reason:
+        "Fallback — last page of multipage packet (classifier missed POD)",
+    }],
+  };
+}
+
 module.exports = {
   POD_PACKAGE_SOURCES,
   POD_DOCUMENT_SHAPE,
@@ -1352,6 +1419,7 @@ module.exports = {
   coercePodDocuments,
   resolvePodDocuments,
   extractPodDocumentPdfBytes,
+  inferLastPagePodIfMissing,
   parseClassificationJson,
   parseClassificationResponse,
   salvageInvoiceObjects,
