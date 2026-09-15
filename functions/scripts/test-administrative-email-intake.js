@@ -1663,6 +1663,53 @@ check("XPO Abe on To is detected for ignore",
         "Innovative Accounting <accounting@innovativecarriers.com>"},
     ]));
 
+const csxSubject = "CSX Billing- 09/15/26";
+const csxFrom = "donotreply.erp@csx.com <donotreply.erp@csx.com>";
+const csxBody =
+  "CSX sent a billing summary showing $18,604.00 in invoices due on " +
+  "September 29, 2026. Review the invoice and submit any disputes " +
+  "by email within seven days of the due date.";
+const csxAtt = [{
+  filename: "CSXARTRUCK_223193546_1.xls",
+  mimeType: "application/octet-stream",
+}];
+check("CSX Billing subject is definitive AR statement",
+    adm.subjectIsDefinitiveCarrierAccountStatement(csxSubject));
+check("CSX AR billing email detected from subject",
+    adm.looksLikeCsxArBillingEmail(csxSubject, csxFrom, csxAtt));
+check("CSX AR file from csx.com detected without Billing subject",
+    adm.looksLikeCsxArBillingEmail(
+        "Weekly dump", csxFrom, csxAtt));
+check("CSXAR filename looks like statement list",
+    adm.attachmentFilenameLooksLikeStatementList(csxAtt[0].filename));
+check("CSX billing summary body is overdue/statement follow-up",
+    adm.bodyLooksLikeOverdueInvoiceFollowUp(csxBody));
+check("CSX is statement follow-up (XLS, no freight PDF)",
+    adm.isCarrierStatementFollowUpEmail(
+        csxSubject, csxFrom, csxBody, csxAtt));
+check("CSX should handle → Abe when no invoice PDF",
+    adm.shouldHandleCarrierStatementFollowUp(
+        csxSubject, csxFrom, csxBody, csxAtt, 0));
+check("CSX skipped when a freight invoice PDF was already found",
+    !adm.shouldHandleCarrierStatementFollowUp(
+        csxSubject, csxFrom, csxBody, csxAtt, 1));
+check("CSX carrier_invoice mislabel does not invoice-veto to Moshe",
+    !adm.hasInvoiceVeto({
+      subject: csxSubject,
+      body: csxBody,
+      from: csxFrom,
+      attachments: csxAtt,
+      emailClassification: {intent: "carrier_invoice", confidence: "high"},
+      invoicePdfCount: 0,
+    }));
+check("CSX is a carrier/factor sender (not customer remittance)",
+    adm.isCarrierOrFactorSender(csxFrom));
+check("Saia freight invoice is not CSX AR billing",
+    !adm.looksLikeCsxArBillingEmail(
+        "Your Invoice From Saia LTL Freight",
+        "invoices@saia.com",
+        [{filename: "saia.pdf", mimeType: "application/pdf"}]));
+
 // Ambiguous Zelle language (non-bank from) must NOT regex quiet-ignore —
 // AI owns that path. Clear bank alerts still ignore.
 check("CHB 266272-style subject+quoted Zelle is NOT ambiguous candidate",

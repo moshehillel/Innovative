@@ -507,6 +507,7 @@ function isCarrierOrFactorSender(from) {
     "vtflog.com",
     "abf.com",
     "arcb.com",
+    "csx.com",
     "notification.intuit.com",
   ];
   if (carrierFactorDomains.some((d) =>
@@ -1203,6 +1204,8 @@ function attachmentFilenameLooksLikeStatementList(filename) {
       /inc|llc|corp|carriers|logistics|transport/i.test(name)) {
     return true;
   }
+  // CSX AR dump: CSXARTRUCK_223193546_1.xls
+  if (/^csxar/i.test(name)) return true;
   return false;
 }
 
@@ -1223,7 +1226,28 @@ function subjectIsDefinitiveCarrierAccountStatement(subject) {
       .test(stripped)) {
     return true;
   }
+  // CSX railroad AR: "CSX Billing- 09/15/26" — not a per-load freight bill.
+  if (/^csx\s+billing\b/i.test(stripped)) return true;
   return false;
+}
+
+/**
+ * CSX railroad AR billing summary (XLS list of invoices due).
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function looksLikeCsxArBillingEmail(subject, from, attachments) {
+  const fromL = String(from || "").toLowerCase();
+  const csxSender = fromL.includes("csx.com");
+  const stripped = String(subject || "").trim()
+      .replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
+  if (/^csx\s+billing\b/i.test(stripped)) return true;
+  const list = Array.isArray(attachments) ? attachments : [];
+  const arFile = list.some((a) =>
+    /^csxar/i.test(String(a && a.filename || "")));
+  return csxSender && arFile;
 }
 
 /**
@@ -1267,6 +1291,8 @@ function bodyLooksLikeOverdueInvoiceFollowUp(body) {
     /\bpayment\s+information\s+or\s+(?:an?\s+)?explanation\b/,
     /\btotal(?:ing)?\s+\$[\d,]+(?:\.\d{2})?\s+(?:in\s+)?overdue\b/,
     /\bamount\s+(?:due|overdue|outstanding)\b/,
+    /\bbilling\s+summary\b/,
+    /\binvoices?\s+due\b/,
   ];
   return patterns.some((re) => re.test(hay));
 }
@@ -1296,6 +1322,9 @@ function attachmentsIncludePdfLike(attachments) {
  */
 function isCarrierStatementFollowUpEmail(subject, from, body, attachments) {
   if (isCustomerPaymentRemittanceEmail(subject, from, body)) return false;
+  // CSX AR billing summaries are Abe statements even when an XLS/PDF
+  // aging list is attached — there is no per-load freight bill to enter.
+  if (looksLikeCsxArBillingEmail(subject, from, attachments)) return true;
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
   if (looksLikeNoaEmailContent(subject, body, from)) return false;
 
@@ -1344,6 +1373,7 @@ function isCarrierStatementFollowUpEmail(subject, from, body, attachments) {
 function shouldHandleCarrierStatementFollowUp(
     subject, from, body, attachments, invoicePdfCount) {
   if (Number(invoicePdfCount) > 0) return false;
+  if (looksLikeCsxArBillingEmail(subject, from, attachments)) return true;
   if (attachmentsIncludePdfLike(attachments)) return false;
   return isCarrierStatementFollowUpEmail(subject, from, body, attachments);
 }
@@ -1718,6 +1748,13 @@ function hasInvoiceVeto(signals = {}) {
     return false;
   }
 
+  // CSX Billing + AR XLS is Abe's statement, even if the classifier
+  // mislabels it carrier_invoice.
+  if (looksLikeCsxArBillingEmail(subject, from, attachments) &&
+      !(Number(invoicePdfCount) > 0)) {
+    return false;
+  }
+
   // Never block intentional D&B marketing / Credit Insights noise ignores.
   if (isDnbPromotionalEmail(subject, from, body)) {
     return false;
@@ -1903,6 +1940,7 @@ module.exports = {
   subjectLooksLikeCarrierAccountStatement,
   bodyLooksLikeOverdueInvoiceFollowUp,
   attachmentsIncludePdfLike,
+  looksLikeCsxArBillingEmail,
   isCarrierStatementFollowUpEmail,
   shouldHandleCarrierStatementFollowUp,
   looksLikeInvoiceEmailContent,

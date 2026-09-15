@@ -551,6 +551,12 @@ function overrideStatementClassificationIfInvoicePacket(
     classification, subject, from, body, attachments) {
   const current = classification && typeof classification === "object" ?
     classification : {intent: "unknown"};
+  if (administrativeEmailIntake.subjectIsDefinitiveCarrierAccountStatement(
+      subject) ||
+      administrativeEmailIntake.looksLikeCsxArBillingEmail(
+          subject, from, attachments)) {
+    return current;
+  }
   const isInvoicePacket = looksLikeStatementCoverInvoicePacketEmail(
       subject, from, body, attachments) ||
     looksLikeCarrierInvoiceEmail(subject, from, body);

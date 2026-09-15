@@ -462,6 +462,17 @@ check("REV Capital unknown classification overridden to carrier_invoice",
           reasoning: "banking information"},
         revSubject, revFrom, "", revPdf).intent, "carrier_invoice");
 
+check("CSX Billing statement is not overridden to carrier_invoice",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "statement", confidence: "high",
+          reasoning: "CSX AR billing summary"},
+        "CSX Billing- 09/15/26",
+        "donotreply.erp@csx.com",
+        "billing summary showing invoices due",
+        [{filename: "CSXARTRUCK_223193546_1.xls",
+          mimeType: "application/octet-stream"}]).intent,
+    "statement");
+
 check("parseStatementIndexLoadNumbers dedupes and sorts",
     JSON.stringify(bundle.parseStatementIndexLoadNumbers(
         "Load 265379 266088 265379 266219 265630")),
