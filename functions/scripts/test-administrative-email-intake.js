@@ -184,6 +184,34 @@ check("Gemini Sound Automatic reply not blocked by invoice veto",
       emailClassification: {intent: "carrier_invoice"},
       invoicePdfCount: 0,
     }));
+const studioRaySubject =
+  "Automatic reply: Invoice #29891 for BOL #263444";
+const studioRayFrom = "Manoj Bansal <mbansal@studioray.com>";
+const studioRayBody =
+  "I will be out of the office September 14-15 and returning September 16. " +
+  "For assistance contact Ezra Tawil at ETAWIL@STUDIORAY.COM.";
+check("Studio Ray Automatic reply + Invoice/BOL is OOO",
+    adm.isOutOfOfficeAutoReply(
+        studioRaySubject, studioRayFrom, studioRayBody));
+check("Studio Ray Automatic reply evaluates to OOO ignore",
+    adm.evaluateAdministrativeIgnore(
+        studioRaySubject, studioRayFrom, studioRayBody, []).status ===
+    "out_of_office_ignored");
+check("Studio Ray Automatic reply is not invoice-vetoed",
+    !adm.hasInvoiceVeto({
+      subject: studioRaySubject,
+      body: studioRayBody,
+      from: studioRayFrom,
+      attachments: [],
+      invoicePdfCount: 0,
+    }));
+check("Studio Ray no-attach veto path (no from/headers) still not veto",
+    !adm.hasInvoiceVeto({
+      subject: studioRaySubject,
+      body: studioRayBody,
+      attachments: [],
+      emailClassification: {intent: "unknown"},
+    }));
 check("External Auto-Submitted header on Invoice/BOL is OOO",
     adm.isOutOfOfficeAutoReply(
         "Re: Invoice #29729 for BOL #265909",

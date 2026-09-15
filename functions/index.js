@@ -8298,6 +8298,28 @@ async function processGmailMessage(
       return;
     }
 
+    // Automatic reply / OOO must ignore before attachment work and before
+    // the no-attachment invoice-veto forward. "Automatic reply: Invoice #…
+    // for BOL #…" has no PDF; the Invoice/BOL subject used to leak to Moshe.
+    if (!isChildSplitJob && !isTai) {
+      const oooIgnore =
+        administrativeEmailIntake.evaluateAdministrativeIgnore(
+            subject, from, emailBody, [], headers);
+      if (oooIgnore.ignore &&
+          administrativeIgnoreBypassesInvoiceVeto(oooIgnore.status)) {
+        await completeAdministrativeIgnore({
+          messageId,
+          subject,
+          from,
+          tenant,
+          queueDocId,
+          finalStatus: oooIgnore.status,
+          reason: oooIgnore.reason,
+        });
+        return;
+      }
+    }
+
     if (isChildSplitJob) {
       const splitCtx = await loadSplitChildContext(
           tenant, parentMessageId, childItemIndex);
@@ -9029,7 +9051,9 @@ async function processGmailMessage(
         const noAttachVeto = administrativeEmailIntake.hasInvoiceVeto({
           subject,
           body: emailBody,
+          from,
           attachments,
+          headers,
           emailClassification,
         });
         await forwardWithAnalysis(
