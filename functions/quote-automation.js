@@ -1018,9 +1018,6 @@ async function rateLane(lane, ctx) {
     ensureGuaranteed: wantsGuaranteed,
     mode: "cheapest",
   });
-  // Primus web shows the full grid; Jerry's cheapest-N cut drops FedEx
-  // (often rank 40+). Always surface Economy/Priority when Primus returned them.
-  options = rateShop.ensureFedExInOptions(options, tagged, {maxAdd: 2});
 
   // Strip broker J&I suffixes on rate-shop / dispatcher options (not
   // email-only) so Active clean rules and Primus tags stay consistent.
