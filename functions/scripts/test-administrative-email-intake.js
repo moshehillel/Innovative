@@ -997,6 +997,8 @@ const rmBody =
 const rmPdf = [{filename: "266111.pdf", mimeType: "application/pdf"}];
 check("RM Capital REF# subject recognized as invoice content",
     adm.looksLikeInvoiceEmailContent(rmSubject, rmBody));
+check("RM Capital FW: REF# subject recognized as invoice content",
+    adm.looksLikeInvoiceEmailContent("FW: REF# 267594", rmBody));
 check("RM Capital factor domain recognized",
     adm.isCarrierOrFactorSender(rmFrom));
 check("RM Capital not NOA",

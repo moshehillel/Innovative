@@ -181,8 +181,11 @@ function looksLikeFactorNameInvoiceSubject(subject) {
  * @return {boolean}
  */
 function looksLikeRefNumberInvoiceSubject(subject) {
-  const sub = String(subject || "").trim();
-  return /^ref\s*#\s*\d{5,9}\b/i.test(sub);
+  const sub = String(subject || "").trim()
+      .replace(/^\uFEFF/, "")
+      .replace(/^(?:(?:fw|fwd|re):\s*)+/i, "")
+      .trim();
+  return /^ref(?:erence)?\s*[#:]?\s*\d{5,9}\b/i.test(sub);
 }
 
 /**
@@ -424,6 +427,70 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
 }
 
 /**
+ * True when a first-page OTHER/STATEMENT pre-check should still be extracted
+ * as a carrier freight invoice (factor cover letters, REF# subjects, or
+ * an email already classified as carrier_invoice).
+ * @param {object} [context] Subject/from/body/filename and optional
+ *   emailClassification / preCheckLabel.
+ * @return {boolean}
+ */
+function shouldKeepAttachmentAsInvoice(context = {}) {
+  const label = sanitizePreCheckLabel(
+      context.preCheckLabel || context.docType);
+  if (label === "INVOICE" || label === "POD") return true;
+
+  if (shouldTreatStatementCoverAsInvoiceBundle({
+    ...context,
+    preCheckLabel: label,
+  })) {
+    return true;
+  }
+
+  const hints = [
+    context.subject,
+    context.filename,
+    context.from,
+    context.body,
+  ].map((s) => String(s || "")).join(" ");
+  if (looksLikeWniClassCorrectionPacket(
+      context.subject, context.from, context.filename)) {
+    return true;
+  }
+  if (/freight\s*inv|carrier\s*inv|transportation/i.test(hints)) {
+    return true;
+  }
+  if (looksLikeCarrierInvoiceEmail(
+      context.subject, context.from, context.body)) {
+    return true;
+  }
+  if (looksLikeCarrierInvoiceEmail(
+      context.filename, context.from, "")) {
+    return true;
+  }
+  if (administrativeEmailIntake.looksLikeInvoiceEmailContent(
+      context.subject, context.body)) {
+    return true;
+  }
+
+  const classification = context.emailClassification &&
+    typeof context.emailClassification === "object" ?
+    context.emailClassification : null;
+  const intent = classification && classification.intent;
+  if (intent === "carrier_invoice" &&
+      (label === "OTHER" || label === "STATEMENT")) {
+    return true;
+  }
+  const hintedPdf = classification && classification.invoicePdfFilename ?
+    String(classification.invoicePdfFilename).trim().toLowerCase() : "";
+  const filename = String(context.filename || "").trim().toLowerCase();
+  if (hintedPdf && filename && hintedPdf === filename &&
+      (label === "OTHER" || label === "STATEMENT")) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Maps cheap first-page pre-check labels to attachment processing types.
  * Standalone carrier statements are ignored; multi-page packets that
  * bundle freight bills still run full invoice extraction.
@@ -435,37 +502,11 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
 function normalizePreCheckDocType(docType, context = {}) {
   const label = sanitizePreCheckLabel(docType);
   if (label === "INVOICE" || label === "POD") return label;
-
-  if (shouldTreatStatementCoverAsInvoiceBundle({
-    preCheckLabel: label,
+  if (shouldKeepAttachmentAsInvoice({
     ...context,
+    preCheckLabel: label,
   })) {
     return "INVOICE";
-  }
-
-  const hints = [
-    context.subject,
-    context.filename,
-    context.from,
-    context.body,
-  ].map((s) => String(s || "")).join(" ");
-  if (label === "OTHER") {
-    if (looksLikeWniClassCorrectionPacket(
-        context.subject, context.from, context.filename)) {
-      return "INVOICE";
-    }
-    if (/freight\s*inv|carrier\s*inv|transportation/i.test(hints)) {
-      return "INVOICE";
-    }
-    if (looksLikeCarrierInvoiceEmail(
-        context.subject, context.from, context.body)) {
-      return "INVOICE";
-    }
-    // Outlook often names the PDF after the email subject.
-    if (looksLikeCarrierInvoiceEmail(
-        context.filename, context.from, "")) {
-      return "INVOICE";
-    }
   }
   return label || "OTHER";
 }
@@ -676,6 +717,7 @@ module.exports = {
   looksLikeCarrierInvoiceEmail,
   looksLikeStatementCoverInvoicePacketEmail,
   shouldTreatStatementCoverAsInvoiceBundle,
+  shouldKeepAttachmentAsInvoice,
   normalizePreCheckDocType,
   shouldShortCircuitAsStatementOnly,
   overrideStatementClassificationIfInvoicePacket,

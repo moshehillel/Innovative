@@ -1417,7 +1417,10 @@ function looksLikeInvoiceEmailContent(subject, body) {
     return true;
   }
   // RM Capital / similar factors: "REF# 266111" — REF # is the broker load.
-  if (/^ref\s*#\s*\d{5,9}\b/i.test(sub)) return true;
+  if (/(?:^|(?:fw|fwd|re):\s*)ref(?:erence)?\s*[#:]?\s*\d{5,9}\b/i
+      .test(sub)) {
+    return true;
+  }
   // REV Capital: "REV CAPITAL/CARRIER, Invoice # 6672 Part 1 of 1"
   if (/revinc\.com/i.test(content) &&
       /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub)) {

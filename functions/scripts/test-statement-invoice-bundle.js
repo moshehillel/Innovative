@@ -393,6 +393,45 @@ check("RM Capital unknown classification overridden to carrier_invoice",
     bundle.overrideStatementClassificationIfInvoicePacket(
         {intent: "unknown", confidence: "low", reasoning: "unclear"},
         rmSubject, rmFrom, "", rmPdf).intent, "carrier_invoice");
+check("RM Capital REF# 267594 OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: "REF# 267594",
+      from: rmFrom,
+      filename: "1199127.pdf",
+      pageCount: 1,
+    }), "INVOICE");
+check("RM Capital FW: REF# subject still detected",
+    bundle.looksLikeRefNumberInvoiceSubject("FW: REF# 267594"), true);
+check("carrier_invoice classification keeps OTHER PDF even without REF#",
+    bundle.shouldKeepAttachmentAsInvoice({
+      preCheckLabel: "OTHER",
+      subject: "Document attached",
+      from: "billing@example.com",
+      filename: "1199127.pdf",
+      pageCount: 1,
+      emailClassification: {intent: "carrier_invoice", confidence: "high"},
+    }), true);
+check("classifier invoicePdfFilename keeps OTHER PDF",
+    bundle.shouldKeepAttachmentAsInvoice({
+      preCheckLabel: "OTHER",
+      subject: "Document attached",
+      from: "billing@example.com",
+      filename: "1199127.pdf",
+      pageCount: 1,
+      emailClassification: {
+        intent: "unknown",
+        invoicePdfFilename: "1199127.pdf",
+      },
+    }), true);
+check("unrelated OTHER PDF is not kept",
+    bundle.shouldKeepAttachmentAsInvoice({
+      preCheckLabel: "OTHER",
+      subject: "W9 on file",
+      from: "ap@vendor.com",
+      filename: "w9.pdf",
+      pageCount: 1,
+      emailClassification: {intent: "unknown"},
+    }), false);
 
 const revSubject =
   "REV CAPITAL/CENTRAL FORCE TRANSPORT INC., Invoice # 6672 Part 1 of 1";

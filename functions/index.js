@@ -51,7 +51,7 @@ const paymentNotificationClassify = require("./payment-notification-classify");
 const statementInvoiceBundle = require("./statement-invoice-bundle");
 const {
   sanitizePreCheckLabel,
-  shouldTreatStatementCoverAsInvoiceBundle,
+  shouldKeepAttachmentAsInvoice,
   normalizePreCheckDocType,
 } = statementInvoiceBundle;
 const drayageIntake = require("./drayage-intake");
@@ -3670,8 +3670,11 @@ async function preCheckDocumentType(pdfBuffer) {
             "are the actual invoices). Also use INVOICE when the first " +
             "page is a Notice of Assignment, factor cover letter, or " +
             "ACH/banking remittance page and later pages are the " +
-            "freight bill (Thunder Funding, REV Capital, and similar " +
-            "factoring companies). Also use INVOICE when the PDF is a " +
+            "freight bill (Thunder Funding, REV Capital, RM Capital, " +
+            "and similar factoring companies). Also use INVOICE when " +
+            "the first page asks to confirm receipt / remit payment " +
+            "to a factor and later pages (or the same page) are the " +
+            "carrier freight bill. Also use INVOICE when the PDF is a "
             "Weight & Inspection (W&I / WNI) class-correction or reweigh " +
             "certificate that shows a revised class, weight, or rate.",
         },
@@ -9186,6 +9189,7 @@ async function processGmailMessage(
           subject, from, filename: attachment.filename,
           pageCount,
           body: emailBody,
+          emailClassification,
         });
         if (preCheckLabel !== docType && docType === "INVOICE") {
           await writeLog("info", "mail",
@@ -9196,19 +9200,13 @@ async function processGmailMessage(
               });
         }
         if (docType !== "INVOICE" && docType !== "POD") {
-          const keepAsInvoice =
-            shouldTreatStatementCoverAsInvoiceBundle({
-              preCheckLabel,
-              subject, from, filename: attachment.filename,
-              pageCount,
-              body: emailBody,
-            }) ||
-            statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
-                subject, from, emailBody) ||
-            statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
-                attachment.filename, from, "") ||
-            administrativeEmailIntake.looksLikeInvoiceEmailContent(
-                subject, emailBody);
+          const keepAsInvoice = shouldKeepAttachmentAsInvoice({
+            preCheckLabel,
+            subject, from, filename: attachment.filename,
+            pageCount,
+            body: emailBody,
+            emailClassification,
+          });
           if (keepAsInvoice) {
             docType = "INVOICE";
             await writeLog("info", "mail",
@@ -9232,6 +9230,9 @@ async function processGmailMessage(
                 `Attachment is ${preCheckLabel}, skipping`, {
                   messageId, filename: attachment.filename,
                   docType: preCheckLabel,
+                  emailIntent: emailClassification &&
+                    emailClassification.intent || null,
+                  subject: String(subject || "").slice(0, 180),
                 });
             skippedDocTypes.push(preCheckLabel);
             continue;
@@ -9305,6 +9306,7 @@ async function processGmailMessage(
               subject, from, filename: attachment.filename,
               pageCount,
               body: emailBody,
+              emailClassification,
             });
             if (preCheckLabel !== docType && docType === "INVOICE") {
               await writeLog("info", "mail",
@@ -9315,19 +9317,13 @@ async function processGmailMessage(
                   });
             }
             if (docType !== "INVOICE" && docType !== "POD") {
-              const keepAsInvoice =
-                shouldTreatStatementCoverAsInvoiceBundle({
-                  preCheckLabel,
-                  subject, from, filename: attachment.filename,
-                  pageCount,
-                  body: emailBody,
-                }) ||
-                statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
-                    subject, from, emailBody) ||
-                statementInvoiceBundle.looksLikeCarrierInvoiceEmail(
-                    attachment.filename, from, "") ||
-                administrativeEmailIntake.looksLikeInvoiceEmailContent(
-                    subject, emailBody);
+              const keepAsInvoice = shouldKeepAttachmentAsInvoice({
+                preCheckLabel,
+                subject, from, filename: attachment.filename,
+                pageCount,
+                body: emailBody,
+                emailClassification,
+              });
               if (keepAsInvoice) {
                 docType = "INVOICE";
               } else if (sanitizePreCheckLabel(preCheckLabel) === "STATEMENT") {
