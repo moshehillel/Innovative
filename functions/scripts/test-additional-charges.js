@@ -409,6 +409,20 @@ check("265880: total matches Primus => valid", westhill.valid, true);
 check("265880: totalMatchesPrimus flag", westhill.totalMatchesPrimus, true);
 check("265880: base still computed", westhill.baseAmount, 2500);
 
+// Lucky Way 266823 — freight $300 + lumper $203.11 = invoice $503.11 = Primus
+const luckyWay = ac.validateLumperAmount({
+  invoiceAmount: 503.11,
+  charges: [{type: "lumper", amount: 203.11}],
+}, 503.11);
+check("266823 Lucky Way: total matches Primus => valid", luckyWay.valid, true);
+check("266823 Lucky Way: totalMatchesPrimus", luckyWay.totalMatchesPrimus, true);
+check("266823 Lucky Way: reads lumper from legacy charges[]",
+    luckyWay.totalLumper, 203.11);
+check("266823 invoiceTotalMatchesPrimusCost helper",
+    ac.invoiceTotalMatchesPrimusCost(503.11, 503.11), true);
+check("266823 money-string Primus cost still matches",
+    ac.invoiceTotalMatchesPrimusCost("$503.11", "503.11"), true);
+
 // Base freight matches Primus when lumper is separate line item
 const baseMatch = ac.validateLumperAmount({
   invoiceAmount: 2600,

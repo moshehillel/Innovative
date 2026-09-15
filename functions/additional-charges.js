@@ -86,24 +86,66 @@ const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
 const LUMPER_BASE_TOLERANCE = 5;
 
 /**
+ * Coerce money-like values ("$503.11", "1,250.00") to a finite number.
+ * @param {*} value Raw amount.
+ * @return {number}
+ */
+function coerceMoneyNumber(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const cleaned = String(value == null ? "" : value)
+      .replace(/[^0-9.-]/g, "");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/**
+ * True when invoice total already agrees with Primus carrier cost.
+ * Lumper (and other) line items are then a breakdown, not an overage.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusCarrierCost Primus vendor.cost.
+ * @param {number} [tolerance=RATE_MATCH_TOLERANCE] Match band in dollars.
+ * @return {boolean}
+ */
+function invoiceTotalMatchesPrimusCost(
+    invoiceAmount, primusCarrierCost, tolerance = RATE_MATCH_TOLERANCE) {
+  const invoice = coerceMoneyNumber(invoiceAmount);
+  const primusCost = coerceMoneyNumber(primusCarrierCost);
+  const band = Number(tolerance);
+  const tol = Number.isFinite(band) ? band : RATE_MATCH_TOLERANCE;
+  return primusCost > 0 && invoice > 0 &&
+      Math.abs(invoice - primusCost) <= tol;
+}
+
+/**
  * Validates invoice amount by subtracting lumper charges before comparing
  * to Primus carrier cost (booking.vendor.cost).
- * @param {object} aiResult AI classification result.
+ * @param {object} aiResult AI classification result (or charge snapshot).
  * @param {number} primusCarrierCost Carrier cost from Primus booking.
  * @return {object} Validation result.
  */
 function validateLumperAmount(aiResult, primusCarrierCost) {
-  const lumperCharges = (aiResult.recognizedCharges || [])
-      .filter((c) => c && c.type === "lumper");
+  const recognized = Array.isArray(aiResult && aiResult.recognizedCharges) ?
+    aiResult.recognizedCharges : [];
+  const unrecognized =
+    Array.isArray(aiResult && aiResult.unrecognizedCharges) ?
+      aiResult.unrecognizedCharges : [];
+  // Claude sometimes puts lumper/detention only in legacy `charges[]`.
+  const legacyCharges = Array.isArray(aiResult && aiResult.charges) ?
+    aiResult.charges : [];
+  const lumperCharges = recognized.concat(unrecognized, legacyCharges)
+      .filter((c) => c && /lumper/i.test(String(c.type || c.label || "")));
   const totalLumper = lumperCharges.reduce(
-      (sum, c) => sum + (Number(c.amount) || 0), 0);
-  const invoiceAmount = Number(aiResult.invoiceAmount || 0);
-  const primusCost = Number(primusCarrierCost || 0);
+      (sum, c) => sum + coerceMoneyNumber(c.amount), 0);
+  const invoiceAmount = coerceMoneyNumber(
+      aiResult && aiResult.invoiceAmount);
+  const primusCost = coerceMoneyNumber(primusCarrierCost);
   const baseAmount = invoiceAmount - totalLumper;
   // When the invoice total already matches Primus, the lumper is included in
   // carrier cost — line items are a breakdown, not an overage.
-  const totalMatchesPrimus = primusCost > 0 &&
-      Math.abs(invoiceAmount - primusCost) <= RATE_MATCH_TOLERANCE;
+  // Lucky Way 266823: $503.11 invoice = $300 freight + $203.11 lumper, and
+  // Primus vendor.cost was already $503.11 — must approve, not flag.
+  const totalMatchesPrimus = invoiceTotalMatchesPrimusCost(
+      invoiceAmount, primusCost);
   if (totalMatchesPrimus) {
     return {
       valid: true,
@@ -1477,6 +1519,8 @@ module.exports = {
   RATE_MATCH_TOLERANCE,
   MIN_IGNORABLE_CHARGE_AMOUNT,
   LISA_EMAIL,
+  coerceMoneyNumber,
+  invoiceTotalMatchesPrimusCost,
   mergeLisaOnCc,
   applyAdditionalChargeEmailCc,
   applyDispatcherEmailCc,

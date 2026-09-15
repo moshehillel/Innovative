@@ -6659,7 +6659,7 @@ function normalizeAiChargeArrays(aiResult) {
     const amt = Number(c.amount);
     return label.length > 0 || (Number.isFinite(amt) && Math.abs(amt) > 0);
   };
-  const recognizedCharges = (Array.isArray(aiResult.recognizedCharges) ?
+  let recognizedCharges = (Array.isArray(aiResult.recognizedCharges) ?
     aiResult.recognizedCharges : []).filter(keepCharge);
   const unrecognizedCharges =
     (Array.isArray(aiResult.unrecognizedCharges) ?
@@ -6668,6 +6668,18 @@ function normalizeAiChargeArrays(aiResult) {
     aiResult.chargesNeedProof : []).filter(keepCharge);
   const chargeProofRefs = Array.isArray(aiResult.chargeProofRefs) ?
     aiResult.chargeProofRefs : [];
+
+  // Legacy `charges[]` from Claude — promote known types into recognized.
+  const legacyCharges = (Array.isArray(aiResult.charges) ?
+    aiResult.charges : []).filter(keepCharge);
+  for (const c of legacyCharges) {
+    const type = String(c.type || c.label || "").toLowerCase();
+    if (!/lumper|detention/.test(type)) continue;
+    const already = recognizedCharges.some((r) =>
+      String(r.type || "").toLowerCase() === type &&
+      Number(r.amount) === Number(c.amount));
+    if (!already) recognizedCharges.push(c);
+  }
 
   return {
     recognizedCharges,
@@ -10726,31 +10738,44 @@ async function processGmailMessage(
             aiResult.loadNumber, aiResult.proNumber,
         );
 
-        // Lumper: subtract lumper from invoice before Primus compare.
+        // Lumper: subtract lumper from invoice before Primus compare —
+        // unless the invoice TOTAL already matches Primus (lumper included).
         let primusValidationAmount = aiResult.invoiceAmount;
         if (normalizedChargeData.recognizedCharges &&
             normalizedChargeData.recognizedCharges.length > 0) {
           const lumperValidation = additionalCharges.validateLumperAmount(
-              aiResult, primusData.vendorCost,
+              {
+                invoiceAmount: aiResult.invoiceAmount,
+                recognizedCharges: normalizedChargeData.recognizedCharges,
+                unrecognizedCharges: normalizedChargeData.unrecognizedCharges,
+                charges: aiResult.charges,
+              },
+              primusData.vendorCost,
           );
-          if (lumperValidation.totalLumper > 0 &&
-              !lumperValidation.totalMatchesPrimus) {
+          const totalsMatch =
+            lumperValidation.totalMatchesPrimus ||
+            additionalCharges.invoiceTotalMatchesPrimusCost(
+                aiResult.invoiceAmount, primusData.vendorCost);
+          if (lumperValidation.totalLumper > 0 && !totalsMatch) {
             primusValidationAmount = lumperValidation.baseAmount;
           }
           await writeLog("info", "ai", "Lumper validation result", {
             messageId,
             baseAmount: lumperValidation.baseAmount,
             totalLumper: lumperValidation.totalLumper,
+            primusCost: primusData.vendorCost,
+            invoiceAmount: aiResult.invoiceAmount,
             primusValidationAmount,
             difference: lumperValidation.difference,
             valid: lumperValidation.valid,
+            totalMatchesPrimus: totalsMatch,
           });
 
           // If lumpers are present but the base amount still doesn't match
           // the Primus carrier cost, flag for billing — better than a
-          // generic mismatch message.
+          // generic mismatch message. Never flag when totals already match.
           if (primusData.vendorCost && lumperValidation.totalLumper > 0 &&
-              !lumperValidation.valid) {
+              !lumperValidation.valid && !totalsMatch) {
             await forwardToHumanReview(
                 gmail, messageId, subject, from,
                 "Lumper charges do not reconcile with Primus carrier cost",
