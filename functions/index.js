@@ -3674,7 +3674,7 @@ async function preCheckDocumentType(pdfBuffer) {
             "and similar factoring companies). Also use INVOICE when " +
             "the first page asks to confirm receipt / remit payment " +
             "to a factor and later pages (or the same page) are the " +
-            "carrier freight bill. Also use INVOICE when the PDF is a "
+            "carrier freight bill. Also use INVOICE when the PDF is a " +
             "Weight & Inspection (W&I / WNI) class-correction or reweigh " +
             "certificate that shows a revised class, weight, or rate.",
         },
