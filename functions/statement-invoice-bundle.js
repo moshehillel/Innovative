@@ -164,6 +164,32 @@ function looksLikeRevCapitalInvoiceEmail(subject, from) {
 }
 
 /**
+ * Sunbelt / similar: "Load 267545 Invoice 113077 for US Carrier Inc"
+ * or "Load 266551 Invoice R3669 for DNG Transport LLC".
+ * Load # is the broker load; the PDF is the carrier freight bill.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function looksLikeLoadNumberInvoiceSubject(subject) {
+  const sub = String(subject || "").trim();
+  return /\bload\s+#?\s*\d{5,9}\b/i.test(sub) &&
+    /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(sub);
+}
+
+/**
+ * Sunbelt Finance factored freight invoices from @sunbeltfinance.com.
+ * @param {string} subject Email subject.
+ * @param {string} from Email sender.
+ * @return {boolean}
+ */
+function looksLikeSunbeltFinanceInvoiceEmail(subject, from) {
+  const fromL = String(from || "").toLowerCase();
+  if (!fromL.includes("sunbeltfinance.com")) return false;
+  return looksLikeLoadNumberInvoiceSubject(subject) ||
+    /\binvoice\s+#?\s*[a-z]{0,4}\d+/i.test(String(subject || ""));
+}
+
+/**
  * Factor-name prefix subjects: "Single Point Capital; Invoice #265914"
  * or "REV CAPITAL/CARRIER, Invoice # 6672 Part 1 of 1".
  * @param {string} subject Email subject.
@@ -253,6 +279,8 @@ function looksLikeCarrierInvoiceEmail(subject, from, body) {
   if (looksLikeSinglePointCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeRmCapitalInvoiceEmail(sub, from)) return true;
   if (looksLikeRevCapitalInvoiceEmail(sub, from)) return true;
+  if (looksLikeSunbeltFinanceInvoiceEmail(sub, from)) return true;
+  if (looksLikeLoadNumberInvoiceSubject(sub)) return true;
   if (looksLikeRefNumberInvoiceSubject(sub)) return true;
   if (looksLikeFactoredPurchaseOrderInvoiceEmail(sub)) return true;
   if (looksLikeFactorNameInvoiceSubject(sub)) return true;
@@ -304,6 +332,12 @@ function looksLikeStatementCoverInvoicePacketEmail(
     return true;
   }
   if (looksLikeRevCapitalInvoiceEmail(subject, from)) {
+    return true;
+  }
+  if (looksLikeSunbeltFinanceInvoiceEmail(subject, from)) {
+    return true;
+  }
+  if (looksLikeLoadNumberInvoiceSubject(subject)) {
     return true;
   }
   if (looksLikeRefNumberInvoiceSubject(subject)) {
@@ -373,6 +407,13 @@ function shouldTreatStatementCoverAsInvoiceBundle(context = {}) {
   }
   if (looksLikeRevCapitalInvoiceEmail(
       context.subject, context.from)) {
+    return true;
+  }
+  if (looksLikeSunbeltFinanceInvoiceEmail(
+      context.subject, context.from)) {
+    return true;
+  }
+  if (looksLikeLoadNumberInvoiceSubject(context.subject)) {
     return true;
   }
   if (looksLikeRefNumberInvoiceSubject(context.subject)) {
@@ -572,6 +613,7 @@ function overrideStatementClassificationIfInvoicePacket(
     looksLikeInvoiceForProcessingSubject(subject);
   const rmCapital = looksLikeRmCapitalInvoiceEmail(subject, from);
   const revCapital = looksLikeRevCapitalInvoiceEmail(subject, from);
+  const sunbelt = looksLikeSunbeltFinanceInvoiceEmail(subject, from);
   let reasoning =
     "Numbered carrier statement packet — first page is a " +
     "statement cover; later pages are freight invoices to process.";
@@ -591,6 +633,12 @@ function overrideStatementClassificationIfInvoicePacket(
   } else if (revCapital) {
     reasoning =
       "REV Capital factored freight invoice — PDF is the carrier bill.";
+  } else if (sunbelt) {
+    reasoning =
+      "Sunbelt Finance factored freight invoice — Load # is the broker load.";
+  } else if (looksLikeLoadNumberInvoiceSubject(subject)) {
+    reasoning =
+      "Factored carrier freight invoice — Load # in subject is the load.";
   } else if (looksLikeRefNumberInvoiceSubject(subject)) {
     reasoning =
       "Factored carrier freight invoice — REF # in subject is the load.";
@@ -717,6 +765,8 @@ module.exports = {
   looksLikeSinglePointCapitalInvoiceEmail,
   looksLikeRmCapitalInvoiceEmail,
   looksLikeRevCapitalInvoiceEmail,
+  looksLikeSunbeltFinanceInvoiceEmail,
+  looksLikeLoadNumberInvoiceSubject,
   looksLikeFactorNameInvoiceSubject,
   looksLikeRefNumberInvoiceSubject,
   hasProcessablePdfAttachment,

@@ -3671,7 +3671,8 @@ async function preCheckDocumentType(pdfBuffer) {
             "page is a Notice of Assignment, factor cover letter, or " +
             "ACH/banking remittance page and later pages are the " +
             "freight bill (Thunder Funding, REV Capital, RM Capital, " +
-            "and similar factoring companies). Also use INVOICE when " +
+            "Sunbelt Finance, and similar factoring companies). Also " +
+            "use INVOICE when " +
             "the first page asks to confirm receipt / remit payment " +
             "to a factor and later pages (or the same page) are the " +
             "carrier freight bill. Also use INVOICE when the PDF is a " +
@@ -7967,11 +7968,13 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  similar) that email Invoice # / PO # / REF # / Load # with a PDF",
       "  are carrier_invoice, even when page 1 is a Notice of Assignment",
       "  or banking letter.",
-      "- Sunbelt Finance (lisa@sunbeltfinance.com / @sunbeltfinance.com):",
-      "  subject 'Load 266551 Invoice R3669 for DNG Transport LLC' with a",
-      "  PDF is a factored carrier freight invoice — Load # is the broker",
-      "  load. Classify as carrier_invoice, not unknown. Invoice ids may",
-      "  be alphanumeric (e.g. R3669).",
+      "- Sunbelt Finance (lisa@sunbeltfinance.com / candice@sunbeltfinance.com",
+      "  / @sunbeltfinance.com): subject 'Load 266551 Invoice R3669 for DNG",
+      "  Transport LLC' or 'Load 267545 Invoice 113077 for US Carrier Inc'",
+      "  with a PDF is a factored carrier freight invoice — Load # is the",
+      "  broker load. Classify as carrier_invoice, not unknown. Invoice ids",
+      "  may be alphanumeric (e.g. R3669) or numeric. Do not classify as",
+      "  statement just because the PDF first page is a factor cover.",
       "- Single Point Capital (reports@singlepointgroup.com): subject",
       "  'Single Point Capital; Invoice #265914' with a PDF is a factored",
       "  carrier freight invoice. Classify as carrier_invoice, not statement",

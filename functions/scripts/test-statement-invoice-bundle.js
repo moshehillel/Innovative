@@ -462,6 +462,48 @@ check("REV Capital unknown classification overridden to carrier_invoice",
           reasoning: "banking information"},
         revSubject, revFrom, "", revPdf).intent, "carrier_invoice");
 
+const sunbeltSubject =
+  "Load 267545 Invoice 113077 for US Carrier Inc";
+const sunbeltFrom = "candice@sunbeltfinance.com <candice@sunbeltfinance.com>";
+const sunbeltPdf = [{
+  filename: "1-113077.pdf",
+  mimeType: "application/octet-stream",
+}];
+check("Sunbelt Load+Invoice subject detected",
+    bundle.looksLikeLoadNumberInvoiceSubject(sunbeltSubject), true);
+check("Sunbelt Finance sender+subject detected",
+    bundle.looksLikeSunbeltFinanceInvoiceEmail(sunbeltSubject, sunbeltFrom),
+    true);
+check("Sunbelt looks like carrier invoice email",
+    bundle.looksLikeCarrierInvoiceEmail(sunbeltSubject, sunbeltFrom, ""),
+    true);
+check("Sunbelt 1-page OTHER cover → INVOICE",
+    bundle.normalizePreCheckDocType("OTHER", {
+      subject: sunbeltSubject,
+      from: sunbeltFrom,
+      filename: sunbeltPdf[0].filename,
+      pageCount: 1,
+    }), "INVOICE");
+check("Sunbelt packet email",
+    bundle.looksLikeStatementCoverInvoicePacketEmail(
+        sunbeltSubject, sunbeltFrom, "", sunbeltPdf), true);
+check("Sunbelt unknown classification overridden to carrier_invoice",
+    bundle.overrideStatementClassificationIfInvoicePacket(
+        {intent: "unknown", confidence: "low", reasoning: "unclear"},
+        sunbeltSubject, sunbeltFrom, "", sunbeltPdf).intent, "carrier_invoice");
+check("Sunbelt OTHER cover kept as invoice without classifier intent",
+    bundle.shouldKeepAttachmentAsInvoice({
+      preCheckLabel: "OTHER",
+      subject: sunbeltSubject,
+      from: sunbeltFrom,
+      filename: sunbeltPdf[0].filename,
+      pageCount: 1,
+    }), true);
+check("Sunbelt NOA-only subject is not a Load+Invoice packet",
+    bundle.looksLikeSunbeltFinanceInvoiceEmail(
+        "NOA for US Carrier Inc from Sunbelt Finance", sunbeltFrom),
+    false);
+
 check("CSX Billing statement is not overridden to carrier_invoice",
     bundle.overrideStatementClassificationIfInvoicePacket(
         {intent: "statement", confidence: "high",

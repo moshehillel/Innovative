@@ -1067,6 +1067,10 @@ const sunbeltBody =
 const sunbeltPdf = [{filename: "R3669.pdf", mimeType: "application/pdf"}];
 check("Sunbelt Load+Invoice R# subject recognized as invoice",
     adm.looksLikeInvoiceEmailContent(sunbeltSubject, sunbeltBody));
+check("Sunbelt Load+Invoice numeric subject recognized as invoice",
+    adm.looksLikeInvoiceEmailContent(
+        "Load 267545 Invoice 113077 for US Carrier Inc",
+        "Please process invoice 113077 for load 267545."));
 check("Sunbelt Finance factor domain recognized",
     adm.isCarrierOrFactorSender(sunbeltFrom));
 check("Sunbelt not payment inquiry",
