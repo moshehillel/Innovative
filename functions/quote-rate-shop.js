@@ -1056,7 +1056,7 @@ function customerNamesShareDistinctiveToken(wantRaw, haveRaw) {
   const haveToks = distinctiveCustomerNameTokens(haveRaw);
   if (!wantToks.length || !haveToks.length) return false;
   const haveSet = new Set(haveToks);
-  return wantToks.some((t) => t.length >= 5 && haveSet.has(t));
+  return wantToks.some((t) => t.length >= 4 && haveSet.has(t));
 }
 
 /**
@@ -2033,13 +2033,28 @@ function mergeProtocolRemarksIntoInstructions(existing, remarks) {
   if (!current) return protocol;
   const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
   if (norm(current).includes(norm(protocol))) return current;
-  // Short distinctive line already present → treat as already attached.
+  // Only skip when every distinctive protocol line is already present —
+  // a single overlapping line must not drop the rest of the protocol.
   const lines = protocol.split(/\n+/).map((l) => l.trim()).filter(Boolean);
   const distinctive = lines.filter((l) => l.length >= 24);
-  if (distinctive.some((l) => norm(current).includes(norm(l)))) {
+  if (distinctive.length >= 2 &&
+      distinctive.every((l) => norm(current).includes(norm(l)))) {
     return current;
   }
   return `${current}\n\n${protocol}`;
+}
+
+/**
+ * True when a Primus rate / noRate row is FedEx Freight.
+ * @param {object|null|undefined} row Rate or noRate row.
+ * @return {boolean}
+ */
+function isFedExRateRow(row) {
+  if (!row || typeof row !== "object") return false;
+  const hay = [
+    row.name, row.carrierName, row.SCAC, row.scac, row.accountName,
+  ].filter(Boolean).join(" ").toLowerCase();
+  return /fed\s*ex|fxfe|fxnl|fxfr/.test(hay);
 }
 
 module.exports = {
@@ -2055,6 +2070,7 @@ module.exports = {
   normalizeCustomerName,
   formatShippingLocationRemarks,
   mergeProtocolRemarksIntoInstructions,
+  isFedExRateRow,
   fetchVendorsByCustomer,
   fetchRateTypes,
   searchCostQuotes,

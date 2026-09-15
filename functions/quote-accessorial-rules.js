@@ -19,6 +19,7 @@ const APPLY_TO_VALUES = ["dest", "origin", "both"];
 const DEFAULT_APPLY_TO = "dest";
 const RULE_KIND_SENDER_CUSTOMER = "sender_customer";
 const RULE_KIND_ZIP_FILL = "zip_fill";
+const RULE_KIND_CARRIER_DISPLAY_CLEAN = "carrier_display_clean";
 
 /** Dest accessorial → pickup equivalent when a rule applies to origin. */
 const DEST_TO_ORIGIN_ACCESSORIAL = {
@@ -1100,6 +1101,25 @@ function enrichmentConflictsEmailSiteType(lane, side = "dest") {
 }
 
 /**
+ * Rules that permanently suppress Insurance (INS) on quotes.
+ * Match even when identifyVia/flags wiring is incomplete so Active
+ * "never add insurance" rules always strip INS before Primus.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isNeverAddInsuranceRule(rule) {
+  if (!rule || rule.active === false) return false;
+  const removes = (rule.removeAccessorials || [])
+      .map((c) => String(c || "").toUpperCase());
+  if (!removes.includes("INS")) return false;
+  const flags = ((rule.match && rule.match.flags) || []).map(String);
+  if (flags.includes("insuranceRequested")) return true;
+  const blob = `${rule.name || ""} ${rule.notes || ""}`.toLowerCase();
+  return /never\s+add\s+insurance|do\s+not\s+(?:add\s+)?insurance|no\s+insurance|strip\s+insurance|omit\s+insurance|without\s+insurance/i
+      .test(blob);
+}
+
+/**
  * @param {object} lane Lane with consignee, flags, specialInstructions.
  * @param {object} context Global context (specialInstructionsGlobal).
  * @param {object} rule Rule document.
@@ -1107,6 +1127,7 @@ function enrichmentConflictsEmailSiteType(lane, side = "dest") {
  * @return {string|null} Match dimension or null.
  */
 function ruleMatchVia(lane, context, rule, side = "dest") {
+  if (isNeverAddInsuranceRule(rule)) return "never_insurance";
   const identifyVia = normalizeIdentifyVia(rule);
   let textVia = ruleMatchViaText(lane, context, rule, side);
   const aiVia = ruleMatchViaAi(lane, context, rule, side);
@@ -1221,13 +1242,14 @@ function isCarrierNameOnlyMatch(rule) {
 }
 
 /**
- * Carrier display rename for customer email (strip broker suffixes like
- * "J&I" / "J&I Distributors") — not a Notes: advisory.
+ * Carrier display rename for customer email / rate UI (strip broker
+ * suffixes like "J&I" / "J&I Distributors") — not a Notes: advisory.
  * @param {object} rule Rule document.
  * @return {boolean}
  */
 function isCarrierDisplayCleanRule(rule) {
   if (!rule || rule.active === false) return false;
+  if (rule.ruleKind === RULE_KIND_CARRIER_DISPLAY_CLEAN) return true;
   if (!isCarrierNameOnlyMatch(rule)) return false;
   const hasAcc = (rule.addAccessorials || []).length > 0 ||
     (rule.removeAccessorials || []).length > 0 ||
@@ -1236,8 +1258,19 @@ function isCarrierDisplayCleanRule(rule) {
     !!rule.fillZipCode;
   if (hasAcc) return false;
   const blob = `${rule.name || ""} ${rule.notes || ""}`.toLowerCase();
-  return /clean\s+carrier|omit\s+the|remove\s+.+\s+wording|only\s+the\s+actual\s+carrier|provide\s+only\s+the\s+actual|omit\s+the\s+added/i
-      .test(blob);
+  if (/clean\s+carrier|omit\s+the|remove\s+.+\s+wording|only\s+the\s+actual\s+carrier|provide\s+only\s+the\s+actual|omit\s+the\s+added|strip\s+.+\s+from\s+carrier|j\s*[&\-–—]\s*i|j\s*&\s*i/i
+      .test(blob)) {
+    return true;
+  }
+  // carrierNameContains-only with J&I-like needles and no notes body that
+  // looks like an advisory sentence → treat as display clean.
+  const needles = carrierNameContainsNeedles(rule).map((n) =>
+    String(n || "").toLowerCase());
+  const jiNeedle = needles.some((n) =>
+    /j\s*[&and\-–—]*\s*i|ji\s*distribut/.test(n.replace(/\s+/g, " ")));
+  if (jiNeedle && !String(rule.notes || "").trim()) return true;
+  return jiNeedle &&
+    !/\bhas\s+|delays|do\s+not\s+use|avoid|prefer\b/i.test(blob);
 }
 
 /**
@@ -1259,8 +1292,24 @@ function isCarrierNoteRule(rule) {
 }
 
 /**
+ * Normalize broker-tag tokens so J&I / J-I / J – I / J and I match.
+ * @param {string} value Raw text.
+ * @return {string}
+ */
+function normalizeCarrierNameMatchText(value) {
+  return String(value || "").toLowerCase()
+      .replace(/&/g, " and ")
+      // Single-letter broker tags: "j – i", "j-i", "j and i" → "j i"
+      .replace(/\bj\s*(?:and|[-–—/])\s*i\b/g, "j i")
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
  * Flexible carrier-name haystack match for clean / note needles.
- * Treats &, "and", and hyphen variants between tokens as equivalent.
+ * Treats &, "and", and hyphen / en-dash variants between tokens as
+ * equivalent (J&I ↔ J-I ↔ J – I ↔ J and I).
  * @param {string} hay Carrier name.
  * @param {string} needle Match phrase.
  * @return {boolean}
@@ -1270,46 +1319,63 @@ function carrierNameMatchesNeedle(hay, needle) {
   const n = String(needle || "").toLowerCase().trim();
   if (!h || !n) return false;
   if (h.includes(n)) return true;
-  const norm = (s) => String(s || "").toLowerCase()
-      .replace(/&/g, " and ")
-      .replace(/[^a-z0-9]+/g, " ")
+  const hn = normalizeCarrierNameMatchText(h);
+  const nn = normalizeCarrierNameMatchText(n);
+  if (hn && nn && hn.includes(nn)) return true;
+  // Compact form: "ji" / "jidistributors" vs spaced "j i".
+  const hc = hn.replace(/\s+/g, "");
+  const nc = nn.replace(/\s+/g, "");
+  return !!(hc && nc && hc.includes(nc));
+}
+
+/**
+ * Strip common Primus J&I / J-I DISTRIBUTORS broker suffixes.
+ * @param {string} name Carrier display name.
+ * @return {string}
+ */
+function stripJiBrokerSuffix(name) {
+  return String(name || "")
+      .replace(
+          /\s*[-–—/%]*\s*j\s*(?:&|and|[-–—/])\s*i(?:\s*distribut[eo]rs?)?\b/ig,
+          "")
+      .replace(/\s*[-–—/%]*\s*ji\s*distribut[eo]rs?\b/ig, "")
       .replace(/\s+/g, " ")
+      .replace(/\s*[-–—/,]+$/g, "")
       .trim();
-  const hn = norm(h);
-  const nn = norm(n);
-  return !!(hn && nn && hn.includes(nn));
 }
 
 /**
  * Strip matched broker / distributor wording from a carrier display name.
+ * Always strips common J&I / J-I variants even when no Firestore rule matched.
  * @param {string} rawName Primus / rate carrier name.
  * @param {Array<{id: string, test: Function, needles: Array<string>}>} [rules]
  * @return {string}
  */
 function cleanCustomerEmailCarrierName(rawName, rules) {
   let name = String(rawName || "").trim();
-  if (!name || !Array.isArray(rules) || !rules.length) return name;
+  if (!name) return name;
   let matched = false;
-  for (const rule of rules) {
-    if (!rule || typeof rule.test !== "function") continue;
-    if (!rule.test(name)) continue;
-    matched = true;
-    for (const needle of rule.needles || []) {
-      const n = String(needle || "").trim();
-      if (!n) continue;
-      const flex = n
-          .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-          .replace(/\\?\s+/g, "[\\s\\-–—/]*")
-          .replace(/\\?&/g, "(?:&|and|\\-)");
-      name = name.replace(
-          new RegExp(`[\\s\\-–—/]*${flex}`, "ig"), " ");
+  if (Array.isArray(rules) && rules.length) {
+    for (const rule of rules) {
+      if (!rule || typeof rule.test !== "function") continue;
+      if (!rule.test(name)) continue;
+      matched = true;
+      for (const needle of rule.needles || []) {
+        const n = String(needle || "").trim();
+        if (!n) continue;
+        const flex = n
+            .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+            .replace(/\\?\s+/g, "[\\s\\-–—/]*")
+            .replace(/\\?&/g, "(?:&|and|\\-)");
+        name = name.replace(
+            new RegExp(`[\\s\\-–—/]*${flex}`, "ig"), " ");
+      }
     }
   }
-  if (matched) {
-    // Common Primus J&I / J-I DISTRIBUTORS suffixes left after partial strip.
-    name = name.replace(
-        /\s*[-–—/]*\s*j\s*[&and\-–—]+\s*i(?:\s*distributors?)?\b/ig, "");
-    name = name.replace(/\s*[-–—/]*\s*ji\s*distributors?\b/ig, "");
+  // Always strip common J&I / J-I DISTRIBUTORS tags — Primus appends these
+  // even when the Active clean rule needles miss a dash/en-dash variant.
+  if (matched || /\bj\s*(?:&|and|[-–—/])\s*i\b|\bji\s*distribut/i.test(name)) {
+    name = stripJiBrokerSuffix(name);
   }
   return name
       .replace(/\s+/g, " ")
@@ -1421,9 +1487,9 @@ function applyRulesToLane(lane, rules, context = {}) {
     // they must not invent site accessorials here.
     if (isSenderCustomerRule(rule)) continue;
     if (isZipFillRule(rule)) continue;
-    // Carrier-name notes attach at email-draft time (selected rates), not
-    // during lane accessorial matching.
+    // Carrier-name notes / display cleaners attach at email / UI time.
     if (isCarrierNoteRule(rule)) continue;
+    if (isCarrierDisplayCleanRule(rule)) continue;
     for (const side of ruleSides(rule)) {
       const via = ruleMatchVia(lane, context, rule, side);
       if (!via) continue;
@@ -1523,6 +1589,7 @@ function applyRemoveAccessorialRules(lane, rulesOut, rules, context = {}) {
     if (isSenderCustomerRule(rule)) continue;
     if (isZipFillRule(rule)) continue;
     if (isCarrierNoteRule(rule)) continue;
+    if (isCarrierDisplayCleanRule(rule)) continue;
     const removes = rule.removeAccessorials || [];
     if (!removes.length) continue;
     for (const side of ruleSides(rule)) {
@@ -1657,6 +1724,7 @@ module.exports = {
   DEST_TO_ORIGIN_ACCESSORIAL,
   RULE_KIND_SENDER_CUSTOMER,
   RULE_KIND_ZIP_FILL,
+  RULE_KIND_CARRIER_DISPLAY_CLEAN,
   SYNTHETIC_REQUEST_FLAGS,
   MANAGED_DEFAULT_RULE_IDS,
   RETIRED_DEFAULT_RULE_IDS,
@@ -1685,11 +1753,13 @@ module.exports = {
   isZipFillRule,
   isCarrierNoteRule,
   isCarrierDisplayCleanRule,
+  isNeverAddInsuranceRule,
   isCarrierNameOnlyMatch,
   carrierNameContainsNeedles,
   carrierNameMatchesNeedle,
   customerEmailNoteText,
   cleanCustomerEmailCarrierName,
+  stripJiBrokerSuffix,
   toCustomerEmailCarrierNoteRules,
   toCustomerEmailCarrierCleanRules,
   applyZipFillRules,

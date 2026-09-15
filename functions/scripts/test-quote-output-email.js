@@ -196,7 +196,12 @@ const roadrunnerEmail = quoteOutput.buildCustomerEmailFromSelections({
 checkIncludes(
     "Roadrunner Firestore carrier note on selected rate",
     roadrunnerEmail,
-    "• Roadrunner J&I: has lots of delays in transit.",
+    "• Roadrunner: has lots of delays in transit.",
+);
+checkNotIncludes(
+    "Roadrunner note strips J&I in Notes label",
+    roadrunnerEmail,
+    "Roadrunner J&I",
 );
 checkNotIncludes(
     "Roadrunner note omitted when not selected",
@@ -253,6 +258,23 @@ check(
     quoteRules.cleanCustomerEmailCarrierName(
         "Central Transport - J - I DISTRIBUTORS", jiCleanRules),
     "Central Transport",
+);
+check(
+    "en-dash J – I cleaned via needle match",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "Roadrunner J – I", jiCleanRules),
+    "Roadrunner",
+);
+check(
+    "builtin strip without Firestore rules",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "ABF Freight J-I DISTRIBUTERS", []),
+    "ABF Freight",
+);
+check(
+    "needle match equates J&I and J – I",
+    quoteRules.carrierNameMatchesNeedle("Roadrunner J – I", "j&i"),
+    true,
 );
 checkNotIncludes(
     "J&I clean rule is not a Notes advisory",

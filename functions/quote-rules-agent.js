@@ -202,7 +202,7 @@ function getToolDefinitions() {
         name: "draft_create_rule",
         description:
           "Build a create proposal for Confirm. ruleKind: accessorial " +
-          "(omit), sender_customer, or zip_fill.",
+          "(omit), sender_customer, zip_fill, or carrier_display_clean.",
         parameters: {
           type: "object",
           properties: {
@@ -210,7 +210,10 @@ function getToolDefinitions() {
             name: {type: "string"},
             ruleKind: {
               type: "string",
-              enum: ["accessorial", "sender_customer", "zip_fill"],
+              enum: [
+                "accessorial", "sender_customer", "zip_fill",
+                "carrier_display_clean",
+              ],
             },
             match: {type: "object"},
             addAccessorials: {
@@ -878,10 +881,12 @@ async function runQuoteRulesAgentTurn(opts) {
     "   customer email draft (Notes: section), not during rate shop.",
     "   Use identifyVia email (ignored). notes = plain advisory text",
     "   like 'has lots of delays in transit.' (no 'Add note:' prefix).",
-    "5) carrier display clean — match.carrierNameContains [j&i] +",
-    "   notes that say to omit/remove that wording from the carrier",
-    "   name shown in the customer email (rate lines + Notes labels).",
+    "5) carrier display clean — ruleKind carrier_display_clean OR",
+    "   match.carrierNameContains [j&i, j-i, j – i] + notes that say to",
+    "   omit/remove that wording from the carrier name shown in the",
+    "   customer email and rate list (rate lines + Notes labels).",
     "   Not a Notes advisory; do not use sender_customer for this.",
+    "   Include needles for J&I, J-I, and J – I variants.",
     "",
     "When user says 'notification' they usually mean Notification (NTD).",
     "If they want 'when Appointment delivery is on, never also",

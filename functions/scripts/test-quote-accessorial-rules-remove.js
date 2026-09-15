@@ -184,6 +184,28 @@ checkTrue("post-email remove records never_add_insurance",
     (stripped.appliedRules || []).some((r) =>
       r.ruleId === "never_add_insurance"));
 
+// Name-only never-ins rule (no flags) still always strips INS.
+const neverInsByName = {
+  id: "never_ins_name",
+  active: true,
+  priority: 40,
+  name: "Never add insurance",
+  identifyVia: "email",
+  match: {},
+  addAccessorials: [],
+  removeAccessorials: ["INS"],
+  applyTo: "dest",
+};
+const outInsName = quoteRules.applyRulesToLane({
+  consignee: {name: "Acme"},
+  shipper: {},
+  accessorials: ["INS", "APD"],
+  accessorialsWithData: [{code: "INS"}, {code: "APD"}],
+}, [neverInsByName], {});
+checkTrue("never-ins by name always strips INS",
+    !outInsName.accessorials.includes("INS") &&
+    outInsName.accessorials.includes("APD"));
+
 if (failures) {
   console.error(`\n${failures} failure(s)`);
   process.exit(1);

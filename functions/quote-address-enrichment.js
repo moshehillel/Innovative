@@ -197,7 +197,9 @@ function pushLaneZipWarning(lane, warning) {
  * @return {Promise<{city: string, state: string, zipCode: string}|null>}
  */
 async function lookupUsZip(zip) {
-  const z = String(zip || "").replace(/\D/g, "").slice(0, 5);
+  const digits = String(zip || "").replace(/\D/g, "");
+  const z = digits.length > 0 && digits.length < 5 ?
+    digits.padStart(5, "0") : digits.slice(0, 5);
   if (!/^\d{5}$/.test(z)) return null;
   try {
     const resp = await fetch(`https://api.zippopotam.us/us/${z}`, {
@@ -211,6 +213,31 @@ async function lookupUsZip(zip) {
     const state = String(place["state abbreviation"] || "").trim();
     if (!city || !state) return null;
     return {city, state, zipCode: z};
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * ZIP → city/state via Google Geocoding (fallback when Zippopotam fails).
+ * @param {string} zip Raw ZIP.
+ * @return {Promise<{city: string, state: string, zipCode: string}|null>}
+ */
+async function lookupUsZipViaGoogle(zip) {
+  const digits = String(zip || "").replace(/\D/g, "");
+  const z = digits.length > 0 && digits.length < 5 ?
+    digits.padStart(5, "0") : digits.slice(0, 5);
+  if (!/^\d{5}$/.test(z)) return null;
+  const apiKey = getGoogleApiKey();
+  if (!apiKey) return null;
+  try {
+    const loc = await geocodeAddressToZip(`${z}, USA`, apiKey, "", "");
+    if (!loc || !loc.city || !loc.state) return null;
+    return {
+      city: String(loc.city).trim(),
+      state: String(loc.state).trim(),
+      zipCode: z,
+    };
   } catch (_) {
     return null;
   }
@@ -348,7 +375,8 @@ function parseGoogleAddressComponents(comps, fallbackCity, fallbackState) {
   const route = get("route");
   const street = [streetNum, route].filter(Boolean).join(" ").trim();
   return {
-    city: get("locality", false) || fallbackCity,
+    city: get("locality", false) || get("postal_town", false) ||
+      get("sublocality", false) || fallbackCity,
     state: get("administrative_area_level_1") || fallbackState,
     zipCode,
     address1: street || undefined,
@@ -468,15 +496,20 @@ function applyKnownWarehouseZipOverride(party, lane) {
 async function fillPartyCityStateFromZip(party, lane) {
   if (!partyNeedsCityStateFromZip(party)) return party;
   const zip = party.zipCode || party.zipcode || party.zip;
-  const loc = await lookupUsZip(zip);
-  if (!loc) return party;
+  let loc = await lookupUsZip(zip);
+  if (!loc) loc = await lookupUsZipViaGoogle(zip);
+  if (!loc) {
+    pushLaneZipWarning(lane, "zip fill failed");
+    return party;
+  }
   pushLaneZipWarning(lane, "zip filled");
   return {
     ...party,
     city: String(party.city || "").trim() || loc.city,
     state: String(party.state || "").trim() || loc.state,
-    zipCode: String(party.zipCode || party.zipcode || party.zip || loc.zipCode)
-        .trim(),
+    // Prefer normalized 5-digit ZIP from lookup (pads 8701 → 08701).
+    zipCode: loc.zipCode ||
+      String(party.zipCode || party.zipcode || party.zip || "").trim(),
     country: String(party.country || "US").trim() || "US",
   };
 }

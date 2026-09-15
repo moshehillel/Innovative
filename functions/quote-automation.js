@@ -74,6 +74,17 @@ async function resolveCustomerMatch(opts) {
   if (shipperName && shipperName.toLowerCase() !== customerName.toLowerCase()) {
     searchTerms.push(shipperName);
   }
+  const parsedFrom = customerNameUtil.parseSenderEmail(opts.from || "");
+  if (parsedFrom.displayName &&
+      !customerNameUtil.isUnusableCustomerName(
+          parsedFrom.displayName, opts.from || "")) {
+    const disp = String(parsedFrom.displayName).trim();
+    if (disp &&
+        disp.toLowerCase() !== customerName.toLowerCase() &&
+        disp.toLowerCase() !== shipperName.toLowerCase()) {
+      searchTerms.push(disp);
+    }
+  }
   const refHead = ref.split(/[/|,]/)[0].trim();
   if (refHead.length > 2 && !/^\d+$/.test(refHead) &&
       refHead.toLowerCase() !== customerName.toLowerCase() &&
@@ -136,13 +147,21 @@ async function resolveCustomerMatch(opts) {
     const id = row && row.id ? String(row.id) : null;
     let name = (row && row.name) || null;
     let remarks = (row && row.remarks) || null;
-    if (id && (!name || remarks == null || remarks === "")) {
+    // Always hydrate from Primus detail — list search often omits remarks.
+    if (id) {
       try {
         const loc = await rateShop.getShippingLocationById(id);
-        if (loc && loc.name && !name) name = loc.name;
-        if (loc && loc.remarks != null &&
-            (remarks == null || remarks === "")) {
-          remarks = loc.remarks;
+        if (loc) {
+          if (loc.name && !name) name = loc.name;
+          const detailRemarks = loc.remarks != null ? loc.remarks :
+            (loc.remark != null ? loc.remark :
+              (loc.protocolRemarks != null ? loc.protocolRemarks : null));
+          if (detailRemarks != null && String(detailRemarks).trim() !== "") {
+            remarks = detailRemarks;
+          } else if ((remarks == null || remarks === "") &&
+              detailRemarks != null) {
+            remarks = detailRemarks;
+          }
         }
       } catch (_) {
         // keep id without name / remarks
@@ -246,14 +265,17 @@ async function applyCustomerLookupToPatch(data, patch, opts = {}) {
       customerRef || null;
     patch.customerLookupQueries = match.searchesTried || [];
     if (match.remarks) {
-      const baseSi = patch.specialInstructionsGlobal != null ?
-        patch.specialInstructionsGlobal :
-        (data.specialInstructionsGlobal || "");
-      patch.specialInstructionsGlobal =
-        rateShop.mergeProtocolRemarksIntoInstructions(
-            baseSi, match.remarks);
-      patch.customerProtocolRemarks =
+      const protocolText =
         rateShop.formatShippingLocationRemarks(match.remarks);
+      if (protocolText) {
+        const baseSi = patch.specialInstructionsGlobal != null ?
+          patch.specialInstructionsGlobal :
+          (data.specialInstructionsGlobal || "");
+        patch.specialInstructionsGlobal =
+          rateShop.mergeProtocolRemarksIntoInstructions(
+              baseSi, match.remarks);
+        patch.customerProtocolRemarks = protocolText;
+      }
     }
     const customerMatch = {
       id: String(match.id),
@@ -751,6 +773,16 @@ async function rateLane(lane, ctx) {
       lane.consignee = await addressEnrichment.fillPartyOdFromZipOrCityState(
           lane.consignee, lane);
     }
+    // Warehouse zip_fill rules (e.g. La Mirada STG) must also run on
+    // re-rate paths that skip enrichLaneAddresses.
+    if (Array.isArray(ctx.rules) && ctx.rules.length) {
+      quoteRules.applyZipFillRules(lane, ctx.rules, lane, {
+        fromEmail: ctx.from || lane.fromEmail || "",
+        fromName: ctx.fromName || lane.fromName || "",
+        customerName: ctx.shippingLocationName ||
+          ctx.customerName || lane.customerName || "",
+      });
+    }
   }
   const odCheck = validateLaneForRating(lane);
   if (!odCheck.ok) {
@@ -823,6 +855,17 @@ async function rateLane(lane, ctx) {
       filterCarrierWarnings: [],
       requiresConfirm: false,
     };
+    // Still honor Active remove rules (e.g. never-add-insurance) so
+    // dispatcher overrides cannot reintroduce suppressed codes to Primus.
+    const extractCtx = {
+      ...(ctx.extracted && typeof ctx.extracted === "object" ?
+        ctx.extracted : {}),
+      emailBody: ctx.emailBody || "",
+      subject: ctx.subject || "",
+      customerDeclinedAccessorials: declinedCodes,
+    };
+    rulesOut = quoteRules.applyRemoveAccessorialRules(
+        laneForRate, rulesOut, ctx.rules, extractCtx);
   } else {
     const extractCtx = {
       ...extracted,
@@ -913,6 +956,40 @@ async function rateLane(lane, ctx) {
     }
   }
 
+  // Partial customer success often omits FedEx. Supplement market FedEx
+  // rows when the customer profile returned other carriers but no FedEx.
+  let fedexMarketSupplement = false;
+  let fedexNoRateHint = null;
+  if (rates.length && ctx.shippingLocationId &&
+      rateSource === "customer" &&
+      !rates.some((r) => rateShop.isFedExRateRow(r))) {
+    try {
+      const marketQuery = {...query};
+      delete marketQuery.customerId;
+      const marketFetch = await rateShop.fetchMultipleRates(marketQuery);
+      const marketRates = marketFetch.rates || [];
+      const marketNo = marketFetch.noRates || [];
+      const fedexRows = marketRates.filter((r) => rateShop.isFedExRateRow(r));
+      if (fedexRows.length) {
+        rates = rates.concat(fedexRows);
+        fedexMarketSupplement = true;
+      } else {
+        const fedexFail = [...noRates, ...marketNo].find((row) =>
+          rateShop.isFedExRateRow(row) ||
+          /fedex|fxfe|fxnl|fxfr/i.test(String(
+              (row && (row.name || row.carrierName || row.error)) || "")));
+        if (fedexFail) {
+          fedexNoRateHint = String(
+              fedexFail.error || fedexFail.message ||
+              "FedEx returned no rate").trim();
+        }
+      }
+      noRates = [...noRates, ...marketNo];
+    } catch (_) {
+      // Keep customer rates; FedEx absence is non-fatal.
+    }
+  }
+
   const filtered = rateShop.filterBlockedCarriers(
       rates, rulesOut.filterCarrierWarnings);
 
@@ -923,9 +1000,13 @@ async function rateLane(lane, ctx) {
 
   const enriched = filtered.map((r) => {
     const billToTotal = r.billTo && r.billTo.total;
+    // Market-supplemented FedEx rows are not customer-contract costs.
+    const rowSource = fedexMarketSupplement && rateShop.isFedExRateRow(r) &&
+      rateSource === "customer" ?
+      "market_fallback" : rateSource;
     const sellRate = rateShop.computeSellRate(r.total, {
       billToTotal,
-      rateSource,
+      rateSource: rowSource,
       ...marginOpts,
     });
     return {...r, sellRate};
@@ -933,9 +1014,20 @@ async function rateLane(lane, ctx) {
 
   const tagged = rateShop.tagRateOptions(enriched, ctx.customerPrefs || {});
   const topN = Number(process.env.QUOTE_TOP_RATES) || 20;
-  const options = rateShop.pickTopOptions(tagged, topN, {
+  let options = rateShop.pickTopOptions(tagged, topN, {
     ensureGuaranteed: wantsGuaranteed,
     mode: "cheapest",
+  });
+
+  // Strip broker J&I suffixes on rate-shop / dispatcher options (not
+  // email-only) so Active clean rules and Primus tags stay consistent.
+  const carrierCleanRules =
+    quoteRules.toCustomerEmailCarrierCleanRules(ctx.rules || []);
+  options = options.map((o) => {
+    const cleaned = quoteRules.cleanCustomerEmailCarrierName(
+        o && o.name, carrierCleanRules);
+    if (!cleaned || cleaned === (o && o.name)) return o;
+    return {...o, name: cleaned, rawName: o.name};
   });
 
   const freightApplied = Array.isArray(lane.freightRulesApplied) ?
@@ -955,12 +1047,21 @@ async function rateLane(lane, ctx) {
   } else if (rateSource === "market_fallback") {
     addWarn("market fallback");
   }
+  if (fedexMarketSupplement) {
+    addWarn("FedEx from market (not on customer profile)");
+  }
+  if (fedexNoRateHint) {
+    addWarn(`FedEx: ${fedexNoRateHint}`);
+  }
   for (const w of rulesOut.extractionWarnings || []) addWarn(w);
   if (!options.length) {
     rateError = rateShop.summarizeNoRateErrors(noRates) ||
       "No rates returned from Primus.";
   } else if (rateNote) {
     rateWarning = rateNote;
+  } else if (fedexNoRateHint && !options.some((o) =>
+    rateShop.isFedExRateRow(o))) {
+    rateWarning = `FedEx unavailable: ${fedexNoRateHint}`;
   }
 
   return {
@@ -1106,10 +1207,14 @@ async function processQuoteEmail(opts) {
   const customerLookupStatus = customerMatch.lookupStatus ||
     (shippingLocationId ? "matched" : "no_match");
   if (customerMatch.remarks) {
-    extracted.specialInstructionsGlobal =
-      rateShop.mergeProtocolRemarksIntoInstructions(
-          extracted.specialInstructionsGlobal || "",
-          customerMatch.remarks);
+    const protocolText =
+      rateShop.formatShippingLocationRemarks(customerMatch.remarks);
+    if (protocolText) {
+      extracted.specialInstructionsGlobal =
+        rateShop.mergeProtocolRemarksIntoInstructions(
+            extracted.specialInstructionsGlobal || "",
+            customerMatch.remarks);
+    }
   }
 
   const enrichLog = (level, category, message, data) =>
@@ -1192,8 +1297,11 @@ async function processQuoteEmail(opts) {
     customerLookupQuery: extractedCustomerName ||
       customerMatch.searchTerm || null,
     customerLookupQueries: customerMatch.searchesTried || [],
-    customerProtocolRemarks: customerMatch.remarks ?
-      rateShop.formatShippingLocationRemarks(customerMatch.remarks) : null,
+    customerProtocolRemarks: (() => {
+      const text = rateShop.formatShippingLocationRemarks(
+          customerMatch.remarks);
+      return text || null;
+    })(),
     customerDeclinedAccessorials: extracted.customerDeclinedAccessorials ||
       [],
     extractModel: extracted.extractModel || null,
@@ -1211,6 +1319,28 @@ async function processQuoteEmail(opts) {
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
+
+  const zipExpandFailed = (quoteDoc.extractionWarnings || []).some((w) =>
+    /zip fill failed/i.test(String(w || ""))) ||
+    (ratedLanes || []).some((lane) => {
+      const ship = lane && lane.shipper;
+      const cons = lane && lane.consignee;
+      return addressEnrichment.partyNeedsCityStateFromZip(ship) ||
+        addressEnrichment.partyNeedsCityStateFromZip(cons) ||
+        (lane.extractionWarnings || []).some((w) =>
+          /zip fill failed/i.test(String(w || "")));
+    });
+  if (zipExpandFailed) {
+    quoteDoc.forReview = true;
+    quoteDoc.forReviewAt = admin.firestore.FieldValue.serverTimestamp();
+    quoteDoc.forReviewBy = "zip_fill";
+    const warns = Array.isArray(quoteDoc.extractionWarnings) ?
+      quoteDoc.extractionWarnings.slice() : [];
+    if (!warns.includes("zip fill failed — needs review")) {
+      warns.push("zip fill failed — needs review");
+    }
+    quoteDoc.extractionWarnings = warns;
+  }
 
   quoteDoc.customerDraftText = quoteOutput.buildCustomerDraftText(quoteDoc);
 

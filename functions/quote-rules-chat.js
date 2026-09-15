@@ -12,6 +12,7 @@ const {
   ACCESSORIAL_LABELS,
   RULE_KIND_SENDER_CUSTOMER,
   RULE_KIND_ZIP_FILL,
+  RULE_KIND_CARRIER_DISPLAY_CLEAN,
 } = require("./quote-accessorial-rules");
 
 // Default gpt-5.6-luna for freeform rule chat. Override via env.
@@ -2526,6 +2527,12 @@ function proposalHasEnoughIdentifyInfo(result) {
         .concat(match.consigneeCityContains || [])
         .concat(match.cityContains || []);
     return cities.length > 0;
+  }
+  if (patch.ruleKind === RULE_KIND_CARRIER_DISPLAY_CLEAN ||
+      (Array.isArray(match.carrierNameContains) &&
+        match.carrierNameContains.length)) {
+    return Array.isArray(match.carrierNameContains) &&
+      match.carrierNameContains.length > 0;
   }
   if (match.siteType || (Array.isArray(match.flags) && match.flags.length)) {
     return true;

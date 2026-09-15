@@ -64,12 +64,20 @@ test("existing SI appends protocol once", () => {
   assert.strictEqual(twice, once);
 });
 
-test("partial distinctive line already present skips re-append", () => {
+test("partial distinctive line already present still appends full protocol", () => {
   const partial =
     "FREIGHT ALWAYS READY, NO NEED TO RECONFIRM — confirmed with WH";
   const out = rateShop.mergeProtocolRemarksIntoInstructions(
       partial, SANDERS_REMARKS);
-  assert.strictEqual(out, partial);
+  assert.ok(out.includes(partial));
+  assert.ok(out.includes("DO NOT USE XPO"));
+  assert.ok(out.includes("WAREHOUSE MGR- TOMMY"));
+});
+
+test("isFedExRateRow detects common FedEx labels", () => {
+  assert.strictEqual(rateShop.isFedExRateRow({name: "FedEx Freight"}), true);
+  assert.strictEqual(rateShop.isFedExRateRow({SCAC: "FXFE"}), true);
+  assert.strictEqual(rateShop.isFedExRateRow({name: "XPO"}), false);
 });
 
 if (failed) {
