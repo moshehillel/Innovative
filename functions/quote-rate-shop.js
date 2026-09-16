@@ -836,125 +836,6 @@ function shouldRetryRatesWithoutCustomer(_noRates) {
 }
 
 /**
- * Dedupe key for Primus rate rows (SCAC + service + rate type + mode).
- * @param {object|null|undefined} row Normalized rate row.
- * @return {string}
- */
-function primusRateDedupeKey(row) {
-  if (!row || typeof row !== "object") return "";
-  const scac = String(row.SCAC || row.scac || "").toUpperCase().trim();
-  const name = String(row.name || row.carrierName || "")
-      .toLowerCase().replace(/\s+/g, " ").trim();
-  const service = String(row.serviceType || "").toLowerCase().trim();
-  const rateType = String(row.rateType || "").toLowerCase().trim();
-  const mode = String(row.mode || "").toLowerCase().trim();
-  return [scac || name || "unknown", service, rateType, mode].join("|");
-}
-
-/**
- * Merge two Primus rate lists; keep the cheaper total per dedupe key.
- * @param {Array<object>} primary First-call rates.
- * @param {Array<object>} secondary Retry rates.
- * @return {Array<object>}
- */
-function mergePrimusRateRows(primary, secondary) {
-  const map = new Map();
-  const order = [];
-  const consider = (row) => {
-    if (!row || typeof row !== "object") return;
-    const key = primusRateDedupeKey(row);
-    if (!key) return;
-    const prev = map.get(key);
-    if (!prev) {
-      map.set(key, row);
-      order.push(key);
-      return;
-    }
-    const prevTotal = Number(prev.total);
-    const nextTotal = Number(row.total);
-    if (Number.isFinite(nextTotal) &&
-        (!Number.isFinite(prevTotal) || nextTotal < prevTotal)) {
-      map.set(key, row);
-    }
-  };
-  for (const r of primary || []) consider(r);
-  for (const r of secondary || []) consider(r);
-  return order.map((k) => map.get(k));
-}
-
-/**
- * Union noRates rows; drop exact SCAC/name/error duplicates.
- * @param {Array<object>} primary First-call noRates.
- * @param {Array<object>} secondary Retry noRates.
- * @return {Array<object>}
- */
-function mergePrimusNoRates(primary, secondary) {
-  const seen = new Set();
-  const out = [];
-  for (const row of [...(primary || []), ...(secondary || [])]) {
-    if (!row || typeof row !== "object") continue;
-    const key = [
-      String(row.SCAC || row.scac || "").toUpperCase(),
-      String(row.name || row.carrierName || "").toLowerCase(),
-      String(row.error || row.message || "").slice(0, 120),
-    ].join("|");
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(row);
-  }
-  return out;
-}
-
-/**
- * True when a customer /rate/multiple response should get one more
- * identical call to catch intermittent Primus vendor omissions.
- * Default: any non-empty customer result (or sparse below minRates).
- * @param {Array<object>} rates First-call rates.
- * @param {object} [opts] customerId, minRates, always.
- * @return {boolean}
- */
-function shouldRetryIncompleteCustomerRates(rates, opts = {}) {
-  if (process.env.QUOTE_PRIMUS_RATE_RETRY === "0") return false;
-  const customerId = opts.customerId != null ? opts.customerId :
-    opts.hasCustomer;
-  if (!customerId) return false;
-  const rows = Array.isArray(rates) ? rates : [];
-  if (!rows.length) return false;
-  if (opts.always === true ||
-      process.env.QUOTE_PRIMUS_RATE_RETRY_ALWAYS === "1") {
-    return true;
-  }
-  const minRates = Number(
-      opts.minRates != null ? opts.minRates :
-        process.env.QUOTE_PRIMUS_RATE_RETRY_MIN);
-  // Blind retry on any customer hit is the durable fix for partial
-  // vendor sets (e.g. D6181 missing cheap J&I on first call only).
-  // Optional minRates still allows "retry only if sparse" if set.
-  if (Number.isFinite(minRates) && minRates > 0) {
-    return rows.length < minRates;
-  }
-  return true;
-}
-
-/**
- * Merge two fetchMultipleRates results; prefer cheaper rate rows.
- * @param {object} first First fetch {rates, noRates, raw, ok}.
- * @param {object} second Retry fetch.
- * @return {object} Merged fetch shape + primusRateRetried.
- */
-function mergePrimusRateFetches(first, second) {
-  const a = first || {};
-  const b = second || {};
-  return {
-    ok: !!(a.ok || b.ok),
-    rates: mergePrimusRateRows(a.rates || [], b.rates || []),
-    noRates: mergePrimusNoRates(a.noRates || [], b.noRates || []),
-    raw: b.raw != null ? b.raw : a.raw,
-    primusRateRetried: true,
-  };
-}
-
-/**
  * @param {object} params Flat + array query params for /rate/multiple.
  * @return {Promise<object>} {ok, rates, noRates, raw}
  */
@@ -968,34 +849,6 @@ async function fetchMultipleRates(params) {
     noRates: parseNoRatesFromResponse(json),
     raw: json,
   };
-}
-
-/**
- * Customer /rate/multiple with at most one identical retry when the
- * first response looks incomplete / intermittent. Max 1 extra call.
- * Uses module.exports.fetchMultipleRates so test doubles apply.
- * @param {object} params Query params (must include customerId).
- * @param {object} [opts] minRates, always, enabled, fetchFn.
- * @return {Promise<object>} {ok, rates, noRates, raw, primusRateRetried}
- */
-async function fetchMultipleRatesWithCustomerRetry(params, opts = {}) {
-  const fetchFn = typeof opts.fetchFn === "function" ?
-    opts.fetchFn :
-    (module.exports.fetchMultipleRates || fetchMultipleRates);
-  const first = await fetchFn(params);
-  const rates = first.rates || [];
-  const customerId = params && params.customerId;
-  const enabled = opts.enabled !== false;
-  if (!enabled ||
-      !shouldRetryIncompleteCustomerRates(rates, {
-        customerId,
-        minRates: opts.minRates,
-        always: opts.always,
-      })) {
-    return {...first, primusRateRetried: false};
-  }
-  const second = await fetchFn(params);
-  return mergePrimusRateFetches(first, second);
 }
 
 /**
@@ -2216,12 +2069,6 @@ function isFedExRateRow(row) {
 module.exports = {
   init,
   fetchMultipleRates,
-  fetchMultipleRatesWithCustomerRetry,
-  primusRateDedupeKey,
-  mergePrimusRateRows,
-  mergePrimusNoRates,
-  mergePrimusRateFetches,
-  shouldRetryIncompleteCustomerRates,
   fetchSingleRate,
   saveRate,
   searchShippingLocations,
