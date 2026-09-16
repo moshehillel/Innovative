@@ -1784,7 +1784,8 @@ function normalizeFreightInfoForRate(freightInfo, opts = {}) {
 /**
  * Builds query params for GET /rate/multiple per Primus API docs.
  * @param {object} lane shipper, consignee, freightInfo, accessorials.
- * @param {object} [opts] customerId, UOM, pickupDate, rateTypes, etc.
+ * @param {object} [opts] customerId, UOM, pickupDate, rateTypes,
+ *   includeGuaranteed, includeVolume (default true — Primus Show Volume).
  * @return {object}
  */
 function buildRateMultipleQuery(lane, opts = {}) {
@@ -1835,8 +1836,15 @@ function buildRateMultipleQuery(lane, opts = {}) {
     params.accessorialsWithData = JSON.stringify(accData);
   }
 
-  const rateTypes = opts.rateTypes ||
-    (opts.includeGuaranteed ? ["LTL", "GUARANTEED"] : ["LTL"]);
+  // Primus UI "Show Volume" includes VOLUME (FedEx Freight Spot TL
+  // exempt/service, ODFL volume, etc.). LTL-only omits those rows.
+  // VOL is accepted as an alias for VOLUME on /rate/multiple.
+  const includeVolume = opts.includeVolume !== false;
+  const rateTypes = opts.rateTypes || [
+    "LTL",
+    ...(includeVolume ? ["VOLUME"] : []),
+    ...(opts.includeGuaranteed ? ["GUARANTEED"] : []),
+  ];
   params["rateTypesList[]"] = rateTypes.map(String);
 
   return params;
@@ -2054,7 +2062,8 @@ function isFedExRateRow(row) {
   const hay = [
     row.name, row.carrierName, row.SCAC, row.scac, row.accountName,
   ].filter(Boolean).join(" ").toLowerCase();
-  return /fed\s*ex|fxfe|fxnl|fxfr/.test(hay);
+  // FDSQ = FedEx Freight Spot (VOLUME / truckload-exempt quotes).
+  return /fed\s*ex|fxfe|fxnl|fxfr|fdsq/.test(hay);
 }
 
 module.exports = {

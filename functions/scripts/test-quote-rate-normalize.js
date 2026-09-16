@@ -56,6 +56,31 @@ const q = rateShop.buildRateMultipleQuery({
 }, {UOM: "US"});
 check("query originCountry US", q.originCountry, "US");
 check("query destinationCountry US", q.destinationCountry, "US");
+check(
+    "default rateTypes include LTL+VOLUME",
+    JSON.stringify(q["rateTypesList[]"]),
+    JSON.stringify(["LTL", "VOLUME"]),
+);
+const qVolOff = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "NY", zipCode: "10913", country: "USA"},
+  consignee: {city: "B", state: "MA", zipCode: "01040", country: "United States"},
+  freightInfo: [{qty: 1, weight: 100, dimType: "pallet"}],
+}, {UOM: "US", includeVolume: false});
+check(
+    "includeVolume false → LTL only",
+    JSON.stringify(qVolOff["rateTypesList[]"]),
+    JSON.stringify(["LTL"]),
+);
+const qGtdVol = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "NY", zipCode: "10913", country: "USA"},
+  consignee: {city: "B", state: "MA", zipCode: "01040", country: "United States"},
+  freightInfo: [{qty: 1, weight: 100, dimType: "pallet"}],
+}, {UOM: "US", includeGuaranteed: true});
+check(
+    "guaranteed + volume rateTypes",
+    JSON.stringify(qGtdVol["rateTypesList[]"]),
+    JSON.stringify(["LTL", "VOLUME", "GUARANTEED"]),
+);
 const freight = JSON.parse(q.freightInfo);
 check("query freight dimType PLT", freight[0].dimType, "PLT");
 

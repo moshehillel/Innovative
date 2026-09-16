@@ -77,6 +77,8 @@ test("partial distinctive line already present still appends full protocol", () 
 test("isFedExRateRow detects common FedEx labels", () => {
   assert.strictEqual(rateShop.isFedExRateRow({name: "FedEx Freight"}), true);
   assert.strictEqual(rateShop.isFedExRateRow({SCAC: "FXFE"}), true);
+  assert.strictEqual(rateShop.isFedExRateRow({name: "FedEx Freight Spot"}), true);
+  assert.strictEqual(rateShop.isFedExRateRow({SCAC: "FDSQ"}), true);
   assert.strictEqual(rateShop.isFedExRateRow({name: "XPO"}), false);
 });
 
