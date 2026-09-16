@@ -1032,9 +1032,16 @@ async function handleGetQuoteDispatcherInbox(req, res) {
         console.warn("quote outlook sync:", syncErr.message);
       }
     }
+    const parsedLimit = Number(req.query.limit);
+    const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ?
+      Math.min(Math.floor(parsedLimit), 100) : 20;
+    const parsedOffset = Number(req.query.offset);
+    const offset = Number.isFinite(parsedOffset) && parsedOffset > 0 ?
+      Math.floor(parsedOffset) : 0;
     const listed = await quoteAutomation.listQuotesForDispatcher(
         user.tenant, user.dispatcher, {
-          limit: Number(req.query.limit) || 50,
+          limit,
+          offset,
           status: status || undefined,
         });
     const items = Array.isArray(listed) ? listed : (listed.items || []);
@@ -1048,6 +1055,9 @@ async function handleGetQuoteDispatcherInbox(req, res) {
       dismissed: 0,
       completed: 0,
     };
+    const hasMore = Array.isArray(listed) ?
+      items.length === limit :
+      !!listed.hasMore;
     const base = process.env.PUBLIC_FUNCTIONS_BASE_URL ||
       "https://us-central1-tai-invoice-automation.cloudfunctions.net";
     const enriched = items.map((item) => {
@@ -1056,7 +1066,14 @@ async function handleGetQuoteDispatcherInbox(req, res) {
         `&tenantId=${encodeURIComponent(user.tenant.tenantId)}`;
       return {...item, openUrl};
     });
-    return res.json({ok: true, items: enriched, counts});
+    return res.json({
+      ok: true,
+      items: enriched,
+      counts,
+      limit,
+      offset,
+      hasMore,
+    });
   } catch (err) {
     return res.status(500).json({ok: false, error: err.message});
   }

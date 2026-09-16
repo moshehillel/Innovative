@@ -1659,28 +1659,51 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
  * @return {Promise<{items: Array<object>, counts: object}>}
  */
 async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
-  const limit = Math.min(Number(opts.limit) || 50, 100);
+  const parsedLimit = Number(opts.limit);
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ?
+    Math.min(Math.floor(parsedLimit), 100) : 20;
+  const parsedOffset = Number(opts.offset);
+  const offset = Number.isFinite(parsedOffset) && parsedOffset > 0 ?
+    Math.floor(parsedOffset) : 0;
   const dispatcherId = String(dispatcher.id || dispatcher);
   const dispatcherEmail = quoteDispatchers.normalizeEmail(
       dispatcher.email || "");
+  // Over-fetch because many quoteRequests are not this dispatcher's.
+  // Need offset+limit matches (+1 to detect hasMore).
+  const fetchCap = Math.min(
+      Math.max((offset + limit + 1) * 5, (limit + 1) * 5),
+      500);
   const [snap, counts] = await Promise.all([
     col(tenant, "quoteRequests")
-      .orderBy("createdAt", "desc")
-      .limit(limit * 5)
+        .orderBy("createdAt", "desc")
+        .limit(fetchCap)
         .get(),
     countQuotesForDispatcher(tenant, dispatcher),
   ]);
   const items = [];
+  let skipped = 0;
+  let hasMore = false;
   for (const doc of snap.docs) {
     const data = doc.data();
     if (!quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail)) {
       continue;
     }
     if (!matchesInboxStatus(data, opts.status)) continue;
-    if (items.length >= limit) continue;
+    if (skipped < offset) {
+      skipped++;
+      continue;
+    }
+    if (items.length >= limit) {
+      hasMore = true;
+      break;
+    }
     items.push(serializeInboxQuote(doc, data));
   }
-  return {items, counts};
+  if (!hasMore && items.length === limit && snap.docs.length >= fetchCap) {
+    // Hit scan cap with a full page — more may exist beyond the window.
+    hasMore = true;
+  }
+  return {items, counts, limit, offset, hasMore};
 }
 
 /**

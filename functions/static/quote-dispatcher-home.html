@@ -492,6 +492,15 @@
     .skel-card:nth-child(3) { animation-delay: 0.24s; }
 
     .quote-list { display: grid; gap: 12px; min-width: 0; max-width: 100%; }
+    .load-more-wrap {
+      display: flex;
+      justify-content: center;
+      margin: 8px 0 0;
+      padding: 8px 0 4px;
+    }
+    .load-more-wrap button.ghost {
+      min-width: 140px;
+    }
     .quote-card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -1002,6 +1011,9 @@
         </div>
       </div>
       <div class="quote-list hidden" id="rows"></div>
+      <div class="load-more-wrap hidden" id="load-more-wrap">
+        <button type="button" class="ghost" id="btn-load-more">Load more</button>
+      </div>
     </main>
   </div>
 
@@ -1015,6 +1027,11 @@
     let outlookConnected = false;
     let syncInFlight = null;
     let inboxLoadInFlight = null;
+    const INBOX_PAGE_SIZE = 20;
+    let inboxItems = [];
+    let inboxOffset = 0;
+    let inboxHasMore = false;
+    let loadMoreInFlight = false;
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
     let thinkingStep = 0;
@@ -1343,57 +1360,134 @@
             const el = document.getElementById(id);
             if (el) el.disabled = !!busy;
           });
+      const loadMoreBtn = document.getElementById("btn-load-more");
+      if (loadMoreBtn && !loadMoreInFlight) {
+        loadMoreBtn.disabled = !!busy;
+      }
     }
 
-    async function loadInbox(opts) {
-      const sync = !!(opts && opts.sync);
-      const silent = !!(opts && opts.silent);
-      if (inboxLoadInFlight) {
-        try {
-          await inboxLoadInFlight;
-        } catch (_) { /* prior load failed */ }
-        if (silent) return;
-      }
-      let path = "/getQuoteDispatcherInbox?tenantId=" +
-        encodeURIComponent(TENANT_ID) + "&limit=50&syncOutlook=" +
-        (sync ? "1" : "0");
-      if (filterStatus === "pending") path += "&status=pending";
-      else if (filterStatus === "sent") path += "&status=sent";
-      else if (filterStatus === "for_review") path += "&status=for_review";
-      else if (filterStatus === "completed") path += "&status=completed";
-      syncFilterButtons();
-      if (!silent) {
-        showInboxThinking(true);
-        setFilterBarBusy(true);
-      }
-      inboxLoadInFlight = (async () => {
-      try {
-      const res = await apiFetch(path);
-      const root = document.getElementById("rows");
-      if (!res.ok) {
-        root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
-        return;
-      }
-      const raw = res.items || [];
-      const counts = res.counts || {};
-      applyCounts(counts);
-      let items = raw;
+    function filterInboxPage(raw) {
       if (filterStatus === "completed") {
-        items = raw.filter(isCompletedItem);
-      } else {
-        const visible = raw.filter((i) => !isInactiveItem(i));
-        if (filterStatus === "pending") {
-          items = visible.filter(isPendingItem);
-        } else if (filterStatus === "sent") {
-          items = visible.filter(isSentItem);
-        } else if (filterStatus === "for_review") {
-          items = visible.filter(isForReviewItem);
-        } else {
-          items = visible;
-        }
+        return (raw || []).filter(isCompletedItem);
       }
+      const visible = (raw || []).filter((i) => !isInactiveItem(i));
+      if (filterStatus === "pending") return visible.filter(isPendingItem);
+      if (filterStatus === "sent") return visible.filter(isSentItem);
+      if (filterStatus === "for_review") return visible.filter(isForReviewItem);
+      return visible;
+    }
+
+    function syncLoadMoreButton() {
+      const wrap = document.getElementById("load-more-wrap");
+      const btn = document.getElementById("btn-load-more");
+      if (!wrap || !btn) return;
+      if (inboxHasMore && inboxItems.length) {
+        wrap.classList.remove("hidden");
+        btn.disabled = !!(inboxLoadInFlight || loadMoreInFlight);
+        btn.textContent = loadMoreInFlight ? "Loading…" : "Load more";
+      } else {
+        wrap.classList.add("hidden");
+        btn.disabled = false;
+        btn.textContent = "Load more";
+      }
+    }
+
+    function bindInboxCardEvents(root) {
+      root.querySelectorAll(".quote-card-head").forEach((el) => {
+        el.addEventListener("click", (e) => {
+          if (e.target.closest(".btn-dismiss-card")) return;
+          if (e.target.closest(".btn-review-card")) return;
+          if (e.target.closest(".btn-complete-card")) return;
+          el.parentElement.classList.toggle("open");
+        });
+      });
+      root.querySelectorAll(".btn-complete-card").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+          const currentlyDone = btn.getAttribute("data-completed") === "1";
+          const prevLabel = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = currentlyDone ? "Restoring…" : "Completing…";
+          try {
+            await completeQuoteById(quoteId, !currentlyDone);
+            await loadInbox({sync: false});
+          } catch (err) {
+            btn.disabled = false;
+            btn.textContent = prevLabel;
+            alert(err.message || "Could not update completed state");
+          }
+        });
+      });
+      root.querySelectorAll(".btn-review-card").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+          const currentlyOn = btn.getAttribute("data-on") === "1";
+          const prevLabel = btn.textContent;
+          btn.disabled = true;
+          btn.textContent = "Updating…";
+          try {
+            await markQuoteForReview(quoteId, !currentlyOn);
+            await loadInbox({sync: false});
+          } catch (err) {
+            btn.disabled = false;
+            btn.textContent = prevLabel;
+            alert(err.message || "Could not update review flag");
+          }
+        });
+      });
+      root.querySelectorAll(".btn-dismiss-card").forEach((btn) => {
+        btn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (btn.getAttribute("data-confirm") !== "1") {
+            btn.setAttribute("data-confirm", "1");
+            btn.textContent = "Confirm?";
+            setTimeout(() => {
+              if (btn.getAttribute("data-confirm") === "1") {
+                btn.removeAttribute("data-confirm");
+                btn.textContent = "Dismiss";
+              }
+            }, 4000);
+            return;
+          }
+          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+          const card = btn.closest(".quote-card");
+          btn.disabled = true;
+          btn.textContent = "Dismissing…";
+          try {
+            await dismissQuoteById(quoteId);
+            const status = (card && card.getAttribute("data-status")) || "";
+            if (card) card.remove();
+            applyLocalDismissStats(status);
+            const removedId = String(quoteId || "");
+            inboxItems = inboxItems.filter((i) => String(i.id) !== removedId);
+            inboxOffset = inboxItems.length;
+            if (!document.querySelector("#rows .quote-card")) {
+              document.getElementById("rows").innerHTML =
+                '<div class="empty">No quotes assigned to you.</div>';
+              inboxHasMore = false;
+            }
+            syncLoadMoreButton();
+            await loadInbox({sync: false});
+          } catch (err) {
+            btn.disabled = false;
+            btn.removeAttribute("data-confirm");
+            btn.textContent = "Dismiss";
+            alert(err.message || "Dismiss failed");
+          }
+        });
+      });
+    }
+
+    function renderInboxCards(items) {
+      const root = document.getElementById("rows");
       if (!items.length) {
         root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
+        syncLoadMoreButton();
         return;
       }
       root.innerHTML = items.map((item) => {
@@ -1502,101 +1596,91 @@
           </div>
         </div>`;
       }).join("");
+      bindInboxCardEvents(root);
+      syncLoadMoreButton();
+    }
 
-      root.querySelectorAll(".quote-card-head").forEach((el) => {
-        el.addEventListener("click", (e) => {
-          if (e.target.closest(".btn-dismiss-card")) return;
-          if (e.target.closest(".btn-review-card")) return;
-          if (e.target.closest(".btn-complete-card")) return;
-          el.parentElement.classList.toggle("open");
-        });
-      });
-      root.querySelectorAll(".btn-complete-card").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
-          const currentlyDone = btn.getAttribute("data-completed") === "1";
-          const prevLabel = btn.textContent;
-          btn.disabled = true;
-          btn.textContent = currentlyDone ? "Restoring…" : "Completing…";
-          try {
-            await completeQuoteById(quoteId, !currentlyDone);
-            await loadInbox({sync: false});
-          } catch (err) {
-            btn.disabled = false;
-            btn.textContent = prevLabel;
-            alert(err.message || "Could not update completed state");
-          }
-        });
-      });
-      root.querySelectorAll(".btn-review-card").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
-          const currentlyOn = btn.getAttribute("data-on") === "1";
-          const prevLabel = btn.textContent;
-          btn.disabled = true;
-          btn.textContent = "Updating…";
-          try {
-            await markQuoteForReview(quoteId, !currentlyOn);
-            await loadInbox({sync: false});
-          } catch (err) {
-            btn.disabled = false;
-            btn.textContent = prevLabel;
-            alert(err.message || "Could not update review flag");
-          }
-        });
-      });
-      root.querySelectorAll(".btn-dismiss-card").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (btn.getAttribute("data-confirm") !== "1") {
-            btn.setAttribute("data-confirm", "1");
-            btn.textContent = "Confirm?";
-            setTimeout(() => {
-              if (btn.getAttribute("data-confirm") === "1") {
-                btn.removeAttribute("data-confirm");
-                btn.textContent = "Dismiss";
-              }
-            }, 4000);
-            return;
-          }
-          const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
-          const card = btn.closest(".quote-card");
-          btn.disabled = true;
-          btn.textContent = "Dismissing…";
-          try {
-            await dismissQuoteById(quoteId);
-            const status = (card && card.getAttribute("data-status")) || "";
-            if (card) card.remove();
-            applyLocalDismissStats(status);
-            if (!document.querySelector("#rows .quote-card")) {
-              document.getElementById("rows").innerHTML =
-                '<div class="empty">No quotes assigned to you.</div>';
-            }
-            await loadInbox({sync: false});
-          } catch (err) {
-            btn.disabled = false;
-            btn.removeAttribute("data-confirm");
-            btn.textContent = "Dismiss";
-            alert(err.message || "Dismiss failed");
-          }
-        });
-      });
+    async function loadInbox(opts) {
+      const sync = !!(opts && opts.sync);
+      const silent = !!(opts && opts.silent);
+      const append = !!(opts && opts.append);
+      if (inboxLoadInFlight) {
+        try {
+          await inboxLoadInFlight;
+        } catch (_) { /* prior load failed */ }
+        // Quiet background refresh can skip; Load more must still run.
+        if (silent && !append) return;
+      }
+      const requestOffset = append ? inboxOffset : 0;
+      if (!append) {
+        inboxItems = [];
+        inboxOffset = 0;
+        inboxHasMore = false;
+      }
+      let path = "/getQuoteDispatcherInbox?tenantId=" +
+        encodeURIComponent(TENANT_ID) +
+        "&limit=" + INBOX_PAGE_SIZE +
+        "&offset=" + requestOffset +
+        "&syncOutlook=" + (sync ? "1" : "0");
+      if (filterStatus === "pending") path += "&status=pending";
+      else if (filterStatus === "sent") path += "&status=sent";
+      else if (filterStatus === "for_review") path += "&status=for_review";
+      else if (filterStatus === "completed") path += "&status=completed";
+      syncFilterButtons();
+      if (!silent && !append) {
+        showInboxThinking(true);
+        setFilterBarBusy(true);
+      }
+      if (append) {
+        loadMoreInFlight = true;
+        syncLoadMoreButton();
+      }
+      inboxLoadInFlight = (async () => {
+      try {
+      const res = await apiFetch(path);
+      const root = document.getElementById("rows");
+      if (!res.ok) {
+        if (!append) {
+          inboxItems = [];
+          inboxOffset = 0;
+          inboxHasMore = false;
+          root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
+          syncLoadMoreButton();
+        }
+        return;
+      }
+      const raw = res.items || [];
+      const counts = res.counts || {};
+      applyCounts(counts);
+      const pageItems = filterInboxPage(raw);
+      if (append) {
+        const seen = new Set(inboxItems.map((i) => String(i.id)));
+        const fresh = pageItems.filter((i) => !seen.has(String(i.id)));
+        inboxItems = inboxItems.concat(fresh);
+      } else {
+        inboxItems = pageItems;
+      }
+      inboxOffset = Number(res.offset) >= 0 ?
+        Number(res.offset) + raw.length :
+        inboxItems.length;
+      // Prefer server hasMore; if client filtered some away, still trust
+      // server pagination cursor based on raw page size.
+      inboxHasMore = !!res.hasMore;
+      renderInboxCards(inboxItems);
       } finally {
-        if (!silent) {
+        if (append) loadMoreInFlight = false;
+        if (!silent && !append) {
           showInboxThinking(false);
           setFilterBarBusy(false);
         }
+        syncLoadMoreButton();
       }
       })();
       try {
         await inboxLoadInFlight;
       } finally {
         inboxLoadInFlight = null;
+        syncLoadMoreButton();
       }
     }
 
@@ -1758,6 +1842,10 @@
     });
     document.getElementById("filter-all").addEventListener("click", () => {
       filterStatus = ""; loadInbox({sync: false});
+    });
+    document.getElementById("btn-load-more").addEventListener("click", () => {
+      if (!inboxHasMore || loadMoreInFlight || inboxLoadInFlight) return;
+      loadInbox({sync: false, append: true, silent: true});
     });
     document.getElementById("btn-report-pull").addEventListener("click", async () => {
       const btn = document.getElementById("btn-report-pull");
