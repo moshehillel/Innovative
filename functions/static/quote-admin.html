@@ -125,6 +125,7 @@
     .badge.on { background: var(--success-bg); color: var(--success); border-color: #a7f3d0; }
     .badge.off { opacity: 0.6; }
     .badge.confirm { background: var(--warning-bg); color: var(--warning); border-color: #fcd34d; }
+    .badge.unwired { background: #fef2f2; color: #b91c1c; border-color: #fecaca; }
     .rules-list { display: flex; flex-direction: column; gap: 8px; }
     .rule-card {
       border: 1px solid var(--border);
@@ -916,6 +917,11 @@
       badges.push(`<span class="badge ${rule.active !== false ? "on" : "off"}">${rule.active !== false ? "Active" : "Turned off"}</span>`);
       if (rule.requiresConfirm) {
         badges.push('<span class="badge confirm">Needs confirmation</span>');
+      }
+      if (rule.active !== false && rule.wiringStatus === "unwired") {
+        badges.push('<span class="badge unwired" title="' +
+          esc(rule.wiringReason || "not wired") +
+          '">Not wired</span>');
       }
 
       const isCarrierEmailNote =

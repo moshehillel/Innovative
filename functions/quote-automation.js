@@ -863,6 +863,12 @@ async function rateLane(lane, ctx) {
       emailBody: ctx.emailBody || "",
       subject: ctx.subject || "",
       customerDeclinedAccessorials: declinedCodes,
+      fromEmail: ctx.from || lane.fromEmail || "",
+      fromName: ctx.fromName || lane.fromName || "",
+      cc: ctx.cc || "",
+      to: ctx.to || "",
+      ccEmails: ctx.ccEmails || [],
+      toEmails: ctx.toEmails || [],
     };
     rulesOut = quoteRules.applyRemoveAccessorialRules(
         laneForRate, rulesOut, ctx.rules, extractCtx);
@@ -872,6 +878,12 @@ async function rateLane(lane, ctx) {
       emailBody: ctx.emailBody || extracted._sourceBody || "",
       subject: ctx.subject || extracted._sourceSubject || "",
       customerDeclinedAccessorials: declinedCodes,
+      fromEmail: ctx.from || lane.fromEmail || extracted.fromEmail || "",
+      fromName: ctx.fromName || lane.fromName || extracted.fromName || "",
+      cc: ctx.cc || extracted.cc || "",
+      to: ctx.to || extracted.to || "",
+      ccEmails: ctx.ccEmails || extracted.ccEmails || [],
+      toEmails: ctx.toEmails || extracted.toEmails || [],
     };
     rulesOut = quoteRules.applyRulesToLane(
         laneForRate, ctx.rules, extractCtx);
@@ -1054,6 +1066,14 @@ async function rateLane(lane, ctx) {
     addWarn(`FedEx: ${fedexNoRateHint}`);
   }
   for (const w of rulesOut.extractionWarnings || []) addWarn(w);
+  const unwiredRules = quoteRules.collectUnwiredActiveWarnings(ctx.rules || []);
+  for (const u of unwiredRules) {
+    const keys = (u.unknownMatchKeys || []).length ?
+      ` unknownFields=[${u.unknownMatchKeys.join(",")}]` : "";
+    addWarn(
+        `Active quote rule "${u.name}" (${u.ruleId}) is not wired ` +
+        `to the runtime (${u.reason})${keys}`);
+  }
   if (!options.length) {
     rateError = rateShop.summarizeNoRateErrors(noRates) ||
       "No rates returned from Primus.";
@@ -1338,6 +1358,20 @@ async function processQuoteEmail(opts) {
       quoteDoc.extractionWarnings.slice() : [];
     if (!warns.includes("zip fill failed — needs review")) {
       warns.push("zip fill failed — needs review");
+    }
+    quoteDoc.extractionWarnings = warns;
+  }
+
+  const unwiredRuleWarn = (quoteDoc.extractionWarnings || []).some((w) =>
+    /is not wired to the runtime/i.test(String(w || "")));
+  if (unwiredRuleWarn) {
+    quoteDoc.forReview = true;
+    quoteDoc.forReviewAt = admin.firestore.FieldValue.serverTimestamp();
+    quoteDoc.forReviewBy = quoteDoc.forReviewBy || "unwired_quote_rule";
+    const warns = Array.isArray(quoteDoc.extractionWarnings) ?
+      quoteDoc.extractionWarnings.slice() : [];
+    if (!warns.includes("Active quote rule not wired — needs review")) {
+      warns.push("Active quote rule not wired — needs review");
     }
     quoteDoc.extractionWarnings = warns;
   }

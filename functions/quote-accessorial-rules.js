@@ -21,6 +21,59 @@ const RULE_KIND_SENDER_CUSTOMER = "sender_customer";
 const RULE_KIND_ZIP_FILL = "zip_fill";
 const RULE_KIND_CARRIER_DISPLAY_CLEAN = "carrier_display_clean";
 
+/**
+ * Single source of truth: match keys the runtime actually consumes.
+ * Chat/UI may still write other keys; unknown leftovers fail loud.
+ */
+const WIRED_MATCH_KEYS = new Set([
+  "flags",
+  "siteType",
+  "instructionsContains",
+  "referenceContains",
+  "consigneeNameContains",
+  "consigneeAddressContains",
+  "shipperNameContains",
+  "shipperAddressContains",
+  "nameContains",
+  "addressContains",
+  "cityContains",
+  "shipperCityContains",
+  "consigneeCityContains",
+  "shipperState",
+  "consigneeState",
+  "state",
+  "fromEmails",
+  "senderEmails",
+  "senderDomains",
+  "ccEmails",
+  "toEmails",
+  "fromNames",
+  "carrierNameContains",
+]);
+
+/** Top-level action / identity fields the engine consumes. */
+const WIRED_ACTION_FIELDS = new Set([
+  "addAccessorials",
+  "removeAccessorials",
+  "filterCarrierWarnings",
+  "addAccessorialsWithData",
+  "customerName",
+  "protocolOnly",
+  "defaultDims",
+  "fromNames",
+  "fillZipCode",
+  "zipCode",
+  "applyTo",
+  "notes",
+  "ruleKind",
+  "identifyVia",
+  "active",
+  "priority",
+  "name",
+  "autoApply",
+  "requiresConfirm",
+]);
+
 /** Dest accessorial → pickup equivalent when a rule applies to origin. */
 const DEST_TO_ORIGIN_ACCESSORIAL = {
   RSD: "RSO",
@@ -428,8 +481,43 @@ function normalizeIdentifyVia(rule) {
 }
 
 /**
- * Sender→customer mapping rules are applied at intake,
- * not as lane accessorials.
+ * True when a rule has lane accessorial / filter actions (not just
+ * sender→customer or carrier email note metadata).
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function hasLaneAccessorialActions(rule) {
+  if (!rule || typeof rule !== "object") return false;
+  return (rule.addAccessorials || []).length > 0 ||
+    (rule.removeAccessorials || []).length > 0 ||
+    (rule.filterCarrierWarnings || []).length > 0 ||
+    (Array.isArray(rule.addAccessorialsWithData) &&
+      rule.addAccessorialsWithData.length > 0);
+}
+
+/**
+ * Match keys that identify the RFQ sender / mailbox participants.
+ * @param {object} match Rule match object.
+ * @return {boolean}
+ */
+function matchHasSenderIdentityKeys(match) {
+  const m = match && typeof match === "object" ? match : {};
+  const emails = []
+      .concat(m.fromEmails || [])
+      .concat(m.senderEmails || [])
+      .concat(m.ccEmails || [])
+      .concat(m.toEmails || []);
+  const domains = [].concat(m.senderDomains || []);
+  const fromNames = [].concat(m.fromNames || []);
+  return emails.some((e) => String(e || "").includes("@")) ||
+    domains.some((d) => !!String(d || "").trim()) ||
+    fromNames.some((n) => !!String(n || "").trim());
+}
+
+/**
+ * Sender→customer mapping rules are applied at intake.
+ * Rules that ALSO add/remove accessorials still match here for identity,
+ * but applyRulesToLane must not skip them — see isPureSenderCustomerRule.
  * @param {object} rule Rule document.
  * @return {boolean}
  */
@@ -439,14 +527,98 @@ function isSenderCustomerRule(rule) {
   if (rule.ruleKind === RULE_KIND_ZIP_FILL) return false;
   if (normalizeIdentifyVia(rule) === "email" && rule.customerName) return true;
   const match = rule.match && typeof rule.match === "object" ? rule.match : {};
-  const emails = []
+  if (matchHasSenderIdentityKeys(match)) return true;
+  const topNames = [].concat(rule.fromNames || []);
+  return topNames.some((n) => !!String(n || "").trim()) &&
+    !!(rule.customerName || rule.defaultDims || rule.protocolOnly);
+}
+
+/**
+ * Pure sender→customer (no lane accessorial actions). These are skipped
+ * inside applyRulesToLane because intake already attaches customer/dims.
+ * @param {object} rule Rule document.
+ * @return {boolean}
+ */
+function isPureSenderCustomerRule(rule) {
+  if (!isSenderCustomerRule(rule)) return false;
+  if (hasLaneAccessorialActions(rule)) return false;
+  if (isZipFillRule(rule)) return false;
+  if (isCarrierNoteRule(rule) || isCarrierDisplayCleanRule(rule)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Whether sender identity constraints on the rule match email context.
+ * Rules with no sender keys always pass. Present constraint groups are
+ * AND'd (same pattern as zip-fill filters).
+ * @param {object} rule Rule document.
+ * @param {object} context Rate / extract context.
+ * @return {boolean}
+ */
+function senderConstraintsMatch(rule, context) {
+  const match = rule && rule.match && typeof rule.match === "object" ?
+    rule.match : {};
+  const ctx = context && typeof context === "object" ? context : {};
+  const fromNames = []
+      .concat(rule && rule.fromNames || [])
+      .concat(match.fromNames || [])
+      .map((n) => String(n || "").trim().toLowerCase())
+      .filter(Boolean);
+  const fromEmails = []
       .concat(match.fromEmails || [])
       .concat(match.senderEmails || [])
-      .concat(match.ccEmails || [])
-      .concat(match.toEmails || []);
-  const domains = [].concat(match.senderDomains || []);
-  return emails.some((e) => String(e || "").includes("@")) ||
-    domains.some((d) => !!String(d || "").trim());
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+  const domains = [].concat(match.senderDomains || [])
+      .map((d) => String(d || "").trim().toLowerCase().replace(/^@+/, ""))
+      .filter(Boolean);
+  const ccWant = [].concat(match.ccEmails || [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+  const toWant = [].concat(match.toEmails || [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+
+  const hasConstraint = fromEmails.length || domains.length ||
+    fromNames.length || ccWant.length || toWant.length;
+  if (!hasConstraint) return true;
+
+  const from = String(ctx.fromEmail || ctx.from || "").trim().toLowerCase();
+  const fromName = String(ctx.fromName || "").trim().toLowerCase();
+  const ccHave = []
+      .concat(ctx.ccEmails || [])
+      .concat(ctx.cc || [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+  const toHave = []
+      .concat(ctx.toEmails || [])
+      .concat(ctx.to || [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => e.includes("@"));
+
+  // From / Cc / To email lists: any listed mailbox role may satisfy.
+  if (fromEmails.length || ccWant.length || toWant.length) {
+    const fromHit = fromEmails.length && from && fromEmails.includes(from);
+    const ccHit = ccWant.length && ccWant.some((e) => ccHave.includes(e));
+    const toHit = toWant.length && toWant.some((e) => toHave.includes(e));
+    // If only Cc/To listed (no fromEmails), those alone can match.
+    if (fromEmails.length) {
+      if (!fromHit && !ccHit && !toHit) return false;
+    } else if (!ccHit && !toHit) {
+      return false;
+    }
+  }
+  if (domains.length) {
+    const at = from.lastIndexOf("@");
+    const domain = at >= 0 ? from.slice(at + 1) : "";
+    if (!domain || !domains.includes(domain)) return false;
+  }
+  if (fromNames.length) {
+    if (!fromName || !containsAny(fromName, fromNames)) return false;
+  }
+  return true;
 }
 
 /**
@@ -622,6 +794,181 @@ function applyZipFillRules(lane, rules, laneRef, context) {
 }
 
 /**
+ * Classify how the runtime wires an Active quoteRules doc.
+ * @param {object} rule Rule document.
+ * @return {{wired: boolean, enginePath: string|null,
+ *   unknownMatchKeys: Array<string>, reason: string|null}}
+ */
+function analyzeRuleWiring(rule) {
+  if (!rule || typeof rule !== "object") {
+    return {
+      wired: false,
+      enginePath: null,
+      unknownMatchKeys: [],
+      reason: "empty_rule",
+    };
+  }
+  const match = rule.match && typeof rule.match === "object" ? rule.match : {};
+  const matchKeys = Object.keys(match).filter((k) => {
+    const v = match[k];
+    if (v == null || v === "") return false;
+    if (Array.isArray(v) && !v.length) return false;
+    return true;
+  });
+  const unknownMatchKeys = matchKeys.filter((k) => !WIRED_MATCH_KEYS.has(k));
+
+  if (isCarrierDisplayCleanRule(rule) &&
+      carrierNameContainsNeedles(rule).length) {
+    return {
+      wired: true,
+      enginePath: "carrier_display_clean",
+      unknownMatchKeys,
+      reason: null,
+    };
+  }
+  if (isCarrierNoteRule(rule) &&
+      carrierNameContainsNeedles(rule).length &&
+      String(rule.notes || "").trim()) {
+    return {
+      wired: true,
+      enginePath: "carrier_note",
+      unknownMatchKeys,
+      reason: null,
+    };
+  }
+  if (isZipFillRule(rule) && /^\d{5}$/.test(zipFillCodeFromRule(rule))) {
+    return {
+      wired: true,
+      enginePath: "zip_fill",
+      unknownMatchKeys,
+      reason: null,
+    };
+  }
+  if (isNeverAddInsuranceRule(rule)) {
+    return {
+      wired: true,
+      enginePath: "never_insurance",
+      unknownMatchKeys,
+      reason: null,
+    };
+  }
+  if (isPureSenderCustomerRule(rule) &&
+      (rule.customerName || rule.defaultDims || rule.protocolOnly ||
+        rule.ruleKind === RULE_KIND_SENDER_CUSTOMER)) {
+    return {
+      wired: true,
+      enginePath: "sender_customer",
+      unknownMatchKeys,
+      reason: null,
+    };
+  }
+  if (hasLaneAccessorialActions(rule)) {
+    const known = matchKeys.some((k) => WIRED_MATCH_KEYS.has(k)) ||
+      [].concat(rule.fromNames || []).some((n) => !!String(n || "").trim());
+    if (known) {
+      return {
+        wired: true,
+        enginePath: "accessorial",
+        unknownMatchKeys,
+        reason: null,
+      };
+    }
+    return {
+      wired: false,
+      enginePath: null,
+      unknownMatchKeys,
+      reason: "accessorial_actions_without_wired_match",
+    };
+  }
+  if (isCarrierDisplayCleanRule(rule) || isCarrierNoteRule(rule)) {
+    return {
+      wired: false,
+      enginePath: null,
+      unknownMatchKeys,
+      reason: "carrier_rule_missing_needles_or_notes",
+    };
+  }
+  if (isSenderCustomerRule(rule) && !rule.customerName && !rule.defaultDims) {
+    return {
+      wired: false,
+      enginePath: null,
+      unknownMatchKeys,
+      reason: "sender_rule_missing_customer_or_dims",
+    };
+  }
+  if (matchKeys.length && unknownMatchKeys.length === matchKeys.length) {
+    return {
+      wired: false,
+      enginePath: null,
+      unknownMatchKeys,
+      reason: "unknown_match_keys_only",
+    };
+  }
+  if (!matchKeys.length && !rule.customerName && !rule.fillZipCode &&
+      !hasLaneAccessorialActions(rule)) {
+    return {
+      wired: false,
+      enginePath: null,
+      unknownMatchKeys,
+      reason: "no_match_or_action",
+    };
+  }
+  if (matchKeys.some((k) => WIRED_MATCH_KEYS.has(k))) {
+    return {
+      wired: true,
+      enginePath: "accessorial",
+      unknownMatchKeys,
+      reason: null,
+    };
+  }
+  return {
+    wired: false,
+    enginePath: null,
+    unknownMatchKeys,
+    reason: "unwired_rule_shape",
+  };
+}
+
+/**
+ * Annotate rules with wiring analysis (non-persistent helper fields).
+ * @param {Array<object>} rules Rules.
+ * @return {Array<object>}
+ */
+function annotateRulesWiring(rules) {
+  return (rules || []).map((rule) => {
+    const wiring = analyzeRuleWiring(rule);
+    return {
+      ...rule,
+      wiringStatus: wiring.wired ? "wired" : "unwired",
+      wiringPath: wiring.enginePath,
+      wiringUnknownMatchKeys: wiring.unknownMatchKeys,
+      wiringReason: wiring.reason,
+    };
+  });
+}
+
+/**
+ * Active rules the engine cannot apply (fail loud).
+ * @param {Array<object>} rules Active rules.
+ * @return {Array<object>} {ruleId, name, reason, unknownMatchKeys}
+ */
+function collectUnwiredActiveWarnings(rules) {
+  const out = [];
+  for (const rule of rules || []) {
+    if (!rule || rule.active === false) continue;
+    const wiring = analyzeRuleWiring(rule);
+    if (wiring.wired) continue;
+    out.push({
+      ruleId: String(rule.id || ""),
+      name: String(rule.name || rule.id || "unnamed"),
+      reason: wiring.reason || "unwired",
+      unknownMatchKeys: wiring.unknownMatchKeys || [],
+    });
+  }
+  return out;
+}
+
+/**
  * @param {object} tenant Tenant.
  * @return {Promise<Array<object>>}
  */
@@ -639,13 +986,23 @@ async function loadActiveRules(tenant) {
       const again = await col(tenant, "quoteRules")
           .where("active", "==", true)
           .get();
-      return again.docs.map((d) => ({id: d.id, ...d.data()})).sort((a, b) =>
-        (Number(a.priority) || 999) - (Number(b.priority) || 999));
+      const seeded = again.docs.map((d) => ({id: d.id, ...d.data()}))
+          .sort((a, b) =>
+            (Number(a.priority) || 999) - (Number(b.priority) || 999));
+      return annotateRulesWiring(seeded);
     }
   }
   const rules = snap.docs.map((d) => ({id: d.id, ...d.data()}));
-  return rules.sort((a, b) =>
+  const sorted = rules.sort((a, b) =>
     (Number(a.priority) || 999) - (Number(b.priority) || 999));
+  const annotated = annotateRulesWiring(sorted);
+  const unwired = collectUnwiredActiveWarnings(annotated);
+  if (unwired.length) {
+    console.warn(
+        "[quote-rules] Active rules with no runtime wiring:",
+        unwired.map((u) => `${u.ruleId}(${u.reason})`).join(", "));
+  }
+  return annotated;
 }
 
 /**
@@ -935,39 +1292,81 @@ function laneFlagMatches(lane, context, flag, side = "dest") {
  */
 function ruleMatchViaText(lane, context, rule, side = "dest") {
   const match = rule.match || {};
-  if (!Object.keys(match).length) return null;
+  const topFromNames = [].concat((rule && rule.fromNames) || []);
+  const hasMatchKeys = Object.keys(match).length > 0 || topFromNames.length > 0;
+  if (!hasMatchKeys) return null;
+  if (!senderConstraintsMatch(rule, context)) return null;
+
   const party = side === "origin" ?
     (lane.shipper || {}) : (lane.consignee || {});
   const name = party.name || "";
-  const addr = [party.address1, party.address2, party.city].join(" ");
+  const addr = [
+    party.address1, party.address2, party.city, party.state, party.zipCode,
+  ].join(" ");
+  const city = String(party.city || "").trim();
+  const state = String(party.state || "").trim().toUpperCase();
   const instr = [
     lane.specialInstructions,
     context.specialInstructionsGlobal,
   ].join(" ");
 
-  if (side === "origin") {
-    if (match.shipperNameContains &&
-      containsAny(name, match.shipperNameContains)) {
-      return "shipperName";
-    }
-    if (match.consigneeNameContains &&
-      containsAny(name, match.consigneeNameContains)) {
-      return "shipperName";
-    }
-    if (match.consigneeAddressContains &&
-      containsAny(addr, match.consigneeAddressContains)) {
-      return "shipperAddress";
-    }
-  } else {
-    if (match.consigneeNameContains &&
-      containsAny(name, match.consigneeNameContains)) {
-      return "consigneeName";
-    }
-    if (match.consigneeAddressContains &&
-      containsAny(addr, match.consigneeAddressContains)) {
-      return "consigneeAddress";
+  const nameNeedles = side === "origin" ?
+    [].concat(match.shipperNameContains || [])
+        .concat(match.nameContains || []) :
+    [].concat(match.consigneeNameContains || [])
+        .concat(match.nameContains || []);
+  // Also allow cross-side name needles the chat historically wrote.
+  if (side === "origin" && match.consigneeNameContains) {
+    nameNeedles.push(...match.consigneeNameContains);
+  }
+  if (nameNeedles.length && containsAny(name, nameNeedles)) {
+    return side === "origin" ? "shipperName" : "consigneeName";
+  }
+
+  const addrNeedles = side === "origin" ?
+    [].concat(match.shipperAddressContains || [])
+        .concat(match.addressContains || [])
+        .concat(match.consigneeAddressContains || []) :
+    [].concat(match.consigneeAddressContains || [])
+        .concat(match.addressContains || []);
+  if (addrNeedles.length && containsAny(addr, addrNeedles)) {
+    return side === "origin" ? "shipperAddress" : "consigneeAddress";
+  }
+
+  const cityNeedles = side === "origin" ?
+    [].concat(match.shipperCityContains || [])
+        .concat(match.cityContains || []) :
+    [].concat(match.consigneeCityContains || [])
+        .concat(match.cityContains || []);
+  if (cityNeedles.length &&
+      (containsAny(city, cityNeedles) || containsAny(name, cityNeedles))) {
+    const wantStateForCity = String(
+        (side === "origin" ?
+          (match.shipperState || match.state) :
+          (match.consigneeState || match.state)) || "")
+        .trim()
+        .toUpperCase();
+    if (wantStateForCity && state && wantStateForCity !== state) {
+      // City needle hit but state filter failed.
+    } else {
+      return side === "origin" ? "shipperCity" : "consigneeCity";
     }
   }
+
+  const wantState = String(
+      (side === "origin" ?
+        (match.shipperState || match.state) :
+        (match.consigneeState || match.state)) || "")
+      .trim()
+      .toUpperCase();
+  if (wantState && state && wantState === state &&
+      !cityNeedles.length && !nameNeedles.length && !addrNeedles.length &&
+      !match.siteType && !match.flags && !match.instructionsContains &&
+      !match.referenceContains && !matchHasSenderIdentityKeys(match) &&
+      !topFromNames.length) {
+    return side === "origin" ? "shipperState" : "consigneeState";
+  }
+
   if (match.instructionsContains &&
     containsAny(instr, match.instructionsContains)) {
     const declineText = [
@@ -1004,6 +1403,25 @@ function ruleMatchViaText(lane, context, rule, side = "dest") {
     // chain_store / amazon APD must not win over "no appointment" / FCFS.
     if (addsOnlyDeclinedAccessorials(lane, context, rule)) return null;
     return "siteType";
+  }
+
+  // Sender-only accessorial rules (fromEmails + add/remove codes).
+  if (hasLaneAccessorialActions(rule) &&
+      (matchHasSenderIdentityKeys(match) || topFromNames.length) &&
+      senderConstraintsMatch(rule, context)) {
+    const otherKeys = Object.keys(match).filter((k) => {
+      if ([
+        "fromEmails", "senderEmails", "senderDomains",
+        "ccEmails", "toEmails", "fromNames", "carrierNameContains",
+      ].includes(k)) {
+        return false;
+      }
+      const v = match[k];
+      if (v == null || v === "") return false;
+      if (Array.isArray(v) && !v.length) return false;
+      return true;
+    });
+    if (!otherKeys.length) return "sender";
   }
   return null;
 }
@@ -1128,6 +1546,8 @@ function isNeverAddInsuranceRule(rule) {
  */
 function ruleMatchVia(lane, context, rule, side = "dest") {
   if (isNeverAddInsuranceRule(rule)) return "never_insurance";
+  // Sender identity filters apply to both text and AI paths.
+  if (!senderConstraintsMatch(rule, context)) return null;
   const identifyVia = normalizeIdentifyVia(rule);
   let textVia = ruleMatchViaText(lane, context, rule, side);
   const aiVia = ruleMatchViaAi(lane, context, rule, side);
@@ -1483,9 +1903,10 @@ function applyRulesToLane(lane, rules, context = {}) {
 
   for (const rule of rules) {
     if (!rule.active) continue;
-    // Sender→customer rules attach Primus customer / dims at intake —
-    // they must not invent site accessorials here.
-    if (isSenderCustomerRule(rule)) continue;
+    // Pure sender→customer rules attach Primus customer / dims at intake —
+    // they must not invent site accessorials here. Rules that ALSO
+    // add/remove accessorials still run (sender filters in ruleMatchVia).
+    if (isPureSenderCustomerRule(rule)) continue;
     if (isZipFillRule(rule)) continue;
     // Carrier-name notes / display cleaners attach at email / UI time.
     if (isCarrierNoteRule(rule)) continue;
@@ -1586,7 +2007,7 @@ function applyRemoveAccessorialRules(lane, rulesOut, rules, context = {}) {
 
   for (const rule of rules || []) {
     if (!rule || rule.active === false) continue;
-    if (isSenderCustomerRule(rule)) continue;
+    if (isPureSenderCustomerRule(rule)) continue;
     if (isZipFillRule(rule)) continue;
     if (isCarrierNoteRule(rule)) continue;
     if (isCarrierDisplayCleanRule(rule)) continue;
@@ -1639,7 +2060,8 @@ async function listAllRules(tenant) {
     await seedDefaultRules(tenant);
     snap = await col(tenant, "quoteRules").orderBy("priority").get();
   }
-  return snap.docs.map((d) => ({id: d.id, ...d.data()}));
+  return annotateRulesWiring(
+      snap.docs.map((d) => ({id: d.id, ...d.data()})));
 }
 
 /**
@@ -1725,6 +2147,8 @@ module.exports = {
   RULE_KIND_SENDER_CUSTOMER,
   RULE_KIND_ZIP_FILL,
   RULE_KIND_CARRIER_DISPLAY_CLEAN,
+  WIRED_MATCH_KEYS,
+  WIRED_ACTION_FIELDS,
   SYNTHETIC_REQUEST_FLAGS,
   MANAGED_DEFAULT_RULE_IDS,
   RETIRED_DEFAULT_RULE_IDS,
@@ -1750,6 +2174,9 @@ module.exports = {
   formatAccessorialLabels,
   ACCESSORIAL_LABELS,
   isSenderCustomerRule,
+  isPureSenderCustomerRule,
+  hasLaneAccessorialActions,
+  senderConstraintsMatch,
   isZipFillRule,
   isCarrierNoteRule,
   isCarrierDisplayCleanRule,
@@ -1765,4 +2192,7 @@ module.exports = {
   applyZipFillRules,
   zipFillRuleMatchesParty,
   zipFillRuleMatchesContext,
+  analyzeRuleWiring,
+  annotateRulesWiring,
+  collectUnwiredActiveWarnings,
 };

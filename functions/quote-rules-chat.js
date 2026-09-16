@@ -35,6 +35,7 @@ const PATCH_FIELDS = [
   "addAccessorialsWithData",
   "ruleKind",
   "customerName",
+  "fromNames",
   "protocolOnly",
   "defaultDims",
   "fillZipCode",
@@ -2975,9 +2976,12 @@ async function runQuoteRulesChatTurn(opts) {
     "removeAccessorials: Primus codes to strip after all matching adds",
     "(e.g. remove NTD when appointment/APD context matches).",
     "match: consigneeNameContains, consigneeAddressContains,",
-    "instructionsContains, referenceContains, flags, siteType,",
+    "shipperNameContains, shipperAddressContains, nameContains,",
+    "addressContains, cityContains, instructionsContains,",
+    "referenceContains, flags, siteType, carrierNameContains,",
     "fromEmails, senderEmails, senderDomains, ccEmails, toEmails,",
-    "shipperCityContains, shipperState, consigneeCityContains, consigneeState.",
+    "fromNames, shipperCityContains, shipperState,",
+    "consigneeCityContains, consigneeState.",
     "",
     "=== CORE BEHAVIOR ===",
     "- Infer intent from typos and casual English.",
@@ -3329,6 +3333,10 @@ function normalizeCreatePatch(patch, ruleId) {
   }
   if (patch.customerName != null && String(patch.customerName).trim()) {
     normalized.customerName = String(patch.customerName).trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "fromNames") &&
+      Array.isArray(patch.fromNames)) {
+    normalized.fromNames = patch.fromNames.map(String);
   }
   if (Object.prototype.hasOwnProperty.call(patch, "protocolOnly")) {
     normalized.protocolOnly = !!patch.protocolOnly;

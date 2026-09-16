@@ -10,6 +10,7 @@ const {
   ACCESSORIAL_LABELS,
   RULE_KIND_SENDER_CUSTOMER,
   RULE_KIND_ZIP_FILL,
+  RULE_KIND_CARRIER_DISPLAY_CLEAN,
 } = require("./quote-accessorial-rules");
 const chat = require("./quote-rules-chat");
 
@@ -544,6 +545,16 @@ function draftCreate(args, ctx) {
     patch.addAccessorials = [];
     patch.removeAccessorials = [];
     patch.identifyVia = "ai";
+  }
+  if (ruleKind === RULE_KIND_CARRIER_DISPLAY_CLEAN ||
+      ruleKind === "carrier_display_clean") {
+    patch.ruleKind = RULE_KIND_CARRIER_DISPLAY_CLEAN;
+    patch.addAccessorials = [];
+    patch.removeAccessorials = [];
+    patch.identifyVia = args.identifyVia || "email";
+  }
+  if (Array.isArray(args.fromNames) && args.fromNames.length) {
+    patch.fromNames = args.fromNames.map(String);
   }
 
   const ruleId = String(args.ruleId || "").trim();
