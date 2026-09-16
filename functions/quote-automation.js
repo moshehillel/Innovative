@@ -1656,7 +1656,8 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row (id + email).
  * @param {object} [opts] limit, status (pending|dismissed|exact).
- * @return {Promise<{items: Array<object>, counts: object}>}
+ * @return {Promise<{items: Array<object>, counts: object,
+ *   limit: number, offset: number, hasMore: boolean}>}
  */
 async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
   const parsedLimit = Number(opts.limit);
