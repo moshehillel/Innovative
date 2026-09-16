@@ -926,7 +926,8 @@ async function rateLane(lane, ctx) {
     pickupDate: extracted.readyDate,
     includeGuaranteed: wantsGuaranteed,
     returnValidAccsOnly: process.env.QUOTE_RETURN_VALID_ACCS_ONLY === "true",
-    timeout: process.env.QUOTE_RATE_TIMEOUT || undefined,
+    // Default 90s applied in buildRateMultipleQuery (Primus UI ~60s).
+    timeout: process.env.QUOTE_RATE_TIMEOUT || 90,
   });
 
   let fetched = await rateShop.fetchMultipleRates(query);

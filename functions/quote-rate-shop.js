@@ -1814,7 +1814,17 @@ function buildRateMultipleQuery(lane, opts = {}) {
   if (opts.pickupDate || lane.readyDate) {
     params.pickupDate = String(opts.pickupDate || lane.readyDate);
   }
-  if (opts.timeout != null) params.timeout = String(opts.timeout);
+  // Primus UI rate shop uses ~60s ajax timeout. Omitting `timeout` on
+  // /rate/multiple uses a shorter API default that aborts slow tariffs
+  // (J&I Central → noRates "Response error") while faster Worldwide
+  // Central still returns — see Q#D6181 WACO. Bulk shop already uses 90.
+  if (opts.timeout !== false && opts.timeout !== "") {
+    const timeoutSec = opts.timeout != null ? opts.timeout :
+      (Number(process.env.QUOTE_RATE_TIMEOUT) || 90);
+    if (Number.isFinite(Number(timeoutSec)) && Number(timeoutSec) > 0) {
+      params.timeout = String(timeoutSec);
+    }
+  }
   if (opts.returnValidAccsOnly != null) {
     params.returnValidAccsOnly = String(!!opts.returnValidAccsOnly);
   }

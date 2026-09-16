@@ -402,6 +402,34 @@ check(
     true,
 );
 
+// Primus /rate/multiple timeout default (Q#D6181 J&I Central)
+const prevTimeoutEnv = process.env.QUOTE_RATE_TIMEOUT;
+delete process.env.QUOTE_RATE_TIMEOUT;
+const qDefault = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "CA", zipCode: "91730", country: "US"},
+  consignee: {city: "B", state: "TX", zipCode: "76712", country: "US"},
+  freightInfo: [{qty: 1, weight: 326, class: "100", length: 40, width: 48,
+    height: 33, dimType: "PLT"}],
+  accessorials: ["LAD", "APD"],
+}, {customerId: "1", includeGuaranteed: true});
+check("default rate timeout is 90", qDefault.timeout, "90");
+const qOmit = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "CA", zipCode: "91730", country: "US"},
+  consignee: {city: "B", state: "TX", zipCode: "76712", country: "US"},
+  freightInfo: [{qty: 1, weight: 326, class: "100", length: 40, width: 48,
+    height: 33, dimType: "PLT"}],
+}, {timeout: false});
+check("timeout false omits timeout param", qOmit.timeout, undefined);
+const qCustom = rateShop.buildRateMultipleQuery({
+  shipper: {city: "A", state: "CA", zipCode: "91730", country: "US"},
+  consignee: {city: "B", state: "TX", zipCode: "76712", country: "US"},
+  freightInfo: [{qty: 1, weight: 326, class: "100", length: 40, width: 48,
+    height: 33, dimType: "PLT"}],
+}, {timeout: 60});
+check("explicit timeout 60 honored", qCustom.timeout, "60");
+if (prevTimeoutEnv == null) delete process.env.QUOTE_RATE_TIMEOUT;
+else process.env.QUOTE_RATE_TIMEOUT = prevTimeoutEnv;
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);
