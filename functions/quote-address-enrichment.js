@@ -374,9 +374,12 @@ function parseGoogleAddressComponents(comps, fallbackCity, fallbackState) {
   const streetNum = get("street_number");
   const route = get("route");
   const street = [streetNum, route].filter(Boolean).join(" ").trim();
+  // Many US ZIPs (e.g. Lakewood NJ 08701, Avenel 07001) label the place
+  // name as neighborhood, not locality — treat that as city for zip fill.
   return {
     city: get("locality", false) || get("postal_town", false) ||
-      get("sublocality", false) || fallbackCity,
+      get("sublocality", false) || get("neighborhood", false) ||
+      fallbackCity,
     state: get("administrative_area_level_1") || fallbackState,
     zipCode,
     address1: street || undefined,
@@ -1556,9 +1559,11 @@ module.exports = {
   isBareStreetGeocode,
   isAddressOnlyOrWeakName,
   lookupUsZip,
+  lookupUsZipViaGoogle,
   lookupUsZipFromCityState,
   lookupZipFromCityState,
   lookupKnownCityStateZip,
+  parseGoogleAddressComponents,
   KNOWN_CITY_STATE_ZIPS,
   fillPartyCityStateFromZip,
   fillPartyZipFromCityState,

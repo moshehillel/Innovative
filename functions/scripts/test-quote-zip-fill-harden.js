@@ -20,6 +20,22 @@ checkTrue("partyNeedsCityStateFromZip false when complete",
       city: "Lakewood", state: "NJ", zipCode: "08701",
     }));
 
+// Google labels Lakewood NJ 08701 as neighborhood (not locality).
+const lakewoodComps = [
+  {long_name: "08701", short_name: "08701", types: ["postal_code"]},
+  {long_name: "Lakewood", short_name: "Lakewood",
+    types: ["neighborhood", "political"]},
+  {long_name: "New Jersey", short_name: "NJ",
+    types: ["administrative_area_level_1", "political"]},
+];
+const lakewoodParsed = enrichment.parseGoogleAddressComponents(
+    lakewoodComps, "", "");
+checkTrue("Google neighborhood ZIP yields city+state",
+    lakewoodParsed &&
+    lakewoodParsed.city === "Lakewood" &&
+    lakewoodParsed.state === "NJ" &&
+    lakewoodParsed.zipCode === "08701");
+
 (async () => {
   const lane = {extractionWarnings: []};
   // padStart path: 4-digit ZIP should become 08701 via Zippopotam or fail
