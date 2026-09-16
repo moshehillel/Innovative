@@ -1769,6 +1769,44 @@ function stripJiBrokerSuffix(name) {
 }
 
 /**
+ * True when a clean-rule needle is safe to strip as a substring.
+ * Short aliases like "abf" / "estes" / "aaa cooper" must not blank
+ * "ABF FREIGHT SYSTEM…" into ", INC." — those belong in rename maps,
+ * not strip needles. J&I / distributor broker tags stay allowed.
+ * @param {string} needle Match phrase.
+ * @return {boolean}
+ */
+function isSafeCarrierStripNeedle(needle) {
+  const n = String(needle || "").trim();
+  if (!n) return false;
+  if (/j\s*[&and\-–—]*\s*i|ji\s*distribut|distribut/i.test(n)) {
+    return true;
+  }
+  // Long phrases only (e.g. "estes express"). Short tokens are rename
+  // targets, not safe substring deletes.
+  return n.length >= 12;
+}
+
+/**
+ * True when a cleaned display name looks destroyed vs the Primus original.
+ * @param {string} cleaned Candidate display name.
+ * @param {string} raw Original Primus name.
+ * @return {boolean}
+ */
+function isBrokenCarrierDisplayName(cleaned, raw) {
+  const c = String(cleaned || "").trim();
+  const r = String(raw || "").trim();
+  if (!r) return false;
+  if (!c) return true;
+  if (/^[,.\-–—/%\s]/.test(c)) return true;
+  if (c.length < 3) return true;
+  const letters = (s) => (String(s).match(/[a-z]/gi) || []).length;
+  // Stripping "ABF FREIGHT SYSTEM" down to ", INC." loses almost all letters.
+  if (letters(c) < Math.max(3, Math.floor(letters(r) * 0.35))) return true;
+  return false;
+}
+
+/**
  * Strip matched broker / distributor wording from a carrier display name.
  * Always strips common J&I / J-I variants even when no Firestore rule matched.
  * @param {string} rawName Primus / rate carrier name.
@@ -1776,7 +1814,8 @@ function stripJiBrokerSuffix(name) {
  * @return {string}
  */
 function cleanCustomerEmailCarrierName(rawName, rules) {
-  let name = String(rawName || "").trim();
+  const raw = String(rawName || "").trim();
+  let name = raw;
   if (!name) return name;
   let matched = false;
   if (Array.isArray(rules) && rules.length) {
@@ -1786,7 +1825,7 @@ function cleanCustomerEmailCarrierName(rawName, rules) {
       matched = true;
       for (const needle of rule.needles || []) {
         const n = String(needle || "").trim();
-        if (!n) continue;
+        if (!n || !isSafeCarrierStripNeedle(n)) continue;
         const flex = n
             .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
             .replace(/\\?\s+/g, "[\\s\\-–—/]*")
@@ -1804,10 +1843,18 @@ function cleanCustomerEmailCarrierName(rawName, rules) {
           .test(name)) {
     name = stripJiBrokerSuffix(name);
   }
-  return name
+  name = name
       .replace(/\s+/g, " ")
       .replace(/\s*[-–—/,]+$/g, "")
-      .trim() || String(rawName || "").trim();
+      .trim();
+  // Guard: short rename needles (e.g. "abf") must not destroy the label.
+  if (isBrokenCarrierDisplayName(name, raw)) {
+    name = stripJiBrokerSuffix(raw)
+        .replace(/\s+/g, " ")
+        .replace(/\s*[-–—/,]+$/g, "")
+        .trim() || raw;
+  }
+  return name || raw;
 }
 
 /**
@@ -2194,6 +2241,8 @@ module.exports = {
   customerEmailNoteText,
   cleanCustomerEmailCarrierName,
   stripJiBrokerSuffix,
+  isSafeCarrierStripNeedle,
+  isBrokenCarrierDisplayName,
   toCustomerEmailCarrierNoteRules,
   toCustomerEmailCarrierCleanRules,
   applyZipFillRules,

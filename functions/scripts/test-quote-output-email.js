@@ -289,6 +289,53 @@ check(
         "Central Transport - J - I DISTRIBUTORS - DENSITY", []),
     "Central Transport - DENSITY",
 );
+const renameishCleanRules = quoteRules.toCustomerEmailCarrierCleanRules([{
+  id: "clean_carrier_display_names",
+  active: true,
+  ruleKind: "carrier_display_clean",
+  name: "Clean carrier names in customer emails and rate lists",
+  match: {
+    carrierNameContains: [
+      "estes express",
+      "abf freight system",
+      "aaa cooper transportation",
+      "estes",
+      "abf",
+      "aaa cooper",
+    ],
+  },
+  notes: "Show only Estes instead of Estes Express, only ABF instead of " +
+    "ABF Freight System.",
+}]);
+const jiPlusRenameRules = [...jiCleanRules, ...renameishCleanRules];
+check(
+    "short abf needle does not blank ABF FREIGHT SYSTEM",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "ABF FREIGHT SYSTEM, INC. % J-I DISTRIBUTERS", jiPlusRenameRules),
+    "ABF FREIGHT SYSTEM, INC.",
+);
+check(
+    "short estes needle does not blank ESTES Express",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "ESTES Express", renameishCleanRules),
+    "ESTES Express",
+);
+check(
+    "Central J-I still cleans with rename-ish rules loaded",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "Central Transport - J - I DISTRIBUTORS", jiPlusRenameRules),
+    "Central Transport",
+);
+check(
+    "isSafeCarrierStripNeedle rejects bare abf",
+    quoteRules.isSafeCarrierStripNeedle("abf"),
+    false,
+);
+check(
+    "isSafeCarrierStripNeedle allows j - i",
+    quoteRules.isSafeCarrierStripNeedle("j - i"),
+    true,
+);
 check(
     "needle match equates J&I and J – I",
     quoteRules.carrierNameMatchesNeedle("Roadrunner J – I", "j&i"),
