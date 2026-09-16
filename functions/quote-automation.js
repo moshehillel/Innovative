@@ -929,9 +929,14 @@ async function rateLane(lane, ctx) {
     timeout: process.env.QUOTE_RATE_TIMEOUT || undefined,
   });
 
-  let fetched = await rateShop.fetchMultipleRates(query);
+  // Customer calls: one identical /rate/multiple retry + merge when
+  // Primus intermittently omits vendor rows (e.g. D6181 J&I miss).
+  let fetched = ctx.shippingLocationId ?
+    await rateShop.fetchMultipleRatesWithCustomerRetry(query) :
+    await rateShop.fetchMultipleRates(query);
   let rates = fetched.rates || [];
   let noRates = fetched.noRates || [];
+  let primusRateRetried = !!fetched.primusRateRetried;
   let rateNote = null;
   let rateSource = ctx.shippingLocationId ? "customer" : null;
   let fakPricing = null;
@@ -1062,6 +1067,9 @@ async function rateLane(lane, ctx) {
   if (fedexMarketSupplement) {
     addWarn("FedEx from market (not on customer profile)");
   }
+  if (primusRateRetried) {
+    addWarn("Primus rate retry merged");
+  }
   if (fedexNoRateHint) {
     addWarn(`FedEx: ${fedexNoRateHint}`);
   }
@@ -1092,6 +1100,7 @@ async function rateLane(lane, ctx) {
     rateWarning,
     rateSource,
     fakPricing: fakPricing || null,
+    primusRateRetried,
     extractionWarnings,
   };
 }
