@@ -1562,7 +1562,8 @@ function serializeInboxQuote(doc, data) {
       })),
       topOptions: (lane.options || []).slice(0, 5).map((o) => ({
         rateId: quoteOutput.optionRateId(o),
-        name: o.name,
+        // Strip J&I on list preview so pre-fix stored names stay clean.
+        name: quoteOutput.customerFacingCarrierName(o, []),
         SCAC: o.SCAC,
         sellRate: o.sellRate != null ? o.sellRate : o.total,
         cost: o.total != null ? o.total : o.cost,

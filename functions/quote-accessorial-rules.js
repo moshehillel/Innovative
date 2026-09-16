@@ -1759,6 +1759,10 @@ function stripJiBrokerSuffix(name) {
           /\s*[-–—/%]*\s*j\s*(?:&|and|[-–—/])\s*i(?:\s*distribut[eo]rs?)?\b/ig,
           "")
       .replace(/\s*[-–—/%]*\s*ji\s*distribut[eo]rs?\b/ig, "")
+      // Orphan broker tags left when only the J-I token was stripped earlier
+      // (e.g. "ABF … % DISTRIBUTERS" or trailing "DISTRIBUTORS").
+      .replace(/\s*[%]*\s*\bdistribut[eo]rs?\b/ig, "")
+      .replace(/\s*%+\s*/g, " ")
       .replace(/\s+/g, " ")
       .replace(/\s*[-–—/,]+$/g, "")
       .trim();
@@ -1794,7 +1798,10 @@ function cleanCustomerEmailCarrierName(rawName, rules) {
   }
   // Always strip common J&I / J-I DISTRIBUTORS tags — Primus appends these
   // even when the Active clean rule needles miss a dash/en-dash variant.
-  if (matched || /\bj\s*(?:&|and|[-–—/])\s*i\b|\bji\s*distribut/i.test(name)) {
+  // Also catch orphan "% DISTRIBUTERS" left by older partial strips.
+  if (matched ||
+      /\bj\s*(?:&|and|[-–—/])\s*i\b|\bji\s*distribut|%\s*distribut|\bdistribut[eo]rs?\b/i
+          .test(name)) {
     name = stripJiBrokerSuffix(name);
   }
   return name

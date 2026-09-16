@@ -720,9 +720,12 @@ function serializeForDispatcherPage(quote) {
         const warnings = warningText ?
           warningText.slice(0, 2000) : null;
         const quoteNumber = o.quoteNumber || o.savedQuoteNumber || null;
+        // Always strip J&I / broker suffixes for UI — covers stale quotes
+        // rated before rate-shop cleaning shipped.
+        const displayName = customerFacingCarrierName(o, []);
         return {
           rateId: optionRateId(o),
-          name: o.name,
+          name: displayName,
           SCAC: o.SCAC,
           cost: o.total != null ? o.total : o.cost,
           sellRate: ceilWholeDollar(
@@ -757,6 +760,7 @@ module.exports = {
   serializeForDispatcherPage,
   effectiveCustomerRate,
   customerNoteFromOption,
+  customerFacingCarrierName,
   formatCustomerPricingLine,
   formatCustomerPricingLineBullet,
   formatCustomerPricingLineSimple,

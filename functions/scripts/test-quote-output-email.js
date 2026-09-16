@@ -272,6 +272,24 @@ check(
     "ABF Freight",
 );
 check(
+    "orphan % DISTRIBUTERS after partial strip",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "ABF FREIGHT SYSTEM, INC. % DISTRIBUTERS", []),
+    "ABF FREIGHT SYSTEM, INC.",
+);
+check(
+    "ABF % J-I DISTRIBUTERS full strip",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "ABF FREIGHT SYSTEM, INC. % J-I DISTRIBUTERS", []),
+    "ABF FREIGHT SYSTEM, INC.",
+);
+check(
+    "density suffix kept after J&I strip",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "Central Transport - J - I DISTRIBUTORS - DENSITY", []),
+    "Central Transport - DENSITY",
+);
+check(
     "needle match equates J&I and J – I",
     quoteRules.carrierNameMatchesNeedle("Roadrunner J – I", "j&i"),
     true,
@@ -329,13 +347,56 @@ const page = quoteOutput.serializeForDispatcherPage({
   }],
 });
 check(
+    "serialize strips Mso warnings",
+    !!(page.lanes[0].options[0].warnings &&
+      !/MsoNormal|font-size|&nbsp;/i.test(page.lanes[0].options[0].warnings)),
+    true,
+);
+
+const pageJi = quoteOutput.serializeForDispatcherPage({
+  id: "q2",
+  lanes: [{
+    laneKey: "1",
+    options: [
+      {id: "a", name: "Roadrunner J&I", sellRate: 100, total: 90},
+      {
+        id: "b",
+        name: "ABF FREIGHT SYSTEM, INC. % DISTRIBUTERS",
+        sellRate: 110,
+        total: 95,
+      },
+      {
+        id: "c",
+        name: "Central Transport - J - I DISTRIBUTORS",
+        sellRate: 120,
+        total: 100,
+      },
+    ],
+  }],
+});
+check(
+    "serialize cleans Roadrunner J&I for UI",
+    pageJi.lanes[0].options[0].name,
+    "Roadrunner",
+);
+check(
+    "serialize cleans orphan DISTRIBUTERS for UI",
+    pageJi.lanes[0].options[1].name,
+    "ABF FREIGHT SYSTEM, INC.",
+);
+check(
+    "serialize cleans Central Transport J-I for UI",
+    pageJi.lanes[0].options[2].name,
+    "Central Transport",
+);
+check(
     "UI serialize strips warnings",
     page.lanes[0].options[0].warnings,
     "Non-direct point. Please double check charges.",
 );
 
 const slimPage = quoteOutput.serializeForDispatcherPage({
-  id: "q2",
+  id: "q3",
   lanes: [{
     laneKey: "L1",
     options: [
@@ -359,6 +420,11 @@ check("serialize prefers rateId when id missing (cheap)",
     slimPage.lanes[0].options[0].rateId, "R-cheap");
 check("serialize prefers rateId when id missing (OD)",
     slimPage.lanes[0].options[1].rateId, "R-od");
+check(
+    "serialize list also cleans J&I on slim rows",
+    slimPage.lanes[0].options[0].name,
+    "Roadrunner",
+);
 check("optionRateId reads rateId",
     quoteOutput.optionRateId({rateId: "R-cheap"}), "R-cheap");
 check("optionRateId prefers id",
