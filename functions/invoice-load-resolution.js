@@ -50,9 +50,9 @@ function normalizeShipmentReference(value) {
 
 /** PRO tokens that are label/status text, not carrier PRO numbers. */
 const PRO_GARBAGE_WORDS = new Set([
-  "vided", "provided", "provide", "none", "null", "na", "n/a",
-  "not", "available", "pending", "attached", "invoice", "number",
-  "ref", "reference", "see", "below", "tbd", "unknown",
+  "vided", "vider", "provided", "provide", "provider", "none", "null",
+  "na", "n/a", "not", "available", "pending", "attached", "invoice",
+  "number", "ref", "reference", "see", "below", "tbd", "unknown",
   "hibited", "prohibited", "ohibited",
 ]);
 

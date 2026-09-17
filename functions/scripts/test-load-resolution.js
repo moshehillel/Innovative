@@ -230,5 +230,20 @@ const factorview798 = lr.applyEmailLoadHintsToInvoice({
 check("FactorView subject does not fill load",
     factorview798.loadNumber, "");
 
+check("vider is not a plausible PRO",
+    lr.isPlausibleCarrierPro("vider"), false);
+check("vided is not a plausible PRO",
+    lr.isPlausibleCarrierPro("vided"), false);
+const whiteArrowVider = lr.normalizeCarrierReferenceFields({
+  loadNumber: "267398",
+  proNumber: "vider",
+  invoiceNumber: "1110865",
+  carrierName: "White Arrow",
+});
+check("White Arrow keeps broker load when PRO is vider garbage",
+    whiteArrowVider.loadNumber, "267398");
+check("White Arrow clears vider PRO",
+    whiteArrowVider.proNumber, "");
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

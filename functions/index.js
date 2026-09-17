@@ -411,16 +411,18 @@ async function hasPriorCompletedBillingForLoad(
     tenant, loadNumber, carrierInvoiceNumber) {
   const normalized = normalizeLoadNumber(loadNumber);
   if (!normalized) return false;
+  // Require the specific carrier invoice # — a prior Jerry run for a
+  // different bill on the same load must not suppress a new carrier invoice.
+  const carrierNorm = String(carrierInvoiceNumber || "").trim() ?
+    normalizeCarrierReference(carrierInvoiceNumber) : "";
+  if (!carrierNorm) return false;
   const snap = await tcol(tenant, "invoices")
       .where("loadNumber", "==", normalized)
       .limit(12)
       .get();
-  const carrierNorm = String(carrierInvoiceNumber || "").trim() ?
-    normalizeCarrierReference(carrierInvoiceNumber) : "";
   for (const doc of snap.docs) {
     const data = doc.data() || {};
     if (data.finalWorkflowStatus !== "completed") continue;
-    if (!carrierNorm) return true;
     const prev = normalizeCarrierReference(
         data.invoiceNumber || data.proNumber || "");
     if (prev && prev === carrierNorm) return true;
@@ -940,6 +942,9 @@ function readBolFromBooking(booking) {
  * @return {Promise<object|null>} First matching booking, or null.
  */
 async function fetchPrimusBookingByPro(proNumber) {
+  if (!loadResolution.isPlausibleCarrierPro(proNumber)) {
+    return null;
+  }
   const variants = proNumberSearchVariants(proNumber);
   for (const variant of variants) {
     try {
@@ -979,6 +984,9 @@ async function fetchPrimusBookingByPro(proNumber) {
  * @return {Promise<object>} {loadNumber, booking, matchedPro}.
  */
 async function resolveLoadNumberFromPrimusPro(proNumber) {
+  if (!loadResolution.isPlausibleCarrierPro(proNumber)) {
+    return {loadNumber: null, booking: null, matchedPro: null};
+  }
   const booking = await fetchPrimusBookingByPro(proNumber);
   if (!booking) {
     return {loadNumber: null, booking: null, matchedPro: null};
@@ -1125,6 +1133,26 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
       loadResolvedFrom: null,
     };
   }
+
+  // Valid 6-digit broker load that only failed the lastKnown range gate:
+  // if Primus has that BOL, keep it — never PRO-remap to another shipment.
+  if (loadResolution.isValidLoadNumber(refs.loadNumber) &&
+      direct.reason === "out_of_range") {
+    let rangedBooking = null;
+    try {
+      rangedBooking = await fetchPrimusBooking(refs.loadNumber);
+    } catch (_) {
+      rangedBooking = null;
+    }
+    if (rangedBooking) {
+      return {
+        aiResult: {...refs, loadNumber: refs.loadNumber},
+        gateFailed: false,
+        loadResolvedFrom: null,
+      };
+    }
+  }
+
   if (normalizedProNumber) {
     const proResolved = await resolveLoadNumberFromPrimusPro(
         normalizedProNumber);
