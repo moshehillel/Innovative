@@ -244,6 +244,19 @@ check("White Arrow keeps broker load when PRO is vider garbage",
     whiteArrowVider.loadNumber, "267398");
 check("White Arrow clears vider PRO",
     whiteArrowVider.proNumber, "");
+check("vider never becomes a Primus lookup key",
+    lr.buildPrimusLookupKeys({
+      loadNumber: "267398",
+      proNumber: "vider",
+      carrierOrderNumber: "vider",
+    }).map((k) => k.ref).includes("vider"), false);
+check("BOL keys still precede digit PRO",
+    lr.buildPrimusLookupKeys({
+      loadNumber: "267398",
+      carrierBolNumber: "999111",
+      proNumber: "1110865",
+    }).map((k) => k.label),
+    ["broker_load", "carrier_bol", "pro"]);
 
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

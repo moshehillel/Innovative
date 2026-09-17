@@ -212,9 +212,20 @@ function buildPrimusLookupKeys(refs) {
     if (keys.some((k) => k.ref === value)) return;
     keys.push({ref: value, label});
   };
+  const addDigitPro = (ref) => {
+    // PRO lookup keys are digits-only. Letter tokens (vider, hibited, OTR-…)
+    // must never reach Primus vendorPro search.
+    if (!isPlausibleCarrierPro(ref)) return;
+    addDigits(ref, "pro");
+  };
   const addText = (ref, label) => {
     const value = normalizeShipmentReference(ref);
     if (!value) return;
+    // Never treat letter garbage / non-digit tokens as Primus search keys
+    // that can fall through to vendorPro matching.
+    const compact = value.toLowerCase().replace(/[\s._-]/g, "");
+    if (PRO_GARBAGE_WORDS.has(compact)) return;
+    if (!/\d/.test(value)) return;
     if (keys.some((k) => k.ref === value)) return;
     keys.push({ref: value, label});
   };
@@ -223,12 +234,13 @@ function buildPrimusLookupKeys(refs) {
     if (!expanded) return;
     addDigits(expanded, label);
   };
+  // Order matters: broker BOL / carrier BOL before PRO.
   addDigits(refs.loadNumber, "broker_load");
   addLeadingTwoExpansion(refs.loadNumber, "broker_load_leading2");
   addDigits(refs.carrierBolNumber, "carrier_bol");
   addLeadingTwoExpansion(refs.carrierBolNumber, "carrier_bol_leading2");
-  addDigits(refs.proNumber, "pro");
   addLeadingTwoExpansion(refs.carrierOrderNumber, "broker_load_leading2");
+  addDigitPro(refs.proNumber);
   addText(refs.shipmentReference, "shipment_ref");
   addText(refs.carrierOrderNumber, "carrier_order");
   addDigits(refs.poNumber, "po");

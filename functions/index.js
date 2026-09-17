@@ -1010,7 +1010,8 @@ async function resolveLoadNumberFromCarrierReference(ref, hints = {}) {
   try {
     const booking = await fetchPrimusBooking(raw);
     if (booking) {
-      const loadNumber = readBolFromBooking(booking);
+      const loadNumber = readBolFromBooking(booking) ||
+        (loadResolution.isValidLoadNumber(raw) ? normalizeLoadNumber(raw) : null);
       if (loadNumber) {
         return {loadNumber, booking, source: "bolnumber", matchedPro: null};
       }
@@ -1019,18 +1020,23 @@ async function resolveLoadNumberFromCarrierReference(ref, hints = {}) {
     // BOL lookup is best-effort.
   }
 
-  try {
-    const resolved = await resolveLoadNumberFromPrimusPro(raw);
-    if (resolved.loadNumber) {
-      return {
-        loadNumber: resolved.loadNumber,
-        booking: resolved.booking,
-        source: "vendor_pro",
-        matchedPro: resolved.matchedPro,
-      };
+  // PRO / vendorPro search is digits-only. Never query Primus with letters.
+  if (!loadResolution.isPlausibleCarrierPro(raw)) {
+    // Still allow tracking search for alphanumeric shipment refs (FBA…).
+  } else {
+    try {
+      const resolved = await resolveLoadNumberFromPrimusPro(raw);
+      if (resolved.loadNumber) {
+        return {
+          loadNumber: resolved.loadNumber,
+          booking: resolved.booking,
+          source: "vendor_pro",
+          matchedPro: resolved.matchedPro,
+        };
+      }
+    } catch (_) {
+      // PRO lookup is best-effort.
     }
-  } catch (_) {
-    // PRO lookup is best-effort.
   }
 
   try {
@@ -1153,32 +1159,9 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
     }
   }
 
-  if (normalizedProNumber) {
-    const proResolved = await resolveLoadNumberFromPrimusPro(
-        normalizedProNumber);
-    if (proResolved.loadNumber) {
-      const proAccepted = loadResolution.evaluateLoadCandidate(
-          proResolved.loadNumber, normalizedProNumber, lastKnownLoadNumber,
-          {skipRange: true});
-      if (proAccepted.ok) {
-        return {
-          aiResult: {
-            ...refs,
-            loadNumber: proAccepted.loadNumber,
-            loadNumberSource: "primus_pro_vendor_pro",
-          },
-          gateFailed: false,
-          loadResolvedFrom: {
-            via: "pro",
-            ref: normalizedProNumber,
-            matchedPro: proResolved.matchedPro || null,
-            primusSource: "vendor_pro",
-          },
-        };
-      }
-    }
-  }
-
+  // BOL / broker load / order refs before PRO. Never search Primus by a
+  // letter-only "PRO" — isPlausibleCarrierPro already cleared those, and
+  // buildPrimusLookupKeys only emits digit PRO keys.
   const lookupKeys = loadResolution.buildPrimusLookupKeys(refs);
   const lookupHints = {
     invoiceAmount: aiResult.invoiceAmount,
