@@ -195,7 +195,27 @@ check("BOL before PRO in lookup keys",
       proNumber: "696469179",
       carrierBolNumber: "263645",
     }).map((k) => k.label),
-    ["carrier_bol", "pro"]);
+    ["carrier_bol"]);
+check("no PRO lookup key when BOL present",
+    lr.buildPrimusLookupKeys({
+      loadNumber: "267398",
+      proNumber: "1110865",
+    }).some((k) => k.label === "pro"), false);
+check("PRO lookup key only when invoice has no BOL",
+    lr.buildPrimusLookupKeys({
+      loadNumber: "",
+      carrierBolNumber: "",
+      proNumber: "696469179",
+    }).map((k) => k.label),
+    ["pro"]);
+check("order ref does not block digit PRO when no BOL",
+    lr.buildPrimusLookupKeys({
+      loadNumber: "",
+      carrierBolNumber: "",
+      proNumber: "1110865",
+      carrierOrderNumber: "2054707475",
+    }).map((k) => k.label),
+    ["pro", "carrier_order"]);
 
 const emptyInvoice = lr.applyEmailLoadHintsToInvoice({
   loadNumber: "",
@@ -250,13 +270,13 @@ check("vider never becomes a Primus lookup key",
       proNumber: "vider",
       carrierOrderNumber: "vider",
     }).map((k) => k.ref).includes("vider"), false);
-check("BOL keys still precede digit PRO",
+check("PRO omitted from keys when BOL present",
     lr.buildPrimusLookupKeys({
       loadNumber: "267398",
       carrierBolNumber: "999111",
       proNumber: "1110865",
     }).map((k) => k.label),
-    ["broker_load", "carrier_bol", "pro"]);
+    ["broker_load", "carrier_bol"]);
 
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

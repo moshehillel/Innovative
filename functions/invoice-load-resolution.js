@@ -235,12 +235,19 @@ function buildPrimusLookupKeys(refs) {
     addDigits(expanded, label);
   };
   // Order matters: broker BOL / carrier BOL before PRO.
+  // PRO is only a fallback when the invoice has no BOL at all.
   addDigits(refs.loadNumber, "broker_load");
   addLeadingTwoExpansion(refs.loadNumber, "broker_load_leading2");
   addDigits(refs.carrierBolNumber, "carrier_bol");
   addLeadingTwoExpansion(refs.carrierBolNumber, "carrier_bol_leading2");
   addLeadingTwoExpansion(refs.carrierOrderNumber, "broker_load_leading2");
-  addDigitPro(refs.proNumber);
+  const hasBol = isValidLoadNumber(refs.loadNumber) ||
+    isValidLoadNumber(refs.carrierBolNumber) ||
+    !!expandDroppedLeadingTwo(refs.loadNumber) ||
+    !!expandDroppedLeadingTwo(refs.carrierBolNumber);
+  if (!hasBol) {
+    addDigitPro(refs.proNumber);
+  }
   addText(refs.shipmentReference, "shipment_ref");
   addText(refs.carrierOrderNumber, "carrier_order");
   addDigits(refs.poNumber, "po");

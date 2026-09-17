@@ -1116,52 +1116,33 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
   const refs = loadResolution.normalizeCarrierReferenceFields(aiResult);
   const normalizedProNumber = refs.proNumber || "";
 
-  const direct = loadResolution.evaluateLoadCandidate(
-      refs.loadNumber, normalizedProNumber, lastKnownLoadNumber);
-  if (direct.ok) {
-    let directBooking = null;
-    try {
-      directBooking = await fetchPrimusBooking(direct.loadNumber);
-    } catch (_) {
-      directBooking = null;
-    }
-    if (directBooking) {
+  // BOL / broker load is the primary key on a carrier invoice. When the
+  // invoice already has a valid 6-digit BOL, that is the load — never look
+  // up or remap via PRO.
+  const bolCandidate = loadResolution.isValidLoadNumber(refs.loadNumber) ?
+    refs.loadNumber :
+    (loadResolution.isValidLoadNumber(refs.carrierBolNumber) ?
+      refs.carrierBolNumber : "");
+  if (bolCandidate) {
+    const direct = loadResolution.evaluateLoadCandidate(
+        bolCandidate, normalizedProNumber, lastKnownLoadNumber,
+        {skipRange: true});
+    if (direct.ok) {
       return {
         aiResult: {...refs, loadNumber: direct.loadNumber},
         gateFailed: false,
         loadResolvedFrom: null,
       };
     }
-    // Valid 6-digit BOL/load wins over PRO remap even when Primus fetch failed.
+    // Still prefer the invoice BOL over any PRO fallback.
     return {
-      aiResult: {...refs, loadNumber: direct.loadNumber},
+      aiResult: {...refs, loadNumber: bolCandidate},
       gateFailed: false,
       loadResolvedFrom: null,
     };
   }
 
-  // Valid 6-digit broker load that only failed the lastKnown range gate:
-  // if Primus has that BOL, keep it — never PRO-remap to another shipment.
-  if (loadResolution.isValidLoadNumber(refs.loadNumber) &&
-      direct.reason === "out_of_range") {
-    let rangedBooking = null;
-    try {
-      rangedBooking = await fetchPrimusBooking(refs.loadNumber);
-    } catch (_) {
-      rangedBooking = null;
-    }
-    if (rangedBooking) {
-      return {
-        aiResult: {...refs, loadNumber: refs.loadNumber},
-        gateFailed: false,
-        loadResolvedFrom: null,
-      };
-    }
-  }
-
-  // BOL / broker load / order refs before PRO. Never search Primus by a
-  // letter-only "PRO" — isPlausibleCarrierPro already cleared those, and
-  // buildPrimusLookupKeys only emits digit PRO keys.
+  // No BOL on the invoice — only then try PRO / order / shipment refs.
   const lookupKeys = loadResolution.buildPrimusLookupKeys(refs);
   const lookupHints = {
     invoiceAmount: aiResult.invoiceAmount,
@@ -1196,7 +1177,7 @@ async function resolveInvoiceLoadNumber(aiResult, lastKnownLoadNumber) {
     aiResult: refs,
     gateFailed: true,
     loadResolvedFrom: null,
-    gateReason: direct.reason || "lookup_failed",
+    gateReason: "lookup_failed",
   };
 }
 
