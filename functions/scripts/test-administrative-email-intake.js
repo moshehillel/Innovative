@@ -316,6 +316,16 @@ check("Lisa D&B New Inquiry alert (exact subject) ignored",
         "Dun & Bradstreet <e.email@dnb.com>",
         "",
         []).status === "dnb_promotional_ignored");
+check("D&B Credit Insights ignored with HTML amp in subject",
+    adm.isDnbPromotionalEmail(
+        "ALERT: New Inquiry Reported in D&amp;B Credit Insights",
+        "Dun & Bradstreet <e.email@dnb.com>",
+        ""));
+check("D&B external inquiry body ignored",
+    adm.isDnbPromotionalEmail(
+        "Credit alert",
+        "Dun & Bradstreet <e.email@dnb.com>",
+        "A new external inquiry has been made. Log in to D&B Credit Insights."));
 check("D&B Credit Insights ignored with empty From",
     adm.evaluateAdministrativeIgnore(
         "ALERT: New Inquiry Reported in D&B Credit Insights",

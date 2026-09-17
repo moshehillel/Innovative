@@ -89,14 +89,15 @@ function looksLikeDnbCreditAlert(hay) {
  * @return {boolean}
  */
 function isDnbCreditInsightsDigest(hay) {
-  const text = String(hay || "").toLowerCase();
+  const text = String(hay || "").toLowerCase()
+      .replace(/&amp;/g, "&");
   if (/credit insights/.test(text) &&
-      /(?:new )?inquir(?:y|ies) reported/.test(text)) {
+      /(?:new )?inquir(?:y|ies) reported|external inquir/.test(text)) {
     return true;
   }
   if (/alert:\s*new inquiry reported/.test(text)) return true;
   // "New Inquiry Reported" + D&B branding (subject may omit "Credit Insights")
-  if (/(?:new )?inquir(?:y|ies) reported/.test(text) &&
+  if (/(?:new )?inquir(?:y|ies) reported|external inquir/.test(text) &&
       /(?:d\s*&\s*b|dun\s*&\s*bradstreet|dnb\.com)/.test(text)) {
     return true;
   }

@@ -8282,6 +8282,24 @@ async function processGmailMessage(
       to: to,
     });
 
+    // Hard failsafe: D&B Credit Insights / marketing ESP must never reach
+    // Lisa as "no attachments / I do not have a rule" — even if a later
+    // admin-ignore gate is skipped or blocked by invoice veto.
+    if (!isChildSplitJob && !isTai &&
+        administrativeEmailIntake.isDnbPromotionalEmail(
+            subject, from, emailBody)) {
+      await completeAdministrativeIgnore({
+        messageId,
+        subject,
+        from,
+        tenant,
+        queueDocId,
+        finalStatus: "dnb_promotional_ignored",
+        reason: "D&B Credit Insights / promotional — no action needed",
+      });
+      return;
+    }
+
     const alreadyProcessed = options.fromQueue ?
       false :
       await hasEmailBeenProcessed(messageId, tenant);
@@ -9059,6 +9077,37 @@ async function processGmailMessage(
               emailClassification,
               queueDocId,
               reason: "Customer remittance (AI) with no attachments",
+            });
+            return;
+          }
+        }
+        {
+          // Last-chance quiet ignores before Lisa no-attachment forward.
+          const lateAdminIgnore =
+            administrativeEmailIntake.evaluateAdministrativeIgnore(
+                subject, from, emailBody, attachments, headers);
+          if (lateAdminIgnore.ignore) {
+            await completeAdministrativeIgnore({
+              messageId,
+              subject,
+              from,
+              tenant,
+              queueDocId,
+              finalStatus: lateAdminIgnore.status,
+              reason: lateAdminIgnore.reason,
+            });
+            return;
+          }
+          if (administrativeEmailIntake.isDnbPromotionalEmail(
+              subject, from, emailBody)) {
+            await completeAdministrativeIgnore({
+              messageId,
+              subject,
+              from,
+              tenant,
+              queueDocId,
+              finalStatus: "dnb_promotional_ignored",
+              reason: "D&B Credit Insights / promotional — no action needed",
             });
             return;
           }
