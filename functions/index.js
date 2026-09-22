@@ -2524,12 +2524,25 @@ exports.executeEnterInvoiceLoadNumber = onRequest(
           });
         }
 
-        const prior = intake && intake.manualLoadNumber ?
-          String(intake.manualLoadNumber) : null;
-        if (prior === normalizedLoad && intake.status === "processed") {
-          return res.json({ok: true, already: true});
+        const existingInv = await findInvoiceForLoadFromEmail(
+            tenant, normalizedLoad, String(messageId));
+        if (existingInv) {
+          await intakeRef.set({
+            "pendingLoadEntry.status": "completed",
+            "pendingLoadEntry.loadNumber": normalizedLoad,
+            "pendingLoadEntry.completedAt":
+              admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, {merge: true});
+          return res.json({
+            ok: true,
+            already: true,
+            invoiceId: existingInv.invoiceId,
+            loadNumber: normalizedLoad,
+          });
         }
 
+        const priorPending = (intake && intake.pendingLoadEntry) || {};
         await intakeRef.set({
           manualLoadNumber: normalizedLoad,
           manualLoadItemIndex: Number(itemIndex) || 0,
@@ -2539,6 +2552,10 @@ exports.executeEnterInvoiceLoadNumber = onRequest(
             status: "submitted",
             loadNumber: normalizedLoad,
             itemIndex: Number(itemIndex) || 0,
+            invoiceAmount: priorPending.invoiceAmount != null ?
+              priorPending.invoiceAmount : null,
+            carrierName: priorPending.carrierName || null,
+            submittedAt: admin.firestore.FieldValue.serverTimestamp(),
           },
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, {merge: true});
@@ -2546,9 +2563,73 @@ exports.executeEnterInvoiceLoadNumber = onRequest(
         const inboxFlowId = (intake && intake.inboxFlowId) ||
           (crypto.randomUUID && crypto.randomUUID()) ||
           String(Date.now());
-        await reprocessGmailMessageForTenant(
+        const reprocess = await reprocessGmailMessageForTenant(
             tenant, String(messageId), inboxFlowId);
-        return res.json({ok: true, loadNumber: normalizedLoad});
+
+        if (!reprocess || reprocess.connected === false || reprocess.error) {
+          const errMsg = (reprocess && reprocess.error) ||
+            "Mail reprocess failed";
+          await intakeRef.set({
+            "pendingLoadEntry.status": "failed",
+            "pendingLoadEntry.error": String(errMsg).slice(0, 300),
+            "pendingLoadEntry.failedAt":
+              admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          }, {merge: true});
+          await writeLog("error", "workflow",
+              "executeEnterInvoiceLoadNumber: reprocess failed", {
+                messageId,
+                loadNumber: normalizedLoad,
+                error: errMsg,
+                connected: reprocess && reprocess.connected,
+              });
+          try {
+            await saveOutboundEmail({
+              type: "load_entry_reprocess_failed",
+              forceRecipient: true,
+              to: invoiceLoadEntry.LISA_EMAIL_DEFAULT,
+              subject: `Could not finish load ${normalizedLoad} — try again`,
+              html:
+                `<p>Jerry saved load <strong>${escapeHtml(normalizedLoad)}` +
+                `</strong> but could not reprocess the carrier email.</p>` +
+                `<p style="color:#6b7280;font-size:14px">` +
+                `${escapeHtml(errMsg)}</p>` +
+                `<p>Please click <strong>Enter load number</strong> again ` +
+                `from the original email, or forward the invoice to ` +
+                `accounting for a fresh try.</p>`,
+              tenant,
+            });
+          } catch (mailErr) {
+            console.error("load_entry_reprocess_failed email:",
+                mailErr.message);
+          }
+          return res.status(500).json({
+            ok: false, error: errMsg, loadNumber: normalizedLoad,
+          });
+        }
+
+        const created = await findInvoiceForLoadFromEmail(
+            tenant, normalizedLoad, String(messageId));
+        await intakeRef.set({
+          "pendingLoadEntry.status": created ? "completed" : "reprocessed",
+          "pendingLoadEntry.loadNumber": normalizedLoad,
+          "pendingLoadEntry.invoiceId": created ? created.invoiceId : null,
+          "pendingLoadEntry.completedAt":
+            admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        }, {merge: true});
+
+        await writeLog("info", "workflow",
+            "executeEnterInvoiceLoadNumber: reprocess finished", {
+              messageId,
+              loadNumber: normalizedLoad,
+              invoiceId: created ? created.invoiceId : null,
+            });
+        return res.json({
+          ok: true,
+          loadNumber: normalizedLoad,
+          invoiceId: created ? created.invoiceId : null,
+        });
       } catch (error) {
         console.error("executeEnterInvoiceLoadNumber error:", error);
         return res.status(500).json({ok: false, error: error.message});
@@ -10061,6 +10142,10 @@ async function processGmailMessage(
       invoiceLoadEntry.normalizeManualLoadNumber(
           intakeDataForLoad.manualLoadNumber) : null;
     const manualLoadItemIndex = Number(intakeDataForLoad.manualLoadItemIndex);
+    const pendingLoadAmount =
+      intakeDataForLoad.pendingLoadEntry &&
+      intakeDataForLoad.pendingLoadEntry.invoiceAmount != null ?
+        intakeDataForLoad.pendingLoadEntry.invoiceAmount : null;
 
     const createdInvoiceIds = [];
     const itemSummaries = preSkippedItemSummaries.slice();
@@ -10278,10 +10363,13 @@ async function processGmailMessage(
           aiResult, subject, emailBody);
 
       if (!isTai) {
-        const useManualLoad = manualLoadOverride &&
-          invoiceLoadEntry.isValidManualLoadNumber(manualLoadOverride) &&
-          (Number.isNaN(manualLoadItemIndex) ||
-            manualLoadItemIndex === itemIndex);
+        const useManualLoad = invoiceLoadEntry.shouldUseLisaManualLoad({
+          manualLoad: manualLoadOverride,
+          itemIndex,
+          manualItemIndex: manualLoadItemIndex,
+          aiResult,
+          pendingAmount: pendingLoadAmount,
+        });
         if (useManualLoad) {
           aiResult.loadNumber = manualLoadOverride;
           aiResult.loadNumberSource = "lisa_manual_entry";
@@ -10292,6 +10380,10 @@ async function processGmailMessage(
                 messageId,
                 loadNumber: manualLoadOverride,
                 itemIndex,
+                invoiceAmount: aiResult.invoiceAmount || null,
+                matchedByAmount: pendingLoadAmount != null &&
+                  Math.abs(Number(aiResult.invoiceAmount) -
+                    Number(pendingLoadAmount)) < 0.02,
               });
         } else if (aiResult.drayageLeoValidated && aiResult.loadNumber) {
           loadGateFailed = false;
@@ -13894,20 +13986,20 @@ async function resetGmailMessageForReprocessing(
     }, {merge: true});
   }
 
+  // Always clear completed/failed so processGmailMessage does not no-op.
   const queueRef = tcol(tenant, "gmailQueue").doc(messageId);
-  const queueSnap = await queueRef.get();
-  if (queueSnap.exists) {
-    await queueRef.set({
-      status: "queued",
-      intakeStatus: "queued",
-      summary: null,
-      finalStatus: null,
-      outcome: null,
-      itemSummaries: [],
-      reprocessRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    }, {merge: true});
-  }
+  await queueRef.set({
+    gmailMessageId: messageId,
+    tenantId: tenant.tenantId,
+    status: "queued",
+    intakeStatus: "queued",
+    summary: null,
+    finalStatus: null,
+    outcome: null,
+    itemSummaries: [],
+    reprocessRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
 }
 
 /**
@@ -13919,11 +14011,20 @@ async function resetGmailMessageForReprocessing(
  */
 async function reprocessGmailMessageForTenant(tenant, messageId, inboxFlowId) {
   return runWithTenant(tenant, async () => {
+    // Reset queue/intake first so a completed queue cannot make processGmailMessage
+    // return immediately — even if mail is temporarily disconnected.
+    await resetGmailMessageForReprocessing(messageId, tenant);
+
     const gmail = await getTenantGmailClient(tenant);
     if (!gmail) {
+      await writeLog("error", "mail",
+          "Reprocess aborted — mail not connected", {
+            messageId,
+            tenantId: tenant.tenantId,
+            provider: process.env.MAIL_PROVIDER || "outlook",
+          });
       return {connected: false, processed: 0, error: "Mail not connected"};
     }
-    await resetGmailMessageForReprocessing(messageId, tenant);
     const lastKnownLoadNumber = await getLastKnownLoadNumber(tenant);
     await writeLog("info", "mail", "Reprocessing mail message", {
       messageId,

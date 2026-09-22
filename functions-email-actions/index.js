@@ -36,6 +36,7 @@ const ACTION_OPTS = {
 const FAT_BASE =
   process.env.PUBLIC_FUNCTIONS_BASE_URL ||
   emailActionTokens.DEFAULT_PUBLIC_BASE_URL;
+const PUBLIC_BASE = FAT_BASE;
 
 const OPTION_LABELS = {
   a: "A - Pay carrier + bill customer (auto-email customer)",
@@ -74,6 +75,12 @@ function kickFatWorker(path, body) {
       "X-Email-Action-Worker-Secret": secret,
     },
     body: JSON.stringify(body),
+  }).then(async (resp) => {
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      console.error(`kickFatWorker ${path} HTTP ${resp.status}:`,
+          text.slice(0, 300));
+    }
   }).catch((err) =>
     console.error(`kickFatWorker ${path} failed:`, err.message));
 }
@@ -672,6 +679,32 @@ exports.enterInvoiceLoadNumber = onRequest(ACTION_OPTS, async (req, res) => {
     }
 
     if (req.method !== "POST") {
+      // Status poll for the processing page (same signed token as the form).
+      if (String(req.query.poll || "") === "1") {
+        try {
+          const tenant = await tenantFromRequest(req);
+          const intakeSnap = await tcol(tenant, "emailIntake")
+              .doc(String(messageId)).get();
+          const intake = intakeSnap.exists ? intakeSnap.data() : null;
+          const pending = (intake && intake.pendingLoadEntry) || {};
+          const loadNumber = pending.loadNumber ||
+            (intake && intake.manualLoadNumber) || null;
+          return res.status(200).json({
+            ok: true,
+            status: pending.status || (intake && intake.status) || "unknown",
+            loadNumber,
+            error: pending.error || null,
+            message: pending.status === "completed" ||
+              pending.status === "reprocessed" ?
+              `Load ${loadNumber || ""} is processing. You can close this page.` :
+              null,
+          });
+        } catch (pollErr) {
+          return res.status(200).json({
+            ok: false, status: "unknown", error: pollErr.message,
+          });
+        }
+      }
       // Best-effort intake lookup for nicer copy; skip if slow/missing.
       let carrier = null;
       let amount = null;
@@ -726,14 +759,25 @@ exports.enterInvoiceLoadNumber = onRequest(ACTION_OPTS, async (req, res) => {
           "leading 2).");
     }
 
+    const pollUrl = `${PUBLIC_BASE.replace(/\/$/, "")}/enterInvoiceLoadNumber` +
+      `?poll=1` +
+      `&messageId=${encodeURIComponent(String(messageId))}` +
+      `&invoiceId=${encodeURIComponent(String(messageId))}` +
+      `&itemIndex=${encodeURIComponent(itemIndex)}` +
+      `&option=${encodeURIComponent(itemIndex)}` +
+      `&tenantId=${encodeURIComponent(tenantId || "")}` +
+      `&exp=${encodeURIComponent(String(exp))}` +
+      `&sig=${encodeURIComponent(String(sig))}`;
+
     // Return processing page immediately; fat worker validates Primus +
-    // reprocesses the Gmail message.
+    // reprocesses the Gmail message. Page polls until done/failed.
     res.status(200).send(pages.buildEmailActionProcessingPage({
       title: "Load submitted",
       message:
         `Jerry is looking up load ${normalizedLoad} in Primus and ` +
-        `reprocessing this invoice — you can close this page.`,
+        `reprocessing this invoice. This usually takes under a minute.`,
       loadNumber: normalizedLoad,
+      pollUrl,
     }));
 
     kickFatWorker("executeEnterInvoiceLoadNumber", {

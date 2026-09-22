@@ -52,10 +52,46 @@ function isValidManualLoadNumber(loadNumber) {
   return /^\d{6}$/.test(String(loadNumber || ""));
 }
 
+/**
+ * True when this classifier item should receive Lisa's manually entered load.
+ * Matches by pending invoice amount first (stable across re-classify order),
+ * then by itemIndex. Never overrides an item that already has a load #.
+ * @param {object} opts Match inputs.
+ * @param {string|null|undefined} opts.manualLoad Normalized 6-digit load.
+ * @param {number} opts.itemIndex Current loop index.
+ * @param {number|null|undefined} opts.manualItemIndex Stored item index.
+ * @param {object} opts.aiResult Classifier invoice row.
+ * @param {number|null|undefined} opts.pendingAmount Amount from Lisa email.
+ * @return {boolean}
+ */
+function shouldUseLisaManualLoad(opts) {
+  const o = opts || {};
+  if (!isValidManualLoadNumber(o.manualLoad)) return false;
+  const existing = String((o.aiResult && o.aiResult.loadNumber) || "")
+      .replace(/\D/g, "");
+  if (existing.length >= 5) return false;
+
+  const pendingAmt = Number(o.pendingAmount);
+  const itemAmt = Number(o.aiResult && o.aiResult.invoiceAmount);
+  if (Number.isFinite(pendingAmt) && pendingAmt > 0 &&
+      Number.isFinite(itemAmt) && Math.abs(itemAmt - pendingAmt) < 0.02) {
+    return true;
+  }
+
+  const manualIdx = Number(o.manualItemIndex);
+  const itemIdx = Number(o.itemIndex);
+  if (Number.isFinite(manualIdx) && Number.isFinite(itemIdx) &&
+      manualIdx === itemIdx) {
+    return true;
+  }
+  return false;
+}
+
 module.exports = {
   LISA_EMAIL_DEFAULT,
   isDrayageInvoiceItem,
   shouldOfferLisaLoadEntry,
   normalizeManualLoadNumber,
   isValidManualLoadNumber,
+  shouldUseLisaManualLoad,
 };

@@ -98,24 +98,67 @@ function buildEmailActionConfirmPage(opts) {
  * @return {string}
  */
 function buildEmailActionProcessingPage(opts) {
+  const done = opts.done === true;
+  const pollUrl = opts.pollUrl ? String(opts.pollUrl) : "";
+  const spinner = done ? "" :
+    `<div id="spin" style="width:40px;height:40px;border:3px solid #e5e7eb;` +
+    `border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear ` +
+    `infinite;margin:0 auto 20px"></div>`;
+  const check = done ?
+    `<div style="width:48px;height:48px;border-radius:50%;background:#059669;` +
+    `color:#fff;font-size:28px;line-height:48px;margin:0 auto 20px">✓</div>` :
+    "";
+  const pollScript = (!done && pollUrl) ? `<script>
+(function(){
+  var url=${JSON.stringify(pollUrl)};
+  var tries=0;
+  function tick(){
+    tries++;
+    fetch(url,{credentials:"omit"}).then(function(r){return r.json();})
+      .then(function(j){
+        if(!j||!j.status) return;
+        var spin=document.getElementById("spin");
+        var title=document.getElementById("title");
+        var msg=document.getElementById("msg");
+        if(j.status==="completed"||j.status==="reprocessed"||j.already){
+          if(spin) spin.style.display="none";
+          if(title) title.textContent="Done";
+          if(msg) msg.textContent=j.message||
+            ("Load "+(j.loadNumber||"")+" is processing. You can close this page.");
+          return;
+        }
+        if(j.status==="failed"){
+          if(spin) spin.style.display="none";
+          if(title) title.textContent="Could not finish";
+          if(msg) msg.textContent=j.error||
+            "Jerry could not reprocess this invoice. Check your email for details.";
+          return;
+        }
+        if(tries<90) setTimeout(tick, 2000);
+        else if(msg) msg.textContent=
+          "Still working in the background — you can close this page. Jerry will email if anything needs attention.";
+      }).catch(function(){ if(tries<90) setTimeout(tick, 3000); });
+  }
+  setTimeout(tick, 2500);
+})();
+</script>` : "";
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${escapeHtml(opts.title || "Processing")}</title>` +
     `<style>@keyframes spin{to{transform:rotate(360deg)}}</style>` +
     `</head><body style="font-family:Arial,sans-serif;text-align:center;` +
     `padding:48px;color:#111827">` +
-    `<div style="width:40px;height:40px;border:3px solid #e5e7eb;` +
-    `border-top-color:#2563eb;border-radius:50%;animation:spin .8s linear ` +
-    `infinite;margin:0 auto 20px"></div>` +
-    `<h1 style="font-size:22px;margin-bottom:12px;color:#111827">` +
+    check + spinner +
+    `<h1 id="title" style="font-size:22px;margin-bottom:12px;color:#111827">` +
     `${escapeHtml(opts.title || "Processing your decision")}</h1>` +
-    `<p style="font-size:16px;color:#374151;line-height:1.5;max-width:420px;` +
-    `margin:0 auto">` +
+    `<p id="msg" style="font-size:16px;color:#374151;line-height:1.5;` +
+    `max-width:420px;margin:0 auto">` +
     `${opts.message || "Jerry is updating billing now. You can close this " +
     "page — we will email if anything needs follow-up."}</p>` +
     (opts.loadNumber ?
       `<p style="font-size:13px;color:#9ca3af;margin-top:20px">Load ` +
       `${escapeHtml(String(opts.loadNumber))}</p>` : "") +
+    pollScript +
     `</body></html>`;
 }
 
