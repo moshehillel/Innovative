@@ -990,6 +990,12 @@ function buildPodClassifierRules(options = {}) {
       "are on top and a small signature/stamp block is at the bottom. " +
       "Set cropFromBottom on that document entry to the bottom fraction " +
       "(e.g. 0.35).",
+      "Common pattern (EDI Express and many LTL carriers): a 2-page PDF " +
+      "where page 1 is the freight invoice and page 2 is the signed " +
+      "delivery receipt / POD. Set pod.found=true, list page 2 in " +
+      "pod.documents with source 'delivery_receipt' or 'signed_pod', " +
+      "and set attachmentFilename to the EXACT PDF filename provided " +
+      "(never invent a name from the PRO or invoice number).",
       "Only set pod.found=true when you can SEE delivery proof on a page " +
       "(signature, received stamp, consignee sign-off, trailer delivery " +
       "photo). Never invent a POD from a page just because it is last or " +
@@ -1122,6 +1128,9 @@ function resolveItemInvoicePdf(item, invoicePdfs) {
 /**
  * True when scoped pages are missing or cover (almost) the entire PDF —
  * typical when the model lists every page for each sibling invoice.
+ * A 2-page invoice+POD packet (page 1 bill, page 2 delivery receipt) that
+ * lists both pages is correct and must NOT be treated as sibling bleed —
+ * otherwise we drop the only file and fail POD extraction (EDI Express).
  * @param {number[]} pages 1-based pages.
  * @param {number} pageCount PDF page count.
  * @return {boolean}
@@ -1132,6 +1141,8 @@ function scopedPagesNeedRepair(pages, pageCount) {
   const uniq = [...new Set(pages.map((p) => Math.trunc(Number(p)))
       .filter((p) => Number.isFinite(p) && p >= 1 && p <= pageCount))];
   if (uniq.length === 0) return true;
+  // Invoice + POD on a 2-page PDF: listing [1,2] is the expected scope.
+  if (pageCount === 2) return false;
   if (uniq.length >= pageCount) return true;
   // Nearly entire packet (≥80%) for a multi-page PDF → sibling bleed.
   if (pageCount >= 3 && uniq.length / pageCount >= 0.8) return true;
@@ -1361,6 +1372,48 @@ function findInvoiceAttachment(attachments, hints) {
   return null;
 }
 
+/**
+ * Resolves which stored attachment a POD document entry refers to.
+ * Classifier sometimes invents a PRO-named file (e.g. "694049713.pdf")
+ * even when the real attachment has that name — or after a sibling filter
+ * drops it. Prefer exact/fuzzy filename match, then the load's invoice PDF.
+ * @param {Array<object>|null|undefined} attachments Invoice attachments.
+ * @param {object} doc POD document entry (attachmentFilename, page, …).
+ * @param {object} [invoice] Invoice doc (proNumber, attachmentFilename).
+ * @return {object|null}
+ */
+function resolvePodAttachment(attachments, doc, invoice) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  const wanted = String((doc && doc.attachmentFilename) || "").trim();
+  if (wanted) {
+    const exact = list.find((a) => a && a.filename === wanted);
+    if (exact && exact.storagePath) return exact;
+    const fuzzy = list.find((a) => a &&
+      attachmentFilenamesMatch(a.filename, wanted));
+    if (fuzzy && fuzzy.storagePath) return fuzzy;
+  }
+
+  const invHint = String(
+      (invoice && invoice.attachmentFilename) || "").trim();
+  if (invHint) {
+    const byInv = list.find((a) => a &&
+      attachmentFilenamesMatch(a.filename, invHint));
+    if (byInv && byInv.storagePath) return byInv;
+  }
+
+  const byLoad = findInvoiceAttachment(list, {
+    proNumber: invoice && invoice.proNumber,
+    attachmentFilename: wanted || invHint || null,
+  });
+  if (byLoad && byLoad.storagePath) return byLoad;
+
+  // Single remaining invoice PDF — use it (common after sibling filter).
+  const pdfs = listInvoicePdfAttachments(list)
+      .filter((a) => a && a.storagePath);
+  if (pdfs.length === 1) return pdfs[0];
+  return null;
+}
+
 module.exports = {
   POD_PACKAGE_SOURCES,
   POD_DOCUMENT_SHAPE,
@@ -1402,4 +1455,5 @@ module.exports = {
   listInvoicePdfAttachments,
   listUncoveredInvoiceAttachments,
   findInvoiceAttachment,
+  resolvePodAttachment,
 };

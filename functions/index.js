@@ -27,6 +27,7 @@ const {
   mergePodDiscrepancies,
   scanPodBufferForDiscrepancies,
   normalizePodDiscrepancies,
+  resolvePodAttachment,
 } = podUtils;
 const workflowErrors = require("./workflow-error-messages");
 const brokerCommission = require("./broker-commission");
@@ -5447,6 +5448,12 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Use source 'same_page_as_invoice' ONLY when invoice line items " +
         "are on top and a small signature/stamp block is at the bottom. " +
         "Set pod.cropFromBottom to the bottom fraction (e.g. 0.35).",
+        "Common pattern (EDI Express and many LTL carriers): a 2-page PDF " +
+        "where page 1 is the freight invoice and page 2 is the signed " +
+        "delivery receipt / POD. Set pod.found=true, list page 2 in " +
+        "pod.documents with source 'delivery_receipt' or 'signed_pod', " +
+        "and set attachmentFilename to the EXACT PDF filename provided " +
+        "(never invent a name from the PRO or invoice number).",
         "Only set pod.found=true when you can SEE delivery proof on a page " +
         "(signature, received stamp, consignee sign-off, trailer delivery " +
         "photo). Never invent a POD from a page just because it is last or " +
@@ -6289,9 +6296,8 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       // that page below — do not require OCR on the whole file (scanned
       // BOL/POD packets often have no readable text and were being held).
       if (!hasPageHint) {
-      const podAtt = attachments.find(
-          (a) => a && a.filename === documents[0].attachmentFilename,
-      );
+      const podAtt = resolvePodAttachment(
+          attachments, documents[0], invoice);
       if (!podAtt || !podAtt.storagePath) {
         return null;
       }
@@ -6411,9 +6417,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
 
     for (let i = 0; i < documents.length; i++) {
       const doc = documents[i];
-      const podAtt = attachments.find(
-          (a) => a && a.filename === doc.attachmentFilename,
-      );
+      const podAtt = resolvePodAttachment(attachments, doc, invoice);
       if (!podAtt || !podAtt.storagePath) {
         await writeLog("warn", "workflow",
             "POD document entry missing attachment in storage", {
@@ -10174,17 +10178,38 @@ async function processGmailMessage(
               scopedPagesNeedRepair(scopedPages, pageCount)) {
             // Never upload the unsliced multi-invoice packet to Primus —
             // it would attach every sibling FedEx bill to this load.
-            aiResult.blockUnscopedMultiInvoicePacket = true;
-            aiResult.unscopedPacketFilename = primaryAtt.filename;
-            await writeLog("warn", "mail",
-                "Could not slice multi-invoice PDF — refusing full packet", {
-                  messageId,
-                  loadNumber: aiResult.loadNumber,
-                  proNumber: aiResult.proNumber,
-                  scopedPages,
-                  pageCount,
-                  packetFilename: primaryAtt.filename,
-                });
+            // Exception: a lone 2-page invoice+POD PDF is not a sibling
+            // packet — dropping it loses the only bill and the POD page.
+            const claimants = invoiceItems.filter((item) => {
+              const n = String((item && item.attachmentFilename) || "")
+                  .trim();
+              return n && podUtils.attachmentFilenamesMatch(
+                  n, primaryAtt.filename);
+            }).length;
+            if (pageCount <= 2 && claimants <= 1) {
+              await writeLog("info", "mail",
+                  "Keeping 2-page invoice+POD PDF (not a multi-invoice " +
+                  "sibling packet)", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    proNumber: aiResult.proNumber,
+                    scopedPages,
+                    pageCount,
+                    packetFilename: primaryAtt.filename,
+                  });
+            } else {
+              aiResult.blockUnscopedMultiInvoicePacket = true;
+              aiResult.unscopedPacketFilename = primaryAtt.filename;
+              await writeLog("warn", "mail",
+                  "Could not slice multi-invoice PDF — refusing full packet", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    proNumber: aiResult.proNumber,
+                    scopedPages,
+                    pageCount,
+                    packetFilename: primaryAtt.filename,
+                  });
+            }
           }
         }
       } catch (sliceErr) {
