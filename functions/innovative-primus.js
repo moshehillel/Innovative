@@ -3651,6 +3651,7 @@ exports.processPrimusWorkflow = onRequest(
                       customerName,
                       errorMessage: uiResult.error || "Unknown error",
                       step: uiResult.step || null,
+                      billtoPartyName: uiResult.billtoPartyName || null,
                     },
                   });
 

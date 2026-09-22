@@ -2651,9 +2651,11 @@ async function resolveManageBilltoId(booking) {
     source: "manage_location_not_found",
     partyName,
     error: partyName ?
-      "Could not map bill-to party \"" + partyName +
-            "\" to manage.php shipping location" :
-      "Could not resolve bill-to party on booking",
+      "Could not find Bill-To shipping location \"" + partyName +
+            "\" in ShipPrimus. Set Bill To on the load to a valid " +
+            "customer location (or create it in Manage), then resume." :
+      "Could not resolve Bill-To party on this booking. Set Bill To " +
+            "on the load in ShipPrimus, then resume.",
   };
 }
 
@@ -4969,7 +4971,8 @@ async function runPrimusUiBillingFlow(args) {
       ok: false,
       step: "resolveBillto",
       error: billtoResolution.error ||
-        "Could not resolve manage.php bill-to shipping location",
+        "Could not resolve Bill-To shipping location on this booking. " +
+        "Set Bill To on the load in ShipPrimus, then resume.",
       billtoSource,
       billtoPartyName: billtoResolution.partyName,
     };
@@ -5010,7 +5013,14 @@ async function runPrimusUiBillingFlow(args) {
           });
     }
   } else if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: "Could not resolve Bill-To shipping location from this " +
+        "booking. Set Bill To on the load in ShipPrimus, then resume.",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName || null,
+    };
   } else if (writeLog) {
     await writeLog("info", "primus",
         "No draft invoice found — saveInvoice will create one", {
@@ -5023,7 +5033,14 @@ async function runPrimusUiBillingFlow(args) {
   }
 
   if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: "Could not resolve Bill-To shipping location from this " +
+        "booking. Set Bill To on the load in ShipPrimus, then resume.",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName || null,
+    };
   }
 
   const billDate = args.billDate || new Date();

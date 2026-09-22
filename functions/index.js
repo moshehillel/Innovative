@@ -5757,9 +5757,13 @@ function resolveSystemErrorEmail() {
 function isSystemErrorOutboundEmail(email) {
   if (!email) return false;
   if (email.systemError === true) return true;
-  if (email.alertCode &&
-    workflowErrors.isSystemAlertCode(email.alertCode, email.alertContext)) {
-    return true;
+  // When alertCode is present, trust isSystemAlertCode only — do not also
+  // route by outbound type. Otherwise actionable UI_BILLING_FAILED emails
+  // (type invoice_generation_failed) were sent to SYSTEM_ERROR_EMAIL
+  // (Moshe) instead of Lisa even when the failure was an ops Bill-To fix.
+  if (email.alertCode) {
+    return workflowErrors.isSystemAlertCode(
+        email.alertCode, email.alertContext);
   }
   return SYSTEM_ERROR_EMAIL_TYPES.has(email.type);
 }

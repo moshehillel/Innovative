@@ -147,12 +147,34 @@ function isSystemUiBillingStep(step) {
 }
 
 /**
+ * True when billing failed because Bill-To / shipping location is missing
+ * or unmapped on the ShipPrimus load (ops can fix in Primus, then resume).
+ * @param {string|null|undefined} message Error message.
+ * @return {boolean}
+ */
+function isBilltoResolutionError(message) {
+  const m = String(message || "").toLowerCase();
+  if (!m) return false;
+  if (/billtoid|bill-to|bill to/.test(m) &&
+      /could not (resolve|map|find)|not found|missing/.test(m)) {
+    return true;
+  }
+  if (/shipping location/.test(m) &&
+      /bill-to|bill to|billtoid|could not (resolve|map|find)/.test(m)) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * @param {string} message Raw error message.
  * @param {string} [step] Optional workflow step.
  * @return {boolean}
  */
 function looksLikeSystemError(message, step) {
   if (isSystemUiBillingStep(step)) return true;
+  // Bill-To mapping is an ops fix even when the message mentions manage.php.
+  if (isBilltoResolutionError(message)) return false;
   const m = String(message || "").toLowerCase();
   if (!m) return false;
   return /internal server|unexpected|cannot read|undefined is not/.test(m) ||
@@ -399,6 +421,21 @@ function buildWorkflowAlertEmail(opts) {
         "correct in the UI. Please handle this load manually or contact " +
         "Advanced Automations.";
         action = ACTION.NONE;
+      } else if (isBilltoResolutionError(ctx.errorMessage)) {
+        const party = ctx.billtoPartyName ?
+          String(ctx.billtoPartyName).trim() : "";
+        subject = `Action needed — Bill-To missing on Load ${loadNumber}`;
+        title = "Bill-To location missing on this load";
+        summary = "Jerry could not create the invoice because ShipPrimus " +
+          "has no usable Bill-To shipping location on this booking.";
+        explanation = party ?
+          `Bill-To party on the load: "${esc(party)}". ` :
+          "";
+        explanation += "Open load " + esc(String(loadNumber)) +
+          " in ShipPrimus → set Bill To to the correct customer shipping " +
+          "location (create the location in Manage if it is missing) → " +
+          "save → then click Resume Workflow.";
+        action = ACTION.RESUME;
       } else {
         subject = `Action needed — Invoice issue on Load ${loadNumber}`;
         title = "ShipPrimus billing needs attention";
@@ -813,6 +850,7 @@ module.exports = {
   BILLING_PIPELINE_RESUME_STEPS,
   buildWorkflowAlertEmail,
   buildWorkflowActionButton,
+  isBilltoResolutionError,
   looksLikeSystemError,
   isSystemAlertCode,
   isSystemUiBillingStep,

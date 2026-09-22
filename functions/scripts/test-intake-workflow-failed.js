@@ -57,6 +57,44 @@ check("missing POD is not a system crash",
 check("unmatched amount is not a system crash",
     workflowErrors.looksLikeSystemError(
         "Submitted $100 vs Primus $90 (diff $10.00)") === false);
+check("billtoId missing is ops Bill-To (not system)",
+    workflowErrors.isBilltoResolutionError(
+        "Could not resolve billtoId from booking") === true &&
+    workflowErrors.looksLikeSystemError(
+        "Could not resolve billtoId from booking") === false &&
+    workflowErrors.isSystemAlertCode("UI_BILLING_FAILED", {
+      errorMessage: "Could not resolve billtoId from booking",
+    }) === false);
+check("Bill-To shipping location missing is ops (not manage.php system)",
+    workflowErrors.isBilltoResolutionError(
+        "Could not find Bill-To shipping location \"B & C\" in ShipPrimus") ===
+      true &&
+    workflowErrors.looksLikeSystemError(
+        "Could not map bill-to party \"B & C\" to manage.php " +
+        "shipping location") === false &&
+    workflowErrors.isSystemAlertCode("UI_BILLING_FAILED", {
+      errorMessage:
+        "Could not map bill-to party \"B & C\" to manage.php " +
+        "shipping location",
+    }) === false);
+const billtoAlert = workflowErrors.buildWorkflowAlertEmail({
+  code: "UI_BILLING_FAILED",
+  context: {
+    loadNumber: "267852",
+    carrierName: "Central Transport",
+    customerName: "B & C Industries",
+    errorMessage: "Could not resolve billtoId from booking",
+    billtoPartyName: "B & C Industries",
+  },
+  baseUrl: "https://example.test",
+  invoiceId: "inv-267852",
+});
+check("billto alert subject is Bill-To missing",
+    /Bill-To missing on Load 267852/.test(billtoAlert.subject));
+check("billto alert tells Lisa how to fix in ShipPrimus",
+    /set Bill To/i.test(billtoAlert.html) &&
+    /Resume Workflow/i.test(billtoAlert.html) &&
+    billtoAlert.action === workflowErrors.ACTION.RESUME);
 check("ops holds skip delayed retry",
     workflowErrors.shouldDelayWorkflowRetry({
       errorMessage: "fetch failed",
