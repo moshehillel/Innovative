@@ -34,6 +34,7 @@ const brokerCommission = require("./broker-commission");
 const undeliveredReport = require("./undelivered-shipment-report");
 const deliveredUninvoicedReport = require("./delivered-uninvoiced-report");
 const additionalCharges = require("./additional-charges");
+const intakeProfitGate = require("./intake-profit-gate");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
 const xpoImaging = require("./xpo-imaging");
@@ -581,6 +582,38 @@ function workflowUrlForTenant(tenant) {
     return envOverride || `${base}/${fn}`;
   }
   return workflowUrlForTms(tenant && tenant.tms);
+}
+
+/**
+ * Reads a workflow kickoff response once (body can only be consumed once).
+ * @param {object} workflowRes Fetch response.
+ * @return {Promise<object>} ok, httpStatus, text, and workflowStatus.
+ */
+async function readWorkflowResponse(workflowRes) {
+  const httpStatus = workflowRes ? workflowRes.status : 0;
+  const ok = !!(workflowRes && workflowRes.ok);
+  if (!workflowRes) {
+    return {ok: false, httpStatus: 0, text: "", workflowStatus: null};
+  }
+  if (!ok) {
+    let text = "";
+    try {
+      text = await workflowRes.text();
+    } catch (_) {
+      text = "";
+    }
+    return {ok: false, httpStatus, text, workflowStatus: null};
+  }
+  let workflowStatus = null;
+  try {
+    const body = await workflowRes.json();
+    if (body && body.workflowStatus) {
+      workflowStatus = String(body.workflowStatus);
+    }
+  } catch (_) {
+    workflowStatus = null;
+  }
+  return {ok: true, httpStatus, text: "", workflowStatus};
 }
 
 /**
@@ -4829,6 +4862,62 @@ async function notifyDispatcherLowProfit(opts) {
     cc: emailPayload.cc || null,
     dispatcher,
   };
+}
+
+/**
+ * Sends the low-profit dispatcher email, or a billing fallback if that fails.
+ * Called only after paperwork upload, or when the workflow never started.
+ * @param {object} opts Alert context.
+ * @return {Promise<void>}
+ */
+async function sendDeferredLowProfitAlert(opts) {
+  const {
+    gmail, messageId, subject, from,
+    loadNumber, carrierName, invoiceAmount, customerRate, profit,
+    hasLumpers, primusValidationAmount,
+  } = opts || {};
+  try {
+    await notifyDispatcherLowProfit({
+      loadNumber,
+      carrierName,
+      invoiceAmount,
+      customerRate,
+      profit,
+      messageId,
+    });
+  } catch (notifyErr) {
+    await writeLog("error", "email",
+        "Failed to notify dispatcher of low profit", {
+          messageId,
+          loadNumber,
+          error: notifyErr.message,
+        });
+    await forwardToHumanReview(
+        gmail, messageId, subject, from,
+        "Invoice profit is below the minimum threshold",
+        `I processed the invoice from ` +
+        `${carrierName || "this carrier"} for load ` +
+        `${loadNumber}. The calculated profit is ` +
+        `$${Number(profit).toFixed(2)}, which is below the ` +
+        `$10 minimum. ` +
+        `Please review the customer rate or authorize an ` +
+        `exception. (Dispatcher notify failed: ` +
+        `${notifyErr.message})`,
+        {
+          department: "billing",
+          extractedData: {
+            "Carrier": carrierName || "—",
+            "Load Number": loadNumber || "—",
+            "Invoice Amount": `$${invoiceAmount}`,
+            ...(hasLumpers ? {
+              "Lumper-Adjusted Amount": `$${primusValidationAmount}`,
+            } : {}),
+            "Customer Rate": `$${customerRate}`,
+            "Profit": `$${Number(profit).toFixed(2)}`,
+          },
+        },
+    );
+  }
 }
 
 /**
@@ -10292,6 +10381,8 @@ async function processGmailMessage(
       aiResult = Object.assign({}, invoiceItems[itemIndex]);
       let finalStatus = "error";
       let primusResult = null;
+      let deferredLowProfit = null;
+      let workflowHoldStatus = null;
       const invoiceIdsBefore = createdInvoiceIds.length;
 
       try {
@@ -11060,57 +11151,34 @@ async function processGmailMessage(
         }
 
         // ── Profit / margin check (use lumper-adjusted amount) ───────────────
+        // Do not stop intake on low profit. Stopping skipped invoice
+        // creation, so the carrier bill and POD never reached Primus
+        // (load 267127). The workflow uploads paperwork, then pauses.
         if (primusData.rate) {
           const profitCheck = checkProfitMargin(
               primusData.rate, primusValidationAmount);
-          if (profitCheck.noRate || profitCheck.lowProfit) {
-            const hasLumpers =
-                primusValidationAmount !== aiResult.invoiceAmount;
-            try {
-              await notifyDispatcherLowProfit({
-                loadNumber: aiResult.loadNumber,
-                carrierName: aiResult.carrierName,
-                invoiceAmount: aiResult.invoiceAmount,
-                customerRate: primusData.rate,
-                profit: profitCheck.profit,
-                messageId,
-              });
-            } catch (notifyErr) {
-              await writeLog("error", "email",
-                  "Failed to notify dispatcher of low profit", {
-                    messageId,
-                    loadNumber: aiResult.loadNumber,
-                    error: notifyErr.message,
-                  });
-              // Fallback: keep ops informed if dispatcher notify fails.
-              await forwardToHumanReview(
-                  gmail, messageId, subject, from,
-                  "Invoice profit is below the minimum threshold",
-                  `I processed the invoice from ` +
-                  `${aiResult.carrierName || "this carrier"} for load ` +
-                  `${aiResult.loadNumber}. The calculated profit is ` +
-                  `$${profitCheck.profit.toFixed(2)}, which is below the ` +
-                  `$10 minimum. ` +
-                  `Please review the customer rate or authorize an ` +
-                  `exception. (Dispatcher notify failed: ` +
-                  `${notifyErr.message})`,
-                  {
-                    department: "billing",
-                    extractedData: {
-                      "Carrier": aiResult.carrierName || "—",
-                      "Load Number": aiResult.loadNumber || "—",
-                      "Invoice Amount": `$${aiResult.invoiceAmount}`,
-                      ...(hasLumpers ? {
-                        "Lumper-Adjusted Amount":
-                          `$${primusValidationAmount}`,
-                      } : {}),
-                      "Customer Rate": `$${primusData.rate}`,
-                      "Profit": `$${profitCheck.profit.toFixed(2)}`,
-                    },
-                  },
-              );
-            }
-            finalStatus = "no_rate";
+          const profitPlan = intakeProfitGate.planLowProfitIntake(
+              profitCheck);
+          if (profitPlan.isLowProfit) {
+            deferredLowProfit = {
+              loadNumber: aiResult.loadNumber,
+              carrierName: aiResult.carrierName,
+              invoiceAmount: aiResult.invoiceAmount,
+              customerRate: primusData.rate,
+              profit: profitCheck.profit,
+              messageId,
+              hasLumpers: primusValidationAmount !== aiResult.invoiceAmount,
+              primusValidationAmount,
+            };
+            await writeLog("info", "workflow",
+                "Low profit — uploading paperwork before the dispatcher hold",
+                {
+                  messageId,
+                  loadNumber: aiResult.loadNumber,
+                  profit: profitCheck.profit,
+                  customerRate: primusData.rate,
+                  invoiceAmount: aiResult.invoiceAmount,
+                });
           }
         }
 
@@ -11516,8 +11584,9 @@ async function processGmailMessage(
                   }),
                 },
             );
-            if (!workflowRes.ok) {
-              const text = await workflowRes.text();
+            const started = await readWorkflowResponse(workflowRes);
+            workflowHoldStatus = started.workflowStatus;
+            if (!started.ok) {
               await writeLog(
                   "error",
                   "workflow",
@@ -11526,8 +11595,8 @@ async function processGmailMessage(
                   {
                     messageId: messageId,
                     invoiceId: invoiceDoc.id,
-                    status: workflowRes.status,
-                    response: text,
+                    status: started.httpStatus,
+                    response: started.text,
                   },
               );
             }
@@ -11578,9 +11647,9 @@ async function processGmailMessage(
                   }),
                 },
             );
-
-            if (!workflowRes.ok) {
-              const text = await workflowRes.text();
+            const started = await readWorkflowResponse(workflowRes);
+            workflowHoldStatus = started.workflowStatus;
+            if (!started.ok) {
               await writeLog(
                   "error",
                   "workflow",
@@ -11588,8 +11657,8 @@ async function processGmailMessage(
                   {
                     messageId: messageId,
                     invoiceId: invoiceDoc.id,
-                    status: workflowRes.status,
-                    response: text,
+                    status: started.httpStatus,
+                    response: started.text,
                   },
               );
             }
@@ -11622,6 +11691,23 @@ async function processGmailMessage(
         );
       }
 
+      if (deferredLowProfit &&
+          intakeProfitGate.shouldSendDeferredLowProfitEmail({
+            isLowProfit: true,
+            workflowStatus: workflowHoldStatus,
+          })) {
+        await sendDeferredLowProfitAlert(Object.assign({
+          gmail, subject, from,
+        }, deferredLowProfit));
+      } else if (deferredLowProfit) {
+        await writeLog("info", "email",
+            "Low-profit email left to the workflow after paperwork upload", {
+              messageId,
+              loadNumber: deferredLowProfit.loadNumber,
+              workflowStatus: workflowHoldStatus,
+              profit: deferredLowProfit.profit,
+            });
+      }
 
       itemSummaries.push({
         loadNumber: aiResult.loadNumber || null,
