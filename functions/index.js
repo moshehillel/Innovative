@@ -6324,6 +6324,34 @@ async function maybeFetchFedExFreightPod(invoiceId, invoice) {
 }
 
 /**
+ * Original email PDFs for an invoice whose stored attachments were stripped.
+ * @param {object} invoice Invoice document.
+ * @return {Promise<Array<object>>}
+ */
+async function loadEmailIntakeAttachments(invoice) {
+  const messageId = String(
+      (invoice && (invoice.gmailMessageId || invoice.messageId)) || "",
+  ).trim();
+  if (!messageId) return [];
+  const tenantId = String((invoice && invoice.tenantId) || "default").trim();
+  const col = !tenantId || tenantId === "default" ?
+    "emailIntake" : `${tenantId}_emailIntake`;
+  try {
+    const snap = await db.collection(col).doc(messageId).get();
+    if (!snap.exists) return [];
+    const parsed = snap.data().parsedAttachments;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    await writeLog("warn", "workflow",
+        "Could not load email intake attachments for POD", {
+          messageId,
+          error: err.message,
+        });
+    return [];
+  }
+}
+
+/**
  * Extracts POD-only PDF(s) from invoice attachments.
  * Multiple POD pages are saved individually and merged into pod.pdf.
  * @param {string} invoiceId - The invoice ID.
@@ -6333,8 +6361,25 @@ async function maybeFetchFedExFreightPod(invoiceId, invoice) {
 async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
   try {
     const rawPod = invoice && invoice.pod;
-    const attachments = Array.isArray(invoice.attachments) ?
+    let attachments = Array.isArray(invoice.attachments) ?
       invoice.attachments : [];
+    const storedPdfCount = podUtils.listInvoicePdfAttachments(attachments)
+        .filter((a) => a && a.storagePath).length;
+    if (storedPdfCount === 0) {
+      const intakeAtts = await loadEmailIntakeAttachments(invoice);
+      const supplemented = podUtils.supplementStrippedPodAttachments(
+          attachments, intakeAtts);
+      if (supplemented.length > attachments.length) {
+        await writeLog("info", "workflow",
+            "POD extraction recovered email PDF missing from the invoice", {
+              invoiceId,
+              loadNumber: invoice && invoice.loadNumber,
+              filenames: supplemented
+                  .map((a) => a && a.filename).filter(Boolean),
+            });
+        attachments = supplemented;
+      }
+    }
     let pageCountHint = 0;
     const hintFilename = rawPod && rawPod.attachmentFilename;
     const firstAtt = attachments.find(

@@ -1458,6 +1458,27 @@ function resolvePodAttachment(attachments, doc, invoice) {
   return null;
 }
 
+/**
+ * When a 2-page invoice+POD was refused as a multi-invoice packet, the
+ * invoice document is saved with no PDF. The original file is still on the
+ * email intake record. Use those PDFs only when the invoice itself has
+ * none — do not pull sibling bills onto an invoice that already has its file.
+ * @param {Array<object>|null|undefined} invoiceAttachments Invoice files.
+ * @param {Array<object>|null|undefined} intakeAttachments Email intake files.
+ * @return {Array<object>}
+ */
+function supplementStrippedPodAttachments(
+    invoiceAttachments, intakeAttachments) {
+  const primary = Array.isArray(invoiceAttachments) ?
+    invoiceAttachments.filter(Boolean) : [];
+  const hasStoredPdf = listInvoicePdfAttachments(primary)
+      .some((a) => a && a.storagePath);
+  if (hasStoredPdf) return primary;
+  const extra = listInvoicePdfAttachments(intakeAttachments)
+      .filter((a) => a && a.storagePath);
+  return extra.length ? primary.concat(extra) : primary;
+}
+
 module.exports = {
   POD_PACKAGE_SOURCES,
   POD_DOCUMENT_SHAPE,
@@ -1502,4 +1523,5 @@ module.exports = {
   listUncoveredInvoiceAttachments,
   findInvoiceAttachment,
   resolvePodAttachment,
+  supplementStrippedPodAttachments,
 };

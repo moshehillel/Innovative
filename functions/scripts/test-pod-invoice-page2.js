@@ -57,6 +57,35 @@ const rules = podUtils.buildPodClassifierRules({singlePdf: false}).join(" ");
 check("classifier rules mention EDI Express 2-page invoice+POD",
     /EDI Express/i.test(rules) && /page 2/i.test(rules));
 
+// Load 267539: page 2 is a scanned delivery receipt (almost no text) and the
+// invoice was saved with attachments stripped after the packet was refused.
+const intakePdf = [{
+  filename: "694049676.pdf",
+  storagePath: "emailAttachments/edi/694049676.pdf",
+  docType: "INVOICE",
+}];
+const recovered = podUtils.supplementStrippedPodAttachments([], intakePdf);
+check("stripped invoice recovers the email PDF",
+    recovered.length === 1 &&
+    recovered[0].filename === "694049676.pdf");
+check("recovered file resolves the page-2 signed POD",
+    podUtils.resolvePodAttachment(recovered, {
+      source: "signed_pod",
+      page: 2,
+      attachmentFilename: "694049676.pdf",
+    }, {proNumber: null}).storagePath === intakePdf[0].storagePath);
+check("invoice that already has a PDF does not gain sibling files",
+    podUtils.supplementStrippedPodAttachments(
+        [{filename: "scoped.pdf", storagePath: "a/scoped", docType: "INVOICE"}],
+        intakePdf.concat([{
+          filename: "sibling.pdf",
+          storagePath: "a/sib",
+          docType: "INVOICE",
+        }]),
+    ).length === 1);
+check("scanned delivery-receipt page is not treated as a cost page",
+    podUtils.textLooksUnsafeForCustomer("262148", 378.37).unsafe === false);
+
 if (failures) {
   console.error(`${failures} failure(s)`);
   process.exit(1);
