@@ -2,6 +2,7 @@
 "use strict";
 
 const pri = require("../pod-request-intake");
+const dedup = require("../pod-send-dedup");
 const {
   toOutboundEmailSafeSubject,
   toOutboundEmailSafeText,
@@ -128,6 +129,118 @@ check("explicit send inside a case comment still detected",
     pri.looksLikePodRequest(
         unishippersSubject,
         unishippersBody + " Please send the POD.",
+    ));
+check("please send it inside a citing case comment still detected",
+    pri.looksLikePodRequest(
+        unishippersSubject,
+        unishippersBody + " Please send it.",
+    ));
+
+// Proximity leftovers the dispute-case carve-out did not cover.
+check("load next to proof of delivery is not an ask",
+    !pri.looksLikePodRequest(
+        "Load 266012",
+        "Load 266012 proof of delivery is on file",
+    ));
+check("shipment next to proof of delivery is not an ask",
+    !pri.looksLikePodRequest(
+        "Status",
+        "The shipment proof of delivery was signed at the dock.",
+    ));
+check("according to the POD is a citation",
+    !pri.looksLikePodRequest(
+        "Dispute notes",
+        "Load 266012 was billed according to the POD.",
+    ));
+check("according to the POD does not alert even if classified as request",
+    !pri.isPodRequestEmail(
+        "Dispute notes",
+        "Load 266012 was billed according to the POD.",
+        "pod_request",
+        {intent: "pod_request", reasoning: "mentions the POD"},
+    ));
+check("get next to proof of delivery is not an ask",
+    !pri.looksLikePodRequest(
+        "Delivery update",
+        "We will get the proof of delivery from the driver tomorrow.",
+    ));
+check("please get me the POD is a real ask",
+    pri.looksLikePodRequest(
+        "Load 266012",
+        "Please get me the POD from the driver.",
+    ));
+check("get back to me plus a POD on file is not an ask",
+    !pri.looksLikePodRequest(
+        "Charges",
+        "Please get back to me about the charges. " +
+        "The proof of delivery is on file.",
+    ));
+check("noreply notice with no ask does not alert",
+    !pri.isPodRequestEmail(
+        "Case: 29484241",
+        "Your case was updated. " +
+        "Are notifications about this post getting annoying?",
+        "pod_request",
+        {intent: "pod_request", reasoning: "mentions delivery"},
+        "Unishippers <noreply.myunishippers@unishippers.com>",
+    ));
+check("noreply dispute citation is not a request",
+    !pri.isPodRequestEmail(
+        unishippersSubject,
+        unishippersBody,
+        "unknown",
+        unishippersCls,
+        "noreply.myunishippers@unishippers.com",
+    ));
+check("need to review near proof of delivery is not an ask",
+    !pri.looksLikePodRequest(
+        "Charges",
+        "We need to review the charges. " +
+        "The proof of delivery shows a signature.",
+    ));
+check("subject POD for load without an ask is not a request",
+    !pri.looksLikePodRequest(
+        "POD for load 264091",
+        "Delivered clean, no issues.",
+    ));
+check("pod inside podium is not a POD",
+    !pri.looksLikePodRequest(
+        "Event setup",
+        "Please send the podium layout for the show.",
+    ));
+check("pod inside podcast is not a POD",
+    !pri.looksLikePodRequest(
+        "Media",
+        "Can you send the podcast link?",
+    ));
+check("bol inside bold is not a BOL",
+    !pri.looksLikePodRequest(
+        "Print",
+        "Please send the bold lettering sample.",
+    ));
+check("podium signed by is not a signed POD",
+    !pri.looksLikeSignedPodRequest(
+        "Venue",
+        "The podium was signed by the artist.",
+    ));
+check("please forward the delivery receipt",
+    pri.looksLikePodRequest(
+        "Load 266012",
+        "Please forward the delivery receipt.",
+    ));
+check("please provide the BOL",
+    pri.looksLikePodRequest(
+        "Load 265042",
+        "Could you provide the BOL?",
+    ));
+check("need to see the POD is an ask",
+    pri.looksLikePodRequest(
+        "Load 264091",
+        "I need to see the POD for this shipment.",
+    ));
+check("unishippers noreply is not an auto-send recipient",
+    dedup.isBlockedPodRecipient(
+        "noreply.myunishippers@unishippers.com",
     ));
 
 // Encoding: em dash / smart quotes must never become â€

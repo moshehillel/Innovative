@@ -7204,7 +7204,7 @@ async function handlePodRequestEmail(opts) {
 
   const intent = emailClassification && emailClassification.intent;
   if (!podRequestIntake.isPodRequestEmail(
-      subject, emailBody, intent, emailClassification)) {
+      subject, emailBody, intent, emailClassification, from)) {
     return {handled: false};
   }
 
