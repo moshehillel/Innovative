@@ -12,6 +12,15 @@ const NON_POD_REQUEST_INTENTS = new Set([
   "pod_delivery",
 ]);
 
+/** POD / proof-of-delivery as a whole phrase, not a substring of another word. */
+const POD_PHRASE =
+  "(?:\\bpods?\\b|\\bproof of delivery\\b|\\bp\\.?\\s*o\\.?\\s*d\\.?\\b)";
+
+/** Verbs that ask someone to produce or send a document. */
+const POD_ASK_VERB =
+  "(?:\\b(?:send|need|request|get|provide)\\b|" +
+  "\\bcopy of\\b|\\blooking for\\b|\\bwhere is\\b)";
+
 /**
  * Drops quoted reply / signature blocks so heuristics do not match
  * boilerplate like "If POD is signed clear…" in a prior signature.
@@ -32,23 +41,61 @@ function stripQuotedReplyNoise(text) {
 }
 
 /**
+ * True when a Unishippers/carrier portal case comment or dispute only
+ * mentions an existing proof of delivery (for example "inside deliver per
+ * the proof of delivery"). That is evidence in a dispute, not a request
+ * to email a POD PDF. An explicit "please send the POD" still counts.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function isIncidentalPodMentionInDisputeCase(subject, body) {
+  const sub = String(subject || "");
+  const hay = stripQuotedReplyNoise(`${sub}\n${body || ""}`);
+  const portalCase =
+    /commented on your post on case\b/i.test(sub) ||
+    (/unishippers/i.test(hay) &&
+      /\b(?:dispute|created a case)\b/i.test(hay)) ||
+    (/\bcreated a case\b/i.test(hay) && /\bdispute\b/i.test(hay));
+  if (!portalCase) return false;
+  if (!new RegExp(POD_PHRASE, "i").test(hay)) return false;
+  const explicitSend = new RegExp(
+      "(?:\\b(?:please|can you|could you|kindly)\\b.{0,30})?" +
+      "\\b(?:send|email|forward|provide|resend)\\b.{0,40}" +
+      POD_PHRASE,
+      "i",
+  );
+  if (explicitSend.test(hay)) return false;
+  return true;
+}
+
+/**
  * @param {string} subject Email subject.
  * @param {string} body Email body.
  * @return {boolean}
  */
 function looksLikePodRequest(subject, body) {
+  if (isIncidentalPodMentionInDisputeCase(subject, body)) return false;
   const hay = stripQuotedReplyNoise(
       `${subject || ""}\n${body || ""}`,
   );
-  const askForPod =
-    /(?:send|need|request|get|provide|copy of|looking for|where is)/i
-        .test(hay) &&
-    /(?:pod|proof of delivery|p\.?o\.?d\.?)/i.test(hay);
+  // "get" must be a word. "getting annoying" in a portal footer is not an ask,
+  // and the ask has to sit next to the POD phrase.
+  const askForPod = new RegExp(
+      `${POD_ASK_VERB}.{0,80}${POD_PHRASE}|` +
+      `${POD_PHRASE}.{0,80}${POD_ASK_VERB}`,
+      "i",
+  ).test(hay);
   const podForLoad =
-    /(?:pod|proof of delivery).{0,60}(?:for|on|regarding|re:?)\s*#?\s*/i
-        .test(hay) && /(?:load|bol)/i.test(hay);
-  const loadNeedsPod =
-    /(?:load|bol|shipment).{0,60}(?:pod|proof of delivery)/i.test(hay);
+    new RegExp(
+        `${POD_PHRASE}.{0,60}` +
+        "(?:\\bfor\\b|\\bon\\b|\\bregarding\\b|\\bre:?\\s*#?\\s*)",
+        "i",
+    ).test(hay) && /\b(?:load|bol)\b/i.test(hay);
+  const loadNeedsPod = new RegExp(
+      `\\b(?:load|bol|shipment)\\b.{0,60}${POD_PHRASE}`,
+      "i",
+  ).test(hay);
   return askForPod || podForLoad || loadNeedsPod;
 }
 
@@ -119,6 +166,7 @@ function parseEmailAddressFromHeader(fromHeader) {
  * @return {boolean}
  */
 function isPodRequestEmail(subject, body, intent, emailClassification) {
+  if (isIncidentalPodMentionInDisputeCase(subject, body)) return false;
   if (intent === "pod_request") return true;
   const classification = emailClassification ||
     (intent ? {intent} : null);
@@ -129,6 +177,7 @@ function isPodRequestEmail(subject, body, intent, emailClassification) {
 module.exports = {
   NON_POD_REQUEST_INTENTS,
   stripQuotedReplyNoise,
+  isIncidentalPodMentionInDisputeCase,
   looksLikePodRequest,
   looksLikeSignedPodRequest,
   aiRejectsPodRequest,

@@ -79,6 +79,57 @@ check("pod_request intent still wins",
 check("quote_request intent blocks heuristic",
     pri.aiRejectsPodRequest({intent: "quote_request", reasoning: "RFQ"}));
 
+// Load 266012 / PRO 200325976: Unishippers case comment cited an existing
+// POD as inside-delivery evidence. The Salesforce footer "getting annoying"
+// contains "get", which used to count as a POD ask anywhere in the email.
+const unishippersSubject =
+  "UserKNLS56142935 commented on your post on Case: 29484241";
+const unishippersBody =
+  "According to our resources, this address does not have a dock. " +
+  "and the driver was asked to inside deliver per the proof of delivery. " +
+  "I do not believe we will be able to dispute the charges. " +
+  "UserKNLS56142935 (Employee) " +
+  "Download (png) View/Comment or reply to this email. " +
+  "UserASPE85140936 (Customer) created a case. " +
+  "Subject: Innovative Carriers, PRO 200325976 Dispute. " +
+  "From noreply.myunishippers@unishippers.com. " +
+  "Are notifications about this post getting annoying?";
+const unishippersCls = {
+  intent: "unknown",
+  confidence: "high",
+  reasoning: "This is a Salesforce case management notification about a " +
+    "dispute discussion, not a freight invoice, POD delivery, quote " +
+    "request, or insurance premium.",
+};
+check("unishippers dispute mention is not a POD send request",
+    !pri.looksLikePodRequest(unishippersSubject, unishippersBody));
+check("unishippers case comment does not alert as POD request",
+    !pri.isPodRequestEmail(
+        unishippersSubject, unishippersBody, "unknown", unishippersCls));
+check("pod_request intent does not override dispute case mention",
+    !pri.isPodRequestEmail(
+        unishippersSubject,
+        unishippersBody,
+        "pod_request",
+        {intent: "pod_request", reasoning: "mentions proof of delivery"},
+    ));
+check("getting plus proof of delivery is not an ask",
+    !pri.looksLikePodRequest(
+        "Delivery notes",
+        "Inside deliver per the proof of delivery. " +
+        "Are notifications about this post getting annoying?",
+    ));
+check("please send the POD still detected",
+    pri.looksLikePodRequest(
+        "Load 266012",
+        "Please send the POD for this shipment",
+    ));
+check("explicit send inside a case comment still detected",
+    pri.looksLikePodRequest(
+        unishippersSubject,
+        unishippersBody + " Please send the POD.",
+    ));
+
 // Encoding: em dash / smart quotes must never become â€
 const mojibakeSubject = toOutboundEmailSafeSubject(
     "Proof of Delivery — Load #265902");
