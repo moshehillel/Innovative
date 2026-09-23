@@ -1858,8 +1858,8 @@ exports.processPrimusWorkflow = onRequest(
           }
 
           // POD is required before billing / customer email — with exceptions:
-          // Power Only: POD must be marked on the Primus booking
-          // (upload trailer images / extracted POD first when possible).
+          // Power Only: trailer photos are the POD even with no signed
+          // document. Upload those pictures, then invoice.
           // Truckload: continue billing, chase carrier for POD, hold customer
           // email until it arrives.
           let hasLocalPod = Boolean(
@@ -1873,7 +1873,8 @@ exports.processPrimusWorkflow = onRequest(
           const isPowerOnly = bookingForMode && isPowerOnlyShipment &&
           isPowerOnlyShipment(bookingForMode);
 
-          // Power Only — build POD from trailer images when extraction missed.
+          // Power Only — pictures (JPEG/PNG or photo pages) are POD with no
+          // signed document. Build that file when extraction missed it.
           if (isPowerOnly && !hasPrimusPod && !hasLocalPod &&
               maybeBuildPodFromTrailerImages) {
             const imgPod = await maybeBuildPodFromTrailerImages(
@@ -1928,7 +1929,7 @@ exports.processPrimusWorkflow = onRequest(
             primusSteps.podUploaded ||
             invoice.podOnPrimusAlready);
 
-          // Power Only without POD marked on Primus — do not process invoice.
+          // Power Only with no pictures and no POD on Primus — do not invoice.
           if (isPowerOnly && !hasPrimusPod) {
             if (isManagePhpEnabled && isManagePhpEnabled() &&
               checkBookingHasPod) {
@@ -1950,7 +1951,7 @@ exports.processPrimusWorkflow = onRequest(
               invoiceId,
               stepName: "power_only_pod_required",
               stepStatus: "stopped",
-              reason: "Power Only load has no POD marked on Primus",
+              reason: "Power Only load has no trailer photos or POD",
               error: "MISSING_POD",
               output: {loadNumber: invoice.loadNumber, shipmentMode},
             });
@@ -1958,7 +1959,7 @@ exports.processPrimusWorkflow = onRequest(
                 invoiceDoc.ref,
                 "pod_extraction",
                 "missing_pod",
-                "Power Only — POD must be marked on the shipment",
+                "Power Only — trailer photos or POD required",
             );
             await sendWorkflowAlert({
               req,
@@ -1972,11 +1973,11 @@ exports.processPrimusWorkflow = onRequest(
                 proNumber: invoice.proNumber || null,
                 shipmentMode,
                 errorMessage:
-                  "Power Only — POD must be marked on the shipment",
+                  "Power Only — trailer photos or POD required",
               },
             });
             await writeLog("error", "workflow",
-                "Power Only — stopped; POD not marked on Primus", {
+                "Power Only — stopped; no trailer photos or POD", {
                   invoiceId,
                   loadNumber: invoice.loadNumber,
                   carrierName: invoice.carrierName || null,

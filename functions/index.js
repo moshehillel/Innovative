@@ -5522,10 +5522,11 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "the SAME PDF, list the POD pages individually by page number with " +
         "'signed_bol', 'signed_load', 'delivery_receipt', 'signed_pod', or " +
         "'unsigned_pod_template' — never 'separate_attachment'.",
-        "When a separate JPEG or PNG attachment is a signed delivery photo " +
-        "or POD scan (common on truckload invoices), set pod.found=true, " +
+        "When a separate JPEG or PNG attachment is a delivery photo, " +
+        "trailer picture, or POD scan, set pod.found=true, " +
         "source='separate_attachment', and pod.attachmentFilename to that " +
-        "image filename even though it is not a PDF.",
+        "image filename even though it is not a PDF. A signature is not " +
+        "required on the photo.",
         "Use source 'same_page_as_invoice' ONLY when invoice line items " +
         "are on top and a small signature/stamp block is at the bottom. " +
         "Set pod.cropFromBottom to the bottom fraction (e.g. 0.35).",
@@ -5537,7 +5538,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "(never invent a name from the PRO or invoice number).",
         "Only set pod.found=true when you can SEE delivery proof on a page " +
         "(signature, received stamp, consignee sign-off, trailer delivery " +
-        "photo). Never invent a POD from a page just because it is last or " +
+        "photo). A photo of the delivered trailer, truck, or equipment is " +
+        "POD even when it has no signature, stamp, or signed bill of lading. " +
+        "Never invent a POD from a page just because it is last or " +
         "does not look like the invoice. If no delivery proof is visible, " +
         "leave pod.found=false.",
         "When a SEPARATE PDF has the POD/BOL on a specific page of a scanned " +
@@ -6839,7 +6842,77 @@ async function maybeBuildPodFromEmailImages(
 }
 
 /**
- * Builds a POD PDF from TRAILER_IMAGE attachments on an invoice (Power Only).
+ * Builds a Power Only POD from picture pages inside the carrier PDF.
+ * Unsigned trailer photos count. The invoice page itself is left out.
+ * @param {string} invoiceId Firestore invoice id.
+ * @param {object} invoice Invoice data with attachments[].
+ * @return {Promise<object|null>} {storagePath, source, pageCount} or null.
+ */
+async function maybeBuildPodFromInvoicePicturePages(invoiceId, invoice) {
+  const atts = Array.isArray(invoice && invoice.attachments) ?
+    invoice.attachments : [];
+  const pdfs = podUtils.listInvoicePdfAttachments(atts)
+      .filter((a) => a && a.storagePath);
+  for (const att of pdfs) {
+    let buf;
+    try {
+      [buf] = await getBucket().file(att.storagePath).download();
+    } catch (err) {
+      await writeLog("warn", "workflow",
+          "Failed to download invoice PDF for Power Only picture POD", {
+            invoiceId,
+            storagePath: att.storagePath,
+            error: err.message,
+          });
+      continue;
+    }
+    if (!buf || !buf.length) continue;
+    let pageCount = 0;
+    try {
+      const doc = await PDFDocument.load(buf, {ignoreEncryption: true});
+      pageCount = doc.getPageCount();
+    } catch (err) {
+      await writeLog("warn", "workflow",
+          "Could not read invoice PDF for Power Only picture POD", {
+            invoiceId,
+            filename: att.filename || null,
+            error: err.message,
+          });
+      continue;
+    }
+    const pageTexts = await extractPdfPageTexts(buf);
+    const pages = podUtils.selectPowerOnlyPicturePages(
+        pageTexts, invoice && invoice.invoiceAmount, pageCount);
+    if (!pages.length) continue;
+    let pdfBuffer = buf;
+    if (pages.length !== pageCount) {
+      pdfBuffer = await slicePdfByPages(buf, pages);
+      if (!pdfBuffer) continue;
+    }
+    const storagePath = await savePodPdfBytes(
+        invoiceId, "power-only-pictures.pdf", pdfBuffer);
+    await writeLog("info", "workflow",
+        "Power Only POD built from picture pages", {
+          invoiceId,
+          loadNumber: invoice && invoice.loadNumber,
+          filename: att.filename || null,
+          pages,
+          pageCount,
+        });
+    return {
+      storagePath,
+      source: "power_only_pictures",
+      pageCount: pages.length,
+      files: [{storagePath, source: "power_only_pictures"}],
+    };
+  }
+  return null;
+}
+
+/**
+ * Builds a POD PDF from trailer pictures on a Power Only invoice.
+ * Separate JPEG/PNG files and photo pages in the carrier PDF both count.
+ * A signed document is not required.
  * @param {string} invoiceId Firestore invoice id.
  * @param {object} invoice Invoice data with attachments[].
  * @return {Promise<object|null>} {storagePath, source, pageCount} or null.
@@ -6852,7 +6925,9 @@ async function maybeBuildPodFromTrailerImages(invoiceId, invoice) {
     a && a.storagePath &&
     (a.docType === "POD_IMAGE" || a.docType === "TRAILER_IMAGE" ||
       /^image\//i.test(String(a.mimeType || ""))));
-  if (!imageAtts.length) return null;
+  if (!imageAtts.length) {
+    return maybeBuildPodFromInvoicePicturePages(invoiceId, invoice);
+  }
 
   const images = [];
   for (const att of imageAtts) {
@@ -6874,7 +6949,9 @@ async function maybeBuildPodFromTrailerImages(invoiceId, invoice) {
           });
     }
   }
-  if (!images.length) return null;
+  if (!images.length) {
+    return maybeBuildPodFromInvoicePicturePages(invoiceId, invoice);
+  }
 
   const built = await podFollowup.imagesToPodPdf(images);
   if (!built.ok || !built.pdfBuffer) {
@@ -6884,7 +6961,7 @@ async function maybeBuildPodFromTrailerImages(invoiceId, invoice) {
           error: built.error,
           skipped: built.skipped,
         });
-    return null;
+    return maybeBuildPodFromInvoicePicturePages(invoiceId, invoice);
   }
   const storagePath = await savePodPdfBytes(
       invoiceId, "trailer-pod.pdf", built.pdfBuffer);

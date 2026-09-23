@@ -819,6 +819,45 @@ async function preferRevisedInvoicesForSameLoad(invoiceItems, pdfAttachments) {
   return {items: kept, dropped};
 }
 
+/** Character cap for a page that is a picture rather than a document. */
+const POWER_ONLY_PICTURE_TEXT_MAX = 80;
+
+/**
+ * Picture pages that can be the POD on a Power Only load.
+ * A signature is not required. Pages that show the carrier invoice amount
+ * or a full document of text are left out so the bill is not sent as POD.
+ * When the PDF has no extractable text, page 1 stays the bill and later
+ * pages are the photos.
+ * @param {Array<string>|null} pageTexts Per-page text, index 0 = page 1.
+ * @param {number|string|null} invoiceAmount Carrier invoice amount.
+ * @param {number} pageCount Page count from the PDF.
+ * @return {number[]} 1-based page numbers.
+ */
+function selectPowerOnlyPicturePages(pageTexts, invoiceAmount, pageCount) {
+  const total = Number(pageCount);
+  const count = Number.isFinite(total) && total >= 1 ?
+    Math.trunc(total) :
+    (Array.isArray(pageTexts) ? pageTexts.length : 0);
+  if (count < 1) return [];
+
+  const texts = Array.isArray(pageTexts) ? pageTexts : null;
+  const noText = !texts || texts.every((t) => !String(t || "").trim());
+  if (noText) {
+    if (count < 2) return [];
+    return Array.from({length: count - 1}, (_, i) => i + 2);
+  }
+
+  const pages = [];
+  for (let i = 0; i < count; i++) {
+    const text = String(texts[i] || "").replace(/\s+/g, " ").trim();
+    const unsafe = textLooksUnsafeForCustomer(text, invoiceAmount);
+    if (unsafe.unsafe) continue;
+    if (text.length > POWER_ONLY_PICTURE_TEXT_MAX) continue;
+    pages.push(i + 1);
+  }
+  return pages;
+}
+
 /**
  * Slices a PDF to the given 1-based page numbers (order preserved, unique).
  * Returns null when pages are empty/invalid or would keep the entire PDF.
@@ -998,9 +1037,14 @@ function buildPodClassifierRules(options = {}) {
       "(never invent a name from the PRO or invoice number).",
       "Only set pod.found=true when you can SEE delivery proof on a page " +
       "(signature, received stamp, consignee sign-off, trailer delivery " +
-      "photo). Never invent a POD from a page just because it is last or " +
+      "photo). A photo of the delivered trailer, truck, or equipment is " +
+      "POD even when it has no signature, stamp, or signed bill of lading. " +
+      "Never invent a POD from a page just because it is last or " +
       "does not look like the invoice. If no delivery proof is visible, " +
       "leave pod.found=false.",
+      "When a separate JPEG or PNG is a delivery photo or trailer picture, " +
+      "set pod.found=true and source='separate_attachment' even if the " +
+      "photo is not signed.",
       "When a SEPARATE PDF attachment contains the POD/BOL on a specific " +
       "page of a scanned packet, set source 'separate_attachment' AND the " +
       "1-based page number of the delivery page — never omit the page.",
@@ -1441,6 +1485,8 @@ module.exports = {
   findInvoicePagesByProInPdf,
   scopedPagesNeedRepair,
   pageTextContainsDigitsRef,
+  POWER_ONLY_PICTURE_TEXT_MAX,
+  selectPowerOnlyPicturePages,
   slicePdfByPages,
   collectInvoiceScopedPages,
   remapPodPagesAfterSlice,

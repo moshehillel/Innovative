@@ -299,15 +299,16 @@ function buildWorkflowAlertEmail(opts) {
       subject = `Action needed — No POD for Load ${loadNumber}`;
       title = "Proof of Delivery missing";
       summary = ctx.shipmentMode === "Power Only" ?
-        "This Power Only load does not have a POD marked on the shipment in " +
-        "ShipPrimus. Jerry will not process the carrier invoice until a POD " +
-        "is uploaded and marked POD on the booking." :
+        "This Power Only load does not have trailer photos or a POD on the " +
+        "shipment in ShipPrimus. Jerry will not invoice until pictures of " +
+        "the delivery are on the booking." :
         "Jerry could not extract a POD from the carrier invoice and " +
         "none is on file in ShipPrimus for this load.";
       explanation = ctx.shipmentMode === "Power Only" ?
-        "Upload the POD in ShipPrimus (POD file type on the booking), or " +
-        "re-forward the carrier email with trailer photos / a clear POD, " +
-        "then resume the workflow." :
+        "Trailer photos are enough for Power Only — a signed document is " +
+        "not required. Re-forward the carrier email with the pictures, or " +
+        "upload them in ShipPrimus as the POD file type, then resume the " +
+        "workflow." :
         "Upload the POD in ShipPrimus (or re-forward the " +
         "carrier email with a clear POD), then resume the workflow. " +
         "Customer email will not send until a POD is on the booking.";
