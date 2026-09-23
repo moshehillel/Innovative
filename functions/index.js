@@ -2443,6 +2443,7 @@ exports.sendRateMissingEmail = onRequest(async (req, res) => {
       context: {
         loadNumber: invoice.loadNumber || invoiceId,
         carrierName: invoice.carrierName,
+        customerName: invoice.customerName || null,
         customerRate,
         profit,
         marginPct: customerRate > 0 ?
@@ -4832,7 +4833,8 @@ async function notifyDispatcherLowProfit(opts) {
 
 /**
  * Emails the load dispatcher (CC Lisa) when customer rate is missing or
- * margin is too low to auto-invoice. Includes the set-rate / resume links
+ * margin is too low to auto-invoice. Children's Apparel shipments go to
+ * Sarah instead of the dispatcher. Includes the set-rate / resume links
  * from the standard workflow alert. Falls back to Lisa as To.
  * @param {object} opts Notification context.
  * @return {Promise<object>} Delivery result.
@@ -4849,6 +4851,7 @@ async function notifyDispatcherRateIssue(opts) {
   const ccLisa = process.env.LOW_PROFIT_CC_EMAIL ||
     "Lisa@innovativecarriers.com";
   const primusUiBridgeLocal = require("./primus-ui-bridge");
+  const customerRateAlert = require("./customer-rate-alert");
 
   let dispatcher = {ok: false};
   try {
@@ -4860,8 +4863,14 @@ async function notifyDispatcherRateIssue(opts) {
     dispatcher = {ok: false, error: err.message};
   }
 
-  const to = (dispatcher.ok && dispatcher.email) ?
-    dispatcher.email : ccLisa;
+  const customerName = (context && context.customerName) || "";
+  const routed = customerRateAlert.resolveCustomerRateAlertRecipient({
+    customerName,
+    dispatcherOk: Boolean(dispatcher.ok && dispatcher.email),
+    dispatcherEmail: dispatcher.email,
+    fallbackEmail: ccLisa,
+  });
+  const to = routed.to;
 
   const baseUrl = req && req.get ? `https://${req.get("host")}` : "";
   const alert = workflowErrors.buildWorkflowAlertEmail({
@@ -4873,12 +4882,14 @@ async function notifyDispatcherRateIssue(opts) {
   });
 
   let html = alert.html;
-  if (dispatcher.displayName) {
+  if (routed.routedTo === "sarah") {
+    html = `<p>Hi Sarah,</p>` + html;
+  } else if (dispatcher.displayName) {
     html = `<p>Hi ${escapeHtml(dispatcher.displayName.trim())},</p>` + html;
   } else if (dispatcher.ok && dispatcher.email) {
     html = `<p>Hi,</p>` + html;
   }
-  if (!dispatcher.ok) {
+  if (!dispatcher.ok && routed.routedTo !== "sarah") {
     html += `<p style="color:#b45309"><em>Note: could not resolve ` +
       `dispatcher email from Primus` +
       (dispatcher.error ? ` (${escapeHtml(dispatcher.error)})` : "") +
@@ -4906,12 +4917,15 @@ async function notifyDispatcherRateIssue(opts) {
         cc: emailPayload.cc || null,
         dispatcherOk: Boolean(dispatcher.ok),
         dispatcherUserName: dispatcher.userName || null,
+        customerName: customerName || null,
+        routedTo: routed.routedTo,
       });
 
   return {
     ok: true,
     to: emailPayload.to,
     cc: emailPayload.cc || null,
+    routedTo: routed.routedTo,
     dispatcher,
   };
 }

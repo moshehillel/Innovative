@@ -2974,6 +2974,7 @@ exports.processPrimusWorkflow = onRequest(
                   context: {
                     loadNumber: invoice.loadNumber,
                     carrierName: invoice.carrierName,
+                    customerName: customerNameForCheck || null,
                     invoiceAmount: invoice.invoiceAmount,
                   },
                 });
@@ -3165,6 +3166,11 @@ exports.processPrimusWorkflow = onRequest(
                   context: {
                     loadNumber: invoice.loadNumber,
                     carrierName: invoice.carrierName,
+                    customerName: customerNameForCheck ||
+                      manualCustomerName ||
+                      (customerForCheckResult &&
+                        customerForCheckResult.customerName) ||
+                      null,
                     invoiceAmount: invoice.invoiceAmount,
                   },
                 });
