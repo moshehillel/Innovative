@@ -4,6 +4,7 @@
 const bridge = require("../primus-ui-bridge");
 const {
   normalizeCompanyName,
+  buildShippingLocationSearchTerms,
   pickAccountingEmails,
   isAccountingContactType,
   sanitizeBillToReferenceText,
@@ -114,6 +115,31 @@ check("enrichBillToPartyFromConsignee uses spelled consignee",
         {consignee: {id: 447360316, name: "FLEET EQUIPMENT LLC",
           zipCode: "38118"}}).name,
     "FLEET EQUIPMENT LLC");
+check("B & C search includes B&C form",
+    buildShippingLocationSearchTerms("B & C Industries")
+        .some((t) => t === "B&C Industries"),
+    true);
+check("Counstraction is not a 1-edit match",
+    namesAreCloseForBillto(
+        "Best Counstraction Products Inc",
+        "Best Construction Products Inc"),
+    false);
+check("Counstraction matches Construction within 2 edits",
+    namesAreCloseForBillto(
+        "Best Counstraction Products Inc",
+        "Best Construction Products Inc", 2),
+    true);
+check("typo bill-to matches same-zip location",
+    pickManageLocationFromList([
+      {id: 822138, name: "Best Construction Products Inc", zipcode: "08103"},
+      {id: 9, name: "Other Camden Co", zipcode: "08103"},
+    ], {name: "Best Counstraction Products Inc", zipCode: "08103"}),
+    822138);
+check("ampersand spacing matches B&C location",
+    pickManageLocationFromList([
+      {id: 837189, name: "B&C Industries", zipcode: "11385"},
+    ], {name: "B & C Industries", zipCode: "11385"}),
+    837189);
 
 (async () => {
   const party = {

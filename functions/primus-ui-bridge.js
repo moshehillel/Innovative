@@ -2327,14 +2327,15 @@ function editDistance(a, b) {
  * @param {string|undefined} b
  * @return {boolean}
  */
-function namesAreCloseForBillto(a, b) {
+function namesAreCloseForBillto(a, b, maxDist) {
   const na = baseCompanyNameForMatch(normalizeCompanyName(a));
   const nb = baseCompanyNameForMatch(normalizeCompanyName(b));
   if (!na || !nb) return false;
   if (na === nb) return true;
   const max = Math.max(na.length, nb.length);
   if (max < 8) return false;
-  return editDistance(na, nb) <= 1;
+  const limit = Number.isFinite(maxDist) ? maxDist : 1;
+  return editDistance(na, nb) <= limit;
 }
 
 /**
@@ -2412,11 +2413,26 @@ function buildShippingLocationSearchTerms(partyName) {
     }
   };
   add(raw);
+  // "B & C Industries" is stored in Primus as "B&C Industries".
+  add(raw.replace(/\s*&\s*/g, "&"));
+  add(raw.replace(/\s*&\s*/g, " and "));
   const normalized = normalizeCompanyName(raw);
   if (normalized) add(normalized);
   const base = baseCompanyNameForMatch(normalized);
   if (base) add(base);
   return terms;
+}
+
+/**
+ * First word long enough to search with a zip when the full name misses
+ * (typos like Counstraction vs Construction).
+ * @param {string} partyName
+ * @return {string}
+ */
+function firstBilltoSearchToken(partyName) {
+  const parts = normalizeCompanyName(partyName).split(" ").filter(Boolean);
+  const token = parts.find((t) => t.length >= 4);
+  return token || "";
 }
 
 /**
@@ -2473,6 +2489,13 @@ function pickManageLocationFromList(list, party, opts) {
   });
   if (baseMatches.length) {
     return pickFromLocationCandidates(baseMatches, preferredSuffix, normZip);
+  }
+
+  if (normZip) {
+    const zipClose = list.filter((row) =>
+      normalizeLookupText(row.zipcode || row.zipCode) === normZip &&
+      namesAreCloseForBillto(row.name, party.name, 2));
+    if (zipClose.length === 1) return Number(zipClose[0].id);
   }
 
   if (list.length === 1) return Number(list[0].id);
@@ -2623,6 +2646,42 @@ async function searchManagePhpShippingLocation(party, customersOnly, opts) {
       result.json.shipping_locations : [];
     const picked = pickManageLocationFromList(list, party, opts);
     if (picked) return picked;
+  }
+  const token = firstBilltoSearchToken(party.name);
+  const fullNorm = normalizeCompanyName(party.name);
+  if (partyZip && token && token !== fullNorm) {
+    const result = await managePhpPost({
+      action: "getShippingLocations",
+      item_id: "0",
+      excludeSLId: "0",
+      zipcode: partyZip,
+      fromStop: "false",
+      fromDrayage: "false",
+      fromBooking: "false",
+      fromInvoice: "false",
+      fromLTLQuote: "false",
+      fromFTLQuote: "false",
+      fromCustomerQuote: "false",
+      fromCopyCarriers: "false",
+      filterCountries: "false",
+      filterCountry: "",
+      page: "1",
+      query: token,
+      forcelimit: "",
+      fromApplet: "false",
+      onlyCustomers: customersOnly ? "true" : "false",
+      start: "0",
+      limit: "25",
+      sort: JSON.stringify([{property: "name", direction: "ASC"}]),
+    });
+    const list = result.json &&
+      Array.isArray(result.json.shipping_locations) ?
+      result.json.shipping_locations : [];
+    const zipOnly = list.filter((row) =>
+      normalizeLookupText(row.zipcode || row.zipCode) ===
+        normalizeLookupText(partyZip) &&
+      namesAreCloseForBillto(row.name, party.name, 2));
+    if (zipOnly.length === 1) return Number(zipOnly[0].id);
   }
   return null;
 }
@@ -6167,6 +6226,7 @@ exports._internal = {
   resolveManageBilltoId,
   resolveManageShippingLocationId,
   normalizeCompanyName,
+  buildShippingLocationSearchTerms,
   pickManageLocationFromList,
   namesAreCloseForBillto,
   enrichBillToPartyFromConsignee,
