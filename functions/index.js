@@ -35,6 +35,7 @@ const undeliveredReport = require("./undelivered-shipment-report");
 const deliveredUninvoicedReport = require("./delivered-uninvoiced-report");
 const additionalCharges = require("./additional-charges");
 const intakeProfitGate = require("./intake-profit-gate");
+const intakeAmountMismatchGate = require("./intake-amount-mismatch-gate");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
 const xpoImaging = require("./xpo-imaging");
@@ -10382,6 +10383,7 @@ async function processGmailMessage(
       let finalStatus = "error";
       let primusResult = null;
       let deferredLowProfit = null;
+      let deferredAmountMismatch = null;
       let workflowHoldStatus = null;
       const invoiceIdsBefore = createdInvoiceIds.length;
 
@@ -11121,32 +11123,49 @@ async function processGmailMessage(
           // generic mismatch message. Never flag when totals already match.
           if (primusData.vendorCost && lumperValidation.totalLumper > 0 &&
               !lumperValidation.valid && !totalsMatch) {
-            await forwardToHumanReview(
-                gmail, messageId, subject, from,
+            // Same hole as a rate mismatch: emailing here skipped invoice
+            // creation, so the carrier bill and POD never reached Primus.
+            // Upload first, then send this alert and pause. Do not invoice.
+            deferredAmountMismatch = {
+              kind: "lumper",
+              reason:
                 "Lumper charges do not reconcile with Primus carrier cost",
-                `The carrier invoice includes ` +
+              notes: `The carrier invoice includes ` +
                 `$${lumperValidation.totalLumper.toFixed(2)} in lumper ` +
                 `charges. After removing them the base freight charge is ` +
                 `$${lumperValidation.baseAmount.toFixed(2)}, but the Primus ` +
                 `carrier cost on file is $${primusData.vendorCost}. ` +
                 `Please verify the lumper receipts and correct the amounts.`,
-                {
-                  department: "billing",
-                  extractedData: {
-                    "Carrier": aiResult.carrierName || "—",
-                    "Load Number": aiResult.loadNumber || "—",
-                    "Invoice Total": `$${aiResult.invoiceAmount}`,
-                    "Lumper Charges":
-                        `$${lumperValidation.totalLumper.toFixed(2)}`,
-                    "Base Freight":
-                        `$${lumperValidation.baseAmount.toFixed(2)}`,
-                    "Primus Carrier Cost": `$${primusData.vendorCost}`,
-                    "Discrepancy": `$${lumperValidation.difference.toFixed(2)}`,
-                  },
-                  emailBody,
+              options: {
+                department: "billing",
+                extractedData: {
+                  "Carrier": aiResult.carrierName || "—",
+                  "Load Number": aiResult.loadNumber || "—",
+                  "Invoice Total": `$${aiResult.invoiceAmount}`,
+                  "Lumper Charges":
+                      `$${lumperValidation.totalLumper.toFixed(2)}`,
+                  "Base Freight":
+                      `$${lumperValidation.baseAmount.toFixed(2)}`,
+                  "Primus Carrier Cost": `$${primusData.vendorCost}`,
+                  "Discrepancy": `$${lumperValidation.difference.toFixed(2)}`,
                 },
-            );
+                emailBody,
+              },
+              submittedAmount: lumperValidation.baseAmount,
+              expectedAmount: Number(primusData.vendorCost) || null,
+              difference: lumperValidation.difference,
+              loadNumber: aiResult.loadNumber,
+            };
             finalStatus = "unmatched_amount";
+            await writeLog("info", "workflow",
+                "Lumper amount mismatch — uploading paperwork " +
+                "before the alert",
+                {
+                  messageId,
+                  loadNumber: aiResult.loadNumber,
+                  baseAmount: lumperValidation.baseAmount,
+                  primusCost: primusData.vendorCost,
+                });
           }
         }
 
@@ -11268,29 +11287,44 @@ async function processGmailMessage(
                 decision: "UNMATCHED_AMOUNT",
               },
             });
-            await forwardToHumanReview(
-                gmail, messageId, subject, from,
-                "Invoice amount does not match the shipment rate",
-                `The carrier invoiced $${aiResult.invoiceAmount} but the ` +
-                `amount on file does not match. ` +
+            const mismatchDifference = primusResult.amount ?
+              Math.abs(aiResult.invoiceAmount - primusResult.amount) : null;
+            // Do not email or stop before an invoice exists. The workflow
+            // uploads the carrier bill and POD, then pauses. The same alert
+            // goes out after that upload. Do not auto-invoice this amount.
+            deferredAmountMismatch = {
+              kind: "primus",
+              reason: "Invoice amount does not match the shipment rate",
+              notes: `The carrier invoiced $${aiResult.invoiceAmount} ` +
+                `but the amount on file does not match. ` +
                 (primusResult.amount ?
                   `Expected: $${primusResult.amount}. ` : "") +
                 `Please verify the correct amount and update the shipment.`,
-                {
-                  department: "billing",
-                  extractedData: {
-                    "Carrier": aiResult.carrierName || "—",
-                    "Load Number": aiResult.loadNumber || "—",
-                    "Invoice Amount": `$${aiResult.invoiceAmount}`,
-                    "Expected Amount": primusResult.amount ?
-                      `$${primusResult.amount}` : "—",
-                    "Difference": primusResult.amount ?
-                      `$${Math.abs(aiResult.invoiceAmount -
-                        primusResult.amount).toFixed(2)}` : "—",
-                  },
-                  emailBody,
+              options: {
+                department: "billing",
+                extractedData: {
+                  "Carrier": aiResult.carrierName || "—",
+                  "Load Number": aiResult.loadNumber || "—",
+                  "Invoice Amount": `$${aiResult.invoiceAmount}`,
+                  "Expected Amount": primusResult.amount ?
+                    `$${primusResult.amount}` : "—",
+                  "Difference": mismatchDifference != null ?
+                    `$${mismatchDifference.toFixed(2)}` : "—",
                 },
-            );
+                emailBody,
+              },
+              submittedAmount: primusValidationAmount,
+              expectedAmount: primusResult.amount || null,
+              difference: mismatchDifference,
+              loadNumber: aiResult.loadNumber,
+            };
+            await writeLog("info", "workflow",
+                "Amount mismatch — uploading paperwork before the alert", {
+                  messageId,
+                  loadNumber: aiResult.loadNumber,
+                  invoiceAmount: aiResult.invoiceAmount,
+                  expectedAmount: primusResult.amount || null,
+                });
           }
         }
       } else {
@@ -11310,9 +11344,13 @@ async function processGmailMessage(
       const isPendingChargeApproval =
           finalStatus === "additional_charge_pending_approval" &&
           !!pendingAdditionalCharge;
+      const amountMismatchPlan =
+          intakeAmountMismatchGate.planAmountMismatchIntake(
+              deferredAmountMismatch ? {unmatched: true} : null);
       const shouldCreateInvoice = aiResult.status !== "error" &&
           aiResult.invoiceAmount > 0 &&
-          (finalStatus === "processing" || isPendingChargeApproval);
+          (finalStatus === "processing" || isPendingChargeApproval ||
+            amountMismatchPlan.createInvoiceForPaperwork);
       if (shouldCreateInvoice) {
         await writeLog("info", "mail", `Creating invoice document`, {
           messageId: messageId,
@@ -11419,6 +11457,17 @@ async function processGmailMessage(
           decisionReason = "Shipment not found in Primus system.";
         }
 
+        if (deferredAmountMismatch) {
+          decisionStage = "unmatched_amount";
+          matchStatus = "unmatched";
+          reviewStatus = "needed";
+          decisionReason = deferredAmountMismatch.reason;
+          primusAmount = deferredAmountMismatch.expectedAmount != null ?
+            Number(deferredAmountMismatch.expectedAmount) : null;
+          amountDifference = deferredAmountMismatch.difference != null ?
+            Number(deferredAmountMismatch.difference) : null;
+        }
+
         const flowId = messageId;
         const invoiceDoc = await tcol(tenant, "invoices").add({
           tenantId: tenant.tenantId,
@@ -11456,6 +11505,14 @@ async function processGmailMessage(
           drayageLeoValidated: !!aiResult.drayageLeoValidated,
           leoDrayageInstructions: aiResult.leoDrayageInstructions || null,
           containerNumber: aiResult.containerNumber || null,
+          amountMismatchHold: deferredAmountMismatch ? {
+            kind: deferredAmountMismatch.kind,
+            reason: deferredAmountMismatch.reason,
+            submittedAmount: deferredAmountMismatch.submittedAmount,
+            expectedAmount: deferredAmountMismatch.expectedAmount,
+            difference: deferredAmountMismatch.difference,
+            paperworkPaused: false,
+          } : null,
           additionalCharge: isPendingChargeApproval ? {
             status: "pending_approval",
             source: "unrecognized_charges",
@@ -11691,7 +11748,27 @@ async function processGmailMessage(
         );
       }
 
-      if (deferredLowProfit &&
+      if (deferredAmountMismatch &&
+          intakeAmountMismatchGate.shouldSendDeferredAmountMismatchEmail({
+            isMismatch: true,
+            workflowStatus: workflowHoldStatus,
+          })) {
+        await forwardToHumanReview(
+            gmail, messageId, subject, from,
+            deferredAmountMismatch.reason,
+            deferredAmountMismatch.notes,
+            deferredAmountMismatch.options,
+        );
+        await writeLog("info", "email",
+            "Amount-mismatch email sent after Primus paperwork upload", {
+              messageId,
+              loadNumber: deferredAmountMismatch.loadNumber,
+              workflowStatus: workflowHoldStatus,
+              kind: deferredAmountMismatch.kind,
+            });
+      }
+
+      if (deferredLowProfit && !deferredAmountMismatch &&
           intakeProfitGate.shouldSendDeferredLowProfitEmail({
             isLowProfit: true,
             workflowStatus: workflowHoldStatus,

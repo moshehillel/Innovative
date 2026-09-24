@@ -15,6 +15,7 @@
 const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const loadResolution = require("./invoice-load-resolution");
+const intakeAmountMismatchGate = require("./intake-amount-mismatch-gate");
 const workflowErrors = require("./workflow-error-messages");
 const mailIntakeQueue = require("./mail-intake-queue");
 const {findInvoiceAttachment} = require("./pod-utils");
@@ -1928,6 +1929,90 @@ exports.processPrimusWorkflow = onRequest(
               hasPrimusPod ||
             primusSteps.podUploaded ||
             invoice.podOnPrimusAlready);
+
+          // Amount mismatch: carrier bill and POD are on the booking.
+          // Pause here so a mismatched amount is never auto-invoiced.
+          // A later resume continues only if Primus now matches.
+          if (invoice.amountMismatchHold &&
+              !invoice.amountMismatchHold.released) {
+            const held = invoice.amountMismatchHold;
+            let recheck = null;
+            if (held.paperworkPaused) {
+              try {
+                recheck = await validateAmountWithPrimus(
+                    invoice.loadNumber,
+                    held.submittedAmount,
+                );
+              } catch (recheckErr) {
+                recheck = {ok: false, validAmount: false};
+                await writeLog("warn", "workflow",
+                    "Amount mismatch recheck failed — keeping the hold", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      error: recheckErr.message || String(recheckErr),
+                    });
+              }
+            }
+            const stillMismatch =
+              intakeAmountMismatchGate.amountMismatchStillBlocks(
+                  held, recheck);
+            if (!stillMismatch) {
+              await writeLog("info", "workflow",
+                  "Amount mismatch cleared — continuing after paperwork", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    submittedAmount: held.submittedAmount,
+                  });
+              await invoiceDoc.ref.update({
+                amountMismatchHold: admin.firestore.FieldValue.delete(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              invoice.amountMismatchHold = null;
+            } else {
+              const reason = held.reason ||
+                "Invoice amount does not match the shipment rate";
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "amount_mismatch_hold",
+                stepStatus: "stopped",
+                reason: "Paperwork uploaded — billing paused " +
+                  "for amount mismatch",
+                error: "UNMATCHED_AMOUNT",
+                output: {
+                  submittedAmount: held.submittedAmount || null,
+                  expectedAmount: held.expectedAmount || null,
+                  difference: held.difference != null ?
+                    held.difference : null,
+                },
+              });
+              await pauseWorkflow(
+                  invoiceDoc.ref,
+                  "amount_validation",
+                  "unmatched_amount",
+                  reason,
+              );
+              await invoiceDoc.ref.update({
+                amountMismatchHold: Object.assign({}, held, {
+                  paperworkPaused: true,
+                }),
+                matchStatus: "unmatched",
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+              });
+              await writeLog("warn", "workflow",
+                  "Amount mismatch — carrier bill and POD uploaded, " +
+                  "billing paused", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    submittedAmount: held.submittedAmount || null,
+                    expectedAmount: held.expectedAmount || null,
+                  });
+              return res.json({
+                ok: true,
+                workflowStatus: "unmatched_amount",
+                paperworkUploaded: true,
+              });
+            }
+          }
 
           // Power Only with no pictures and no POD on Primus — do not invoice.
           if (isPowerOnly && !hasPrimusPod) {
