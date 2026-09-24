@@ -3678,6 +3678,145 @@ function buildInsuranceActualCostLine(vendor, bill, lineId) {
 }
 
 /**
+ * Splits a Primus id list stored as a JSON array or a delimited string.
+ * @param {*} value Raw carrierTypes or similar.
+ * @return {Array<string>}
+ */
+function parseIdList(value) {
+  if (Array.isArray(value)) {
+    return value.map((v) => String(v).trim()).filter(Boolean);
+  }
+  const text = String(value == null ? "" : value).trim();
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) {
+      return parsed.map((v) => String(v).trim()).filter(Boolean);
+    }
+  } catch (_) {
+    // Fall through to delimiter split.
+  }
+  return text.split(/[,/|;]+/).map((p) => p.trim()).filter(Boolean);
+}
+
+/**
+ * @param {Array<object>} rows Catalog rows with id.
+ * @return {Map<string, object>}
+ */
+function indexRowsById(rows) {
+  const map = new Map();
+  for (const row of rows || []) {
+    if (!row || row.id == null) continue;
+    map.set(String(row.id), row);
+  }
+  return map;
+}
+
+/**
+ * Merges getVendors.type with the vendor profile's carrier types and
+ * shipment mode. getVendors.type is a single string (LTL for every
+ * vendor on this account). The profile Type multi-select is
+ * carrierTypes (provider type ids) and shipmentMode is a classification
+ * id. Names are resolved from getProviderTypes / getShipmentClassifications.
+ * @param {object} vendor Parsed getVendors row.
+ * @param {object|null} detail getVendor data, if loaded.
+ * @param {Array<object>} providerTypes getProviderTypes rows.
+ * @param {Array<object>} shipmentClasses getShipmentClassifications rows.
+ * @return {object}
+ */
+function applyVendorProfileTypes(
+    vendor, detail, providerTypes, shipmentClasses) {
+  const base = vendor && typeof vendor === "object" ? {...vendor} : {};
+  const providers = indexRowsById(providerTypes);
+  const modes = indexRowsById(shipmentClasses);
+  const labels = [];
+  const push = (label) => {
+    const text = String(label || "").trim();
+    if (!text || /^\d+$/.test(text)) return;
+    if (labels.some((existing) => existing.toLowerCase() === text.toLowerCase())) {
+      return;
+    }
+    labels.push(text);
+  };
+  push(base.type);
+  const ids = parseIdList(detail && detail.carrierTypes);
+  for (const id of ids) {
+    const row = providers.get(String(id));
+    if (row) push(row.name || row.code);
+    else if (!/^\d+$/.test(String(id))) push(id);
+  }
+  const modeId = detail && detail.shipmentMode != null ?
+    String(detail.shipmentMode).trim() : "";
+  const mode = modeId ? modes.get(modeId) : null;
+  const shipmentMode = mode ?
+    String(mode.name || mode.code || "").trim() : "";
+  if (shipmentMode) push(shipmentMode);
+  return {
+    ...base,
+    types: labels,
+    shipmentMode: shipmentMode || base.shipmentMode || null,
+  };
+}
+
+let cachedProviderTypes = null;
+let cachedShipmentClasses = null;
+
+/**
+ * @return {Promise<Array<object>>}
+ */
+async function getProviderTypes() {
+  if (cachedProviderTypes) return cachedProviderTypes;
+  const result = await managePhpPost({
+    action: "getProviderTypes",
+    enabled: "1",
+  });
+  const list = result.json && result.json.ProviderTypes;
+  if (!Array.isArray(list) || !list.length) return [];
+  cachedProviderTypes = list;
+  return list;
+}
+
+/**
+ * @return {Promise<Array<object>>}
+ */
+async function getShipmentClassifications() {
+  if (cachedShipmentClasses) return cachedShipmentClasses;
+  const result = await managePhpPost({
+    action: "getShipmentClassifications",
+    active: "1",
+    start: "0",
+    limit: "1000",
+  });
+  const list = result.json && result.json.ShipmentClassifications;
+  if (!Array.isArray(list) || !list.length) return [];
+  cachedShipmentClasses = list;
+  return list;
+}
+
+/**
+ * Loads the vendor profile so a multi-type carrier is not reduced to
+ * the single getVendors.type string.
+ * @param {object} vendor Parsed getVendors row.
+ * @return {Promise<object>}
+ */
+async function enrichVendorProfileTypes(vendor) {
+  if (!vendor || !vendor.id) return vendor;
+  try {
+    const [detailResult, providerTypes, shipmentClasses] = await Promise.all([
+      managePhpPost({action: "getVendor", recordId: String(vendor.id)}),
+      getProviderTypes(),
+      getShipmentClassifications(),
+    ]);
+    const detail = detailResult.json && detailResult.json.data;
+    if (!detail || typeof detail !== "object") return vendor;
+    return applyVendorProfileTypes(
+        vendor, detail, providerTypes, shipmentClasses);
+  } catch (_) {
+    return vendor;
+  }
+}
+
+/**
  * @param {object} json getVendors response.
  * @return {Array<object>}
  */
@@ -3775,7 +3914,9 @@ function findVendorByCarrierHint(vendors, hints = {}) {
  * @param {object} hints carrierName, fromEmail/from, nameOnly.
  *   When nameOnly is true: ignore From email and skip unscoped vendor paging
  *   (drayage must not match via up.com / gmail / random short name substrings).
- * @return {Promise<object|null>} {id, name, type, vendorEmail} or null.
+ * @return {Promise<object|null>} {id, name, type, types, shipmentMode,
+ *   vendorEmail} or null. types includes every profile type and the
+ *   shipment mode name, not only getVendors.type.
  */
 async function lookupVendorByCarrierHint(hints = {}) {
   if (!isManagePhpEnabled()) return null;
@@ -3822,7 +3963,7 @@ async function lookupVendorByCarrierHint(hints = {}) {
       const out = await tryPage(page * 25, nameQuery);
       if (!out) break;
       if (out.done) break;
-      if (out.match) return out.match;
+      if (out.match) return await enrichVendorProfileTypes(out.match);
     }
   }
 
@@ -3833,7 +3974,7 @@ async function lookupVendorByCarrierHint(hints = {}) {
     const out = await tryPage(page * 25, null);
     if (!out) break;
     if (out.done) break;
-    if (out.match) return out.match;
+    if (out.match) return await enrichVendorProfileTypes(out.match);
   }
 
   return null;
@@ -4862,6 +5003,7 @@ exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
 exports.removeInsurancePremiumFromLoad = removeInsurancePremiumFromLoad;
 exports.resolveInsuranceVendor = resolveInsuranceVendor;
 exports.lookupVendorByCarrierHint = lookupVendorByCarrierHint;
+exports.applyVendorProfileTypes = applyVendorProfileTypes;
 exports.findMasterVendorByName = findMasterVendorByName;
 exports.normalizeVendorNameKey = normalizeVendorNameKey;
 exports.vendorNamesMeaningfullyOverlap = vendorNamesMeaningfullyOverlap;

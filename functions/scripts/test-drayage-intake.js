@@ -55,6 +55,16 @@ check("drayage vendor type Drayage Broker",
     dray.isDrayageVendorType("Drayage Broker"), true);
 check("LTL vendor type not drayage",
     dray.isDrayageVendorType("LTL"), false);
+check("combined LTL, DRAYAGE string is drayage",
+    dray.isDrayageVendorType("LTL, DRAYAGE"), true);
+check("combined LTL / DRAYAGE string is drayage",
+    dray.isDrayageVendorType("LTL / DRAYAGE"), true);
+check("type list LTL and DRAYAGE is drayage",
+    dray.isDrayageVendorType(["LTL", "DRAYAGE"]), true);
+check("type list LTL and FTL is not drayage",
+    dray.isDrayageVendorType(["LTL", "FTL"]), false);
+check("numeric shipment mode id is not drayage",
+    dray.isDrayageVendorType({type: "LTL", shipmentMode: "590"}), false);
 check("Blitz Transportation Services is a known drayage name",
     dray.isKnownDrayageCarrierName("Blitz Transportation Services"), true);
 check("exact Blitz is a known drayage name",
@@ -287,6 +297,78 @@ async function runAsyncChecks() {
       /Blitz Transportation Services/i.test(blitzLtl.reason || ""), true);
   check("Blitz LTL is not flagged as Primus vendor type",
       blitzLtl.drayageByVendorType, false);
+
+  // Profile shows LTL and DRAYAGE together. List type alone is LTL.
+  const multiType = await dray.resolveInboundDrayageSignal({
+    from: "Billing <billing@examplehaul.com>",
+    invoiceItems: [{
+      carrierName: "Example Haul LLC",
+      invoiceAmount: 900,
+    }],
+    subject: "Invoice",
+    body: "",
+    lookupVendor: async () => ({
+      id: "42",
+      name: "Example Haul LLC",
+      type: "LTL",
+      types: ["LTL", "DRAYAGE"],
+    }),
+  });
+  check("LTL plus DRAYAGE type list is drayage",
+      multiType.isDrayage, true);
+  check("multi-type match is from Primus vendor type",
+      multiType.drayageByVendorType, true);
+  check("multi-type reason cites Primus vendor",
+      /Primus vendor/i.test(multiType.reason || ""), true);
+
+  const combinedString = await dray.resolveInboundDrayageSignal({
+    from: "Billing <billing@examplehaul.com>",
+    invoiceItems: [{carrierName: "Example Haul LLC"}],
+    subject: "Invoice",
+    body: "",
+    lookupVendor: async () => ({
+      id: "43",
+      name: "Example Haul LLC",
+      type: "LTL, DRAYAGE",
+    }),
+  });
+  check("LTL, DRAYAGE type string is drayage",
+      combinedString.isDrayage, true);
+  check("combined string is Primus vendor type",
+      combinedString.drayageByVendorType, true);
+
+  const shipmentMode = await dray.resolveInboundDrayageSignal({
+    from: "Billing <billing@examplehaul.com>",
+    invoiceItems: [{carrierName: "Example Haul LLC"}],
+    subject: "Invoice",
+    body: "",
+    lookupVendor: async () => ({
+      id: "44",
+      name: "Example Haul LLC",
+      type: "LTL",
+      shipmentMode: "Drayage",
+    }),
+  });
+  check("shipment mode Drayage with LTL type is drayage",
+      shipmentMode.isDrayage, true);
+
+  const blitzProfile = bridge.applyVendorProfileTypes(
+      {id: "113646", name: "Blitz Transportation Services", type: "LTL"},
+      {carrierTypes: "[\"457\",\"0\"]", shipmentMode: "590"},
+      [
+        {id: 0, code: "LTL", name: "LTL"},
+        {id: "457", code: "DRAY", name: "DRAYAGE"},
+      ],
+      [{id: "590", code: "Drayage", name: "Drayage"}],
+  );
+  check("Blitz profile types include DRAYAGE",
+      blitzProfile.types.includes("DRAYAGE"), true);
+  check("Blitz profile types include LTL",
+      blitzProfile.types.includes("LTL"), true);
+  check("Blitz profile shipment mode is Drayage",
+      blitzProfile.shipmentMode, "Drayage");
+  check("Blitz resolved profile is drayage",
+      dray.isDrayageVendorType(blitzProfile), true);
 }
 
 runAsyncChecks().then(() => {

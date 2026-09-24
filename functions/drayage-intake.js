@@ -108,20 +108,77 @@ function findContainerOnInvoiceItems(items) {
 }
 
 /**
- * @param {string|null|undefined} type Primus getVendors vendor.type value.
- * @return {boolean}
+ * Walks Primus vendor type values. getVendors stores one `type` string
+ * (this account's list is always "LTL"). The vendor profile can also
+ * show several provider types and a shipment mode. Combined strings
+ * such as "LTL, DRAYAGE" or "LTL / DRAYAGE" are split. Numeric ids are
+ * skipped — those are resolved to names before classification.
+ * @param {*} value Type string, list, or vendor lookup row.
+ * @param {function(string): void} visit Token callback.
  */
-function isDrayageVendorType(type) {
-  const normalized = String(type || "").trim().toLowerCase();
-  if (!normalized) return false;
-  return normalized === "drayage" ||
-    normalized.includes("dray");
+function eachVendorTypeToken(value, visit) {
+  if (value == null) return;
+  if (Array.isArray(value)) {
+    for (const item of value) eachVendorTypeToken(item, visit);
+    return;
+  }
+  if (typeof value === "object") {
+    eachVendorTypeToken(value.type, visit);
+    eachVendorTypeToken(value.types, visit);
+    eachVendorTypeToken(value.vendorType, visit);
+    eachVendorTypeToken(value.carrierType, visit);
+    eachVendorTypeToken(value.carrierTypes, visit);
+    eachVendorTypeToken(value.shipmentMode, visit);
+    eachVendorTypeToken(value.modes, visit);
+    return;
+  }
+  const text = String(value).trim();
+  if (!text || text === "null" || text === "undefined") return;
+  const parts = text.split(/[,/|;]+/);
+  for (const part of parts) {
+    const token = part.trim().replace(/^["'[\]]+|["'[\]]+$/g, "");
+    if (!token || /^\d+$/.test(token)) continue;
+    visit(token);
+  }
 }
 
 /**
- * First-token keys for carriers that are drayage even when Primus
- * vendor.type is not DRAYAGE. Blitz Transportation Services is stored
- * as LTL, and those invoices often have no Primus load to open.
+ * Unique type labels from a Primus vendor row, in first-seen order.
+ * @param {*} value Type string, list, or vendor lookup row.
+ * @return {Array<string>}
+ */
+function vendorTypeLabels(value) {
+  const labels = [];
+  const seen = new Set();
+  eachVendorTypeToken(value, (token) => {
+    const key = token.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    labels.push(token);
+  });
+  return labels;
+}
+
+/**
+ * True when any Primus type or shipment mode is or contains drayage.
+ * Other types on the same vendor do not cancel that.
+ * @param {*} type Type string, list, or vendor lookup row.
+ * @return {boolean}
+ */
+function isDrayageVendorType(type) {
+  let hit = false;
+  eachVendorTypeToken(type, (token) => {
+    const normalized = token.toLowerCase();
+    if (normalized === "drayage" || normalized.includes("dray")) hit = true;
+  });
+  return hit;
+}
+
+/**
+ * First-token keys for carriers that are drayage even when the Primus
+ * profile type list does not include DRAYAGE. getVendors.type is LTL
+ * for every vendor; Blitz's profile does include DRAYAGE, and this
+ * name rule still covers that carrier if the profile lookup fails.
  */
 const KNOWN_DRAYAGE_CARRIER_NAME_KEYS = [
   "blitz",
@@ -546,10 +603,10 @@ function resolveInboundDrayageContainer(
 }
 
 /**
- * Classifies inbound freight as drayage from the Primus vendor type for
- * that carrier name, or from a known drayage carrier name when Primus
- * type is not DRAYAGE. Container numbers and sender email never trigger
- * routing.
+ * Classifies inbound freight as drayage when any Primus vendor type or
+ * shipment mode shows drayage, even if the vendor also has LTL or other
+ * types. A known drayage carrier name still matches when the profile
+ * does not. Container numbers and sender email never trigger routing.
  *
  * @param {object} args from, invoiceItems, probedContainer, subject, body,
  *   lookupVendor (optional test inject).
@@ -586,11 +643,14 @@ async function resolveInboundDrayageSignal(args) {
     vendor = null;
   }
 
-  const vendorType = vendor && vendor.type || null;
+  const typeLabels = vendor ? vendorTypeLabels(vendor) : [];
+  const vendorType = typeLabels.length ?
+    typeLabels.join(", ") :
+    (vendor && vendor.type || null);
   const vendorName = vendor && vendor.name || null;
   const knownByName = isKnownDrayageCarrierName(carrierName) ||
     isKnownDrayageCarrierName(vendorName);
-  const drayageByVendorType = !!(vendor && isDrayageVendorType(vendorType));
+  const drayageByVendorType = !!(vendor && isDrayageVendorType(vendor));
   if (knownByName || drayageByVendorType) {
     const displayName = carrierName || vendorName;
     const reason = drayageByVendorType ?
@@ -631,6 +691,7 @@ module.exports = {
   containerFromInvoiceItem,
   findContainerOnInvoiceItems,
   isDrayageVendorType,
+  vendorTypeLabels,
   isKnownDrayageCarrierName,
   carrierNameFromInvoiceItems,
   resolveContainerNumber,
