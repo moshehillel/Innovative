@@ -119,6 +119,39 @@ function isDrayageVendorType(type) {
 }
 
 /**
+ * First-token keys for carriers that are drayage even when Primus
+ * vendor.type is not DRAYAGE. Blitz Transportation Services is stored
+ * as LTL, and those invoices often have no Primus load to open.
+ */
+const KNOWN_DRAYAGE_CARRIER_NAME_KEYS = [
+  "blitz",
+];
+
+/**
+ * @param {string|null|undefined} name Invoice or Primus vendor name.
+ * @return {string}
+ */
+function normalizeCarrierNameKey(name) {
+  return String(name || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+}
+
+/**
+ * @param {string|null|undefined} name Invoice or Primus vendor name.
+ * @return {boolean}
+ */
+function isKnownDrayageCarrierName(name) {
+  const key = normalizeCarrierNameKey(name);
+  if (!key) return false;
+  return KNOWN_DRAYAGE_CARRIER_NAME_KEYS.some((known) =>
+    key === known || key.startsWith(`${known} `));
+}
+
+/**
  * Looks up the Primus master vendor by invoice carrier name only.
  * Never uses the email From header — forwards often come from customers
  * (e.g. *@gmail.com) and would match the wrong vendor.
@@ -513,8 +546,10 @@ function resolveInboundDrayageContainer(
 }
 
 /**
- * Classifies inbound freight as drayage from the Primus vendor for that
- * carrier name only. Container numbers and sender email never trigger routing.
+ * Classifies inbound freight as drayage from the Primus vendor type for
+ * that carrier name, or from a known drayage carrier name when Primus
+ * type is not DRAYAGE. Container numbers and sender email never trigger
+ * routing.
  *
  * @param {object} args from, invoiceItems, probedContainer, subject, body,
  *   lookupVendor (optional test inject).
@@ -552,16 +587,25 @@ async function resolveInboundDrayageSignal(args) {
   }
 
   const vendorType = vendor && vendor.type || null;
-  if (vendor && isDrayageVendorType(vendorType)) {
+  const vendorName = vendor && vendor.name || null;
+  const knownByName = isKnownDrayageCarrierName(carrierName) ||
+    isKnownDrayageCarrierName(vendorName);
+  const drayageByVendorType = !!(vendor && isDrayageVendorType(vendorType));
+  if (knownByName || drayageByVendorType) {
+    const displayName = carrierName || vendorName;
+    const reason = drayageByVendorType ?
+      `Drayage invoice — Primus vendor ` +
+        `${vendorName || carrierName} (${vendorType})` :
+      `Drayage invoice — carrier ${displayName} recognized as drayage`;
     return {
       isDrayage: true,
-      reason: `Drayage invoice — Primus vendor ` +
-        `${vendor.name || carrierName} (${vendorType})`,
+      reason,
       containerNumber,
-      carrierName: carrierName || vendor.name || null,
+      carrierName: displayName,
       vendorType,
-      primusVendorId: vendor.id || null,
-      drayageByVendorType: true,
+      primusVendorId: vendor && vendor.id || null,
+      drayageByVendorType,
+      drayageByCarrierName: knownByName,
     };
   }
 
@@ -587,6 +631,7 @@ module.exports = {
   containerFromInvoiceItem,
   findContainerOnInvoiceItems,
   isDrayageVendorType,
+  isKnownDrayageCarrierName,
   carrierNameFromInvoiceItems,
   resolveContainerNumber,
   parseLeoReturnInstructions,

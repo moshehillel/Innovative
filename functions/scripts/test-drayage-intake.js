@@ -55,6 +55,12 @@ check("drayage vendor type Drayage Broker",
     dray.isDrayageVendorType("Drayage Broker"), true);
 check("LTL vendor type not drayage",
     dray.isDrayageVendorType("LTL"), false);
+check("Blitz Transportation Services is a known drayage name",
+    dray.isKnownDrayageCarrierName("Blitz Transportation Services"), true);
+check("exact Blitz is a known drayage name",
+    dray.isKnownDrayageCarrierName("Blitz"), true);
+check("Saia is not a known drayage name",
+    dray.isKnownDrayageCarrierName("Saia Motor Freight Line, LLC"), false);
 check("carrier name from invoice items",
     dray.carrierNameFromInvoiceItems(
         [{carrierName: "Saia Motor Freight Line, LLC"}]),
@@ -257,6 +263,30 @@ async function runAsyncChecks() {
   });
   check("no carrier name + fake container is not drayage",
       missingCarrier.isDrayage, false);
+
+  // Primus stores Blitz Transportation Services as LTL. Invoices still
+  // route to Leo because the carrier name is drayage.
+  const blitzLtl = await dray.resolveInboundDrayageSignal({
+    from: "Orders <orders@blitztransportation.com>",
+    invoiceItems: [{
+      carrierName: "Blitz Transportation Services",
+      carrierBolNumber: "YMJAE209084570",
+      invoiceAmount: 1030,
+    }],
+    subject: "Invoice Number BL314661",
+    body: "",
+    lookupVendor: async () => ({
+      id: "113646",
+      name: "Blitz Transportation Services",
+      type: "LTL",
+    }),
+  });
+  check("Blitz LTL Primus type is still drayage by carrier name",
+      blitzLtl.isDrayage, true);
+  check("Blitz reason cites carrier name",
+      /Blitz Transportation Services/i.test(blitzLtl.reason || ""), true);
+  check("Blitz LTL is not flagged as Primus vendor type",
+      blitzLtl.drayageByVendorType, false);
 }
 
 runAsyncChecks().then(() => {
