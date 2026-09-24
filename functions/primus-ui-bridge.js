@@ -175,14 +175,25 @@ async function clearCachedSession() {
  * True when manage.php rejected the request because the UI session is dead.
  * Primus often returns plain text "No session started." (HTTP 200) instead of
  * 401 — that must trigger a re-login + retry, not a billing failure alert.
+ *
+ * Do not treat the substring "login" inside a JSON payload as a dead session.
+ * getVendors returns the full vendor book, and a vendor email can contain
+ * those letters. That false positive re-logged in on every page and the
+ * follow-up login fetch then aborted billing with "fetch failed".
  * @param {number} status HTTP status.
  * @param {string} [text] Response body.
  * @return {boolean}
  */
 function isUiSessionAuthFailure(status, text) {
   if (status === 401 || status === 403) return true;
-  return /no session started|session expired|not logged|login/i
-      .test(String(text || ""));
+  const body = String(text || "");
+  if (/no session started|session expired|not logged/i.test(body)) {
+    return true;
+  }
+  const trimmed = body.trim();
+  if (!trimmed || trimmed[0] === "{" || trimmed[0] === "[") return false;
+  if (trimmed.length > 8000) return false;
+  return /\blogin\b/i.test(trimmed);
 }
 
 /**
@@ -218,27 +229,57 @@ async function loginUi() {
     os: "Windows",
   });
 
-  const resp = await fetch(manageUrl(), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "X-Requested-With": "XMLHttpRequest",
-      "Accept": "*/*",
-      "Origin": "https://shipprimus.com",
-      "Referer": "https://shipprimus.com/v2/",
-    },
-    body: body.toString(),
-    redirect: "manual",
-  });
+  const attemptLogin = async () => {
+    const resp = await fetch(manageUrl(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "*/*",
+        "Origin": "https://shipprimus.com",
+        "Referer": "https://shipprimus.com/v2/",
+      },
+      body: body.toString(),
+      redirect: "manual",
+    });
 
-  const cookie = extractSessionFromResponse(resp);
-  if (!cookie) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(
-        `Primus UI login did not return PHPSESSID (HTTP ${resp.status})` +
-        (text ? `: ${text.slice(0, 200)}` : ""),
-    );
+    const cookie = extractSessionFromResponse(resp);
+    if (!cookie) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(
+          `Primus UI login did not return PHPSESSID (HTTP ${resp.status})` +
+          (text ? `: ${text.slice(0, 200)}` : ""),
+      );
+    }
+    return cookie;
+  };
+
+  let cookie;
+  let lastErr;
+  for (let attempt = 1; attempt <= MANAGE_POST_NETWORK_ATTEMPTS; attempt++) {
+    try {
+      cookie = await attemptLogin();
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const msg = err && err.message ? err.message : String(err);
+      if (attempt >= MANAGE_POST_NETWORK_ATTEMPTS ||
+          !workflowErrors.isTransientNetworkError(msg)) {
+        throw err;
+      }
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "Primus UI login network error — retrying", {
+              attempt,
+              error: msg,
+            });
+      }
+      await new Promise((resolve) => setTimeout(resolve,
+          workflowErrors.TRANSIENT_NETWORK_RETRY_MS));
+    }
   }
+  if (!cookie) throw lastErr;
 
   await saveSession(cookie);
   if (writeLog) {
@@ -3821,17 +3862,26 @@ async function resolveMasterVendorForBilling(bookingVendor, nameHint) {
   const hint = String(nameHint || bookingVendor.name || "").trim();
   if (!hint) return bookingVendor;
 
+  const pageSize = 25;
   const maxPages = 160;
+  const seenIds = new Set();
   for (let page = 0; page < maxPages; page++) {
-    const start = page * 25;
+    const start = page * pageSize;
     const result = await managePhpPost({
       action: "getVendors",
       page: "1",
       start: String(start),
-      limit: "25",
+      limit: String(pageSize),
     });
     const vendors = parseVendorsFromResponse(result.json);
     if (!vendors.length) break;
+    let anyNew = false;
+    for (const v of vendors) {
+      if (!seenIds.has(v.id)) {
+        seenIds.add(v.id);
+        anyNew = true;
+      }
+    }
     const match = findMasterVendorByName(vendors, hint);
     if (match && match.id) {
       if (writeLog) {
@@ -3848,6 +3898,10 @@ async function resolveMasterVendorForBilling(bookingVendor, nameHint) {
         bookingVendorId: bookingVendor.id,
       };
     }
+    // getVendors ignores limit and returns the whole book in one response.
+    // One scan is enough; paging the same book again is what turned a single
+    // fetch failure into a billing stop.
+    if (!anyNew || vendors.length !== pageSize) break;
   }
 
   if (writeLog) {
@@ -6100,6 +6154,7 @@ function invoiceChargesIncludeReference(charges, billToReference) {
 exports._internal = {
   parsePhpSessId,
   extractSessionFromResponse,
+  isUiSessionAuthFailure,
   isManageSuccess,
   isUploadSuccess,
   parseManagePhpJson,
