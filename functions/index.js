@@ -15176,11 +15176,13 @@ async function validateAmountWithPrimus(loadNumber, amount) {
       };
     }
     const submitted = Number(amount);
-    const diff = Math.abs(submitted - primusAmount);
-    const tolerance = Math.max(0.50, primusAmount * 0.02);
-    // Accept when within tolerance, or when the carrier billed at/under the
-    // quoted cost — Jerry enters the carrier invoice amount, not the quote.
-    const valid = diff <= tolerance || submitted <= primusAmount + 0.01;
+    // Same band as extra-charge auto-approve / invoiceTotalMatchesPrimusCost:
+    // flat $10 floor (Roadtex 268077: $8.70 over failed on 2%-only), plus
+    // 2% when that is larger. Carrier at/under Primus still always passes.
+    const match = additionalCharges.evaluatePrimusAmountMatch(
+        submitted, primusAmount);
+    const diff = match.difference;
+    const valid = match.valid;
     return {
       ok: true,
       validAmount: valid,
@@ -15190,6 +15192,7 @@ async function validateAmountWithPrimus(loadNumber, amount) {
       savedAmount: valid ? submitted : primusAmount,
       enteredAmount: valid ? submitted : null,
       difference: diff,
+      tolerance: match.tolerance,
       proNumber,
       reason: valid ?
         (submitted <= primusAmount + 0.01 && submitted < primusAmount - 0.01 ?

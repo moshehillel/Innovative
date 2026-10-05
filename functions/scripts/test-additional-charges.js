@@ -439,5 +439,25 @@ const realMismatch = ac.validateLumperAmount({
 check("real mismatch => invalid", realMismatch.valid, false);
 check("real mismatch difference", Math.round(realMismatch.difference), 99);
 
+// 7. Primus amount match — $10 floor (Roadtex 268077 / statement 555194)
+// Diff $8.70 is under $10 but over old 2%-only band (~$7.95) — must match.
+const roadtex = ac.evaluatePrimusAmountMatch(406.02, 397.32);
+check("268077 Roadtex: under-$10 overage is valid", roadtex.valid, true);
+check("268077 Roadtex: difference ~8.70",
+    Math.round(roadtex.difference * 100) / 100, 8.70);
+check("268077 Roadtex: tolerance at least $10",
+    roadtex.tolerance >= 10, true);
+check("exact match still valid",
+    ac.evaluatePrimusAmountMatch(397.32, 397.32).valid, true);
+check("carrier under Primus always valid",
+    ac.evaluatePrimusAmountMatch(350, 397.32).valid, true);
+check("over $10 without 2% room is invalid",
+    ac.evaluatePrimusAmountMatch(410, 397.32).valid, false);
+// Large invoice: 2% ($20 on $1000) still allows more than the $10 floor
+check("large invoice uses 2% when bigger than $10",
+    ac.evaluatePrimusAmountMatch(1015, 1000).valid, true);
+check("large invoice still rejects beyond 2%",
+    ac.evaluatePrimusAmountMatch(1025, 1000).valid, false);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

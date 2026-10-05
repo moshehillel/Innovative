@@ -99,6 +99,36 @@ function coerceMoneyNumber(value) {
 }
 
 /**
+ * Tolerance band for carrier invoice vs Primus vendor.cost.
+ * Flat $10 floor (ops auto-approve under $10) plus 2% for larger loads.
+ * @param {number|string} primusAmount Primus vendor.cost.
+ * @return {number}
+ */
+function primusAmountMatchTolerance(primusAmount) {
+  const cost = coerceMoneyNumber(primusAmount);
+  if (!(cost > 0)) return RATE_MATCH_TOLERANCE;
+  return Math.max(RATE_MATCH_TOLERANCE, cost * 0.02);
+}
+
+/**
+ * Whether carrier invoice amount may proceed without a billing hold.
+ * Accepts within tolerance, or when the carrier billed at/under Primus.
+ * @param {number|string} submittedAmount Carrier invoice amount.
+ * @param {number|string} primusAmount Primus vendor.cost.
+ * @return {{valid:boolean,difference:number,tolerance:number,
+ *   submitted:number,primus:number}}
+ */
+function evaluatePrimusAmountMatch(submittedAmount, primusAmount) {
+  const submitted = coerceMoneyNumber(submittedAmount);
+  const primus = coerceMoneyNumber(primusAmount);
+  const difference = Math.abs(submitted - primus);
+  const tolerance = primusAmountMatchTolerance(primus);
+  const valid = (primus > 0 && submitted > 0 && difference <= tolerance) ||
+      (primus > 0 && submitted <= primus + 0.01);
+  return {valid, difference, tolerance, submitted, primus};
+}
+
+/**
  * True when invoice total already agrees with Primus carrier cost.
  * Lumper (and other) line items are then a breakdown, not an overage.
  * @param {number|string} invoiceAmount Carrier invoice total.
@@ -1520,6 +1550,8 @@ module.exports = {
   MIN_IGNORABLE_CHARGE_AMOUNT,
   LISA_EMAIL,
   coerceMoneyNumber,
+  primusAmountMatchTolerance,
+  evaluatePrimusAmountMatch,
   invoiceTotalMatchesPrimusCost,
   mergeLisaOnCc,
   applyAdditionalChargeEmailCc,
