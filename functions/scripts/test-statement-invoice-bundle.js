@@ -187,6 +187,16 @@ check("POD label unchanged",
       subject: "Statement 22568",
       pageCount: 8,
     }), "POD");
+check("filename *-POD.pdf overrides mislabeled INVOICE",
+    bundle.normalizePreCheckDocType("INVOICE", {
+      filename: "MAV-INNOV-26-POD.pdf",
+      pageCount: 1,
+    }), "POD");
+check("plain invoice filename stays INVOICE",
+    bundle.normalizePreCheckDocType("INVOICE", {
+      filename: "INV-MAV-INNOV-26.pdf",
+      pageCount: 1,
+    }), "INVOICE");
 check("low-confidence statement does not short-circuit",
     bundle.shouldShortCircuitAsStatementOnly({
       intent: "statement",

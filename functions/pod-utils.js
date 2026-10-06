@@ -1459,24 +1459,157 @@ function resolvePodAttachment(attachments, doc, invoice) {
 }
 
 /**
+ * True when a filename is clearly a standalone POD companion
+ * (e.g. MAV-INNOV-26-POD.pdf).
+ * @param {string|null|undefined} filename Attachment filename.
+ * @return {boolean}
+ */
+function looksLikePodCompanionFilename(filename) {
+  const base = String(filename || "")
+      .replace(/\\/g, "/")
+      .split("/")
+      .pop() || "";
+  const stem = base.replace(/\.pdf$/i, "").trim();
+  if (!stem) return false;
+  return /(?:^|[^a-z0-9])pod(?:[^a-z0-9]|$)/i.test(stem);
+}
+
+/**
+ * Filenames the classifier marked as the POD source.
+ * @param {object|null|undefined} pod Invoice pod block.
+ * @return {Array<string>}
+ */
+function collectPodReferencedFilenames(pod) {
+  const names = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const name = String(raw || "").trim();
+    if (!name) return;
+    const key = normalizeAttachmentFilenameKey(name);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    names.push(name);
+  };
+  if (!pod || typeof pod !== "object") return names;
+  add(pod.attachmentFilename);
+  for (const doc of (Array.isArray(pod.documents) ? pod.documents : [])) {
+    if (doc) add(doc.attachmentFilename);
+  }
+  return names;
+}
+
+/**
+ * Sidecar kept with a load's primary invoice PDF (POD, weight cert, scoped
+ * slice, or AI/filename POD companion). Used when filtering sibling bills.
+ * @param {object|null|undefined} att Attachment.
+ * @param {object} [opts] podFilenames from collectPodReferencedFilenames.
+ * @return {boolean}
+ */
+function isLoadSidecarAttachment(att, opts = {}) {
+  if (!att) return false;
+  const dt = String(att.docType || "");
+  if (/WEIGHT_INSPECTION_CERT|POD_IMAGE|TRAILER_IMAGE|^POD$/i.test(dt)) {
+    return true;
+  }
+  if (att.scopedFrom) return true;
+  const podNames = Array.isArray(opts.podFilenames) ? opts.podFilenames : [];
+  if (podNames.some((n) => attachmentFilenamesMatch(att.filename, n))) {
+    return true;
+  }
+  if (looksLikePodCompanionFilename(att.filename)) return true;
+  return false;
+}
+
+/**
+ * @param {Array<object>} list Attachment list.
+ * @param {string} filename Wanted filename.
+ * @return {boolean}
+ */
+function listHasAttachmentFilename(list, filename) {
+  return (Array.isArray(list) ? list : []).some((a) => a &&
+    attachmentFilenamesMatch(a.filename, filename));
+}
+
+/**
+ * Recover POD companion PDFs from email intake when the invoice kept the
+ * bill but dropped the POD sidecar (mis-typed as INVOICE, sibling filter).
+ * @param {Array<object>|null|undefined} invoiceAttachments Invoice files.
+ * @param {Array<object>|null|undefined} intakeAttachments Email intake files.
+ * @param {object|null|undefined} pod Invoice pod block.
+ * @return {Array<object>}
+ */
+function supplementMissingPodReferencedAttachments(
+    invoiceAttachments, intakeAttachments, pod) {
+  const primary = Array.isArray(invoiceAttachments) ?
+    invoiceAttachments.filter(Boolean) : [];
+  const intake = Array.isArray(intakeAttachments) ?
+    intakeAttachments.filter(Boolean) : [];
+  if (!intake.length) return primary;
+
+  const wanted = collectPodReferencedFilenames(pod);
+  const extras = [];
+  const pushExtra = (att) => {
+    if (!att || !att.storagePath || !att.filename) return;
+    if (listHasAttachmentFilename(primary, att.filename)) return;
+    if (listHasAttachmentFilename(extras, att.filename)) return;
+    const named = wanted.some((w) =>
+      attachmentFilenamesMatch(att.filename, w));
+    const asPod = named ||
+      looksLikePodCompanionFilename(att.filename) ||
+      String(att.docType || "").toUpperCase() === "POD";
+    extras.push(asPod ?
+      Object.assign({}, att, {docType: "POD"}) : att);
+  };
+
+  for (const name of wanted) {
+    const hit = intake.find((a) => a && a.storagePath &&
+      attachmentFilenamesMatch(a.filename, name));
+    if (hit) pushExtra(hit);
+  }
+
+  if (wanted.length > 0 || (pod && pod.found === true)) {
+    for (const att of intake) {
+      if (!att || !att.storagePath) continue;
+      const isPodType = String(att.docType || "").toUpperCase() === "POD";
+      const isPodName = looksLikePodCompanionFilename(att.filename);
+      if (!isPodType && !isPodName) continue;
+      if (wanted.length > 0 &&
+          !wanted.some((w) => attachmentFilenamesMatch(att.filename, w)) &&
+          !isPodName) {
+        continue;
+      }
+      pushExtra(att);
+    }
+  }
+
+  return extras.length ? primary.concat(extras) : primary;
+}
+
+/**
  * When a 2-page invoice+POD was refused as a multi-invoice packet, the
  * invoice document is saved with no PDF. The original file is still on the
  * email intake record. Use those PDFs only when the invoice itself has
  * none — do not pull sibling bills onto an invoice that already has its file.
+ * Also recovers POD companions referenced by pod.* that were stripped.
  * @param {Array<object>|null|undefined} invoiceAttachments Invoice files.
  * @param {Array<object>|null|undefined} intakeAttachments Email intake files.
+ * @param {object|null|undefined} [pod] Invoice pod block.
  * @return {Array<object>}
  */
 function supplementStrippedPodAttachments(
-    invoiceAttachments, intakeAttachments) {
+    invoiceAttachments, intakeAttachments, pod) {
   const primary = Array.isArray(invoiceAttachments) ?
     invoiceAttachments.filter(Boolean) : [];
   const hasStoredPdf = listInvoicePdfAttachments(primary)
       .some((a) => a && a.storagePath);
-  if (hasStoredPdf) return primary;
-  const extra = listInvoicePdfAttachments(intakeAttachments)
-      .filter((a) => a && a.storagePath);
-  return extra.length ? primary.concat(extra) : primary;
+  let base = primary;
+  if (!hasStoredPdf) {
+    const extra = listInvoicePdfAttachments(intakeAttachments)
+        .filter((a) => a && a.storagePath);
+    base = extra.length ? primary.concat(extra) : primary;
+  }
+  return supplementMissingPodReferencedAttachments(
+      base, intakeAttachments, pod);
 }
 
 module.exports = {
@@ -1523,5 +1656,9 @@ module.exports = {
   listUncoveredInvoiceAttachments,
   findInvoiceAttachment,
   resolvePodAttachment,
+  looksLikePodCompanionFilename,
+  collectPodReferencedFilenames,
+  isLoadSidecarAttachment,
+  supplementMissingPodReferencedAttachments,
   supplementStrippedPodAttachments,
 };

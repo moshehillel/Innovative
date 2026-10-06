@@ -540,8 +540,26 @@ function shouldKeepAttachmentAsInvoice(context = {}) {
  * @param {number} [context.pageCount] PDF page count when known.
  * @return {string} Attachment docType for intake.
  */
+/**
+ * Standalone POD companion filenames (e.g. MAV-INNOV-26-POD.pdf).
+ * Kept local to avoid a pod-utils require cycle.
+ * @param {string|null|undefined} filename Attachment filename.
+ * @return {boolean}
+ */
+function looksLikePodCompanionFilename(filename) {
+  const base = String(filename || "")
+      .replace(/\\/g, "/")
+      .split("/")
+      .pop() || "";
+  const stem = base.replace(/\.pdf$/i, "").trim();
+  if (!stem) return false;
+  return /(?:^|[^a-z0-9])pod(?:[^a-z0-9]|$)/i.test(stem);
+}
+
 function normalizePreCheckDocType(docType, context = {}) {
   const label = sanitizePreCheckLabel(docType);
+  // Filename wins when Haiku mis-labels a scanned POD as INVOICE.
+  if (looksLikePodCompanionFilename(context.filename)) return "POD";
   if (label === "INVOICE" || label === "POD") return label;
   if (shouldKeepAttachmentAsInvoice({
     ...context,

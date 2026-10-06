@@ -6467,12 +6467,27 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
     const rawPod = invoice && invoice.pod;
     let attachments = Array.isArray(invoice.attachments) ?
       invoice.attachments : [];
+    const intakeAtts = await loadEmailIntakeAttachments(invoice);
+    // Sibling-bill filters used to drop AI-named POD PDFs when preCheck
+    // labeled them INVOICE (load 267514 / MAV). Recover from email intake
+    // even when the carrier invoice PDF is already on the invoice doc.
+    const withNamedPod = podUtils.supplementMissingPodReferencedAttachments(
+        attachments, intakeAtts, rawPod);
+    if (withNamedPod.length > attachments.length) {
+      await writeLog("info", "workflow",
+          "POD extraction recovered named POD PDF from email intake", {
+            invoiceId,
+            loadNumber: invoice && invoice.loadNumber,
+            filenames: withNamedPod
+                .map((a) => a && a.filename).filter(Boolean),
+          });
+      attachments = withNamedPod;
+    }
     const storedPdfCount = podUtils.listInvoicePdfAttachments(attachments)
         .filter((a) => a && a.storagePath).length;
     if (storedPdfCount === 0) {
-      const intakeAtts = await loadEmailIntakeAttachments(invoice);
       const supplemented = podUtils.supplementStrippedPodAttachments(
-          attachments, intakeAtts);
+          attachments, intakeAtts, rawPod);
       if (supplemented.length > attachments.length) {
         await writeLog("info", "workflow",
             "POD extraction recovered email PDF missing from the invoice", {
@@ -11362,24 +11377,31 @@ async function processGmailMessage(
 
         const preferredName =
             String(aiResult.attachmentFilename || "").trim();
-        let invoiceAttachments = storedAttachments.map((att) => ({
-          filename: att.filename,
-          storagePath: att.storagePath,
-          mimeType: att.mimeType,
-          docType: att.docType,
-          scopedFrom: att.scopedFrom || null,
-          scopedFromStoragePath: att.scopedFromStoragePath || null,
-        }));
+        const podFilenames =
+            podUtils.collectPodReferencedFilenames(aiResult.pod);
+        let invoiceAttachments = storedAttachments.map((att) => {
+          const namedPod = podFilenames.some((n) =>
+            podUtils.attachmentFilenamesMatch(att.filename, n));
+          return {
+            filename: att.filename,
+            storagePath: att.storagePath,
+            mimeType: att.mimeType,
+            // Pre-check often labels a standalone POD PDF as INVOICE; trust
+            // the classifier's pod.attachmentFilename over that label.
+            docType: namedPod ? "POD" : att.docType,
+            scopedFrom: att.scopedFrom || null,
+            scopedFromStoragePath: att.scopedFromStoragePath || null,
+          };
+        });
         // Drop the unsliced multi-invoice packet when we could not isolate
         // this load's pages — never upload sibling FedEx bills to Primus.
         if (aiResult.blockUnscopedMultiInvoicePacket) {
           const packetName = String(
               aiResult.unscopedPacketFilename || "").trim();
           invoiceAttachments = invoiceAttachments.filter((a) => {
-            if (/WEIGHT_INSPECTION_CERT/i.test(String(a.docType || ""))) {
+            if (podUtils.isLoadSidecarAttachment(a, {podFilenames})) {
               return true;
             }
-            if (a.scopedFrom) return true;
             if (packetName &&
                 podUtils.attachmentFilenamesMatch(a.filename, packetName)) {
               return false;
@@ -11393,7 +11415,7 @@ async function processGmailMessage(
         });
         if (loadAtt && aiResult.proNumber) {
           invoiceAttachments = invoiceAttachments.filter((a) => {
-            if (/WEIGHT_INSPECTION_CERT/i.test(String(a.docType || ""))) {
+            if (podUtils.isLoadSidecarAttachment(a, {podFilenames})) {
               return true;
             }
             return podUtils.attachmentFilenamesMatch(
@@ -11405,10 +11427,9 @@ async function processGmailMessage(
           const rest = invoiceAttachments.filter((a) =>
             !podUtils.attachmentFilenamesMatch(a.filename, preferredName));
           if (preferred.length) {
-            // Prefer the scoped per-load PDF; keep sidecars after it.
+            // Prefer the scoped per-load PDF; keep POD/cert sidecars after it.
             invoiceAttachments = preferred.concat(rest.filter((a) =>
-              a.scopedFrom ||
-              /WEIGHT_INSPECTION_CERT|POD/i.test(String(a.docType || ""))));
+              podUtils.isLoadSidecarAttachment(a, {podFilenames})));
           }
         }
         if (pendingXpoWeightCert && pendingXpoWeightCert.storagePath) {
