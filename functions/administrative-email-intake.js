@@ -1072,6 +1072,37 @@ function senderDomainLooksLikeFactor(from) {
 }
 
 /**
+ * Body asks about payment timing/status on an Invoice+Load reply thread.
+ * Used when the subject already looks like a freight invoice (e.g.
+ * "Re: Invoice 731 Load 267038") so we do not treat new invoice submissions
+ * as payment inquiries, but do route payment-status follow-ups to Abe.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeInvoiceThreadPaymentFollowUp(body) {
+  const bodyL = String(body || "").toLowerCase();
+  if (!bodyL.trim()) return false;
+  const signals = [
+    /\bpayment\s+status\b/,
+    /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\bpayment\s+has\s+not\s+been\s+received\b/,
+    /\bpayment\s+not\s+received\b/,
+    /\b(?:have\s+not|has\s+not|haven't)\s+received\s+(?:our\s+)?payment\b/,
+    /\bwhen\s+(?:will|can)\s+(?:we|i|our)\s+(?:get\s+)?paid\b/,
+    /\bwhen\s+will\s+.*\s+be\s+paid\b/,
+    /\b(?:still\s+)?awaiting\s+payment\b/,
+    /\bexpected\s+payment\s+date\b/,
+    /\bcheck\s+(?:on|regarding)\s+(?:my\s+)?payment\b/,
+    /\bhas\s+(?:this|the)\s+invoice\s+been\s+paid\b/,
+    /\bfollow(?:ing)?\s+up\s+on\s+(?:the\s+)?(?:payment|invoice)\b/,
+    /\bany\s+update\s+on\s+(?:the\s+)?payment\b/,
+    /\bupdate\s+on\s+(?:the\s+)?payment\b/,
+    /\b(?:provide|send|share)\s+(?:an?\s+)?(?:payment\s+)?(?:update|status)\b/,
+  ];
+  return signals.some((re) => re.test(bodyL));
+}
+
+/**
  * Carrier / factor follow-ups about payment timing, Quick Pay, or remittance
  * — not a freight invoice to enter.
  * @param {string} subject Email subject.
@@ -1085,7 +1116,12 @@ function isPaymentInquiryEmail(subject, from, body) {
   const subStripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
   const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase();
   if (!hay.trim()) return false;
-  if (looksLikeInvoiceEmailContent(subject, body)) return false;
+  // "Re: Invoice N Load M" subjects look like freight invoices, but carriers
+  // often reply on that thread asking for payment status (no PDF). Allow those
+  // when the body clearly asks about payment timing/status.
+  if (looksLikeInvoiceEmailContent(subject, body)) {
+    return bodyLooksLikeInvoiceThreadPaymentFollowUp(body);
+  }
 
   const patterns = [
     /\bquick\s*pay\b/,
@@ -1761,7 +1797,16 @@ function hasInvoiceVeto(signals = {}) {
     return false;
   }
 
-  if (looksLikeInvoiceEmailContent(subject, body)) return true;
+  // Invoice+Load reply subjects normally veto to Moshe — except payment-status
+  // follow-ups with no freight PDF (route via payment-inquiry → Abe).
+  if (looksLikeInvoiceEmailContent(subject, body)) {
+    if (!(Number(invoicePdfCount) > 0) &&
+        !attachmentsIncludePdfLike(attachments) &&
+        isPaymentInquiryEmail(subject, from, body)) {
+      return false;
+    }
+    return true;
+  }
 
   if (shouldIgnoreAsPaymentReceipt(subject, from, body, attachments)) {
     return false;

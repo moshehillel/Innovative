@@ -585,6 +585,45 @@ check("Easton Star multi-load follow-up body pattern",
         "Following up on unpaid load numbers 264617, 264618, 264732. " +
         "When will payment be sent?"));
 
+// RS Freight: "Re: Invoice N Load M" payment-status follow-up (no PDF) must
+// hit payment-inquiry → Abe, not invoice_veto → Moshe.
+const rsFreightSubject = "Re: Invoice 731 Load 267038";
+const rsFreightFrom =
+  "RS Freight Lines LLC <rsfreight207@gmail.com>";
+const rsFreightBody =
+  "Following up on the payment status for invoice 731 related to load 267038.";
+check("RS Freight Invoice+Load subject still looks like invoice content",
+    adm.looksLikeInvoiceEmailContent(rsFreightSubject, rsFreightBody));
+check("RS Freight payment-status body on Invoice+Load is payment inquiry",
+    adm.isPaymentInquiryEmail(rsFreightSubject, rsFreightFrom, rsFreightBody));
+check("RS Freight payment inquiry handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        rsFreightSubject, rsFreightFrom, rsFreightBody, 0));
+check("RS Freight Invoice+Load payment follow-up does not invoice-veto",
+    !adm.hasInvoiceVeto({
+      subject: rsFreightSubject,
+      body: rsFreightBody,
+      from: rsFreightFrom,
+      attachments: [],
+      invoicePdfCount: 0,
+    }));
+check("RS Freight Invoice+Load with no payment body is not payment inquiry",
+    !adm.isPaymentInquiryEmail(
+        rsFreightSubject, rsFreightFrom, "Please see attached invoice."));
+check("RS Freight bare Invoice+Load subject alone is not payment inquiry",
+    !adm.isPaymentInquiryEmail(rsFreightSubject, rsFreightFrom, ""));
+check("RS Freight Invoice+Load + PDF still invoice-vetoes",
+    adm.hasInvoiceVeto({
+      subject: rsFreightSubject,
+      body: rsFreightBody,
+      from: rsFreightFrom,
+      attachments: [{filename: "731.pdf", mimeType: "application/pdf"}],
+      invoicePdfCount: 1,
+    }));
+check("RS Freight payment inquiry skipped when invoice PDF present",
+    !adm.shouldHandlePaymentInquiry(
+        rsFreightSubject, rsFreightFrom, rsFreightBody, 1));
+
 const cjSubject = "Payment Update Load 263966";
 const cjSubjectHash = "Payment Update Load #263966";
 const cjFrom = "Katelyn Wright <kwright@cjfinancing.com>";
