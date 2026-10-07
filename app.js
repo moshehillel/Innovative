@@ -580,126 +580,44 @@
     return text.slice(0, max - 1).trimEnd() + "…";
   }
 
-  function emailLocal(value) {
-    const raw = String(value || "").trim();
-    if (!raw) return "";
-    const angle = raw.match(/<([^>]+)>/);
-    const email = (angle ? angle[1] : raw).trim();
-    const local = email.split("@")[0] || email;
-    return shortText(local, 28);
+  function looksLikeHtml(value) {
+    return /<\/?[a-z][\s\S]*>/i.test(String(value || ""));
   }
 
-  function notifKind(n) {
-    if (n.type === "additional_charge") {
-      return {label: "Extra charge", tone: "charge"};
-    }
-    if (n.type === "unhandled_email") {
-      return {label: "Needs review", tone: "review"};
-    }
-    if (n.type === "ops_email") {
-      return {label: "Alert", tone: "alert"};
-    }
-    return {label: "Notice", tone: "alert"};
+  function notifSubject(n) {
+    return String(n.subject || n.title || "(no subject)").trim();
   }
 
-  function notifHeadline(n) {
-    if (n.type === "additional_charge") {
-      const load = n.loadNumber ? `Load ${n.loadNumber}` : "Load —";
-      const amt = n.chargesTotal != null && n.chargesTotal !== "" ?
-        formatMoney(n.chargesTotal) : "";
-      return amt ? `${load} · ${amt}` : load;
-    }
-    if (n.type === "unhandled_email") {
-      return shortText(n.reason || n.subject || n.title || "Review this email", 72);
-    }
-    return shortText(n.subject || n.title || "Alert", 72);
+  function notifFromLine(n) {
+    return String(n.from || n.to || "").trim();
   }
 
-  function notifSubline(n) {
-    const bits = [];
-    if (n.from) bits.push(emailLocal(n.from));
-    else if (n.to) bits.push("To " + emailLocal(n.to));
-    if (n.loadNumber && n.type !== "additional_charge") {
-      bits.push("Load " + String(n.loadNumber));
+  function renderEmailBodyHtml(rawBody) {
+    const body = String(rawBody || "");
+    if (!body.trim()) {
+      return '<p class="notif-body-empty">(empty)</p>';
     }
-    if (n.carrierName) bits.push(shortText(n.carrierName, 24));
-    return bits.filter(Boolean).join(" · ");
+    if (looksLikeHtml(body)) {
+      // Keep the email markup; sandbox blocks scripts.
+      return `<iframe class="notif-body-frame" title="Email" sandbox="" loading="lazy"></iframe>`;
+    }
+    return `<pre class="notif-body">${bodyEsc(body)}</pre>`;
   }
 
-  function decodeHtmlEntities(value) {
-    const el = document.createElement("textarea");
-    el.innerHTML = String(value || "");
-    return el.value;
-  }
-
-  function cleanEmailPlainText(raw) {
-    let s = String(raw || "");
-    if (!s.trim()) return "";
-
-    // Quoted-printable leftovers from some mail paths.
-    s = s.replace(/=\r?\n/g, "");
-    s = s.replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => {
-      try { return String.fromCharCode(parseInt(hex, 16)); } catch (_) { return ""; }
+  function fillEmailFrames(items) {
+    const frames = els.notificationsContainer.querySelectorAll(".notif-body-frame");
+    frames.forEach((frame) => {
+      const card = frame.closest(".notif-card");
+      const id = card && card.dataset.notifId;
+      const n = (items || []).find((item) => item.id === id);
+      if (!n) return;
+      const html = String(n.body || "");
+      const doc =
+        "<!doctype html><html><head><meta charset=\"utf-8\">" +
+        "<style>body{margin:16px;font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#14212b;word-wrap:break-word;}img{max-width:100%;height:auto;}</style>" +
+        "</head><body>" + html + "</body></html>";
+      frame.srcdoc = doc;
     });
-
-    const looksHtml = /<\/?[a-z][\s\S]*>/i.test(s) || /&(?:nbsp|amp|lt|gt|#\d+|#x[0-9a-f]+);/i.test(s);
-    if (looksHtml) {
-      try {
-        const doc = new DOMParser().parseFromString(s, "text/html");
-        doc.querySelectorAll("script, style, noscript, head").forEach((el) => el.remove());
-        doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
-        ["p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "blockquote", "pre"]
-          .forEach((tag) => {
-            doc.querySelectorAll(tag).forEach((el) => {
-              el.append("\n");
-            });
-          });
-        s = doc.body ? (doc.body.innerText || doc.body.textContent || "") : s;
-      } catch (_) {
-        s = s
-          .replace(/<\s*br\s*\/?>/gi, "\n")
-          .replace(/<\/\s*(p|div|tr|li|h[1-6]|blockquote)\s*>/gi, "\n")
-          .replace(/<[^>]+>/g, " ");
-      }
-      s = decodeHtmlEntities(s);
-    }
-
-    s = s
-      .replace(/\u00a0/g, " ")
-      .replace(/[\u200b-\u200d\ufeff]/g, "")
-      .replace(/\[cid:[^\]]+\]/gi, "")
-      .replace(/https?:\/\/\S+/g, (url) => {
-        // Keep short links readable; drop tracking junk tails later if needed.
-        return url.length > 90 ? url.slice(0, 87) + "..." : url;
-      })
-      .replace(/[ \t]+\n/g, "\n")
-      .replace(/\n[ \t]+/g, "\n")
-      .replace(/[ \t]{2,}/g, " ")
-      .replace(/\n{3,}/g, "\n\n")
-      .replace(/([a-z])([A-Z])/g, "$1 $2")
-      .replace(/([a-zA-Z])(\d)/g, "$1 $2")
-      .replace(/(\d)([a-zA-Z])/g, "$1 $2")
-      .replace(/ {2,}/g, " ")
-      .trim();
-
-    // Drop near-empty symbol-only lines (----, ====, ****).
-    s = s
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => line && !/^[\-_=*~.|]{3,}$/.test(line))
-      .join("\n")
-      .trim();
-
-    return s;
-  }
-
-  function notifEmailBody(n) {
-    const cleaned = cleanEmailPlainText(n.body);
-    if (cleaned) return cleaned;
-    if (n.type === "additional_charge") {
-      return "Open Tasks to choose A-E for this charge.";
-    }
-    return "No email body saved.";
   }
 
   function renderNotifications(items, opsPrimary) {
@@ -717,33 +635,29 @@
     }
 
     els.notificationsContainer.innerHTML = items.map((n) => {
-      const kind = notifKind(n);
       const unhandled = n.type === "unhandled_email";
       const charge = n.type === "additional_charge";
-      const sub = notifSubline(n);
-      const metaRows = [
-        n.from ? ["From", n.from] : null,
-        n.to ? ["To", n.to] : null,
-        n.cc ? ["Cc", n.cc] : null,
-        n.subject ? ["Subject", n.subject] : null,
-        n.loadNumber ? ["Load", n.loadNumber] : null,
-        n.carrierName ? ["Carrier", n.carrierName] : null,
-      ].filter(Boolean);
-      return `<article class="notif-card tone-${kind.tone}" data-notif-id="${bodyEsc(n.id)}" data-notif-type="${bodyEsc(n.type || "")}">
+      const subject = notifSubject(n);
+      const from = notifFromLine(n);
+      return `<article class="notif-card" data-notif-id="${bodyEsc(n.id)}" data-notif-type="${bodyEsc(n.type || "")}">
         <button type="button" class="notif-row" aria-expanded="false">
-          <span class="notif-kind kind-${kind.tone}">${bodyEsc(kind.label)}</span>
-          <span class="notif-title">${bodyEsc(notifHeadline(n))}</span>
-          <span class="notif-sub">${bodyEsc(sub)}</span>
+          <span class="notif-title">${bodyEsc(shortText(subject, 100))}</span>
+          <span class="notif-sub">${bodyEsc(shortText(from, 48))}</span>
           <time class="notif-when">${bodyEsc(formatLogTime(n.createdAt))}</time>
           <span class="notif-chevron" aria-hidden="true"></span>
         </button>
         <div class="notif-expand" hidden>
-          <dl class="notif-meta-grid">
-            ${metaRows.map(([k, v]) =>
-              `<div><dt>${bodyEsc(k)}</dt><dd>${bodyEsc(v)}</dd></div>`
-            ).join("")}
-          </dl>
-          <pre class="notif-body">${bodyEsc(notifEmailBody(n))}</pre>
+          <div class="notif-email">
+            <div class="notif-email-headers">
+              ${n.from ? `<div><span>From</span><strong>${bodyEsc(n.from)}</strong></div>` : ""}
+              ${n.to ? `<div><span>To</span><strong>${bodyEsc(n.to)}</strong></div>` : ""}
+              ${n.cc ? `<div><span>Cc</span><strong>${bodyEsc(n.cc)}</strong></div>` : ""}
+              <div><span>Subject</span><strong>${bodyEsc(subject)}</strong></div>
+            </div>
+            <div class="notif-email-body">
+              ${renderEmailBodyHtml(n.body)}
+            </div>
+          </div>
           <div class="task-actions">
             <button type="button" class="btn btn-outline btn-sm notif-dismiss">Done</button>
             <button type="button" class="btn btn-ghost btn-sm notif-flag">Flag</button>
@@ -761,6 +675,7 @@
       </article>`;
     }).join("");
 
+    fillEmailFrames(items);
     bindNotificationActions();
   }
 
@@ -783,10 +698,22 @@
     els.notificationsContainer.querySelectorAll(".notif-row").forEach((row) => {
       row.addEventListener("click", () => {
         const card = row.closest(".notif-card");
+        const opening = !card.classList.contains("is-open");
+        els.notificationsContainer.querySelectorAll(".notif-card.is-open").forEach((other) => {
+          if (other === card) return;
+          other.classList.remove("is-open");
+          const otherPanel = other.querySelector(".notif-expand");
+          const otherRow = other.querySelector(".notif-row");
+          if (otherPanel) otherPanel.hidden = true;
+          if (otherRow) otherRow.setAttribute("aria-expanded", "false");
+        });
         const panel = card.querySelector(".notif-expand");
-        const open = card.classList.toggle("is-open");
-        panel.hidden = !open;
-        row.setAttribute("aria-expanded", open ? "true" : "false");
+        card.classList.toggle("is-open", opening);
+        panel.hidden = !opening;
+        row.setAttribute("aria-expanded", opening ? "true" : "false");
+        if (opening) {
+          card.scrollIntoView({behavior: "smooth", block: "nearest"});
+        }
       });
     });
 

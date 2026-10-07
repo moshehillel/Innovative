@@ -796,27 +796,27 @@ body {
   color: var(--info);
 }
 
-/* Compact notifications — collapsed rows */
+/* Notifications — thin rows, large email pane when open */
 .notif-card {
   border: 1px solid var(--border);
   border-radius: 10px;
   background: #fff;
-  border-left: 3px solid var(--accent);
   overflow: hidden;
   animation: row-in 0.25s ease both;
 }
 
-.notif-card.tone-charge { border-left-color: #c47a12; }
-.notif-card.tone-review { border-left-color: #1a4f8a; }
-.notif-card.tone-alert { border-left-color: var(--accent); }
+.notif-card.is-open {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow);
+}
 
 .notif-row {
   width: 100%;
   display: grid;
-  grid-template-columns: auto minmax(0, 1.4fr) minmax(0, 1fr) auto auto;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 0.65rem;
-  padding: 0.55rem 0.75rem;
+  gap: 0.75rem;
+  padding: 0.55rem 0.85rem;
   border: none;
   background: transparent;
   font: inherit;
@@ -835,24 +835,9 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
-.notif-kind {
-  display: inline-block;
-  padding: 0.1rem 0.45rem;
-  border-radius: 5px;
-  font-size: 0.65rem;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
-  white-space: nowrap;
-}
-
-.notif-kind.kind-charge { background: #fff1e0; color: #9a6700; }
-.notif-kind.kind-review { background: var(--info-soft); color: var(--info); }
-.notif-kind.kind-alert { background: var(--accent-soft); color: var(--accent-ink); }
-
 .notif-title {
   margin: 0;
-  font-size: 0.9rem;
+  font-size: 0.95rem;
   font-weight: 650;
   line-height: 1.25;
   white-space: nowrap;
@@ -862,7 +847,7 @@ body {
 
 .notif-sub {
   margin: 0;
-  font-size: 0.78rem;
+  font-size: 0.82rem;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -870,7 +855,7 @@ body {
 }
 
 .notif-when {
-  font-size: 0.72rem;
+  font-size: 0.75rem;
   color: var(--muted);
   white-space: nowrap;
 }
@@ -891,67 +876,103 @@ body {
 }
 
 .notif-expand {
-  padding: 0.85rem 1rem 1rem;
+  padding: 1rem 1.15rem 1.15rem;
   background: #fff;
 }
 
-.notif-meta-grid {
-  display: grid;
-  gap: 0.35rem;
-  margin: 0 0 0.75rem;
+.notif-email {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 0.9rem;
+  background: #fff;
 }
 
-.notif-meta-grid > div {
+.notif-email-headers {
   display: grid;
-  grid-template-columns: 4.5rem minmax(0, 1fr);
-  gap: 0.5rem;
-  font-size: 0.84rem;
+  gap: 0.45rem;
+  padding: 0.9rem 1.1rem;
+  background: var(--surface-soft);
+  border-bottom: 1px solid var(--border);
 }
 
-.notif-meta-grid dt {
-  margin: 0;
+.notif-email-headers > div {
+  display: grid;
+  grid-template-columns: 4.75rem minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: baseline;
+  font-size: 0.95rem;
+  line-height: 1.4;
+}
+
+.notif-email-headers span {
   color: var(--muted);
   font-weight: 600;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
 
-.notif-meta-grid dd {
-  margin: 0;
+.notif-email-headers strong {
+  font-weight: 600;
   color: var(--text);
   overflow-wrap: anywhere;
 }
 
+.notif-email-body {
+  min-height: 280px;
+  background: #fff;
+}
+
+.notif-body,
+.notif-body-frame {
+  display: block;
+  width: 100%;
+  min-height: 420px;
+  height: min(70vh, 720px);
+  margin: 0;
+  border: 0;
+  background: #fff;
+}
+
 .notif-body {
-  margin: 0 0 0.85rem;
-  padding: 0.85rem 1rem;
-  max-height: 320px;
+  padding: 1.1rem 1.25rem;
   overflow: auto;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface-soft);
   font-family: inherit;
-  font-size: 0.9rem;
-  line-height: 1.55;
-  letter-spacing: 0.01em;
+  font-size: 1.02rem;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
   color: var(--text);
 }
 
+.notif-body-empty {
+  margin: 0;
+  padding: 1.25rem;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
 @media (max-width: 720px) {
   .notif-row {
-    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
-      "kind title chev"
-      "kind sub when";
+      "title chev"
+      "sub when";
     row-gap: 0.15rem;
   }
 
-  .notif-kind { grid-area: kind; align-self: start; margin-top: 0.15rem; }
   .notif-title { grid-area: title; }
   .notif-sub { grid-area: sub; }
   .notif-when { grid-area: when; }
   .notif-chevron { grid-area: chev; }
+
+  .notif-body,
+  .notif-body-frame {
+    min-height: 320px;
+    height: 55vh;
+  }
 }
 
 .status-pill {
