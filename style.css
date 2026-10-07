@@ -395,8 +395,23 @@ body {
   border-radius: 14px; box-shadow: var(--ic-shadow); display: flex; flex-direction: column;
   overflow: hidden;
 }
-.support-chat-header { padding: 10px 12px; border-bottom: 1px solid var(--ic-border); }
+.support-chat-header {
+  padding: 10px 12px; border-bottom: 1px solid var(--ic-border);
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+}
 .support-chat-header-content { display: flex; gap: 10px; align-items: center; }
+.support-chat-header-actions { flex: 0 0 auto; }
+.support-chat-minimized {
+  display: inline-flex; align-items: center; gap: 10px;
+  border: 1px solid var(--ic-border); background: #fff;
+  border-radius: 999px; padding: 10px 14px; font: inherit; font-weight: 700;
+  box-shadow: var(--ic-shadow); cursor: pointer; color: var(--ic-brand-ink);
+  margin-bottom: 10px;
+}
+.support-chat-min-expand {
+  font-size: 11px; font-weight: 600; color: var(--ic-text-muted);
+}
+.folder-item-dispute { margin-top: 8px; border-top: 1px solid var(--ic-border); padding-top: 12px; border-radius: 0 0 8px 8px; }
 .jerry-avatar-btn { width: 36px; height: 36px; border: 0; border-radius: 50%; padding: 0; overflow: hidden; cursor: pointer; background: transparent; }
 .support-chat-title { margin: 0; font-weight: 700; }
 .support-chat-subtitle { margin: 0; font-size: 12px; color: var(--ic-text-muted); }

@@ -89,10 +89,12 @@
   let statsInFlight = null;
   let activeTab = "tasks";
   let ownerBucket = "accounting";
+  let chargePhase = null; // null | "dispute"
   let dispatcherKey = null;
   let taskOffset = 0;
   let taskHasMore = false;
   let tasksCache = [];
+  let disputeCount = 0;
   let bucketCounts = {accounting: {}, sarah: {}, dispatch: {}};
   let dispatchers = [];
   let notifOffset = 0;
@@ -478,19 +480,8 @@
     if (!foot || !drawerItem) return;
 
     foot.querySelectorAll(".drawer-dismiss").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        setButtonBusy(btn, true, "Saving…");
-        try {
-          await postJson("/dismissDashboardTask", {
-            taskId: drawerItem.id,
-            source: drawerItem.source,
-          });
-          closeDrawer();
-          await loadTasks({reset: true});
-        } catch (error) {
-          showError(error.message || "Could not dismiss task.");
-          setButtonBusy(btn, false);
-        }
+      btn.addEventListener("click", () => {
+        dismissTaskOptimistic(drawerItem, {closeDrawerFirst: true});
       });
     });
 
@@ -498,17 +489,21 @@
       btn.addEventListener("click", () => openChargeForm(btn));
     });
 
-    foot.querySelector(".notif-dismiss")?.addEventListener("click", async (e) => {
-      const btn = e.currentTarget;
-      setButtonBusy(btn, true, "…");
-      try {
-        await postJson("/dismissDashboardNotification", {id: drawerItem.id});
-        closeDrawer();
-        await loadNotifications({reset: true});
-      } catch (error) {
-        showError(error.message);
-        setButtonBusy(btn, false);
+    foot.querySelector(".notif-dismiss")?.addEventListener("click", () => {
+      const id = drawerItem.id;
+      closeDrawer();
+      notifsCache = notifsCache.filter((n) => n.id !== id);
+      openNotifCount = Math.max(0, openNotifCount - 1);
+      if (els.notifCountBadge) {
+        els.notifCountBadge.textContent = String(openNotifCount);
       }
+      const keep = notifsCache.slice();
+      notifsCache = [];
+      renderNotifications(keep);
+      postJson("/dismissDashboardNotification", {id}).catch((error) => {
+        showError(error.message);
+        loadNotifications({reset: true});
+      });
     });
 
     foot.querySelector(".notif-flag")?.addEventListener("click", () => {
@@ -640,11 +635,22 @@
         showRunResult(
             result.handedOffToDispatch ?
               `Option B applied — moved to Dispatch Tasks.` :
-              `Option ${opt.toUpperCase()} applied for ${invoiceId}.`,
+              result.markedInDispute ?
+                `Option D applied — moved to In dispute.` :
+                `Option ${opt.toUpperCase()} applied for ${invoiceId}.`,
             false);
-        closeDrawer();
-        await loadTasks({reset: true});
-        await loadNotifications({reset: true});
+        if (opt === "d" || opt === "b") {
+          closeDrawer();
+          const el = getTasksScrollEl();
+          const top = el ? el.scrollTop : 0;
+          await loadTasks({reset: true});
+          if (el) el.scrollTop = top;
+        } else if (drawerItem) {
+          dismissTaskOptimistic(drawerItem, {closeDrawerFirst: true});
+        } else {
+          closeDrawer();
+        }
+        loadNotifications({reset: true});
       } catch (error) {
         showError(error.message || "Could not apply decision.");
         setButtonBusy(confirmBtn, false);
@@ -655,11 +661,16 @@
   /* —— Tasks —— */
   function updateFolderActive() {
     document.querySelectorAll(".folder-item").forEach((el) => {
-      el.classList.toggle("is-active",
-          el.dataset.owner === ownerBucket && !dispatcherKey);
+      const isDispute = el.dataset.owner === "dispute";
+      const on = isDispute ?
+        chargePhase === "dispute" :
+        chargePhase !== "dispute" &&
+          el.dataset.owner === ownerBucket && !dispatcherKey;
+      el.classList.toggle("is-active", on);
     });
     document.querySelectorAll(".folder-child").forEach((el) => {
-      el.classList.toggle("is-active", el.dataset.key === dispatcherKey);
+      el.classList.toggle("is-active",
+          chargePhase !== "dispute" && el.dataset.key === dispatcherKey);
     });
   }
 
@@ -678,6 +689,8 @@
       if (countEl) countEl.textContent = String(c.openCount || 0);
       if (urgentEl) urgentEl.hidden = !(c.urgentCount > 0);
     });
+    const disputeBadge = document.getElementById("disputeCountBadge");
+    if (disputeBadge) disputeBadge.textContent = String(disputeCount || 0);
     if (!els.dispatcherFolders) return;
     els.dispatcherFolders.innerHTML = (dispatchers || []).map((d) =>
       `<button type="button" class="folder-child" data-key="${bodyEsc(d.key)}">` +
@@ -686,6 +699,7 @@
     ).join("");
     els.dispatcherFolders.querySelectorAll(".folder-child").forEach((btn) => {
       btn.addEventListener("click", () => {
+        chargePhase = null;
         ownerBucket = "dispatch";
         dispatcherKey = btn.dataset.key;
         updateFolderActive();
@@ -697,12 +711,66 @@
 
   document.querySelectorAll(".folder-item").forEach((btn) => {
     btn.addEventListener("click", () => {
-      ownerBucket = btn.dataset.owner;
-      dispatcherKey = null;
+      if (btn.dataset.owner === "dispute") {
+        chargePhase = "dispute";
+        dispatcherKey = null;
+      } else {
+        chargePhase = null;
+        ownerBucket = btn.dataset.owner;
+        dispatcherKey = null;
+      }
       updateFolderActive();
       loadTasks({reset: true});
     });
   });
+
+  function getTasksScrollEl() {
+    return els.tasksContainer;
+  }
+
+  function withPreservedScroll(fn) {
+    const el = getTasksScrollEl();
+    const top = el ? el.scrollTop : 0;
+    const winTop = window.scrollY || 0;
+    fn();
+    if (el) el.scrollTop = top;
+    window.scrollTo(0, winTop);
+  }
+
+  function dismissTaskOptimistic(task, opts) {
+    if (!task || !task.id) return;
+    const closeDrawerFirst = opts && opts.closeDrawerFirst;
+    if (closeDrawerFirst) closeDrawer();
+
+    withPreservedScroll(() => {
+      tasksCache = tasksCache.filter((t) => t.id !== task.id);
+      openTaskCount = Math.max(0, openTaskCount - 1);
+      if (task.chargePhase === "dispute" || chargePhase === "dispute") {
+        disputeCount = Math.max(0, disputeCount - 1);
+      } else if (task.ownerBucket && bucketCounts[task.ownerBucket]) {
+        const b = bucketCounts[task.ownerBucket];
+        b.openCount = Math.max(0, (b.openCount || 0) - 1);
+        if (task.isUrgentOld) {
+          b.urgentCount = Math.max(0, (b.urgentCount || 0) - 1);
+        }
+      }
+      renderFolderCounts();
+      renderTasks(tasksCache.slice(), {append: false, preserveCache: true});
+    });
+
+    postJson("/dismissDashboardTask", {
+      taskId: task.id,
+      source: task.source,
+    }).catch((error) => {
+      showError(error.message || "Could not dismiss task.");
+      // Soft recovery — pull fresh list without forcing scroll to top.
+      const el = getTasksScrollEl();
+      const top = el ? el.scrollTop : 0;
+      loadTasks({reset: true}).then(() => {
+        if (el) el.scrollTop = top;
+      });
+    });
+  }
 
   function clientFilterSort(items) {
     const q = String(els.workspaceSearch?.value || "").trim().toLowerCase();
@@ -732,9 +800,14 @@
     return list;
   }
 
-  function renderTasks(tasks, {append = false} = {}) {
-    if (!append) tasksCache = tasks.slice();
-    else tasksCache = tasksCache.concat(tasks);
+  function renderTasks(tasks, {append = false, preserveCache = false} = {}) {
+    if (!preserveCache) {
+      if (!append) tasksCache = tasks.slice();
+      else tasksCache = tasksCache.concat(tasks);
+    } else if (Array.isArray(tasks) && tasks.length && !append) {
+      // Caller already mutated tasksCache; keep it.
+      void tasks;
+    }
 
     const list = clientFilterSort(tasksCache);
     if (els.taskCountBadge) {
@@ -762,6 +835,8 @@
         const meta = taskTypeMeta(task);
         const high = Number(task.chargesTotal) >= HIGH_DOLLAR;
         const urgent = Boolean(task.isUrgentOld || task.ageLabel);
+        const statusLabel = task.chargePhase === "dispute" ?
+          "dispute" : (task.ownerBucket || "—");
         rows += `<tr class="${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
           <td><span class="type-badge ${meta.cls}">${bodyEsc(meta.label)}</span></td>
           <td>${task.loadNumber ?
@@ -770,9 +845,12 @@
           <td>${bodyEsc(shortText(task.carrierName, 28) || "—")}</td>
           <td>${bodyEsc(formatMoney(task.chargesTotal))}</td>
           <td>${bodyEsc(shortText(task.reason || task.description, 40) || "—")}</td>
-          <td>${bodyEsc(task.ownerBucket || "—")}${urgent ? ' <span class="age-badge">URGENT/OLD</span>' : ""}</td>
-          <td>${bodyEsc(formatLogTime(task.createdAt))}</td>
-          <td class="row-actions"><button type="button" class="btn btn-sm btn-outline task-open">Review</button></td>
+          <td>${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">URGENT/OLD</span>' : ""}</td>
+          <td title="When Jerry logged this item (not Gmail received time)">${bodyEsc(formatLogTime(task.createdAt))}</td>
+          <td class="row-actions">
+            <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
+            <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
+          </td>
         </tr>`;
       });
     }
@@ -780,7 +858,7 @@
     els.tasksContainer.innerHTML =
       `<table class="data-table"><thead><tr>
         <th>Type</th><th>Load #</th><th>Carrier</th><th>Amount</th>
-        <th>Reason</th><th>Status</th><th>Received</th><th></th>
+        <th>Reason</th><th>Status</th><th>Logged</th><th></th>
       </tr></thead><tbody>${rows}</tbody></table>`;
 
     const byId = new Map(list.map((t) => [t.id, t]));
@@ -794,6 +872,10 @@
       tr.querySelector(".task-open")?.addEventListener("click", (e) => {
         e.stopPropagation();
         openTaskDrawer(task);
+      });
+      tr.querySelector(".task-dismiss")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        dismissTaskOptimistic(task);
       });
       tr.querySelector(".load-link")?.addEventListener("click", (e) => {
         e.preventDefault();
@@ -823,18 +905,26 @@
       const params = new URLSearchParams({
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
-        ownerBucket,
       });
-      if (dispatcherKey) params.set("dispatcherKey", dispatcherKey);
+      if (chargePhase === "dispute") {
+        params.set("chargePhase", "dispute");
+      } else {
+        params.set("ownerBucket", ownerBucket);
+        if (dispatcherKey) params.set("dispatcherKey", dispatcherKey);
+      }
       const data = await fetchJson(`/getDashboardTasks?${params}`);
       openTaskCount = data.openCount || 0;
+      disputeCount = data.disputeCount != null ? data.disputeCount : disputeCount;
       bucketCounts = data.bucketCounts || bucketCounts;
       dispatchers = data.dispatchers || [];
       renderFolderCounts();
       const page = data.tasks || [];
       taskHasMore = Boolean(data.hasMore);
       taskOffset = data.nextOffset != null ? data.nextOffset : taskOffset + page.length;
+      const scrollEl = getTasksScrollEl();
+      const savedTop = (!reset && scrollEl) ? scrollEl.scrollTop : null;
       renderTasks(page, {append: !reset});
+      if (savedTop != null && scrollEl) scrollEl.scrollTop = savedTop;
       updateTasksLoadMore(false);
     } catch (error) {
       if (reset) {
@@ -1229,12 +1319,10 @@
     if (notifHasMore) loadNotifications({reset: false});
   });
   els.workspaceSearch?.addEventListener("input", () => {
-    if (activeTab === "tasks") renderTasks([], {append: true});
-    // re-render from cache
     if (activeTab === "tasks") {
-      const keep = tasksCache.slice();
-      tasksCache = [];
-      renderTasks(keep);
+      withPreservedScroll(() => {
+        renderTasks(tasksCache.slice(), {preserveCache: true});
+      });
     } else if (activeTab === "invoices") {
       paintInvoices(clientFilterSort(invoicesCache));
     } else if (activeTab === "notifications") {
@@ -1253,6 +1341,8 @@
   const chatEls = {
     toggle: document.getElementById("supportChatToggle"),
     headerToggle: document.getElementById("supportChatHeaderToggle"),
+    minimizeBtn: document.getElementById("supportChatMinimizeBtn"),
+    minimized: document.getElementById("supportChatMinimized"),
     panel: document.getElementById("supportChatPanel"),
     log: document.getElementById("supportChatLog"),
     form: document.getElementById("supportChatForm"),
@@ -1262,6 +1352,7 @@
   let chatBusy = false;
   let chatStarted = false;
   let chatOpen = false;
+  let chatMinimized = false;
 
   function appendChatMessage(role, text) {
     const bubble = document.createElement("p");
@@ -1272,11 +1363,26 @@
     return bubble;
   }
 
+  function setChatMinimized(minimized) {
+    chatMinimized = !!minimized;
+    if (chatEls.minimized) chatEls.minimized.hidden = !chatMinimized;
+    if (chatMinimized) {
+      chatEls.panel.hidden = true;
+      if (chatEls.toggle) chatEls.toggle.hidden = true;
+    } else if (!chatOpen && chatEls.toggle) {
+      chatEls.toggle.hidden = false;
+    }
+  }
+
   function setChatOpen(open) {
     chatOpen = !!open;
+    if (chatOpen) setChatMinimized(false);
     chatEls.panel.hidden = !chatOpen;
-    chatEls.toggle.classList.toggle("is-open", chatOpen);
-    chatEls.toggle.setAttribute("aria-expanded", chatOpen ? "true" : "false");
+    if (chatEls.toggle) {
+      chatEls.toggle.hidden = chatOpen || chatMinimized;
+      chatEls.toggle.classList.toggle("is-open", chatOpen);
+      chatEls.toggle.setAttribute("aria-expanded", chatOpen ? "true" : "false");
+    }
     if (chatOpen) {
       chatEls.input.focus();
       if (!chatStarted) {
@@ -1341,6 +1447,16 @@
     chatEls.headerToggle?.addEventListener("click", (event) => {
       event.stopPropagation();
       if (chatOpen) setChatOpen(false);
+    });
+    chatEls.minimizeBtn?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setChatOpen(false);
+      setChatMinimized(true);
+    });
+    chatEls.minimized?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setChatMinimized(false);
+      setChatOpen(true);
     });
     chatEls.form.addEventListener("submit", (event) => {
       event.preventDefault();
