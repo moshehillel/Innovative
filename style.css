@@ -1,30 +1,30 @@
 :root {
-  --bg: #eef2f4;
-  --bg-deep: #e2e9ee;
+  --bg: #ebf0f3;
+  --bg-deep: #dde6ec;
   --surface: #ffffff;
-  --surface-soft: #f7fafb;
-  --text: #14212b;
-  --muted: #5c6b76;
-  --accent: #0d6e6e;
-  --accent-hover: #0a5757;
-  --accent-soft: #e4f3f3;
-  --accent-ink: #084848;
-  --border: #d5dee5;
-  --border-strong: #b8c5cf;
-  --good: #1a7f4b;
-  --good-soft: #e5f6ec;
-  --bad: #c0392b;
+  --surface-soft: #f4f7f8;
+  --text: #101820;
+  --muted: #5a6874;
+  --accent: #0b6565;
+  --accent-hover: #084f4f;
+  --accent-soft: #e2f2f2;
+  --accent-ink: #063f3f;
+  --border: #cfd9e1;
+  --border-strong: #aebcc8;
+  --good: #157a45;
+  --good-soft: #e3f6eb;
+  --bad: #b83226;
   --bad-soft: #fdecea;
-  --warn: #9a6700;
-  --warn-soft: #fff6e0;
-  --info: #1a4f8a;
-  --info-soft: #e8f1fb;
-  --shadow: 0 1px 2px rgba(20, 33, 43, 0.04), 0 8px 24px rgba(20, 33, 43, 0.06);
-  --radius: 14px;
-  --radius-sm: 10px;
+  --warn: #8f5f00;
+  --warn-soft: #fff5db;
+  --info: #184a82;
+  --info-soft: #e7f0fa;
+  --shadow: 0 1px 2px rgba(16, 24, 32, 0.04), 0 10px 28px rgba(16, 24, 32, 0.07);
+  --radius: 16px;
+  --radius-sm: 12px;
   --font: "Instrument Sans", system-ui, sans-serif;
   --display: "Source Serif 4", Georgia, serif;
-  --page-pad: clamp(1rem, 2vw, 1.75rem);
+  --page-pad: clamp(1rem, 2.2vw, 2rem);
   --page-max: 100%;
 }
 
@@ -42,8 +42,11 @@ body {
   font-family: var(--font);
   background: var(--bg);
   color: var(--text);
-  line-height: 1.45;
+  line-height: 1.5;
+  letter-spacing: 0.005em;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 .page-bg {
@@ -65,10 +68,11 @@ body {
   align-items: center;
   gap: 1rem;
   width: 100%;
-  padding: 0.75rem var(--page-pad);
-  background: rgba(255, 255, 255, 0.86);
+  padding: 0.85rem var(--page-pad);
+  background: rgba(255, 255, 255, 0.92);
   border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(10px);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+  backdrop-filter: blur(14px);
   position: sticky;
   top: 0;
   z-index: 20;
@@ -309,18 +313,20 @@ body {
   justify-content: space-between;
   gap: 0.85rem;
   flex-wrap: wrap;
-  padding: 0.55rem 0.75rem;
+  padding: 0.65rem 0.9rem;
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
 }
 
 .ops-console {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius);
   overflow: hidden;
   min-height: calc(100vh - 12rem);
+  box-shadow: var(--shadow);
 }
 
 .metrics-left,
@@ -648,14 +654,14 @@ body {
 /* ——— Task rows (collapsed / expandable) ——— */
 .task-card {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: #fff;
   overflow: hidden;
   animation: row-in 0.25s ease both;
 }
 
 .task-card.is-open {
-  border-color: var(--border-strong);
+  border-color: var(--accent);
   box-shadow: var(--shadow);
 }
 
@@ -922,14 +928,14 @@ body {
 /* Notifications — thin rows, large email pane when open */
 .notif-card {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-sm);
   background: #fff;
   overflow: hidden;
   animation: row-in 0.25s ease both;
 }
 
 .notif-card.is-open {
-  border-color: var(--border-strong);
+  border-color: var(--accent);
   box-shadow: var(--shadow);
 }
 
@@ -939,7 +945,7 @@ body {
   grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 0.75rem;
-  padding: 0.55rem 0.85rem;
+  padding: 0.7rem 1rem;
   border: none;
   background: transparent;
   font: inherit;
@@ -954,15 +960,16 @@ body {
 }
 
 .notif-card.is-open .notif-row {
-  background: var(--surface-soft);
+  background: linear-gradient(180deg, #f3f8f8 0%, #eef4f4 100%);
   border-bottom: 1px solid var(--border);
 }
 
 .notif-title {
   margin: 0;
-  font-size: 0.95rem;
-  font-weight: 650;
-  line-height: 1.25;
+  font-size: 1rem;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -970,7 +977,8 @@ body {
 
 .notif-sub {
   margin: 0;
-  font-size: 0.82rem;
+  font-size: 0.88rem;
+  font-weight: 500;
   color: var(--muted);
   white-space: nowrap;
   overflow: hidden;
@@ -978,7 +986,8 @@ body {
 }
 
 .notif-when {
-  font-size: 0.75rem;
+  font-size: 0.78rem;
+  font-weight: 500;
   color: var(--muted);
   white-space: nowrap;
 }
@@ -999,41 +1008,42 @@ body {
 }
 
 .notif-expand {
-  padding: 1rem 1.15rem 1.15rem;
-  background: #fff;
+  padding: 1.15rem 1.25rem 1.3rem;
+  background: linear-gradient(180deg, #f7fafb 0%, #fff 40%);
 }
 
 .notif-email {
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 14px;
   overflow: hidden;
-  margin-bottom: 0.9rem;
+  margin-bottom: 1rem;
   background: #fff;
+  box-shadow: 0 1px 2px rgba(16, 24, 32, 0.04);
 }
 
 .notif-email-headers {
   display: grid;
-  gap: 0.45rem;
-  padding: 0.9rem 1.1rem;
-  background: var(--surface-soft);
+  gap: 0.55rem;
+  padding: 1.05rem 1.35rem;
+  background: #f8fafb;
   border-bottom: 1px solid var(--border);
 }
 
 .notif-email-headers > div {
   display: grid;
-  grid-template-columns: 4.75rem minmax(0, 1fr);
-  gap: 0.65rem;
+  grid-template-columns: 5.25rem minmax(0, 1fr);
+  gap: 0.75rem;
   align-items: baseline;
-  font-size: 0.95rem;
-  line-height: 1.4;
+  font-size: 1rem;
+  line-height: 1.45;
 }
 
 .notif-email-headers span {
   color: var(--muted);
-  font-weight: 600;
-  font-size: 0.8rem;
+  font-weight: 700;
+  font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.05em;
 }
 
 .notif-email-headers strong {
@@ -1043,7 +1053,7 @@ body {
 }
 
 .notif-email-body {
-  min-height: 280px;
+  min-height: 320px;
   background: #fff;
 }
 
@@ -1051,24 +1061,26 @@ body {
 .notif-body-frame {
   display: block;
   width: 100%;
-  min-height: 420px;
-  height: min(70vh, 720px);
+  min-height: 480px;
+  height: min(74vh, 820px);
   margin: 0;
   border: 0;
   background: #fff;
 }
 
 .notif-body {
-  padding: 1.15rem 1.35rem;
+  padding: 1.5rem 1.75rem;
   overflow: auto;
   font-family: inherit;
-  font-size: 1.05rem;
-  line-height: 1.65;
+  font-size: 1.12rem;
+  font-weight: 400;
+  line-height: 1.7;
+  letter-spacing: 0.01em;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
   color: var(--text);
-  max-width: 70ch;
+  max-width: 46rem;
 }
 
 .notif-body-empty {

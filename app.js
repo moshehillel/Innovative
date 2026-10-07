@@ -683,14 +683,36 @@
       if (!html) return;
       const doc =
         "<!doctype html><html><head><meta charset=\"utf-8\">" +
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
         "<base target=\"_blank\" rel=\"noopener\">" +
+        "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">" +
+        "<link href=\"https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap\" rel=\"stylesheet\">" +
         "<style>" +
         "html,body{margin:0;padding:0;background:#fff;}" +
-        "body{margin:16px 18px;font:15px/1.5 'Segoe UI',Tahoma,Arial,sans-serif;" +
-        "color:#242424;word-wrap:break-word;overflow-wrap:anywhere;}" +
-        "img{max-width:100%;height:auto;} a{color:#0563c1;}" +
-        "table{border-collapse:collapse;max-width:100%;}" +
-        "blockquote{margin:0.5em 0;padding-left:0.75em;border-left:2px solid #ccc;color:#555;}" +
+        "body{" +
+        "margin:0 auto;padding:28px 32px 36px;max-width:720px;" +
+        "font-family:'Instrument Sans',Segoe UI,Roboto,sans-serif;" +
+        "font-size:17.5px;font-weight:400;line-height:1.7;" +
+        "letter-spacing:0.01em;color:#1a2430;" +
+        "-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;" +
+        "word-wrap:break-word;overflow-wrap:anywhere;" +
+        "}" +
+        "p{margin:0 0 1em;} p:last-child{margin-bottom:0;}" +
+        "b,strong{font-weight:700;color:#0f1720;}" +
+        "em,i{font-style:italic;color:#334155;}" +
+        "a{color:#0d6e6e;font-weight:500;text-decoration:underline;text-underline-offset:2px;}" +
+        "h1,h2,h3,h4{margin:1.25em 0 0.5em;line-height:1.3;font-weight:700;color:#0f1720;}" +
+        "h1{font-size:1.35em;} h2{font-size:1.2em;} h3{font-size:1.08em;}" +
+        "ul,ol{margin:0 0 1em;padding-left:1.35em;} li{margin:0.25em 0;}" +
+        "img{max-width:100%;height:auto;border-radius:4px;}" +
+        "table{border-collapse:collapse;max-width:100%;margin:0.75em 0;font-size:0.98em;}" +
+        "td,th{padding:0.35em 0.65em;vertical-align:top;}" +
+        "hr{border:0;border-top:1px solid #e2e8f0;margin:1.4em 0;}" +
+        "blockquote{margin:1em 0;padding:0.65em 0 0.65em 1em;" +
+        "border-left:3px solid #cbd5e1;color:#475569;font-weight:400;}" +
+        "pre{white-space:pre-wrap;font:inherit;margin:0;line-height:1.7;}" +
+        "div[style*='font-size:10'],div[style*='font-size:11'],span[style*='font-size:10']," +
+        "span[style*='font-size:11'],font[size='1'],font[size='2']{font-size:1em !important;}" +
         "</style></head><body>" + html + "</body></html>";
       frame.srcdoc = doc;
     });
