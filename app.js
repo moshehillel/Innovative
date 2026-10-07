@@ -301,13 +301,20 @@
 
   function renderChargeButtons(task) {
     if (!isAdditionalChargeTask(task) || !task.invoiceId) return "";
+    const legend = ["a", "b", "c", "d", "e"].map((opt) =>
+      `<li><strong>${opt.toUpperCase()}</strong> ${bodyEsc(CHARGE_LABELS[opt].replace(/^[A-E]\s*[—-]\s*/, ""))}</li>`
+    ).join("");
     const opts = ["a", "b", "c", "d", "e"].map((opt) =>
       `<button type="button" class="btn btn-outline btn-sm charge-opt" ` +
       `data-charge-opt="${opt}" data-invoice="${bodyEsc(task.invoiceId)}" ` +
       `data-task-id="${bodyEsc(task.id)}" data-task-source="${bodyEsc(task.source || "dashboardTasks")}" ` +
       `title="${bodyEsc(CHARGE_LABELS[opt])}">${opt.toUpperCase()}</button>`
     ).join("");
-    return `<div class="charge-options" data-charge-row="${bodyEsc(task.id)}">${opts}</div>` +
+    return `<div class="charge-block" data-charge-row="${bodyEsc(task.id)}">` +
+      `<p class="charge-legend-title">Choose an option</p>` +
+      `<ul class="charge-legend">${legend}</ul>` +
+      `<div class="charge-options">${opts}</div>` +
+      `</div>` +
       `<div class="charge-opt-form" data-charge-form="${bodyEsc(task.id)}" hidden></div>`;
   }
 

@@ -710,11 +710,49 @@ body {
   margin-top: 0.85rem;
 }
 
+.charge-block {
+  margin-top: 0.7rem;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.charge-legend-title {
+  margin: 0 0 0.4rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.charge-legend {
+  margin: 0 0 0.65rem;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.charge-legend li {
+  font-size: 0.86rem;
+  line-height: 1.35;
+  color: var(--text);
+}
+
+.charge-legend strong {
+  display: inline-block;
+  min-width: 1.1rem;
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+
 .charge-options {
   display: flex;
   flex-wrap: wrap;
   gap: 0.4rem;
-  margin-top: 0.55rem;
+  margin-top: 0;
 }
 
 .charge-opt {
