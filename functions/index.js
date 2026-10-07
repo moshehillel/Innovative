@@ -11454,17 +11454,46 @@ exports.mailOAuthCallback = exports.gmailOAuthCallback;
 exports.outlookOAuthCallback = exports.gmailOAuthCallback;
 
 /**
+ * Known dashboard browser origins always allowed in addition to
+ * DASHBOARD_ORIGIN (comma-separated). Keeps AA and the Innovative Netlify
+ * site working when either is configured.
+ */
+const DASHBOARD_CORS_DEFAULT_ORIGINS = [
+  "https://www.advancedautomations.net",
+  "https://innovative-jerry.netlify.app",
+];
+
+/**
  * Applies CORS headers so the static dashboard can call these endpoints
- * directly from the browser. Set the DASHBOARD_ORIGIN env var to the
- * dashboard's URL (e.g. https://your-site.netlify.app) to restrict access;
- * it falls back to "*" so the dashboard works before that's configured.
+ * directly from the browser. Set DASHBOARD_ORIGIN to one origin, a
+ * comma-separated list, or "*" (default when unset).
  * @param {object} req Express request.
  * @param {object} res Express response.
  * @return {boolean} True if this was an OPTIONS preflight that was already
  *   responded to, meaning the caller should stop handling the request.
  */
 function applyDashboardCors(req, res) {
-  res.set("Access-Control-Allow-Origin", process.env.DASHBOARD_ORIGIN || "*");
+  const fromEnv = String(process.env.DASHBOARD_ORIGIN || "*")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  const allowAny = fromEnv.includes("*");
+  const allowed = new Set(
+      allowAny ? ["*"] : [...DASHBOARD_CORS_DEFAULT_ORIGINS, ...fromEnv],
+  );
+  const requestOrigin = req.get("Origin");
+  let allowOrigin = "*";
+  if (!allowAny) {
+    if (requestOrigin && allowed.has(requestOrigin)) {
+      allowOrigin = requestOrigin;
+    } else if (fromEnv.length === 1) {
+      allowOrigin = fromEnv[0];
+    } else {
+      allowOrigin = DASHBOARD_CORS_DEFAULT_ORIGINS[0];
+    }
+    res.set("Vary", "Origin");
+  }
+  res.set("Access-Control-Allow-Origin", allowOrigin);
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") {
