@@ -5173,6 +5173,216 @@ function customerNameFromPrimusBooking(booking) {
 }
 
 /**
+ * Isolates the inspection certificate PDF (sidecar or listed pages).
+ * Never returns the full priced invoice.
+ * @param {object} opts attachments, aiResult.
+ * @return {Promise<object>}
+ */
+async function loadWeightCertificatePdf(opts) {
+  const aiResult = opts.aiResult || {};
+  const list = Array.isArray(opts.attachments) ? opts.attachments : [];
+  const certAtt = list.find((a) =>
+    a && a.storagePath &&
+    /WEIGHT_INSPECTION_CERT/i.test(String(a.docType || "")));
+  if (certAtt) {
+    const b64 = await downloadStorageFileBase64(certAtt.storagePath);
+    if (b64) {
+      const buffer = Buffer.from(b64, "base64");
+      const hints = {
+        proNumber: aiResult.proNumber,
+        attachmentFilename: aiResult.attachmentFilename,
+      };
+      const invoiceAtt = additionalCharges.pickCarrierInvoiceAttachment(
+          list, hints);
+      let forbiddenBuffer = null;
+      if (invoiceAtt && invoiceAtt.storagePath &&
+          invoiceAtt.storagePath !== certAtt.storagePath) {
+        const invoiceB64 = await downloadStorageFileBase64(
+            invoiceAtt.storagePath);
+        if (invoiceB64) forbiddenBuffer = Buffer.from(invoiceB64, "base64");
+      } else if (invoiceAtt &&
+          invoiceAtt.storagePath === certAtt.storagePath) {
+        forbiddenBuffer = buffer;
+      }
+      return {
+        buffer: forbiddenBuffer === buffer ? null : buffer,
+        filename: certAtt.filename || "inspection-certificate.pdf",
+        isolated: forbiddenBuffer !== buffer,
+        forbiddenBuffer,
+        source: "sidecar",
+      };
+    }
+  }
+
+  const pages = additionalCharges.normalizeCertificatePages(
+      aiResult.weightInspectionCertificatePages);
+  if (pages.length) {
+    const hints = {
+      proNumber: aiResult.proNumber,
+      attachmentFilename: aiResult.attachmentFilename,
+    };
+    const invoiceAtt = additionalCharges.pickCarrierInvoiceAttachment(
+        list, hints) || list.find((a) =>
+      a && a.storagePath && /\.pdf$/i.test(String(a.filename || "")));
+    if (invoiceAtt && invoiceAtt.storagePath) {
+      const b64 = await downloadStorageFileBase64(invoiceAtt.storagePath);
+      if (b64) {
+        const full = Buffer.from(b64, "base64");
+        const sliced = await slicePdfByPages(full, pages);
+        if (sliced && sliced.length) {
+          return {
+            buffer: sliced,
+            filename: `inspection-cert-${aiResult.loadNumber || "load"}.pdf`,
+            isolated: true,
+            forbiddenBuffer: full,
+            source: "pages",
+          };
+        }
+        return {
+          buffer: null,
+          isolated: false,
+          forbiddenBuffer: full,
+          source: "pages_are_whole_file",
+        };
+      }
+    }
+  }
+
+  return {
+    buffer: null,
+    isolated: false,
+    source: aiResult.hasWeightInspectionCertificate ?
+      "present_not_separated" : "absent",
+  };
+}
+
+/**
+ * Scans the inspection certificate for prices and uploads it to Primus
+ * only when the text has no prices. A priced certificate stays off Primus
+ * so it is not sent to the customer.
+ * @param {object} opts aiResult, attachments, booking, loadNumber.
+ * @return {Promise<object>}
+ */
+async function inspectAndUploadWeightCertificate(opts) {
+  const aiResult = opts.aiResult || {};
+  const present = !!aiResult.hasWeightInspectionCertificate ||
+    !!(opts.pending && opts.pending.hasCertificate);
+  if (!present) {
+    return {
+      present: false,
+      hasPricing: false,
+      uploaded: false,
+      withheldReason: "not_present",
+      customerVisible: null,
+    };
+  }
+
+  const loaded = await loadWeightCertificatePdf({
+    attachments: opts.attachments,
+    aiResult,
+  });
+  const aiSaysPricing = !!aiResult.weightInspectionCertificateHasPricing;
+  if (!loaded.buffer) {
+    return {
+      present: true,
+      hasPricing: aiSaysPricing ? true : null,
+      uploaded: false,
+      withheldReason: aiSaysPricing ? "pricing" : "could_not_separate",
+      customerVisible: null,
+    };
+  }
+
+  const texts = await extractPdfPageTexts(loaded.buffer);
+  const joined = Array.isArray(texts) ? texts.join("\n") : "";
+  const scan = additionalCharges.certificateTextHasPricing(joined);
+  const hasPricing = aiSaysPricing || scan.hasPricing;
+  if (hasPricing) {
+    return {
+      present: true,
+      hasPricing: true,
+      uploaded: false,
+      withheldReason: "pricing",
+      customerVisible: null,
+    };
+  }
+  if (!scan.hasText) {
+    return {
+      present: true,
+      hasPricing: null,
+      uploaded: false,
+      withheldReason: "unverified_pricing",
+      customerVisible: null,
+    };
+  }
+
+  const bridge = require("./primus-ui-bridge");
+  if (!bridge.isManagePhpEnabled()) {
+    return {
+      present: true,
+      hasPricing: false,
+      uploaded: false,
+      withheldReason: "upload_failed",
+      detail: "Primus document upload is not enabled",
+      customerVisible: null,
+    };
+  }
+  if (!opts.booking) {
+    return {
+      present: true,
+      hasPricing: false,
+      uploaded: false,
+      withheldReason: "no_booking",
+      customerVisible: null,
+    };
+  }
+
+  const up = await bridge.uploadInspectionCertificate({
+    booking: opts.booking,
+    loadNumber: opts.loadNumber,
+    file: {buffer: loaded.buffer, filename: loaded.filename},
+    forbiddenBuffer: loaded.forbiddenBuffer || null,
+  });
+  if (up.uploaded || (up.skipped && up.reason === "already uploaded")) {
+    return {
+      present: true,
+      hasPricing: false,
+      uploaded: true,
+      withheldReason: null,
+      customerVisible: up.customerVisible !== false,
+      fileTypeName: up.fileTypeName || null,
+    };
+  }
+  const err = String(up.error || "");
+  if (/carrier invoice/i.test(err)) {
+    return {
+      present: true,
+      hasPricing: true,
+      uploaded: false,
+      withheldReason: "pricing",
+      customerVisible: null,
+    };
+  }
+  if (/no inspection certificate file type/i.test(err)) {
+    return {
+      present: true,
+      hasPricing: false,
+      uploaded: false,
+      withheldReason: "no_file_type",
+      detail: err,
+      customerVisible: null,
+    };
+  }
+  return {
+    present: true,
+    hasPricing: false,
+    uploaded: false,
+    withheldReason: "upload_failed",
+    detail: err || "upload failed",
+    customerVisible: null,
+  };
+}
+
+/**
  * Sends the 5-option (A/B/C/D/E) additional-charge approval email to the
  * approver (Sarah) with the dispatcher CC'd, and creates the follow-up
  * entry so the charge is tracked until resolved.
@@ -5223,6 +5433,51 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     status: additionalCharges.FOLLOW_UP_STATUS.PENDING_APPROVAL,
   });
 
+  let certificateStatus = null;
+  if (pending.category ===
+      additionalCharges.CHARGE_CATEGORY.WEIGHT_INSPECTION) {
+    try {
+      certificateStatus = await inspectAndUploadWeightCertificate({
+        aiResult,
+        pending,
+        attachments: opts.invoiceAttachments,
+        booking: pending.booking || null,
+        loadNumber: aiResult.loadNumber,
+      });
+    } catch (certErr) {
+      certificateStatus = {
+        present: !!pending.hasCertificate,
+        hasPricing: null,
+        uploaded: false,
+        withheldReason: "upload_failed",
+        detail: certErr.message || String(certErr),
+        customerVisible: null,
+      };
+    }
+    await writeLog("info", "primus",
+        "Inspection certificate upload decision", {
+          invoiceId,
+          loadNumber: aiResult.loadNumber,
+          present: certificateStatus.present,
+          uploaded: certificateStatus.uploaded,
+          hasPricing: certificateStatus.hasPricing,
+          withheldReason: certificateStatus.withheldReason || null,
+        });
+    try {
+      await tcol(tenant, "invoices").doc(String(invoiceId)).update({
+        "additionalCharge.certificateStatus": certificateStatus,
+        "additionalCharge.weightRebill": pending.weightRebill || null,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (saveErr) {
+      await writeLog("warn", "primus",
+          "Could not save inspection certificate status", {
+            invoiceId,
+            error: saveErr.message || String(saveErr),
+          });
+    }
+  }
+
   const email = additionalCharges.buildAdditionalChargeApprovalEmail({
     baseUrl: functionsBaseUrl(),
     invoiceId,
@@ -5241,6 +5496,8 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     rateValidation: pending.rateValidation || null,
     customerRate,
     excludedInPrimusCount: pending.excludedInPrimusCount || 0,
+    weightRebill: pending.weightRebill || null,
+    certificateStatus,
   });
 
   const podFollowup = require("./pod-followup");
@@ -5379,7 +5636,14 @@ async function getPrimusShipment(loadNumber, proNumber) {
     } else if (booking.shipper && booking.shipper.email) {
       customerEmail = booking.shipper.email;
     }
-    return {found: true, rate, vendorCost, customerEmail, BOLId: booking.BOLId};
+    return {
+      found: true,
+      rate,
+      vendorCost,
+      customerEmail,
+      BOLId: booking.BOLId,
+      booking,
+    };
   } catch (error) {
     await writeLog("error", "primus", "getPrimusShipment failed", {
       loadNumber,
@@ -5433,8 +5697,17 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
     unrecognizedCharges: [],
     chargesNeedProof: [],
     chargeProofRefs: [],
-    freightDetails: {totalWeightLbs: 0, freightClass: "", pieces: 0},
+    freightDetails: {
+      totalWeightLbs: 0,
+      freightClass: "",
+      pieces: 0,
+      length: 0,
+      width: 0,
+      height: 0,
+    },
     hasWeightInspectionCertificate: false,
+    weightInspectionCertificateHasPricing: false,
+    weightInspectionCertificatePages: [],
     pod: {
       found: false,
       documents: [],
@@ -5591,11 +5864,22 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Any other added charge is unrecognized_charges.",
         "Extract freightDetails as billed on THIS invoice: totalWeightLbs " +
         "(billed/rated weight in lbs), freightClass (billed/rated NMFC " +
-        "class like '92.5'), pieces. Use 0 / empty string when not shown.",
+        "class like '92.5'), pieces, and length/width/height in inches " +
+        "(billed pallet or piece dims, e.g. 40 x 48 x 30). Use 0 / empty " +
+        "string when a value is not shown.",
         "Set hasWeightInspectionCertificate=true when a Weight & " +
         "Inspection (W&I) / reweigh / inspection certificate page is " +
         "attached or referenced, or when the invoice shows a corrected, " +
         "reweighed, or reclassified weight/class versus an original.",
+        "Set weightInspectionCertificatePages to the 1-based page numbers " +
+        "of the inspection certificate only, not the priced invoice " +
+        "pages. Use an empty array when there is no certificate or the " +
+        "certificate is a separate file.",
+        "Set weightInspectionCertificateHasPricing=true only when the " +
+        "inspection certificate itself shows a dollar amount, rate, " +
+        "charge, freight total, or amount due. False when the certificate " +
+        "shows only weight, class, dims, and inspection results. False " +
+        "when there is no certificate.",
         "A W&I / WNI class-correction or reweigh certificate that shows " +
         "a revised class, weight, or rate IS the freight bill to extract " +
         "(corrected invoice / additional charge). Do not set status error.",
@@ -11079,61 +11363,40 @@ async function processGmailMessage(
                 decision: "RATE_INCREASE_DISPUTE",
               });
         } else {
-          // Accessorial or W&I → 4-option approval email to Sarah +
+          // Accessorial or W&I → 5-option approval email to Sarah +
           // dispatcher after the invoice doc is created below.
-          // For W&I, re-rate via Primus GET /rate with the invoice's
-          // updated weight/class and compare to the carrier total ($10).
-          let rateValidation = null;
+          // For W&I, re-quote Primus with the invoice's updated weight
+          // and dims and compare that total to the carrier invoice.
+          finalStatus = "additional_charge_pending_approval";
+          const excludedInPrimusCount = chargeReconciliation &&
+            chargeReconciliation.filtered ?
+            chargeReconciliation.filtered.alreadyInPrimus.length : 0;
           if (chargeCategory ===
               additionalCharges.CHARGE_CATEGORY.WEIGHT_INSPECTION) {
-            try {
-              rateValidation = await validateReweighRateWithPrimus({
-                booking: bookingForCharges,
-                invoiceFreight: aiResult.freightDetails,
-                invoiceAmount: aiResult.invoiceAmount,
-              });
-              await writeLog("info", "primus",
-                  "W&I Primus re-rate validation", {
-                    messageId,
-                    loadNumber: aiResult.loadNumber,
-                    matched: rateValidation.matched,
-                    ok: rateValidation.ok,
-                    rateTotal: rateValidation.rateTotal,
-                    invoiceAmount: rateValidation.invoiceAmount,
-                    difference: rateValidation.difference,
-                    quoteNumber: rateValidation.quoteNumber,
-                    error: rateValidation.error,
-                  });
-            } catch (rateErr) {
-              rateValidation = {
-                attempted: true,
-                ok: false,
-                matched: false,
-                tolerance: additionalCharges.RATE_MATCH_TOLERANCE,
-                invoiceAmount: Number(aiResult.invoiceAmount) || null,
-                rateTotal: null,
-                difference: null,
-                quoteNumber: null,
-                error: rateErr.message || String(rateErr),
-                freightInfo: null,
-              };
-            }
+            pendingAdditionalCharge = await collectWeightInspectionPending({
+              messageId,
+              booking: bookingForCharges,
+              aiResult,
+              charges: normalizedChargeData.unrecognizedCharges,
+              chargesTotal,
+              freightMismatch,
+              primusVendorCost,
+              excludedInPrimusCount,
+            });
+          } else {
+            pendingAdditionalCharge = {
+              category: chargeCategory,
+              charges: normalizedChargeData.unrecognizedCharges,
+              chargesTotal,
+              freightMismatch,
+              hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+              primusVendorCost,
+              booking: bookingForCharges,
+              rateValidation: null,
+              customerRate: customerRateFromBooking(bookingForCharges),
+              excludedInPrimusCount,
+            };
           }
-          finalStatus = "additional_charge_pending_approval";
-          pendingAdditionalCharge = {
-            category: chargeCategory,
-            charges: normalizedChargeData.unrecognizedCharges,
-            chargesTotal,
-            freightMismatch,
-            hasCertificate: !!aiResult.hasWeightInspectionCertificate,
-            primusVendorCost,
-            booking: bookingForCharges,
-            rateValidation,
-            customerRate: customerRateFromBooking(bookingForCharges),
-            excludedInPrimusCount: chargeReconciliation &&
-              chargeReconciliation.filtered ?
-              chargeReconciliation.filtered.alreadyInPrimus.length : 0,
-          };
           await writeLog("warn", "ai",
               "Additional charge needs approval (4-option email)", {
                 event: "AI decision - needs review",
@@ -11148,13 +11411,16 @@ async function processGmailMessage(
                     normalizedChargeData.unrecognizedCharges,
                   freightMismatch: freightMismatch.mismatch ?
                     freightMismatch.details : null,
-                  rateValidation: rateValidation ? {
-                    matched: rateValidation.matched,
-                    ok: rateValidation.ok,
-                    rateTotal: rateValidation.rateTotal,
-                    difference: rateValidation.difference,
-                    quoteNumber: rateValidation.quoteNumber,
-                    error: rateValidation.error,
+                  rateValidation: pendingAdditionalCharge.rateValidation ? {
+                    matched: pendingAdditionalCharge.rateValidation.matched,
+                    ok: pendingAdditionalCharge.rateValidation.ok,
+                    rateTotal:
+                      pendingAdditionalCharge.rateValidation.rateTotal,
+                    difference:
+                      pendingAdditionalCharge.rateValidation.difference,
+                    quoteNumber:
+                      pendingAdditionalCharge.rateValidation.quoteNumber,
+                    error: pendingAdditionalCharge.rateValidation.error,
                   } : null,
                   decision: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
                 },
@@ -11414,6 +11680,44 @@ async function processGmailMessage(
                 },
             );
           } else {
+            const rebillBooking = (primusData && primusData.booking) || null;
+            const rebillMismatch = additionalCharges.detectFreightMismatch(
+                aiResult.freightDetails, rebillBooking);
+            const replacementWeightInvoice =
+              additionalCharges.isReplacementWeightInvoice({
+                invoiceAmount: aiResult.invoiceAmount,
+                primusAmount: primusResult.amount,
+                freightMismatch: rebillMismatch,
+                hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+                charges: normalizedChargeData.unrecognizedCharges,
+              });
+            if (replacementWeightInvoice) {
+              finalStatus = "additional_charge_pending_approval";
+              pendingAdditionalCharge =
+                await collectWeightInspectionPending({
+                  messageId,
+                  booking: rebillBooking,
+                  aiResult,
+                  charges: normalizedChargeData.unrecognizedCharges,
+                  chargesTotal: 0,
+                  freightMismatch: rebillMismatch,
+                  primusVendorCost: Number(primusResult.amount) || null,
+                  excludedInPrimusCount: 0,
+                });
+              await writeLog("info", "primus",
+                  "Replacement invoice for updated weight or dims", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    invoiceAmount: aiResult.invoiceAmount,
+                    primusAmount: primusResult.amount,
+                    addedCharge: pendingAdditionalCharge.weightRebill &&
+                      pendingAdditionalCharge.weightRebill.addedCharge,
+                    weightMismatch: !!rebillMismatch.weightMismatch,
+                    dimMismatch: !!rebillMismatch.dimMismatch,
+                    hasCertificate:
+                      !!aiResult.hasWeightInspectionCertificate,
+                  });
+            } else {
             finalStatus = "unmatched_amount";
             await writeLog("warn", "primus", "Primus validation failed", {
               event: "Primus validation failed",
@@ -11467,6 +11771,7 @@ async function processGmailMessage(
                   invoiceAmount: aiResult.invoiceAmount,
                   expectedAmount: primusResult.amount || null,
                 });
+            }
           }
         }
       } else {
@@ -11640,6 +11945,11 @@ async function processGmailMessage(
           freightDetails: aiResult.freightDetails || null,
           hasWeightInspectionCertificate:
             !!aiResult.hasWeightInspectionCertificate,
+          weightInspectionCertificateHasPricing:
+            !!aiResult.weightInspectionCertificateHasPricing,
+          weightInspectionCertificatePages:
+            additionalCharges.normalizeCertificatePages(
+                aiResult.weightInspectionCertificatePages),
           weightInspectionCertificate: pendingXpoWeightCert ? {
             source: pendingXpoWeightCert.source,
             storagePath: pendingXpoWeightCert.storagePath,
@@ -15281,6 +15591,73 @@ async function validateReweighRateWithPrimus(opts) {
     quoteNumber: rateRes.quoteNumber,
     error: null,
     freightInfo,
+  };
+}
+
+/**
+ * W&I / replacement-invoice payload: re-quote updated weight and dims,
+ * and record original quote vs invoice total for Jerry's email.
+ * @param {object} args messageId, booking, aiResult, charges, chargesTotal,
+ *   freightMismatch, primusVendorCost, excludedInPrimusCount.
+ * @return {Promise<object>}
+ */
+async function collectWeightInspectionPending(args) {
+  const {
+    messageId, booking, aiResult, charges, chargesTotal,
+    freightMismatch, primusVendorCost, excludedInPrimusCount,
+  } = args;
+  let rateValidation = null;
+  try {
+    rateValidation = await validateReweighRateWithPrimus({
+      booking,
+      invoiceFreight: aiResult.freightDetails,
+      invoiceAmount: aiResult.invoiceAmount,
+    });
+    await writeLog("info", "primus", "W&I Primus re-rate validation", {
+      messageId,
+      loadNumber: aiResult.loadNumber,
+      matched: rateValidation.matched,
+      ok: rateValidation.ok,
+      rateTotal: rateValidation.rateTotal,
+      invoiceAmount: rateValidation.invoiceAmount,
+      difference: rateValidation.difference,
+      quoteNumber: rateValidation.quoteNumber,
+      error: rateValidation.error,
+    });
+  } catch (rateErr) {
+    rateValidation = {
+      attempted: true,
+      ok: false,
+      matched: false,
+      tolerance: additionalCharges.RATE_MATCH_TOLERANCE,
+      invoiceAmount: Number(aiResult.invoiceAmount) || null,
+      rateTotal: null,
+      difference: null,
+      quoteNumber: null,
+      error: rateErr.message || String(rateErr),
+      freightInfo: null,
+    };
+  }
+  const weightRebill = additionalCharges.buildWeightRebillSummary({
+    booking,
+    invoiceFreight: aiResult.freightDetails,
+    invoiceAmount: aiResult.invoiceAmount,
+    primusAmount: primusVendorCost,
+  });
+  const lineTotal = Number(chargesTotal) || 0;
+  const added = weightRebill.addedCharge;
+  return {
+    category: additionalCharges.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+    charges: Array.isArray(charges) ? charges : [],
+    chargesTotal: lineTotal > 0 ? lineTotal : (added != null ? added : 0),
+    freightMismatch,
+    hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+    primusVendorCost,
+    booking,
+    rateValidation,
+    customerRate: customerRateFromBooking(booking),
+    excludedInPrimusCount: excludedInPrimusCount || 0,
+    weightRebill,
   };
 }
 

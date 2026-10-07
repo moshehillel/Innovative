@@ -5,10 +5,15 @@
  *   A. Identify the reason — accessorial, weight/reweigh/inspection, or a
  *      rate increase with no reason.
  *   B. Weight/Reweigh/Inspection is identified by: a fee with W&I wording,
- *      an attached W&I certificate, or the invoice weight/class differing
- *      from what is on the Primus booking. For W&I we re-rate via Primus
- *      GET /rate with the invoice's updated weight/class and compare the
- *      returned total to the carrier invoice (default $10 tolerance).
+ *      an attached W&I certificate, or the invoice weight/class/dims
+ *      differing from the Primus booking. A whole new invoice that
+ *      replaces the quote (weight or dims changed) is the same case.
+ *      Jerry re-quotes Primus with the updated weight and dims. The
+ *      additional charge on the email is invoice total minus the Primus
+ *      quoted total, and the email says whether that new quote matches
+ *      the carrier invoice. The inspection certificate is uploaded to
+ *      Primus only when it has no prices, so it can be sent to the
+ *      customer.
  *   C. Approval email offers FIVE decisions:
  *        A — pay carrier + bill customer; auto-email the customer contact.
  *        B — pay carrier + bill customer; dispatcher notifies the customer
@@ -459,6 +464,76 @@ function filterChargesForApproval(charges, breakdown, minAmount) {
 }
 
 /**
+ * @param {*} value Raw dimension.
+ * @return {number} Positive inches, or 0.
+ */
+function readPositiveDim(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * @param {object|null} row Freight row.
+ * @param {Array<string>} keys Candidate property names.
+ * @return {number}
+ */
+function readDimFromRow(row, keys) {
+  if (!row || typeof row !== "object") return 0;
+  for (const key of keys) {
+    const n = readPositiveDim(row[key]);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
+/**
+ * @param {number} length Inches.
+ * @param {number} width Inches.
+ * @param {number} height Inches.
+ * @return {string} "40 x 48 x 30 in", or "" when a side is missing.
+ */
+function formatDims(length, width, height) {
+  const l = readPositiveDim(length);
+  const w = readPositiveDim(width);
+  const h = readPositiveDim(height);
+  if (!(l > 0) || !(w > 0) || !(h > 0)) return "";
+  const n = (v) => {
+    const rounded = Math.round(v * 10) / 10;
+    return String(rounded).replace(/\.0$/, "");
+  };
+  return `${n(l)} x ${n(w)} x ${n(h)} in`;
+}
+
+/**
+ * @param {number} lbs Weight.
+ * @return {string}
+ */
+function formatWeightLbs(lbs) {
+  const n = Number(lbs);
+  if (!(n > 0)) return "not shown";
+  const rounded = Math.round(n);
+  const withCommas = String(rounded).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${withCommas} lbs`;
+}
+
+/**
+ * Billed freight on the carrier invoice.
+ * @param {object|null} invoiceFreight Classifier freightDetails.
+ * @return {object}
+ */
+function readInvoiceFreight(invoiceFreight) {
+  const inv = invoiceFreight || {};
+  return {
+    totalWeightLbs: Number(inv.totalWeightLbs) || 0,
+    freightClass: String(inv.freightClass || "").trim(),
+    pieces: Number(inv.pieces) || 0,
+    length: readPositiveDim(inv.length),
+    width: readPositiveDim(inv.width),
+    height: readPositiveDim(inv.height),
+  };
+}
+
+/**
  * Reads billed weight/class from a Primus booking for mismatch comparison.
  * @param {object|null} booking Primus booking (GET /book/bolnumber).
  * @return {{totalWeightLbs: number, freightClass: string}}
@@ -479,6 +554,26 @@ function readBookingFreight(booking) {
 }
 
 /**
+ * Original quoted freight on the Primus booking (weight, class, dims).
+ * @param {object|null} booking Primus booking.
+ * @return {object}
+ */
+function readBookingFreightSnapshot(booking) {
+  const base = readBookingFreight(booking);
+  const info = Array.isArray(booking && booking.freightInfo) ?
+    booking.freightInfo : [];
+  const row = info[0] || {};
+  return {
+    totalWeightLbs: base.totalWeightLbs,
+    freightClass: base.freightClass,
+    pieces: info.reduce((sum, r) => sum + (Number(r && r.qty) || 0), 0),
+    length: readDimFromRow(row, ["length", "Length"]),
+    width: readDimFromRow(row, ["width", "Width"]),
+    height: readDimFromRow(row, ["height", "Height"]),
+  };
+}
+
+/**
  * Compares the freight details billed on the invoice with the Primus booking.
  * A mismatch (weight or class) indicates an unlabeled reweigh/redim charge.
  * @param {object|null} invoiceFreight {totalWeightLbs, freightClass} from AI.
@@ -486,10 +581,10 @@ function readBookingFreight(booking) {
  * @return {object} {mismatch, weightMismatch, classMismatch, details}
  */
 function detectFreightMismatch(invoiceFreight, booking) {
-  const inv = invoiceFreight || {};
-  const invWeight = Number(inv.totalWeightLbs) || 0;
-  const invClass = String(inv.freightClass || "").trim();
-  const primus = readBookingFreight(booking);
+  const inv = readInvoiceFreight(invoiceFreight);
+  const primus = readBookingFreightSnapshot(booking);
+  const invWeight = inv.totalWeightLbs;
+  const invClass = inv.freightClass;
 
   let weightMismatch = false;
   if (invWeight > 0 && primus.totalWeightLbs > 0) {
@@ -503,15 +598,28 @@ function detectFreightMismatch(invoiceFreight, booking) {
     classMismatch = true;
   }
 
+  const invoiceDims = formatDims(inv.length, inv.width, inv.height);
+  const primusDims = formatDims(primus.length, primus.width, primus.height);
+  let dimMismatch = false;
+  if (invoiceDims && primusDims) {
+    dimMismatch =
+      Math.abs(inv.length - primus.length) >= 1 ||
+      Math.abs(inv.width - primus.width) >= 1 ||
+      Math.abs(inv.height - primus.height) >= 1;
+  }
+
   return {
-    mismatch: weightMismatch || classMismatch,
+    mismatch: weightMismatch || classMismatch || dimMismatch,
     weightMismatch,
     classMismatch,
+    dimMismatch,
     details: {
       invoiceWeightLbs: invWeight || null,
       primusWeightLbs: primus.totalWeightLbs || null,
       invoiceClass: invClass || null,
       primusClass: primus.freightClass || null,
+      invoiceDims: invoiceDims || null,
+      primusDims: primusDims || null,
     },
   };
 }
@@ -525,11 +633,19 @@ function detectFreightMismatch(invoiceFreight, booking) {
  * @return {Array<object>|null} freightInfo payload, or null if unusable.
  */
 function buildRequoteFreightInfo(booking, invoiceFreight) {
-  const inv = invoiceFreight || {};
-  const invWeight = Number(inv.totalWeightLbs) || 0;
-  const invClass = String(inv.freightClass || "").trim();
+  const billed = readInvoiceFreight(invoiceFreight);
+  const invWeight = billed.totalWeightLbs;
+  const invClass = billed.freightClass;
   const rows = Array.isArray(booking && booking.freightInfo) ?
     booking.freightInfo : [];
+
+  const applyInvoiceDims = (out, idx) => {
+    if (idx !== 0) return out;
+    if (billed.length) out.length = billed.length;
+    if (billed.width) out.width = billed.width;
+    if (billed.height) out.height = billed.height;
+    return out;
+  };
 
   if (rows.length > 0) {
     return rows.map((row, idx) => {
@@ -553,17 +669,17 @@ function buildRequoteFreightInfo(booking, invoiceFreight) {
       if (row.commodity) out.commodity = String(row.commodity);
       if (row.nmfc) out.nmfc = String(row.nmfc);
       if (row.hazmat != null) out.hazmat = !!row.hazmat;
-      return out;
+      return applyInvoiceDims(out, idx);
     }).filter((r) => Number(r.weight) > 0);
   }
 
   if (invWeight <= 0) return null;
-  return [{
+  return [applyInvoiceDims({
     qty: 1,
     weight: invWeight,
     weightType: "total",
     class: invClass || 50,
-  }];
+  }, 0)];
 }
 
 /**
@@ -843,12 +959,295 @@ function listAdditionalChargeApprovalAttachments(attachments, hints) {
 }
 
 /**
+ * Additional charge when the carrier voids the quote and sends a new
+ * invoice: invoice total minus the Primus quoted carrier total.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusQuotedTotal Primus vendor.cost.
+ * @return {number|null} Dollars, or null when either side is missing.
+ */
+function computeAddedCharge(invoiceAmount, primusQuotedTotal) {
+  const invoice = coerceMoneyNumber(invoiceAmount);
+  const quoted = coerceMoneyNumber(primusQuotedTotal);
+  if (!(invoice > 0) || !(quoted > 0)) return null;
+  return Math.round((invoice - quoted) * 100) / 100;
+}
+
+/**
+ * True when a higher carrier invoice replaces the booked rate because
+ * weight, class, or dims changed, or a W&I certificate / reweigh fee
+ * is present.
+ * @param {object} opts invoiceAmount, primusAmount, freightMismatch,
+ *   hasCertificate, charges.
+ * @return {boolean}
+ */
+function isReplacementWeightInvoice(opts) {
+  const invoice = coerceMoneyNumber(opts && opts.invoiceAmount);
+  const quoted = coerceMoneyNumber(opts && opts.primusAmount);
+  if (!(invoice > 0) || !(quoted > 0)) return false;
+  if (invoice <= quoted + RATE_MATCH_TOLERANCE) return false;
+  const mm = opts.freightMismatch;
+  if (mm && mm.mismatch) return true;
+  if (opts.hasCertificate) return true;
+  const charges = Array.isArray(opts.charges) ? opts.charges : [];
+  return charges.some((c) => isWeightInspectionLabel(chargeLabel(c)));
+}
+
+/**
+ * Original quote vs the freight billed on the replacement invoice.
+ * @param {object} opts booking, invoiceFreight, invoiceAmount, primusAmount.
+ * @return {object}
+ */
+function buildWeightRebillSummary(opts) {
+  const original = readBookingFreightSnapshot(opts && opts.booking);
+  const updated = readInvoiceFreight(opts && opts.invoiceFreight);
+  const invoiceAmount = coerceMoneyNumber(opts && opts.invoiceAmount);
+  const primusAmount = coerceMoneyNumber(opts && opts.primusAmount);
+  return {
+    original,
+    updated,
+    invoiceAmount: invoiceAmount > 0 ? invoiceAmount : null,
+    primusQuotedTotal: primusAmount > 0 ? primusAmount : null,
+    addedCharge: computeAddedCharge(invoiceAmount, primusAmount),
+  };
+}
+
+/**
+ * 1-based certificate page numbers from the classifier.
+ * @param {Array<*>} pages Raw pages.
+ * @return {number[]}
+ */
+function normalizeCertificatePages(pages) {
+  const list = Array.isArray(pages) ? pages : [];
+  const out = [];
+  for (const page of list) {
+    const n = Math.trunc(Number(page));
+    if (Number.isFinite(n) && n >= 1 && !out.includes(n)) out.push(n);
+  }
+  return out;
+}
+
+/**
+ * Whether certificate text shows a price. Weights and dims alone do not.
+ * @param {string|null} text Extracted certificate text.
+ * @return {{hasPricing: boolean, hasText: boolean, reason: string|null}}
+ */
+function certificateTextHasPricing(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) {
+    return {hasPricing: false, hasText: false, reason: null};
+  }
+  if (/\$\s*\d/.test(raw)) {
+    return {hasPricing: true, hasText: true, reason: "dollar_amount"};
+  }
+  const pricingWord =
+    /\b(?:amount\s+due|balance\s+due|total\s+charges|total\s+due|freight\s+charges?|line\s*-?\s*haul|fuel\s+surcharge|invoice\s+total|additional\s+charge)\b/i;
+  if (pricingWord.test(raw) && /\d+\.\d{2}/.test(raw)) {
+    return {
+      hasPricing: true,
+      hasText: true,
+      reason: "charge_word_with_amount",
+    };
+  }
+  if (/\brate\b.{0,24}\d+\.\d{2}|\d+\.\d{2}.{0,24}\brate\b/i.test(raw)) {
+    return {hasPricing: true, hasText: true, reason: "rate_amount"};
+  }
+  return {hasPricing: false, hasText: true, reason: null};
+}
+
+/**
+ * Dispatcher-facing block for a weight/dims replacement invoice.
+ * @param {object} opts Email opts plus optional weightRebill and
+ *   certificateStatus.
+ * @return {string} HTML, or "" when this is not a weight inspection.
+ */
+function weightRebillSectionHtml(opts) {
+  if (!opts || opts.category !== CHARGE_CATEGORY.WEIGHT_INSPECTION) {
+    return "";
+  }
+  const summary = opts.weightRebill || buildWeightRebillSummary({
+    booking: null,
+    invoiceFreight: null,
+    invoiceAmount: opts.invoiceAmount,
+    primusAmount: opts.primusAmount,
+  });
+  const mm = (opts.freightMismatch && opts.freightMismatch.details) || {};
+  const original = summary.original || {};
+  const updated = summary.updated || {};
+  const originalWeight = original.totalWeightLbs || mm.primusWeightLbs || 0;
+  const updatedWeight = updated.totalWeightLbs || mm.invoiceWeightLbs || 0;
+  const originalDims = formatDims(
+      original.length, original.width, original.height) ||
+    mm.primusDims || "";
+  const updatedDims = formatDims(
+      updated.length, updated.width, updated.height) ||
+    mm.invoiceDims || "";
+  const originalClass = original.freightClass || mm.primusClass || "";
+  const updatedClass = updated.freightClass || mm.invoiceClass || "";
+  const quoted = summary.primusQuotedTotal != null ?
+    summary.primusQuotedTotal :
+    coerceMoneyNumber(opts.primusAmount);
+  const invoiceTotal = summary.invoiceAmount != null ?
+    summary.invoiceAmount :
+    coerceMoneyNumber(opts.invoiceAmount);
+  const added = summary.addedCharge != null ?
+    summary.addedCharge :
+    computeAddedCharge(invoiceTotal, quoted);
+
+  const dimsNote = (originalDims && updatedDims) ?
+    (originalDims === updatedDims ?
+      `Dims are the same as the original quote (${esc(originalDims)}).` :
+      `Dims changed from ${esc(originalDims)} on the quote to ` +
+      `${esc(updatedDims)} on the invoice.`) :
+    "";
+
+  const rate = opts.rateValidation;
+  let verdict;
+  if (rate && rate.attempted && rate.ok && rate.matched) {
+    verdict =
+      `<p style="color:#166534;background:#dcfce7;padding:10px 12px;` +
+      `border-radius:6px"><strong>Correct.</strong> Jerry re-quoted ` +
+      `Primus with the updated weight and dims` +
+      (rate.quoteNumber ?
+        ` (quote #${esc(String(rate.quoteNumber))})` : "") +
+      `. The updated Primus quote is ${money(rate.rateTotal)}. ` +
+      `Primus re-rate matches the carrier invoice ` +
+      `${money(rate.invoiceAmount)} within ` +
+      `$${esc(String(rate.tolerance))}, so the carrier is not ` +
+      `overcharging.</p>`;
+  } else if (rate && rate.attempted && rate.ok && !rate.matched) {
+    const rateTotal = Number(rate.rateTotal);
+    const inv = Number(rate.invoiceAmount);
+    const carrierHigher = Number.isFinite(rateTotal) &&
+      Number.isFinite(inv) && inv > rateTotal;
+    verdict =
+      `<p style="color:#991b1b;background:#fee2e2;padding:10px 12px;` +
+      `border-radius:6px"><strong>` +
+      (carrierHigher ? "Not correct." : "Review.") +
+      `</strong> Jerry re-quoted Primus with the updated weight and ` +
+      `dims` +
+      (rate.quoteNumber ?
+        ` (quote #${esc(String(rate.quoteNumber))})` : "") +
+      `. The updated Primus quote is ${money(rate.rateTotal)}. ` +
+      `Primus re-rate does NOT match the carrier invoice ` +
+      `${money(rate.invoiceAmount)} (difference ` +
+      `${money(rate.difference)}, tolerance ` +
+      `$${esc(String(rate.tolerance))}). ` +
+      (carrierHigher ?
+        `The carrier invoice is higher than the updated quote.` :
+        `The carrier invoice is below the updated quote.`) +
+      `</p>`;
+  } else if (rate && rate.attempted) {
+    verdict =
+      `<p style="color:#92400e;background:#fef3c7;padding:10px 12px;` +
+      `border-radius:6px"><strong>Updated quote could not be run.</strong> ` +
+      `${esc(rate.error || "Primus re-rate failed")}. The additional ` +
+      `charge above is still the invoice total minus the original Primus ` +
+      `quoted total. Review the carrier invoice manually.</p>`;
+  } else {
+    verdict =
+      `<p style="color:#92400e;background:#fef3c7;padding:10px 12px;` +
+      `border-radius:6px">An updated Primus quote for the new weight and ` +
+      `dims was not attached to this email. Review the carrier invoice ` +
+      `manually.</p>`;
+  }
+
+  const cert = opts.certificateStatus || null;
+  const present = cert ? !!cert.present : !!opts.hasCertificate;
+  let certHtml;
+  if (!present) {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> not included with ` +
+      `this invoice.</p>`;
+  } else if (cert && cert.uploaded) {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> it was uploaded to ` +
+      `Primus. The certificate does not have prices on it, so it can be ` +
+      `sent to the customer` +
+      (cert.customerVisible === false ?
+        `. The Primus file type is not marked customer-visible — ` +
+        `confirm it will go out with the customer documents` : "") +
+      `.</p>`;
+  } else if (cert && cert.withheldReason === "pricing") {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> it was not uploaded ` +
+      `due to pricing on it. Do not send that certificate to the ` +
+      `customer.</p>`;
+  } else if (cert && cert.withheldReason === "unverified_pricing") {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> it was not uploaded. ` +
+      `Prices could not be ruled out on the certificate, so it must not ` +
+      `be sent to the customer until someone confirms it has no ` +
+      `prices.</p>`;
+  } else if (cert && cert.withheldReason === "could_not_separate") {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> the carrier included ` +
+      `one, but it was not uploaded because it could not be separated ` +
+      `from the priced invoice. Do not send the invoice to the ` +
+      `customer as the certificate.</p>`;
+  } else if (cert && cert.withheldReason === "no_file_type") {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> it has no prices, ` +
+      `but it was not uploaded because Primus has no inspection-` +
+      `certificate file type.</p>`;
+  } else if (cert && cert.uploaded === false) {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> it was not uploaded` +
+      (cert.detail ? ` (${esc(cert.detail)})` : "") +
+      `.</p>`;
+  } else {
+    certHtml =
+      `<p><strong>Inspection certificate:</strong> included with the ` +
+      `invoice.</p>`;
+  }
+
+  const line = (label, value) =>
+    `<tr><td style="padding:3px 12px 3px 0;font-weight:600">` +
+    `${esc(label)}</td><td>${value}</td></tr>`;
+
+  return `<div style="border:1px solid #e5e7eb;border-radius:8px;` +
+    `padding:12px 14px;margin:14px 0">` +
+    `<p style="margin:0 0 8px"><strong>Weight / inspection — new ` +
+    `carrier invoice</strong></p>` +
+    `<p style="margin:0 0 8px">The original rate is void. The carrier ` +
+    `sent a new invoice for the updated weight and dims. ` +
+    `<strong>Additional charge</strong> is the invoice total minus the ` +
+    `Primus quoted total: <strong>` +
+    (added == null ? "—" : money(added)) +
+    `</strong>` +
+    (quoted > 0 ?
+      ` (${money(invoiceTotal)} − ${money(quoted)})` : "") +
+    `.</p>` +
+    `<table style="border-collapse:collapse;font-size:14px;margin:8px 0">` +
+    line("Original quote weight", esc(formatWeightLbs(originalWeight))) +
+    (originalClass ?
+      line("Original class", esc(String(originalClass))) : "") +
+    line("Original dims", esc(originalDims || "not shown")) +
+    line("Original quoted price", quoted > 0 ? money(quoted) : "—") +
+    line("Updated weight", esc(formatWeightLbs(updatedWeight))) +
+    (updatedClass ? line("Updated class", esc(String(updatedClass))) : "") +
+    line("Updated dims", esc(updatedDims || "not shown")) +
+    line("Carrier invoice total", invoiceTotal > 0 ?
+      money(invoiceTotal) : "—") +
+    line("Additional charge", added == null ? "—" : money(added)) +
+    `</table>` +
+    (dimsNote ? `<p style="margin:8px 0">${dimsNote}</p>` : "") +
+    verdict +
+    certHtml +
+    `<p style="margin:8px 0 0">Dispatcher: advise the customer of the ` +
+    `original quote, the updated weight and dims, and this additional ` +
+    `charge, then enter the updated rate (option B).</p>` +
+    `</div>`;
+}
+
+/**
  * Builds the 5-option approval email for Sarah + the dispatcher.
  * @param {object} opts baseUrl, invoiceId, tenantId, loadNumber, carrierName,
  *   customerName, invoiceAmount, primusAmount, charges, chargesTotal,
  *   category, freightMismatch, hasCertificate, dispatcherName,
  *   rateValidation (optional W&I re-rate result), customerRate,
- *   excludedInPrimusCount (optional — charges already on file).
+ *   excludedInPrimusCount (optional — charges already on file),
+ *   weightRebill (original vs updated freight), certificateStatus
+ *   (uploaded, or withheld because the certificate has prices).
  * @return {{subject: string, html: string}}
  */
 function buildAdditionalChargeApprovalEmail(opts) {
@@ -860,6 +1259,13 @@ function buildAdditionalChargeApprovalEmail(opts) {
     excludedInPrimusCount,
     actionUrl: actionUrlFn,
   } = opts;
+  const weightInspection =
+    category === CHARGE_CATEGORY.WEIGHT_INSPECTION;
+  const addedCharge = weightInspection ?
+    ((opts.weightRebill && opts.weightRebill.addedCharge != null) ?
+      opts.weightRebill.addedCharge :
+      computeAddedCharge(invoiceAmount, primusAmount)) :
+    null;
 
   const emailTokens = require("./email-action-tokens");
   const actionUrl = typeof actionUrlFn === "function" ?
@@ -885,7 +1291,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
 
   const mm = freightMismatch || {};
   const mmDetails = mm.details || {};
-  const mismatchHtml = mm.mismatch ?
+  const mismatchHtml = mm.mismatch && !weightInspection ?
     `<p style="color:#b45309"><strong>Freight mismatch vs Primus:</strong> ` +
     (mm.weightMismatch ?
       `invoice weight ${esc(String(mmDetails.invoiceWeightLbs))} lbs vs ` +
@@ -896,7 +1302,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `</p>` : "";
 
   let rateHtml = "";
-  if (rateValidation && rateValidation.attempted) {
+  if (!weightInspection && rateValidation && rateValidation.attempted) {
     if (rateValidation.ok && rateValidation.matched) {
       rateHtml =
         `<p style="color:#166534;background:#dcfce7;padding:10px 12px;` +
@@ -956,13 +1362,16 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Customer rate (Primus)", formatCustomerRate(customerRate)) +
     row("Carrier invoice", money(invoiceAmount)) +
     row("Amount on file (Primus)", money(primusAmount)) +
-    row("Additional charges", money(chargesTotal)) +
+    row(weightInspection ? "Additional charge" : "Additional charges",
+        weightInspection && addedCharge != null ?
+          money(addedCharge) : money(chargesTotal)) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
       row("W&I certificate", "Attached / referenced on invoice") : "") +
     (dispatcherName ? row("Dispatcher", esc(dispatcherName)) : "") +
     `</table>` +
     accessorialConfirmHtml +
+    weightRebillSectionHtml(opts) +
     mismatchHtml +
     rateHtml +
     `<p><strong>Charges:</strong></p>` +
@@ -1568,9 +1977,19 @@ module.exports = {
   partitionChargesByPrimus,
   filterChargesForApproval,
   detectFreightMismatch,
+  readInvoiceFreight,
+  readBookingFreightSnapshot,
+  formatDims,
+  formatWeightLbs,
   buildRequoteFreightInfo,
   buildRateQueryFromBooking,
   evaluateRequoteMatch,
+  computeAddedCharge,
+  isReplacementWeightInvoice,
+  buildWeightRebillSummary,
+  normalizeCertificatePages,
+  certificateTextHasPricing,
+  weightRebillSectionHtml,
   classifyAdditionalChargeReason,
   validateLumperAmount,
   LUMPER_BASE_TOLERANCE,

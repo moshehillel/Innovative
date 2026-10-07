@@ -17,6 +17,8 @@
  *     "carrier bill"); customer must NOT see this type in portal
  *   PRIMUS_UI_POD_TYPE_NAME — match name in getFileTypes (default "pod")
  *   PRIMUS_UI_FILETYPE_QUOTE_APPROVAL — override Quote Approval type id
+ *   PRIMUS_UI_FILETYPE_INSPECTION_CERT — override inspection certificate
+ *     type id (customer-visible; used for price-free W&I certificates)
  *   PRIMUS_UI_QUOTE_APPROVAL_TYPE_NAME — match name in getFileTypes
  *   PRIMUS_UI_UPLOAD_FILE_FIELD — multipart file field name (default file)
  *   PRIMUS_UI_SESSION_TTL_HOURS — PHPSESSID cache lifetime (default 24)
@@ -678,7 +680,51 @@ async function resolveUploadFileTypes() {
       "customer quote approval",
     ]) || null);
 
-  return {carrierBill: carrier, pod, quoteApproval};
+  const envInspection = process.env.PRIMUS_UI_FILETYPE_INSPECTION_CERT;
+  const inspectionCert = envInspection ?
+    {
+      id: String(envInspection),
+      name: "Inspection certificate (env)",
+      external: "1",
+    } :
+    matchInspectionCertFileType(types);
+
+  return {carrierBill: carrier, pod, quoteApproval, inspectionCert};
+}
+
+/**
+ * Customer-visible weight & inspection certificate file type, when Primus
+ * has one. Prefers external=1 so the document can be sent to the customer.
+ * @param {Array<object>} types File type rows.
+ * @return {{id: string, name: string, external: string}|null}
+ */
+function matchInspectionCertFileType(types) {
+  const patterns = [
+    "weight & inspection",
+    "weight and inspection",
+    "inspection certificate",
+    "weight inspection",
+    "weight certificate",
+    "reweigh certificate",
+    "inspection cert",
+  ];
+  const hits = [];
+  for (const t of (Array.isArray(types) ? types : [])) {
+    const name = String(
+        t.name || t.description || t.typeName || t.fileTypeName || "",
+    ).trim();
+    const id = t.id != null ? t.id :
+      (t.fileTypeId != null ? t.fileTypeId : t.type);
+    if (id == null || !name) continue;
+    const lower = name.toLowerCase();
+    if (!patterns.some((p) => lower.includes(p))) continue;
+    hits.push({
+      id: String(id),
+      name,
+      external: String(t.external != null ? t.external : ""),
+    });
+  }
+  return hits.find((h) => h.external === "1") || hits[0] || null;
 }
 exports.resolveUploadFileTypes = resolveUploadFileTypes;
 
@@ -796,6 +842,52 @@ async function uploadDriveFile(args) {
   };
 }
 exports.uploadDriveFile = uploadDriveFile;
+
+/**
+ * Uploads a price-free inspection certificate so it can be sent to the
+ * customer. Refuses bytes that are the carrier invoice itself.
+ * @param {object} args booking, loadNumber, file {buffer, filename},
+ *   forbiddenBuffer.
+ * @return {Promise<object>}
+ */
+async function uploadInspectionCertificate(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "Primus document upload is not enabled"};
+  }
+  const types = await resolveUploadFileTypes();
+  if (!types.inspectionCert) {
+    return {
+      ok: false,
+      error: "No inspection certificate file type in Primus",
+    };
+  }
+  const bookingId = resolveManageBookingId(args.booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  const loadNumber = String(args.loadNumber || "");
+  let docData = null;
+  if (loadNumber) {
+    const docs = await getBookingDocuments({
+      bookingId,
+      bookingBOL: loadNumber,
+    });
+    if (docs.ok) docData = docs.data;
+  }
+  const result = await maybeUploadBookingPdf({
+    docData,
+    bookingId,
+    bookingBOL: loadNumber || bookingId,
+    fileType: types.inspectionCert.id,
+    fileTypeName: types.inspectionCert.name,
+    file: args.file,
+    forbiddenBuffer: args.forbiddenBuffer,
+  });
+  result.customerVisible = types.inspectionCert.external === "1";
+  result.fileTypeName = types.inspectionCert.name;
+  return result;
+}
+exports.uploadInspectionCertificate = uploadInspectionCertificate;
 
 /**
  * @param {Buffer|Uint8Array|null} a

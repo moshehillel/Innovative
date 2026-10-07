@@ -93,6 +93,53 @@ const noMatch = ac.evaluateRequoteMatch({
 });
 check("rate mismatch over $10", noMatch.matched, false);
 
+const quotedBooking = {
+  totalWeight: 3200,
+  freightInfo: [{qty: 1, weight: 3200, class: "70", length: 40, width: 48,
+    height: 30}],
+};
+const updatedFreight = {
+  totalWeightLbs: 4372, freightClass: "70", pieces: 1,
+  length: 40, width: 48, height: 30,
+};
+const rebillFreight = ac.buildRequoteFreightInfo(quotedBooking, updatedFreight);
+check("requote keeps updated weight", rebillFreight[0].weight, 4372);
+check("requote uses invoice dims length", rebillFreight[0].length, 40);
+check("requote uses invoice dims height", rebillFreight[0].height, 30);
+const dimChange = ac.detectFreightMismatch(
+    {totalWeightLbs: 3200, freightClass: "70", length: 40, width: 48,
+      height: 40},
+    quotedBooking,
+);
+check("dim mismatch detected", dimChange.dimMismatch, true);
+check("dim mismatch is a freight mismatch", dimChange.mismatch, true);
+const sameDims = ac.detectFreightMismatch(updatedFreight, quotedBooking);
+check("weight increase is a mismatch", sameDims.weightMismatch, true);
+check("same dims are not a dim mismatch", sameDims.dimMismatch, false);
+check("added charge is invoice minus quote",
+    ac.computeAddedCharge(1500, 1100), 400);
+check("replacement invoice when weight changed",
+    ac.isReplacementWeightInvoice({
+      invoiceAmount: 1500,
+      primusAmount: 1100,
+      freightMismatch: sameDims,
+    }), true);
+check("close invoice is not a replacement rebill",
+    ac.isReplacementWeightInvoice({
+      invoiceAmount: 1105,
+      primusAmount: 1100,
+      freightMismatch: sameDims,
+    }), false);
+check("certificate dollar amount is pricing",
+    ac.certificateTextHasPricing("Inspection result $1,250.00").hasPricing,
+    true);
+check("certificate weight and dims are not pricing",
+    ac.certificateTextHasPricing(
+        "Weight 4372 lbs Class 70 Dims 40 x 48 x 30").hasPricing,
+    false);
+check("blank certificate text is not readable",
+    ac.certificateTextHasPricing("  ").hasText, false);
+
 // 3. Approval email contains all five buttons (signed confirm links)
 const email = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
@@ -118,6 +165,13 @@ const email = ac.buildAdditionalChargeApprovalEmail({
 });
 check("email shows re-rate mismatch",
     email.html.includes("does NOT match"), true);
+check("email shows additional charge formula",
+    email.html.includes("invoice total minus the Primus quoted total"),
+    true);
+check("email shows original quote weight",
+    email.html.includes("Original quote weight"), true);
+check("email says not correct when re-quote is lower",
+    email.html.includes("Not correct."), true);
 check("email shows quote number",
     email.html.includes("48025106"), true);
 check("email shows customer rate", email.html.includes("$545.00"), true);
@@ -301,6 +355,64 @@ const emailCert = ac.buildAdditionalChargeApprovalEmail({
 check("W&I label single-escaped",
     emailCert.html.includes("W&amp;I certificate") &&
     !emailCert.html.includes("W&amp;amp;I"), true);
+const emailRebill = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv265500",
+  tenantId: "innovative",
+  loadNumber: "265500",
+  carrierName: "Central Transport",
+  invoiceAmount: 1500,
+  primusAmount: 1100,
+  charges: [],
+  chargesTotal: 400,
+  category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  freightMismatch: sameDims,
+  hasCertificate: true,
+  weightRebill: ac.buildWeightRebillSummary({
+    booking: quotedBooking,
+    invoiceFreight: updatedFreight,
+    invoiceAmount: 1500,
+    primusAmount: 1100,
+  }),
+  rateValidation: {
+    attempted: true, ok: true, matched: true, tolerance: 10,
+    invoiceAmount: 1500, rateTotal: 1495, difference: 5,
+    quoteNumber: "9001",
+  },
+  certificateStatus: {
+    present: true,
+    hasPricing: true,
+    uploaded: false,
+    withheldReason: "pricing",
+  },
+});
+check("rebill email states added charge dollars",
+    emailRebill.html.includes("$400.00"), true);
+check("rebill email states original weight",
+    emailRebill.html.includes("3,200 lbs"), true);
+check("rebill email states updated weight",
+    emailRebill.html.includes("4,372 lbs"), true);
+check("rebill email says the new quote is correct",
+    emailRebill.html.includes("Correct."), true);
+check("rebill email says certificate was not uploaded for pricing",
+    emailRebill.html.includes("not uploaded") &&
+    emailRebill.html.includes("pricing on it"), true);
+const emailUploaded = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv265500",
+  loadNumber: "265500",
+  carrierName: "Central Transport",
+  invoiceAmount: 1500,
+  primusAmount: 1100,
+  charges: [],
+  chargesTotal: 400,
+  category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  hasCertificate: false,
+  certificateStatus: {present: false, uploaded: false},
+});
+check("missing certificate is stated",
+    emailUploaded.html.includes("not included"), true);
+
 check("subject matches Lisa example shape",
     emailCert.subject.includes("Approval needed - additional charge on Load") &&
     emailCert.subject.includes("266614") &&
