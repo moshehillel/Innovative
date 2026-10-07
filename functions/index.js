@@ -7237,7 +7237,7 @@ function normalizeAiChargeArrays(aiResult) {
   };
   let recognizedCharges = (Array.isArray(aiResult.recognizedCharges) ?
     aiResult.recognizedCharges : []).filter(keepCharge);
-  const unrecognizedCharges =
+  let unrecognizedCharges =
     (Array.isArray(aiResult.unrecognizedCharges) ?
       aiResult.unrecognizedCharges : []).filter(keepCharge);
   const chargesNeedProof = (Array.isArray(aiResult.chargesNeedProof) ?
@@ -7246,16 +7246,31 @@ function normalizeAiChargeArrays(aiResult) {
     aiResult.chargeProofRefs : [];
 
   // Legacy `charges[]` from Claude — promote known types into recognized.
+  // NOTIFY DETENTION (storage) must stay on the unrecognized / approval
+  // path — never bury it as "recognized" or the amount-gap email loses
+  // the storage wording ops already asked for.
   const legacyCharges = (Array.isArray(aiResult.charges) ?
     aiResult.charges : []).filter(keepCharge);
   for (const c of legacyCharges) {
     const type = String(c.type || c.label || "").toLowerCase();
+    if (additionalCharges.isNotifyDetentionStorageCharge(c)) {
+      const already = unrecognizedCharges.some((u) =>
+        String(u.type || u.label || "").toLowerCase() === type &&
+        Number(u.amount) === Number(c.amount));
+      if (!already) unrecognizedCharges.push(c);
+      continue;
+    }
     if (!/lumper|detention/.test(type)) continue;
     const already = recognizedCharges.some((r) =>
       String(r.type || "").toLowerCase() === type &&
       Number(r.amount) === Number(c.amount));
     if (!already) recognizedCharges.push(c);
   }
+
+  const rehomed = additionalCharges.rehomeNotifyDetentionToUnrecognized(
+      recognizedCharges, unrecognizedCharges);
+  recognizedCharges = rehomed.recognizedCharges;
+  unrecognizedCharges = rehomed.unrecognizedCharges;
 
   return {
     recognizedCharges,
@@ -11718,6 +11733,47 @@ async function processGmailMessage(
                       !!aiResult.hasWeightInspectionCertificate,
                   });
             } else {
+            const mismatchDifference = primusResult.amount ?
+              Math.abs(aiResult.invoiceAmount - primusResult.amount) : null;
+            // NOTIFY DETENTION / N days = storage. Prefer the additional-
+            // charge approval email (storage wording + dispatcher CC)
+            // over a bare amount-mismatch dump when that line explains
+            // the gap.
+            const storageCharges =
+              additionalCharges.collectNotifyDetentionStorageCharges(
+                  normalizedChargeData.unrecognizedCharges,
+                  normalizedChargeData.recognizedCharges,
+                  aiResult.charges);
+            const storageSummary =
+              additionalCharges.summarizeNotifyDetentionStorage(
+                  storageCharges);
+            if (storageSummary && storageSummary.amount > 0) {
+              finalStatus = "additional_charge_pending_approval";
+              const storageTotal = additionalCharges.sumCharges(
+                  storageCharges);
+              pendingAdditionalCharge = {
+                category: additionalCharges.CHARGE_CATEGORY.ACCESSORIAL,
+                charges: storageCharges,
+                chargesTotal: storageTotal,
+                freightMismatch: rebillMismatch,
+                hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+                primusVendorCost: Number(primusResult.amount) || null,
+                booking: rebillBooking,
+                rateValidation: null,
+                customerRate: customerRateFromBooking(rebillBooking),
+                excludedInPrimusCount: 0,
+              };
+              await writeLog("info", "primus",
+                  "Amount gap explained by notify detention (storage)", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    invoiceAmount: aiResult.invoiceAmount,
+                    primusAmount: primusResult.amount,
+                    storageDays: storageSummary.days,
+                    storageAmount: storageSummary.amount,
+                    difference: mismatchDifference,
+                  });
+            } else {
             finalStatus = "unmatched_amount";
             await writeLog("warn", "primus", "Primus validation failed", {
               event: "Primus validation failed",
@@ -11725,16 +11781,12 @@ async function processGmailMessage(
               details: {
                 submittedAmount: aiResult.invoiceAmount,
                 savedAmount: primusResult.amount,
-                difference: primusResult.amount ?
-                  Math.abs(aiResult.invoiceAmount - primusResult.amount) :
-                  null,
+                difference: mismatchDifference,
                 result: "MISMATCH",
                 reason: primusResult.reason || "Amount does not match Primus",
                 decision: "UNMATCHED_AMOUNT",
               },
             });
-            const mismatchDifference = primusResult.amount ?
-              Math.abs(aiResult.invoiceAmount - primusResult.amount) : null;
             // Do not email or stop before an invoice exists. The workflow
             // uploads the carrier bill and POD, then pauses. The same alert
             // goes out after that upload. Do not auto-invoice this amount.
@@ -11771,6 +11823,7 @@ async function processGmailMessage(
                   invoiceAmount: aiResult.invoiceAmount,
                   expectedAmount: primusResult.amount || null,
                 });
+            }
             }
           }
         }

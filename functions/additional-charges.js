@@ -288,6 +288,144 @@ function chargeLabel(charge) {
 }
 
 /**
+ * Full text used to detect notify-detention / storage wording on a charge.
+ * @param {object|string|null} charge Charge row or raw label.
+ * @return {string}
+ */
+function chargeStorageText(charge) {
+  if (typeof charge === "string") return String(charge || "").trim();
+  if (!charge || typeof charge !== "object") return "";
+  return [
+    charge.label,
+    charge.type,
+    charge.description,
+    charge.detail,
+    charge.days != null ? `${charge.days} days` : "",
+    charge.quantity != null && /day/i.test(String(charge.unit || "day")) ?
+      `${charge.quantity} days` : "",
+  ].filter(Boolean).join(" ").trim();
+}
+
+/**
+ * Ops rule: AAA Cooper (and similar) "NOTIFY DETENTION: N DAYS" means
+ * N days of storage - not unexplained detention jargon in emails.
+ * @param {string|object|null} labelOrCharge Raw label or charge row.
+ * @return {object|null} {isStorage, days} or null when not notify detention.
+ */
+function parseNotifyDetentionStorage(labelOrCharge) {
+  const raw = chargeStorageText(labelOrCharge);
+  if (!raw) return null;
+  if (!/notify[\s_-]*detention/i.test(raw)) return null;
+  const daysMatch = raw.match(/(\d+)\s*days?/i);
+  let days = daysMatch ? Number(daysMatch[1]) : null;
+  if (!(Number.isFinite(days) && days > 0) &&
+      labelOrCharge && typeof labelOrCharge === "object") {
+    const fromField = Number(labelOrCharge.days != null ?
+      labelOrCharge.days : labelOrCharge.quantity);
+    if (Number.isFinite(fromField) && fromField > 0) days = fromField;
+  }
+  return {
+    isStorage: true,
+    days: Number.isFinite(days) && days > 0 ? days : null,
+  };
+}
+
+/**
+ * @param {object|string|null} charge Charge row or label.
+ * @return {boolean}
+ */
+function isNotifyDetentionStorageCharge(charge) {
+  return !!parseNotifyDetentionStorage(charge);
+}
+
+/**
+ * Collects notify-detention (storage) rows from one or more charge lists.
+ * @param {...Array<object>} lists Charge arrays.
+ * @return {Array<object>} Deduped charge rows.
+ */
+function collectNotifyDetentionStorageCharges(...lists) {
+  const out = [];
+  const seen = new Set();
+  for (const list of lists) {
+    for (const c of (Array.isArray(list) ? list : [])) {
+      if (!isNotifyDetentionStorageCharge(c)) continue;
+      const key = `${chargeLabel(c).toLowerCase()}|` +
+        `${Number(c && c.amount) || 0}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(c);
+    }
+  }
+  return out;
+}
+
+/**
+ * @param {Array<object>} charges Charge rows (preferably notify-detention).
+ * @return {object|null} {days, amount, charges} or null when none found.
+ */
+function summarizeNotifyDetentionStorage(charges) {
+  const hits = collectNotifyDetentionStorageCharges(charges);
+  if (!hits.length) return null;
+  let days = null;
+  let amount = 0;
+  for (const c of hits) {
+    const parsed = parseNotifyDetentionStorage(c);
+    if (parsed && parsed.days != null && days == null) days = parsed.days;
+    amount += Number(c && c.amount) || 0;
+  }
+  return {days, amount, charges: hits};
+}
+
+/**
+ * Plain-language sentence for Lisa/Sarah/dispatcher emails.
+ * @param {object|null} summary From summarizeNotifyDetentionStorage.
+ * @return {string|null} Explanation sentence, or null.
+ */
+function formatNotifyDetentionStorageExplanation(summary) {
+  if (!summary) return null;
+  const amt = money(summary.amount);
+  if (summary.days != null) {
+    const dayWord = summary.days === 1 ? "day" : "days";
+    return `The carrier is charging ${summary.days} ${dayWord} ` +
+      `storage totaling ${amt}.`;
+  }
+  return `The carrier is charging storage totaling ${amt}.`;
+}
+
+/**
+ * Moves notify-detention (storage) rows out of recognized into
+ * unrecognized so they take the additional-charge approval path
+ * instead of a bare Primus amount-mismatch dump.
+ * @param {Array<object>} recognized Recognized charge rows.
+ * @param {Array<object>} unrecognized Unrecognized charge rows.
+ * @return {object} recognizedCharges, unrecognizedCharges, moved.
+ */
+function rehomeNotifyDetentionToUnrecognized(recognized, unrecognized) {
+  const stay = [];
+  const moved = [];
+  for (const c of (Array.isArray(recognized) ? recognized : [])) {
+    if (isNotifyDetentionStorageCharge(c)) moved.push(c);
+    else stay.push(c);
+  }
+  const unrecognizedOut = Array.isArray(unrecognized) ?
+    unrecognized.slice() : [];
+  for (const c of moved) {
+    const amt = Number(c && c.amount) || 0;
+    const key = `${chargeLabel(c).toLowerCase()}|${amt}`;
+    const already = unrecognizedOut.some((u) => {
+      const uAmt = Number(u && u.amount) || 0;
+      return `${chargeLabel(u).toLowerCase()}|${uAmt}` === key;
+    });
+    if (!already) unrecognizedOut.push(c);
+  }
+  return {
+    recognizedCharges: stay,
+    unrecognizedCharges: unrecognizedOut,
+    moved,
+  };
+}
+
+/**
  * True when a charge label reads like an accessorial / service fee.
  * @param {string} label Charge label from the invoice.
  * @return {boolean}
@@ -303,13 +441,21 @@ function isAccessorialLabel(label) {
 function displayChargeLabel(label) {
   const raw = String(label || "").trim();
   if (!raw) return "Additional charge";
+  const storage = parseNotifyDetentionStorage(raw);
+  if (storage) {
+    if (storage.days != null) {
+      const dayWord = storage.days === 1 ? "day" : "days";
+      return `${storage.days} ${dayWord} storage`;
+    }
+    return "Storage";
+  }
   const key = raw.toLowerCase()
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_|_$/g, "");
   const aliases = {
     school_delivery: "School delivery fee",
     notify_charge: "Notify charge",
-    notify_detention: "Notify detention",
+    notify_detention: "Storage",
     notify_delivery: "Notify delivery",
     notification_fee: "Notification fee",
     detention: "Detention",
@@ -817,13 +963,29 @@ function categoryLabel(category) {
 }
 
 /**
+ * @param {object} charge Charge row.
+ * @return {string} Human-readable label (storage wording when applicable).
+ */
+function displayChargeLabelForRow(charge) {
+  const storage = parseNotifyDetentionStorage(charge);
+  if (storage) {
+    if (storage.days != null) {
+      const dayWord = storage.days === 1 ? "day" : "days";
+      return `${storage.days} ${dayWord} storage`;
+    }
+    return "Storage";
+  }
+  return displayChargeLabel(chargeLabel(charge));
+}
+
+/**
  * @param {Array<object>} charges Charge rows.
  * @return {string} HTML list of charges.
  */
 function chargesHtml(charges) {
   const rows = (Array.isArray(charges) ? charges : [])
       .map((c) =>
-        `<li>${esc(displayChargeLabel(chargeLabel(c)))}: ` +
+        `<li>${esc(displayChargeLabelForRow(c))}: ` +
         `<strong>${money(c && c.amount)}</strong></li>`)
       .join("");
   return rows ? `<ul style="margin:6px 0 6px 18px;padding:0">${rows}</ul>` :
@@ -1341,6 +1503,14 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `<tr><td style="padding:4px 16px 4px 0;font-weight:600;` +
     `white-space:nowrap">${esc(label)}</td><td>${value}</td></tr>`;
 
+  const storageSummary = summarizeNotifyDetentionStorage(charges);
+  const storageExplain = formatNotifyDetentionStorageExplanation(
+      storageSummary);
+  const storageExplainHtml = storageExplain ?
+    `<p style="background:#fef3c7;border:1px solid #fcd34d;` +
+    `padding:12px 14px;border-radius:6px;margin:14px 0">` +
+    `<strong>${esc(storageExplain)}</strong></p>` : "";
+
   const accessorialConfirmHtml =
     category === CHARGE_CATEGORY.ACCESSORIAL ?
       `<p style="background:#eff6ff;border:1px solid #bfdbfe;` +
@@ -1348,13 +1518,15 @@ function buildAdditionalChargeApprovalEmail(opts) {
       `<strong>Dispatcher${dispatcherName ?
         ` (${esc(dispatcherName)})` : ""} — please confirm:</strong> ` +
       `Were the accessorial charge(s) below authorized on this load ` +
-      `(e.g. notify detention, school delivery, notify delivery)? ` +
+      `(e.g. storage / notify detention, school delivery, ` +
+      `notify delivery)? ` +
       `Reply to this thread or tell accounting before we bill the ` +
       `customer or dispute the carrier.</p>` : "";
 
   const html =
     `<p>A carrier invoice came in <strong>higher than the quoted ` +
     `amount</strong> and needs your decision.</p>` +
+    storageExplainHtml +
     `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
     row("Load #", esc(String(loadNumber || "—"))) +
     row("Carrier", esc(carrierName || "—")) +
@@ -1465,7 +1637,7 @@ function buildDisputeEmailDraft(opts) {
     }
   } else if (effectiveCategory === CHARGE_CATEGORY.ACCESSORIAL) {
     const names = (Array.isArray(charges) ? charges : [])
-        .map((c) => displayChargeLabel(chargeLabel(c)))
+        .map((c) => displayChargeLabelForRow(c))
         .filter(Boolean);
     const chargeList = names.length ?
       names.join(", ") :
@@ -1483,7 +1655,7 @@ function buildDisputeEmailDraft(opts) {
   }
 
   const chargeLines = (Array.isArray(charges) ? charges : [])
-      .map((c) => `- ${displayChargeLabel(chargeLabel(c))}: ` +
+      .map((c) => `- ${displayChargeLabelForRow(c)}: ` +
         `${money(c && c.amount)}`)
       .join("<br>");
 
@@ -1969,6 +2141,13 @@ module.exports = {
   isWeightInspectionLabel,
   isAccessorialLabel,
   displayChargeLabel,
+  displayChargeLabelForRow,
+  parseNotifyDetentionStorage,
+  isNotifyDetentionStorageCharge,
+  collectNotifyDetentionStorageCharges,
+  summarizeNotifyDetentionStorage,
+  formatNotifyDetentionStorageExplanation,
+  rehomeNotifyDetentionToUnrecognized,
   sumCharges,
   normalizeBreakdownText,
   chargeBreakdownKeywords,

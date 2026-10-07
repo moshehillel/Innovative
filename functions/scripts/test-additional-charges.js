@@ -44,6 +44,59 @@ check("school delivery + notify = accessorial (not reweigh)",
       freightMismatch: {mismatch: false},
     }), ac.CHARGE_CATEGORY.ACCESSORIAL);
 
+// Notify detention N days = storage (AAA Cooper / amount-gap emails)
+const ndParsed = ac.parseNotifyDetentionStorage("NOTIFY DETENTION: 2 DAYS");
+check("notify detention parses as storage",
+    !!(ndParsed && ndParsed.isStorage), true);
+check("notify detention parses 2 days",
+    ndParsed && ndParsed.days, 2);
+check("display notify detention as 2 days storage",
+    ac.displayChargeLabel("NOTIFY DETENTION: 2 DAYS"),
+    "2 days storage");
+check("display notify_detention alias as Storage",
+    ac.displayChargeLabel("notify_detention"), "Storage");
+const ndSummary = ac.summarizeNotifyDetentionStorage([
+  {label: "NOTIFY DETENTION: 2 DAYS", amount: 166.45},
+]);
+check("storage summary days", ndSummary && ndSummary.days, 2);
+check("storage summary amount",
+    ndSummary && Number(ndSummary.amount.toFixed(2)), 166.45);
+check("storage explanation wording",
+    ac.formatNotifyDetentionStorageExplanation(ndSummary),
+    "The carrier is charging 2 days storage totaling $166.45.");
+const rehomed = ac.rehomeNotifyDetentionToUnrecognized([
+  {label: "NOTIFY DETENTION: 2 DAYS", amount: 171.80},
+  {label: "Lumper", amount: 50},
+], [{label: "Residential", amount: 75}]);
+check("rehome moves notify detention out of recognized",
+    rehomed.recognizedCharges.length === 1 &&
+    /lumper/i.test(rehomed.recognizedCharges[0].label), true);
+check("rehome puts notify detention in unrecognized",
+    rehomed.unrecognizedCharges.some((c) =>
+      /notify/i.test(String(c.label || ""))), true);
+const emailStorage = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv268391",
+  tenantId: "innovative",
+  loadNumber: "268391",
+  carrierName: "AAA Cooper Transportation",
+  invoiceAmount: 786.05,
+  primusAmount: 619.60,
+  charges: [{label: "NOTIFY DETENTION: 2 DAYS", amount: 166.45}],
+  chargesTotal: 166.45,
+  category: ac.CHARGE_CATEGORY.ACCESSORIAL,
+  dispatcherName: "Sam Dispatcher",
+});
+check("approval email states 2 days storage totaling",
+    emailStorage.html.includes(
+        "The carrier is charging 2 days storage totaling $166.45."),
+    true);
+check("approval email charge line uses storage label",
+    emailStorage.html.includes("2 days storage") &&
+    emailStorage.html.includes("$166.45"), true);
+check("approval email still names dispatcher",
+    emailStorage.html.includes("Sam Dispatcher"), true);
+
 check("no rows = rate increase",
     ac.classifyAdditionalChargeReason({charges: []}),
     ac.CHARGE_CATEGORY.RATE_INCREASE);
