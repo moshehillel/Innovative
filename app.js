@@ -623,6 +623,15 @@
     return bits.filter(Boolean).join(" · ");
   }
 
+  function notifEmailBody(n) {
+    const text = String(n.body || "").replace(/\r\n/g, "\n").trim();
+    if (text) return text;
+    if (n.type === "additional_charge") {
+      return "Open Tasks to choose A–E for this charge.";
+    }
+    return "No email body saved.";
+  }
+
   function renderNotifications(items, opsPrimary) {
     openNotifCount = items ? items.length : 0;
     if (els.notifCountBadge) {
@@ -641,21 +650,30 @@
       const kind = notifKind(n);
       const unhandled = n.type === "unhandled_email";
       const charge = n.type === "additional_charge";
-      const detailBits = [];
-      if (n.subject && n.type !== "ops_email") {
-        detailBits.push(shortText(n.subject, 90));
-      }
-      if (charge) detailBits.push("Decide A–E in Tasks");
-      const detail = detailBits.join(" · ");
+      const sub = notifSubline(n);
+      const metaRows = [
+        n.from ? ["From", n.from] : null,
+        n.to ? ["To", n.to] : null,
+        n.cc ? ["Cc", n.cc] : null,
+        n.subject ? ["Subject", n.subject] : null,
+        n.loadNumber ? ["Load", n.loadNumber] : null,
+        n.carrierName ? ["Carrier", n.carrierName] : null,
+      ].filter(Boolean);
       return `<article class="notif-card tone-${kind.tone}" data-notif-id="${bodyEsc(n.id)}" data-notif-type="${bodyEsc(n.type || "")}">
-        <div class="notif-main">
-          <div class="notif-top">
-            <span class="notif-kind kind-${kind.tone}">${bodyEsc(kind.label)}</span>
-            <time class="notif-when">${bodyEsc(formatLogTime(n.createdAt))}</time>
-          </div>
-          <h3 class="notif-title">${bodyEsc(notifHeadline(n))}</h3>
-          <p class="notif-sub">${bodyEsc(notifSubline(n))}</p>
-          ${detail ? `<p class="notif-detail">${bodyEsc(detail)}</p>` : ""}
+        <button type="button" class="notif-row" aria-expanded="false">
+          <span class="notif-kind kind-${kind.tone}">${bodyEsc(kind.label)}</span>
+          <span class="notif-title">${bodyEsc(notifHeadline(n))}</span>
+          <span class="notif-sub">${bodyEsc(sub)}</span>
+          <time class="notif-when">${bodyEsc(formatLogTime(n.createdAt))}</time>
+          <span class="notif-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="notif-expand" hidden>
+          <dl class="notif-meta-grid">
+            ${metaRows.map(([k, v]) =>
+              `<div><dt>${bodyEsc(k)}</dt><dd>${bodyEsc(v)}</dd></div>`
+            ).join("")}
+          </dl>
+          <pre class="notif-body">${bodyEsc(notifEmailBody(n))}</pre>
           <div class="task-actions">
             <button type="button" class="btn btn-outline btn-sm notif-dismiss">Done</button>
             <button type="button" class="btn btn-ghost btn-sm notif-flag">Flag</button>
@@ -692,12 +710,26 @@
   }
 
   function bindNotificationActions() {
+    els.notificationsContainer.querySelectorAll(".notif-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        const card = row.closest(".notif-card");
+        const panel = card.querySelector(".notif-expand");
+        const open = card.classList.toggle("is-open");
+        panel.hidden = !open;
+        row.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+    });
+
     els.notificationsContainer.querySelectorAll(".notif-goto-tasks").forEach((btn) => {
-      btn.addEventListener("click", () => switchTab("tasks"));
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        switchTab("tasks");
+      });
     });
 
     els.notificationsContainer.querySelectorAll(".notif-dismiss").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
         const card = btn.closest(".notif-card");
         setButtonBusy(btn, true, "...");
         try {
@@ -712,7 +744,8 @@
     });
 
     els.notificationsContainer.querySelectorAll(".notif-flag").forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
         const card = btn.closest(".notif-card");
         const form = card.querySelector(".flag-form");
         form.hidden = false;
@@ -720,7 +753,7 @@
           `<label>What went wrong?</label>` +
           `<textarea class="flag-note" rows="2" required placeholder="Short note..."></textarea>` +
           `<div class="task-actions">` +
-          `<button type="button" class="btn btn-sm flag-submit">Send to Moshe</button>` +
+          `<button type="button" class="btn btn-sm flag-submit">Send for review</button>` +
           `<button type="button" class="btn btn-ghost btn-sm flag-cancel">Cancel</button>` +
           `</div>`;
         form.querySelector(".flag-cancel").onclick = () => {
@@ -736,7 +769,7 @@
               id: card.dataset.notifId,
               note,
             });
-            showRunResult("Flagged — Moshe was emailed.", false);
+            showRunResult("Sent for review.", false);
             card.remove();
             afterNotifRemoved();
           } catch (error) {
@@ -748,7 +781,8 @@
     });
 
     els.notificationsContainer.querySelectorAll(".notif-reply").forEach((btn) => {
-      btn.addEventListener("click", () => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
         const card = btn.closest(".notif-card");
         const form = card.querySelector(".reply-form");
         form.hidden = false;
@@ -784,7 +818,8 @@
     });
 
     els.notificationsContainer.querySelectorAll(".notif-delete").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
         if (!confirm("Trash the original email?")) return;
         const card = btn.closest(".notif-card");
         setButtonBusy(btn, true, "Deleting...");
