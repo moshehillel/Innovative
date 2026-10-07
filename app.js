@@ -331,20 +331,32 @@
     }
 
     els.tasksContainer.innerHTML = tasks.map((task) => {
-      const meta = [
-        task.loadNumber ? `Load ${bodyEsc(task.loadNumber)}` : "",
-        task.carrierName ? bodyEsc(shortText(task.carrierName, 28)) : "",
-        task.chargesTotal ? formatMoney(task.chargesTotal) : "",
-        formatLogTime(task.createdAt),
+      const subBits = [
+        task.loadNumber ? `Load ${task.loadNumber}` : "",
+        task.carrierName ? shortText(task.carrierName, 28) : "",
+        task.chargesTotal != null && task.chargesTotal !== "" ?
+          formatMoney(task.chargesTotal) : "",
       ].filter(Boolean).join(" · ");
-      const title = shortText(task.title || "Task", 80);
+      const title = shortText(task.title || "Task", 100);
+      const desc = String(task.description || "").trim();
       return `<article class="task-card" data-id="${bodyEsc(task.id)}" data-source="${bodyEsc(task.source || "dashboardTasks")}">
-        <div class="task-main">
-          <div class="task-title-row">
-            <h3 class="task-title">${bodyEsc(title)}</h3>
-            <span class="task-type-pill">${bodyEsc(taskTypeLabel(task.type))}</span>
-          </div>
-          ${meta ? `<p class="task-meta">${meta}</p>` : ""}
+        <button type="button" class="task-row" aria-expanded="false">
+          <span class="task-title">${bodyEsc(title)}</span>
+          <span class="task-sub">${bodyEsc(subBits)}</span>
+          <time class="task-when">${bodyEsc(formatLogTime(task.createdAt))}</time>
+          <span class="task-chevron" aria-hidden="true"></span>
+        </button>
+        <div class="task-expand" hidden>
+          ${desc ? `<p class="task-desc">${bodyEsc(desc)}</p>` : ""}
+          ${task.loadNumber || task.carrierName || task.chargesTotal != null ? `
+            <dl class="task-detail-grid">
+              ${task.loadNumber ? `<div><dt>Load</dt><dd>${bodyEsc(task.loadNumber)}</dd></div>` : ""}
+              ${task.carrierName ? `<div><dt>Carrier</dt><dd>${bodyEsc(task.carrierName)}</dd></div>` : ""}
+              ${task.chargesTotal != null && task.chargesTotal !== "" ?
+                `<div><dt>Amount</dt><dd>${bodyEsc(formatMoney(task.chargesTotal))}</dd></div>` : ""}
+              ${task.type ? `<div><dt>Type</dt><dd>${bodyEsc(taskTypeLabel(task.type))}</dd></div>` : ""}
+            </dl>
+          ` : ""}
           ${renderChargeButtons(task)}
           <div class="task-actions">
             <button type="button" class="btn btn-outline btn-sm task-dismiss-btn">Done</button>
@@ -357,10 +369,33 @@
   }
 
   function bindTaskActions() {
+    els.tasksContainer.querySelectorAll(".task-row").forEach((row) => {
+      row.addEventListener("click", () => {
+        const card = row.closest(".task-card");
+        const opening = !card.classList.contains("is-open");
+        els.tasksContainer.querySelectorAll(".task-card.is-open").forEach((other) => {
+          if (other === card) return;
+          other.classList.remove("is-open");
+          const otherPanel = other.querySelector(".task-expand");
+          const otherRow = other.querySelector(".task-row");
+          if (otherPanel) otherPanel.hidden = true;
+          if (otherRow) otherRow.setAttribute("aria-expanded", "false");
+        });
+        const panel = card.querySelector(".task-expand");
+        card.classList.toggle("is-open", opening);
+        panel.hidden = !opening;
+        row.setAttribute("aria-expanded", opening ? "true" : "false");
+        if (opening) {
+          card.scrollIntoView({behavior: "smooth", block: "nearest"});
+        }
+      });
+    });
+
     els.tasksContainer.querySelectorAll(".task-dismiss-btn").forEach((btn) => {
-      btn.addEventListener("click", async () => {
+      btn.addEventListener("click", async (e) => {
+        e.stopPropagation();
         const card = btn.closest(".task-card");
-        setButtonBusy(btn, true, "Dismissing…");
+        setButtonBusy(btn, true, "Dismissing...");
         try {
           await postJson("/dismissDashboardTask", {
             taskId: card.dataset.id,
@@ -383,7 +418,10 @@
     });
 
     els.tasksContainer.querySelectorAll(".charge-opt").forEach((btn) => {
-      btn.addEventListener("click", () => openChargeForm(btn));
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openChargeForm(btn);
+      });
     });
   }
 
