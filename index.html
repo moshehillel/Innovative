@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Innovative Carriers — Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-brand">
+      <h1 id="dashboardTitle">Dashboard</h1>
+      <div class="topbar-meta">
+        <span id="tmsBadge" class="tms-badge tms-primus" hidden>TMS</span>
+        <span id="tenantLabel" class="tenant-label" hidden></span>
+      </div>
+    </div>
+    <div class="gmail-status">
+      <span id="gmailStatusBadge" class="badge badge-unknown">Checking…</span>
+      <span id="connectedMailboxLabel" class="connected-mailbox" hidden></span>
+      <button id="disconnectGmailBtn" class="btn btn-danger" hidden>Disconnect</button>
+      <button id="connectGmailBtn" class="btn">Connect Outlook</button>
+    </div>
+  </header>
+
+  <main id="dashboardMain">
+    <p id="runResultBanner" class="run-result-banner" hidden></p>
+    <p id="taiHintBanner" class="info-banner" hidden>
+      TAI workflow: carrier invoices are matched to shipments via the TAI webhook
+      index. Make sure <code>ShipmentCreateUrl</code> and
+      <code>ShipmentDetailUpdateUrl</code> point at your
+      <code>taiWebhook</code> endpoint.
+    </p>
+
+    <div class="range-switch" role="tablist" aria-label="Time range">
+      <button class="range-btn" data-range="day">Day</button>
+      <button class="range-btn is-active" data-range="week">Week</button>
+      <button class="range-btn" data-range="month">Month</button>
+      <button class="range-btn" data-range="year">Year</button>
+    </div>
+
+    <section class="cards">
+      <article class="card">
+        <p class="card-label">Invoices processed</p>
+        <p class="card-value is-thinking" id="statInvoices">thinking</p>
+      </article>
+      <article class="card">
+        <p class="card-label">Workflows completed</p>
+        <p class="card-value is-thinking" id="statWorkflows">thinking</p>
+      </article>
+      <article class="card">
+        <p class="card-label">With added charges</p>
+        <p class="card-value is-thinking" id="statAddedCharges">thinking</p>
+      </article>
+      <article class="card">
+        <p class="card-label">Emails replied</p>
+        <p class="card-value is-thinking" id="statReplied">thinking</p>
+      </article>
+      <article class="card">
+        <p class="card-label">Emails forwarded for review</p>
+        <p class="card-value is-thinking" id="statForwarded">thinking</p>
+      </article>
+    </section>
+
+    <section class="chart-section">
+      <canvas id="statsChart" height="120"></canvas>
+    </section>
+
+    <p id="errorBanner" class="error-banner" hidden></p>
+
+    <section class="panel-section log-export-section">
+      <div class="panel-header">
+        <h2 class="panel-title">Activity logs</h2>
+      </div>
+      <div class="log-export-row">
+        <label class="log-export-label" for="logExportDate">Day (Eastern)</label>
+        <input type="date" id="logExportDate" class="log-export-date" />
+        <button id="exportLogsCsvBtn" class="btn btn-outline btn-sm">
+          Export CSV
+        </button>
+      </div>
+      <p class="log-export-hint">
+        Download all Jerry logs for the selected calendar day (one day at a time).
+      </p>
+    </section>
+
+    <section class="panel-section">
+      <div class="panel-header">
+        <h2 class="panel-title">Recent Invoices</h2>
+        <button id="refreshInvoicesBtn" class="btn btn-outline btn-sm">Refresh</button>
+      </div>
+      <div id="invoicesContainer" class="panel-container">
+        <p class="panel-empty">thinking</p>
+      </div>
+      <div id="invoicesLoadMoreWrap" class="load-more-wrap" hidden>
+        <button type="button" id="loadMoreInvoicesBtn" class="btn btn-outline btn-sm">
+          Load more
+        </button>
+      </div>
+    </section>
+
+    <section class="panel-section">
+      <div class="panel-header">
+        <h2 class="panel-title">Open Tasks</h2>
+        <span id="taskCountBadge" class="task-count-badge">0 open</span>
+      </div>
+      <div id="tasksContainer" class="tasks-container">
+        <p class="panel-empty">thinking</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="supportChatRoot" class="support-chat-root">
+    <section id="supportChatPanel" class="support-chat-panel" hidden aria-label="Support chat">
+      <header class="support-chat-header">
+        <div class="support-chat-header-content">
+        <button type="button" id="supportChatHeaderToggle" class="jerry-avatar-btn"
+          aria-label="Close Jerry chat">
+          <img src="assets/jerry-robot-signature.png" alt="Jerry" class="jerry-avatar">
+        </button>
+          <div>
+            <p class="support-chat-title">Ask Jerry</p>
+            <p class="support-chat-subtitle">Ask about loads, invoices, or the dashboard</p>
+          </div>
+        </div>
+      </header>
+      <div id="supportChatLog" class="support-chat-log" role="log" aria-live="polite"></div>
+      <form id="supportChatForm" class="support-chat-form">
+        <textarea id="supportChatInput" class="support-chat-input" rows="1" placeholder="Describe the issue you're seeing…" aria-label="Message"></textarea>
+        <button type="submit" class="support-chat-send" aria-label="Send message">&#10148;</button>
+      </form>
+    </section>
+
+    <button id="supportChatToggle" class="support-chat-toggle" type="button"
+      aria-label="Chat with Jerry" aria-expanded="false">
+      <img src="assets/jerry-robot-signature.png" alt="" class="support-chat-fab-img">
+      <span class="support-chat-tooltip">Hi, I am Jerry — how can I help?</span>
+    </button>
+  </div>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
