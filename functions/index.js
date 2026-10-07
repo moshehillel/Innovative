@@ -36,6 +36,7 @@ const deliveredUninvoicedReport = require("./delivered-uninvoiced-report");
 const additionalCharges = require("./additional-charges");
 const intakeProfitGate = require("./intake-profit-gate");
 const intakeAmountMismatchGate = require("./intake-amount-mismatch-gate");
+const carrierRateMissingAlert = require("./carrier-rate-missing-alert");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
 const xpoImaging = require("./xpo-imaging");
@@ -4422,6 +4423,7 @@ function encodeMimeBase64(buf) {
  */
 function buildReviewForwardMime({
   to,
+  cc,
   subject,
   html,
   originalRawBuffer,
@@ -4430,28 +4432,35 @@ function buildReviewForwardMime({
   const boundary = `review_${crypto.randomBytes(16).toString("hex")}`;
   const safeFilename = String(originalFilename || "original.eml")
       .replace(/[\r\n"]/g, "_");
+  const safeTo = String(to || "").replace(/[\r\n]/g, "");
+  const safeCc = String(cc || "").replace(/[\r\n]/g, "");
 
   const htmlB64 = encodeMimeBase64(Buffer.from(String(html || ""), "utf8"));
 
   const lines = [
-    `To: ${to}\r\n`,
-    `Subject: ${subject}\r\n`,
-    `MIME-Version: 1.0\r\n`,
-    `Content-Type: multipart/mixed; boundary="${boundary}"\r\n`,
-    `\r\n`,
-    `--${boundary}\r\n`,
-    `Content-Type: text/html; charset="UTF-8"\r\n`,
-    `Content-Transfer-Encoding: base64\r\n`,
-    `\r\n`,
-    `${htmlB64}\r\n`,
-    `--${boundary}\r\n`,
-    `Content-Type: message/rfc822\r\n`,
-    `Content-Disposition: attachment; filename="${safeFilename}"\r\n`,
-    `Content-Transfer-Encoding: base64\r\n`,
-    `\r\n`,
-    `${encodeMimeBase64(originalRawBuffer)}\r\n`,
-    `--${boundary}--`,
+    `To: ${safeTo}\r\n`,
   ];
+  if (safeCc) {
+    lines.push(`Cc: ${safeCc}\r\n`);
+  }
+  lines.push(
+      `Subject: ${subject}\r\n`,
+      `MIME-Version: 1.0\r\n`,
+      `Content-Type: multipart/mixed; boundary="${boundary}"\r\n`,
+      `\r\n`,
+      `--${boundary}\r\n`,
+      `Content-Type: text/html; charset="UTF-8"\r\n`,
+      `Content-Transfer-Encoding: base64\r\n`,
+      `\r\n`,
+      `${htmlB64}\r\n`,
+      `--${boundary}\r\n`,
+      `Content-Type: message/rfc822\r\n`,
+      `Content-Disposition: attachment; filename="${safeFilename}"\r\n`,
+      `Content-Transfer-Encoding: base64\r\n`,
+      `\r\n`,
+      `${encodeMimeBase64(originalRawBuffer)}\r\n`,
+      `--${boundary}--`,
+  );
   return Buffer.from(lines.join(""));
 }
 
@@ -4467,6 +4476,7 @@ function buildReviewForwardMime({
  * @param {string} options.department - Routes to a department inbox.
  * @param {object} options.extractedData - Extracted invoice data to render.
  * @param {string} options.emailBody - Original email body to include.
+ * @param {string} [options.cc] Optional CC (e.g. load dispatcher).
  * @return {Promise<void>}
  */
 async function forwardToHumanReview(
@@ -4475,6 +4485,7 @@ async function forwardToHumanReview(
     department = "general",
     extractedData = null,
     emailBody = null,
+    cc = null,
   } = options;
 
   const departmentEmail =
@@ -4610,11 +4621,13 @@ async function forwardToHumanReview(
   const safeReason = String(reason || "").replace(/[\r\n]/g, " ");
   const safeSubject = String(subject || "").replace(/[\r\n]/g, " ");
   const forwardSubject = `[ACTION REQUIRED] ${safeReason} — ${safeSubject}`;
+  const safeCc = String(cc || "").replace(/[\r\n]/g, "");
 
   let mimeBuffer;
   if (originalRawBuffer) {
     mimeBuffer = buildReviewForwardMime({
       to: departmentEmail,
+      cc: safeCc || undefined,
       subject: forwardSubject,
       html,
       originalRawBuffer,
@@ -4624,6 +4637,7 @@ async function forwardToHumanReview(
     const htmlB64 = encodeMimeBase64(Buffer.from(String(html || ""), "utf8"));
     mimeBuffer = Buffer.from(
         `To: ${departmentEmail}\r\n` +
+        (safeCc ? `Cc: ${safeCc}\r\n` : "") +
         `Subject: ${forwardSubject}\r\n` +
         `MIME-Version: 1.0\r\n` +
         `Content-Type: text/html; charset="UTF-8"\r\n` +
@@ -4639,6 +4653,7 @@ async function forwardToHumanReview(
     messageId,
     reason,
     reviewEmail: departmentEmail,
+    cc: safeCc || null,
     department,
     originalAttached: Boolean(originalRawBuffer),
   });
@@ -11775,6 +11790,8 @@ async function processGmailMessage(
                   });
             } else {
             finalStatus = "unmatched_amount";
+            const missingCarrierRate =
+              carrierRateMissingAlert.isMissingCarrierCostResult(primusResult);
             await writeLog("warn", "primus", "Primus validation failed", {
               event: "Primus validation failed",
               messageId: messageId,
@@ -11782,46 +11799,64 @@ async function processGmailMessage(
                 submittedAmount: aiResult.invoiceAmount,
                 savedAmount: primusResult.amount,
                 difference: mismatchDifference,
-                result: "MISMATCH",
-                reason: primusResult.reason || "Amount does not match Primus",
+                result: missingCarrierRate ?
+                  "MISSING_CARRIER_RATE" : "MISMATCH",
+                reason: missingCarrierRate ?
+                  (primusResult.error || "No carrier cost on Primus record") :
+                  (primusResult.reason || "Amount does not match Primus"),
                 decision: "UNMATCHED_AMOUNT",
               },
             });
             // Do not email or stop before an invoice exists. The workflow
             // uploads the carrier bill and POD, then pauses. The same alert
             // goes out after that upload. Do not auto-invoice this amount.
-            deferredAmountMismatch = {
-              kind: "primus",
-              reason: "Invoice amount does not match the shipment rate",
-              notes: `The carrier invoiced $${aiResult.invoiceAmount} ` +
-                `but the amount on file does not match. ` +
-                (primusResult.amount ?
-                  `Expected: $${primusResult.amount}. ` : "") +
-                `Please verify the correct amount and update the shipment.`,
-              options: {
-                department: "billing",
-                extractedData: {
-                  "Carrier": aiResult.carrierName || "—",
-                  "Load Number": aiResult.loadNumber || "—",
-                  "Invoice Amount": `$${aiResult.invoiceAmount}`,
-                  "Expected Amount": primusResult.amount ?
-                    `$${primusResult.amount}` : "—",
-                  "Difference": mismatchDifference != null ?
-                    `$${mismatchDifference.toFixed(2)}` : "—",
+            if (missingCarrierRate) {
+              deferredAmountMismatch =
+                carrierRateMissingAlert.buildMissingCarrierRateAlert({
+                  loadNumber: aiResult.loadNumber,
+                  carrierName: aiResult.carrierName,
+                  invoiceAmount: aiResult.invoiceAmount,
+                  emailBody,
+                });
+              deferredAmountMismatch.submittedAmount = primusValidationAmount;
+            } else {
+              deferredAmountMismatch = {
+                kind: "primus",
+                reason: "Invoice amount does not match the shipment rate",
+                notes: `The carrier invoiced $${aiResult.invoiceAmount} ` +
+                  `but the amount on file does not match. ` +
+                  (primusResult.amount ?
+                    `Expected: $${primusResult.amount}. ` : "") +
+                  `Please verify the correct amount and update the shipment.`,
+                options: {
+                  department: "billing",
+                  extractedData: {
+                    "Carrier": aiResult.carrierName || "—",
+                    "Load Number": aiResult.loadNumber || "—",
+                    "Invoice Amount": `$${aiResult.invoiceAmount}`,
+                    "Expected Amount": primusResult.amount ?
+                      `$${primusResult.amount}` : "—",
+                    "Difference": mismatchDifference != null ?
+                      `$${mismatchDifference.toFixed(2)}` : "—",
+                  },
+                  emailBody,
                 },
-                emailBody,
-              },
-              submittedAmount: primusValidationAmount,
-              expectedAmount: primusResult.amount || null,
-              difference: mismatchDifference,
-              loadNumber: aiResult.loadNumber,
-            };
+                submittedAmount: primusValidationAmount,
+                expectedAmount: primusResult.amount || null,
+                difference: mismatchDifference,
+                loadNumber: aiResult.loadNumber,
+              };
+            }
             await writeLog("info", "workflow",
-                "Amount mismatch — uploading paperwork before the alert", {
+                missingCarrierRate ?
+                  "Carrier rate missing — uploading paperwork " +
+                  "before the alert" :
+                  "Amount mismatch — uploading paperwork before the alert", {
                   messageId,
                   loadNumber: aiResult.loadNumber,
                   invoiceAmount: aiResult.invoiceAmount,
                   expectedAmount: primusResult.amount || null,
+                  kind: deferredAmountMismatch.kind,
                 });
             }
             }
@@ -12264,18 +12299,41 @@ async function processGmailMessage(
             isMismatch: true,
             workflowStatus: workflowHoldStatus,
           })) {
+        let mismatchToSend = deferredAmountMismatch;
+        if (mismatchToSend.kind === "missing_carrier_rate") {
+          let dispatcherEmail = null;
+          try {
+            const bridge = require("./primus-ui-bridge");
+            const dispatcher = await bridge.resolveDispatcherEmail({
+              loadNumber: mismatchToSend.loadNumber,
+              fetchBooking: fetchPrimusBooking,
+            });
+            if (dispatcher.ok && dispatcher.email) {
+              dispatcherEmail = dispatcher.email;
+            }
+          } catch (_) {
+            dispatcherEmail = null;
+          }
+          mismatchToSend =
+            carrierRateMissingAlert.applyDispatcherCcToDeferredAlert(
+                mismatchToSend, dispatcherEmail);
+        }
         await forwardToHumanReview(
             gmail, messageId, subject, from,
-            deferredAmountMismatch.reason,
-            deferredAmountMismatch.notes,
-            deferredAmountMismatch.options,
+            mismatchToSend.reason,
+            mismatchToSend.notes,
+            mismatchToSend.options,
         );
         await writeLog("info", "email",
-            "Amount-mismatch email sent after Primus paperwork upload", {
+            mismatchToSend.kind === "missing_carrier_rate" ?
+              "Carrier-rate-missing email sent after paperwork upload" :
+              "Amount-mismatch email sent after Primus paperwork upload", {
               messageId,
-              loadNumber: deferredAmountMismatch.loadNumber,
+              loadNumber: mismatchToSend.loadNumber,
               workflowStatus: workflowHoldStatus,
-              kind: deferredAmountMismatch.kind,
+              kind: mismatchToSend.kind,
+              cc: (mismatchToSend.options &&
+                mismatchToSend.options.cc) || null,
             });
       }
 
