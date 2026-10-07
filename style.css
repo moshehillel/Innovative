@@ -24,6 +24,8 @@
   --radius-sm: 10px;
   --font: "Instrument Sans", system-ui, sans-serif;
   --display: "Source Serif 4", Georgia, serif;
+  --page-pad: clamp(1rem, 2vw, 1.75rem);
+  --page-max: 100%;
 }
 
 * {
@@ -61,7 +63,10 @@ body {
   justify-content: space-between;
   align-items: flex-end;
   gap: 1.25rem;
-  padding: 1.5rem clamp(1.25rem, 4vw, 2.5rem) 1.25rem;
+  width: 100%;
+  max-width: var(--page-max);
+  margin: 0 auto;
+  padding: 1.25rem var(--page-pad) 1rem;
   border-bottom: 1px solid transparent;
   animation: fade-down 0.45s ease both;
 }
@@ -234,13 +239,43 @@ body {
 
 /* ——— Shell ——— */
 .shell {
-  max-width: 1040px;
+  width: 100%;
+  max-width: var(--page-max);
   margin: 0 auto;
-  padding: 1.25rem clamp(1.25rem, 4vw, 2.5rem) 6rem;
+  padding: 1rem var(--page-pad) 5rem;
   display: flex;
   flex-direction: column;
-  gap: 1.25rem;
+  gap: 1rem;
   animation: fade-up 0.5s ease 0.05s both;
+}
+
+@media (min-width: 1100px) {
+  .shell {
+    display: grid;
+    grid-template-columns: minmax(280px, 0.95fr) minmax(0, 1.55fr);
+    grid-template-areas:
+      "banners banners"
+      "overview ops";
+    align-items: start;
+    gap: 1rem 1.25rem;
+  }
+
+  .shell > .run-result-banner,
+  .shell > .error-banner,
+  .shell > .info-banner {
+    grid-area: banners;
+  }
+
+  .shell > .overview {
+    grid-area: overview;
+    position: sticky;
+    top: 0.75rem;
+  }
+
+  .shell > .ops-console {
+    grid-area: ops;
+    min-width: 0;
+  }
 }
 
 .run-result-banner,
