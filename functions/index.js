@@ -52,6 +52,8 @@ const {
 const drayageIntake = require("./drayage-intake");
 const invoiceLoadEntry = require("./invoice-load-entry");
 const dashboardTasks = require("./dashboard-tasks");
+const dashboardOps = require("./dashboard-ops");
+const dashboardOpsHttp = require("./dashboard-ops-http");
 const mailProvider = require("./mail-provider");
 const emailBranding = require("./email-branding");
 const mailIntakeQueue = require("./mail-intake-queue");
@@ -4735,20 +4737,50 @@ async function forwardToHumanReview(
 
   const raw = mimeBuffer.toString("base64url");
 
-  await gmail.users.messages.send({userId: "me", requestBody: {raw}});
-  await writeLog("info", "mail", "Forwarded to human review", {
-    messageId,
-    reason,
-    reviewEmail: departmentEmail,
-    department,
-    originalAttached: Boolean(originalRawBuffer),
-  });
-
   const loadHint = extractedData && (
     extractedData.loadNumber || extractedData["Load #"] ||
     extractedData.load);
+  const tenantId = (currentTenant() && currentTenant().tenantId) || "default";
+  const opsPrimary = dashboardOps.isDashboardOpsPrimary();
+  const bodyPreview = emailBody ?
+    String(emailBody).slice(0, 4000) : (notes || null);
+
+  await dashboardOps.createNotification(db, {
+    tenantId,
+    type: dashboardOps.NOTIF_TYPE.UNHANDLED_EMAIL,
+    title: `[Review] ${safeReason}`,
+    body: bodyPreview,
+    subject: safeSubject,
+    from,
+    to: departmentEmail,
+    messageId,
+    loadNumber: loadHint ? String(loadHint) : null,
+    department,
+    reason: safeReason,
+    emailType: "human_review",
+    emailSent: !opsPrimary,
+  });
+
+  if (!opsPrimary) {
+    await gmail.users.messages.send({userId: "me", requestBody: {raw}});
+    await writeLog("info", "mail", "Forwarded to human review", {
+      messageId,
+      reason,
+      reviewEmail: departmentEmail,
+      department,
+      originalAttached: Boolean(originalRawBuffer),
+    });
+  } else {
+    await writeLog("info", "mail",
+        "Unhandled email parked on dashboard (DASHBOARD_OPS_PRIMARY)", {
+          messageId,
+          reason,
+          department,
+        });
+  }
+
   await dashboardTasks.createDashboardTask(db, {
-    tenantId: (currentTenant() && currentTenant().tenantId) || "default",
+    tenantId,
     type: dashboardTasks.TASK_TYPE.HUMAN_REVIEW,
     title: `[Review] ${safeReason}`,
     description: notes || null,
@@ -5324,7 +5356,37 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         });
   }
 
-  await saveOutboundEmail(emailPayload);
+  await dashboardOps.createNotification(db, {
+    tenantId: tenant.tenantId,
+    type: dashboardOps.NOTIF_TYPE.ADDITIONAL_CHARGE,
+    title: `Additional charge — Load ${aiResult.loadNumber || "—"}`,
+    body: `Category: ${pending.category || "—"}. ` +
+      `Charges total: $${Number(pending.chargesTotal || 0).toFixed(2)}. ` +
+      `Choose A–E in the dashboard Tasks tab.`,
+    subject: email.subject,
+    to: approver,
+    cc: dispatcherEmail || additionalCharges.LISA_EMAIL,
+    invoiceId,
+    followUpId,
+    loadNumber: aiResult.loadNumber || null,
+    carrierName: aiResult.carrierName || null,
+    emailType: "additional_charge_approval",
+    chargesTotal: pending.chargesTotal,
+    chargeOptions: ["a", "b", "c", "d", "e"],
+    emailSent: !dashboardOps.isDashboardOpsPrimary(),
+  });
+
+  if (!dashboardOps.isDashboardOpsPrimary()) {
+    await saveOutboundEmail(emailPayload);
+  } else {
+    await writeLog("info", "email",
+        "Additional-charge approval parked on dashboard " +
+        "(DASHBOARD_OPS_PRIMARY)", {
+          invoiceId,
+          followUpId,
+          loadNumber: aiResult.loadNumber,
+        });
+  }
 
   await writeLog("info", "email",
       "Additional-charge approval email sent (A/B/C/D/E)", {
@@ -5957,7 +6019,39 @@ async function saveOutboundEmail(email) {
     deleteAt: getDeleteAt(7),
   });
 
-  if (to) {
+  const isCustomerBill = email.type === "generated_bill";
+  const isSystemErr = isSystemErrorOutboundEmail(email);
+  const isDashboardMeta = email.type === "dashboard_flag" ||
+    email.type === "dashboard_reply";
+  const parkOpsOnDashboard = dashboardOps.isDashboardOpsPrimary() &&
+    !isCustomerBill && !isSystemErr && !isDashboardMeta;
+
+  // additional_charge_approval already creates a richer notification upstream.
+  if (!isCustomerBill && !isDashboardMeta &&
+      email.type !== "additional_charge_approval") {
+    const plainBody = String(htmlToSend || "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 4000);
+    await dashboardOps.createNotification(db, {
+      tenantId: tenant.tenantId || "default",
+      type: dashboardOps.NOTIF_TYPE.OPS_EMAIL,
+      title: toOutboundEmailSafeSubject(email.subject || "Ops notification"),
+      body: plainBody || null,
+      subject: email.subject || null,
+      to,
+      cc,
+      invoiceId: email.invoiceId || null,
+      loadNumber: email.loadNumber || null,
+      emailType: email.type || null,
+      emailSent: !parkOpsOnDashboard,
+    }).catch((err) => {
+      console.error("saveOutboundEmail notification:", err.message);
+    });
+  }
+
+  if (to && !parkOpsOnDashboard) {
     try {
       await sendViaGmail(
           to,
@@ -5976,6 +6070,13 @@ async function saveOutboundEmail(email) {
       await emailRef.update({sendResult});
     } catch (updErr) {
       console.error("saveOutboundEmail sendResult update:", updErr.message);
+    }
+  } else if (parkOpsOnDashboard) {
+    sendResult = {ok: true, parked: true};
+    try {
+      await emailRef.update({sendResult, parkedOnDashboard: true});
+    } catch (updErr) {
+      console.error("saveOutboundEmail park update:", updErr.message);
     }
   } else {
     console.warn("saveOutboundEmail: no recipient, email not sent", {
@@ -12359,6 +12460,121 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
     });
   }
 });
+
+/**
+ * Trashes a Gmail message for the tenant mailbox (dashboard delete action).
+ * @param {object} tenant Tenant.
+ * @param {string} messageId Gmail message id.
+ * @return {Promise<void>}
+ */
+async function trashGmailMessage(tenant, messageId) {
+  const gmail = await mailProvider.getTenantMailClient(tenant);
+  if (!gmail) {
+    throw new Error("Mailbox not connected.");
+  }
+  await gmail.users.messages.trash({userId: "me", id: String(messageId)});
+}
+
+/**
+ * Applies an A–E additional-charge decision from the dashboard by signing a
+ * short-lived action token and reusing handleAdditionalChargeAction.
+ * @param {object} opts tenant, invoiceId, option, customerChargeAmount?,
+ *   customerBillLines?.
+ * @return {Promise<object>}
+ */
+async function applyAdditionalChargeFromDashboard(opts) {
+  const emailActionTokens = require("./email-action-tokens");
+  const invoiceId = String(opts.invoiceId);
+  const option = String(opts.option).toLowerCase();
+  const tenantId = opts.tenant.tenantId;
+  const exp = Date.now() + (60 * 60 * 1000);
+  const sig = emailActionTokens.sign(
+      "additionalCharge", invoiceId, option, tenantId, exp);
+
+  const body = {
+    invoiceId,
+    option,
+    tenantId,
+    exp: String(exp),
+    sig,
+  };
+  if (option === "a" || option === "e") {
+    body.customerChargeAmount = opts.customerChargeAmount;
+  }
+  if (option === "b") {
+    const lines = Array.isArray(opts.customerBillLines) ?
+      opts.customerBillLines : [];
+    // Form parser expects JSON string or structured fields.
+    body.customerBillLinesJson = JSON.stringify(lines.map((line) => ({
+      name: line.description || line.name || "ACCESSORIAL",
+      amount: Number(line.amount) || 0,
+    })));
+  }
+
+  let statusCode = 200;
+  let sentBody = "";
+  const fakeReq = {
+    method: "POST",
+    query: {},
+    body,
+    get: () => undefined,
+  };
+  const fakeRes = {
+    status(code) {
+      statusCode = code;
+      return this;
+    },
+    send(payload) {
+      sentBody = String(payload || "");
+      return this;
+    },
+    json(payload) {
+      sentBody = JSON.stringify(payload || {});
+      return this;
+    },
+  };
+
+  await handleAdditionalChargeAction(fakeReq, fakeRes);
+  if (statusCode >= 400) {
+    const plain = sentBody.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    return {
+      ok: false,
+      status: statusCode,
+      error: plain.slice(0, 300) || "Charge decision failed.",
+    };
+  }
+  const message = sentBody.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ")
+      .trim().slice(0, 240);
+  return {ok: true, message};
+}
+
+dashboardOpsHttp.init({
+  db,
+  tcol,
+  applyDashboardCors,
+  resolveDashboardTenant,
+  resolveSystemErrorEmail,
+  escapeHtml,
+  saveOutboundEmail,
+  applyAdditionalChargeFromDashboard,
+  dashboardTasks,
+  additionalCharges,
+  trashGmailMessage,
+});
+
+exports.getDashboardNotifications = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
+exports.dismissDashboardNotification = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleDismissNotification);
+exports.flagDashboardNotification = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleFlagNotification);
+exports.dashboardAdditionalChargeDecision = onRequest(
+    {invoker: "public", timeoutSeconds: 300, memory: "512MiB"},
+    dashboardOpsHttp.handleAdditionalChargeDecision);
+exports.replyDashboardEmail = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleReplyUnhandledEmail);
+exports.deleteDashboardEmail = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleDeleteUnhandledEmail);
 
 /**
  * Recipients for support-chat issue reports
