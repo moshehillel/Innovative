@@ -3148,7 +3148,8 @@ async function handleAdditionalChargeAction(req, res) {
     // Options a/b/c/e — the charge is approved for the carrier side.
     const billCustomer = option === "a" || option === "b" || option === "e";
 
-    // A/E: approver enters customer charge amount; bump sell rate by that amount.
+    // A/E: approver enters customer charge amount; bump sell rate
+    // by that amount.
     // B: approver itemizes accessorials on the confirm page.
     let rateBumpNote = "";
     const approvalUpdate = {
@@ -5874,7 +5875,8 @@ async function supplementStatementInvoiceExtraction(
     if (!chunkBuf) continue;
 
     const chunkAtt = {
-      filename: `${primaryAtt.filename || "statement.pdf"}-p${start}-${end}.pdf`,
+      filename:
+        `${primaryAtt.filename || "statement.pdf"}-p${start}-${end}.pdf`,
       mimeType: "application/pdf",
       buffer: chunkBuf,
       docType: "INVOICE",
@@ -5951,7 +5953,7 @@ async function recoverStatementInvoiceItems(opts) {
     pageCount: gap.pageCount,
   });
 
-  let recovered = await supplementStatementInvoiceExtraction(
+  const recovered = await supplementStatementInvoiceExtraction(
       pdfAttachments, invoiceItems, gap, lastKnownLoadNumber);
   gap = statementInvoiceBundle.analyzeStatementExtractionGap({
     indexLoadNumbers,
@@ -9174,7 +9176,8 @@ async function processGmailMessage(
             emailClassification,
           })) {
           await handlePaymentInquiryEmail({
-            gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+            gmail, messageId, subject, from, emailBody, emailHtml,
+            tenant, headers,
             emailClassification,
             queueDocId,
             reason: "Payment inquiry email with no attachments",
@@ -9184,7 +9187,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
             subject, from, emailBody)) {
           await handleCustomerPaymentRemittanceEmail({
-            gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+            gmail, messageId, subject, from, emailBody, emailHtml,
+            tenant, headers,
             emailClassification,
             queueDocId,
             reason: "Customer payment remittance with no attachments",
@@ -9654,7 +9658,8 @@ async function processGmailMessage(
             !statementInvoiceBundle.looksLikeStatementCoverInvoicePacketEmail(
                 subject, from, emailBody, attachments)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+            gmail, messageId, subject, from, emailBody, emailHtml,
+            tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -9665,7 +9670,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
             subject, from, emailBody, attachments, invoicePdfCount)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+            gmail, messageId, subject, from, emailBody, emailHtml,
+            tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -9738,7 +9744,8 @@ async function processGmailMessage(
             invoicePdfCount,
           })) {
           await handlePaymentInquiryEmail({
-            gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+            gmail, messageId, subject, from, emailBody, emailHtml,
+            tenant, headers,
             emailClassification,
             queueDocId,
             reason: noInvoiceReason,
@@ -9748,7 +9755,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
             subject, from, emailBody)) {
           await handleCustomerPaymentRemittanceEmail({
-            gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+            gmail, messageId, subject, from, emailBody, emailHtml,
+            tenant, headers,
             emailClassification,
             queueDocId,
             reason: noInvoiceReason,
@@ -9835,11 +9843,13 @@ async function processGmailMessage(
       if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
           subject, from, emailBody)) {
         await handleCustomerPaymentRemittanceEmail({
-          gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
+          gmail, messageId, subject, from, emailBody, emailHtml,
+          tenant, headers,
           emailClassification,
           queueDocId,
           reason:
-            "Customer payment remittance — attachments are not carrier invoices",
+            "Customer payment remittance — attachments are not " +
+            "carrier invoices",
         });
         return;
       }
