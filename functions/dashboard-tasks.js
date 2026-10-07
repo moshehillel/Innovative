@@ -1,6 +1,7 @@
 /**
- * Dashboard task list — tracks items that need Lisa / ops attention
- * (human-review forwards, additional charges, signed POD requests, etc.).
+ * Dashboard task list — items Lisa must act on
+ * (additional charges, signed POD requests, POD discrepancies, etc.).
+ * Unhandled "Jerry doesn't understand" emails are notifications only.
  */
 
 "use strict";
@@ -100,7 +101,9 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       .limit(limit)
       .get();
 
-  const tasks = taskSnap.docs.map(serializeTaskDoc);
+  // Drop legacy human_review rows — those belong in Notifications.
+  const tasks = taskSnap.docs.map(serializeTaskDoc)
+      .filter((t) => t.type !== TASK_TYPE.HUMAN_REVIEW);
   const linkedFollowUpIds = new Set(
       tasks.map((t) => t.followUpId).filter(Boolean),
   );

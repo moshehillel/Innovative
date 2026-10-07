@@ -4779,16 +4779,8 @@ async function forwardToHumanReview(
         });
   }
 
-  await dashboardTasks.createDashboardTask(db, {
-    tenantId,
-    type: dashboardTasks.TASK_TYPE.HUMAN_REVIEW,
-    title: `[Review] ${safeReason}`,
-    description: notes || null,
-    loadNumber: loadHint ? String(loadHint) : null,
-    messageId,
-    department,
-    reason: safeReason,
-  });
+  // Unhandled / "Jerry doesn't understand" emails are notifications only.
+  // Tasks are reserved for Lisa action items (charges, POD review, etc.).
 }
 
 /**
