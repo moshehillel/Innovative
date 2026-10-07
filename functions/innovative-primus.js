@@ -2291,6 +2291,28 @@ exports.processPrimusWorkflow = onRequest(
           });
         }
 
+        // Option B: customer must be notified before the invoice is sent.
+        if (invoice.additionalCharge &&
+            invoice.additionalCharge.awaitingCustomerNotify) {
+          await logWorkflowStep({
+            invoiceId,
+            stepName: "awaiting_customer_notify",
+            stepStatus: "skipped",
+            reason: "Option B: awaiting dispatcher customer-notify confirm",
+          });
+          await invoiceDoc.ref.update({
+            processingLock: false,
+            finalWorkflowStatus: "awaiting_customer_notify",
+            workflowPausedAtStep: "awaiting_customer_notify",
+            workflowPausedAt: admin.firestore.FieldValue.serverTimestamp(),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+          return res.json({
+            ok: false,
+            error: "AWAITING_CUSTOMER_NOTIFY",
+          });
+        }
+
         if (
           Array.isArray(invoice.unrecognizedCharges) &&
       invoice.unrecognizedCharges.length > 0

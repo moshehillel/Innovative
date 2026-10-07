@@ -307,7 +307,66 @@ const okA = ac.parseCustomerChargeAmountFromRequest({
 });
 check("option A amount parses", okA.ok && okA.amount === 125.5, true);
 
-// 3c. Option B dispatcher ready template
+// 3c. Option B markup / flat customer charge math
+const liftgatePct = ac.computeCustomerChargeAmount({
+  carrierAmount: 100, markupPct: 20,
+});
+check("20% markup on $100 → $120",
+    liftgatePct.ok && liftgatePct.amount === 120, true);
+const detentionPct = ac.computeCustomerChargeAmount({
+  carrierAmount: 150, markupPct: 10,
+});
+check("10% markup on $150 → $165",
+    detentionPct.ok && detentionPct.amount === 165, true);
+const lumperFlat = ac.computeCustomerChargeAmount({
+  carrierAmount: 200, flatAmount: 250, markupPct: 50,
+});
+check("flat $250 wins over markup",
+    lumperFlat.ok && lumperFlat.amount === 250 &&
+    lumperFlat.pricingMode === "flat", true);
+const badPctNoCarrier = ac.computeCustomerChargeAmount({
+  carrierAmount: 0, markupPct: 20,
+});
+check("markup without carrier cost fails", badPctNoCarrier.ok, false);
+const normalized = ac.normalizeCustomerBillLines([
+  {name: "Liftgate", carrierAmount: 100, markupPct: 20},
+  {name: "Detention", carrierAmount: 150, markupPct: 10},
+  {name: "Lumper", carrierAmount: 200, flatAmount: 250},
+]);
+check("normalize Option B mixed lines ok", normalized.ok, true);
+check("normalize Option B total 120+165+250",
+    normalized.ok && normalized.total === 535, true);
+const parsedBill = ac.parseCustomerBillLinesFromRequest({
+  customerBillLinesJson: JSON.stringify([
+    {name: "Liftgate", carrierAmount: 100, markupPct: 20},
+  ]),
+});
+check("parse Option B markup lines",
+    parsedBill.ok && parsedBill.lines[0].amount === 120, true);
+
+// 3c2. Option B form seeds carrier costs
+const optionBPage = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option B",
+  description: "test",
+  baseUrl: "https://x.example.com",
+  actionPath: "additionalChargeAction",
+  baseCustomerRate: 500,
+  carrierCharges: [
+    {label: "Liftgate", amount: 100},
+    {label: "Detention", amount: 150},
+  ],
+  fields: {invoiceId: "inv1", option: "b"},
+});
+check("Option B form shows carrier cost label",
+    optionBPage.includes("Carrier cost:"), true);
+check("Option B form has percent markup mode",
+    optionBPage.includes("Percent markup"), true);
+check("Option B form has flat amount mode",
+    optionBPage.includes("Flat customer amount"), true);
+check("Option B form seeds liftgate carrier amount",
+    optionBPage.includes("\"carrierAmount\":100"), true);
+
+// 3c3. Option B dispatcher ready template + finalize button
 const reminder = ac.buildDispatcherNotifyReminderEmail({
   dispatcherName: "Sam",
   loadNumber: "264172",
@@ -316,7 +375,13 @@ const reminder = ac.buildDispatcherNotifyReminderEmail({
   charges: [{label: "Reweigh Fee", amount: 120}],
   chargesTotal: 120,
   customerRate: 545,
-  customerBillLines: [{name: "Reweigh Fee", amount: 120}],
+  customerBillLines: [{
+    name: "Reweigh Fee", amount: 120, carrierAmount: 100,
+    pricingMode: "markup", markupPct: 20,
+  }],
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv123",
+  tenantId: "innovative",
 });
 check("dispatcher reminder has ready template",
     reminder.html.includes("Ready-to-send customer email"), true);
@@ -325,6 +390,15 @@ check("dispatcher reminder has updated rate",
 check("dispatcher reminder subject ASCII",
     !reminder.subject.includes("\u2014") &&
     reminder.subject.includes(" - "), true);
+check("dispatcher reminder has finalize button",
+    reminder.html.includes("Customer notified") &&
+    reminder.html.includes("complete invoice") &&
+    reminder.html.includes("finalizeAdditionalChargeInvoice"), true);
+check("dispatcher reminder finalize is signed",
+    reminder.html.includes("sig=") && reminder.html.includes("exp="), true);
+check("dispatcher reminder says invoice paused until notify",
+    reminder.html.includes("before") &&
+    reminder.html.includes("customer invoice"), true);
 const forward = ac.buildDispatcherCustomerNotifyTemplate({
   loadNumber: "264172",
   customerName: "Miworld",

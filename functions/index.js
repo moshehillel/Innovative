@@ -3007,6 +3007,9 @@ async function runAdditionalChargeDecisionBackground(args) {
 
   const billCustomer = option === "a" || option === "b" || option === "e";
   let rateBumpNote = "";
+  // Option B pauses invoice send until the dispatcher confirms the
+  // customer was notified (see finalizeAdditionalChargeInvoice).
+  const optionBPausesForNotify = option === "b";
   const approvalUpdate = {
     "additionalCharge.decision": decision,
     "additionalCharge.approved": true,
@@ -3021,11 +3024,18 @@ async function runAdditionalChargeDecisionBackground(args) {
     "chargesNeedProof": [],
     "decisionStage": "additional_charge_approved",
     "decisionReason": `Additional charge approved (option ${decision})`,
-    "finalWorkflowStatus": "created",
-    "workflowPausedAtStep": null,
-    "workflowPausedAt": null,
+    "finalWorkflowStatus": optionBPausesForNotify ?
+      "awaiting_customer_notify" : "created",
+    "workflowPausedAtStep": optionBPausesForNotify ?
+      "awaiting_customer_notify" : null,
+    "workflowPausedAt": optionBPausesForNotify ?
+      admin.firestore.FieldValue.serverTimestamp() : null,
     "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
   };
+  if (optionBPausesForNotify) {
+    approvalUpdate["additionalCharge.awaitingCustomerNotify"] = true;
+    approvalUpdate["additionalCharge.customerNotifiedAt"] = null;
+  }
 
   if ((option === "a" || option === "e") &&
       optionACustomerChargeAmount > 0) {
@@ -3167,6 +3177,9 @@ async function runAdditionalChargeDecisionBackground(args) {
         customerRate: await resolveCurrentCustomerRate(invoice, booking),
         customerBillLines:
           approvalUpdate["additionalCharge.customerBillLines"] || [],
+        baseUrl: emailActionTokens.publicFunctionsBaseUrl(),
+        invoiceId: String(invoiceId),
+        tenantId: tenant.tenantId,
       });
       const podFollowup = require("./pod-followup");
       const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
@@ -3182,13 +3195,25 @@ async function runAdditionalChargeDecisionBackground(args) {
         reminderPayload.to = dispatcher.email;
         if (approver) reminderPayload.cc = approver;
         extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
-          `to notify the customer.`;
+          `to notify the customer before the invoice is sent.`;
       } else {
         extraNote += " Could not resolve the dispatcher email — the " +
-          "reminder went to the ops mailbox instead.";
+          "reminder went to the ops mailbox instead. Invoice paused " +
+          "until customer notify is confirmed.";
       }
       await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc(
           additionalCharges.applyAdditionalChargeEmailCc(reminderPayload)));
+      extraNote += " Customer invoice paused until the dispatcher " +
+        "confirms the customer was notified.";
+    } else {
+      // Primus already reconciled — clear the Option B notify pause.
+      await invoiceRef.update({
+        "additionalCharge.awaitingCustomerNotify": false,
+        "finalWorkflowStatus": "created",
+        "workflowPausedAtStep": null,
+        "workflowPausedAt": null,
+        "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+      });
     }
 
     await additionalCharges.updateFollowUp(db, {
@@ -3209,8 +3234,10 @@ async function runAdditionalChargeDecisionBackground(args) {
     });
   }
 
+  // Option B with dispatcher notify: do not resume until finalize click.
+  const resumeNow = option !== "b" || skipDispatcherNotify;
   const workflowUrl = workflowUrlForTenant(tenant);
-  if (workflowUrl) {
+  if (resumeNow && workflowUrl) {
     fetch(workflowUrl, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
@@ -3223,11 +3250,14 @@ async function runAdditionalChargeDecisionBackground(args) {
   }
 
   await writeLog("info", "workflow",
-      "Additional charge approved — workflow resumed", {
+      resumeNow ?
+        "Additional charge approved — workflow resumed" :
+        "Additional charge approved — paused for customer notify", {
         invoiceId,
         loadNumber: invoice.loadNumber,
         decision,
         billCustomer,
+        awaitingCustomerNotify: !resumeNow,
       });
 }
 
@@ -13289,6 +13319,19 @@ function invoiceDashboardStatus(data) {
       displayLabel: "Awaiting extra-charge approval",
       displayReason: data.decisionReason ||
         "Additional charge awaiting A/B/C/D decision.",
+      remapWorkflow: false};
+  }
+  const awaitingCustomerNotify =
+    wf === "awaiting_customer_notify" ||
+    (data.additionalCharge &&
+      data.additionalCharge.awaitingCustomerNotify) ||
+    String(data.workflowPausedAtStep || "") === "awaiting_customer_notify";
+  if (awaitingCustomerNotify) {
+    return {matchStatus: match,
+      displayStatus: "awaiting_customer_notify",
+      displayLabel: "Awaiting customer notify (Option B)",
+      displayReason: data.decisionReason ||
+        "Dispatcher must notify the customer, then complete the invoice.",
       remapWorkflow: false};
   }
   const staleEmailGate =

@@ -163,7 +163,7 @@ function buildEmailActionProcessingPage(opts) {
 }
 
 /**
- * Option B confirm page — itemized customer accessorial billing.
+ * Option B confirm page — accessorials with % markup or flat customer charge.
  * @param {object} opts Form options.
  * @return {string}
  */
@@ -185,7 +185,9 @@ function buildOptionBAccessorialConfirmPage(opts) {
     amount: "",
     carrierAmount: Number(charge && charge.amount) || 0,
   }));
-  if (!seedRows.length) seedRows.push({name: "", amount: "", carrierAmount: 0});
+  if (!seedRows.length) {
+    seedRows.push({name: "", amount: "", carrierAmount: 0});
+  }
   const seedJson = JSON.stringify(seedRows)
       .replace(/</g, "\\u003c")
       .replace(/-->/g, "--\\u003e");
@@ -194,24 +196,34 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `<strong>Base customer rate (unchanged):</strong> ` +
     `$${baseRate.toFixed(2)}</p>` :
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `The base customer freight rate will stay as-is. Enter each ` +
-    `accessorial and the amount to bill the customer below.</p>`;
+    `The base customer freight rate will stay as-is. For each ` +
+    `accessorial, enter a percent markup or a flat customer charge.</p>`;
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${esc(opts.title || "Confirm option B")}</title>` +
     `<style>` +
-    `.bill-row{display:grid;grid-template-columns:1fr 140px 32px;gap:8px;` +
-    `align-items:start;margin-bottom:10px}` +
-    `.bill-row input{width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
-    `border-radius:8px;font-size:16px;box-sizing:border-box}` +
-    `.bill-hint{font-size:12px;color:#6b7280;margin-top:4px}` +
+    `.bill-row{border:1px solid #e5e7eb;border-radius:10px;padding:12px;` +
+    `margin-bottom:12px;background:#fafafa}` +
+    `.bill-row-top{display:grid;grid-template-columns:1fr 32px;gap:8px;` +
+    `align-items:start;margin-bottom:8px}` +
+    `.bill-row input,.bill-row select{width:100%;padding:10px 12px;` +
+    `border:1px solid #d1d5db;border-radius:8px;font-size:16px;` +
+    `box-sizing:border-box;background:#fff}` +
+    `.bill-meta{font-size:13px;color:#374151;margin:0 0 8px}` +
+    `.bill-meta strong{color:#111827}` +
+    `.bill-price{display:grid;grid-template-columns:140px 1fr;gap:8px;` +
+    `align-items:end}` +
+    `.bill-preview{font-size:13px;color:#0f766e;margin-top:8px;` +
+    `font-weight:600}` +
+    `.field-label{font-size:12px;color:#6b7280;margin:0 0 4px;` +
+    `display:block}` +
     `.add-btn{background:#fff;color:#0d9488;border:1px solid #0d9488;` +
     `padding:8px 12px;border-radius:8px;font-size:14px;cursor:pointer}` +
     `.remove-btn{background:#fff;color:#dc2626;border:1px solid #fecaca;` +
     `border-radius:8px;width:32px;height:42px;cursor:pointer}` +
     `@keyframes spin{to{transform:rotate(360deg)}}` +
     `</style></head>` +
-    `<body style="font-family:Arial,sans-serif;max-width:560px;` +
+    `<body style="font-family:Arial,sans-serif;max-width:640px;` +
     `margin:48px auto;padding:0 16px;color:#111827">` +
     `<h1 style="font-size:22px;margin-bottom:12px">` +
     `${esc(opts.title || "Confirm option B")}</h1>` +
@@ -224,7 +236,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `<input type="hidden" name="customerBillLinesJson" ` +
     `id="customerBillLinesJson">` +
     `<p style="font-size:14px;font-weight:600;color:#374151;` +
-    `margin-bottom:8px">Accessorials to bill the customer</p>` +
+    `margin-bottom:8px">Additional accessorials</p>` +
     `<div id="bill-lines"></div>` +
     `<button type="button" class="add-btn" id="add-bill-line">` +
     `+ Add accessorial</button>` +
@@ -242,29 +254,90 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `const container = document.getElementById("bill-lines");` +
     `function escAttr(v){return String(v ?? "").replace(/&/g,"&amp;")` +
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
+    `function money(n){return "$"+(Number(n)||0).toFixed(2);}` +
+    `function refreshPreview(wrap){` +
+    `const carrier=Number(wrap.dataset.carrierAmount)||0;` +
+    `const mode=wrap.querySelector(".bill-mode").value;` +
+    `const val=Number(wrap.querySelector(".bill-value").value);` +
+    `const el=wrap.querySelector(".bill-preview");` +
+    `if(mode==="flat"){el.textContent=Number.isFinite(val)&&val>0?` +
+    `"Customer charged: "+money(val):"Enter a flat customer charge";` +
+    `return;}` +
+    `if(!(carrier>0)){el.textContent=` +
+    `"Carrier cost required for percent markup";return;}` +
+    `if(!Number.isFinite(val)||val<0){el.textContent=` +
+    `"Enter a markup percent";return;}` +
+    `const amt=Math.round(carrier*(1+val/100)*100)/100;` +
+    `el.textContent="Customer charged: "+money(amt)+` +
+    `" ("+money(carrier)+" + "+val+"%)";}` +
     `function addRow(row={}){` +
     `const wrap=document.createElement("div");wrap.className="bill-row";` +
-    `const hint=row.carrierAmount?` +
-    `"<div class=\\"bill-hint\\">Carrier billed ` +
-    `"+row.carrierAmount.toFixed(2)+"</div>":"";` +
-    `wrap.innerHTML="<div><input type=\\"text\\" class=\\"bill-name\\" ` +
-    `placeholder=\\"Accessorial name\\" value=\\""+escAttr(row.name||"")+` +
-    `"\\" required>"+hint+"</div><div><input type=\\"number\\" ` +
-    `class=\\"bill-amount\\" min=\\"0.01\\" step=\\"0.01\\" ` +
-    `placeholder=\\"0.00\\" value=\\""+escAttr(row.amount||"")+` +
-    `"\\" required></div><button type=\\"button\\" class=\\"remove-btn\\" ` +
-    `title=\\"Remove\\">×</button>";` +
+    `const carrier=Number(row.carrierAmount)||0;` +
+    `wrap.dataset.carrierAmount=String(carrier);` +
+    `const mode=row.pricingMode==="flat"?"flat":"markup";` +
+    `const seedVal=mode==="flat"?` +
+    `(row.flatAmount!=null?row.flatAmount:row.amount||""):` +
+    `(row.markupPct!=null?row.markupPct:"");` +
+    `wrap.innerHTML="<div class=\\"bill-row-top\\"><div>"+` +
+    `"<label class=\\"field-label\\">Accessorial name</label>"+` +
+    `"<input type=\\"text\\" class=\\"bill-name\\" ` +
+    `placeholder=\\"e.g. Liftgate\\" value=\\""+escAttr(row.name||"")+` +
+    `"\\" required></div>"+` +
+    `"<button type=\\"button\\" class=\\"remove-btn\\" ` +
+    `title=\\"Remove\\">×</button></div>"+` +
+    `"<p class=\\"bill-meta\\"><strong>Carrier cost:</strong> "+` +
+    `(carrier>0?money(carrier):"Not set — use flat charge or edit")+` +
+    `"</p>"+` +
+    `"<div class=\\"bill-price\\"><div>"+` +
+    `"<label class=\\"field-label\\">Charge type</label>"+` +
+    `"<select class=\\"bill-mode\\"><option value=\\"markup\\""+` +
+    `(mode==="markup"?" selected":"")+` +
+    `">Percent markup</option><option value=\\"flat\\""+` +
+    `(mode==="flat"?" selected":"")+` +
+    `">Flat customer amount</option></select></div><div>"+` +
+    `"<label class=\\"field-label bill-value-label\\">"+` +
+    `(mode==="flat"?"Flat amount ($)":"Markup (%)")+"</label>"+` +
+    `"<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
+    `step=\\"0.01\\" placeholder=\\""+(mode==="flat"?"250.00":"20")+` +
+    `"\\" value=\\""+escAttr(seedVal===0||seedVal?String(seedVal):"")+` +
+    `"\\" required></div></div>"+` +
+    `"<div class=\\"bill-preview\\"></div>";` +
+    `const syncLabel=()=>{` +
+    `const m=wrap.querySelector(".bill-mode").value;` +
+    `wrap.querySelector(".bill-value-label").textContent=` +
+    `m==="flat"?"Flat amount ($)":"Markup (%)";` +
+    `wrap.querySelector(".bill-value").placeholder=` +
+    `m==="flat"?"250.00":"20";refreshPreview(wrap);};` +
+    `wrap.querySelector(".bill-mode").onchange=syncLabel;` +
+    `wrap.querySelector(".bill-value").oninput=()=>refreshPreview(wrap);` +
     `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
-    `container.appendChild(wrap);}` +
-    `(seedRows.length?seedRows:[{name:"",amount:""}]).forEach(addRow);` +
-    `document.getElementById("add-bill-line").onclick=()=>addRow({});` +
+    `container.appendChild(wrap);refreshPreview(wrap);}` +
+    `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);` +
+    `document.getElementById("add-bill-line").onclick=` +
+    `()=>addRow({name:"",carrierAmount:0});` +
     `document.getElementById("option-b-form").onsubmit=(e)=>{` +
-    `const lines=[...container.querySelectorAll(".bill-row")].map((row)=>{` +
-    `return {name:row.querySelector(".bill-name").value.trim(),` +
-    `amount:Number(row.querySelector(".bill-amount").value)};` +
-    `}).filter((line)=>line.name&&line.amount>0);` +
-    `if(!lines.length){alert("Enter at least one accessorial and amount.");` +
+    `const lines=[];` +
+    `for(const row of container.querySelectorAll(".bill-row")){` +
+    `const name=row.querySelector(".bill-name").value.trim();` +
+    `if(!name)continue;` +
+    `const carrierAmount=Number(row.dataset.carrierAmount)||0;` +
+    `const mode=row.querySelector(".bill-mode").value;` +
+    `const val=Number(row.querySelector(".bill-value").value);` +
+    `if(mode==="flat"){` +
+    `if(!(val>0)){alert("Enter a flat customer charge for "+name);` +
     `e.preventDefault();return false;}` +
+    `lines.push({name,carrierAmount,pricingMode:"flat",flatAmount:val,` +
+    `markupPct:null,amount:val});` +
+    `}else{` +
+    `if(!(carrierAmount>0)){alert(name+": carrier cost required for ` +
+    `% markup, or switch to flat amount.");e.preventDefault();return false;}` +
+    `if(!Number.isFinite(val)||val<0){alert("Enter a markup % for "+name);` +
+    `e.preventDefault();return false;}` +
+    `const amount=Math.round(carrierAmount*(1+val/100)*100)/100;` +
+    `lines.push({name,carrierAmount,pricingMode:"markup",markupPct:val,` +
+    `flatAmount:null,amount});}}` +
+    `if(!lines.length){alert("Enter at least one accessorial with a ` +
+    `percent markup or flat charge.");e.preventDefault();return false;}` +
     `document.getElementById("customerBillLinesJson").value=` +
     `JSON.stringify(lines);` +
     `const btn=e.target.querySelector('button[type="submit"]');` +

@@ -145,6 +145,60 @@ function parseCustomerChargeAmountFromRequest(body) {
 }
 
 /**
+ * Flat amount wins; else carrierCost * (1 + pct/100).
+ * @param {object} row Line fields.
+ * @return {object}
+ */
+function computeCustomerChargeAmount(row) {
+  const flatRaw = row && row.flatAmount;
+  const hasFlat = flatRaw != null && String(flatRaw).trim() !== "";
+  if (hasFlat) {
+    const flat = Math.round(Number(flatRaw) * 100) / 100;
+    if (!Number.isFinite(flat) || flat <= 0) {
+      return {ok: false, error: "Flat customer charge must be greater than 0."};
+    }
+    return {
+      ok: true, amount: flat, pricingMode: "flat",
+      flatAmount: flat, markupPct: null,
+    };
+  }
+  const pctRaw = row && row.markupPct;
+  const hasPct = pctRaw != null && String(pctRaw).trim() !== "";
+  if (hasPct) {
+    const pct = Number(pctRaw);
+    const carrier = Math.round(Number(row.carrierAmount) * 100) / 100;
+    if (!Number.isFinite(pct) || pct < 0) {
+      return {ok: false, error: "Markup percent must be 0 or greater."};
+    }
+    if (!Number.isFinite(carrier) || carrier <= 0) {
+      return {
+        ok: false,
+        error: "Carrier cost is required when using a percent markup.",
+      };
+    }
+    const amount = Math.round(carrier * (1 + pct / 100) * 100) / 100;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return {ok: false, error: "Could not compute customer charge."};
+    }
+    return {
+      ok: true, amount, pricingMode: "markup",
+      markupPct: pct, flatAmount: null,
+    };
+  }
+  const amount = Math.round(Number(row && row.amount) * 100) / 100;
+  if (Number.isFinite(amount) && amount > 0) {
+    return {
+      ok: true, amount, pricingMode: (row && row.pricingMode) || "amount",
+      markupPct: null, flatAmount: null,
+    };
+  }
+  return {
+    ok: false,
+    error: "Enter a percent markup or a flat customer charge.",
+  };
+}
+
+/**
  * @param {object} body POST body.
  * @return {object}
  */
@@ -156,17 +210,44 @@ function parseCustomerBillLinesFromRequest(body) {
   try {
     const parsed = JSON.parse(String(raw));
     if (!Array.isArray(parsed) || !parsed.length) {
-      return {ok: false, error: "Enter at least one accessorial line."};
+      return {
+        ok: false,
+        error: "Enter at least one accessorial with a percent markup or " +
+          "flat customer charge.",
+      };
     }
     const lines = [];
     for (const row of parsed) {
       const name = String(row && row.name || "").trim();
-      const amount = Math.round(Number(row && row.amount) * 100) / 100;
-      if (!name || !Number.isFinite(amount) || amount <= 0) continue;
-      lines.push({name, amount});
+      if (!name) continue;
+      const carrierAmount = Math.round(
+          Number(row && row.carrierAmount) * 100) / 100;
+      const priced = computeCustomerChargeAmount({
+        carrierAmount: Number.isFinite(carrierAmount) ? carrierAmount : 0,
+        markupPct: row && row.markupPct,
+        flatAmount: row && row.flatAmount,
+        amount: row && row.amount,
+        pricingMode: row && row.pricingMode,
+      });
+      if (!priced.ok) {
+        return {ok: false, error: `${priced.error} (${name})`};
+      }
+      lines.push({
+        name,
+        amount: priced.amount,
+        carrierAmount: Number.isFinite(carrierAmount) && carrierAmount > 0 ?
+          carrierAmount : 0,
+        pricingMode: priced.pricingMode,
+        markupPct: priced.markupPct,
+        flatAmount: priced.flatAmount,
+      });
     }
     if (!lines.length) {
-      return {ok: false, error: "Enter at least one accessorial line."};
+      return {
+        ok: false,
+        error: "Enter at least one accessorial with a percent markup or " +
+          "flat customer charge.",
+      };
     }
     return {ok: true, lines};
   } catch (_) {
@@ -288,10 +369,12 @@ async function handleAdditionalChargeGet(req, res) {
   return res.status(200).send(pages.buildOptionBAccessorialConfirmPage({
     title: "Confirm option B",
     description:
-      `Load ${loadLabel}: ${OPTION_LABELS[option]}. Enter each accessorial ` +
-      `and the amount to bill the customer. The base customer rate stays ` +
-      `the same; each accessorial is added as a separate invoice line. The ` +
-      `dispatcher will get a ready customer-notification template.`,
+      `Load ${loadLabel}: ${OPTION_LABELS[option]}. Each additional ` +
+      `accessorial shows the carrier cost. Enter a percent markup or a ` +
+      `flat amount to charge the customer. You can rename lines or add ` +
+      `new accessorials. After submit, the dispatcher gets a customer ` +
+      `notification template; the customer invoice stays paused until ` +
+      `they confirm the customer was notified.`,
     confirmLabel: "Confirm option B",
     confirmColor: "#0d9488",
     actionPath: "additionalChargeAction",
@@ -373,8 +456,10 @@ async function handleAdditionalChargePost(req, res) {
   const processingMessages = {
     a: "Option A recorded. Jerry is billing the customer and resuming " +
       "the workflow — you can close this page.",
-    b: "Option B recorded. Jerry is updating accessorial billing and " +
-      "resuming the workflow — you can close this page.",
+    b: "Option B recorded. Jerry is emailing the dispatcher a customer " +
+      "notification template. The customer invoice stays paused until " +
+      "the dispatcher confirms the customer was notified — you can " +
+      "close this page.",
     c: "Option C recorded. Jerry is paying the carrier and resuming the " +
       "workflow — you can close this page.",
     d: "Option D recorded. Jerry is generating the dispute draft — you " +
@@ -409,6 +494,146 @@ exports.additionalChargeAction = onRequest(ACTION_OPTS, async (req, res) => {
     return res.status(500).send("Internal server error.");
   }
 });
+
+/**
+ * Option B: dispatcher confirms customer was notified, then resume invoice.
+ * GET shows confirm; POST clears the notify pause and resumes billing.
+ */
+exports.finalizeAdditionalChargeInvoice = onRequest(
+    ACTION_OPTS, async (req, res) => {
+      try {
+        const invoiceId =
+          (req.body && req.body.invoiceId) || req.query.invoiceId;
+        const option = String(
+            (req.body && req.body.option) || req.query.option || "complete",
+        ).toLowerCase();
+        const tenantId =
+          (req.body && req.body.tenantId) || req.query.tenantId || null;
+        const exp = (req.body && req.body.exp) || req.query.exp;
+        const sig = (req.body && req.body.sig) || req.query.sig;
+
+        if (!invoiceId) {
+          return res.status(400).send("Missing invoiceId.");
+        }
+
+        const tokenOk = emailActionTokens.verify({
+          action: "additionalChargeFinalize",
+          invoiceId: String(invoiceId),
+          option,
+          tenantId,
+          exp,
+          sig,
+        });
+        if (!tokenOk) {
+          return res.status(403).send(
+              "This link is invalid or expired. Ask Jerry to resend the " +
+              "dispatcher notification email.");
+        }
+
+        const tenant = await tenantFromRequest(req);
+        const invoiceRef = tcol(tenant, "invoices").doc(String(invoiceId));
+        const snap = await invoiceRef.get();
+        if (!snap.exists) {
+          return res.status(404).send("Invoice not found.");
+        }
+        const invoice = snap.data();
+        const charge = invoice.additionalCharge || {};
+        const loadNumber = invoice.loadNumber || invoiceId;
+        const decision = String(charge.decision || "").toUpperCase();
+
+        if (decision !== "B") {
+          return res.status(400).send(
+              "This finalize link only applies to Option B approvals.");
+        }
+
+        if (charge.customerNotifiedAt && !charge.awaitingCustomerNotify) {
+          return res.status(200).send(pages.simpleResultPage(
+              "Already completed", "#6b7280",
+              "Customer notification was already confirmed and the " +
+              "invoice workflow was resumed.",
+              loadNumber));
+        }
+
+        if (req.method !== "POST") {
+          return res.status(200).send(pages.buildEmailActionConfirmPage({
+            title: "Complete invoice after customer notify",
+            description:
+              `Load ${loadNumber}: confirm that the customer has been ` +
+              `notified of the additional charge. Jerry will then resume ` +
+              `billing (enter bill if needed, generate, and send the ` +
+              `Primus customer invoice). Nothing happens until you click ` +
+              `Confirm.`,
+            confirmLabel: "Customer notified — complete invoice",
+            confirmColor: "#0d9488",
+            actionPath: "finalizeAdditionalChargeInvoice",
+            fields: {
+              invoiceId: String(invoiceId),
+              option: option || "complete",
+              tenantId: tenant.tenantId || "",
+              exp: String(exp || ""),
+              sig: String(sig || ""),
+            },
+          }));
+        }
+
+        await invoiceRef.update({
+          "additionalCharge.awaitingCustomerNotify": false,
+          "additionalCharge.customerNotifiedAt":
+            admin.firestore.FieldValue.serverTimestamp(),
+          "additionalCharge.status": "approved",
+          "decisionStage": "additional_charge_approved",
+          "decisionReason":
+            "Option B: customer notified — invoice workflow resumed",
+          "finalWorkflowStatus": "created",
+          "workflowPausedAtStep": null,
+          "workflowPausedAt": null,
+          "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+        });
+
+        try {
+          const followSnap = await admin.firestore()
+              .collection("additionalCharges")
+              .where("invoiceId", "==", String(invoiceId))
+              .limit(1).get();
+          if (!followSnap.empty) {
+            await followSnap.docs[0].ref.update({
+              status: "approved_billed",
+              notes: "Dispatcher confirmed customer was notified; " +
+                "invoice workflow resumed",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+          }
+        } catch (_) {
+          // Best-effort follow-up update.
+        }
+
+        res.status(200).send(pages.buildEmailActionProcessingPage({
+          title: "Completing invoice",
+          message: "Customer notification confirmed. Jerry is resuming " +
+            "the invoice workflow — you can close this page.",
+          loadNumber,
+        }));
+
+        const workflowUrl = workflowUrlForTenant(tenant);
+        if (workflowUrl) {
+          fetch(workflowUrl, {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+              invoiceId: String(invoiceId),
+              tenantId: tenant.tenantId,
+            }),
+          }).catch((e) =>
+            console.error(
+                "finalizeAdditionalChargeInvoice: resume failed",
+                e.message));
+        }
+        return;
+      } catch (error) {
+        console.error("finalizeAdditionalChargeInvoice error:", error);
+        return res.status(500).send("Internal server error.");
+      }
+    });
 
 /**
  * Resume / Continue workflow — confirm on GET, execute on POST.
@@ -796,4 +1021,10 @@ exports.enterInvoiceLoadNumber = onRequest(ACTION_OPTS, async (req, res) => {
 });
 
 // Exported for unit tests / local checks only.
-exports._test = {workerAuthOk, workerSecret, parseCustomerChargeAmountFromRequest};
+exports._test = {
+  workerAuthOk,
+  workerSecret,
+  parseCustomerChargeAmountFromRequest,
+  parseCustomerBillLinesFromRequest,
+  computeCustomerChargeAmount,
+};
