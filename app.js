@@ -211,6 +211,9 @@
       panel.classList.toggle("is-active", on);
       panel.hidden = !on;
     });
+    if (els.refreshTasksBtn) els.refreshTasksBtn.hidden = tab !== "tasks";
+    if (els.refreshInvoicesBtn) els.refreshInvoicesBtn.hidden = tab !== "invoices";
+    if (els.refreshNotifsBtn) els.refreshNotifsBtn.hidden = tab !== "notifications";
   }
 
   els.tabBtns.forEach((btn) => {
