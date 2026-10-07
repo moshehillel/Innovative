@@ -378,6 +378,7 @@ body {
 /* —— Chat (kept compact) —— */
 .support-chat-root { position: fixed; right: 18px; bottom: 18px; z-index: 70; }
 .support-chat-toggle {
+  position: relative; z-index: 2;
   width: 56px; height: 56px; border-radius: 50%; border: 0;
   background: #fff; box-shadow: var(--ic-shadow); cursor: pointer; padding: 0;
   overflow: hidden;
@@ -392,11 +393,13 @@ body {
 .support-chat-toggle.is-open { box-shadow: 0 0 0 3px var(--ic-brand); }
 .support-chat-toggle.is-open .support-chat-tooltip { opacity: 0; }
 .support-chat-panel {
-  position: absolute; right: 0; bottom: 68px; width: min(360px, calc(100vw - 36px));
+  position: absolute; right: 0; bottom: 68px; z-index: 1;
+  width: min(360px, calc(100vw - 36px));
   height: 440px; background: #fff; border: 1px solid var(--ic-border);
   border-radius: 14px; box-shadow: var(--ic-shadow); display: flex; flex-direction: column;
   overflow: hidden;
 }
+.support-chat-panel[hidden] { display: none !important; }
 .support-chat-header {
   padding: 10px 12px; border-bottom: 1px solid var(--ic-border);
   display: flex; align-items: center; justify-content: space-between; gap: 8px;

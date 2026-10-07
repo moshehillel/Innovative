@@ -1360,6 +1360,10 @@
     return bubble;
   }
 
+  function isChatPanelVisible() {
+    return !!(chatEls.panel && !chatEls.panel.hidden);
+  }
+
   function setChatOpen(open) {
     chatOpen = !!open;
     chatEls.panel.hidden = !chatOpen;
@@ -1434,7 +1438,7 @@
   }
 
   function toggleChatOpen() {
-    setChatOpen(!chatOpen);
+    setChatOpen(!isChatPanelVisible());
   }
 
   if (chatEls.toggle && chatEls.panel) {
