@@ -99,6 +99,41 @@ check("non-AmEx we want to hear from you not ignored",
         "support@othercarrier.com",
         "Please reply with feedback on our freight service."));
 
+const paycargoHolidaySubject = "October 12, 2026: U.S. Bank Holiday";
+const paycargoHolidayFrom = "PayCargo Team <hello@now.paycargo.com>";
+const paycargoHolidayBody =
+  "Please note that U.S. banks will be closed on Monday, October 12, 2026 " +
+  "in observance of a U.S. Bank Holiday. The PayCargo platform remains " +
+  "operational. Payments submitted will process the next business day.";
+check("PayCargo bank holiday notice detected",
+    adm.isBankHolidayNoticeEmail(
+        paycargoHolidaySubject, paycargoHolidayFrom, paycargoHolidayBody));
+check("PayCargo bank holiday evaluate quiet-ignore",
+    adm.evaluateAdministrativeIgnore(
+        paycargoHolidaySubject, paycargoHolidayFrom, paycargoHolidayBody, [])
+        .status === "bank_holiday_notice_ignored");
+check("generic banks-closed holiday schedule ignored",
+    adm.evaluateAdministrativeIgnore(
+        "Holiday payment schedule",
+        "alerts@payments.example.com",
+        "Banks are closed for the federal holiday. ACH payments post next day.",
+        []).status === "bank_holiday_notice_ignored");
+const paycargoPaymentSubject = "PayCargo payment confirmation — Invoice #88421";
+const paycargoPaymentBody =
+  "Your payment of $1,250.00 for Invoice #88421 was received. " +
+  "Transaction ID: PC-998877. Remittance advice attached.";
+check("PayCargo payment/invoice email NOT ignored as holiday",
+    !adm.isBankHolidayNoticeEmail(
+        paycargoPaymentSubject, paycargoHolidayFrom, paycargoPaymentBody) &&
+    !adm.evaluateAdministrativeIgnore(
+        paycargoPaymentSubject, paycargoHolidayFrom, paycargoPaymentBody, [])
+        .ignore);
+check("unrelated PayCargo product email not ignored as holiday",
+    !adm.isBankHolidayNoticeEmail(
+        "New PayCargo features available",
+        paycargoHolidayFrom,
+        "Learn about faster checkout on the PayCargo platform."));
+
 const cofaceBriefsSubject =
   "Coface Briefs: The Latest News from around the World";
 const cofaceBriefsFrom =

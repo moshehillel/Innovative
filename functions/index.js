@@ -4371,6 +4371,7 @@ function administrativeIgnoreBypassesInvoiceVeto(status) {
     s === "cardknox_ignored" ||
     s === "emodal_broadcast_ignored" ||
     s === "amex_merchant_survey_ignored" ||
+    s === "bank_holiday_notice_ignored" ||
     s === "dnb_promotional_ignored" ||
     s === "coface_ignored";
 }

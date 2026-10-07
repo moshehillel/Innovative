@@ -159,6 +159,60 @@ function isDnbPromotionalEmail(subject, from, body) {
 }
 
 /**
+ * True when haystack looks like real payment/invoice traffic (not a holiday notice).
+ * @param {string} hay Lowercased subject + body.
+ * @return {boolean}
+ */
+function looksLikeOperationalPaymentOrInvoiceContent(hay) {
+  const text = String(hay || "").toLowerCase();
+  if (/\binvoice\s*(?:#|number|no\.?)\s*[a-z0-9]/i.test(text)) return true;
+  if (/\bpayment\s+(?:confirmation|receipt|received|successful|completed)\b/
+      .test(text)) {
+    return true;
+  }
+  if (/\byour\s+payment\s+(?:of|for)\s+\$/.test(text)) return true;
+  if (/\bamount\s+paid\b/.test(text) && /\binvoice\b/.test(text)) return true;
+  if (/\bremittance\s+advice\b/.test(text)) return true;
+  if (/\btransaction\s+(?:id|number|#)\s*[:#]?\s*\w+/.test(text)) return true;
+  return false;
+}
+
+/**
+ * Bank holiday / banking-closure schedule notices (e.g. PayCargo U.S. Bank Holiday).
+ * Matches holiday/bank-closure language — not every PayCargo or bank email.
+ * Real payment/invoice mail is never ignored by this rule.
+ * @param {string} subject Email subject.
+ * @param {string} from From header (unused; content match only).
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function isBankHolidayNoticeEmail(subject, from, body) {
+  void from;
+  const sub = String(subject || "");
+  const hay = `${sub}\n${body || ""}`.toLowerCase()
+      .replace(/&amp;/g, "&");
+
+  if (looksLikeOperationalPaymentOrInvoiceContent(hay)) return false;
+
+  if (/\bu\.?s\.?\s+bank\s+holiday\b/.test(hay)) return true;
+  if (/\bbank\s+holiday\b/.test(hay)) return true;
+  if (/\bbanking\s+holiday\b/.test(hay)) return true;
+  if (/\bfederal\s+holiday\b/.test(hay) &&
+      /\b(?:bank|payment|ach|wire|funds)\b/.test(hay)) {
+    return true;
+  }
+  if (/\bholiday\s+payment\s+schedule\b/.test(hay)) return true;
+
+  const banksClosed =
+    /\bbanks?\s+(?:are\s+|will\s+be\s+)?closed\b/.test(hay) ||
+    /\b(?:closed|closure)\s+(?:for|on)\s+(?:the\s+)?(?:bank|federal|u\.?s\.?)\s+holiday\b/
+        .test(hay);
+  if (banksClosed && /\bholiday\b/.test(hay)) return true;
+
+  return false;
+}
+
+/**
  * Vendor promotional/marketing emails safe to auto-ignore.
  * @param {string} subject Email subject.
  * @param {string} from From header.
@@ -1877,6 +1931,13 @@ function evaluateAdministrativeIgnore(
       status: "amex_merchant_survey_ignored",
     };
   }
+  if (isBankHolidayNoticeEmail(subject, from, body)) {
+    return {
+      ignore: true,
+      reason: "Bank holiday notice — no action needed",
+      status: "bank_holiday_notice_ignored",
+    };
+  }
   if (isDnbPromotionalEmail(subject, from, body)) {
     return {
       ignore: true,
@@ -1956,6 +2017,7 @@ module.exports = {
   isInternalTeamAutoReply,
   isOutOfOfficeAutoReply,
   isAmexMerchantSurveyEmail,
+  isBankHolidayNoticeEmail,
   isHafstaffSender,
   isCarrierOrFactorSender,
   subjectLooksLikeCustomerPaymentDate,
