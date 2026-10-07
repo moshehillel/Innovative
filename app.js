@@ -338,7 +338,8 @@
           formatMoney(task.chargesTotal) : "",
       ].filter(Boolean).join(" · ");
       const title = shortText(task.title || "Task", 100);
-      const desc = String(task.description || "").trim();
+      const subject = String(task.subject || task.title || "").trim();
+      const hasEmail = Boolean(task.body || task.description);
       return `<article class="task-card" data-id="${bodyEsc(task.id)}" data-source="${bodyEsc(task.source || "dashboardTasks")}">
         <button type="button" class="task-row" aria-expanded="false">
           <span class="task-title">${bodyEsc(title)}</span>
@@ -347,16 +348,20 @@
           <span class="task-chevron" aria-hidden="true"></span>
         </button>
         <div class="task-expand" hidden>
-          ${desc ? `<p class="task-desc">${bodyEsc(desc)}</p>` : ""}
-          ${task.loadNumber || task.carrierName || task.chargesTotal != null ? `
-            <dl class="task-detail-grid">
-              ${task.loadNumber ? `<div><dt>Load</dt><dd>${bodyEsc(task.loadNumber)}</dd></div>` : ""}
-              ${task.carrierName ? `<div><dt>Carrier</dt><dd>${bodyEsc(task.carrierName)}</dd></div>` : ""}
-              ${task.chargesTotal != null && task.chargesTotal !== "" ?
-                `<div><dt>Amount</dt><dd>${bodyEsc(formatMoney(task.chargesTotal))}</dd></div>` : ""}
-              ${task.type ? `<div><dt>Type</dt><dd>${bodyEsc(taskTypeLabel(task.type))}</dd></div>` : ""}
-            </dl>
-          ` : ""}
+          <div class="notif-email">
+            <div class="notif-email-headers">
+              ${task.to ? `<div><span>To</span><strong>${bodyEsc(task.to)}</strong></div>` : ""}
+              ${task.cc ? `<div><span>Cc</span><strong>${bodyEsc(task.cc)}</strong></div>` : ""}
+              ${subject ? `<div><span>Subject</span><strong>${bodyEsc(subject)}</strong></div>` : ""}
+              ${task.loadNumber ? `<div><span>Load</span><strong>${bodyEsc(task.loadNumber)}</strong></div>` : ""}
+              ${task.carrierName ? `<div><span>Carrier</span><strong>${bodyEsc(task.carrierName)}</strong></div>` : ""}
+            </div>
+            <div class="notif-email-body">
+              ${hasEmail ?
+                renderEmailBodyHtml(task.body || task.description) :
+                '<p class="notif-body-empty">(empty)</p>'}
+            </div>
+          </div>
           ${renderChargeButtons(task)}
           <div class="task-actions">
             <button type="button" class="btn btn-outline btn-sm task-dismiss-btn">Done</button>
@@ -365,6 +370,7 @@
       </article>`;
     }).join("");
 
+    fillEmailFrames(tasks, els.tasksContainer);
     bindTaskActions();
   }
 
@@ -672,14 +678,17 @@
     return `<iframe class="notif-body-frame" title="Email" sandbox="" loading="lazy"></iframe>`;
   }
 
-  function fillEmailFrames(items) {
-    const frames = els.notificationsContainer.querySelectorAll(".notif-body-frame");
+  function fillEmailFrames(items, rootEl) {
+    const root = rootEl || els.notificationsContainer;
+    if (!root) return;
+    const frames = root.querySelectorAll(".notif-body-frame");
     frames.forEach((frame) => {
-      const card = frame.closest(".notif-card");
-      const id = card && card.dataset.notifId;
+      const card = frame.closest(".notif-card, .task-card");
+      if (!card) return;
+      const id = card.dataset.notifId || card.dataset.id;
       const n = (items || []).find((item) => item.id === id);
       if (!n) return;
-      const html = emailBodyAsHtml(n.body);
+      const html = emailBodyAsHtml(n.body || n.description);
       if (!html) return;
       const doc =
         "<!doctype html><html><head><meta charset=\"utf-8\">" +
