@@ -10,9 +10,8 @@
     return;
   }
 
-  document.title = `${client.name} — Dashboard`;
-  document.getElementById("dashboardTitle").textContent =
-    `${client.name} Dashboard`;
+  document.title = `${client.name} — Jerry`;
+  // Keep the hero brand as "Jerry"; client name lives in the brand mark.
 
   const BASE_URL = client.functionsBaseUrl;
   const TENANT_ID = client.tenantId || "default";
@@ -324,21 +323,21 @@
     els.tasksContainer.innerHTML = tasks.map((task) => {
       const meta = [
         task.loadNumber ? `Load ${bodyEsc(task.loadNumber)}` : "",
-        task.carrierName ? bodyEsc(task.carrierName) : "",
+        task.carrierName ? bodyEsc(shortText(task.carrierName, 28)) : "",
         task.chargesTotal ? formatMoney(task.chargesTotal) : "",
+        formatLogTime(task.createdAt),
       ].filter(Boolean).join(" · ");
+      const title = shortText(task.title || "Task", 80);
       return `<article class="task-card" data-id="${bodyEsc(task.id)}" data-source="${bodyEsc(task.source || "dashboardTasks")}">
         <div class="task-main">
           <div class="task-title-row">
-            <h3 class="task-title">${bodyEsc(task.title || "Task")}</h3>
+            <h3 class="task-title">${bodyEsc(title)}</h3>
             <span class="task-type-pill">${bodyEsc(taskTypeLabel(task.type))}</span>
           </div>
           ${meta ? `<p class="task-meta">${meta}</p>` : ""}
-          ${task.description ? `<p class="task-desc">${bodyEsc(task.description)}</p>` : ""}
-          <p class="task-time">${formatLogTime(task.createdAt)}</p>
           ${renderChargeButtons(task)}
           <div class="task-actions">
-            <button type="button" class="btn btn-outline btn-sm task-dismiss-btn">Dismiss</button>
+            <button type="button" class="btn btn-outline btn-sm task-dismiss-btn">Done</button>
           </div>
         </div>
       </article>`;
@@ -571,6 +570,59 @@
     try { await invoicesInFlight; } finally { invoicesInFlight = null; }
   }
 
+  function shortText(value, max) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return "";
+    if (text.length <= max) return text;
+    return text.slice(0, max - 1).trimEnd() + "…";
+  }
+
+  function emailLocal(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const angle = raw.match(/<([^>]+)>/);
+    const email = (angle ? angle[1] : raw).trim();
+    const local = email.split("@")[0] || email;
+    return shortText(local, 28);
+  }
+
+  function notifKind(n) {
+    if (n.type === "additional_charge") {
+      return {label: "Extra charge", tone: "charge"};
+    }
+    if (n.type === "unhandled_email") {
+      return {label: "Needs review", tone: "review"};
+    }
+    if (n.type === "ops_email") {
+      return {label: "Alert", tone: "alert"};
+    }
+    return {label: "Notice", tone: "alert"};
+  }
+
+  function notifHeadline(n) {
+    if (n.type === "additional_charge") {
+      const load = n.loadNumber ? `Load ${n.loadNumber}` : "Load —";
+      const amt = n.chargesTotal != null && n.chargesTotal !== "" ?
+        formatMoney(n.chargesTotal) : "";
+      return amt ? `${load} · ${amt}` : load;
+    }
+    if (n.type === "unhandled_email") {
+      return shortText(n.reason || n.subject || n.title || "Review this email", 72);
+    }
+    return shortText(n.subject || n.title || "Alert", 72);
+  }
+
+  function notifSubline(n) {
+    const bits = [];
+    if (n.from) bits.push(emailLocal(n.from));
+    else if (n.to) bits.push("To " + emailLocal(n.to));
+    if (n.loadNumber && n.type !== "additional_charge") {
+      bits.push("Load " + String(n.loadNumber));
+    }
+    if (n.carrierName) bits.push(shortText(n.carrierName, 24));
+    return bits.filter(Boolean).join(" · ");
+  }
+
   function renderNotifications(items, opsPrimary) {
     openNotifCount = items ? items.length : 0;
     if (els.notifCountBadge) {
@@ -586,34 +638,33 @@
     }
 
     els.notificationsContainer.innerHTML = items.map((n) => {
-      const sentPill = n.emailSent ?
-        '<span class="pill-email-sent">emailed</span>' :
-        '<span class="pill-parked">dashboard only</span>';
+      const kind = notifKind(n);
       const unhandled = n.type === "unhandled_email";
       const charge = n.type === "additional_charge";
-      return `<article class="task-card" data-notif-id="${bodyEsc(n.id)}" data-notif-type="${bodyEsc(n.type || "")}">
-        <div class="task-main">
-          <div class="task-title-row">
-            <h3 class="task-title">${bodyEsc(n.title || "Notification")}${sentPill}</h3>
-            <span class="task-type-pill">${bodyEsc((n.type || "").replace(/_/g, " "))}</span>
+      const detailBits = [];
+      if (n.subject && n.type !== "ops_email") {
+        detailBits.push(shortText(n.subject, 90));
+      }
+      if (charge) detailBits.push("Decide A–E in Tasks");
+      const detail = detailBits.join(" · ");
+      return `<article class="notif-card tone-${kind.tone}" data-notif-id="${bodyEsc(n.id)}" data-notif-type="${bodyEsc(n.type || "")}">
+        <div class="notif-main">
+          <div class="notif-top">
+            <span class="notif-kind kind-${kind.tone}">${bodyEsc(kind.label)}</span>
+            <time class="notif-when">${bodyEsc(formatLogTime(n.createdAt))}</time>
           </div>
-          <p class="notif-meta">
-            ${n.from ? `From ${bodyEsc(n.from)} · ` : ""}
-            ${n.to ? `To ${bodyEsc(n.to)} · ` : ""}
-            ${formatLogTime(n.createdAt)}
-          </p>
-          ${n.subject ? `<p class="task-meta">Subject: ${bodyEsc(n.subject)}</p>` : ""}
-          ${n.loadNumber ? `<p class="task-meta">Load ${bodyEsc(n.loadNumber)}</p>` : ""}
-          ${n.body ? `<p class="task-desc">${bodyEsc(n.body)}</p>` : ""}
-          ${charge && n.invoiceId ?
-            `<p class="ops-hint" style="margin:0.5rem 0 0">Open the Tasks tab to choose A–E for invoice ${bodyEsc(n.invoiceId)}.</p>` :
-            ""}
+          <h3 class="notif-title">${bodyEsc(notifHeadline(n))}</h3>
+          <p class="notif-sub">${bodyEsc(notifSubline(n))}</p>
+          ${detail ? `<p class="notif-detail">${bodyEsc(detail)}</p>` : ""}
           <div class="task-actions">
-            <button type="button" class="btn btn-outline btn-sm notif-dismiss">Dismiss</button>
-            <button type="button" class="btn btn-outline btn-sm notif-flag">Flag error</button>
+            <button type="button" class="btn btn-outline btn-sm notif-dismiss">Done</button>
+            <button type="button" class="btn btn-ghost btn-sm notif-flag">Flag</button>
             ${unhandled ? `
               <button type="button" class="btn btn-outline btn-sm notif-reply">Reply</button>
               <button type="button" class="btn btn-danger btn-sm notif-delete">Delete</button>
+            ` : ""}
+            ${charge ? `
+              <button type="button" class="btn btn-primary btn-sm notif-goto-tasks">Open Tasks</button>
             ` : ""}
           </div>
           <div class="flag-form" hidden></div>
@@ -625,22 +676,34 @@
     bindNotificationActions();
   }
 
+  function countNotifCards() {
+    return els.notificationsContainer.querySelectorAll(".notif-card").length;
+  }
+
+  function afterNotifRemoved() {
+    openNotifCount = countNotifCards();
+    if (els.notifCountBadge) {
+      els.notifCountBadge.textContent = String(openNotifCount);
+    }
+    if (!openNotifCount) {
+      els.notificationsContainer.innerHTML =
+        '<p class="panel-empty">No open notifications.</p>';
+    }
+  }
+
   function bindNotificationActions() {
+    els.notificationsContainer.querySelectorAll(".notif-goto-tasks").forEach((btn) => {
+      btn.addEventListener("click", () => switchTab("tasks"));
+    });
+
     els.notificationsContainer.querySelectorAll(".notif-dismiss").forEach((btn) => {
       btn.addEventListener("click", async () => {
-        const card = btn.closest(".task-card");
-        setButtonBusy(btn, true, "…");
+        const card = btn.closest(".notif-card");
+        setButtonBusy(btn, true, "...");
         try {
           await postJson("/dismissDashboardNotification", {id: card.dataset.notifId});
           card.remove();
-          openNotifCount = els.notificationsContainer.querySelectorAll(".task-card").length;
-          if (els.notifCountBadge) {
-            els.notifCountBadge.textContent = String(openNotifCount);
-          }
-          if (!openNotifCount) {
-            els.notificationsContainer.innerHTML =
-              '<p class="panel-empty">No open notifications.</p>';
-          }
+          afterNotifRemoved();
         } catch (error) {
           showError(error.message);
           setButtonBusy(btn, false);
@@ -650,15 +713,15 @@
 
     els.notificationsContainer.querySelectorAll(".notif-flag").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const card = btn.closest(".task-card");
+        const card = btn.closest(".notif-card");
         const form = card.querySelector(".flag-form");
         form.hidden = false;
         form.innerHTML =
-          `<label>What is wrong with this notification?</label>` +
-          `<textarea class="flag-note" rows="3" required></textarea>` +
+          `<label>What went wrong?</label>` +
+          `<textarea class="flag-note" rows="2" required placeholder="Short note..."></textarea>` +
           `<div class="task-actions">` +
-          `<button type="button" class="btn btn-sm flag-submit">Send flag to Moshe</button>` +
-          `<button type="button" class="btn btn-outline btn-sm flag-cancel">Cancel</button>` +
+          `<button type="button" class="btn btn-sm flag-submit">Send to Moshe</button>` +
+          `<button type="button" class="btn btn-ghost btn-sm flag-cancel">Cancel</button>` +
           `</div>`;
         form.querySelector(".flag-cancel").onclick = () => {
           form.hidden = true;
@@ -667,7 +730,7 @@
         form.querySelector(".flag-submit").onclick = async () => {
           const note = form.querySelector(".flag-note").value.trim();
           const submit = form.querySelector(".flag-submit");
-          setButtonBusy(submit, true, "Sending…");
+          setButtonBusy(submit, true, "Sending...");
           try {
             await postJson("/flagDashboardNotification", {
               id: card.dataset.notifId,
@@ -675,10 +738,7 @@
             });
             showRunResult("Flagged — Moshe was emailed.", false);
             card.remove();
-            openNotifCount = els.notificationsContainer.querySelectorAll(".task-card").length;
-            if (els.notifCountBadge) {
-              els.notifCountBadge.textContent = String(openNotifCount);
-            }
+            afterNotifRemoved();
           } catch (error) {
             showError(error.message);
             setButtonBusy(submit, false);
@@ -689,15 +749,15 @@
 
     els.notificationsContainer.querySelectorAll(".notif-reply").forEach((btn) => {
       btn.addEventListener("click", () => {
-        const card = btn.closest(".task-card");
+        const card = btn.closest(".notif-card");
         const form = card.querySelector(".reply-form");
         form.hidden = false;
         form.innerHTML =
           `<label>Reply</label>` +
-          `<textarea class="reply-text" rows="4"></textarea>` +
+          `<textarea class="reply-text" rows="3" placeholder="Your reply..."></textarea>` +
           `<div class="task-actions">` +
-          `<button type="button" class="btn btn-sm reply-submit">Send reply</button>` +
-          `<button type="button" class="btn btn-outline btn-sm reply-cancel">Cancel</button>` +
+          `<button type="button" class="btn btn-sm reply-submit">Send</button>` +
+          `<button type="button" class="btn btn-ghost btn-sm reply-cancel">Cancel</button>` +
           `</div>`;
         form.querySelector(".reply-cancel").onclick = () => {
           form.hidden = true;
@@ -706,7 +766,7 @@
         form.querySelector(".reply-submit").onclick = async () => {
           const replyText = form.querySelector(".reply-text").value.trim();
           const submit = form.querySelector(".reply-submit");
-          setButtonBusy(submit, true, "Sending…");
+          setButtonBusy(submit, true, "Sending...");
           try {
             await postJson("/replyDashboardEmail", {
               id: card.dataset.notifId,
@@ -714,10 +774,7 @@
             });
             showRunResult("Reply sent.", false);
             card.remove();
-            openNotifCount = els.notificationsContainer.querySelectorAll(".task-card").length;
-            if (els.notifCountBadge) {
-              els.notifCountBadge.textContent = String(openNotifCount);
-            }
+            afterNotifRemoved();
           } catch (error) {
             showError(error.message);
             setButtonBusy(submit, false);
@@ -728,17 +785,14 @@
 
     els.notificationsContainer.querySelectorAll(".notif-delete").forEach((btn) => {
       btn.addEventListener("click", async () => {
-        if (!confirm("Delete / trash the original email in the mailbox?")) return;
-        const card = btn.closest(".task-card");
-        setButtonBusy(btn, true, "Deleting…");
+        if (!confirm("Trash the original email?")) return;
+        const card = btn.closest(".notif-card");
+        setButtonBusy(btn, true, "Deleting...");
         try {
           await postJson("/deleteDashboardEmail", {id: card.dataset.notifId});
           card.remove();
-          openNotifCount = els.notificationsContainer.querySelectorAll(".task-card").length;
-          if (els.notifCountBadge) {
-            els.notifCountBadge.textContent = String(openNotifCount);
-          }
-          showRunResult("Email deleted from mailbox.", false);
+          afterNotifRemoved();
+          showRunResult("Email deleted.", false);
         } catch (error) {
           showError(error.message);
           setButtonBusy(btn, false);
