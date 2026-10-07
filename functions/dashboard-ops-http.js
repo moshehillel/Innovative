@@ -38,7 +38,11 @@ async function handleListNotifications(req, res) {
     const result = await dashboardOps.listNotifications(deps.db, {
       tenantId: tenant.tenantId,
       limit: req.query.limit,
+      offset: req.query.offset,
       type: req.query.type || null,
+      ownerBucket: req.query.ownerBucket || null,
+      dispatcherKey: req.query.dispatcherKey || null,
+      urgentFirst: req.query.urgentFirst !== "0",
       additionalChargesMod: deps.additionalCharges || null,
     });
     return res.json({
@@ -197,7 +201,21 @@ async function handleAdditionalChargeDecision(req, res) {
         extra: {actedOption: option.toUpperCase()},
       });
     }
-    if (body.taskId) {
+    // Option B hands work to the dispatcher — move task into their folder.
+    // Other options close the charge task.
+    if (option === "b") {
+      await deps.dashboardTasks.handoffTaskToDispatch(
+          deps.db, deps.additionalCharges, {
+            taskId: body.taskId || null,
+            source: body.taskSource || null,
+            followUpId: body.followUpId || null,
+            invoiceId,
+            tenantId: tenant.tenantId,
+            option,
+          }).catch((err) => {
+        console.error("handoffTaskToDispatch:", err.message);
+      });
+    } else if (body.taskId) {
       await deps.dashboardTasks.dismissDashboardTask(
           deps.db, deps.additionalCharges, {
             taskId: body.taskId,
@@ -210,6 +228,7 @@ async function handleAdditionalChargeDecision(req, res) {
       ok: true,
       accepted: true,
       option: option.toUpperCase(),
+      handedOffToDispatch: option === "b",
       message: result.message || null,
     });
   } catch (error) {

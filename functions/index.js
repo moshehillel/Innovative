@@ -5402,7 +5402,19 @@ async function sendAdditionalChargeApprovalEmail(opts) {
   // Persist the same HTML the email has so Tasks/Notifications match.
   const MAX_NOTIF_BODY = 120000;
   const emailHtmlBody = String(email.html || "").slice(0, MAX_NOTIF_BODY);
-  const emailCc = dispatcherEmail || additionalCharges.LISA_EMAIL;
+  const emailCcParts = [dispatcherEmail, additionalCharges.LISA_EMAIL]
+      .filter(Boolean);
+  const emailCc = emailCcParts.join(", ");
+  const resolvedDispatcherName =
+    dispatcher.displayName || dispatcher.userName || null;
+  const ownershipMod = require("./dashboard-ownership");
+  const chargeOwner = ownershipMod.ownershipFieldsForCreate({
+    to: approver,
+    cc: emailCc,
+    type: "additional_charge",
+    dispatcherEmail: dispatcherEmail || null,
+    dispatcherName: resolvedDispatcherName,
+  });
   try {
     await db.collection(additionalCharges.FOLLOW_UP_COLLECTION)
         .doc(followUpId).update({
@@ -5410,6 +5422,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
           emailSubject: email.subject || null,
           emailTo: approver,
           emailCc: emailCc || null,
+          ...chargeOwner,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
   } catch (updErr) {
@@ -5431,6 +5444,9 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     followUpId,
     reason: pending.category || null,
     chargesTotal: pending.chargesTotal || null,
+    dispatcherEmail: dispatcherEmail || null,
+    dispatcherName: resolvedDispatcherName,
+    ownerBucket: chargeOwner.ownerBucket,
   });
 
   await dashboardOps.createNotification(db, {
@@ -5449,6 +5465,9 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     chargesTotal: pending.chargesTotal,
     chargeOptions: ["a", "b", "c", "d", "e"],
     emailSent: !dashboardOps.isDashboardOpsPrimary(),
+    dispatcherEmail: dispatcherEmail || null,
+    dispatcherName: resolvedDispatcherName,
+    ownerBucket: chargeOwner.ownerBucket,
   });
 
   if (!dashboardOps.isDashboardOpsPrimary()) {
@@ -12384,19 +12403,21 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
     const parsedOffset = Number(req.query.offset);
     const offset = Number.isFinite(parsedOffset) && parsedOffset > 0 ?
       Math.floor(parsedOffset) : 0;
-    // Fetch the window with limit+offset, then slice. Avoid Query.offset()
-    // so pagination cannot 400/500 on admin SDK versions that lack it.
-    const fetchCount = Math.min(offset + limit, 500);
+    const statusGroup = String(req.query.statusGroup || "open").toLowerCase();
+    // Fetch a wider window, filter by open/completed, then page in memory.
+    const fetchCount = Math.min(Math.max(offset + limit * 4, 80), 500);
     const snap = await tcol(tenant, "invoices")
         .orderBy("createdAt", "desc")
         .limit(fetchCount)
         .get();
-    const pageDocs = snap.docs.slice(offset);
-    const invoices = pageDocs.map((doc) => {
+    const mapped = snap.docs.map((doc) => {
       const data = doc.data() || {};
       const createdAt = data.createdAt && data.createdAt.toDate ?
         data.createdAt.toDate().toISOString() : null;
       const shown = invoiceDashboardStatus(data);
+      const isCompleted = shown.displayStatus === "completed" ||
+        data.finalWorkflowStatus === "completed" ||
+        data.decisionStage === "completed";
       return {
         id: doc.id,
         loadNumber: data.loadNumber || null,
@@ -12406,11 +12427,9 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
         invoiceAmount: data.invoiceAmount || null,
         customerRate: data.customerRate || null,
         profit: data.profit || null,
+        primusAmount: data.primusAmount || data.vendorCost || null,
         tms: data.tms || tenant.tms,
         taiShipmentId: data.taiShipmentId || null,
-        // Dashboard row uses finalWorkflowStatus, then decisionReason.
-        // Remap leftover customer-email-gate / ready_to_approve so those
-        // rows do not look like they are waiting for reviewer approval.
         finalWorkflowStatus: shown.remapWorkflow ?
           (shown.displayStatus || data.finalWorkflowStatus || null) :
           (data.finalWorkflowStatus || null),
@@ -12420,9 +12439,15 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
         displayStatus: shown.displayStatus,
         displayLabel: shown.displayLabel,
         currentStep: data.currentStep || null,
+        isCompleted,
         createdAt,
       };
     });
+    const filtered = statusGroup === "all" ? mapped :
+      statusGroup === "completed" ?
+        mapped.filter((inv) => inv.isCompleted) :
+        mapped.filter((inv) => !inv.isCompleted);
+    const invoices = filtered.slice(offset, offset + limit);
     return res.json({
       ok: true,
       tenantId: tenant.tenantId,
@@ -12430,7 +12455,9 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
       invoices,
       limit,
       offset,
-      hasMore: snap.docs.length === offset + limit,
+      statusGroup,
+      hasMore: offset + invoices.length < filtered.length ||
+        (filtered.length >= fetchCount && snap.docs.length === fetchCount),
     });
   } catch (error) {
     console.error("getRecentInvoices error:", error);
@@ -12546,16 +12573,28 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
   try {
     const tenant = await resolveDashboardTenant(req);
     const limit = Math.min(Number(req.query.limit || 50), 100);
+    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
     const result = await dashboardTasks.listDashboardTasks(
         db, additionalCharges, {
           tenantId: tenant.tenantId,
           limit,
+          offset,
+          ownerBucket: req.query.ownerBucket || null,
+          dispatcherKey: req.query.dispatcherKey || null,
+          urgentFirst: req.query.urgentFirst !== "0",
         });
     return res.json({
       ok: true,
       tenantId: tenant.tenantId,
       tasks: result.tasks,
       openCount: result.openCount,
+      filteredCount: result.filteredCount,
+      hasMore: result.hasMore,
+      nextOffset: result.nextOffset,
+      offset: result.offset,
+      limit: result.limit,
+      bucketCounts: result.bucketCounts,
+      dispatchers: result.dispatchers,
     });
   } catch (error) {
     console.error("getDashboardTasks error:", error);

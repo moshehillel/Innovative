@@ -1094,6 +1094,15 @@ async function createFollowUp(db, data) {
   if (emailHtml && emailHtml.length > MAX_BODY) {
     emailHtml = emailHtml.slice(0, MAX_BODY);
   }
+  const ownership = require("./dashboard-ownership");
+  const owner = ownership.ownershipFieldsForCreate({
+    to: data.emailTo,
+    cc: data.emailCc,
+    type: "additional_charge",
+    dispatcherEmail: data.dispatcherEmail,
+    dispatcherName: data.dispatcherName,
+    ownerBucket: data.ownerBucket,
+  });
   const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
     loadNumber: data.loadNumber || null,
     carrierName: data.carrierName || null,
@@ -1112,6 +1121,7 @@ async function createFollowUp(db, data) {
     emailSubject: data.emailSubject || null,
     emailTo: data.emailTo || null,
     emailCc: data.emailCc || null,
+    ...owner,
     resolved: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -1135,6 +1145,9 @@ async function createFollowUp(db, data) {
         followUpId: doc.id,
         reason: data.category || data.status || null,
         chargesTotal: data.chargesTotal || null,
+        dispatcherEmail: owner.dispatcherEmail,
+        dispatcherName: owner.dispatcherName,
+        ownerBucket: owner.ownerBucket,
       });
     } catch (taskErr) {
       console.error("[createFollowUp] dashboard task failed:", taskErr.message);

@@ -1,5 +1,5 @@
 /**
- * Dashboard task list — items Lisa must act on
+ * Dashboard task list — items Lisa / Sarah / Dispatch must act on
  * (additional charges, signed POD requests, POD discrepancies, etc.).
  * Unhandled "Jerry doesn't understand" emails are notifications only.
  */
@@ -7,6 +7,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const ownership = require("./dashboard-ownership");
 
 const TASK_COLLECTION = "dashboardTasks";
 
@@ -33,6 +34,7 @@ async function createDashboardTask(db, data) {
     const MAX_BODY = 120000;
     let body = data.body != null ? String(data.body) : null;
     if (body && body.length > MAX_BODY) body = body.slice(0, MAX_BODY);
+    const owner = ownership.ownershipFieldsForCreate(data);
     const doc = await db.collection(TASK_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || TASK_TYPE.HUMAN_REVIEW,
@@ -52,6 +54,7 @@ async function createDashboardTask(db, data) {
       department: data.department || null,
       reason: data.reason || null,
       chargesTotal: data.chargesTotal != null ? data.chargesTotal : null,
+      ...owner,
       status: TASK_STATUS.OPEN,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       dismissedAt: null,
@@ -91,6 +94,13 @@ function serializeTaskDoc(doc) {
     reason: d.reason || null,
     status: d.status || null,
     chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
+    ownerBucket: d.ownerBucket || null,
+    awaitingReplyFrom: d.awaitingReplyFrom || null,
+    dispatcherEmail: d.dispatcherEmail || null,
+    dispatcherName: d.dispatcherName || null,
+    dispatcherKey: d.dispatcherKey || null,
+    ownershipHistory: Array.isArray(d.ownershipHistory) ?
+      d.ownershipHistory : [],
     createdAt: d.createdAt && d.createdAt.toDate ?
       d.createdAt.toDate().toISOString() : null,
     dismissedAt: d.dismissedAt && d.dismissedAt.toDate ?
@@ -177,18 +187,19 @@ function buildAdditionalChargeFallbackHtml(additionalChargesMod, d) {
  * Lists open tasks for a tenant plus unresolved additional-charge follow-ups.
  * @param {object} db Firestore instance.
  * @param {object} additionalChargesMod additional-charges module.
- * @param {object} opts tenantId, limit.
- * @return {Promise<{tasks: object[], openCount: number}>}
+ * @param {object} opts tenantId, limit, offset, ownerBucket, dispatcherKey.
+ * @return {Promise<object>}
  */
 async function listDashboardTasks(db, additionalChargesMod, opts) {
   const tenantId = String(opts.tenantId || "default");
-  const limit = Math.min(Number(opts.limit) || 50, 100);
+  // Fetch a wider window so folder filters still have enough rows.
+  const fetchLimit = Math.min(Math.max(Number(opts.fetchLimit) || 300, 50), 500);
 
   const taskSnap = await db.collection(TASK_COLLECTION)
       .where("tenantId", "==", tenantId)
       .where("status", "==", TASK_STATUS.OPEN)
       .orderBy("createdAt", "desc")
-      .limit(limit)
+      .limit(fetchLimit)
       .get();
 
   // Drop legacy human_review rows — those belong in Notifications.
@@ -202,29 +213,37 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
       .where("resolved", "==", false)
       .orderBy("createdAt", "desc")
-      .limit(limit)
+      .limit(fetchLimit)
       .get();
 
   // Enrich linked dashboardTasks that are missing the approval email body.
   for (const task of tasks) {
-    if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE || task.body) continue;
-    if (!task.followUpId) continue;
-    let fuDoc = chargeSnap.docs.find((x) => x.id === task.followUpId);
-    if (!fuDoc) {
+    if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE) continue;
+    let fuDoc = task.followUpId ?
+      chargeSnap.docs.find((x) => x.id === task.followUpId) : null;
+    if (task.followUpId && !fuDoc) {
       // eslint-disable-next-line no-await-in-loop
       const snap = await db
           .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
           .doc(task.followUpId).get();
       if (snap.exists) fuDoc = snap;
     }
-    if (!fuDoc) continue;
-    const d = fuDoc.data() || {};
-    task.body = d.emailHtml ||
-      buildAdditionalChargeFallbackHtml(additionalChargesMod, d);
-    task.subject = task.subject || d.emailSubject || null;
-    task.to = task.to || d.emailTo || null;
-    task.cc = task.cc || d.emailCc || null;
-    if (task.chargesTotal == null) task.chargesTotal = d.chargesTotal || null;
+    if (fuDoc) {
+      const d = fuDoc.data() || {};
+      if (!task.body) {
+        task.body = d.emailHtml ||
+          buildAdditionalChargeFallbackHtml(additionalChargesMod, d);
+      }
+      task.subject = task.subject || d.emailSubject || null;
+      task.to = task.to || d.emailTo || null;
+      task.cc = task.cc || d.emailCc || null;
+      if (task.chargesTotal == null) task.chargesTotal = d.chargesTotal || null;
+      task.dispatcherEmail = task.dispatcherEmail || d.dispatcherEmail || null;
+      task.dispatcherName = task.dispatcherName || d.dispatcherName || null;
+      task.ownerBucket = task.ownerBucket || d.ownerBucket || null;
+      task.awaitingReplyFrom = task.awaitingReplyFrom ||
+        d.awaitingReplyFrom || null;
+    }
   }
 
   chargeSnap.forEach((doc) => {
@@ -255,21 +274,37 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       status: "open",
       chargesTotal: d.chargesTotal || null,
       invoiceAmount: d.invoiceAmount || null,
+      ownerBucket: d.ownerBucket || null,
+      awaitingReplyFrom: d.awaitingReplyFrom || null,
+      dispatcherEmail: d.dispatcherEmail || null,
+      dispatcherName: d.dispatcherName || null,
+      dispatcherKey: d.dispatcherKey || null,
+      ownershipHistory: Array.isArray(d.ownershipHistory) ?
+        d.ownershipHistory : [],
       createdAt: d.createdAt && d.createdAt.toDate ?
         d.createdAt.toDate().toISOString() : null,
       dismissedAt: null,
     });
   });
 
-  tasks.sort((a, b) => {
-    const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
-    const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
-    return tb - ta;
+  const page = ownership.filterSortPaginate(tasks, {
+    ownerBucket: opts.ownerBucket || null,
+    dispatcherKey: opts.dispatcherKey || null,
+    offset: opts.offset,
+    limit: opts.limit || 50,
+    urgentFirst: opts.urgentFirst,
   });
 
   return {
-    tasks: tasks.slice(0, limit),
-    openCount: tasks.length,
+    tasks: page.items,
+    openCount: page.openCount,
+    filteredCount: page.filteredCount,
+    hasMore: page.hasMore,
+    nextOffset: page.nextOffset,
+    offset: page.offset,
+    limit: page.limit,
+    bucketCounts: page.bucketCounts,
+    dispatchers: page.dispatchers,
   };
 }
 
@@ -319,6 +354,69 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
   return {ok: true};
 }
 
+/**
+ * Moves a Sarah-owned task into the dispatcher folder after dashboard action.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod Module.
+ * @param {object} opts taskId?, followUpId?, invoiceId?, tenantId, option.
+ * @return {Promise<object>}
+ */
+async function handoffTaskToDispatch(db, additionalChargesMod, opts) {
+  const option = String(opts.option || "").toLowerCase();
+  const updates = [];
+
+  if (opts.taskId && opts.source !== "additionalCharges") {
+    const ref = db.collection(TASK_COLLECTION).doc(String(opts.taskId));
+    const snap = await ref.get();
+    if (snap.exists) {
+      const data = snap.data() || {};
+      await ref.update(ownership.handoffToDispatchUpdate(data, {
+        reason: "sarah_dashboard_action",
+        option,
+      }));
+      updates.push("task");
+    }
+  }
+
+  const followUpId = opts.followUpId ||
+    (opts.source === "additionalCharges" ? opts.taskId : null);
+  if (followUpId) {
+    const ref = db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .doc(String(followUpId));
+    const snap = await ref.get();
+    if (snap.exists) {
+      const data = snap.data() || {};
+      await ref.update(ownership.handoffToDispatchUpdate(data, {
+        reason: "sarah_dashboard_action",
+        option,
+      }));
+      updates.push("followUp");
+    }
+  }
+
+  if (opts.invoiceId) {
+    const q = await db.collection(TASK_COLLECTION)
+        .where("invoiceId", "==", String(opts.invoiceId))
+        .where("status", "==", TASK_STATUS.OPEN)
+        .limit(10)
+        .get();
+    for (const doc of q.docs) {
+      const data = doc.data() || {};
+      if (opts.tenantId && data.tenantId && data.tenantId !== opts.tenantId) {
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await doc.ref.update(ownership.handoffToDispatchUpdate(data, {
+        reason: "sarah_dashboard_action",
+        option,
+      }));
+      updates.push(doc.id);
+    }
+  }
+
+  return {ok: true, updates};
+}
+
 module.exports = {
   TASK_COLLECTION,
   TASK_TYPE,
@@ -326,4 +424,5 @@ module.exports = {
   createDashboardTask,
   listDashboardTasks,
   dismissDashboardTask,
+  handoffTaskToDispatch,
 };

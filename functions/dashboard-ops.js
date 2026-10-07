@@ -11,6 +11,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const ownership = require("./dashboard-ownership");
 
 const NOTIF_COLLECTION = "dashboardNotifications";
 
@@ -75,6 +76,13 @@ function serializeNotif(doc) {
     chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
     chargeOptions: Array.isArray(d.chargeOptions) ? d.chargeOptions : null,
     emailSent: d.emailSent === true,
+    ownerBucket: d.ownerBucket || null,
+    awaitingReplyFrom: d.awaitingReplyFrom || null,
+    dispatcherEmail: d.dispatcherEmail || null,
+    dispatcherName: d.dispatcherName || null,
+    dispatcherKey: d.dispatcherKey || null,
+    ownershipHistory: Array.isArray(d.ownershipHistory) ?
+      d.ownershipHistory : [],
     createdAt: tsIso(d.createdAt),
     dismissedAt: tsIso(d.dismissedAt),
     flaggedAt: tsIso(d.flaggedAt),
@@ -93,6 +101,10 @@ async function createNotification(db, data) {
     const MAX_BODY = 120000;
     let body = data.body != null ? String(data.body) : null;
     if (body && body.length > MAX_BODY) body = body.slice(0, MAX_BODY);
+    const owner = ownership.ownershipFieldsForCreate({
+      ...data,
+      type: data.type || NOTIF_TYPE.OPS_EMAIL,
+    });
     const ref = await db.collection(NOTIF_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || NOTIF_TYPE.OPS_EMAIL,
@@ -115,6 +127,7 @@ async function createNotification(db, data) {
       chargesTotal: data.chargesTotal != null ? data.chargesTotal : null,
       chargeOptions: data.chargeOptions || null,
       emailSent: data.emailSent === true,
+      ...owner,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       dismissedAt: null,
       flaggedAt: null,
@@ -189,19 +202,19 @@ function enrichUnhandledNotifBody(n) {
  */
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
-  const limit = Math.min(Number(opts.limit) || 50, 100);
+  const fetchLimit = Math.min(Math.max(Number(opts.fetchLimit) || 300, 50), 500);
   let query = db.collection(NOTIF_COLLECTION)
       .where("tenantId", "==", tenantId)
       .where("status", "==", NOTIF_STATUS.OPEN)
       .orderBy("createdAt", "desc")
-      .limit(limit);
+      .limit(fetchLimit);
   if (opts.type) {
     query = db.collection(NOTIF_COLLECTION)
         .where("tenantId", "==", tenantId)
         .where("status", "==", NOTIF_STATUS.OPEN)
         .where("type", "==", String(opts.type))
         .orderBy("createdAt", "desc")
-        .limit(limit);
+        .limit(fetchLimit);
   }
   const snap = await query.get();
   const notifications = snap.docs.map(serializeNotif);
@@ -230,12 +243,33 @@ async function listNotifications(db, opts) {
         n.to = n.to || d.emailTo || null;
         n.cc = n.cc || d.emailCc || null;
       }
+      n.dispatcherEmail = n.dispatcherEmail || d.dispatcherEmail || null;
+      n.dispatcherName = n.dispatcherName || d.dispatcherName || null;
+      n.ownerBucket = n.ownerBucket || d.ownerBucket || null;
     } catch (err) {
       console.error("[listNotifications] charge enrich:", err.message);
     }
   }
 
-  return {notifications, openCount: notifications.length};
+  const page = ownership.filterSortPaginate(notifications, {
+    ownerBucket: opts.ownerBucket || null,
+    dispatcherKey: opts.dispatcherKey || null,
+    offset: opts.offset,
+    limit: opts.limit || 50,
+    urgentFirst: opts.urgentFirst,
+  });
+
+  return {
+    notifications: page.items,
+    openCount: page.openCount,
+    filteredCount: page.filteredCount,
+    hasMore: page.hasMore,
+    nextOffset: page.nextOffset,
+    offset: page.offset,
+    limit: page.limit,
+    bucketCounts: page.bucketCounts,
+    dispatchers: page.dispatchers,
+  };
 }
 
 /**
