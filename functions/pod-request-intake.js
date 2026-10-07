@@ -222,6 +222,47 @@ function looksLikeSpecialPodRequest(subject, body) {
 }
 
 /**
+ * Five Below delivery locations require a stamped POD (ops rule).
+ * @param {string|null|undefined} name Party / location name.
+ * @return {boolean}
+ */
+function isFiveBelowParty(name) {
+  return /\bfive\s*below\b/i.test(String(name || ""));
+}
+
+/**
+ * True when any shipper / consignee / customer / bill-to party is Five Below.
+ * @param {...(string|null|undefined)} names Party names.
+ * @return {boolean}
+ */
+function partyRequiresStampedPod(...names) {
+  return names.some((n) => isFiveBelowParty(n));
+}
+
+/**
+ * Primus booking fields that identify a Five Below delivery / customer.
+ * @param {object|null|undefined} booking Primus booking.
+ * @return {boolean}
+ */
+function bookingRequiresStampedPod(booking) {
+  if (!booking || typeof booking !== "object") return false;
+  const consignee = booking.consignee || {};
+  const shipper = booking.shipper || {};
+  const thirdParty = booking.thirdParty || {};
+  return partyRequiresStampedPod(
+      booking.consigneeName,
+      consignee.name,
+      consignee.customerName,
+      booking.shipperName,
+      shipper.name,
+      booking.thirdPartyName,
+      thirdParty.name,
+      booking.customerName,
+      booking.billToName,
+  );
+}
+
+/**
  * @param {string} subject Email subject.
  * @param {string} body Email body.
  * @return {boolean}
@@ -232,16 +273,17 @@ function looksLikeSignedPodRequest(subject, body) {
 
 /**
  * Pure fulfillment decision for customer POD requests.
- * - special type → Lisa only (no auto-send)
+ * - special type OR Five Below (stamped required) → Lisa only (no auto-send)
  * - generic + Primus has POD → send to customer
  * - generic + no Primus POD → existing missing-POD path
- * @param {object} opts subject, body, hasPodOnPrimus
+ * @param {object} opts subject, body, hasPodOnPrimus, requiresStampedPod
  * @return {"escalate_special"|"send_customer"|"missing_pod"}
  */
 function resolvePodRequestFulfillment(opts) {
   const subject = opts && opts.subject;
   const body = opts && opts.body;
-  if (looksLikeSpecialPodRequest(subject, body)) {
+  if (looksLikeSpecialPodRequest(subject, body) ||
+      (opts && opts.requiresStampedPod)) {
     return "escalate_special";
   }
   if (opts && opts.hasPodOnPrimus) return "send_customer";
@@ -337,6 +379,9 @@ module.exports = {
   looksLikePodRequest,
   looksLikeSpecialPodRequest,
   looksLikeSignedPodRequest,
+  isFiveBelowParty,
+  partyRequiresStampedPod,
+  bookingRequiresStampedPod,
   resolvePodRequestFulfillment,
   aiRejectsPodRequest,
   parseEmailAddressFromHeader,

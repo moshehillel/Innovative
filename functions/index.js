@@ -5600,13 +5600,18 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "(corrected invoice / additional charge). Do not set status error.",
         "If attachment is not a freight invoice, status is error.",
         "Detect Proof of Delivery (POD) and shipment document pages.",
-        "Include in pod.documents every post-invoice page that supports " +
-        "delivery: unsigned POD forms, signed BOL, signed delivery receipt.",
+        "Include in pod.documents EVERY BOL/POD/delivery page that supports " +
+        "delivery — unsigned POD forms, signed BOL, stamped POD, delivery " +
+        "receipt — not only the last signed page. Missing sibling pages is " +
+        "worse than including a duplicate page.",
         "Sources: 'unsigned_pod_template', 'signed_bol', 'signed_load', " +
         "'delivery_receipt', 'signed_pod', 'separate_attachment', " +
         "'last_page_of_invoice', 'same_page_as_invoice'.",
         "When a PDF has invoice + POD form + signed BOL + delivery receipt, " +
         "list ALL of those pages in pod.documents (page order).",
+        "If the carrier attached the same POD twice (duplicate PDFs or " +
+        "duplicate page sets), list both. Prefer a complete (even " +
+        "duplicate) POD over an incomplete single copy.",
         "pod.documents is an array of {source, page, attachmentFilename, " +
         "reason} with 1-based page numbers.",
         "NEVER include a page in pod.documents if it shows the carrier " +
@@ -6620,8 +6625,39 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
             });
       }
 
-      // No unsafe pages present — genuine standalone POD; keep original file.
-      if (droppedInvoicePages === 0) {
+      // Merge any second POD companion the carrier attached (ops: duplicates OK).
+      const extraPods = podUtils.listUnreferencedPodCompanionAttachments(
+          attachments, documents);
+      for (const extra of extraPods) {
+        if (!extra || !extra.storagePath) continue;
+        const [extraBuf] = await getBucket()
+            .file(extra.storagePath).download();
+        const extraDoc = await PDFDocument.load(extraBuf);
+        const extraTexts = await extractPdfPageTexts(extraBuf);
+        const extraCount = extraDoc.getPageCount();
+        let keptExtra = 0;
+        for (let p = 0; p < extraCount; p++) {
+          const verdict = textLooksUnsafeForCustomer(
+              extraTexts ? extraTexts[p] : null, invoice.invoiceAmount);
+          if (verdict.unsafe) continue;
+          const [keep] = await cleanDoc.copyPages(extraDoc, [p]);
+          cleanDoc.addPage(keep);
+          keptExtra++;
+        }
+        if (keptExtra > 0) {
+          keptPages += keptExtra;
+          await writeLog("info", "workflow",
+              "POD separate_attachment kept duplicate companion", {
+                invoiceId,
+                loadNumber: invoice.loadNumber,
+                filename: extra.filename,
+                keptPages: keptExtra,
+              });
+        }
+      }
+
+      // No unsafe pages and no extras — keep the original file as-is.
+      if (droppedInvoicePages === 0 && extraPods.length === 0) {
         return {
           storagePath: podAtt.storagePath,
           source: "separate_attachment",
@@ -6633,7 +6669,7 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
         };
       }
 
-      // Combined invoice+POD: save the cost-free subset only.
+      // Combined invoice+POD and/or merged duplicates: save clean packet.
       const cleanBytes = await cleanDoc.save();
       const cleanPath = await savePodPdfBytes(
           invoiceId, "pod.pdf", cleanBytes);
@@ -6645,13 +6681,14 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
             keptPages,
             droppedInvoicePages,
             droppedReasons,
+            duplicateCompanions: extraPods.length,
           });
       return {
         storagePath: cleanPath,
-        source: "separate_attachment",
+        source: extraPods.length ? "multi" : "separate_attachment",
         files: [{
           storagePath: cleanPath,
-          source: "separate_attachment",
+          source: extraPods.length ? "multi" : "separate_attachment",
           page: null,
         }],
       };
@@ -6747,6 +6784,53 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       }
     }
 
+    // Carrier sometimes attaches the POD twice. Keep unreferenced companion
+    // PDFs (complete duplicate preferred over dropping pages).
+    const extraPods = podUtils.listUnreferencedPodCompanionAttachments(
+        attachments, documents);
+    for (const podAtt of extraPods) {
+      if (!podAtt || !podAtt.storagePath) continue;
+      if (!bufferCache.has(podAtt.storagePath)) {
+        const [fileBuffer] = await getBucket()
+            .file(podAtt.storagePath).download();
+        bufferCache.set(podAtt.storagePath, fileBuffer);
+      }
+      const fileBuffer = bufferCache.get(podAtt.storagePath);
+      const srcDoc = await PDFDocument.load(fileBuffer);
+      if (!textCache.has(podAtt.storagePath)) {
+        textCache.set(podAtt.storagePath,
+            await extractPdfPageTexts(fileBuffer));
+      }
+      const pageTexts = textCache.get(podAtt.storagePath);
+      const srcPageCount = srcDoc.getPageCount();
+      let keptFromExtra = 0;
+      for (let p = 0; p < srcPageCount; p++) {
+        const verdict = textLooksUnsafeForCustomer(
+            pageTexts ? pageTexts[p] : null, invoice.invoiceAmount);
+        if (verdict.unsafe) continue;
+        const [keep] = await mergedDoc.copyPages(srcDoc, [p]);
+        mergedDoc.addPage(keep);
+        keptFromExtra++;
+      }
+      if (keptFromExtra > 0) {
+        files.push({
+          storagePath: podAtt.storagePath,
+          source: "duplicate_pod_companion",
+          page: null,
+          filename: podAtt.filename,
+          pageCount: keptFromExtra,
+        });
+        await writeLog("info", "workflow",
+            "POD extraction kept duplicate companion attachment", {
+              invoiceId,
+              loadNumber: invoice.loadNumber,
+              filename: podAtt.filename,
+              keptPages: keptFromExtra,
+              srcPageCount,
+            });
+      }
+    }
+
     if (files.length === 0) {
       await writeLog("warn", "workflow",
           "POD was detected but no pages could be extracted", {
@@ -6757,8 +6841,10 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
       return null;
     }
 
+    const hadDuplicateCompanion = files.some(
+        (f) => f && f.source === "duplicate_pod_companion");
     let combinedPath = files[0].storagePath;
-    if (files.length > 1) {
+    if (files.length > 1 || hadDuplicateCompanion) {
       const combinedBytes = await mergedDoc.save();
       combinedPath = await savePodPdfBytes(invoiceId, "pod.pdf", combinedBytes);
     }
@@ -6773,7 +6859,8 @@ async function maybeExtractPodOnlyPdf(invoiceId, invoice) {
 
     return {
       storagePath: combinedPath,
-      source: files.length > 1 ? "multi" : files[0].source,
+      source: (files.length > 1 || hadDuplicateCompanion) ?
+        "multi" : files[0].source,
       files,
     };
   } catch (error) {
@@ -7164,15 +7251,23 @@ async function notifyLisaSignedPodRequest(opts) {
     proNumber,
     requesterEmail,
     emailBody,
+    escalateReason,
   } = opts || {};
   const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
+  const fiveBelow = escalateReason === "five_below_stamp";
+  const whyHtml = fiveBelow ?
+    `This load delivers to <strong>Five Below</strong>, which requires a ` +
+    `<strong>stamped POD</strong>. Jerry did not auto-send a generic ` +
+    `Primus POD — please obtain the stamped POD and ` +
+    `<strong>reply to the customer</strong>.` :
+    `A customer requested a <strong>specific type of POD</strong> ` +
+    `(e.g. stamped, signed, notarized). Jerry did not auto-send the ` +
+    `Primus POD — please obtain the requested document and ` +
+    `<strong>reply to the customer</strong>.`;
   const html =
     `<p>Hi Lisa,</p>` +
-    `<p>A customer requested a <strong>specific type of POD</strong> ` +
-    `(e.g. stamped, signed, notarized) on load ` +
-    `<strong>${escapeHtml(String(loadNumber || "—"))}</strong>. ` +
-    `Jerry did not auto-send the Primus POD — please obtain the requested ` +
-    `document and <strong>reply to the customer</strong>.</p>` +
+    `<p>${whyHtml} Load ` +
+    `<strong>${escapeHtml(String(loadNumber || "—"))}</strong>.</p>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
     `<tr><td style="padding:4px 16px 4px 0;font-weight:600">From</td>` +
     `<td>${escapeHtml(from || "—")}</td></tr>` +
@@ -7203,19 +7298,22 @@ async function notifyLisaSignedPodRequest(opts) {
         loadNumber,
         proNumber: proNumber || null,
         requesterEmail,
+        escalateReason: escalateReason || "special_pod_type",
         to: lisa,
       });
 
   await dashboardTasks.createDashboardTask(db, {
     tenantId: (opts && opts.tenant && opts.tenant.tenantId) || "default",
     type: dashboardTasks.TASK_TYPE.SIGNED_POD,
-    title: `Special POD requested — Load ${loadNumber || "—"}`,
+    title: fiveBelow ?
+      `Five Below stamped POD — Load ${loadNumber || "—"}` :
+      `Special POD requested — Load ${loadNumber || "—"}`,
     description: requesterEmail ?
       `Reply to ${requesterEmail}` : null,
     loadNumber: loadNumber || null,
     proNumber: proNumber || null,
     messageId: messageId || null,
-    reason: "signed_pod_request",
+    reason: fiveBelow ? "five_below_stamp" : "signed_pod_request",
   });
 
   return {ok: true, sent: true, to: lisa};
@@ -7380,6 +7478,7 @@ async function handlePodRequestEmail(opts) {
       requesterEmail,
       emailBody,
       tenant,
+      escalateReason: "special_pod_type",
     });
     return {
       handled: true,
@@ -7410,6 +7509,28 @@ async function handlePodRequestEmail(opts) {
       messageId, loadNumber,
     });
     return {handled: false};
+  }
+
+  // Five Below deliveries require a stamped POD — Lisa replies; do not
+  // auto-send a generic Primus POD as if it satisfied the stamp rule.
+  if (podRequestIntake.bookingRequiresStampedPod(booking)) {
+    await notifyLisaSignedPodRequest({
+      messageId,
+      subject,
+      from,
+      loadNumber,
+      proNumber,
+      requesterEmail,
+      emailBody,
+      tenant,
+      escalateReason: "five_below_stamp",
+    });
+    return {
+      handled: true,
+      status: "five_below_stamp_escalated",
+      loadNumber,
+      escalatedToLisa: true,
+    };
   }
 
   if (!requesterEmail) {

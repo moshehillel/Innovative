@@ -60,6 +60,25 @@ check("generic+no POD → missing_pod (existing path)",
       body: "Please send the POD",
       hasPodOnPrimus: false,
     }) === "missing_pod");
+check("Five Below party detected",
+    pri.isFiveBelowParty("Five Below #1234"));
+check("non-Five Below party ignored",
+    !pri.isFiveBelowParty("Walmart Supercenter"));
+check("booking consignee Five Below requires stamp",
+    pri.bookingRequiresStampedPod({consigneeName: "FIVE BELOW STORE 882"}));
+check("booking nested consignee Five Below requires stamp",
+    pri.bookingRequiresStampedPod({
+      consignee: {name: "Five Below"},
+    }));
+check("unrelated booking does not require stamp",
+    !pri.bookingRequiresStampedPod({consigneeName: "Target DC"}));
+check("Five Below stamp flag → escalate_special even with Primus POD",
+    pri.resolvePodRequestFulfillment({
+      subject: "POD for load 264091",
+      body: "Please send the POD",
+      hasPodOnPrimus: true,
+      requiresStampedPod: true,
+    }) === "escalate_special");
 check("parse angle email",
     pri.parseEmailAddressFromHeader("Jane <jane@example.com>") ===
     "jane@example.com");

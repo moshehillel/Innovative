@@ -271,6 +271,12 @@ function normalizeDocumentEntries(documents, fallbackFilename) {
 }
 
 /**
+ * Fills sibling POD/BOL pages the classifier skipped.
+ * - Gaps between the first and last listed page (middle BOL pages)
+ * - Pages after the last listed page (existing trailing behavior)
+ * - For dedicated POD companion PDFs, also pages before the first listed
+ *   page (complete packet). Never back-fills into combined invoice PDFs —
+ *   that used to pull rate-confirmation pages between the bill and BOL.
  * @param {Array<object>} documents POD document entries.
  * @param {number|null} pageCount Total PDF page count when known.
  * @param {string} attachmentFilename Attachment filename.
@@ -282,35 +288,107 @@ function enrichPodDocumentsWithTrailingPages(
     attachmentFilename,
 ) {
   const totalPages = Number(pageCount);
-  if (!Number.isFinite(totalPages) || totalPages <= 1) {
+  if (!Number.isFinite(totalPages) || totalPages < 1) {
     return documents;
   }
 
+  const fileName = String(attachmentFilename || "").trim();
+  const dedicatedPod = looksLikePodCompanionFilename(fileName);
   const listedPages = documents
       .map((d) => Number(d.page))
-      .filter((p) => p > 0);
+      .filter((p) => p > 0 && p <= totalPages);
+
   if (listedPages.length === 0) {
-    return documents;
+    // Standalone POD.pdf with no page list — keep the whole packet.
+    if (!dedicatedPod || totalPages < 1) return documents;
+    return Array.from({length: totalPages}, (_, i) => ({
+      source: "signed_bol",
+      page: i + 1,
+      attachmentFilename: fileName,
+      reason: "[auto-included] full dedicated POD companion pages",
+    }));
   }
 
+  const firstListed = Math.min(...listedPages);
   const lastListed = Math.max(...listedPages);
   const listed = new Set(listedPages);
   const enriched = [...documents];
 
-  for (let page = lastListed + 1; page <= totalPages; page++) {
-    if (listed.has(page)) continue;
+  const pushPage = (page, source, reason) => {
+    if (listed.has(page)) return;
     enriched.push({
-      source: "unsigned_pod_template",
+      source,
       page,
-      attachmentFilename,
-      reason: "[auto-included] POD page after last classified page",
+      attachmentFilename: fileName ||
+        (documents[0] && documents[0].attachmentFilename) || "",
+      reason,
     });
     listed.add(page);
+  };
+
+  // Sibling pages between classified POD/BOL pages (ops: upload ALL pages).
+  for (let page = firstListed + 1; page < lastListed; page++) {
+    pushPage(
+        page,
+        "unsigned_pod_template",
+        "[auto-included] POD/BOL page between classified pages",
+    );
+  }
+
+  // Leading pages of a dedicated POD companion (never for invoice PDFs).
+  if (dedicatedPod) {
+    for (let page = 1; page < firstListed; page++) {
+      pushPage(
+          page,
+          "signed_bol",
+          "[auto-included] leading page of dedicated POD companion",
+      );
+    }
+  }
+
+  for (let page = lastListed + 1; page <= totalPages; page++) {
+    pushPage(
+        page,
+        "unsigned_pod_template",
+        "[auto-included] POD page after last classified page",
+    );
   }
 
   return enriched.sort(
       (a, b) => (Number(a.page) || 0) - (Number(b.page) || 0),
   );
+}
+
+/**
+ * Extra POD companion PDFs on the invoice that the classifier did not list
+ * in pod.documents (e.g. carrier emailed the POD twice). Prefer keeping a
+ * complete duplicate over dropping pages.
+ * @param {Array<object>|null|undefined} attachments Invoice attachments.
+ * @param {Array<object>|null|undefined} documents Already-selected POD docs.
+ * @return {Array<object>} Attachment objects not referenced by documents.
+ */
+function listUnreferencedPodCompanionAttachments(attachments, documents) {
+  const docs = Array.isArray(documents) ? documents : [];
+  const referenced = new Set();
+  for (const doc of docs) {
+    const key = normalizeAttachmentFilenameKey(
+        doc && doc.attachmentFilename);
+    if (key) referenced.add(key);
+  }
+  const list = Array.isArray(attachments) ? attachments : [];
+  const out = [];
+  const seen = new Set();
+  for (const att of list) {
+    if (!att || !att.storagePath || !att.filename) continue;
+    const key = normalizeAttachmentFilenameKey(att.filename);
+    if (!key || seen.has(key) || referenced.has(key)) continue;
+    const isPodType = String(att.docType || "").toUpperCase() === "POD";
+    const isPodName = looksLikePodCompanionFilename(att.filename);
+    if (!isPodType && !isPodName) continue;
+    seen.add(key);
+    out.push(att);
+  }
+  return out;
 }
 
 /**
@@ -987,11 +1065,16 @@ function buildPodClassifierRules(options = {}) {
 
   const rules = [
     "Detect Proof of Delivery (POD) and shipment document pages.",
-    "Include in pod.documents every post-invoice page that supports " +
-    "delivery: unsigned POD forms, signed BOL, signed delivery receipt.",
+    "Include in pod.documents EVERY BOL/POD/delivery page that supports " +
+    "delivery — unsigned POD forms, signed BOL, stamped POD, delivery " +
+    "receipt — not only the last signed page. Missing sibling pages is " +
+    "worse than including a duplicate page.",
     `Sources: ${sources.join(", ")}.`,
     "When a PDF has invoice + POD form + signed BOL + delivery receipt, " +
     "list ALL of those pages in pod.documents (page order).",
+    "If the carrier attached the same POD twice (duplicate PDFs or " +
+    "duplicate page sets), list both attachments / page sets. Prefer a " +
+    "complete (even duplicate) POD over an incomplete single copy.",
     "pod.documents is an array of {source, page, attachmentFilename, " +
     "reason, cropFromBottom} with 1-based page numbers.",
     "NEVER include a page in pod.documents if it shows the carrier " +
@@ -1624,6 +1707,7 @@ module.exports = {
   normalizePodDocEntry,
   normalizeDocumentEntries,
   enrichPodDocumentsWithTrailingPages,
+  listUnreferencedPodCompanionAttachments,
   normalizePodData,
   normalizePodFromClassification,
   coercePodDocuments,

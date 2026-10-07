@@ -110,5 +110,86 @@ const wrong = podUtils.resolvePodAttachment(
 check("without recovery, falls back to sole invoice PDF",
     wrong && wrong.filename, "INV-MAV-INNOV-26.pdf");
 
+// Ops: upload ALL BOL/POD pages — fill gaps + trailing; dedicated POD
+// companions also keep leading pages the classifier skipped.
+const gapFilled = podUtils.enrichPodDocumentsWithTrailingPages(
+    [
+      {
+        source: "unsigned_pod_template",
+        page: 2,
+        attachmentFilename: "carrier-invoice-packet.pdf",
+        reason: "form",
+      },
+      {
+        source: "signed_bol",
+        page: 4,
+        attachmentFilename: "carrier-invoice-packet.pdf",
+        reason: "signed",
+      },
+    ],
+    5,
+    "carrier-invoice-packet.pdf",
+);
+check("fills gap page between classified POD pages",
+    gapFilled.map((d) => d.page),
+    [2, 3, 4, 5]);
+
+const companionFilled = podUtils.normalizePodData({
+  found: true,
+  documents: [{
+    source: "signed_bol",
+    page: 3,
+    attachmentFilename: "MAV-INNOV-26-POD.pdf",
+    reason: "last signed only",
+  }],
+}, {pageCount: 3, attachmentFilename: "MAV-INNOV-26-POD.pdf"});
+check("dedicated POD companion keeps leading + listed pages",
+    companionFilled.documents.map((d) => d.page),
+    [1, 2, 3]);
+
+const invoiceOnlyLast = podUtils.normalizePodData({
+  found: true,
+  documents: [{
+    source: "delivery_receipt",
+    page: 3,
+    attachmentFilename: "carrier-invoice.pdf",
+    reason: "signed last page only",
+  }],
+}, {pageCount: 3, attachmentFilename: "carrier-invoice.pdf"});
+check("combined invoice PDF does not back-fill before first POD page",
+    invoiceOnlyLast.documents.map((d) => d.page),
+    [3]);
+
+const dupPods = podUtils.listUnreferencedPodCompanionAttachments(
+    [
+      {
+        filename: "INV-MAV.pdf",
+        storagePath: "a/inv.pdf",
+        docType: "INVOICE",
+      },
+      {
+        filename: "MAV-INNOV-26-POD.pdf",
+        storagePath: "a/pod1.pdf",
+        docType: "POD",
+      },
+      {
+        filename: "MAV-INNOV-26-POD-copy.pdf",
+        storagePath: "a/pod2.pdf",
+        docType: "POD",
+      },
+    ],
+    [{
+      source: "signed_bol",
+      page: 1,
+      attachmentFilename: "MAV-INNOV-26-POD.pdf",
+    }],
+);
+check("lists second POD companion as unreferenced duplicate",
+    dupPods.map((a) => a.filename),
+    ["MAV-INNOV-26-POD-copy.pdf"]);
+check("second POD companion filename still looks like POD",
+    podUtils.looksLikePodCompanionFilename("MAV-INNOV-26-POD-copy.pdf"),
+    true);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);
