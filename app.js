@@ -6,17 +6,19 @@
     document.getElementById("dashboardTitle").textContent =
       "Dashboard not configured";
     document.getElementById("dashboardMain").innerHTML =
-      '<p class="error-banner">Missing window.DASHBOARD_CONFIG in config.js.</p>';
+      '<p class="banner banner-danger">Missing window.DASHBOARD_CONFIG in config.js.</p>';
     return;
   }
 
   document.title = `${client.name} — Jerry`;
-  // Keep the hero brand as "Jerry"; client name lives in the brand mark.
 
   const BASE_URL = client.functionsBaseUrl;
   const TENANT_ID = client.tenantId || "default";
   const TMS = (client.tms || "primus").toLowerCase();
   const tenantQuery = `tenantId=${encodeURIComponent(TENANT_ID)}`;
+  const TASK_PAGE = 50;
+  const INVOICE_PAGE_SIZE = 20;
+  const HIGH_DOLLAR = 250;
 
   const CHARGE_LABELS = {
     a: "A — Pay + bill customer (auto-email)",
@@ -35,7 +37,7 @@
     connectBtn: document.getElementById("connectGmailBtn"),
     disconnectBtn: document.getElementById("disconnectGmailBtn"),
     runResultBanner: document.getElementById("runResultBanner"),
-    rangeBtns: Array.from(document.querySelectorAll(".range-btn")),
+    rangeBtns: Array.from(document.querySelectorAll(".segmented-btn, .range-btn")),
     statInvoices: document.getElementById("statInvoices"),
     statWorkflows: document.getElementById("statWorkflows"),
     statAddedCharges: document.getElementById("statAddedCharges"),
@@ -52,14 +54,26 @@
     invoicesLoadMoreWrap: document.getElementById("invoicesLoadMoreWrap"),
     loadMoreInvoicesBtn: document.getElementById("loadMoreInvoicesBtn"),
     tasksContainer: document.getElementById("tasksContainer"),
+    tasksLoadMoreWrap: document.getElementById("tasksLoadMoreWrap"),
+    loadMoreTasksBtn: document.getElementById("loadMoreTasksBtn"),
     taskCountBadge: document.getElementById("taskCountBadge"),
     notifCountBadge: document.getElementById("notifCountBadge"),
     notificationsContainer: document.getElementById("notificationsContainer"),
+    notifsLoadMoreWrap: document.getElementById("notifsLoadMoreWrap"),
+    loadMoreNotifsBtn: document.getElementById("loadMoreNotifsBtn"),
     opsPrimaryHint: document.getElementById("opsPrimaryHint"),
-    tabBtns: Array.from(document.querySelectorAll(".ops-tab")),
+    tabBtns: Array.from(document.querySelectorAll(".workspace-tab, .ops-tab")),
     tabPanelTasks: document.getElementById("tabPanelTasks"),
     tabPanelInvoices: document.getElementById("tabPanelInvoices"),
     tabPanelNotifications: document.getElementById("tabPanelNotifications"),
+    dispatcherFolders: document.getElementById("dispatcherFolders"),
+    workspaceSearch: document.getElementById("workspaceSearch"),
+    workspaceSort: document.getElementById("workspaceSort"),
+    drawer: document.getElementById("detailDrawer"),
+    drawerTitle: document.getElementById("drawerTitle"),
+    drawerKicker: document.getElementById("drawerKicker"),
+    drawerBody: document.getElementById("drawerBody"),
+    drawerFooter: document.getElementById("drawerFooter"),
   };
 
   let chart = null;
@@ -68,26 +82,36 @@
   let openNotifCount = 0;
   let connectedMailboxEmail = null;
   let statsTotals = null;
-  const INVOICE_PAGE_SIZE = 20;
   let invoiceOffset = 0;
   let invoiceHasMore = false;
-  let statsInFlight = null;
+  let invoiceGroup = "open";
   let invoicesInFlight = null;
+  let statsInFlight = null;
   let activeTab = "tasks";
-  let chargeFormTaskId = null;
+  let ownerBucket = "accounting";
+  let dispatcherKey = null;
+  let taskOffset = 0;
+  let taskHasMore = false;
+  let tasksCache = [];
+  let bucketCounts = {accounting: {}, sarah: {}, dispatch: {}};
+  let dispatchers = [];
+  let notifOffset = 0;
+  let notifHasMore = false;
+  let notifsCache = [];
+  let readNotifIds = new Set(
+      JSON.parse(localStorage.getItem("jerryReadNotifs") || "[]"));
+  let drawerItem = null;
+  let drawerKind = null;
 
   if (els.tmsBadge) {
     els.tmsBadge.hidden = false;
     els.tmsBadge.textContent = TMS === "tai" ? "TAI TMS" : "Primus TMS";
-    els.tmsBadge.className = `tms-badge tms-${TMS}`;
   }
   if (els.tenantLabel) {
     els.tenantLabel.hidden = false;
-    els.tenantLabel.textContent = `Tenant: ${TENANT_ID}`;
+    els.tenantLabel.textContent = `Tenant ${TENANT_ID}`;
   }
-  if (els.taiHintBanner && TMS === "tai") {
-    els.taiHintBanner.hidden = false;
-  }
+  if (els.taiHintBanner && TMS === "tai") els.taiHintBanner.hidden = false;
 
   function setButtonBusy(btn, busy, busyText, idleText) {
     if (!btn) return;
@@ -104,9 +128,7 @@
   }
 
   function setRangeButtonsDisabled(disabled) {
-    els.rangeBtns.forEach((btn) => {
-      btn.disabled = disabled;
-    });
+    els.rangeBtns.forEach((btn) => { btn.disabled = disabled; });
   }
 
   function showRunResult(message, isError) {
@@ -115,16 +137,15 @@
     if (!message) {
       banner.hidden = true;
       banner.textContent = "";
-      banner.classList.remove("is-error", "is-success");
       return;
     }
     banner.hidden = false;
     banner.textContent = message;
-    banner.classList.toggle("is-error", !!isError);
-    banner.classList.toggle("is-success", !isError);
+    banner.className = isError ? "banner banner-danger" : "banner banner-success";
   }
 
   function showError(message) {
+    if (!els.errorBanner) return;
     if (!message) {
       els.errorBanner.hidden = true;
       els.errorBanner.textContent = "";
@@ -135,60 +156,56 @@
   }
 
   function bodyEsc(text) {
-    return String(text ?? "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
-
-  function formatLogTime(ts) {
-    if (!ts) return "—";
-    const d = new Date(ts);
-    return isNaN(d) ? ts : d.toLocaleString(undefined, {
-      month: "short", day: "numeric",
-      hour: "2-digit", minute: "2-digit",
-    });
+    return String(text == null ? "" : text)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
   }
 
   function formatMoney(value) {
     const n = Number(value);
     if (!Number.isFinite(n)) return "—";
-    return `$${n.toFixed(2)}`;
+    return `$${n.toLocaleString(undefined, {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
   }
 
-  function statusClass(status) {
-    const s = String(status || "").toLowerCase();
-    if (s === "completed") return "status-completed";
-    if (s === "running") return "status-running";
-    if (s === "waiting_manual" || s === "failed") return "status-attention";
-    return "status-neutral";
+  function formatLogTime(iso) {
+    if (!iso) return "—";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    return d.toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    });
+  }
+
+  function shortText(value, max) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return "";
+    if (text.length <= max) return text;
+    return text.slice(0, max - 1).trimEnd() + "…";
   }
 
   function todayEasternIsoDate() {
-    return new Date().toLocaleDateString("en-CA", {
-      timeZone: "America/New_York",
-    });
+    return new Date().toLocaleDateString("en-CA", {timeZone: "America/New_York"});
   }
 
   async function fetchJson(path) {
     const sep = path.includes("?") ? "&" : "?";
-    const response = await fetch(`${BASE_URL}${path}${sep}${tenantQuery}`);
-    if (!response.ok) {
-      throw new Error(`Request to ${path} failed (${response.status})`);
-    }
-    return response.json();
+    const res = await fetch(`${BASE_URL}${path}${sep}${tenantQuery}`);
+    if (!res.ok) throw new Error(`Request failed (${res.status})`);
+    return res.json();
   }
 
   async function postJson(path, body) {
-    const response = await fetch(`${BASE_URL}${path}?${tenantQuery}`, {
+    const res = await fetch(`${BASE_URL}${path}?${tenantQuery}`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({...(body || {}), tenantId: TENANT_ID}),
+      body: JSON.stringify(body || {}),
     });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(data.error || `Request to ${path} failed (${response.status})`);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.ok === false) {
+      throw new Error(data.error || data.details || `Request failed (${res.status})`);
     }
     return data;
   }
@@ -205,11 +222,12 @@
       invoices: els.tabPanelInvoices,
       notifications: els.tabPanelNotifications,
     };
-    Object.entries(panels).forEach(([key, panel]) => {
+    Object.keys(panels).forEach((key) => {
+      const panel = panels[key];
       if (!panel) return;
       const on = key === tab;
-      panel.classList.toggle("is-active", on);
       panel.hidden = !on;
+      panel.classList.toggle("is-active", on);
     });
     if (els.refreshTasksBtn) els.refreshTasksBtn.hidden = tab !== "tasks";
     if (els.refreshInvoicesBtn) els.refreshInvoicesBtn.hidden = tab !== "invoices";
@@ -220,202 +238,255 @@
     btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
 
-  async function exportLogsCsvForSelectedDay() {
-    const day = els.logExportDate && els.logExportDate.value;
-    if (!day) {
-      showError("Pick a date to export.");
-      return;
-    }
-    setButtonBusy(els.exportLogsCsvBtn, true, "Exporting…");
-    showError("");
-    try {
-      const url =
-        `${BASE_URL}/exportLogsCsv?${tenantQuery}&date=${encodeURIComponent(day)}`;
-      const response = await fetch(url);
-      if (!response.ok) {
-        let errMsg = `Export failed (${response.status})`;
-        try {
-          const errJson = await response.json();
-          if (errJson.error) errMsg = errJson.error;
-        } catch (_) { /* ignore */ }
-        throw new Error(errMsg);
-      }
-      const blob = await response.blob();
-      let filename = `jerry-logs-${day}.csv`;
-      const disposition = response.headers.get("Content-Disposition");
-      const match = disposition && disposition.match(/filename="([^"]+)"/);
-      if (match) filename = match[1];
-      const objectUrl = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = objectUrl;
-      link.download = filename;
-      link.click();
-      URL.revokeObjectURL(objectUrl);
-    } catch (error) {
-      showError(error.message || "Could not export logs.");
-    } finally {
-      setButtonBusy(els.exportLogsCsvBtn, false);
-    }
-  }
-
+  /* —— Mail status —— */
   async function loadMailStatus() {
     try {
       const data = await fetchJson("/getMailStatus");
-      const provider = data.provider === "gmail" ? "Gmail" : "Outlook";
-      connectedMailboxEmail = data.connectedEmail || null;
-      if (data.connected) {
-        els.badge.textContent = `${provider} connected`;
-        els.badge.className = "badge badge-connected";
-        els.connectBtn.textContent = `Reconnect ${provider}`;
-        els.disconnectBtn.hidden = false;
-        if (els.connectedMailbox && connectedMailboxEmail) {
-          const name = data.connectedDisplayName ?
-            `${data.connectedDisplayName} · ` : "";
-          els.connectedMailbox.textContent =
-            `${name}${connectedMailboxEmail}`;
-          els.connectedMailbox.hidden = false;
-        }
-      } else {
-        els.badge.textContent = `${provider} not connected`;
-        els.badge.className = "badge badge-disconnected";
-        els.connectBtn.textContent = `Connect ${provider}`;
-        els.disconnectBtn.hidden = true;
-        connectedMailboxEmail = null;
-        if (els.connectedMailbox) els.connectedMailbox.hidden = true;
+      const connected = Boolean(data.connected);
+      connectedMailboxEmail = data.email || null;
+      els.badge.textContent = connected ? "Outlook connected" : "Outlook disconnected";
+      els.badge.className = connected ?
+        "status-pill status-pill-success badge-connected" :
+        "status-pill status-pill-danger badge-disconnected";
+      if (els.connectedMailbox) {
+        els.connectedMailbox.hidden = !connectedMailboxEmail;
+        els.connectedMailbox.textContent = connectedMailboxEmail || "";
       }
-    } catch (error) {
-      els.badge.textContent = "Status unavailable";
-      els.badge.className = "badge badge-unknown";
-      console.error("loadMailStatus failed:", error);
+      if (els.connectBtn) els.connectBtn.hidden = connected;
+      if (els.disconnectBtn) els.disconnectBtn.hidden = !connected;
+    } catch (_) {
+      els.badge.textContent = "Outlook unknown";
+      els.badge.className = "status-pill status-pill-muted badge-unknown";
     }
   }
 
-  function taskTypeLabel(type) {
-    return String(type || "task").replace(/_/g, " ");
+  /* —— Email HTML helpers —— */
+  function looksLikeHtml(value) {
+    return /<\/?[a-z][\s\S]*>/i.test(String(value || ""));
   }
 
-  function isAdditionalChargeTask(task) {
-    return task.type === "additional_charge" ||
-      task.source === "additionalCharges";
+  function decodeHtmlEntities(value) {
+    const ta = document.createElement("textarea");
+    let s = String(value || "");
+    for (let i = 0; i < 3; i++) {
+      if (!/&(?:#\d+|#x[0-9a-f]+|[a-z]+);/i.test(s)) break;
+      ta.innerHTML = s;
+      const next = ta.value;
+      if (next === s) break;
+      s = next;
+    }
+    return s;
+  }
+
+  function emailBodyAsHtml(rawBody) {
+    let s = String(rawBody || "").trim();
+    if (!s) return "";
+    if (!looksLikeHtml(s) && /&(?:nbsp|lt|gt|amp|#\d+);/i.test(s)) {
+      s = decodeHtmlEntities(s);
+    }
+    if (looksLikeHtml(s)) {
+      return s.replace(/<script[\s\S]*?<\/script>/gi, "");
+    }
+    return `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
+      `${bodyEsc(s)}</pre>`;
+  }
+
+  function frameDoc(html) {
+    return "<!doctype html><html><head><meta charset=\"utf-8\">" +
+      "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
+      "<base target=\"_blank\" rel=\"noopener\">" +
+      "<style>html,body{margin:0;padding:0;background:#fff}" +
+      "body{margin:0 auto;padding:22px 24px 28px;max-width:720px;" +
+      "font-family:'DM Sans',Segoe UI,sans-serif;font-size:15px;line-height:1.65;" +
+      "color:#1a2430;word-wrap:break-word;overflow-wrap:anywhere}" +
+      "p{margin:0 0 1em} table{border-collapse:collapse;max-width:100%}" +
+      "td,th{padding:.35em .65em;vertical-align:top}" +
+      "img{max-width:100%;height:auto}</style></head><body>" +
+      html + "</body></html>";
+  }
+
+  /* —— Drawer —— */
+  function closeDrawer() {
+    if (!els.drawer) return;
+    els.drawer.hidden = true;
+    els.drawer.setAttribute("aria-hidden", "true");
+    drawerItem = null;
+    drawerKind = null;
+  }
+
+  function openDrawer(kind, item, title, kicker, bodyHtml, footerHtml) {
+    drawerKind = kind;
+    drawerItem = item;
+    els.drawerTitle.textContent = title || "Details";
+    els.drawerKicker.textContent = kicker || "";
+    els.drawerBody.innerHTML = bodyHtml || "";
+    els.drawerFooter.innerHTML = footerHtml || "";
+    els.drawer.hidden = false;
+    els.drawer.setAttribute("aria-hidden", "false");
+    const frame = els.drawerBody.querySelector(".notif-body-frame");
+    if (frame && item) {
+      const html = emailBodyAsHtml(item.body || item.description || "");
+      if (html) frame.srcdoc = frameDoc(html);
+    }
+    bindDrawerActions();
+  }
+
+  document.querySelectorAll("[data-drawer-close]").forEach((el) => {
+    el.addEventListener("click", closeDrawer);
+  });
+
+  function detailCells(pairs) {
+    return `<dl class="detail-grid">${pairs.filter((p) => p[1] != null && p[1] !== "")
+        .map(([k, v]) =>
+          `<div class="detail-cell"><dt>${bodyEsc(k)}</dt><dd>${v}</dd></div>`)
+        .join("")}</dl>`;
+  }
+
+  function taskTypeMeta(task) {
+    const t = String(task.type || "");
+    const reason = String(task.reason || "").toLowerCase();
+    if (t === "additional_charge") {
+      return {label: "Additional Charge", cls: "type-badge-charge"};
+    }
+    if (t === "pod_discrepancy") {
+      if (/damage/i.test(reason)) {
+        return {label: "Damaged POD", cls: "type-badge-pod"};
+      }
+      if (/shortage|missing carton/i.test(reason)) {
+        return {label: "Shortage", cls: "type-badge-pod"};
+      }
+      return {label: "POD Discrepancy", cls: "type-badge-pod"};
+    }
+    if (t === "signed_pod") {
+      return {label: "Signed POD", cls: "type-badge-signed"};
+    }
+    if (/missing/i.test(reason)) {
+      return {label: "Missing Information", cls: "type-badge-review"};
+    }
+    return {label: "Review", cls: "type-badge-review"};
   }
 
   function renderChargeButtons(task) {
-    if (!isAdditionalChargeTask(task) || !task.invoiceId) return "";
-    const legend = ["a", "b", "c", "d", "e"].map((opt) =>
-      `<li><strong>${opt.toUpperCase()}</strong> ${bodyEsc(CHARGE_LABELS[opt].replace(/^[A-E]\s*[—-]\s*/, ""))}</li>`
-    ).join("");
-    const opts = ["a", "b", "c", "d", "e"].map((opt) =>
-      `<button type="button" class="btn btn-outline btn-sm charge-opt" ` +
-      `data-charge-opt="${opt}" data-invoice="${bodyEsc(task.invoiceId)}" ` +
-      `data-task-id="${bodyEsc(task.id)}" data-task-source="${bodyEsc(task.source || "dashboardTasks")}" ` +
-      `title="${bodyEsc(CHARGE_LABELS[opt])}">${opt.toUpperCase()}</button>`
-    ).join("");
-    return `<div class="charge-block" data-charge-row="${bodyEsc(task.id)}">` +
-      `<p class="charge-legend-title">Choose an option</p>` +
-      `<ul class="charge-legend">${legend}</ul>` +
-      `<div class="charge-options">${opts}</div>` +
-      `</div>` +
-      `<div class="charge-opt-form" data-charge-form="${bodyEsc(task.id)}" hidden></div>`;
+    if (task.type !== "additional_charge" || !task.invoiceId) return "";
+    return `<div class="charge-opt-grid">` +
+      ["a", "b", "c", "d", "e"].map((opt) =>
+        `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}" ` +
+        `data-invoice="${bodyEsc(task.invoiceId)}" data-task-id="${bodyEsc(task.id)}" ` +
+        `data-task-source="${bodyEsc(task.source || "dashboardTasks")}">` +
+        `${bodyEsc(CHARGE_LABELS[opt])}</button>`).join("") +
+      `</div><div class="charge-form" data-charge-form="${bodyEsc(task.id)}" hidden></div>`;
   }
 
-  function renderTasks(tasks) {
-    openTaskCount = tasks ? tasks.length : 0;
-    if (els.taskCountBadge) {
-      els.taskCountBadge.textContent = String(openTaskCount);
-    }
-
-    if (!tasks || tasks.length === 0) {
-      els.tasksContainer.innerHTML =
-        '<p class="panel-empty">No open tasks — you\'re all caught up.</p>';
-      return;
-    }
-
-    els.tasksContainer.innerHTML = tasks.map((task) => {
-      const subBits = [
-        task.loadNumber ? `Load ${task.loadNumber}` : "",
-        task.carrierName ? shortText(task.carrierName, 28) : "",
-        task.chargesTotal != null && task.chargesTotal !== "" ?
-          formatMoney(task.chargesTotal) : "",
-      ].filter(Boolean).join(" · ");
-      const title = shortText(task.title || "Task", 100);
-      const subject = String(task.subject || task.title || "").trim();
-      const hasEmail = Boolean(task.body || task.description);
-      return `<article class="task-card" data-id="${bodyEsc(task.id)}" data-source="${bodyEsc(task.source || "dashboardTasks")}">
-        <button type="button" class="task-row" aria-expanded="false">
-          <span class="task-title">${bodyEsc(title)}</span>
-          <span class="task-sub">${bodyEsc(subBits)}</span>
-          <time class="task-when">${bodyEsc(formatLogTime(task.createdAt))}</time>
-          <span class="task-chevron" aria-hidden="true"></span>
-        </button>
-        <div class="task-expand" hidden>
-          <div class="notif-email">
-            <div class="notif-email-headers">
-              ${task.to ? `<div><span>To</span><strong>${bodyEsc(task.to)}</strong></div>` : ""}
-              ${task.cc ? `<div><span>Cc</span><strong>${bodyEsc(task.cc)}</strong></div>` : ""}
-              ${subject ? `<div><span>Subject</span><strong>${bodyEsc(subject)}</strong></div>` : ""}
-              ${task.loadNumber ? `<div><span>Load</span><strong>${bodyEsc(task.loadNumber)}</strong></div>` : ""}
-              ${task.carrierName ? `<div><span>Carrier</span><strong>${bodyEsc(task.carrierName)}</strong></div>` : ""}
-            </div>
-            <div class="notif-email-body">
-              ${hasEmail ?
-                renderEmailBodyHtml(task.body || task.description) :
-                '<p class="notif-body-empty">(empty)</p>'}
-            </div>
-          </div>
-          ${renderChargeButtons(task)}
-          <div class="task-actions">
-            <button type="button" class="btn btn-outline btn-sm task-dismiss-btn">Done</button>
-          </div>
-        </div>
-      </article>`;
-    }).join("");
-
-    fillEmailFrames(tasks, els.tasksContainer);
-    bindTaskActions();
+  function openTaskDrawer(task) {
+    const meta = taskTypeMeta(task);
+    const why = task.reason || task.description || task.subject ||
+      "Needs a human decision before billing can continue.";
+    const body =
+      detailCells([
+        ["Load", task.loadNumber ? bodyEsc(task.loadNumber) : "—"],
+        ["Carrier", bodyEsc(task.carrierName || "—")],
+        ["Amount", bodyEsc(formatMoney(task.chargesTotal))],
+        ["Owner", bodyEsc(task.ownerBucket || "—")],
+        ["To", bodyEsc(task.to || "—")],
+        ["Cc", bodyEsc(task.cc || "—")],
+        ["Received", bodyEsc(formatLogTime(task.createdAt))],
+        ["Dispatcher", bodyEsc(task.dispatcherName || task.dispatcherEmail || "—")],
+      ]) +
+      `<div class="why-box"><strong>Why it needs attention:</strong> ${bodyEsc(why)}</div>` +
+      (task.isUrgentOld || task.ageLabel ?
+        `<p><span class="age-badge">URGENT/OLD</span></p>` : "") +
+      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>`;
+    const footer =
+      renderChargeButtons(task) +
+      `<button type="button" class="btn btn-outline btn-sm drawer-dismiss">Done / Resolve</button>`;
+    openDrawer("task", task, task.title || meta.label, meta.label, body, footer);
   }
 
-  function bindTaskActions() {
-    els.tasksContainer.querySelectorAll(".task-row").forEach((row) => {
-      row.addEventListener("click", () => {
-        const card = row.closest(".task-card");
-        const opening = !card.classList.contains("is-open");
-        els.tasksContainer.querySelectorAll(".task-card.is-open").forEach((other) => {
-          if (other === card) return;
-          other.classList.remove("is-open");
-          const otherPanel = other.querySelector(".task-expand");
-          const otherRow = other.querySelector(".task-row");
-          if (otherPanel) otherPanel.hidden = true;
-          if (otherRow) otherRow.setAttribute("aria-expanded", "false");
-        });
-        const panel = card.querySelector(".task-expand");
-        card.classList.toggle("is-open", opening);
-        panel.hidden = !opening;
-        row.setAttribute("aria-expanded", opening ? "true" : "false");
-        if (opening) {
-          card.scrollIntoView({behavior: "smooth", block: "nearest"});
-        }
-      });
-    });
+  function openInvoiceDrawer(inv) {
+    const invoiceAmt = Number(inv.invoiceAmount);
+    const tmsAmt = Number(inv.primusAmount != null ? inv.primusAmount : inv.customerRate);
+    const diff = Number.isFinite(invoiceAmt) && Number.isFinite(tmsAmt) ?
+      invoiceAmt - tmsAmt : null;
+    const why = inv.decisionReason || inv.currentStep ||
+      (inv.isCompleted ? "Workflow completed." : "Still in automation.");
+    const body =
+      detailCells([
+        ["Vendor / Carrier", bodyEsc(inv.carrierName || "—")],
+        ["Customer", bodyEsc(inv.customerName || "—")],
+        ["Load", bodyEsc(inv.loadNumber || "—")],
+        ["PRO", bodyEsc(inv.proNumber || "—")],
+        ["Invoice amount", bodyEsc(formatMoney(inv.invoiceAmount))],
+        ["TMS amount", bodyEsc(formatMoney(
+            inv.primusAmount != null ? inv.primusAmount : inv.customerRate))],
+        ["Difference", diff == null ? "—" : bodyEsc(formatMoney(diff))],
+        ["Status", bodyEsc(inv.displayLabel || inv.displayStatus || "—")],
+        ["Received", bodyEsc(formatLogTime(inv.createdAt))],
+        ["Invoice ID", bodyEsc(inv.id)],
+      ]) +
+      `<div class="why-box"><strong>Automation note:</strong> ${bodyEsc(why)}</div>`;
+    openDrawer("invoice", inv,
+        `Invoice ${inv.loadNumber || inv.id}`,
+        inv.displayLabel || "Invoice",
+        body, "");
+  }
 
-    els.tasksContainer.querySelectorAll(".task-dismiss-btn").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const card = btn.closest(".task-card");
-        setButtonBusy(btn, true, "Dismissing...");
+  function notifSeverity(n) {
+    const t = `${n.type || ""} ${n.reason || ""} ${n.emailType || ""}`.toLowerCase();
+    if (/fail|error|dispute|damage|shortage/.test(t)) return "error";
+    if (/charge|pending|review|action required|missing/.test(t)) return "warn";
+    if (/complete|success|replied/.test(t)) return "success";
+    return "info";
+  }
+
+  function openNotifDrawer(n) {
+    const sev = notifSeverity(n);
+    markNotifRead(n.id);
+    const body =
+      detailCells([
+        ["From", bodyEsc(n.from || "—")],
+        ["To", bodyEsc(n.to || "—")],
+        ["Cc", bodyEsc(n.cc || "—")],
+        ["Subject", bodyEsc(n.subject || n.title || "—")],
+        ["Reason", bodyEsc(n.reason || "—")],
+        ["Load", bodyEsc(n.loadNumber || "—")],
+        ["Carrier", bodyEsc(n.carrierName || "—")],
+        ["Received", bodyEsc(formatLogTime(n.createdAt))],
+      ]) +
+      (n.reason ?
+        `<div class="why-box"><strong>Why review:</strong> ${bodyEsc(n.reason)}</div>` :
+        "") +
+      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>` +
+      `<div class="flag-form" hidden></div><div class="reply-form" hidden></div>`;
+    const unhandled = n.type === "unhandled_email";
+    const footer =
+      `<button type="button" class="btn btn-outline btn-sm notif-dismiss">Done</button>` +
+      `<button type="button" class="btn btn-ghost btn-sm notif-flag">Flag</button>` +
+      (unhandled ?
+        `<button type="button" class="btn btn-outline btn-sm notif-reply">Reply</button>` +
+        `<button type="button" class="btn btn-danger btn-sm notif-delete">Delete</button>` :
+        "") +
+      (n.type === "additional_charge" ?
+        `<button type="button" class="btn btn-primary btn-sm notif-goto-tasks">Open Tasks</button>` :
+        "");
+    openDrawer("notif", n, n.subject || n.title || "Notification",
+        sev.toUpperCase(), body, footer);
+  }
+
+  function bindDrawerActions() {
+    const foot = els.drawerFooter;
+    const body = els.drawerBody;
+    if (!foot || !drawerItem) return;
+
+    foot.querySelectorAll(".drawer-dismiss").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        setButtonBusy(btn, true, "Saving…");
         try {
           await postJson("/dismissDashboardTask", {
-            taskId: card.dataset.id,
-            source: card.dataset.source,
+            taskId: drawerItem.id,
+            source: drawerItem.source,
           });
-          card.remove();
-          openTaskCount = els.tasksContainer.querySelectorAll(".task-card").length;
-          if (els.taskCountBadge) {
-            els.taskCountBadge.textContent = String(openTaskCount);
-          }
-          if (!openTaskCount) {
-            els.tasksContainer.innerHTML =
-              '<p class="panel-empty">No open tasks — you\'re all caught up.</p>';
-          }
+          closeDrawer();
+          await loadTasks({reset: true});
         } catch (error) {
           showError(error.message || "Could not dismiss task.");
           setButtonBusy(btn, false);
@@ -423,11 +494,90 @@
       });
     });
 
-    els.tasksContainer.querySelectorAll(".charge-opt").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        openChargeForm(btn);
+    foot.querySelectorAll(".charge-opt").forEach((btn) => {
+      btn.addEventListener("click", () => openChargeForm(btn));
+    });
+
+    foot.querySelector(".notif-dismiss")?.addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      setButtonBusy(btn, true, "…");
+      try {
+        await postJson("/dismissDashboardNotification", {id: drawerItem.id});
+        closeDrawer();
+        await loadNotifications({reset: true});
+      } catch (error) {
+        showError(error.message);
+        setButtonBusy(btn, false);
+      }
+    });
+
+    foot.querySelector(".notif-flag")?.addEventListener("click", () => {
+      const form = body.querySelector(".flag-form");
+      if (!form) return;
+      form.hidden = false;
+      form.innerHTML =
+        `<label>What went wrong?</label>` +
+        `<textarea class="flag-note" rows="3"></textarea>` +
+        `<button type="button" class="btn btn-sm btn-primary flag-send">Send flag</button>`;
+      form.querySelector(".flag-send").addEventListener("click", async () => {
+        const note = form.querySelector(".flag-note").value.trim();
+        try {
+          await postJson("/flagDashboardNotification", {id: drawerItem.id, note});
+          showRunResult("Flagged for review.", false);
+          closeDrawer();
+          await loadNotifications({reset: true});
+        } catch (error) {
+          showError(error.message);
+        }
       });
+    });
+
+    foot.querySelector(".notif-reply")?.addEventListener("click", () => {
+      const form = body.querySelector(".reply-form");
+      if (!form) return;
+      form.hidden = false;
+      form.innerHTML =
+        `<label>Reply</label>` +
+        `<textarea class="reply-text" rows="4"></textarea>` +
+        `<button type="button" class="btn btn-sm btn-primary reply-send">Send reply</button>`;
+      form.querySelector(".reply-send").addEventListener("click", async () => {
+        const text = form.querySelector(".reply-text").value.trim();
+        try {
+          await postJson("/replyDashboardEmail", {
+            notificationId: drawerItem.id,
+            messageId: drawerItem.messageId,
+            body: text,
+          });
+          showRunResult("Reply sent.", false);
+          closeDrawer();
+          await loadNotifications({reset: true});
+        } catch (error) {
+          showError(error.message);
+        }
+      });
+    });
+
+    foot.querySelector(".notif-delete")?.addEventListener("click", async () => {
+      if (!confirm("Delete this email from the mailbox?")) return;
+      try {
+        await postJson("/deleteDashboardEmail", {
+          notificationId: drawerItem.id,
+          messageId: drawerItem.messageId,
+        });
+        closeDrawer();
+        await loadNotifications({reset: true});
+      } catch (error) {
+        showError(error.message);
+      }
+    });
+
+    foot.querySelector(".notif-goto-tasks")?.addEventListener("click", () => {
+      closeDrawer();
+      ownerBucket = "sarah";
+      dispatcherKey = null;
+      updateFolderActive();
+      switchTab("tasks");
+      loadTasks({reset: true});
     });
   }
 
@@ -436,41 +586,33 @@
     const invoiceId = btn.dataset.invoice;
     const taskId = btn.dataset.taskId;
     const taskSource = btn.dataset.taskSource;
-    const form = els.tasksContainer.querySelector(
-        `[data-charge-form="${taskId}"]`);
+    const form = els.drawerFooter.querySelector(`[data-charge-form="${taskId}"]`) ||
+      els.drawerBody.querySelector(`[data-charge-form="${taskId}"]`);
     if (!form) return;
-    chargeFormTaskId = taskId;
-
+    form.hidden = false;
     if (opt === "c" || opt === "d") {
-      form.hidden = false;
       form.innerHTML =
         `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
-        `<div class="task-actions">` +
-        `<button type="button" class="btn btn-sm charge-confirm" data-opt="${opt}">Confirm ${opt.toUpperCase()}</button>` +
-        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button>` +
-        `</div>`;
+        `<div class="row-actions">` +
+        `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="${opt}">Confirm ${opt.toUpperCase()}</button>` +
+        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
     } else if (opt === "a" || opt === "e") {
-      form.hidden = false;
       form.innerHTML =
         `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
         `<label>Customer charge amount ($)</label>` +
         `<input type="number" min="0.01" step="0.01" class="charge-amount" />` +
-        `<div class="task-actions">` +
-        `<button type="button" class="btn btn-sm charge-confirm" data-opt="${opt}">Confirm ${opt.toUpperCase()}</button>` +
-        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button>` +
-        `</div>`;
+        `<div class="row-actions">` +
+        `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="${opt}">Confirm ${opt.toUpperCase()}</button>` +
+        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
     } else {
-      form.hidden = false;
       form.innerHTML =
         `<p><strong>${bodyEsc(CHARGE_LABELS.b)}</strong></p>` +
-        `<label>Customer bill lines (one per line: description | amount)</label>` +
-        `<textarea class="charge-lines" rows="3" placeholder="Liftgate|75&#10;Detention|150"></textarea>` +
-        `<div class="task-actions">` +
-        `<button type="button" class="btn btn-sm charge-confirm" data-opt="b">Confirm B</button>` +
-        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button>` +
-        `</div>`;
+        `<label>Customer bill lines (description | amount)</label>` +
+        `<textarea class="charge-lines" rows="3" placeholder="Liftgate|75"></textarea>` +
+        `<div class="row-actions">` +
+        `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="b">Confirm B</button>` +
+        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
     }
-
     form.querySelector(".charge-cancel").addEventListener("click", () => {
       form.hidden = true;
       form.innerHTML = "";
@@ -479,12 +621,7 @@
       const confirmBtn = form.querySelector(".charge-confirm");
       setButtonBusy(confirmBtn, true, "Applying…");
       try {
-        const payload = {
-          invoiceId,
-          option: opt,
-          taskId,
-          taskSource,
-        };
+        const payload = {invoiceId, option: opt, taskId, taskSource};
         if (opt === "a" || opt === "e") {
           payload.customerChargeAmount =
             form.querySelector(".charge-amount").value;
@@ -499,10 +636,15 @@
             };
           }).filter((l) => l.amount > 0);
         }
-        await postJson("/dashboardAdditionalChargeDecision", payload);
-        showRunResult(`Option ${opt.toUpperCase()} applied for ${invoiceId}.`, false);
-        await loadTasks();
-        await loadNotifications();
+        const result = await postJson("/dashboardAdditionalChargeDecision", payload);
+        showRunResult(
+            result.handedOffToDispatch ?
+              `Option B applied — moved to Dispatch Tasks.` :
+              `Option ${opt.toUpperCase()} applied for ${invoiceId}.`,
+            false);
+        closeDrawer();
+        await loadTasks({reset: true});
+        await loadNotifications({reset: true});
       } catch (error) {
         showError(error.message || "Could not apply decision.");
         setButtonBusy(confirmBtn, false);
@@ -510,76 +652,263 @@
     });
   }
 
-  async function loadTasks() {
-    els.tasksContainer.innerHTML = '<p class="panel-empty">Loading...</p>';
-    try {
-      const data = await fetchJson("/getDashboardTasks?limit=50");
-      renderTasks(data.tasks || []);
-    } catch (error) {
+  /* —— Tasks —— */
+  function updateFolderActive() {
+    document.querySelectorAll(".folder-item").forEach((el) => {
+      el.classList.toggle("is-active",
+          el.dataset.owner === ownerBucket && !dispatcherKey);
+    });
+    document.querySelectorAll(".folder-child").forEach((el) => {
+      el.classList.toggle("is-active", el.dataset.key === dispatcherKey);
+    });
+  }
+
+  function renderFolderCounts() {
+    const map = {
+      accounting: document.getElementById("folderAccounting"),
+      sarah: document.getElementById("folderSarah"),
+      dispatch: document.getElementById("folderDispatch"),
+    };
+    Object.keys(map).forEach((key) => {
+      const el = map[key];
+      if (!el) return;
+      const c = bucketCounts[key] || {};
+      const countEl = el.querySelector("[data-count]");
+      const urgentEl = el.querySelector("[data-urgent]");
+      if (countEl) countEl.textContent = String(c.openCount || 0);
+      if (urgentEl) urgentEl.hidden = !(c.urgentCount > 0);
+    });
+    if (!els.dispatcherFolders) return;
+    els.dispatcherFolders.innerHTML = (dispatchers || []).map((d) =>
+      `<button type="button" class="folder-child" data-key="${bodyEsc(d.key)}">` +
+      `<span>${bodyEsc(d.name)}</span>` +
+      `<span>${d.openCount || 0}${d.urgentCount ? " ·!" : ""}</span></button>`,
+    ).join("");
+    els.dispatcherFolders.querySelectorAll(".folder-child").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        ownerBucket = "dispatch";
+        dispatcherKey = btn.dataset.key;
+        updateFolderActive();
+        loadTasks({reset: true});
+      });
+    });
+    updateFolderActive();
+  }
+
+  document.querySelectorAll(".folder-item").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      ownerBucket = btn.dataset.owner;
+      dispatcherKey = null;
+      updateFolderActive();
+      loadTasks({reset: true});
+    });
+  });
+
+  function clientFilterSort(items) {
+    const q = String(els.workspaceSearch?.value || "").trim().toLowerCase();
+    let list = items.slice();
+    if (q) {
+      list = list.filter((t) => {
+        const hay = [
+          t.loadNumber, t.carrierName, t.title, t.subject, t.reason, t.to,
+        ].join(" ").toLowerCase();
+        return hay.includes(q);
+      });
+    }
+    const sort = els.workspaceSort?.value || "urgent";
+    list.sort((a, b) => {
+      if (sort === "urgent") {
+        if (Boolean(a.isUrgentOld) !== Boolean(b.isUrgentOld)) {
+          return a.isUrgentOld ? -1 : 1;
+        }
+      }
+      if (sort === "amount") {
+        return (Number(b.chargesTotal) || 0) - (Number(a.chargesTotal) || 0);
+      }
+      const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
+      const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+      return sort === "oldest" ? ta - tb : tb - ta;
+    });
+    return list;
+  }
+
+  function renderTasks(tasks, {append = false} = {}) {
+    if (!append) tasksCache = tasks.slice();
+    else tasksCache = tasksCache.concat(tasks);
+
+    const list = clientFilterSort(tasksCache);
+    if (els.taskCountBadge) {
+      els.taskCountBadge.textContent = String(openTaskCount);
+    }
+    if (!list.length) {
       els.tasksContainer.innerHTML =
-        '<p class="panel-empty">Could not load tasks.</p>';
+        '<p class="panel-empty">No open tasks in this folder.</p>';
+      return;
+    }
+
+    const groups = new Map();
+    list.forEach((t) => {
+      const key = t.loadNumber || `id:${t.id}`;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(t);
+    });
+
+    let rows = "";
+    for (const [loadKey, group] of groups) {
+      if (group.length > 1 && !String(loadKey).startsWith("id:")) {
+        rows += `<tr class="group-row"><td colspan="8">Load ${bodyEsc(loadKey)} · ${group.length} related tasks</td></tr>`;
+      }
+      group.forEach((task) => {
+        const meta = taskTypeMeta(task);
+        const high = Number(task.chargesTotal) >= HIGH_DOLLAR;
+        const urgent = Boolean(task.isUrgentOld || task.ageLabel);
+        rows += `<tr class="${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
+          <td><span class="type-badge ${meta.cls}">${bodyEsc(meta.label)}</span></td>
+          <td>${task.loadNumber ?
+            `<a class="load-link" href="#" data-load="${bodyEsc(task.loadNumber)}">${bodyEsc(task.loadNumber)}</a>` :
+            "—"}</td>
+          <td>${bodyEsc(shortText(task.carrierName, 28) || "—")}</td>
+          <td>${bodyEsc(formatMoney(task.chargesTotal))}</td>
+          <td>${bodyEsc(shortText(task.reason || task.description, 40) || "—")}</td>
+          <td>${bodyEsc(task.ownerBucket || "—")}${urgent ? ' <span class="age-badge">URGENT/OLD</span>' : ""}</td>
+          <td>${bodyEsc(formatLogTime(task.createdAt))}</td>
+          <td class="row-actions"><button type="button" class="btn btn-sm btn-outline task-open">Review</button></td>
+        </tr>`;
+      });
+    }
+
+    els.tasksContainer.innerHTML =
+      `<table class="data-table"><thead><tr>
+        <th>Type</th><th>Load #</th><th>Carrier</th><th>Amount</th>
+        <th>Reason</th><th>Status</th><th>Received</th><th></th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+
+    const byId = new Map(list.map((t) => [t.id, t]));
+    els.tasksContainer.querySelectorAll("tbody tr[data-task-id]").forEach((tr) => {
+      const task = byId.get(tr.dataset.taskId);
+      if (!task) return;
+      tr.addEventListener("click", (e) => {
+        if (e.target.closest("a,button")) return;
+        openTaskDrawer(task);
+      });
+      tr.querySelector(".task-open")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        openTaskDrawer(task);
+      });
+      tr.querySelector(".load-link")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        openTaskDrawer(task);
+      });
+    });
+  }
+
+  function updateTasksLoadMore(loading) {
+    if (!els.tasksLoadMoreWrap || !els.loadMoreTasksBtn) return;
+    els.tasksLoadMoreWrap.hidden = !taskHasMore;
+    els.loadMoreTasksBtn.disabled = Boolean(loading);
+    els.loadMoreTasksBtn.textContent = loading ? "Loading…" : "Load more tasks";
+  }
+
+  async function loadTasks({reset = true} = {}) {
+    if (reset) {
+      taskOffset = 0;
+      taskHasMore = false;
+      tasksCache = [];
+      els.tasksContainer.innerHTML = '<p class="panel-empty">Loading…</p>';
+    } else {
+      updateTasksLoadMore(true);
+    }
+    try {
+      const params = new URLSearchParams({
+        limit: String(TASK_PAGE),
+        offset: String(taskOffset),
+        ownerBucket,
+      });
+      if (dispatcherKey) params.set("dispatcherKey", dispatcherKey);
+      const data = await fetchJson(`/getDashboardTasks?${params}`);
+      openTaskCount = data.openCount || 0;
+      bucketCounts = data.bucketCounts || bucketCounts;
+      dispatchers = data.dispatchers || [];
+      renderFolderCounts();
+      const page = data.tasks || [];
+      taskHasMore = Boolean(data.hasMore);
+      taskOffset = data.nextOffset != null ? data.nextOffset : taskOffset + page.length;
+      renderTasks(page, {append: !reset});
+      updateTasksLoadMore(false);
+    } catch (error) {
+      if (reset) {
+        els.tasksContainer.innerHTML =
+          '<p class="panel-empty">Could not load tasks.</p>';
+      }
       console.error("loadTasks failed:", error);
+      updateTasksLoadMore(false);
     }
   }
 
+  /* —— Invoices —— */
+  function statusClass(status) {
+    const s = String(status || "").toLowerCase();
+    if (/complete/.test(s)) return "status-pill-success";
+    if (/fail|error/.test(s)) return "status-pill-danger";
+    if (/review|await|pending|charge/.test(s)) return "status-pill-warn";
+    if (/process|running|send/.test(s)) return "status-pill-info";
+    return "status-pill-neutral";
+  }
+
   function buildInvoiceRow(inv) {
-    const status = inv.displayLabel || inv.displayStatus ||
-      inv.finalWorkflowStatus || inv.decisionStage || "—";
-    const taiCol = TMS === "tai" ?
-      `<td>${inv.taiShipmentId || "—"}</td>` : "";
-    return `<tr>
-      <td class="log-time">${formatLogTime(inv.createdAt)}</td>
-      <td>${inv.loadNumber || "—"}</td>
-      <td>${inv.proNumber || "—"}</td>
-      <td>${inv.carrierName || "—"}</td>
-      <td>${formatMoney(inv.invoiceAmount)}</td>
-      ${taiCol}
-      <td><span class="status-pill ${statusClass(status)}">${status}</span></td>
-      <td class="log-message">${inv.decisionReason || inv.currentStep || "—"}</td>
+    const status = inv.displayLabel || inv.displayStatus || "—";
+    return `<tr data-invoice-id="${bodyEsc(inv.id)}">
+      <td>${bodyEsc(inv.carrierName || "—")}</td>
+      <td>${bodyEsc(inv.id)}</td>
+      <td>${inv.loadNumber ?
+        `<a class="load-link" href="#">${bodyEsc(inv.loadNumber)}</a>` : "—"}</td>
+      <td>${bodyEsc(inv.proNumber || "—")}</td>
+      <td>${bodyEsc(formatMoney(inv.invoiceAmount))}</td>
+      <td>${bodyEsc(formatLogTime(inv.createdAt))}</td>
+      <td><span class="status-pill ${statusClass(status)}">${bodyEsc(status)}</span></td>
     </tr>`;
   }
 
   function updateLoadMoreButton(loading) {
     if (!els.invoicesLoadMoreWrap || !els.loadMoreInvoicesBtn) return;
-    if (!invoiceHasMore) {
-      els.invoicesLoadMoreWrap.hidden = true;
+    els.invoicesLoadMoreWrap.hidden = !invoiceHasMore;
+    els.loadMoreInvoicesBtn.disabled = Boolean(loading);
+    els.loadMoreInvoicesBtn.textContent = loading ? "Loading…" : "Load more";
+  }
+
+  let invoicesCache = [];
+
+  function paintInvoices(list) {
+    if (!list.length) {
+      els.invoicesContainer.innerHTML =
+        `<p class="panel-empty">${invoiceGroup === "completed" ?
+          "No completed invoices in this page." :
+          "No open invoices — nothing waiting."}</p>`;
       return;
     }
-    els.invoicesLoadMoreWrap.hidden = false;
-    els.loadMoreInvoicesBtn.disabled = Boolean(loading);
-    els.loadMoreInvoicesBtn.textContent = loading ? "Loading..." : "Load more";
+    els.invoicesContainer.innerHTML =
+      `<table class="data-table"><thead><tr>
+        <th>Vendor</th><th>Invoice</th><th>Load</th><th>PRO</th>
+        <th>Amount</th><th>Received</th><th>Status</th>
+      </tr></thead><tbody>${list.map(buildInvoiceRow).join("")}</tbody></table>`;
+    const byId = new Map(list.map((i) => [i.id, i]));
+    els.invoicesContainer.querySelectorAll("tbody tr").forEach((tr) => {
+      const inv = byId.get(tr.dataset.invoiceId);
+      if (!inv) return;
+      tr.addEventListener("click", () => openInvoiceDrawer(inv));
+    });
   }
 
   function renderInvoices(invoices) {
-    if (!invoices || invoices.length === 0) {
-      els.invoicesContainer.innerHTML =
-        '<p class="panel-empty">No invoices yet.</p>';
-      updateLoadMoreButton(false);
-      return;
-    }
-    const taiHeader = TMS === "tai" ? "<th>TAI Shipment</th>" : "";
-    els.invoicesContainer.innerHTML =
-      `<table class="logs-table">
-        <thead><tr>
-          <th>Created</th><th>Load #</th><th>PRO</th><th>Carrier</th>
-          <th>Amount</th>${taiHeader}<th>Status</th><th>Detail</th>
-        </tr></thead>
-        <tbody>${invoices.map(buildInvoiceRow).join("")}</tbody>
-      </table>`;
+    invoicesCache = invoices.slice();
+    paintInvoices(clientFilterSort(invoicesCache));
     updateLoadMoreButton(false);
   }
 
   function appendInvoices(invoices) {
-    if (!invoices || !invoices.length) {
-      updateLoadMoreButton(false);
-      return;
-    }
-    const tbody = els.invoicesContainer.querySelector("tbody");
-    if (!tbody) {
-      renderInvoices(invoices);
-      return;
-    }
-    tbody.insertAdjacentHTML("beforeend", invoices.map(buildInvoiceRow).join(""));
+    invoicesCache = invoicesCache.concat(invoices);
+    paintInvoices(clientFilterSort(invoicesCache));
     updateLoadMoreButton(false);
   }
 
@@ -592,15 +921,16 @@
       if (reset) {
         invoiceOffset = 0;
         invoiceHasMore = false;
+        invoicesCache = [];
         setButtonBusy(els.refreshInvoicesBtn, true, "Refreshing…");
-        els.invoicesContainer.innerHTML =
-          '<p class="panel-empty">Loading...</p>';
+        els.invoicesContainer.innerHTML = '<p class="panel-empty">Loading…</p>';
       } else {
         updateLoadMoreButton(true);
       }
       try {
         const data = await fetchJson(
-            `/getRecentInvoices?limit=${INVOICE_PAGE_SIZE}&offset=${invoiceOffset}`,
+            `/getRecentInvoices?limit=${INVOICE_PAGE_SIZE}&offset=${invoiceOffset}` +
+            `&statusGroup=${encodeURIComponent(invoiceGroup)}`,
         );
         const invoices = data.invoices || [];
         invoiceHasMore = typeof data.hasMore === "boolean" ?
@@ -624,380 +954,130 @@
     try { await invoicesInFlight; } finally { invoicesInFlight = null; }
   }
 
-  function shortText(value, max) {
-    const text = String(value || "").replace(/\s+/g, " ").trim();
-    if (!text) return "";
-    if (text.length <= max) return text;
-    return text.slice(0, max - 1).trimEnd() + "…";
-  }
-
-  function looksLikeHtml(value) {
-    return /<\/?[a-z][\s\S]*>/i.test(String(value || ""));
-  }
-
-  function decodeHtmlEntities(value) {
-    const ta = document.createElement("textarea");
-    let s = String(value || "");
-    for (let i = 0; i < 3; i++) {
-      if (!/&(?:#\d+|#x[0-9a-f]+|[a-z]+);/i.test(s)) break;
-      ta.innerHTML = s;
-      const next = ta.value;
-      if (next === s) break;
-      s = next;
-    }
-    return s;
-  }
-
-  // Build mail-client HTML: keep real HTML as-is; wrap plain text only.
-  function emailBodyAsHtml(rawBody) {
-    let s = String(rawBody || "").trim();
-    if (!s) return "";
-    // Legacy rows stored entity-escaped HTML/text dumps.
-    if (!looksLikeHtml(s) && /&(?:nbsp|lt|gt|amp|#\d+);/i.test(s)) {
-      s = decodeHtmlEntities(s);
-    }
-    if (looksLikeHtml(s)) {
-      return s.replace(/<script[\s\S]*?<\/script>/gi, "");
-    }
-    return `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
-      `${bodyEsc(s)}</pre>`;
-  }
-
-  function notifSubject(n) {
-    return String(n.subject || n.title || "(no subject)").trim();
-  }
-
-  function notifFromLine(n) {
-    return String(n.from || n.to || "").trim();
-  }
-
-  function renderEmailBodyHtml(rawBody) {
-    if (!String(rawBody || "").trim()) {
-      return '<p class="notif-body-empty">(empty)</p>';
-    }
-    return `<iframe class="notif-body-frame" title="Email" sandbox="" loading="lazy"></iframe>`;
-  }
-
-  function fillEmailFrames(items, rootEl) {
-    const root = rootEl || els.notificationsContainer;
-    if (!root) return;
-    const frames = root.querySelectorAll(".notif-body-frame");
-    frames.forEach((frame) => {
-      const card = frame.closest(".notif-card, .task-card");
-      if (!card) return;
-      const id = card.dataset.notifId || card.dataset.id;
-      const n = (items || []).find((item) => item.id === id);
-      if (!n) return;
-      const html = emailBodyAsHtml(n.body || n.description);
-      if (!html) return;
-      const doc =
-        "<!doctype html><html><head><meta charset=\"utf-8\">" +
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
-        "<base target=\"_blank\" rel=\"noopener\">" +
-        "<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">" +
-        "<link href=\"https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&display=swap\" rel=\"stylesheet\">" +
-        "<style>" +
-        "html,body{margin:0;padding:0;background:#fff;}" +
-        "body{" +
-        "margin:0 auto;padding:28px 32px 36px;max-width:720px;" +
-        "font-family:'Instrument Sans',Segoe UI,Roboto,sans-serif;" +
-        "font-size:17.5px;font-weight:400;line-height:1.7;" +
-        "letter-spacing:0.01em;color:#1a2430;" +
-        "-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;" +
-        "word-wrap:break-word;overflow-wrap:anywhere;" +
-        "}" +
-        "p{margin:0 0 1em;} p:last-child{margin-bottom:0;}" +
-        "b,strong{font-weight:700;color:#0f1720;}" +
-        "em,i{font-style:italic;color:#334155;}" +
-        "a{color:#0d6e6e;font-weight:500;text-decoration:underline;text-underline-offset:2px;}" +
-        "h1,h2,h3,h4{margin:1.25em 0 0.5em;line-height:1.3;font-weight:700;color:#0f1720;}" +
-        "h1{font-size:1.35em;} h2{font-size:1.2em;} h3{font-size:1.08em;}" +
-        "ul,ol{margin:0 0 1em;padding-left:1.35em;} li{margin:0.25em 0;}" +
-        "img{max-width:100%;height:auto;border-radius:4px;}" +
-        "table{border-collapse:collapse;max-width:100%;margin:0.75em 0;font-size:0.98em;}" +
-        "td,th{padding:0.35em 0.65em;vertical-align:top;}" +
-        "hr{border:0;border-top:1px solid #e2e8f0;margin:1.4em 0;}" +
-        "blockquote{margin:1em 0;padding:0.65em 0 0.65em 1em;" +
-        "border-left:3px solid #cbd5e1;color:#475569;font-weight:400;}" +
-        "pre{white-space:pre-wrap;font:inherit;margin:0;line-height:1.7;}" +
-        "div[style*='font-size:10'],div[style*='font-size:11'],span[style*='font-size:10']," +
-        "span[style*='font-size:11'],font[size='1'],font[size='2']{font-size:1em !important;}" +
-        "</style></head><body>" + html + "</body></html>";
-      frame.srcdoc = doc;
+  document.querySelectorAll("[data-invoice-group]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      invoiceGroup = btn.dataset.invoiceGroup;
+      document.querySelectorAll("[data-invoice-group]").forEach((b) => {
+        b.classList.toggle("is-active", b === btn);
+      });
+      loadInvoices({reset: true});
     });
+  });
+
+  /* —— Notifications —— */
+  function markNotifRead(id) {
+    readNotifIds.add(id);
+    localStorage.setItem("jerryReadNotifs",
+        JSON.stringify([...readNotifIds].slice(-500)));
   }
 
-  function renderNotifications(items, opsPrimary) {
-    openNotifCount = items ? items.length : 0;
+  function renderNotifications(items, {append = false} = {}) {
+    if (!append) notifsCache = items.slice();
+    else notifsCache = notifsCache.concat(items);
+    const list = clientFilterSort(notifsCache);
     if (els.notifCountBadge) {
       els.notifCountBadge.textContent = String(openNotifCount);
     }
-    if (els.opsPrimaryHint) {
-      els.opsPrimaryHint.hidden = true;
-    }
-    if (!items || !items.length) {
+    if (els.opsPrimaryHint) els.opsPrimaryHint.hidden = true;
+    if (!list.length) {
       els.notificationsContainer.innerHTML =
         '<p class="panel-empty">No open notifications.</p>';
       return;
     }
-
-    els.notificationsContainer.innerHTML = items.map((n) => {
-      const unhandled = n.type === "unhandled_email";
-      const charge = n.type === "additional_charge";
-      const subject = notifSubject(n);
-      const from = notifFromLine(n);
-      return `<article class="notif-card" data-notif-id="${bodyEsc(n.id)}" data-notif-type="${bodyEsc(n.type || "")}">
-        <button type="button" class="notif-row" aria-expanded="false">
-          <span class="notif-title">${bodyEsc(shortText(subject, 100))}</span>
-          <span class="notif-sub">${bodyEsc(shortText(from, 48))}</span>
-          <time class="notif-when">${bodyEsc(formatLogTime(n.createdAt))}</time>
-          <span class="notif-chevron" aria-hidden="true"></span>
-        </button>
-        <div class="notif-expand" hidden>
-          <div class="notif-email">
-            <div class="notif-email-headers">
-              ${n.from ? `<div><span>From</span><strong>${bodyEsc(n.from)}</strong></div>` : ""}
-              ${n.to ? `<div><span>To</span><strong>${bodyEsc(n.to)}</strong></div>` : ""}
-              ${n.cc ? `<div><span>Cc</span><strong>${bodyEsc(n.cc)}</strong></div>` : ""}
-              <div><span>Subject</span><strong>${bodyEsc(subject)}</strong></div>
-              ${n.reason ? `<div><span>Reason</span><strong>${bodyEsc(n.reason)}</strong></div>` : ""}
-              ${n.loadNumber ? `<div><span>Load</span><strong>${bodyEsc(n.loadNumber)}</strong></div>` : ""}
-              ${n.carrierName ? `<div><span>Carrier</span><strong>${bodyEsc(n.carrierName)}</strong></div>` : ""}
-            </div>
-            <div class="notif-email-body">
-              ${renderEmailBodyHtml(n.body)}
-            </div>
-          </div>
-          <div class="task-actions">
-            <button type="button" class="btn btn-outline btn-sm notif-dismiss">Done</button>
-            <button type="button" class="btn btn-ghost btn-sm notif-flag">Flag</button>
-            ${unhandled ? `
-              <button type="button" class="btn btn-outline btn-sm notif-reply">Reply</button>
-              <button type="button" class="btn btn-danger btn-sm notif-delete">Delete</button>
-            ` : ""}
-            ${charge ? `
-              <button type="button" class="btn btn-primary btn-sm notif-goto-tasks">Open Tasks</button>
-            ` : ""}
-          </div>
-          <div class="flag-form" hidden></div>
-          <div class="reply-form" hidden></div>
-        </div>
-      </article>`;
-    }).join("");
-
-    fillEmailFrames(items);
-    bindNotificationActions();
-  }
-
-  function countNotifCards() {
-    return els.notificationsContainer.querySelectorAll(".notif-card").length;
-  }
-
-  function afterNotifRemoved() {
-    openNotifCount = countNotifCards();
-    if (els.notifCountBadge) {
-      els.notifCountBadge.textContent = String(openNotifCount);
-    }
-    if (!openNotifCount) {
-      els.notificationsContainer.innerHTML =
-        '<p class="panel-empty">No open notifications.</p>';
-    }
-  }
-
-  function bindNotificationActions() {
-    els.notificationsContainer.querySelectorAll(".notif-row").forEach((row) => {
-      row.addEventListener("click", () => {
-        const card = row.closest(".notif-card");
-        const opening = !card.classList.contains("is-open");
-        els.notificationsContainer.querySelectorAll(".notif-card.is-open").forEach((other) => {
-          if (other === card) return;
-          other.classList.remove("is-open");
-          const otherPanel = other.querySelector(".notif-expand");
-          const otherRow = other.querySelector(".notif-row");
-          if (otherPanel) otherPanel.hidden = true;
-          if (otherRow) otherRow.setAttribute("aria-expanded", "false");
-        });
-        const panel = card.querySelector(".notif-expand");
-        card.classList.toggle("is-open", opening);
-        panel.hidden = !opening;
-        row.setAttribute("aria-expanded", opening ? "true" : "false");
-        if (opening) {
-          card.scrollIntoView({behavior: "smooth", block: "nearest"});
-        }
-      });
-    });
-
-    els.notificationsContainer.querySelectorAll(".notif-goto-tasks").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        switchTab("tasks");
-      });
-    });
-
-    els.notificationsContainer.querySelectorAll(".notif-dismiss").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const card = btn.closest(".notif-card");
-        setButtonBusy(btn, true, "...");
-        try {
-          await postJson("/dismissDashboardNotification", {id: card.dataset.notifId});
-          card.remove();
-          afterNotifRemoved();
-        } catch (error) {
-          showError(error.message);
-          setButtonBusy(btn, false);
-        }
-      });
-    });
-
-    els.notificationsContainer.querySelectorAll(".notif-flag").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const card = btn.closest(".notif-card");
-        const form = card.querySelector(".flag-form");
-        form.hidden = false;
-        form.innerHTML =
-          `<label>What went wrong?</label>` +
-          `<textarea class="flag-note" rows="2" required placeholder="Short note..."></textarea>` +
-          `<div class="task-actions">` +
-          `<button type="button" class="btn btn-sm flag-submit">Send for review</button>` +
-          `<button type="button" class="btn btn-ghost btn-sm flag-cancel">Cancel</button>` +
-          `</div>`;
-        form.querySelector(".flag-cancel").onclick = () => {
-          form.hidden = true;
-          form.innerHTML = "";
-        };
-        form.querySelector(".flag-submit").onclick = async () => {
-          const note = form.querySelector(".flag-note").value.trim();
-          const submit = form.querySelector(".flag-submit");
-          setButtonBusy(submit, true, "Sending...");
-          try {
-            await postJson("/flagDashboardNotification", {
-              id: card.dataset.notifId,
-              note,
-            });
-            showRunResult("Sent for review.", false);
-            card.remove();
-            afterNotifRemoved();
-          } catch (error) {
-            showError(error.message);
-            setButtonBusy(submit, false);
-          }
-        };
-      });
-    });
-
-    els.notificationsContainer.querySelectorAll(".notif-reply").forEach((btn) => {
-      btn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        const card = btn.closest(".notif-card");
-        const form = card.querySelector(".reply-form");
-        form.hidden = false;
-        form.innerHTML =
-          `<label>Reply</label>` +
-          `<textarea class="reply-text" rows="3" placeholder="Your reply..."></textarea>` +
-          `<div class="task-actions">` +
-          `<button type="button" class="btn btn-sm reply-submit">Send</button>` +
-          `<button type="button" class="btn btn-ghost btn-sm reply-cancel">Cancel</button>` +
-          `</div>`;
-        form.querySelector(".reply-cancel").onclick = () => {
-          form.hidden = true;
-          form.innerHTML = "";
-        };
-        form.querySelector(".reply-submit").onclick = async () => {
-          const replyText = form.querySelector(".reply-text").value.trim();
-          const submit = form.querySelector(".reply-submit");
-          setButtonBusy(submit, true, "Sending...");
-          try {
-            await postJson("/replyDashboardEmail", {
-              id: card.dataset.notifId,
-              replyText,
-            });
-            showRunResult("Reply sent.", false);
-            card.remove();
-            afterNotifRemoved();
-          } catch (error) {
-            showError(error.message);
-            setButtonBusy(submit, false);
-          }
-        };
-      });
-    });
-
-    els.notificationsContainer.querySelectorAll(".notif-delete").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        if (!confirm("Trash the original email?")) return;
-        const card = btn.closest(".notif-card");
-        setButtonBusy(btn, true, "Deleting...");
-        try {
-          await postJson("/deleteDashboardEmail", {id: card.dataset.notifId});
-          card.remove();
-          afterNotifRemoved();
-          showRunResult("Email deleted.", false);
-        } catch (error) {
-          showError(error.message);
-          setButtonBusy(btn, false);
-        }
-      });
-    });
-  }
-
-  async function loadNotifications() {
     els.notificationsContainer.innerHTML =
-      '<p class="panel-empty">Loading...</p>';
+      `<table class="data-table"><thead><tr>
+        <th></th><th>Subject</th><th>From / To</th><th>Type</th><th>Received</th><th></th>
+      </tr></thead><tbody>${list.map((n) => {
+        const sev = notifSeverity(n);
+        const read = readNotifIds.has(n.id);
+        return `<tr class="${read ? "notif-read" : "notif-unread"}" data-notif-id="${bodyEsc(n.id)}">
+          <td><span class="severity-dot sev-${sev}"></span></td>
+          <td>${bodyEsc(shortText(n.subject || n.title, 70) || "(no subject)")}</td>
+          <td>${bodyEsc(shortText(n.from || n.to, 36) || "—")}</td>
+          <td>${bodyEsc(n.type || "ops")}</td>
+          <td>${bodyEsc(formatLogTime(n.createdAt))}</td>
+          <td><button type="button" class="btn btn-sm btn-outline notif-open">Open</button></td>
+        </tr>`;
+      }).join("")}</tbody></table>`;
+
+    const byId = new Map(list.map((n) => [n.id, n]));
+    els.notificationsContainer.querySelectorAll("tbody tr").forEach((tr) => {
+      const n = byId.get(tr.dataset.notifId);
+      if (!n) return;
+      const open = () => openNotifDrawer(n);
+      tr.addEventListener("click", (e) => {
+        if (e.target.closest("button")) return;
+        open();
+      });
+      tr.querySelector(".notif-open")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        open();
+      });
+    });
+  }
+
+  function updateNotifsLoadMore(loading) {
+    if (!els.notifsLoadMoreWrap || !els.loadMoreNotifsBtn) return;
+    els.notifsLoadMoreWrap.hidden = !notifHasMore;
+    els.loadMoreNotifsBtn.disabled = Boolean(loading);
+    els.loadMoreNotifsBtn.textContent = loading ? "Loading…" : "Load more";
+  }
+
+  async function loadNotifications({reset = true} = {}) {
+    if (reset) {
+      notifOffset = 0;
+      notifHasMore = false;
+      notifsCache = [];
+      els.notificationsContainer.innerHTML = '<p class="panel-empty">Loading…</p>';
+    } else {
+      updateNotifsLoadMore(true);
+    }
     try {
-      const data = await fetchJson("/getDashboardNotifications?limit=50");
-      renderNotifications(data.notifications || [], data.opsPrimary);
+      const data = await fetchJson(
+          `/getDashboardNotifications?limit=${TASK_PAGE}&offset=${notifOffset}`);
+      const page = data.notifications || [];
+      if (data.bucketCounts) bucketCounts = data.bucketCounts;
+      notifHasMore = Boolean(data.hasMore);
+      notifOffset = data.nextOffset != null ?
+        data.nextOffset : notifOffset + page.length;
+      openNotifCount = data.openCount != null ? data.openCount : page.length;
+      if (els.notifCountBadge) {
+        els.notifCountBadge.textContent = String(openNotifCount);
+      }
+      renderNotifications(page, {append: !reset});
+      updateNotifsLoadMore(false);
     } catch (error) {
-      els.notificationsContainer.innerHTML =
-        '<p class="panel-empty">Could not load notifications. Deploy the new dashboard APIs if this persists.</p>';
-      console.error("loadNotifications failed:", error);
+      if (reset) {
+        els.notificationsContainer.innerHTML =
+          '<p class="panel-empty">Could not load notifications.</p>';
+      }
+      updateNotifsLoadMore(false);
     }
   }
 
-  function formatPeriodLabel(period, range) {
-    const date = new Date(period);
-    if (range === "day") {
-      return date.toLocaleTimeString(undefined, {
-        hour: "numeric", minute: "2-digit",
-      });
-    }
-    if (range === "year") {
-      return date.toLocaleDateString(undefined, {month: "short", year: "numeric"});
-    }
-    return date.toLocaleDateString(undefined, {month: "short", day: "numeric"});
+  /* —— Stats / chart —— */
+  function formatPeriodLabel(value, range) {
+    if (!value) return "";
+    if (range === "day") return String(value).slice(11, 16);
+    return String(value);
   }
 
   function renderChart(series, range) {
-    const labels = series.map((row) => formatPeriodLabel(row.period, range));
+    if (!els.chartCanvas || !window.Chart) return;
+    const labels = (series || []).map((p) => formatPeriodLabel(p.period, range));
     const datasets = [
       {
-        label: "Invoices processed",
-        data: series.map((row) => row.invoicesProcessed),
+        label: "Invoices",
+        data: (series || []).map((p) => p.invoicesProcessed || 0),
         borderColor: "#0d6e6e",
         backgroundColor: "#0d6e6e",
         tension: 0.35,
       },
       {
-        label: "With added charges",
-        data: series.map((row) => row.invoicesWithAddedCharges || 0),
-        borderColor: "#c47a12",
-        backgroundColor: "#c47a12",
-        tension: 0.35,
-      },
-      {
-        label: "Emails replied",
-        data: series.map((row) => row.emailsReplied),
-        borderColor: "#1a7f4b",
-        backgroundColor: "#1a7f4b",
-        tension: 0.35,
-      },
-      {
-        label: "Emails forwarded for review",
-        data: series.map((row) => row.emailsForwarded),
-        borderColor: "#c0392b",
-        backgroundColor: "#c0392b",
+        label: "Review",
+        data: (series || []).map((p) => p.emailsForwarded || 0),
+        borderColor: "#b42318",
+        backgroundColor: "#b42318",
         tension: 0.35,
       },
     ];
@@ -1016,23 +1096,17 @@
         plugins: {
           legend: {
             labels: {
-              boxWidth: 10,
-              boxHeight: 10,
-              usePointStyle: true,
-              pointStyle: "circle",
-              font: {family: "'Instrument Sans', system-ui, sans-serif", size: 12},
+              boxWidth: 10, usePointStyle: true, pointStyle: "circle",
+              font: {family: "DM Sans, system-ui, sans-serif", size: 11},
               color: "#5c6b76",
             },
           },
         },
         scales: {
-          x: {
-            grid: {display: false},
-            ticks: {color: "#5c6b76", font: {size: 11}},
-          },
+          x: {grid: {display: false}, ticks: {color: "#5c6b76", font: {size: 10}}},
           y: {
             beginAtZero: true,
-            ticks: {precision: 0, color: "#5c6b76", font: {size: 11}},
+            ticks: {precision: 0, color: "#5c6b76", font: {size: 10}},
             grid: {color: "rgba(20, 33, 43, 0.06)"},
           },
         },
@@ -1045,7 +1119,7 @@
       els.statReplied, els.statForwarded].forEach((el) => {
       if (!el) return;
       if (active) {
-        el.textContent = "Loading...";
+        el.textContent = "…";
         el.classList.add("is-thinking");
       } else {
         el.classList.remove("is-thinking");
@@ -1101,12 +1175,12 @@
     });
   });
 
-  els.connectBtn.addEventListener("click", () => {
+  els.connectBtn?.addEventListener("click", () => {
     setButtonBusy(els.connectBtn, true, "Connecting…");
     window.location.href = `${BASE_URL}/mailConnect?${tenantQuery}`;
   });
 
-  els.disconnectBtn.addEventListener("click", async () => {
+  els.disconnectBtn?.addEventListener("click", async () => {
     if (!confirm("Disconnect Outlook?")) return;
     setButtonBusy(els.disconnectBtn, true, "Disconnecting…");
     try {
@@ -1124,24 +1198,58 @@
     }
   });
 
-  els.refreshInvoicesBtn.addEventListener("click", () => loadInvoices({reset: true}));
-  if (els.refreshTasksBtn) {
-    els.refreshTasksBtn.addEventListener("click", () => loadTasks());
-  }
-  if (els.refreshNotifsBtn) {
-    els.refreshNotifsBtn.addEventListener("click", () => loadNotifications());
-  }
-  if (els.loadMoreInvoicesBtn) {
-    els.loadMoreInvoicesBtn.addEventListener("click", () => {
-      if (invoiceHasMore) loadInvoices({reset: false});
-    });
-  }
-  if (els.logExportDate) els.logExportDate.value = todayEasternIsoDate();
-  if (els.exportLogsCsvBtn) {
-    els.exportLogsCsvBtn.addEventListener("click", exportLogsCsvForSelectedDay);
+  async function exportLogsCsvForSelectedDay() {
+    const day = els.logExportDate?.value || todayEasternIsoDate();
+    try {
+      const res = await fetch(
+          `${BASE_URL}/exportLogsCsv?${tenantQuery}&date=${encodeURIComponent(day)}`);
+      if (!res.ok) throw new Error("Export failed");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `jerry-logs-${day}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (_) {
+      showError("Could not export logs.");
+    }
   }
 
-  // ---- Support chat (unchanged behavior) ----
+  els.refreshInvoicesBtn?.addEventListener("click", () => loadInvoices({reset: true}));
+  els.refreshTasksBtn?.addEventListener("click", () => loadTasks({reset: true}));
+  els.refreshNotifsBtn?.addEventListener("click", () => loadNotifications({reset: true}));
+  els.loadMoreInvoicesBtn?.addEventListener("click", () => {
+    if (invoiceHasMore) loadInvoices({reset: false});
+  });
+  els.loadMoreTasksBtn?.addEventListener("click", () => {
+    if (taskHasMore) loadTasks({reset: false});
+  });
+  els.loadMoreNotifsBtn?.addEventListener("click", () => {
+    if (notifHasMore) loadNotifications({reset: false});
+  });
+  els.workspaceSearch?.addEventListener("input", () => {
+    if (activeTab === "tasks") renderTasks([], {append: true});
+    // re-render from cache
+    if (activeTab === "tasks") {
+      const keep = tasksCache.slice();
+      tasksCache = [];
+      renderTasks(keep);
+    } else if (activeTab === "invoices") {
+      paintInvoices(clientFilterSort(invoicesCache));
+    } else if (activeTab === "notifications") {
+      const keep = notifsCache.slice();
+      notifsCache = [];
+      renderNotifications(keep);
+    }
+  });
+  els.workspaceSort?.addEventListener("change", () => {
+    els.workspaceSearch?.dispatchEvent(new Event("input"));
+  });
+  if (els.logExportDate) els.logExportDate.value = todayEasternIsoDate();
+  els.exportLogsCsvBtn?.addEventListener("click", exportLogsCsvForSelectedDay);
+
+  /* —— Support chat —— */
   const chatEls = {
     toggle: document.getElementById("supportChatToggle"),
     headerToggle: document.getElementById("supportChatHeaderToggle"),
@@ -1176,8 +1284,7 @@
         appendChatMessage(
             "bot",
             `Hi! I am Jerry, the support assistant for ${client.name}. ` +
-            "Ask about a load number, invoice status, or anything on " +
-            "the dashboard.",
+            "Ask about a load number, invoice status, or anything on the dashboard.",
         );
       }
     }
@@ -1216,7 +1323,7 @@
       const reply = (data && data.reply) || "Sorry, something went wrong.";
       appendChatMessage("bot", reply);
       chatHistory.push({role: "assistant", content: reply});
-    } catch (error) {
+    } catch (_) {
       pending.remove();
       appendChatMessage("bot", "Sorry, I couldn't reach the support assistant.");
     } finally {
@@ -1231,12 +1338,10 @@
       event.stopPropagation();
       setChatOpen(!chatOpen);
     });
-    if (chatEls.headerToggle) {
-      chatEls.headerToggle.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (chatOpen) setChatOpen(false);
-      });
-    }
+    chatEls.headerToggle?.addEventListener("click", (event) => {
+      event.stopPropagation();
+      if (chatOpen) setChatOpen(false);
+    });
     chatEls.form.addEventListener("submit", (event) => {
       event.preventDefault();
       if (chatBusy) return;
@@ -1251,6 +1356,6 @@
   loadMailStatus();
   setActiveRange(activeRange);
   loadInvoices({reset: true});
-  loadTasks();
-  loadNotifications();
+  loadTasks({reset: true});
+  loadNotifications({reset: true});
 })();
