@@ -623,11 +623,78 @@
     return bits.filter(Boolean).join(" · ");
   }
 
+  function decodeHtmlEntities(value) {
+    const el = document.createElement("textarea");
+    el.innerHTML = String(value || "");
+    return el.value;
+  }
+
+  function cleanEmailPlainText(raw) {
+    let s = String(raw || "");
+    if (!s.trim()) return "";
+
+    // Quoted-printable leftovers from some mail paths.
+    s = s.replace(/=\r?\n/g, "");
+    s = s.replace(/=([0-9A-Fa-f]{2})/g, (_, hex) => {
+      try { return String.fromCharCode(parseInt(hex, 16)); } catch (_) { return ""; }
+    });
+
+    const looksHtml = /<\/?[a-z][\s\S]*>/i.test(s) || /&(?:nbsp|amp|lt|gt|#\d+|#x[0-9a-f]+);/i.test(s);
+    if (looksHtml) {
+      try {
+        const doc = new DOMParser().parseFromString(s, "text/html");
+        doc.querySelectorAll("script, style, noscript, head").forEach((el) => el.remove());
+        doc.querySelectorAll("br").forEach((br) => br.replaceWith("\n"));
+        ["p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "section", "article", "blockquote", "pre"]
+          .forEach((tag) => {
+            doc.querySelectorAll(tag).forEach((el) => {
+              el.append("\n");
+            });
+          });
+        s = doc.body ? (doc.body.innerText || doc.body.textContent || "") : s;
+      } catch (_) {
+        s = s
+          .replace(/<\s*br\s*\/?>/gi, "\n")
+          .replace(/<\/\s*(p|div|tr|li|h[1-6]|blockquote)\s*>/gi, "\n")
+          .replace(/<[^>]+>/g, " ");
+      }
+      s = decodeHtmlEntities(s);
+    }
+
+    s = s
+      .replace(/\u00a0/g, " ")
+      .replace(/[\u200b-\u200d\ufeff]/g, "")
+      .replace(/\[cid:[^\]]+\]/gi, "")
+      .replace(/https?:\/\/\S+/g, (url) => {
+        // Keep short links readable; drop tracking junk tails later if needed.
+        return url.length > 90 ? url.slice(0, 87) + "..." : url;
+      })
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n[ \t]+/g, "\n")
+      .replace(/[ \t]{2,}/g, " ")
+      .replace(/\n{3,}/g, "\n\n")
+      .replace(/([a-z])([A-Z])/g, "$1 $2")
+      .replace(/([a-zA-Z])(\d)/g, "$1 $2")
+      .replace(/(\d)([a-zA-Z])/g, "$1 $2")
+      .replace(/ {2,}/g, " ")
+      .trim();
+
+    // Drop near-empty symbol-only lines (----, ====, ****).
+    s = s
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line && !/^[\-_=*~.|]{3,}$/.test(line))
+      .join("\n")
+      .trim();
+
+    return s;
+  }
+
   function notifEmailBody(n) {
-    const text = String(n.body || "").replace(/\r\n/g, "\n").trim();
-    if (text) return text;
+    const cleaned = cleanEmailPlainText(n.body);
+    if (cleaned) return cleaned;
     if (n.type === "additional_charge") {
-      return "Open Tasks to choose A–E for this charge.";
+      return "Open Tasks to choose A-E for this charge.";
     }
     return "No email body saved.";
   }

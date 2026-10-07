@@ -890,16 +890,19 @@ body {
 
 .notif-body {
   margin: 0 0 0.85rem;
-  padding: 0.75rem 0.85rem;
-  max-height: 280px;
+  padding: 0.85rem 1rem;
+  max-height: 320px;
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--surface-soft);
   font-family: inherit;
-  font-size: 0.86rem;
-  line-height: 1.45;
+  font-size: 0.9rem;
+  line-height: 1.55;
+  letter-spacing: 0.01em;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   color: var(--text);
 }
 
