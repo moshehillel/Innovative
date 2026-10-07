@@ -4397,13 +4397,30 @@ async function ensureDraftInvoiceForInsurance(args) {
 }
 
 /**
+ * Close flags for Redkik insurance saveInvoice.
+ * Closes vendor/actual costs only — never the customer cost section
+ * (costClosed). Matches freight carrier-bill entry (costClosed stays "0").
+ *
+ * @return {object} costClosed / costActualClosed / readyToInvoice flags.
+ */
+function insuranceSaveInvoiceCloseFlags() {
+  return {
+    costClosed: "0",
+    costActualClosed: "1",
+    readyToInvoice: "1",
+  };
+}
+
+/**
  * Close-cost insurance entry — mirrors the manual Primus UI sequence:
- * getTerms → addVendorRefNumber → saveInvoice (cost closed) → getInvoiceStores.
+ * getTerms → addVendorRefNumber → saveInvoice (actual cost closed;
+ * customer cost left open) → getInvoiceStores.
  *
  * Adds a Redkik premium line to an existing load invoice without blocking on
  * rows that lack a BOL (caller handles batching via innovative-insurance).
  * When a Redkik charge already exists without a closed insurance bill #, fills
- * in the vendor invoice number and closes — does not treat that as a duplicate.
+ * in the vendor invoice number and closes actual cost — does not treat that
+ * as a duplicate. Does not close the customer cost section.
  *
  * @param {object} args Flow inputs.
  * @param {object} args.booking Primus booking from GET /book/bolnumber.
@@ -4692,9 +4709,7 @@ async function addInsurancePremiumToLoad(args) {
     billtoId: String(billtoId),
     bookingId,
     ...notes,
-    costClosed: "1",
-    costActualClosed: "1",
-    readyToInvoice: "1",
+    ...insuranceSaveInvoiceCloseFlags(),
     estimatedProfitUSD: profit,
     estimatedProfitPer: profitPer,
     estimatedGP: gp,
@@ -4939,9 +4954,7 @@ async function removeInsurancePremiumFromLoad(args) {
     billtoId: String(billtoId),
     bookingId,
     ...notes,
-    costClosed: "1",
-    costActualClosed: "1",
-    readyToInvoice: "1",
+    ...insuranceSaveInvoiceCloseFlags(),
     estimatedProfitUSD: profit,
     estimatedProfitPer: profitPer,
     estimatedGP: gp,
@@ -5008,6 +5021,7 @@ exports.findMasterVendorByName = findMasterVendorByName;
 exports.normalizeVendorNameKey = normalizeVendorNameKey;
 exports.vendorNamesMeaningfullyOverlap = vendorNamesMeaningfullyOverlap;
 exports.isClosedPriorInsuranceBill = isClosedPriorInsuranceBill;
+exports.insuranceSaveInvoiceCloseFlags = insuranceSaveInvoiceCloseFlags;
 exports.ensureDraftInvoiceForInsurance = ensureDraftInvoiceForInsurance;
 
 /**
@@ -6407,6 +6421,7 @@ exports._internal = {
   invoiceChargesIncludeReference,
   defaultCustomerInvoiceEmailSubject,
   isClosedPriorInsuranceBill,
+  insuranceSaveInvoiceCloseFlags,
   ensureDraftInvoiceForInsurance,
   dispatcherQueriesFromBooking,
 };
