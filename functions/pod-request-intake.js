@@ -33,10 +33,15 @@ const DOCUMENT =
 
 const DOCUMENT_WORD = `(?:${DOCUMENT})`;
 
-/** Words that may sit between an ask verb and the document name. */
+/**
+ * Words that may sit between an ask verb and the document name.
+ * Includes special-type adjectives so "send the stamped POD" still matches
+ * as a POD request (then escalates to Lisa instead of auto-send).
+ */
 const ASK_FILLER =
   "(?:\\s+(?:me|us|over|along|a|an|the|our|your|this|that|" +
-  "signed|copy of|a copy of))*";
+  "signed|stamped|notarized|certified|original|wet|ink|signature|" +
+  "copy of|a copy of))*";
 
 const POLITE =
   "please|kindly|can you|could you|would you|can we|could we";
@@ -96,13 +101,29 @@ const DOCUMENT_CITATION = new RegExp(
     "i",
 );
 
-const SIGNED_DOCUMENT = new RegExp(
+/**
+ * Customer asked for a specific POD type we must not auto-fulfill with a
+ * generic Primus POD. Ops: escalate to Lisa (she replies to the customer).
+ * Focused list: signed, stamped, notarized, original, wet ink/signature,
+ * certified.
+ */
+const SPECIAL_POD_TYPE = new RegExp(
     "\\bsigned\\s+(?:pods?|bols?|bill of lading)\\b|" +
     "\\b(?:pods?|bols?)\\b.{0,30}\\bwith\\s+signature\\b|" +
     "\\bfully\\s+signed\\s+(?:pods?|bols?)\\b|" +
-    "\\b(?:pods?|bols?)\\b.{0,30}\\bsigned\\s+by\\b",
+    "\\b(?:pods?|bols?)\\b.{0,30}\\bsigned\\s+by\\b|" +
+    "\\b(?:stamped|notarized|certified|original)\\s+" +
+    `(?:(?:a|an|the|copy of|a copy of)\\s+)*${DOCUMENT_WORD}\\b|` +
+    `\\b${DOCUMENT_WORD}\\b.{0,40}\\b(?:stamped|notarized|certified)\\b|` +
+    "\\bwet\\s+(?:ink|signature)\\s+" +
+    `(?:(?:a|an|the|copy of|a copy of)\\s+)*${DOCUMENT_WORD}\\b|` +
+    `\\b${DOCUMENT_WORD}\\b.{0,40}\\bwet\\s+(?:ink|signature)\\b|` +
+    "\\boriginal\\s+wet\\s+(?:ink|signature)\\b",
     "i",
 );
+
+/** @deprecated Use SPECIAL_POD_TYPE / looksLikeSpecialPodRequest. */
+const SIGNED_DOCUMENT = SPECIAL_POD_TYPE;
 
 /**
  * Drops quoted reply / signature blocks so heuristics do not match
@@ -187,15 +208,44 @@ function looksLikePodRequest(subject, body) {
 }
 
 /**
+ * True when the customer wants a special POD type (stamped, signed, etc.)
+ * that must go to Lisa — do not auto-send a generic Primus POD.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function looksLikeSpecialPodRequest(subject, body) {
+  const hay = stripPortalNotificationBoilerplate(
+      stripQuotedReplyNoise(`${subject || ""}\n${body || ""}`),
+  );
+  return SPECIAL_POD_TYPE.test(hay);
+}
+
+/**
  * @param {string} subject Email subject.
  * @param {string} body Email body.
  * @return {boolean}
  */
 function looksLikeSignedPodRequest(subject, body) {
-  const hay = stripQuotedReplyNoise(
-      `${subject || ""}\n${body || ""}`,
-  );
-  return SIGNED_DOCUMENT.test(hay);
+  return looksLikeSpecialPodRequest(subject, body);
+}
+
+/**
+ * Pure fulfillment decision for customer POD requests.
+ * - special type → Lisa only (no auto-send)
+ * - generic + Primus has POD → send to customer
+ * - generic + no Primus POD → existing missing-POD path
+ * @param {object} opts subject, body, hasPodOnPrimus
+ * @return {"escalate_special"|"send_customer"|"missing_pod"}
+ */
+function resolvePodRequestFulfillment(opts) {
+  const subject = opts && opts.subject;
+  const body = opts && opts.body;
+  if (looksLikeSpecialPodRequest(subject, body)) {
+    return "escalate_special";
+  }
+  if (opts && opts.hasPodOnPrimus) return "send_customer";
+  return "missing_pod";
 }
 
 /**
@@ -279,11 +329,15 @@ function isPodRequestEmail(
 
 module.exports = {
   NON_POD_REQUEST_INTENTS,
+  SPECIAL_POD_TYPE,
+  SIGNED_DOCUMENT,
   stripQuotedReplyNoise,
   stripPortalNotificationBoilerplate,
   isDocumentCitationWithoutAsk,
   looksLikePodRequest,
+  looksLikeSpecialPodRequest,
   looksLikeSignedPodRequest,
+  resolvePodRequestFulfillment,
   aiRejectsPodRequest,
   parseEmailAddressFromHeader,
   senderIsSystemMailbox,

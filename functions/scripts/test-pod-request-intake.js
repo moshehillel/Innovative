@@ -24,6 +24,42 @@ check("detects signed POD ask",
     pri.looksLikeSignedPodRequest("Signed POD", "Need signed BOL for load"));
 check("regular pod ask not signed",
     !pri.looksLikeSignedPodRequest("Send POD", "Please send pod for 264091"));
+check("detects stamped POD ask",
+    pri.looksLikeSpecialPodRequest(
+        "Load 264091", "Please send the stamped POD"));
+check("detects notarized POD ask",
+    pri.looksLikeSpecialPodRequest(
+        "POD", "Need a notarized proof of delivery for BOL 265042"));
+check("detects wet ink POD ask",
+    pri.looksLikeSpecialPodRequest(
+        "Load 264091", "Can you email the wet ink POD?"));
+check("detects original POD ask",
+    pri.looksLikeSpecialPodRequest(
+        "Documents", "Please provide the original POD"));
+check("detects certified POD ask",
+    pri.looksLikeSpecialPodRequest(
+        "Load 264091", "We need a certified POD"));
+check("stamped ask still counts as POD request",
+    pri.looksLikePodRequest(
+        "Load 264091", "Please send the stamped POD"));
+check("generic+has POD → send_customer",
+    pri.resolvePodRequestFulfillment({
+      subject: "POD for load 264091",
+      body: "Please send the POD",
+      hasPodOnPrimus: true,
+    }) === "send_customer");
+check("stamped → escalate_special (no auto-send)",
+    pri.resolvePodRequestFulfillment({
+      subject: "Load 264091",
+      body: "Please send the stamped POD",
+      hasPodOnPrimus: true,
+    }) === "escalate_special");
+check("generic+no POD → missing_pod (existing path)",
+    pri.resolvePodRequestFulfillment({
+      subject: "POD for load 264091",
+      body: "Please send the POD",
+      hasPodOnPrimus: false,
+    }) === "missing_pod");
 check("parse angle email",
     pri.parseEmailAddressFromHeader("Jane <jane@example.com>") ===
     "jane@example.com");

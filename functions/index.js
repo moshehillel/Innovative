@@ -7149,7 +7149,8 @@ function extractLoadHintsFromEmail(subject, body, hints) {
 }
 
 /**
- * Emails Lisa when someone requests a signed POD we may not have on file.
+ * Emails Lisa when someone requests a special POD type (stamped, signed,
+ * notarized, etc.). Jerry does not auto-send; Lisa replies to the customer.
  * @param {object} opts Request context.
  * @return {Promise<object>}
  */
@@ -7167,10 +7168,11 @@ async function notifyLisaSignedPodRequest(opts) {
   const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
   const html =
     `<p>Hi Lisa,</p>` +
-    `<p>Someone asked for a <strong>signed POD</strong> on load ` +
+    `<p>A customer requested a <strong>specific type of POD</strong> ` +
+    `(e.g. stamped, signed, notarized) on load ` +
     `<strong>${escapeHtml(String(loadNumber || "—"))}</strong>. ` +
-    `Jerry did not auto-send a document — please obtain the signed POD ` +
-    `and send it to the requester.</p>` +
+    `Jerry did not auto-send the Primus POD — please obtain the requested ` +
+    `document and <strong>reply to the customer</strong>.</p>` +
     `<table style="border-collapse:collapse;font-size:14px;margin:12px 0">` +
     `<tr><td style="padding:4px 16px 4px 0;font-weight:600">From</td>` +
     `<td>${escapeHtml(from || "—")}</td></tr>` +
@@ -7190,23 +7192,24 @@ async function notifyLisaSignedPodRequest(opts) {
     type: "signed_pod_request",
     forceRecipient: true,
     to: lisa,
-    subject: `Signed POD requested — Load ${loadNumber || "—"}`,
+    subject: `Special POD requested — Load ${loadNumber || "—"}`,
     html,
     tenant: opts && opts.tenant,
   });
 
-  await writeLog("info", "email", "Signed POD request escalated to Lisa", {
-    messageId,
-    loadNumber,
-    proNumber: proNumber || null,
-    requesterEmail,
-    to: lisa,
-  });
+  await writeLog("info", "email",
+      "Special POD request escalated to Lisa", {
+        messageId,
+        loadNumber,
+        proNumber: proNumber || null,
+        requesterEmail,
+        to: lisa,
+      });
 
   await dashboardTasks.createDashboardTask(db, {
     tenantId: (opts && opts.tenant && opts.tenant.tenantId) || "default",
     type: dashboardTasks.TASK_TYPE.SIGNED_POD,
-    title: `Signed POD requested — Load ${loadNumber || "—"}`,
+    title: `Special POD requested — Load ${loadNumber || "—"}`,
     description: requesterEmail ?
       `Reply to ${requesterEmail}` : null,
     loadNumber: loadNumber || null,
@@ -7297,7 +7300,9 @@ async function notifyLisaPodRequestBlockedRecipient(opts) {
 
 /**
  * Handles inbound emails asking us to send a POD from Primus.
- * Signed-POD requests escalate to Lisa instead of auto-sending.
+ * Special-type POD requests (stamped, signed, notarized, etc.) escalate to
+ * Lisa only — she replies to the customer. Generic requests auto-send when
+ * Primus has a POD on the load.
  * @param {object} opts gmail, messageId, subject, from, emailBody, tenant,
  *   emailClassification.
  * @return {Promise<object>} {handled, status, loadNumber, error?}
@@ -7342,7 +7347,7 @@ async function handlePodRequestEmail(opts) {
   }
 
   const requesterEmail = podRequestIntake.parseEmailAddressFromHeader(from);
-  const wantsSignedPod = podRequestIntake.looksLikeSignedPodRequest(
+  const wantsSpecialPod = podRequestIntake.looksLikeSpecialPodRequest(
       subject, emailBody);
 
   if (requesterEmail && podSendDedup.isBlockedPodRecipient(requesterEmail)) {
@@ -7365,7 +7370,7 @@ async function handlePodRequestEmail(opts) {
     };
   }
 
-  if (wantsSignedPod) {
+  if (wantsSpecialPod) {
     await notifyLisaSignedPodRequest({
       messageId,
       subject,
