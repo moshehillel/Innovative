@@ -90,12 +90,15 @@ function serializeNotif(doc) {
  */
 async function createNotification(db, data) {
   try {
+    const MAX_BODY = 120000;
+    let body = data.body != null ? String(data.body) : null;
+    if (body && body.length > MAX_BODY) body = body.slice(0, MAX_BODY);
     const ref = await db.collection(NOTIF_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || NOTIF_TYPE.OPS_EMAIL,
       status: NOTIF_STATUS.OPEN,
       title: data.title || "Notification",
-      body: data.body || null,
+      body,
       subject: data.subject || null,
       from: data.from || null,
       to: data.to || null,
@@ -127,9 +130,61 @@ async function createNotification(db, data) {
 }
 
 /**
+ * Wraps a thin stored body with the same Action Required chrome the review
+ * email uses (for legacy rows that only saved the original message HTML).
+ * @param {object} n Serialized notification.
+ * @return {string}
+ */
+function enrichUnhandledNotifBody(n) {
+  const body = String(n.body || "").trim();
+  const reason = String(n.reason || "").trim();
+  if (!body && !reason) return body;
+  if (/Action Required/i.test(body) && /Original (Email|Message)/i.test(body)) {
+    return body;
+  }
+  const esc = (v) => String(v == null ? "" : v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  const notes = reason ?
+    `Jerry could not auto-handle this email (${esc(reason)}). ` +
+    `Please review and take action.` :
+    `Jerry could not auto-handle this email. Please review and take action.`;
+  return `<div style="font-family:Arial,sans-serif;max-width:620px;` +
+    `color:#111827;font-size:14px;">` +
+    `<div style="background:#dc2626;color:#fff;padding:14px 18px;` +
+    `border-radius:6px 6px 0 0;font-size:15px;font-weight:700;">` +
+    `&#9888; Action Required — ${esc(reason || "Review needed")}</div>` +
+    `<div style="border:1px solid #e5e7eb;border-top:none;padding:18px;` +
+    `border-radius:0 0 6px 6px;">` +
+    `<p style="margin:0 0 16px;color:#374151;line-height:1.6;">${notes}</p>` +
+    `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Original Email</h3>` +
+    `<table style="border-collapse:collapse;font-size:13px;">` +
+    (n.from ?
+      `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+      `From</td><td>${esc(n.from)}</td></tr>` : "") +
+    (n.subject ?
+      `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+      `Subject</td><td>${esc(n.subject)}</td></tr>` : "") +
+    (n.messageId ?
+      `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+      `Message&nbsp;ID</td>` +
+      `<td style="font-family:monospace;font-size:11px;">` +
+      `${esc(n.messageId)}</td></tr>` : "") +
+    `</table>` +
+    (body ?
+      `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+      `letter-spacing:.05em;color:#374151;">Original Message</h3>` +
+      `<div style="background:#f9fafb;border:1px solid #e5e7eb;` +
+      `border-radius:6px;padding:14px;font-size:13px;line-height:1.6;` +
+      `color:#374151;">${body}</div>` : "") +
+    `</div></div>`;
+}
+
+/**
  * Lists open notifications for a tenant.
  * @param {object} db Firestore.
- * @param {object} opts tenantId, limit, type.
+ * @param {object} opts tenantId, limit, type, additionalChargesMod?
  * @return {Promise<object>}
  */
 async function listNotifications(db, opts) {
@@ -150,6 +205,36 @@ async function listNotifications(db, opts) {
   }
   const snap = await query.get();
   const notifications = snap.docs.map(serializeNotif);
+
+  for (const n of notifications) {
+    if (n.type === NOTIF_TYPE.UNHANDLED_EMAIL) {
+      n.body = enrichUnhandledNotifBody(n);
+      if (n.reason && n.subject &&
+          !/^\[ACTION REQUIRED\]/i.test(String(n.subject))) {
+        n.subject = `[ACTION REQUIRED] ${n.reason} — ${n.subject}`;
+      }
+      continue;
+    }
+    if (n.type !== NOTIF_TYPE.ADDITIONAL_CHARGE || n.body) continue;
+    if (!n.followUpId || !opts.additionalChargesMod) continue;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const fu = await db
+          .collection(opts.additionalChargesMod.FOLLOW_UP_COLLECTION)
+          .doc(n.followUpId).get();
+      if (!fu.exists) continue;
+      const d = fu.data() || {};
+      if (d.emailHtml) {
+        n.body = String(d.emailHtml);
+        n.subject = n.subject || d.emailSubject || null;
+        n.to = n.to || d.emailTo || null;
+        n.cc = n.cc || d.emailCc || null;
+      }
+    } catch (err) {
+      console.error("[listNotifications] charge enrich:", err.message);
+    }
+  }
+
   return {notifications, openCount: notifications.length};
 }
 

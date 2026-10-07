@@ -4745,18 +4745,48 @@ async function forwardToHumanReview(
     extractedData.load);
   const tenantId = (currentTenant() && currentTenant().tenantId) || "default";
   const opsPrimary = dashboardOps.isDashboardOpsPrimary();
-  // Prefer the original HTML so the dashboard matches the mail client.
+  // Dashboard shows the same review email Lisa gets, plus the full original
+  // message (outbound may only attach original.eml / a truncated snippet).
   const MAX_NOTIF_BODY = 120000;
-  let notifBody = emailHtml ? String(emailHtml) : "";
-  if (!notifBody && emailBody) {
-    notifBody =
+  const originalFullHtml = emailHtml ? String(emailHtml) :
+    (emailBody ?
       `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
-      `${escapeHtml(String(emailBody))}</pre>`;
-  }
-  if (!notifBody && notes) {
-    notifBody =
-      `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
-      `${escapeHtml(String(notes))}</pre>`;
+      `${escapeHtml(String(emailBody))}</pre>` : "");
+  const originalFullSection = originalFullHtml ?
+    `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Original Message</h3>` +
+    `<div style="background:#f9fafb;border:1px solid #e5e7eb;` +
+    `border-radius:6px;padding:14px;font-size:13px;line-height:1.6;` +
+    `color:#374151;">${originalFullHtml}</div>` : "";
+  let notifBody =
+    `<div style="font-family:Arial,sans-serif;max-width:620px;` +
+    `color:#111827;font-size:14px;">` +
+    `<div style="background:#dc2626;color:#fff;padding:14px 18px;` +
+    `border-radius:6px 6px 0 0;font-size:15px;font-weight:700;">` +
+    `&#9888; Action Required — ${escapeHtml(reason)}</div>` +
+    `<div style="border:1px solid #e5e7eb;border-top:none;padding:18px;` +
+    `border-radius:0 0 6px 6px;">` +
+    `<p style="margin:0 0 16px;color:#374151;line-height:1.6;` +
+    `white-space:pre-wrap;">${escapeHtml(notes)}</p>` +
+    `${dataSection}` +
+    `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+    `letter-spacing:.05em;color:#374151;">Original Email</h3>` +
+    `<table style="border-collapse:collapse;font-size:13px;">` +
+    `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+    `From</td><td>${escapeHtml(from)}</td></tr>` +
+    `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+    `Subject</td><td>${escapeHtml(subject)}</td></tr>` +
+    `<tr><td style="padding:4px 14px 4px 0;color:#6b7280;font-weight:600;">` +
+    `Message&nbsp;ID</td>` +
+    `<td style="font-family:monospace;font-size:11px;">` +
+    `${escapeHtml(messageId)}</td>` +
+    `</tr></table>` +
+    `${attachmentNotice}` +
+    `${originalFullSection}` +
+    `</div></div>`;
+  if (!originalFullSection && notes) {
+    // Extremely thin fallback — still better than empty.
+    notifBody = String(html || "");
   }
   if (notifBody.length > MAX_NOTIF_BODY) {
     notifBody = notifBody.slice(0, MAX_NOTIF_BODY);
@@ -4767,7 +4797,7 @@ async function forwardToHumanReview(
     type: dashboardOps.NOTIF_TYPE.UNHANDLED_EMAIL,
     title: `[Review] ${safeReason}`,
     body: notifBody || null,
-    subject: safeSubject,
+    subject: forwardSubject,
     from,
     to: departmentEmail,
     messageId,

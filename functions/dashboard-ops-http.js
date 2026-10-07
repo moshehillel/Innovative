@@ -39,6 +39,7 @@ async function handleListNotifications(req, res) {
       tenantId: tenant.tenantId,
       limit: req.query.limit,
       type: req.query.type || null,
+      additionalChargesMod: deps.additionalCharges || null,
     });
     return res.json({
       ok: true,
