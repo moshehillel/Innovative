@@ -6,6 +6,8 @@ Static Jerry / invoice-ops dashboard for Innovative Carriers.
 
 This branch (`dashboard`) is the **only** source for the dedicated Netlify site.
 
+- **Site:** https://innovative-jerry.netlify.app  
+  (Admin: https://app.netlify.com/projects/innovative-jerry)
 - **GitHub repo:** `moshehillel/Innovative`
 - **Production branch:** `dashboard` (not `main`)
 - **Publish directory:** `.` (site root)
@@ -18,13 +20,15 @@ Pushes to `dashboard` auto-deploy. Backend Cloud Functions stay on `main`.
 | --- | --- |
 | `DASHBOARD_PASSWORD` | Basic-auth password (username ignored) |
 
+Set/rotate under Site configuration → Environment variables.
+
 ## Backend CORS
 
-Cloud Functions env `DASHBOARD_ORIGIN` should include this site’s origin
-(comma-separated if AA should keep working too), e.g.:
+Cloud Functions allowlist includes this origin. Optional env
+`DASHBOARD_ORIGIN` may be a single origin, a comma-separated list, or `*`:
 
 ```text
-https://www.advancedautomations.net,https://innovative.netlify.app
+https://www.advancedautomations.net,https://innovative-jerry.netlify.app
 ```
 
 ## Local preview
