@@ -724,7 +724,7 @@
       els.notifCountBadge.textContent = String(openNotifCount);
     }
     if (els.opsPrimaryHint) {
-      els.opsPrimaryHint.hidden = !opsPrimary;
+      els.opsPrimaryHint.hidden = true;
     }
     if (!items || !items.length) {
       els.notificationsContainer.innerHTML =
