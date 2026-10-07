@@ -760,6 +760,9 @@
               ${n.to ? `<div><span>To</span><strong>${bodyEsc(n.to)}</strong></div>` : ""}
               ${n.cc ? `<div><span>Cc</span><strong>${bodyEsc(n.cc)}</strong></div>` : ""}
               <div><span>Subject</span><strong>${bodyEsc(subject)}</strong></div>
+              ${n.reason ? `<div><span>Reason</span><strong>${bodyEsc(n.reason)}</strong></div>` : ""}
+              ${n.loadNumber ? `<div><span>Load</span><strong>${bodyEsc(n.loadNumber)}</strong></div>` : ""}
+              ${n.carrierName ? `<div><span>Carrier</span><strong>${bodyEsc(n.carrierName)}</strong></div>` : ""}
             </div>
             <div class="notif-email-body">
               ${renderEmailBodyHtml(n.body)}
