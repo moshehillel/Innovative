@@ -336,6 +336,57 @@ check(
     quoteRules.isSafeCarrierStripNeedle("j - i"),
     true,
 );
+const xpoBdCleanRules = quoteRules.toCustomerEmailCarrierCleanRules([{
+  id: "clean_carrier_display_xpo_bd",
+  active: true,
+  ruleKind: "carrier_display_clean",
+  name: "Clean carrier names — remove XPO BD",
+  match: {
+    carrierNameContains: ["xpo bd", "xpo-bd", "xpo  bd"],
+  },
+  notes: "In customer emails and rate lists, show only XPO and omit " +
+    "the BD wording.",
+}]);
+check(
+    "XPO BD notes infer displayAs XPO",
+    quoteRules.carrierDisplayAsFromRule({
+      notes: "In customer emails and rate lists, show only XPO and omit " +
+        "the BD wording.",
+    }),
+    "XPO",
+);
+check(
+    "XPO BD → XPO via rename-style clean rule",
+    quoteRules.cleanCustomerEmailCarrierName("XPO BD", xpoBdCleanRules),
+    "XPO",
+);
+check(
+    "XPO-BD → XPO via hyphen needle",
+    quoteRules.cleanCustomerEmailCarrierName("XPO-BD", xpoBdCleanRules),
+    "XPO",
+);
+check(
+    "explicit displayAs renames short needle",
+    quoteRules.cleanCustomerEmailCarrierName(
+        "XPO BD",
+        quoteRules.toCustomerEmailCarrierCleanRules([{
+          id: "clean_xpo_explicit",
+          active: true,
+          ruleKind: "carrier_display_clean",
+          displayAs: "XPO",
+          match: {carrierNameContains: ["xpo bd"]},
+          notes: "rename",
+        }])),
+    "XPO",
+);
+check(
+    "multi instead-of notes do not infer a single displayAs",
+    quoteRules.carrierDisplayAsFromRule({
+      notes: "Show only Estes instead of Estes Express, only ABF instead of " +
+        "ABF Freight System.",
+    }),
+    "",
+);
 check(
     "needle match equates J&I and J – I",
     quoteRules.carrierNameMatchesNeedle("Roadrunner J – I", "j&i"),

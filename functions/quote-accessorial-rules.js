@@ -1788,17 +1788,62 @@ function isSafeCarrierStripNeedle(needle) {
 }
 
 /**
+ * Escape a carrier needle for flexible whitespace / dash / & matching.
+ * @param {string} needle Match phrase.
+ * @return {string} Regex source (unanchored).
+ */
+function carrierNeedleFlexSource(needle) {
+  return String(needle || "").trim()
+      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      .replace(/\\?\s+/g, "[\\s\\-–—/]*")
+      .replace(/\\?&/g, "(?:&|and|\\-)");
+}
+
+/**
+ * Explicit rename target for a carrier_display_clean rule.
+ * Prefers rule.displayAs / rule.renameTo; otherwise infers a single
+ * "show only X and omit…" / "show only X" alias from notes. Does not
+ * infer from multi-mapping prose ("only Estes instead of…, only ABF…").
+ * @param {object} rule Rule document or compiled clean rule.
+ * @return {string}
+ */
+function carrierDisplayAsFromRule(rule) {
+  if (!rule || typeof rule !== "object") return "";
+  const explicit = String(rule.displayAs || rule.renameTo || "").trim();
+  if (explicit) return explicit;
+  const notes = String(rule.notes || "").trim();
+  if (!notes) return "";
+  // Multi-mapping prose is not a single rename target.
+  if (/\binstead\s+of\b/i.test(notes) &&
+      (notes.match(/\bonly\b/gi) || []).length > 1) {
+    return "";
+  }
+  // "show only XPO and omit the BD wording"
+  const omit = notes.match(
+      /\bshow\s+only\s+([A-Za-z0-9][A-Za-z0-9 .&'*_-]{0,39}?)\s+and\s+omit\b/i);
+  if (omit) return omit[1].trim();
+  // "show only XPO." / trailing "show only XPO"
+  if (/\binstead\s+of\b/i.test(notes)) return "";
+  const simple = notes.match(
+      /\bshow\s+only\s+([A-Za-z0-9][A-Za-z0-9 .&'*_-]{0,39}?)(?:\s*[.,]|\s*$)/i);
+  return simple ? simple[1].trim() : "";
+}
+
+/**
  * True when a cleaned display name looks destroyed vs the Primus original.
  * @param {string} cleaned Candidate display name.
  * @param {string} raw Original Primus name.
+ * @param {string} [allowedShort] Intentional rename alias (e.g. "XPO").
  * @return {boolean}
  */
-function isBrokenCarrierDisplayName(cleaned, raw) {
+function isBrokenCarrierDisplayName(cleaned, raw, allowedShort) {
   const c = String(cleaned || "").trim();
   const r = String(raw || "").trim();
   if (!r) return false;
   if (!c) return true;
   if (/^[,.\-–—/%\s]/.test(c)) return true;
+  const allow = String(allowedShort || "").trim();
+  if (allow && c.toLowerCase() === allow.toLowerCase()) return false;
   if (c.length < 3) return true;
   const letters = (s) => (String(s).match(/[a-z]/gi) || []).length;
   // Stripping "ABF FREIGHT SYSTEM" down to ", INC." loses almost all letters.
@@ -1809,8 +1854,11 @@ function isBrokenCarrierDisplayName(cleaned, raw) {
 /**
  * Strip matched broker / distributor wording from a carrier display name.
  * Always strips common J&I / J-I variants even when no Firestore rule matched.
+ * Rename-style Active clean rules (displayAs / "show only X and omit…")
+ * replace short needles with the alias; bare short strip needles stay blocked.
  * @param {string} rawName Primus / rate carrier name.
- * @param {Array<{id: string, test: Function, needles: Array<string>}>} [rules]
+ * @param {Array<{id: string, test: Function, needles: Array<string>,
+ *   displayAs?: string}>} [rules]
  * @return {string}
  */
 function cleanCustomerEmailCarrierName(rawName, rules) {
@@ -1818,18 +1866,29 @@ function cleanCustomerEmailCarrierName(rawName, rules) {
   let name = raw;
   if (!name) return name;
   let matched = false;
+  let appliedDisplayAs = "";
   if (Array.isArray(rules) && rules.length) {
     for (const rule of rules) {
       if (!rule || typeof rule.test !== "function") continue;
       if (!rule.test(name)) continue;
       matched = true;
+      const displayAs = String(
+          rule.displayAs || carrierDisplayAsFromRule(rule) || "").trim();
       for (const needle of rule.needles || []) {
         const n = String(needle || "").trim();
-        if (!n || !isSafeCarrierStripNeedle(n)) continue;
-        const flex = n
-            .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-            .replace(/\\?\s+/g, "[\\s\\-–—/]*")
-            .replace(/\\?&/g, "(?:&|and|\\-)");
+        if (!n) continue;
+        const flex = carrierNeedleFlexSource(n);
+        if (!flex) continue;
+        if (displayAs) {
+          // Explicit / notes-inferred rename (e.g. "XPO BD" → "XPO").
+          const next = name.replace(new RegExp(flex, "ig"), displayAs);
+          if (next !== name) {
+            name = next;
+            appliedDisplayAs = displayAs;
+          }
+          continue;
+        }
+        if (!isSafeCarrierStripNeedle(n)) continue;
         name = name.replace(
             new RegExp(`[\\s\\-–—/]*${flex}`, "ig"), " ");
       }
@@ -1848,7 +1907,8 @@ function cleanCustomerEmailCarrierName(rawName, rules) {
       .replace(/\s*[-–—/,]+$/g, "")
       .trim();
   // Guard: short rename needles (e.g. "abf") must not destroy the label.
-  if (isBrokenCarrierDisplayName(name, raw)) {
+  // Intentional displayAs aliases (e.g. "XPO") are allowed even when short.
+  if (isBrokenCarrierDisplayName(name, raw, appliedDisplayAs)) {
     name = stripJiBrokerSuffix(raw)
         .replace(/\s+/g, " ")
         .replace(/\s*[-–—/,]+$/g, "")
@@ -1860,7 +1920,8 @@ function cleanCustomerEmailCarrierName(rawName, rules) {
 /**
  * Builds carrier display-name cleaners from quoteRules.
  * @param {Array<object>} rules Active quote rules.
- * @return {Array<{id: string, test: Function, needles: Array<string>}>}
+ * @return {Array<{id: string, test: Function, needles: Array<string>,
+ *   displayAs: string}>}
  */
 function toCustomerEmailCarrierCleanRules(rules) {
   const out = [];
@@ -1868,9 +1929,12 @@ function toCustomerEmailCarrierCleanRules(rules) {
     if (!isCarrierDisplayCleanRule(rule)) continue;
     const needles = carrierNameContainsNeedles(rule);
     if (!needles.length) continue;
+    const displayAs = carrierDisplayAsFromRule(rule);
     out.push({
       id: String(rule.id || `carrier_clean_${out.length}`),
       needles,
+      displayAs,
+      notes: String(rule.notes || ""),
       test: (name) => needles.some(
           (n) => carrierNameMatchesNeedle(name, n)),
     });
@@ -2243,6 +2307,7 @@ module.exports = {
   stripJiBrokerSuffix,
   isSafeCarrierStripNeedle,
   isBrokenCarrierDisplayName,
+  carrierDisplayAsFromRule,
   toCustomerEmailCarrierNoteRules,
   toCustomerEmailCarrierCleanRules,
   applyZipFillRules,
