@@ -205,6 +205,12 @@ function buildIntakeSummary(data) {
       statement_forwarded: "Forwarded — carrier statement, no freight invoice",
       customer_payment_remittance_ignored_abe_cc:
         "Ignored — customer payment remittance (Abe on thread)",
+      payment_inquiry_ignored_abe_cc:
+        "Ignored — payment inquiry (Abe already on thread)",
+      payment_inquiry_replied:
+        "Processed — payment inquiry reply (directed to Abe)",
+      bank_holiday_notice_ignored:
+        "Ignored — bank holiday notice",
       customer_payment_remittance_forwarded:
         "Forwarded — customer payment remittance to accounting",
       hafstaff_forwarded_to_lisa: "Forwarded — Hafstaff to Lisa (ops rule)",

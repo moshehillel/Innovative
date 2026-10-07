@@ -571,6 +571,68 @@ check("HaulPay Abe on Cc is detected for ignore",
       {name: "Cc", value: "Abe Goldberger <abe@innovativecarriers.com>"},
     ]));
 
+// Lisa: payment-status request with Abe already copied → quiet ignore.
+// ZEMA live miss: body typo "payment statue" + Abe on To → was Lisa forward.
+const zemaPaySubject = "Load # 265361";
+const zemaPayFrom =
+  "ZEMA LOGISTICS LLC <zemalogisticsllc@gmail.com>";
+const zemaPayBody =
+  "Good morning Accounting i need the payment statue for this load please " +
+  "Thank you";
+const zemaAbeToHeaders = [
+  {
+    name: "To",
+    value:
+      "Abe <abe@innovativecarriers.com>, " +
+      "Innovative Accounting <accounting@innovativecarriers.com>",
+  },
+];
+const zemaAbeCcHeaders = [
+  {
+    name: "To",
+    value: "Innovative Accounting <accounting@innovativecarriers.com>",
+  },
+  {name: "Cc", value: "Abe Goldberger <abe@innovativecarriers.com>"},
+];
+const zemaNoAbeHeaders = [
+  {
+    name: "To",
+    value: "Innovative Accounting <accounting@innovativecarriers.com>",
+  },
+];
+check("ZEMA payment statue typo is payment inquiry",
+    adm.isPaymentInquiryEmail(zemaPaySubject, zemaPayFrom, zemaPayBody));
+check("ZEMA payment inquiry handled when no invoice PDF",
+    adm.shouldHandlePaymentInquiry(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, 0));
+check("payment status + Abe on To → quiet ignore",
+    adm.shouldQuietIgnorePaymentInquiryAbeCc(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, zemaAbeToHeaders, 0) &&
+    adm.evaluateAdministrativeIgnore(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, [], zemaAbeToHeaders)
+        .status === "payment_inquiry_ignored_abe_cc");
+check("payment status + Abe on Cc → quiet ignore",
+    adm.shouldQuietIgnorePaymentInquiryAbeCc(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, zemaAbeCcHeaders, 0) &&
+    adm.evaluateAdministrativeIgnore(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, [], zemaAbeCcHeaders)
+        .status === "payment_inquiry_ignored_abe_cc");
+check("payment status without Abe → still payment inquiry, not ignored",
+    adm.shouldHandlePaymentInquiry(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, 0) &&
+    !adm.shouldQuietIgnorePaymentInquiryAbeCc(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, zemaNoAbeHeaders, 0) &&
+    adm.evaluateAdministrativeIgnore(
+        zemaPaySubject, zemaPayFrom, zemaPayBody, [], zemaNoAbeHeaders)
+        .ignore === false);
+check("correct spelling payment status + Abe Cc → quiet ignore",
+    adm.shouldQuietIgnorePaymentInquiryAbeCc(
+        "Load # 265361",
+        zemaPayFrom,
+        "Please provide payment status for this load.",
+        zemaAbeCcHeaders,
+        0));
+
 const fleetexReSubject = "RE: Outstanding Payment Reminder";
 const fleetexLisaBody =
   "following up on outstanding invoices totaling $7,225, " +

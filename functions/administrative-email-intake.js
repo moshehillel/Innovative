@@ -1039,44 +1039,8 @@ function shouldIgnoreAsPaymentReceipt(
 }
 
 /**
- * Subject is only a load-number thread title, e.g. "Re: 264617".
- * @param {string} subject Email subject.
- * @return {boolean}
- */
-function subjectLooksLikeLoadNumberReply(subject) {
-  const sub = String(subject || "").trim();
-  const stripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
-  return /^\d{5,6}\.?\s*$/.test(stripped);
-}
-
-/**
- * Body asks about missing or delayed payment (optionally for load numbers).
- * Used with bare load-number subjects so non-payment Re: threads do not match.
- * @param {string} body Plain body.
- * @return {boolean}
- */
-function bodyLooksLikeLoadPaymentFollowUp(body) {
-  const bodyL = String(body || "").toLowerCase();
-  if (!bodyL.trim()) return false;
-  const paymentSignals = [
-    /\bpayment\s+has\s+not\s+been\s+received\b/,
-    /\bpayment\s+not\s+received\b/,
-    /\b(?:have\s+not|has\s+not|haven't)\s+received\s+(?:our\s+)?payment\b/,
-    /\b(?:update|status)\s+(?:on\s+)?payment\s+status\b/,
-    /\bpayment\s+status\s+update\b/,
-    /\bunpaid\b/,
-    /\boutstanding\s+payment\b/,
-    /\bpending\s+payment\b/,
-    /\bwhen\s+(?:will|can)\s+(?:we|i|our)\s+(?:get\s+)?paid\b/,
-    /\bstatus\s+of\s+(?:my\s+)?payment\b/,
-    /\bpayment\s+status\b/,
-    /\b(?:still\s+)?awaiting\s+payment\b/,
-  ];
-  return paymentSignals.some((re) => re.test(bodyL));
-}
-
-/**
- * Subject is a bare load-number thread title (e.g. "Re: 264617", "264618").
+ * Subject is a bare load-number thread title (e.g. "Re: 264617",
+ * "Load # 265361").
  * @param {string} subject Email subject.
  * @return {boolean}
  */
@@ -1089,24 +1053,37 @@ function subjectLooksLikeLoadNumberReply(subject) {
 
 /**
  * Body asks about payment timing/status for one or more loads.
+ * Includes common typo "payment statue" (status).
  * @param {string} body Plain body.
  * @return {boolean}
  */
 function bodyLooksLikeLoadPaymentFollowUp(body) {
-  const bodyL = String(body || "").toLowerCase();
+  const bodyL = String(body || "").toLowerCase()
+      .replace(/&nbsp;/g, " ")
+      .replace(/\u00a0/g, " ");
   if (!bodyL.trim()) return false;
   const hasLoadRef =
     /\bload\s+(?:numbers?|nos?\.?|#)\b/.test(bodyL) ||
+    /\b(?:this|the|that)\s+load\b/.test(bodyL) ||
     /\b\d{5,9}\b/.test(bodyL);
   if (!hasLoadRef) return false;
   const paymentSignals = [
     /\bpayment\s+(?:has\s+not\s+been\s+received|not\s+received)\b/,
-    /\bpayment\s+status(?:\s+update)?\b/,
+    // "status" plus common typo "statue"
+    /\bpayment\s+statu[se]\w*(?:\s+update)?\b/,
+    /\bi\s+need\s+(?:the\s+)?payment\b/,
+    /\bneed\s+(?:the\s+)?payment\s+statu[se]\w*\b/,
     /\b(?:unpaid|outstanding)\s+(?:load|payment|invoice)/,
     /\bfollow(?:ing)?\s+up\s+on\s+(?:unpaid|outstanding)/,
     /\bwhen\s+will\s+payment\b/,
     /\bprovide\s+(?:an?\s+)?(?:update\s+on\s+)?payment\b/,
-    /\brequesting\s+.*payment\s+status\b/,
+    /\brequesting\s+.*payment\s+statu[se]\w*\b/,
+    /\bunpaid\b/,
+    /\boutstanding\s+payment\b/,
+    /\bpending\s+payment\b/,
+    /\bwhen\s+(?:will|can)\s+(?:we|i|our)\s+(?:get\s+)?paid\b/,
+    /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\b(?:still\s+)?awaiting\s+payment\b/,
   ];
   return paymentSignals.some((re) => re.test(bodyL));
 }
@@ -1134,11 +1111,14 @@ function senderDomainLooksLikeFactor(from) {
  * @return {boolean}
  */
 function bodyLooksLikeInvoiceThreadPaymentFollowUp(body) {
-  const bodyL = String(body || "").toLowerCase();
+  const bodyL = String(body || "").toLowerCase()
+      .replace(/&nbsp;/g, " ")
+      .replace(/\u00a0/g, " ");
   if (!bodyL.trim()) return false;
   const signals = [
-    /\bpayment\s+status\b/,
+    /\bpayment\s+statu[se]\w*\b/,
     /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\bi\s+need\s+(?:the\s+)?payment\b/,
     /\bpayment\s+has\s+not\s+been\s+received\b/,
     /\bpayment\s+not\s+received\b/,
     /\b(?:have\s+not|has\s+not|haven't)\s+received\s+(?:our\s+)?payment\b/,
@@ -1168,7 +1148,9 @@ function isPaymentInquiryEmail(subject, from, body) {
   if (isPaymentNotificationEmail(subject, from, body)) return false;
   const sub = String(subject || "").trim();
   const subStripped = sub.replace(/^(?:(?:re|fw|fwd):\s*)+/i, "").trim();
-  const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase();
+  const hay = `${sub}\n${from || ""}\n${body || ""}`.toLowerCase()
+      .replace(/&nbsp;/g, " ")
+      .replace(/\u00a0/g, " ");
   if (!hay.trim()) return false;
   // "Re: Invoice N Load M" subjects look like freight invoices, but carriers
   // often reply on that thread asking for payment status (no PDF). Allow those
@@ -1177,13 +1159,17 @@ function isPaymentInquiryEmail(subject, from, body) {
     return bodyLooksLikeInvoiceThreadPaymentFollowUp(body);
   }
 
+  const hayNorm = hay;
   const patterns = [
     /\bquick\s*pay\b/,
     /\bquickpay\b/,
     /\bpayment\s+inquir(y|ies)\b/,
     /\bpayment\s+request\b/,
-    /\bpayment\s+status\b/,
+    // "payment status" plus common typo "payment statue"
+    /\bpayment\s+statu[se]\w*\b/,
     /\bstatus\s+of\s+(?:my\s+)?payment\b/,
+    /\bi\s+need\s+(?:the\s+)?payment\b/,
+    /\bneed\s+(?:the\s+)?payment\s+statu[se]\w*\b/,
     /\bpending\s+payment\b/,
     /\bunpaid\s+payment\b/,
     /\b(?:outstanding|overdue|awaiting)\s+payment(?:\s+(?:reminder|follow[- ]?up))?\b/,
@@ -1212,20 +1198,20 @@ function isPaymentInquiryEmail(subject, from, body) {
     /\bpayment\s+has\s+not\s+been\s+received\b/,
     /\bpayment\s+not\s+received\b/,
     /\b(?:have\s+not|has\s+not|haven't)\s+received\s+(?:our\s+)?payment\b/,
-    /\b(?:update|status)\s+(?:on\s+)?payment\s+status\b/,
-    /\bpayment\s+status\s+update\b/,
-    /\bpayment\s+(?:has\s+not\s+been\s+received|not\s+received|status)\b.*\bload\b/,
+    /\b(?:update|status)\s+(?:on\s+)?payment\s+statu[se]\w*\b/,
+    /\bpayment\s+statu[se]\w*\s+update\b/,
+    /\bpayment\s+(?:has\s+not\s+been\s+received|not\s+received|statu[se]\w*)\b.*\bload\b/,
     /\bload\s+(?:numbers?|nos?\.?|#)\b.*\bpayment\b/,
     /\bfollow(?:ing)?\s+up\b.*\b(?:unpaid|outstanding|payment)\b.*\bload\b/,
     /\b(?:unpaid|outstanding)\b.*\bload\s+(?:numbers?|#)\b/,
   ];
-  if (patterns.some((re) => re.test(hay))) return true;
+  if (patterns.some((re) => re.test(hayNorm))) return true;
   if (/quick\s*pay\s+invoice/i.test(subStripped)) return true;
   if (/payment\s+inquir/i.test(subStripped)) return true;
   if (/pending\s+payment\s+for\s+load/i.test(subStripped)) return true;
   if (/payment\s+update\s+load\s+#?\s*\d{5,9}/i.test(subStripped)) return true;
   if (/payment\s+update\s+for\s+load/i.test(subStripped)) return true;
-  if (/payment\s+status\s+update/i.test(subStripped)) return true;
+  if (/payment\s+statu[se]\w*\s+update/i.test(subStripped)) return true;
   if (/outstanding\s+payment\s+reminder/i.test(subStripped)) return true;
   if (/outstanding\s+invoices?/i.test(subStripped)) return true;
   if (/expected\s+payment\s+date/i.test(subStripped)) return true;
@@ -1261,6 +1247,27 @@ function shouldHandlePaymentInquiry(
   if (Number(invoicePdfCount) > 0) return false;
   if (!isPaymentInquiryEmail(subject, from, body)) return false;
   return true;
+}
+
+/**
+ * Lisa: payment-status requests where Abe is already on To/Cc — quiet ignore
+ * (do not reply, do not escalate to Lisa).
+ * @param {string} subject Email subject.
+ * @param {string} from From header.
+ * @param {string} body Plain body.
+ * @param {Array<object>} headers Gmail/Outlook payload headers.
+ * @param {number} [invoicePdfCount] Invoice PDFs after doc classification.
+ * @param {Array<object>} [attachments] Attachments (PDF blocks ignore).
+ * @return {boolean}
+ */
+function shouldQuietIgnorePaymentInquiryAbeCc(
+    subject, from, body, headers, invoicePdfCount, attachments) {
+  if (attachmentsIncludePdfLike(attachments)) return false;
+  if (!shouldHandlePaymentInquiry(
+      subject, from, body, invoicePdfCount)) {
+    return false;
+  }
+  return isAbeCopiedOnEmailHeaders(headers);
 }
 
 /**
@@ -1983,6 +1990,16 @@ function evaluateAdministrativeIgnore(
       status: "payment_receipt_ignored",
     };
   }
+  // Lisa: payment-status ask with Abe already on To/Cc — quiet ignore
+  // (same outcome as handlePaymentInquiryEmail Abe-CC short-circuit).
+  if (shouldQuietIgnorePaymentInquiryAbeCc(
+      subject, from, body, headers, 0, attachments)) {
+    return {
+      ignore: true,
+      reason: "Payment inquiry — Abe already on thread",
+      status: "payment_inquiry_ignored_abe_cc",
+    };
+  }
   // Before PDF classification: only ignore when filenames clearly NOA-only.
   if (rtsNoaAttachmentsLookNoaOnly(attachments) &&
       looksLikeNoaEmailContent(subject, body, from) &&
@@ -2042,6 +2059,7 @@ module.exports = {
   shouldIgnoreAsPaymentReceipt,
   isPaymentInquiryEmail,
   shouldHandlePaymentInquiry,
+  shouldQuietIgnorePaymentInquiryAbeCc,
   attachmentLooksLikeStatementSpreadsheet,
   attachmentFilenameLooksLikeStatementList,
   subjectIsDefinitiveCarrierAccountStatement,
