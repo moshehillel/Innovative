@@ -389,6 +389,8 @@ body {
   border-radius: 6px; opacity: 0; pointer-events: none; transition: opacity .15s;
 }
 .support-chat-toggle:hover .support-chat-tooltip { opacity: 1; }
+.support-chat-toggle.is-open { box-shadow: 0 0 0 3px var(--ic-brand); }
+.support-chat-toggle.is-open .support-chat-tooltip { opacity: 0; }
 .support-chat-panel {
   position: absolute; right: 0; bottom: 68px; width: min(360px, calc(100vw - 36px));
   height: 440px; background: #fff; border: 1px solid var(--ic-border);
@@ -400,17 +402,6 @@ body {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
 }
 .support-chat-header-content { display: flex; gap: 10px; align-items: center; }
-.support-chat-header-actions { flex: 0 0 auto; }
-.support-chat-minimized {
-  display: inline-flex; align-items: center; gap: 10px;
-  border: 1px solid var(--ic-border); background: #fff;
-  border-radius: 999px; padding: 10px 14px; font: inherit; font-weight: 700;
-  box-shadow: var(--ic-shadow); cursor: pointer; color: var(--ic-brand-ink);
-  margin-bottom: 10px;
-}
-.support-chat-min-expand {
-  font-size: 11px; font-weight: 600; color: var(--ic-text-muted);
-}
 .folder-item-dispute { margin-top: 8px; border-top: 1px solid var(--ic-border); padding-top: 12px; border-radius: 0 0 8px 8px; }
 .jerry-avatar-btn { width: 36px; height: 36px; border: 0; border-radius: 50%; padding: 0; overflow: hidden; cursor: pointer; background: transparent; }
 .support-chat-title { margin: 0; font-weight: 700; }

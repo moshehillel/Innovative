@@ -1341,8 +1341,6 @@
   const chatEls = {
     toggle: document.getElementById("supportChatToggle"),
     headerToggle: document.getElementById("supportChatHeaderToggle"),
-    minimizeBtn: document.getElementById("supportChatMinimizeBtn"),
-    minimized: document.getElementById("supportChatMinimized"),
     panel: document.getElementById("supportChatPanel"),
     log: document.getElementById("supportChatLog"),
     form: document.getElementById("supportChatForm"),
@@ -1352,7 +1350,6 @@
   let chatBusy = false;
   let chatStarted = false;
   let chatOpen = false;
-  let chatMinimized = false;
 
   function appendChatMessage(role, text) {
     const bubble = document.createElement("p");
@@ -1363,25 +1360,22 @@
     return bubble;
   }
 
-  function setChatMinimized(minimized) {
-    chatMinimized = !!minimized;
-    if (chatEls.minimized) chatEls.minimized.hidden = !chatMinimized;
-    if (chatMinimized) {
-      chatEls.panel.hidden = true;
-      if (chatEls.toggle) chatEls.toggle.hidden = true;
-    } else if (!chatOpen && chatEls.toggle) {
-      chatEls.toggle.hidden = false;
-    }
-  }
-
   function setChatOpen(open) {
     chatOpen = !!open;
-    if (chatOpen) setChatMinimized(false);
     chatEls.panel.hidden = !chatOpen;
     if (chatEls.toggle) {
-      chatEls.toggle.hidden = chatOpen || chatMinimized;
       chatEls.toggle.classList.toggle("is-open", chatOpen);
       chatEls.toggle.setAttribute("aria-expanded", chatOpen ? "true" : "false");
+      chatEls.toggle.setAttribute(
+          "aria-label",
+          chatOpen ? "Close Jerry chat" : "Chat with Jerry",
+      );
+    }
+    if (chatEls.headerToggle) {
+      chatEls.headerToggle.setAttribute(
+          "aria-label",
+          chatOpen ? "Close Jerry chat" : "Open Jerry chat",
+      );
     }
     if (chatOpen) {
       chatEls.input.focus();
@@ -1439,24 +1433,18 @@
     }
   }
 
+  function toggleChatOpen() {
+    setChatOpen(!chatOpen);
+  }
+
   if (chatEls.toggle && chatEls.panel) {
     chatEls.toggle.addEventListener("click", (event) => {
       event.stopPropagation();
-      setChatOpen(!chatOpen);
+      toggleChatOpen();
     });
     chatEls.headerToggle?.addEventListener("click", (event) => {
       event.stopPropagation();
-      if (chatOpen) setChatOpen(false);
-    });
-    chatEls.minimizeBtn?.addEventListener("click", (event) => {
-      event.stopPropagation();
-      setChatOpen(false);
-      setChatMinimized(true);
-    });
-    chatEls.minimized?.addEventListener("click", (event) => {
-      event.stopPropagation();
-      setChatMinimized(false);
-      setChatOpen(true);
+      toggleChatOpen();
     });
     chatEls.form.addEventListener("submit", (event) => {
       event.preventDefault();
