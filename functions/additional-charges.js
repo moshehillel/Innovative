@@ -1408,6 +1408,8 @@ function weightRebillSectionHtml(opts) {
  *   category, freightMismatch, hasCertificate, dispatcherName,
  *   rateValidation (optional W&I re-rate result), customerRate,
  *   excludedInPrimusCount (optional — charges already on file),
+ *   ignoredSmall (optional — auto-ignored ≤$5 rows),
+ *   chargesNeedProof (optional — recognized but awaiting receipts),
  *   weightRebill (original vs updated freight), certificateStatus
  *   (uploaded, or withheld because the certificate has prices).
  * @return {{subject: string, html: string}}
@@ -1419,6 +1421,8 @@ function buildAdditionalChargeApprovalEmail(opts) {
     freightMismatch, hasCertificate, dispatcherName, rateValidation,
     customerRate,
     excludedInPrimusCount,
+    ignoredSmall,
+    chargesNeedProof,
     actionUrl: actionUrlFn,
   } = opts;
   const weightInspection =
@@ -1428,6 +1432,14 @@ function buildAdditionalChargeApprovalEmail(opts) {
       opts.weightRebill.addedCharge :
       computeAddedCharge(invoiceAmount, primusAmount)) :
     null;
+  // Accessorial emails historically showed only the sum of line items
+  // pending A/B/C/D/E. Ops read that next to invoice + amount on file and
+  // expected invoice − Primus. Show both so the math reconciles.
+  const invoiceOverage = !weightInspection ?
+    computeAddedCharge(invoiceAmount, primusAmount) : null;
+  const pendingTotal = Number(chargesTotal) || 0;
+  const overageDiffersFromPending = invoiceOverage != null &&
+    Math.abs(invoiceOverage - pendingTotal) > 0.05;
 
   const emailTokens = require("./email-action-tokens");
   const actionUrl = typeof actionUrlFn === "function" ?
@@ -1503,6 +1515,17 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `<tr><td style="padding:4px 16px 4px 0;font-weight:600;` +
     `white-space:nowrap">${esc(label)}</td><td>${value}</td></tr>`;
 
+  const formatChargeBrief = (list) => (Array.isArray(list) ? list : [])
+      .map((c) => {
+        const label = displayChargeLabelForRow(c) ||
+          String((c && (c.label || c.type)) || "charge");
+        const amt = Number(c && c.amount);
+        return Number.isFinite(amt) ?
+          `${label} ${money(amt)}` : label;
+      })
+      .filter(Boolean)
+      .join("; ");
+
   const storageSummary = summarizeNotifyDetentionStorage(charges);
   const storageExplain = formatNotifyDetentionStorageExplanation(
       storageSummary);
@@ -1523,6 +1546,43 @@ function buildAdditionalChargeApprovalEmail(opts) {
       `Reply to this thread or tell accounting before we bill the ` +
       `customer or dispute the carrier.</p>` : "";
 
+  const overageNoteParts = [];
+  if (overageDiffersFromPending) {
+    overageNoteParts.push(
+        `Invoice is ${money(invoiceOverage)} over amount on file, but ` +
+        `only ${money(pendingTotal)} are the accessorial line(s) needing ` +
+        `your decision below.`);
+    const ignoredBrief = formatChargeBrief(ignoredSmall);
+    if (ignoredBrief) {
+      overageNoteParts.push(
+          `Auto-ignored small charge(s): ${ignoredBrief}.`);
+    }
+    const needProofBrief = formatChargeBrief(chargesNeedProof);
+    if (needProofBrief) {
+      overageNoteParts.push(
+          `Awaiting proof (handled separately): ${needProofBrief}.`);
+    }
+    if (Number(excludedInPrimusCount) > 0) {
+      overageNoteParts.push(
+          `${excludedInPrimusCount} charge(s) already on file in Primus ` +
+          `were excluded.`);
+    }
+    overageNoteParts.push(
+        `Any leftover is usually freight variance vs the Primus quote.`);
+  }
+  const overageNoteHtml = overageNoteParts.length ?
+    `<p style="background:#fef3c7;border:1px solid #fcd34d;` +
+    `padding:12px 14px;border-radius:6px;margin:14px 0;font-size:13px">` +
+    `<strong>Why the totals differ:</strong> ` +
+    `${esc(overageNoteParts.join(" "))}</p>` : "";
+
+  const additionalChargeRowLabel = weightInspection ?
+    "Additional charge" :
+    (overageDiffersFromPending ?
+      "Charges needing decision" : "Additional charges");
+  const additionalChargeRowValue = weightInspection && addedCharge != null ?
+    money(addedCharge) : money(chargesTotal);
+
   const html =
     `<p>A carrier invoice came in <strong>higher than the quoted ` +
     `amount</strong> and needs your decision.</p>` +
@@ -1534,21 +1594,22 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Customer rate (Primus)", formatCustomerRate(customerRate)) +
     row("Carrier invoice", money(invoiceAmount)) +
     row("Amount on file (Primus)", money(primusAmount)) +
-    row(weightInspection ? "Additional charge" : "Additional charges",
-        weightInspection && addedCharge != null ?
-          money(addedCharge) : money(chargesTotal)) +
+    (invoiceOverage != null ?
+      row("Invoice over amount on file", money(invoiceOverage)) : "") +
+    row(additionalChargeRowLabel, additionalChargeRowValue) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
       row("W&I certificate", "Attached / referenced on invoice") : "") +
     (dispatcherName ? row("Dispatcher", esc(dispatcherName)) : "") +
     `</table>` +
+    overageNoteHtml +
     accessorialConfirmHtml +
     weightRebillSectionHtml(opts) +
     mismatchHtml +
     rateHtml +
     `<p><strong>Charges:</strong></p>` +
     chargesHtml(charges) +
-    (Number(excludedInPrimusCount) > 0 ?
+    (Number(excludedInPrimusCount) > 0 && !overageDiffersFromPending ?
       `<p style="font-size:12px;color:#6b7280"><em>` +
       `${esc(String(excludedInPrimusCount))} charge(s) already on file ` +
       `in Primus were excluded from this list.</em></p>` : "") +

@@ -96,6 +96,45 @@ check("approval email charge line uses storage label",
     emailStorage.html.includes("$166.45"), true);
 check("approval email still names dispatcher",
     emailStorage.html.includes("Sam Dispatcher"), true);
+check("accessorial email shows invoice over amount on file when equal",
+    emailStorage.html.includes("Invoice over amount on file") &&
+    emailStorage.html.includes("$166.45"), true);
+
+// Load 264844-style: pending accessorials ≠ invoice − Primus gap.
+const emailGap = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv264844",
+  tenantId: "innovative",
+  loadNumber: "264844",
+  carrierName: "Central Transport",
+  customerName: "Brumis Imports Inc",
+  invoiceAmount: 295.23,
+  primusAmount: 120.55,
+  charges: [
+    {type: "ADVANCING", amount: 45},
+    {type: "REDELIVERY", amount: 100},
+  ],
+  chargesTotal: 145,
+  category: ac.CHARGE_CATEGORY.ACCESSORIAL,
+  customerRate: 200,
+  ignoredSmall: [{type: "APPOINTMENT DLVY", amount: 5}],
+  chargesNeedProof: [{type: "LUMPER SERVICE", amount: 22.76}],
+  dispatcherName: "Jason",
+});
+check("gap email shows invoice over amount on file $174.68",
+    emailGap.html.includes("Invoice over amount on file") &&
+    emailGap.html.includes("$174.68"), true);
+check("gap email labels pending accessorials separately",
+    emailGap.html.includes("Charges needing decision") &&
+    emailGap.html.includes("$145.00"), true);
+check("gap email explains why totals differ",
+    emailGap.html.includes("Why the totals differ") &&
+    emailGap.html.includes("Auto-ignored") &&
+    emailGap.html.includes("APPOINTMENT") &&
+    emailGap.html.includes("Awaiting proof") &&
+    emailGap.html.includes("LUMPER"), true);
+check("gap email still shows customer rate",
+    emailGap.html.includes("$200.00"), true);
 
 check("no rows = rate increase",
     ac.classifyAdditionalChargeReason({charges: []}),

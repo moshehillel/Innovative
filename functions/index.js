@@ -5511,6 +5511,8 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     rateValidation: pending.rateValidation || null,
     customerRate,
     excludedInPrimusCount: pending.excludedInPrimusCount || 0,
+    ignoredSmall: pending.ignoredSmall || [],
+    chargesNeedProof: pending.chargesNeedProof || [],
     weightRebill: pending.weightRebill || null,
     certificateStatus,
   });
@@ -11401,6 +11403,12 @@ async function processGmailMessage(
           const excludedInPrimusCount = chargeReconciliation &&
             chargeReconciliation.filtered ?
             chargeReconciliation.filtered.alreadyInPrimus.length : 0;
+          const ignoredSmall = chargeReconciliation &&
+            chargeReconciliation.filtered ?
+            chargeReconciliation.filtered.ignorableSmall || [] : [];
+          const chargesNeedProofForEmail =
+            Array.isArray(normalizedChargeData.chargesNeedProof) ?
+              normalizedChargeData.chargesNeedProof : [];
           if (chargeCategory ===
               additionalCharges.CHARGE_CATEGORY.WEIGHT_INSPECTION) {
             pendingAdditionalCharge = await collectWeightInspectionPending({
@@ -11412,6 +11420,8 @@ async function processGmailMessage(
               freightMismatch,
               primusVendorCost,
               excludedInPrimusCount,
+              ignoredSmall,
+              chargesNeedProof: chargesNeedProofForEmail,
             });
           } else {
             pendingAdditionalCharge = {
@@ -11425,6 +11435,8 @@ async function processGmailMessage(
               rateValidation: null,
               customerRate: customerRateFromBooking(bookingForCharges),
               excludedInPrimusCount,
+              ignoredSmall,
+              chargesNeedProof: chargesNeedProofForEmail,
             };
           }
           await writeLog("warn", "ai",
@@ -15709,13 +15721,15 @@ async function validateReweighRateWithPrimus(opts) {
  * W&I / replacement-invoice payload: re-quote updated weight and dims,
  * and record original quote vs invoice total for Jerry's email.
  * @param {object} args messageId, booking, aiResult, charges, chargesTotal,
- *   freightMismatch, primusVendorCost, excludedInPrimusCount.
+ *   freightMismatch, primusVendorCost, excludedInPrimusCount,
+ *   ignoredSmall, chargesNeedProof.
  * @return {Promise<object>}
  */
 async function collectWeightInspectionPending(args) {
   const {
     messageId, booking, aiResult, charges, chargesTotal,
     freightMismatch, primusVendorCost, excludedInPrimusCount,
+    ignoredSmall, chargesNeedProof,
   } = args;
   let rateValidation = null;
   try {
@@ -15768,6 +15782,9 @@ async function collectWeightInspectionPending(args) {
     rateValidation,
     customerRate: customerRateFromBooking(booking),
     excludedInPrimusCount: excludedInPrimusCount || 0,
+    ignoredSmall: Array.isArray(ignoredSmall) ? ignoredSmall : [],
+    chargesNeedProof: Array.isArray(chargesNeedProof) ?
+      chargesNeedProof : [],
     weightRebill,
   };
 }
