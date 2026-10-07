@@ -458,7 +458,7 @@
   }
 
   async function loadTasks() {
-    els.tasksContainer.innerHTML = '<p class="panel-empty">thinking</p>';
+    els.tasksContainer.innerHTML = '<p class="panel-empty">Loading...</p>';
     try {
       const data = await fetchJson("/getDashboardTasks?limit=50");
       renderTasks(data.tasks || []);
@@ -494,7 +494,7 @@
     }
     els.invoicesLoadMoreWrap.hidden = false;
     els.loadMoreInvoicesBtn.disabled = Boolean(loading);
-    els.loadMoreInvoicesBtn.textContent = loading ? "thinking" : "Load more";
+    els.loadMoreInvoicesBtn.textContent = loading ? "Loading..." : "Load more";
   }
 
   function renderInvoices(invoices) {
@@ -541,7 +541,7 @@
         invoiceHasMore = false;
         setButtonBusy(els.refreshInvoicesBtn, true, "Refreshing…");
         els.invoicesContainer.innerHTML =
-          '<p class="panel-empty">thinking</p>';
+          '<p class="panel-empty">Loading...</p>';
       } else {
         updateLoadMoreButton(true);
       }
@@ -749,7 +749,7 @@
 
   async function loadNotifications() {
     els.notificationsContainer.innerHTML =
-      '<p class="panel-empty">thinking</p>';
+      '<p class="panel-empty">Loading...</p>';
     try {
       const data = await fetchJson("/getDashboardNotifications?limit=50");
       renderNotifications(data.notifications || [], data.opsPrimary);
@@ -779,30 +779,30 @@
       {
         label: "Invoices processed",
         data: series.map((row) => row.invoicesProcessed),
-        borderColor: "#4f46e5",
-        backgroundColor: "#4f46e5",
-        tension: 0.3,
+        borderColor: "#0d6e6e",
+        backgroundColor: "#0d6e6e",
+        tension: 0.35,
       },
       {
         label: "With added charges",
         data: series.map((row) => row.invoicesWithAddedCharges || 0),
-        borderColor: "#d97706",
-        backgroundColor: "#d97706",
-        tension: 0.3,
+        borderColor: "#c47a12",
+        backgroundColor: "#c47a12",
+        tension: 0.35,
       },
       {
         label: "Emails replied",
         data: series.map((row) => row.emailsReplied),
-        borderColor: "#16a34a",
-        backgroundColor: "#16a34a",
-        tension: 0.3,
+        borderColor: "#1a7f4b",
+        backgroundColor: "#1a7f4b",
+        tension: 0.35,
       },
       {
         label: "Emails forwarded for review",
         data: series.map((row) => row.emailsForwarded),
-        borderColor: "#dc2626",
-        backgroundColor: "#dc2626",
-        tension: 0.3,
+        borderColor: "#c0392b",
+        backgroundColor: "#c0392b",
+        tension: 0.35,
       },
     ];
     if (chart) {
@@ -816,7 +816,30 @@
       data: {labels, datasets},
       options: {
         responsive: true,
-        scales: {y: {beginAtZero: true, ticks: {precision: 0}}},
+        maintainAspectRatio: true,
+        plugins: {
+          legend: {
+            labels: {
+              boxWidth: 10,
+              boxHeight: 10,
+              usePointStyle: true,
+              pointStyle: "circle",
+              font: {family: "'Instrument Sans', system-ui, sans-serif", size: 12},
+              color: "#5c6b76",
+            },
+          },
+        },
+        scales: {
+          x: {
+            grid: {display: false},
+            ticks: {color: "#5c6b76", font: {size: 11}},
+          },
+          y: {
+            beginAtZero: true,
+            ticks: {precision: 0, color: "#5c6b76", font: {size: 11}},
+            grid: {color: "rgba(20, 33, 43, 0.06)"},
+          },
+        },
       },
     });
   }
@@ -826,7 +849,7 @@
       els.statReplied, els.statForwarded].forEach((el) => {
       if (!el) return;
       if (active) {
-        el.textContent = "thinking";
+        el.textContent = "Loading...";
         el.classList.add("is-thinking");
       } else {
         el.classList.remove("is-thinking");
@@ -967,7 +990,7 @@
   async function sendChatMessage(text) {
     chatHistory.push({role: "user", content: text});
     appendChatMessage("user", text);
-    const pending = appendChatMessage("bot", "thinking");
+    const pending = appendChatMessage("bot", "Loading...");
     pending.classList.add("is-pending");
     chatBusy = true;
     chatEls.input.disabled = true;
