@@ -642,28 +642,19 @@
     return s;
   }
 
-  function formatReadableEmailText(value) {
-    let s = String(value || "")
-      .replace(/\r\n/g, "\n")
-      .replace(/\r/g, "\n")
-      .replace(/\u00a0/g, " ");
-    // Flattened threads often glue headers onto the previous line.
-    s = s.replace(/\s*(From|Sent|To|Cc|Bcc|Subject|Date):\s*/gi, "\n\n$1: ");
-    s = s.replace(/[ \t]{2,}/g, " ");
-    s = s.replace(/ *\n */g, "\n");
-    s = s.replace(/\n{3,}/g, "\n\n").trim();
-    return s;
-  }
-
-  function prepareNotifBody(rawBody) {
-    const decoded = decodeHtmlEntities(rawBody);
-    if (!decoded.trim()) {
-      return {kind: "empty", content: ""};
+  // Build mail-client HTML: keep real HTML as-is; wrap plain text only.
+  function emailBodyAsHtml(rawBody) {
+    let s = String(rawBody || "").trim();
+    if (!s) return "";
+    // Legacy rows stored entity-escaped HTML/text dumps.
+    if (!looksLikeHtml(s) && /&(?:nbsp|lt|gt|amp|#\d+);/i.test(s)) {
+      s = decodeHtmlEntities(s);
     }
-    if (looksLikeHtml(decoded)) {
-      return {kind: "html", content: decoded};
+    if (looksLikeHtml(s)) {
+      return s.replace(/<script[\s\S]*?<\/script>/gi, "");
     }
-    return {kind: "text", content: formatReadableEmailText(decoded)};
+    return `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
+      `${bodyEsc(s)}</pre>`;
   }
 
   function notifSubject(n) {
@@ -675,14 +666,10 @@
   }
 
   function renderEmailBodyHtml(rawBody) {
-    const prepared = prepareNotifBody(rawBody);
-    if (prepared.kind === "empty") {
+    if (!String(rawBody || "").trim()) {
       return '<p class="notif-body-empty">(empty)</p>';
     }
-    if (prepared.kind === "html") {
-      return `<iframe class="notif-body-frame" title="Email" sandbox="" loading="lazy"></iframe>`;
-    }
-    return `<pre class="notif-body">${bodyEsc(prepared.content)}</pre>`;
+    return `<iframe class="notif-body-frame" title="Email" sandbox="" loading="lazy"></iframe>`;
   }
 
   function fillEmailFrames(items) {
@@ -692,21 +679,19 @@
       const id = card && card.dataset.notifId;
       const n = (items || []).find((item) => item.id === id);
       if (!n) return;
-      const prepared = prepareNotifBody(n.body);
-      if (prepared.kind !== "html") return;
-      const safe = prepared.content
-          .replace(/<script[\s\S]*?<\/script>/gi, "")
-          .replace(/<style[\s\S]*?<\/style>/gi, (m) => m); // keep styles for layout
+      const html = emailBodyAsHtml(n.body);
+      if (!html) return;
       const doc =
         "<!doctype html><html><head><meta charset=\"utf-8\">" +
         "<base target=\"_blank\" rel=\"noopener\">" +
         "<style>" +
         "html,body{margin:0;padding:0;background:#fff;}" +
-        "body{margin:18px 20px;font:16px/1.55 Instrument Sans,Segoe UI,Roboto,sans-serif;" +
-        "color:#14212b;word-wrap:break-word;overflow-wrap:anywhere;}" +
-        "img{max-width:100%;height:auto;} a{color:#0d6e6e;}" +
-        "p{margin:0 0 0.85em;} table{max-width:100%;}" +
-        "</style></head><body>" + safe + "</body></html>";
+        "body{margin:16px 18px;font:15px/1.5 'Segoe UI',Tahoma,Arial,sans-serif;" +
+        "color:#242424;word-wrap:break-word;overflow-wrap:anywhere;}" +
+        "img{max-width:100%;height:auto;} a{color:#0563c1;}" +
+        "table{border-collapse:collapse;max-width:100%;}" +
+        "blockquote{margin:0.5em 0;padding-left:0.75em;border-left:2px solid #ccc;color:#555;}" +
+        "</style></head><body>" + html + "</body></html>";
       frame.srcdoc = doc;
     });
   }
