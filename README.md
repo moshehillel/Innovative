@@ -31,8 +31,19 @@ Cloud Functions allowlist includes this origin. Optional env
 https://www.advancedautomations.net,https://innovative-jerry.netlify.app
 ```
 
+## Ops console tabs
+
+| Tab | Purpose |
+| --- | --- |
+| **Tasks awaiting** | Open tasks + A–E additional-charge decisions |
+| **Recent invoices** | Invoice table with pagination |
+| **Notifications** | Ops emails / unhandled emails — dismiss, flag (emails Moshe), reply, delete |
+
+When Cloud Functions env `DASHBOARD_OPS_PRIMARY=true`, Jerry parks unhandled
+“no rules” emails and ops alerts on the Notifications tab instead of emailing
+Lisa/Sarah (customer invoices and system-error emails still send).
+
 ## Local preview
 
-Serve the folder with any static server after setting a throwaway password is
-not required locally (edge auth only runs on Netlify). Open `index.html` via
-a local static server so `fetch` to Cloud Functions works.
+Serve the folder with any static server. Edge Basic-auth only runs on Netlify.
+Open via a local static server so `fetch` to Cloud Functions works.
