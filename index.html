@@ -85,28 +85,64 @@
       </p>
     </section>
 
-    <section class="panel-section">
-      <div class="panel-header">
-        <h2 class="panel-title">Recent Invoices</h2>
-        <button id="refreshInvoicesBtn" class="btn btn-outline btn-sm">Refresh</button>
-      </div>
-      <div id="invoicesContainer" class="panel-container">
-        <p class="panel-empty">thinking</p>
-      </div>
-      <div id="invoicesLoadMoreWrap" class="load-more-wrap" hidden>
-        <button type="button" id="loadMoreInvoicesBtn" class="btn btn-outline btn-sm">
-          Load more
+    <section class="panel-section ops-console">
+      <div class="ops-tabs" role="tablist" aria-label="Ops console">
+        <button type="button" class="ops-tab is-active" role="tab" aria-selected="true"
+          data-tab="tasks" id="tabBtnTasks">
+          Tasks awaiting <span id="taskCountBadge" class="tab-count">0</span>
+        </button>
+        <button type="button" class="ops-tab" role="tab" aria-selected="false"
+          data-tab="invoices" id="tabBtnInvoices">
+          Recent invoices
+        </button>
+        <button type="button" class="ops-tab" role="tab" aria-selected="false"
+          data-tab="notifications" id="tabBtnNotifications">
+          Notifications <span id="notifCountBadge" class="tab-count">0</span>
         </button>
       </div>
-    </section>
 
-    <section class="panel-section">
-      <div class="panel-header">
-        <h2 class="panel-title">Open Tasks</h2>
-        <span id="taskCountBadge" class="task-count-badge">0 open</span>
-      </div>
-      <div id="tasksContainer" class="tasks-container">
-        <p class="panel-empty">thinking</p>
+      <div class="ops-tab-panels">
+        <div id="tabPanelTasks" class="ops-panel is-active" role="tabpanel"
+          aria-labelledby="tabBtnTasks">
+          <div class="panel-header ops-panel-header">
+            <h2 class="panel-title">Tasks awaiting</h2>
+            <button id="refreshTasksBtn" class="btn btn-outline btn-sm">Refresh</button>
+          </div>
+          <div id="tasksContainer" class="tasks-container">
+            <p class="panel-empty">thinking</p>
+          </div>
+        </div>
+
+        <div id="tabPanelInvoices" class="ops-panel" role="tabpanel" hidden
+          aria-labelledby="tabBtnInvoices">
+          <div class="panel-header ops-panel-header">
+            <h2 class="panel-title">Recent invoices</h2>
+            <button id="refreshInvoicesBtn" class="btn btn-outline btn-sm">Refresh</button>
+          </div>
+          <div id="invoicesContainer" class="panel-container">
+            <p class="panel-empty">thinking</p>
+          </div>
+          <div id="invoicesLoadMoreWrap" class="load-more-wrap" hidden>
+            <button type="button" id="loadMoreInvoicesBtn" class="btn btn-outline btn-sm">
+              Load more
+            </button>
+          </div>
+        </div>
+
+        <div id="tabPanelNotifications" class="ops-panel" role="tabpanel" hidden
+          aria-labelledby="tabBtnNotifications">
+          <div class="panel-header ops-panel-header">
+            <h2 class="panel-title">Notifications</h2>
+            <button id="refreshNotifsBtn" class="btn btn-outline btn-sm">Refresh</button>
+          </div>
+          <p class="ops-hint" id="opsPrimaryHint" hidden>
+            Dashboard ops mode is on — Jerry parks review items here instead of
+            emailing them. You can still reply, delete, dismiss, or flag.
+          </p>
+          <div id="notificationsContainer" class="tasks-container">
+            <p class="panel-empty">thinking</p>
+          </div>
+        </div>
       </div>
     </section>
   </main>

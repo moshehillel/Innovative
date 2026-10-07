@@ -874,3 +874,117 @@ main {
     display: none;
   }
 }
+
+/* Ops console tabs */
+.ops-console { overflow: visible; }
+.ops-tabs {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.75rem 1rem 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--card-bg);
+  flex-wrap: wrap;
+}
+.ops-tab {
+  border: none;
+  background: transparent;
+  padding: 0.65rem 1rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.ops-tab:hover { color: var(--text); }
+.ops-tab.is-active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.tab-count {
+  display: inline-flex;
+  min-width: 1.4rem;
+  justify-content: center;
+  padding: 0.05rem 0.4rem;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.72rem;
+}
+.ops-panel { display: none; }
+.ops-panel.is-active { display: block; }
+.ops-panel-header { padding: 1rem 1.25rem 0.5rem; }
+.ops-hint {
+  margin: 0 1.25rem 0.75rem;
+  padding: 0.65rem 0.85rem;
+  background: #eff6ff;
+  color: #1e40af;
+  border-radius: 8px;
+  font-size: 0.85rem;
+}
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
+.charge-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.5rem;
+}
+.charge-opt {
+  min-width: 2.2rem;
+  font-weight: 700;
+}
+.charge-opt-form {
+  margin-top: 0.65rem;
+  padding: 0.75rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.charge-opt-form label {
+  display: block;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 0.25rem;
+}
+.charge-opt-form input,
+.charge-opt-form textarea {
+  width: 100%;
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  margin-bottom: 0.5rem;
+  box-sizing: border-box;
+}
+.notif-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin: 0.25rem 0;
+}
+.flag-form, .reply-form {
+  margin-top: 0.65rem;
+  padding: 0.75rem;
+  background: #fffbeb;
+  border: 1px solid #fde68a;
+  border-radius: 8px;
+}
+.reply-form { background: #f0fdf4; border-color: #bbf7d0; }
+.pill-email-sent, .pill-parked {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  margin-left: 0.35rem;
+}
+.pill-email-sent { background: #ecfdf5; color: #047857; }
+.pill-parked { background: #eff6ff; color: #1d4ed8; }
