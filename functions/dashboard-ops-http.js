@@ -201,7 +201,7 @@ async function handleAdditionalChargeDecision(req, res) {
         extra: {actedOption: option.toUpperCase()},
       });
     }
-    // Option B hands work to the dispatcher — move task into their folder.
+    // Option B → Dispatch folder. Option D → keep as open dispute task.
     // Other options close the charge task.
     if (option === "b") {
       await deps.dashboardTasks.handoffTaskToDispatch(
@@ -214,6 +214,17 @@ async function handleAdditionalChargeDecision(req, res) {
             option,
           }).catch((err) => {
         console.error("handoffTaskToDispatch:", err.message);
+      });
+    } else if (option === "d") {
+      await deps.dashboardTasks.markTaskInDispute(
+          deps.db, deps.additionalCharges, {
+            taskId: body.taskId || null,
+            source: body.taskSource || null,
+            followUpId: body.followUpId || null,
+            invoiceId,
+            tenantId: tenant.tenantId,
+          }).catch((err) => {
+        console.error("markTaskInDispute:", err.message);
       });
     } else if (body.taskId) {
       await deps.dashboardTasks.dismissDashboardTask(
@@ -229,6 +240,7 @@ async function handleAdditionalChargeDecision(req, res) {
       accepted: true,
       option: option.toUpperCase(),
       handedOffToDispatch: option === "b",
+      markedInDispute: option === "d",
       message: result.message || null,
     });
   } catch (error) {

@@ -93,18 +93,20 @@ function serializeTaskDoc(doc) {
     department: d.department || null,
     reason: d.reason || null,
     status: d.status || null,
-    chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
-    ownerBucket: d.ownerBucket || null,
-    awaitingReplyFrom: d.awaitingReplyFrom || null,
-    dispatcherEmail: d.dispatcherEmail || null,
-    dispatcherName: d.dispatcherName || null,
-    dispatcherKey: d.dispatcherKey || null,
-    ownershipHistory: Array.isArray(d.ownershipHistory) ?
-      d.ownershipHistory : [],
-    createdAt: d.createdAt && d.createdAt.toDate ?
-      d.createdAt.toDate().toISOString() : null,
-    dismissedAt: d.dismissedAt && d.dismissedAt.toDate ?
-      d.dismissedAt.toDate().toISOString() : null,
+      chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
+      ownerBucket: d.ownerBucket || null,
+      awaitingReplyFrom: d.awaitingReplyFrom || null,
+      dispatcherEmail: d.dispatcherEmail || null,
+      dispatcherName: d.dispatcherName || null,
+      dispatcherKey: d.dispatcherKey || null,
+      chargePhase: d.chargePhase || null,
+      followUpStatus: d.followUpStatus || null,
+      ownershipHistory: Array.isArray(d.ownershipHistory) ?
+        d.ownershipHistory : [],
+      createdAt: d.createdAt && d.createdAt.toDate ?
+        d.createdAt.toDate().toISOString() : null,
+      dismissedAt: d.dismissedAt && d.dismissedAt.toDate ?
+        d.dismissedAt.toDate().toISOString() : null,
   };
 }
 
@@ -250,12 +252,17 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     if (linkedFollowUpIds.has(doc.id)) return;
     const d = doc.data() || {};
     if (d.tenantId && d.tenantId !== tenantId) return;
+    const isDispute = d.status ===
+      additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
+      d.chargePhase === "dispute";
     tasks.push({
       id: doc.id,
       source: "additionalCharges",
       tenantId: d.tenantId || tenantId,
       type: TASK_TYPE.ADDITIONAL_CHARGE,
-      title: `Additional charge — Load ${d.loadNumber || "—"}`,
+      title: isDispute ?
+        `Charge in dispute — Load ${d.loadNumber || "—"}` :
+        `Additional charge — Load ${d.loadNumber || "—"}`,
       description: d.notes || null,
       body: d.emailHtml ||
         buildAdditionalChargeFallbackHtml(additionalChargesMod, d),
@@ -279,6 +286,8 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       dispatcherEmail: d.dispatcherEmail || null,
       dispatcherName: d.dispatcherName || null,
       dispatcherKey: d.dispatcherKey || null,
+      chargePhase: isDispute ? "dispute" : (d.chargePhase || null),
+      followUpStatus: d.status || null,
       ownershipHistory: Array.isArray(d.ownershipHistory) ?
         d.ownershipHistory : [],
       createdAt: d.createdAt && d.createdAt.toDate ?
@@ -287,9 +296,35 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     });
   });
 
-  const page = ownership.filterSortPaginate(tasks, {
-    ownerBucket: opts.ownerBucket || null,
-    dispatcherKey: opts.dispatcherKey || null,
+  // Enrich linked tasks with follow-up dispute status.
+  for (const task of tasks) {
+    if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE || !task.followUpId) continue;
+    const fuDoc = chargeSnap.docs.find((x) => x.id === task.followUpId);
+    if (!fuDoc) continue;
+    const d = fuDoc.data() || {};
+    task.followUpStatus = d.status || task.followUpStatus || null;
+    if (d.status === additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
+        d.chargePhase === "dispute" || task.chargePhase === "dispute") {
+      task.chargePhase = "dispute";
+    }
+  }
+
+  const chargePhase = String(opts.chargePhase || "").toLowerCase();
+  let working = tasks;
+  if (chargePhase === "dispute") {
+    working = tasks.filter((t) => t.chargePhase === "dispute");
+  } else if (chargePhase === "open" || !chargePhase) {
+    // Default task folders hide items already in dispute.
+    working = tasks.filter((t) => t.chargePhase !== "dispute");
+  }
+
+  const disputeCount = tasks.filter((t) => t.chargePhase === "dispute").length;
+
+  const page = ownership.filterSortPaginate(working, {
+    ownerBucket: chargePhase === "dispute" ?
+      null : (opts.ownerBucket || null),
+    dispatcherKey: chargePhase === "dispute" ?
+      null : (opts.dispatcherKey || null),
     offset: opts.offset,
     limit: opts.limit || 50,
     urgentFirst: opts.urgentFirst,
@@ -305,6 +340,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     limit: page.limit,
     bucketCounts: page.bucketCounts,
     dispatchers: page.dispatchers,
+    disputeCount,
   };
 }
 
@@ -352,6 +388,65 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
   return {ok: true};
+}
+
+/**
+ * Keeps a charge task open and marks it as in dispute (option D).
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod Module.
+ * @param {object} opts taskId?, followUpId?, invoiceId?, tenantId, source?
+ * @return {Promise<object>}
+ */
+async function markTaskInDispute(db, additionalChargesMod, opts) {
+  const updates = [];
+  const patch = {
+    chargePhase: "dispute",
+    followUpStatus: additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING,
+    awaitingReplyFrom: "accounting",
+    ownerBucket: ownership.OWNER_BUCKET.ACCOUNTING,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+
+  if (opts.taskId && opts.source !== "additionalCharges") {
+    const ref = db.collection(TASK_COLLECTION).doc(String(opts.taskId));
+    const snap = await ref.get();
+    if (snap.exists) {
+      await ref.update(patch);
+      updates.push("task");
+    }
+  }
+
+  const followUpId = opts.followUpId ||
+    (opts.source === "additionalCharges" ? opts.taskId : null);
+  if (followUpId) {
+    const ref = db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .doc(String(followUpId));
+    const snap = await ref.get();
+    if (snap.exists) {
+      await ref.update({
+        status: additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING,
+        chargePhase: "dispute",
+        resolved: false,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      updates.push("followUp");
+    }
+  }
+
+  if (opts.invoiceId) {
+    const q = await db.collection(TASK_COLLECTION)
+        .where("invoiceId", "==", String(opts.invoiceId))
+        .where("status", "==", TASK_STATUS.OPEN)
+        .limit(10)
+        .get();
+    for (const doc of q.docs) {
+      // eslint-disable-next-line no-await-in-loop
+      await doc.ref.update(patch);
+      updates.push(doc.id);
+    }
+  }
+
+  return {ok: true, updates};
 }
 
 /**
@@ -425,4 +520,5 @@ module.exports = {
   listDashboardTasks,
   dismissDashboardTask,
   handoffTaskToDispatch,
+  markTaskInDispute,
 };

@@ -449,6 +449,54 @@ async function findInvoiceForLoadFromEmail(tenant, loadNumber, messageId) {
 }
 
 /**
+ * Finds a prior Firestore invoice for the same load with the same dollar
+ * total (carrier resent an identical copy). Different totals are NOT
+ * duplicates — those are treated as updated invoices and must be processed.
+ * @param {object} tenant Tenant config.
+ * @param {object} aiResult Extracted invoice fields.
+ * @return {Promise<object|null>}
+ */
+async function findExactDuplicateCarrierInvoice(tenant, aiResult) {
+  const loadNumber = normalizeLoadNumber(
+      aiResult && aiResult.loadNumber);
+  const amount = Number(aiResult && aiResult.invoiceAmount);
+  if (!loadNumber || !Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+  try {
+    const snap = await tcol(tenant, "invoices")
+        .where("loadNumber", "==", loadNumber)
+        .orderBy("createdAt", "desc")
+        .limit(25)
+        .get();
+    for (const doc of snap.docs) {
+      const d = doc.data() || {};
+      const prev = Number(d.invoiceAmount);
+      if (!Number.isFinite(prev)) continue;
+      // Different $ total → updated invoice; never skip.
+      if (Math.abs(prev - amount) > 0.009) continue;
+
+      const newInv = normalizeCarrierReference(aiResult.invoiceNumber);
+      const oldInv = normalizeCarrierReference(d.invoiceNumber);
+      // When both sides have an invoice # and they differ, keep processing
+      // (could be a second bill that happens to match on dollars).
+      if (newInv && oldInv && newInv !== oldInv) continue;
+
+      return {
+        invoiceId: doc.id,
+        invoiceAmount: prev,
+        invoiceNumber: d.invoiceNumber || null,
+        gmailMessageId: d.gmailMessageId || null,
+        finalWorkflowStatus: d.finalWorkflowStatus || null,
+      };
+    }
+  } catch (err) {
+    console.error("[findExactDuplicateCarrierInvoice]", err.message);
+  }
+  return null;
+}
+
+/**
  * Drops invoice items whose load was already processed from this email.
  * @param {object} tenant Tenant config.
  * @param {string} messageId Parent Gmail message id.
@@ -10311,6 +10359,29 @@ async function processGmailMessage(
             });
             continue;
           }
+
+          // Carrier resent the same invoice copy (same load + same $).
+          // Different totals are treated as updates and still process.
+          const exactDup = await findExactDuplicateCarrierInvoice(
+              tenant, aiResult);
+          if (exactDup) {
+            await writeLog("info", "mail",
+                "Skipping exact duplicate carrier invoice copy", {
+                  messageId,
+                  loadNumber: aiResult.loadNumber,
+                  invoiceNumber: aiResult.invoiceNumber || null,
+                  invoiceAmount: aiResult.invoiceAmount || null,
+                  priorInvoiceId: exactDup.invoiceId,
+                  priorGmailMessageId: exactDup.gmailMessageId || null,
+                });
+            itemSummaries.push({
+              loadNumber: aiResult.loadNumber,
+              status: aiResult.status || null,
+              finalStatus: "exact_duplicate_skipped",
+              invoiceId: exactDup.invoiceId,
+            });
+            continue;
+          }
         }
       }
 
@@ -12443,10 +12514,24 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
         createdAt,
       };
     });
-    const filtered = statusGroup === "all" ? mapped :
-      statusGroup === "completed" ?
-        mapped.filter((inv) => inv.isCompleted) :
-        mapped.filter((inv) => !inv.isCompleted);
+    const stageOf = (inv) =>
+      `${inv.displayStatus || ""} ${inv.decisionStage || ""} ` +
+      `${inv.finalWorkflowStatus || ""}`.toLowerCase();
+    let filtered;
+    if (statusGroup === "all") {
+      filtered = mapped;
+    } else if (statusGroup === "completed") {
+      filtered = mapped.filter((inv) => inv.isCompleted);
+    } else if (statusGroup === "needs_rate") {
+      filtered = mapped.filter((inv) =>
+        !inv.isCompleted &&
+        /needs_customer_rate|missing_rate|low_margin/.test(stageOf(inv)));
+    } else if (statusGroup === "missing_pod") {
+      filtered = mapped.filter((inv) =>
+        !inv.isCompleted && /missing_pod/.test(stageOf(inv)));
+    } else {
+      filtered = mapped.filter((inv) => !inv.isCompleted);
+    }
     const invoices = filtered.slice(offset, offset + limit);
     return res.json({
       ok: true,
@@ -12581,6 +12666,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
           offset,
           ownerBucket: req.query.ownerBucket || null,
           dispatcherKey: req.query.dispatcherKey || null,
+          chargePhase: req.query.chargePhase || null,
           urgentFirst: req.query.urgentFirst !== "0",
         });
     return res.json({
@@ -12595,6 +12681,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
       limit: result.limit,
       bucketCounts: result.bucketCounts,
       dispatchers: result.dispatchers,
+      disputeCount: result.disputeCount || 0,
     });
   } catch (error) {
     console.error("getDashboardTasks error:", error);
