@@ -1089,6 +1089,11 @@ function buildDispatcherNotifyReminderEmail(opts) {
  * @return {Promise<string>} Follow-up doc id.
  */
 async function createFollowUp(db, data) {
+  const MAX_BODY = 120000;
+  let emailHtml = data.emailHtml != null ? String(data.emailHtml) : null;
+  if (emailHtml && emailHtml.length > MAX_BODY) {
+    emailHtml = emailHtml.slice(0, MAX_BODY);
+  }
   const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
     loadNumber: data.loadNumber || null,
     carrierName: data.carrierName || null,
@@ -1103,26 +1108,37 @@ async function createFollowUp(db, data) {
     decision: null,
     decisionAt: null,
     notes: data.notes || null,
+    emailHtml,
+    emailSubject: data.emailSubject || null,
+    emailTo: data.emailTo || null,
+    emailCc: data.emailCc || null,
     resolved: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
-  try {
-    const dashboardTasks = require("./dashboard-tasks");
-    await dashboardTasks.createDashboardTask(db, {
-      tenantId: data.tenantId || "default",
-      type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
-      title: `Additional charge - Load ${data.loadNumber || "-"}`,
-      description: data.notes || null,
-      loadNumber: data.loadNumber || null,
-      carrierName: data.carrierName || null,
-      invoiceId: data.invoiceId || null,
-      followUpId: doc.id,
-      reason: data.category || data.status || null,
-    });
-  } catch (taskErr) {
-    console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+  if (data.skipDashboardTask !== true) {
+    try {
+      const dashboardTasks = require("./dashboard-tasks");
+      await dashboardTasks.createDashboardTask(db, {
+        tenantId: data.tenantId || "default",
+        type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+        title: `Additional charge - Load ${data.loadNumber || "-"}`,
+        description: data.notes || null,
+        body: emailHtml,
+        subject: data.emailSubject || null,
+        to: data.emailTo || null,
+        cc: data.emailCc || null,
+        loadNumber: data.loadNumber || null,
+        carrierName: data.carrierName || null,
+        invoiceId: data.invoiceId || null,
+        followUpId: doc.id,
+        reason: data.category || data.status || null,
+        chargesTotal: data.chargesTotal || null,
+      });
+    } catch (taskErr) {
+      console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+    }
   }
 
   return doc.id;

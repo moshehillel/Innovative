@@ -5165,6 +5165,9 @@ async function notifyLisaPodDiscrepancy(opts) {
     type: dashboardTasks.TASK_TYPE.POD_DISCREPANCY,
     title: `Review POD — ${flagLabel}`,
     description: disc.details || null,
+    body: html,
+    subject: `Review POD — ${flagLabel} — Load ${loadNumber || "—"}`,
+    to: lisa,
     loadNumber: loadNumber || null,
     proNumber: proNumber || null,
     carrierName: carrierName || null,
@@ -5294,6 +5297,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     chargesTotal: pending.chargesTotal,
     invoiceAmount: aiResult.invoiceAmount,
     status: additionalCharges.FOLLOW_UP_STATUS.PENDING_APPROVAL,
+    skipDashboardTask: true,
   });
 
   const email = additionalCharges.buildAdditionalChargeApprovalEmail({
@@ -5365,16 +5369,48 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         });
   }
 
+  // Persist the same HTML the email has so Tasks/Notifications match.
+  const MAX_NOTIF_BODY = 120000;
+  const emailHtmlBody = String(email.html || "").slice(0, MAX_NOTIF_BODY);
+  const emailCc = dispatcherEmail || additionalCharges.LISA_EMAIL;
+  try {
+    await db.collection(additionalCharges.FOLLOW_UP_COLLECTION)
+        .doc(followUpId).update({
+          emailHtml: emailHtmlBody,
+          emailSubject: email.subject || null,
+          emailTo: approver,
+          emailCc: emailCc || null,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+  } catch (updErr) {
+    console.error("follow-up emailHtml update failed:", updErr.message);
+  }
+
+  await dashboardTasks.createDashboardTask(db, {
+    tenantId: tenant.tenantId,
+    type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+    title: `Additional charge — Load ${aiResult.loadNumber || "—"}`,
+    description: pending.category || null,
+    body: emailHtmlBody,
+    subject: email.subject || null,
+    to: approver,
+    cc: emailCc || null,
+    loadNumber: aiResult.loadNumber || null,
+    carrierName: aiResult.carrierName || null,
+    invoiceId,
+    followUpId,
+    reason: pending.category || null,
+    chargesTotal: pending.chargesTotal || null,
+  });
+
   await dashboardOps.createNotification(db, {
     tenantId: tenant.tenantId,
     type: dashboardOps.NOTIF_TYPE.ADDITIONAL_CHARGE,
     title: `Additional charge — Load ${aiResult.loadNumber || "—"}`,
-    body: `Category: ${pending.category || "—"}. ` +
-      `Charges total: $${Number(pending.chargesTotal || 0).toFixed(2)}. ` +
-      `Choose A–E in the dashboard Tasks tab.`,
+    body: emailHtmlBody,
     subject: email.subject,
     to: approver,
-    cc: dispatcherEmail || additionalCharges.LISA_EMAIL,
+    cc: emailCc,
     invoiceId,
     followUpId,
     loadNumber: aiResult.loadNumber || null,
@@ -7111,6 +7147,10 @@ async function notifyLisaSignedPodRequest(opts) {
     title: `Signed POD requested — Load ${loadNumber || "—"}`,
     description: requesterEmail ?
       `Reply to ${requesterEmail}` : null,
+    body: html,
+    subject: `Signed POD requested — Load ${loadNumber || "—"}`,
+    to: lisa,
+    from: from || null,
     loadNumber: loadNumber || null,
     proNumber: proNumber || null,
     messageId: messageId || null,
@@ -7188,6 +7228,10 @@ async function notifyLisaPodRequestBlockedRecipient(opts) {
     title: `POD request needs review — Load ${loadNumber || "—"}`,
     description: requesterEmail ?
       `Blocked auto-send to ${requesterEmail}` : null,
+    body: html,
+    subject: `POD request needs review — Load ${loadNumber || "—"}`,
+    to: reviewTo,
+    from: from || null,
     loadNumber: loadNumber || null,
     proNumber: proNumber || null,
     messageId: messageId || null,
