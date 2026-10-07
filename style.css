@@ -1059,15 +1059,16 @@ body {
 }
 
 .notif-body {
-  padding: 1.1rem 1.25rem;
+  padding: 1.15rem 1.35rem;
   overflow: auto;
   font-family: inherit;
-  font-size: 1.02rem;
-  line-height: 1.6;
+  font-size: 1.05rem;
+  line-height: 1.65;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   word-break: break-word;
   color: var(--text);
+  max-width: 70ch;
 }
 
 .notif-body-empty {

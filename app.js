@@ -629,6 +629,43 @@
     return /<\/?[a-z][\s\S]*>/i.test(String(value || ""));
   }
 
+  function decodeHtmlEntities(value) {
+    const ta = document.createElement("textarea");
+    let s = String(value || "");
+    for (let i = 0; i < 3; i++) {
+      if (!/&(?:#\d+|#x[0-9a-f]+|[a-z]+);/i.test(s)) break;
+      ta.innerHTML = s;
+      const next = ta.value;
+      if (next === s) break;
+      s = next;
+    }
+    return s;
+  }
+
+  function formatReadableEmailText(value) {
+    let s = String(value || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .replace(/\u00a0/g, " ");
+    // Flattened threads often glue headers onto the previous line.
+    s = s.replace(/\s*(From|Sent|To|Cc|Bcc|Subject|Date):\s*/gi, "\n\n$1: ");
+    s = s.replace(/[ \t]{2,}/g, " ");
+    s = s.replace(/ *\n */g, "\n");
+    s = s.replace(/\n{3,}/g, "\n\n").trim();
+    return s;
+  }
+
+  function prepareNotifBody(rawBody) {
+    const decoded = decodeHtmlEntities(rawBody);
+    if (!decoded.trim()) {
+      return {kind: "empty", content: ""};
+    }
+    if (looksLikeHtml(decoded)) {
+      return {kind: "html", content: decoded};
+    }
+    return {kind: "text", content: formatReadableEmailText(decoded)};
+  }
+
   function notifSubject(n) {
     return String(n.subject || n.title || "(no subject)").trim();
   }
@@ -638,15 +675,14 @@
   }
 
   function renderEmailBodyHtml(rawBody) {
-    const body = String(rawBody || "");
-    if (!body.trim()) {
+    const prepared = prepareNotifBody(rawBody);
+    if (prepared.kind === "empty") {
       return '<p class="notif-body-empty">(empty)</p>';
     }
-    if (looksLikeHtml(body)) {
-      // Keep the email markup; sandbox blocks scripts.
+    if (prepared.kind === "html") {
       return `<iframe class="notif-body-frame" title="Email" sandbox="" loading="lazy"></iframe>`;
     }
-    return `<pre class="notif-body">${bodyEsc(body)}</pre>`;
+    return `<pre class="notif-body">${bodyEsc(prepared.content)}</pre>`;
   }
 
   function fillEmailFrames(items) {
@@ -656,11 +692,21 @@
       const id = card && card.dataset.notifId;
       const n = (items || []).find((item) => item.id === id);
       if (!n) return;
-      const html = String(n.body || "");
+      const prepared = prepareNotifBody(n.body);
+      if (prepared.kind !== "html") return;
+      const safe = prepared.content
+          .replace(/<script[\s\S]*?<\/script>/gi, "")
+          .replace(/<style[\s\S]*?<\/style>/gi, (m) => m); // keep styles for layout
       const doc =
         "<!doctype html><html><head><meta charset=\"utf-8\">" +
-        "<style>body{margin:16px;font:16px/1.55 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#14212b;word-wrap:break-word;}img{max-width:100%;height:auto;}</style>" +
-        "</head><body>" + html + "</body></html>";
+        "<base target=\"_blank\" rel=\"noopener\">" +
+        "<style>" +
+        "html,body{margin:0;padding:0;background:#fff;}" +
+        "body{margin:18px 20px;font:16px/1.55 Instrument Sans,Segoe UI,Roboto,sans-serif;" +
+        "color:#14212b;word-wrap:break-word;overflow-wrap:anywhere;}" +
+        "img{max-width:100%;height:auto;} a{color:#0d6e6e;}" +
+        "p{margin:0 0 0.85em;} table{max-width:100%;}" +
+        "</style></head><body>" + safe + "</body></html>";
       frame.srcdoc = doc;
     });
   }
