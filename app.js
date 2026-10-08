@@ -969,20 +969,72 @@
 
   let invoicesCache = [];
 
+  function invoiceStatusText(inv) {
+    return [
+      inv && inv.displayStatus,
+      inv && inv.displayLabel,
+      inv && inv.decisionStage,
+      inv && inv.finalWorkflowStatus,
+    ].filter((v) => v != null && String(v).trim() !== "")
+        .join(" ")
+        .toLowerCase()
+        .replace(/[_-]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+  }
+
+  function invoiceIsCompleted(inv) {
+    return [
+      inv && inv.displayStatus,
+      inv && inv.displayLabel,
+      inv && inv.decisionStage,
+      inv && inv.finalWorkflowStatus,
+    ].some((v) =>
+      String(v || "").trim().toLowerCase().replace(/[_-]+/g, " ") === "completed");
+  }
+
+  function invoiceMatchesGroup(inv, group) {
+    const text = invoiceStatusText(inv);
+    const completed = invoiceIsCompleted(inv);
+    if (group === "completed") return completed;
+    if (group === "needs_rate") {
+      return !completed &&
+        /needs customer rate|missing rate|low margin/.test(text);
+    }
+    if (group === "missing_pod") {
+      // "Missing Pod" / missing_pod only — signed_pod is a different task.
+      return !completed && /\bmissing pod\b/.test(text);
+    }
+    return !completed;
+  }
+
+  function invoiceEmptyMessage() {
+    if (invoiceGroup === "completed") {
+      return "No completed invoices in this page.";
+    }
+    if (invoiceGroup === "needs_rate") {
+      return "No invoices awaiting a customer rate in this page.";
+    }
+    if (invoiceGroup === "missing_pod") {
+      return "No invoices missing a POD in this page.";
+    }
+    return "No open invoices — nothing waiting.";
+  }
+
   function paintInvoices(list) {
-    if (!list.length) {
+    const visible = (Array.isArray(list) ? list : []).filter((inv) =>
+      invoiceMatchesGroup(inv, invoiceGroup));
+    if (!visible.length) {
       els.invoicesContainer.innerHTML =
-        `<p class="panel-empty">${invoiceGroup === "completed" ?
-          "No completed invoices in this page." :
-          "No open invoices — nothing waiting."}</p>`;
+        `<p class="panel-empty">${invoiceEmptyMessage()}</p>`;
       return;
     }
     els.invoicesContainer.innerHTML =
       `<table class="data-table"><thead><tr>
         <th>Vendor</th><th>Invoice</th><th>Load</th><th>PRO</th>
         <th>Amount</th><th>Received</th><th>Status</th>
-      </tr></thead><tbody>${list.map(buildInvoiceRow).join("")}</tbody></table>`;
-    const byId = new Map(list.map((i) => [i.id, i]));
+      </tr></thead><tbody>${visible.map(buildInvoiceRow).join("")}</tbody></table>`;
+    const byId = new Map(visible.map((i) => [i.id, i]));
     els.invoicesContainer.querySelectorAll("tbody tr").forEach((tr) => {
       const inv = byId.get(tr.dataset.invoiceId);
       if (!inv) return;
