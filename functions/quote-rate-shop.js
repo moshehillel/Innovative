@@ -515,8 +515,12 @@ async function getFakManageSession() {
  */
 async function fakManagePost(params, retryOnAuthFail = true) {
   // Prefer shared bridge session when available (same Cloud Function process).
+  let isUiSessionAuthFailure = null;
   try {
     const bridge = require("./primus-ui-bridge");
+    if (bridge._internal && bridge._internal.isUiSessionAuthFailure) {
+      isUiSessionAuthFailure = bridge._internal.isUiSessionAuthFailure;
+    }
     if (typeof bridge.managePhpPost === "function") {
       const res = await bridge.managePhpPost(params);
       if (res && res.json && typeof res.json === "object") return res.json;
@@ -552,7 +556,12 @@ async function fakManagePost(params, retryOnAuthFail = true) {
       body: form.toString(),
     });
     const text = await resp.text();
-    if (/no session started|session expired/i.test(text)) {
+    const dead = typeof isUiSessionAuthFailure === "function" ?
+      isUiSessionAuthFailure(
+          resp.status, text, resp.headers.get("location") || resp.url || "") :
+      (/no session started|session expired/i.test(text) &&
+        !/^\s*[[{]/.test(text));
+    if (dead) {
       const err = new Error("FAK manage session expired");
       err.authFailed = true;
       throw err;

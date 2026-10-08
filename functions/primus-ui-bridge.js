@@ -173,29 +173,140 @@ async function clearCachedSession() {
   await firestore().doc(SESSION_DOC).delete().catch(() => {});
 }
 
+/** Explicit Primus auth text. Never applied to a vendor-book payload. */
+const UI_AUTH_PHRASE = /no session started|session expired|not logged/i;
+
+/**
+ * @param {string} text Response or header text.
+ * @return {string} Same text with email addresses removed.
+ */
+function stripEmailAddresses(text) {
+  return String(text || "").replace(
+      /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
+      " ");
+}
+
+/**
+ * @param {string} trimmed Body with BOM and outer whitespace removed.
+ * @return {boolean}
+ */
+function looksLikeJsonBody(trimmed) {
+  if (!trimmed) return false;
+  const c = trimmed[0];
+  return c === "{" || c === "[";
+}
+
+/**
+ * Vendor books and other data payloads are successful responses.
+ * @param {object} parsed Parsed JSON object.
+ * @return {boolean}
+ */
+function payloadLooksLikeData(parsed) {
+  if (!parsed || typeof parsed !== "object") return false;
+  if (Array.isArray(parsed)) return parsed.length > 0;
+  const lists = [
+    parsed.vendors,
+    parsed.results,
+    parsed.bookingsfortracking,
+    parsed.ShipmentClassifications,
+  ];
+  if (lists.some((list) => Array.isArray(list) && list.length > 0)) {
+    return true;
+  }
+  const data = parsed.data;
+  if (Array.isArray(data)) return data.length > 0;
+  if (data && typeof data === "object") {
+    if (Array.isArray(data.vendors) && data.vendors.length > 0) return true;
+    if (Array.isArray(data.results) && data.results.length > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * Small JSON error envelopes ("No session started.") are dead sessions.
+ * A getVendors book is not, even when a vendor email contains "login".
+ * @param {string} trimmed JSON text.
+ * @return {boolean}
+ */
+function jsonIsExplicitAuthFailure(trimmed) {
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch (_) {
+    if (trimmed.length > 2000) return false;
+    return UI_AUTH_PHRASE.test(trimmed);
+  }
+  if (!parsed || typeof parsed !== "object") return false;
+  if (payloadLooksLikeData(parsed)) return false;
+  const message = [parsed.message, parsed.error, parsed.msg]
+      .filter((v) => v != null && typeof v !== "object")
+      .join(" ");
+  if (UI_AUTH_PHRASE.test(message)) return true;
+  if (trimmed.length <= 800 && UI_AUTH_PHRASE.test(trimmed)) return true;
+  return false;
+}
+
+/**
+ * @param {number} status HTTP status.
+ * @param {string} [location] Location header or final URL.
+ * @return {boolean}
+ */
+function isLoginRedirect(status, location) {
+  const loc = String(location || "");
+  const urlIsLogin = /\/login\b|\/sign-?in\b|[?&]action=login\b/i.test(loc);
+  if (status >= 300 && status < 400) {
+    if (!loc) return true;
+    return urlIsLogin;
+  }
+  return urlIsLogin;
+}
+
+/**
+ * HTML or plain-text login wall. Email addresses are removed first so
+ * arialoginC@gmail.com and login@gmail.com are not the word "login".
+ * @param {string} trimmed Non-JSON body.
+ * @return {boolean}
+ */
+function isLoginWall(trimmed) {
+  const stripped = stripEmailAddresses(trimmed);
+  if (UI_AUTH_PHRASE.test(stripped) && stripped.trim().length < 2000) {
+    return true;
+  }
+  if (!/\blogin\b/i.test(stripped)) return false;
+  if (stripped.length > 8000) return false;
+  if (/please\s+log\s*in|log\s*in\s+to|sign\s+in/i.test(stripped)) {
+    return true;
+  }
+  if (/<\s*form\b/i.test(stripped) &&
+      /type\s*=\s*["']?password/i.test(stripped)) {
+    return true;
+  }
+  if (/<\s*html\b/i.test(stripped) && stripped.length < 2000) return true;
+  if (stripped.length < 400) return true;
+  return false;
+}
+
 /**
  * True when manage.php rejected the request because the UI session is dead.
  * Primus often returns plain text "No session started." (HTTP 200) instead of
  * 401 — that must trigger a re-login + retry, not a billing failure alert.
  *
- * Do not treat the substring "login" inside a JSON payload as a dead session.
- * getVendors returns the full vendor book, and a vendor email can contain
- * those letters. That false positive re-logged in on every page and the
- * follow-up login fetch then aborted billing with "fetch failed".
+ * Do not search a vendor book for the letters "login". getVendors returns
+ * the full book, and addresses such as arialoginC@gmail.com contain them.
+ * Matching that substring forced a re-login whose fetch then aborted
+ * billing at resolveMasterVendor with "fetch failed".
  * @param {number} status HTTP status.
  * @param {string} [text] Response body.
+ * @param {string} [location] Location header or final URL after redirects.
  * @return {boolean}
  */
-function isUiSessionAuthFailure(status, text) {
+function isUiSessionAuthFailure(status, text, location) {
   if (status === 401 || status === 403) return true;
-  const body = String(text || "");
-  if (/no session started|session expired|not logged/i.test(body)) {
-    return true;
-  }
-  const trimmed = body.trim();
-  if (!trimmed || trimmed[0] === "{" || trimmed[0] === "[") return false;
-  if (trimmed.length > 8000) return false;
-  return /\blogin\b/i.test(trimmed);
+  const trimmed = String(text || "").replace(/^\uFEFF/, "").trim();
+  if (looksLikeJsonBody(trimmed)) return jsonIsExplicitAuthFailure(trimmed);
+  if (isLoginRedirect(status, location)) return true;
+  if (!trimmed) return false;
+  return isLoginWall(trimmed);
 }
 
 /**
@@ -372,7 +483,14 @@ async function managePhpPost(params, retryOnAuthFail = true) {
     } catch (_) {
       // HTML or empty — caller inspects text.
     }
-    return {ok: resp.ok, status: resp.status, text, json};
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      text,
+      json,
+      location: resp.headers.get("location") || "",
+      finalUrl: resp.url || "",
+    };
   };
 
   const postWithNetworkRetry = async (sessionCookie) => {
@@ -403,8 +521,8 @@ async function managePhpPost(params, retryOnAuthFail = true) {
   };
 
   let result = await postWithNetworkRetry(cookie);
-  if (retryOnAuthFail &&
-      isUiSessionAuthFailure(result.status, result.text)) {
+  if (retryOnAuthFail && isUiSessionAuthFailure(
+      result.status, result.text, result.location || result.finalUrl)) {
     if (writeLog) {
       await writeLog("warn", "primus",
           "Primus UI session dead — re-login and retry", {
@@ -467,12 +585,19 @@ async function managePhpUpload(
     });
     const text = await resp.text();
     const json = parseManagePhpJson(text);
-    return {ok: resp.ok, status: resp.status, text, json};
+    return {
+      ok: resp.ok,
+      status: resp.status,
+      text,
+      json,
+      location: resp.headers.get("location") || "",
+      finalUrl: resp.url || "",
+    };
   };
 
   let result = await doUpload(cookie);
-  if (retryOnAuthFail &&
-      isUiSessionAuthFailure(result.status, result.text)) {
+  if (retryOnAuthFail && isUiSessionAuthFailure(
+      result.status, result.text, result.location || result.finalUrl)) {
     if (writeLog) {
       await writeLog("warn", "primus",
           "Primus UI session dead — re-login and retry upload", {
