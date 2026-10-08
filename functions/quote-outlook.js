@@ -11,6 +11,31 @@ const quoteIntake = require("./quote-intake");
 let tcolFn = null;
 let writeLogFn = null;
 
+/** One Graph page. A 2-minute check never brings 40 new messages. */
+const QUOTE_SYNC_PAGE_SIZE = 40;
+/** Re-read this far before the watermark so mail arriving mid-check is kept. */
+const QUOTE_SYNC_OVERLAP_MS = 2 * 60 * 1000;
+/** No stored watermark yet: catch the deploy gap, not yesterday's cache. */
+const QUOTE_SYNC_FIRST_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * Lower bound for the next Outlook list.
+ * Missing watermark: now minus 10 minutes.
+ * Stored watermark: last successful check minus a 2-minute overlap.
+ * @param {string|Date|null} storedWatermark Last successful check time.
+ * @param {number} [nowMs] Clock override.
+ * @return {Date}
+ */
+function quoteSyncReceivedAfter(storedWatermark, nowMs) {
+  const now = Number(nowMs) || Date.now();
+  const storedMs = storedWatermark ?
+    new Date(storedWatermark).getTime() : NaN;
+  if (!storedMs || isNaN(storedMs)) {
+    return new Date(now - QUOTE_SYNC_FIRST_WINDOW_MS);
+  }
+  return new Date(storedMs - QUOTE_SYNC_OVERLAP_MS);
+}
+
 /**
  * @param {object} deps tcol, writeLog.
  * @return {void}
@@ -112,6 +137,19 @@ async function getDispatcherDoc(tenant, dispatcherId) {
 async function getDispatcherTokens(tenant, dispatcherId) {
   const doc = await getDispatcherDoc(tenant, dispatcherId);
   return doc && doc.outlookTokens ? doc.outlookTokens : null;
+}
+
+/**
+ * @param {object} tenant Tenant.
+ * @param {string} dispatcherId Id.
+ * @param {string} iso Successful check time.
+ * @return {Promise<void>}
+ */
+async function saveQuoteSyncWatermark(tenant, dispatcherId, iso) {
+  await col(tenant, "quoteDispatchers").doc(String(dispatcherId)).set({
+    outlookQuoteSyncWatermark: iso,
+    outlookQuoteSyncWatermarkAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, {merge: true});
 }
 
 /**
@@ -423,10 +461,10 @@ async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
 }
 
 /**
- * Sync recent quote RFQs from a dispatcher's connected Outlook inbox.
+ * Sync quote RFQs that arrived after this mailbox's last successful check.
  * Luna classifies from email body; quotes are enqueued then drained.
- * Quoted mail stays unread. includeRead lists already-read mail in the
- * same 7-day / newest-40 window. Dedup is the stored Outlook message id.
+ * Quoted mail stays unread. Already-read mail is still listed.
+ * Dedup is the stored Outlook message id.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {Function} processQuoteEmail quote-automation.processQuoteEmail.
@@ -436,10 +474,11 @@ async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
 async function syncDispatcherInbox(
     tenant, dispatcher, processQuoteEmail, opts = {}) {
   const quoteMailQueue = require("./quote-mail-queue");
-  const tokens = await getDispatcherTokens(tenant, dispatcher.id);
+  const dispatcherDoc = await getDispatcherDoc(tenant, dispatcher.id);
+  const tokens = dispatcherDoc && dispatcherDoc.outlookTokens ?
+    dispatcherDoc.outlookTokens : null;
   if (!tokens) {
-    const doc = await getDispatcherDoc(tenant, dispatcher.id);
-    if (doc && doc.outlookNeedsReconnect) {
+    if (dispatcherDoc && dispatcherDoc.outlookNeedsReconnect) {
       return {ok: true, synced: 0, skipped: "needs_reconnect"};
     }
     return {ok: true, synced: 0, skipped: "not_connected"};
@@ -476,15 +515,16 @@ async function syncDispatcherInbox(
     throw err;
   }
 
-  const after = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const q = `after:${after.getUTCFullYear()}/` +
-    `${after.getUTCMonth() + 1}/${after.getUTCDate()}`;
+  const checkedAt = new Date();
+  const receivedAfter = quoteSyncReceivedAfter(
+      dispatcherDoc.outlookQuoteSyncWatermark,
+      checkedAt.getTime());
   let listResp;
   try {
     listResp = await client.users.messages.list({
-      maxResults: 40,
+      maxResults: QUOTE_SYNC_PAGE_SIZE,
       includeRead,
-      q,
+      receivedAfter,
     });
   } catch (err) {
     if (isOutlookInvalidGrant(err)) {
@@ -668,6 +708,11 @@ async function syncDispatcherInbox(
     }
   }
 
+  // Check succeeded. Next run starts at this list time, minus a short overlap.
+  // Do this even when every id was already stored, so we do not rescan a backlog.
+  await saveQuoteSyncWatermark(
+      tenant, dispatcher.id, checkedAt.toISOString());
+
   let drainedAfter = {processed: 0, errors: 0};
   try {
     drainedAfter = await drainQuoteQueue(
@@ -694,6 +739,8 @@ async function syncDispatcherInbox(
     enqueued,
     scanned: messages.length,
     includeRead,
+    receivedAfter: receivedAfter.toISOString(),
+    watermark: checkedAt.toISOString(),
     skippedExisting,
     skippedNotQuote,
     processErrors,
@@ -797,5 +844,6 @@ module.exports = {
   isOutlookInvalidGrant,
   handleOAuthCallback,
   syncDispatcherInbox,
+  quoteSyncReceivedAfter,
   sendQuoteReply,
 };

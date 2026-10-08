@@ -516,6 +516,7 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
           pageToken,
           q,
           includeRead,
+          receivedAfter,
           readAfter,
           readBefore,
           readMode,
@@ -551,10 +552,22 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
                 orderBy = "lastModifiedDateTime desc";
               }
             } else {
-              const after = parseGmailAfterDate(q);
+              const receivedAfterDate = receivedAfter ?
+                (receivedAfter instanceof Date ?
+                  receivedAfter : new Date(receivedAfter)) :
+                null;
+              const hasReceivedAfter = Boolean(
+                  receivedAfterDate && !isNaN(receivedAfterDate.getTime()));
+              const after = hasReceivedAfter ?
+                receivedAfterDate : parseGmailAfterDate(q);
               filter = includeRead ? "" : "isRead eq false";
               if (after) {
-                const dateClause = `receivedDateTime ge ${after.toISOString()}`;
+                // receivedAfter is an exact watermark (gt). Date-only q stays ge.
+                const op = hasReceivedAfter ? "gt" : "ge";
+                const stamp = hasReceivedAfter ?
+                  after.toISOString().replace(/\.\d{3}Z$/, "Z") :
+                  after.toISOString();
+                const dateClause = `receivedDateTime ${op} ${stamp}`;
                 filter = filter ? `${filter} and ${dateClause}` : dateClause;
               }
               if (!filter) {

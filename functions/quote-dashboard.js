@@ -1017,17 +1017,15 @@ async function handleGetQuoteDispatcherInbox(req, res) {
       req.query.syncOutlook === "true";
     if (wantSync) {
       try {
-        const includeRead =
-          req.query.includeRead === "1" ||
-          req.query.includeRead === "true";
         const forceReprocess =
           req.query.forceReprocess === "1" ||
           req.query.forceReprocess === "true";
+        // Same watermark list as the scheduler, including mail already read.
         await quoteOutlook.syncDispatcherInbox(
             user.tenant,
             user.dispatcher,
             quoteAutomation.processQuoteEmail,
-            {includeRead, forceReprocess});
+            {includeRead: true, forceReprocess});
       } catch (syncErr) {
         console.warn("quote outlook sync:", syncErr.message);
       }
@@ -1360,8 +1358,9 @@ function handleQuoteAuthClient(req, res) {
 
 /**
  * Scheduled sync: every connected dispatcher Outlook inbox.
- * Mirror of Jerry checkMailInbox — Cloud Scheduler hits this every 20 min.
- * Lists the last 7 days (newest 40), including mail that is already read.
+ * Mirror of Jerry checkMailInbox — Cloud Scheduler hits this every 2 minutes.
+ * Lists mail received after each mailbox's last successful check
+ * (first run: the last 10 minutes), including mail that is already read.
  * Dedup is the stored Outlook message id. Quoted mail stays unread.
  * Dashboard inbox loads use syncOutlook=0 by default; syncOutlook=1 is opt-in.
  * @param {object} req Request.
@@ -1419,6 +1418,8 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
           skippedNotQuote: result && result.skippedNotQuote,
           processErrors: result && result.processErrors,
           includeRead: result && result.includeRead,
+          receivedAfter: result && result.receivedAfter,
+          watermark: result && result.watermark,
           skipped: result && result.skipped ? result.skipped : undefined,
         });
       } catch (syncErr) {
