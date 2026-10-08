@@ -1,11 +1,29 @@
 "use strict";
 
 const admin = require("firebase-admin");
-const {google} = require("googleapis");
 const outlookMail = require("./outlook-mail");
 
 /** @type {FirebaseFirestore.Firestore|null} */
 let dbRef = null;
+
+/** @type {object|null} */
+let googleApis = null;
+
+/**
+ * Loads the Gmail client only when MAIL_PROVIDER=gmail.
+ * The default Outlook process must not pull in the full googleapis package.
+ * @return {object}
+ */
+function loadGoogleApis() {
+  if (getProvider() !== "gmail") {
+    throw new Error(
+        "Refusing to load googleapis while MAIL_PROVIDER is not gmail");
+  }
+  if (!googleApis) {
+    googleApis = require("googleapis").google;
+  }
+  return googleApis;
+}
 
 /**
  * @param {object} deps Dependencies.
@@ -86,6 +104,7 @@ async function persistTenantMailTokens(tenant, tokens) {
  * @return {google.auth.OAuth2}
  */
 function getGmailOAuthClient() {
+  const google = loadGoogleApis();
   return new google.auth.OAuth2(
       process.env.GMAIL_CLIENT_ID,
       process.env.GMAIL_CLIENT_SECRET,
@@ -145,7 +164,7 @@ async function getTenantMailClient(tenant) {
 
   const oauth2Client = getGmailOAuthClient();
   oauth2Client.setCredentials(tokens);
-  return google.gmail({version: "v1", auth: oauth2Client});
+  return loadGoogleApis().gmail({version: "v1", auth: oauth2Client});
 }
 
 /**
@@ -168,7 +187,7 @@ async function resolveMailboxProfileFromTokens(tokens, tenant) {
 
   const oauth2Client = getGmailOAuthClient();
   oauth2Client.setCredentials(tokens);
-  const gmail = google.gmail({version: "v1", auth: oauth2Client});
+  const gmail = loadGoogleApis().gmail({version: "v1", auth: oauth2Client});
   const profile = await gmail.users.getProfile({userId: "me"});
   return {
     email: profile.data.emailAddress || null,
