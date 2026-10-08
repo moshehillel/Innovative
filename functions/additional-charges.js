@@ -1082,50 +1082,157 @@ function buildDispatcherNotifyReminderEmail(opts) {
 }
 
 /**
+ * Finds an unresolved follow-up for the same load, amount, and reason.
+ * @param {object} db Firestore.
+ * @param {object} data Incoming follow-up fields.
+ * @return {Promise<string|null>}
+ */
+async function findUnresolvedDuplicateFollowUp(db, data) {
+  const dedupe = require("./dashboard-dedupe");
+  const loadNumber = String(data.loadNumber || "").trim();
+  if (!loadNumber) return null;
+  const snap = await db.collection(FOLLOW_UP_COLLECTION)
+      .where("loadNumber", "==", loadNumber)
+      .limit(200)
+      .get();
+  const incoming = {
+    type: "additional_charge",
+    loadNumber,
+    reason: data.category || null,
+    chargesTotal: data.chargesTotal,
+  };
+  let best = null;
+  for (const doc of snap.docs) {
+    const row = doc.data() || {};
+    if (row.resolved === true) continue;
+    if (data.tenantId && row.tenantId && row.tenantId !== data.tenantId) {
+      continue;
+    }
+    const candidate = {
+      type: "additional_charge",
+      loadNumber: row.loadNumber,
+      reason: row.category || null,
+      chargesTotal: row.chargesTotal,
+      chargePhase: row.chargePhase || null,
+      followUpStatus: row.status || null,
+      createdAt: row.createdAt && row.createdAt.toDate ?
+        row.createdAt.toDate().toISOString() : null,
+      receivedAt: row.receivedAt && row.receivedAt.toDate ?
+        row.receivedAt.toDate().toISOString() : null,
+    };
+    if (!dedupe.sameExactCharge(incoming, candidate)) continue;
+    if (!best ||
+        dedupe.compareDuplicatePreference(candidate, best.item) > 0) {
+      best = {id: doc.id, item: candidate};
+    }
+  }
+  return best ? best.id : null;
+}
+
+/**
  * Creates a follow-up entry so the charge is tracked until resolved.
+ * Reuses an unresolved follow-up for the same charge.
  * @param {object} db Firestore instance.
  * @param {object} data loadNumber, carrierName, customerName, invoiceId,
  *   category, charges, chargesTotal, invoiceAmount, status, notes.
  * @return {Promise<string>} Follow-up doc id.
  */
 async function createFollowUp(db, data) {
-  const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
-    loadNumber: data.loadNumber || null,
-    carrierName: data.carrierName || null,
-    customerName: data.customerName || null,
-    invoiceId: data.invoiceId || null,
-    tenantId: data.tenantId || null,
-    category: data.category || null,
-    charges: Array.isArray(data.charges) ? data.charges : [],
-    chargesTotal: Number(data.chargesTotal) || 0,
-    invoiceAmount: Number(data.invoiceAmount) || 0,
-    status: data.status || FOLLOW_UP_STATUS.PENDING_APPROVAL,
-    decision: null,
-    decisionAt: null,
-    notes: data.notes || null,
-    resolved: false,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  const MAX_BODY = 120000;
+  let emailHtml = data.emailHtml != null ? String(data.emailHtml) : null;
+  if (emailHtml && emailHtml.length > MAX_BODY) {
+    emailHtml = emailHtml.slice(0, MAX_BODY);
+  }
+  const ownership = require("./dashboard-ownership");
+  const owner = ownership.ownershipFieldsForCreate({
+    to: data.emailTo,
+    cc: data.emailCc,
+    type: "additional_charge",
+    dispatcherEmail: data.dispatcherEmail,
+    dispatcherName: data.dispatcherName,
+    ownerBucket: data.ownerBucket,
   });
-
+  let docId = null;
   try {
-    const dashboardTasks = require("./dashboard-tasks");
-    await dashboardTasks.createDashboardTask(db, {
-      tenantId: data.tenantId || "default",
-      type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
-      title: `Additional charge - Load ${data.loadNumber || "-"}`,
-      description: data.notes || null,
+    docId = await findUnresolvedDuplicateFollowUp(db, data);
+  } catch (dedupeErr) {
+    console.error("[createFollowUp] dedupe lookup failed:", dedupeErr.message);
+  }
+  if (docId) {
+    console.log("[createFollowUp] exact duplicate open charge — reused",
+        docId, data.loadNumber || "", data.chargesTotal, data.category || "");
+    if (data.status === FOLLOW_UP_STATUS.DISPUTING) {
+      await db.collection(FOLLOW_UP_COLLECTION).doc(docId).update({
+        status: FOLLOW_UP_STATUS.DISPUTING,
+        chargePhase: "dispute",
+        resolved: false,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } else {
+    const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
       loadNumber: data.loadNumber || null,
       carrierName: data.carrierName || null,
+      customerName: data.customerName || null,
       invoiceId: data.invoiceId || null,
-      followUpId: doc.id,
-      reason: data.category || data.status || null,
+      tenantId: data.tenantId || null,
+      category: data.category || null,
+      charges: Array.isArray(data.charges) ? data.charges : [],
+      chargesTotal: Number(data.chargesTotal) || 0,
+      invoiceAmount: Number(data.invoiceAmount) || 0,
+      status: data.status || FOLLOW_UP_STATUS.PENDING_APPROVAL,
+      decision: null,
+      decisionAt: null,
+      notes: data.notes || null,
+      emailHtml,
+      emailSubject: data.emailSubject || null,
+      emailTo: data.emailTo || null,
+      emailCc: data.emailCc || null,
+      ...owner,
+      ...require("./dashboard-email-files").fieldsForCreate({
+        receivedAt: data.receivedAt || data.emailReceivedAt || null,
+        receivedAtSource: data.receivedAtSource || "mailbox",
+        attachments: data.attachments,
+      }),
+      resolved: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-  } catch (taskErr) {
-    console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+    docId = doc.id;
   }
 
-  return doc.id;
+  if (data.skipDashboardTask !== true) {
+    try {
+      const dashboardTasks = require("./dashboard-tasks");
+      await dashboardTasks.createDashboardTask(db, {
+        tenantId: data.tenantId || "default",
+        type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+        title: `Additional charge - Load ${data.loadNumber || "-"}`,
+        description: data.notes || null,
+        body: emailHtml,
+        subject: data.emailSubject || null,
+        to: data.emailTo || null,
+        cc: data.emailCc || null,
+        loadNumber: data.loadNumber || null,
+        carrierName: data.carrierName || null,
+        invoiceId: data.invoiceId || null,
+        followUpId: docId,
+        messageId: data.messageId || null,
+        reason: data.category || data.status || null,
+        chargesTotal: data.chargesTotal || null,
+        dispatcherEmail: owner.dispatcherEmail,
+        dispatcherName: owner.dispatcherName,
+        ownerBucket: owner.ownerBucket,
+        receivedAt: data.receivedAt || data.emailReceivedAt || null,
+        receivedAtSource: data.receivedAtSource || "mailbox",
+        attachments: data.attachments,
+      });
+    } catch (taskErr) {
+      console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+    }
+  }
+
+  return docId;
 }
 
 /**
