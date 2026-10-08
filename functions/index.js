@@ -12474,6 +12474,67 @@ function invoiceDashboardStatus(data) {
     remapWorkflow: false};
 }
 
+/**
+ * @param {FirebaseFirestore.QueryDocumentSnapshot} doc Invoice doc.
+ * @param {object} tenant Tenant.
+ * @return {object} Dashboard invoice row.
+ */
+function mapDashboardInvoice(doc, tenant) {
+  const data = doc.data() || {};
+  const createdAt = data.createdAt && data.createdAt.toDate ?
+    data.createdAt.toDate().toISOString() : null;
+  const shown = invoiceDashboardStatus(data);
+  const isCompleted = shown.displayStatus === "completed" ||
+    data.finalWorkflowStatus === "completed" ||
+    data.decisionStage === "completed";
+  return {
+    id: doc.id,
+    loadNumber: data.loadNumber || null,
+    proNumber: data.proNumber || null,
+    carrierName: data.carrierName || null,
+    customerName: data.customerName || null,
+    invoiceAmount: data.invoiceAmount || null,
+    customerRate: data.customerRate || null,
+    profit: data.profit || null,
+    primusAmount: data.primusAmount || data.vendorCost || null,
+    tms: data.tms || tenant.tms,
+    taiShipmentId: data.taiShipmentId || null,
+    finalWorkflowStatus: shown.remapWorkflow ?
+      (shown.displayStatus || data.finalWorkflowStatus || null) :
+      (data.finalWorkflowStatus || null),
+    decisionStage: shown.displayStatus || data.decisionStage || null,
+    decisionReason: shown.displayReason,
+    matchStatus: shown.matchStatus,
+    displayStatus: shown.displayStatus,
+    displayLabel: shown.displayLabel,
+    currentStep: data.currentStep || null,
+    isCompleted,
+    createdAt,
+  };
+}
+
+/**
+ * @param {object} inv Mapped invoice.
+ * @param {string} statusGroup open|needs_rate|missing_pod|completed|all.
+ * @return {boolean} Whether the row belongs in that filter.
+ */
+function invoiceInStatusGroup(inv, statusGroup) {
+  const stage = `${inv.displayStatus || ""} ${inv.decisionStage || ""} ` +
+    `${inv.finalWorkflowStatus || ""}`.toLowerCase();
+  if (statusGroup === "all") return true;
+  if (statusGroup === "completed") return Boolean(inv.isCompleted);
+  if (inv.isCompleted) return false;
+  if (statusGroup === "needs_rate") {
+    return /needs_customer_rate|missing_rate|low_margin/.test(stage);
+  }
+  if (statusGroup === "missing_pod") {
+    // POD holds only. Signed-POD request tasks are a different queue.
+    if (/signed_pod|pod_request/.test(stage)) return false;
+    return /missing_pod|needs_pod|awaiting_pod/.test(stage);
+  }
+  return true;
+}
+
 exports.getRecentInvoices = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
@@ -12485,62 +12546,34 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
     const offset = Number.isFinite(parsedOffset) && parsedOffset > 0 ?
       Math.floor(parsedOffset) : 0;
     const statusGroup = String(req.query.statusGroup || "open").toLowerCase();
-    // Fetch a wider window, filter by open/completed, then page in memory.
-    const fetchCount = Math.min(Math.max(offset + limit * 4, 80), 500);
-    const snap = await tcol(tenant, "invoices")
-        .orderBy("createdAt", "desc")
-        .limit(fetchCount)
-        .get();
-    const mapped = snap.docs.map((doc) => {
-      const data = doc.data() || {};
-      const createdAt = data.createdAt && data.createdAt.toDate ?
-        data.createdAt.toDate().toISOString() : null;
-      const shown = invoiceDashboardStatus(data);
-      const isCompleted = shown.displayStatus === "completed" ||
-        data.finalWorkflowStatus === "completed" ||
-        data.decisionStage === "completed";
-      return {
-        id: doc.id,
-        loadNumber: data.loadNumber || null,
-        proNumber: data.proNumber || null,
-        carrierName: data.carrierName || null,
-        customerName: data.customerName || null,
-        invoiceAmount: data.invoiceAmount || null,
-        customerRate: data.customerRate || null,
-        profit: data.profit || null,
-        primusAmount: data.primusAmount || data.vendorCost || null,
-        tms: data.tms || tenant.tms,
-        taiShipmentId: data.taiShipmentId || null,
-        finalWorkflowStatus: shown.remapWorkflow ?
-          (shown.displayStatus || data.finalWorkflowStatus || null) :
-          (data.finalWorkflowStatus || null),
-        decisionStage: shown.displayStatus || data.decisionStage || null,
-        decisionReason: shown.displayReason,
-        matchStatus: shown.matchStatus,
-        displayStatus: shown.displayStatus,
-        displayLabel: shown.displayLabel,
-        currentStep: data.currentStep || null,
-        isCompleted,
-        createdAt,
-      };
-    });
-    const stageOf = (inv) =>
-      `${inv.displayStatus || ""} ${inv.decisionStage || ""} ` +
-      `${inv.finalWorkflowStatus || ""}`.toLowerCase();
-    let filtered;
-    if (statusGroup === "all") {
-      filtered = mapped;
-    } else if (statusGroup === "completed") {
-      filtered = mapped.filter((inv) => inv.isCompleted);
-    } else if (statusGroup === "needs_rate") {
-      filtered = mapped.filter((inv) =>
-        !inv.isCompleted &&
-        /needs_customer_rate|missing_rate|low_margin/.test(stageOf(inv)));
-    } else if (statusGroup === "missing_pod") {
-      filtered = mapped.filter((inv) =>
-        !inv.isCompleted && /missing_pod/.test(stageOf(inv)));
-    } else {
-      filtered = mapped.filter((inv) => !inv.isCompleted);
+    // Status is computed, so scan newest-first until the page is full.
+    const batchSize = 100;
+    const maxScan = 800;
+    const need = offset + limit;
+    const filtered = [];
+    let scanned = 0;
+    let lastDoc = null;
+    let exhausted = false;
+    while (filtered.length < need && scanned < maxScan) {
+      let query = tcol(tenant, "invoices")
+          .orderBy("createdAt", "desc")
+          .limit(batchSize);
+      if (lastDoc) query = query.startAfter(lastDoc);
+      const snap = await query.get();
+      if (snap.empty) {
+        exhausted = true;
+        break;
+      }
+      scanned += snap.size;
+      lastDoc = snap.docs[snap.docs.length - 1];
+      snap.docs.forEach((doc) => {
+        const inv = mapDashboardInvoice(doc, tenant);
+        if (invoiceInStatusGroup(inv, statusGroup)) filtered.push(inv);
+      });
+      if (snap.size < batchSize) {
+        exhausted = true;
+        break;
+      }
     }
     const invoices = filtered.slice(offset, offset + limit);
     return res.json({
@@ -12551,8 +12584,7 @@ exports.getRecentInvoices = onRequest(async (req, res) => {
       limit,
       offset,
       statusGroup,
-      hasMore: offset + invoices.length < filtered.length ||
-        (filtered.length >= fetchCount && snap.docs.length === fetchCount),
+      hasMore: offset + invoices.length < filtered.length || !exhausted,
     });
   } catch (error) {
     console.error("getRecentInvoices error:", error);
