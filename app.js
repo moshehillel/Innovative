@@ -85,7 +85,6 @@
   let invoiceOffset = 0;
   let invoiceHasMore = false;
   let invoiceGroup = "open";
-  let invoicesInFlight = null;
   let statsInFlight = null;
   let activeTab = "tasks";
   let ownerBucket = "accounting";
@@ -772,14 +771,24 @@
     });
   }
 
+  function itemAmount(item) {
+    const raw = item && (item.chargesTotal != null ?
+      item.chargesTotal : item.invoiceAmount);
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  }
+
   function clientFilterSort(items) {
     const q = String(els.workspaceSearch?.value || "").trim().toLowerCase();
     let list = items.slice();
     if (q) {
       list = list.filter((t) => {
         const hay = [
-          t.loadNumber, t.carrierName, t.title, t.subject, t.reason, t.to,
-        ].join(" ").toLowerCase();
+          t.loadNumber, t.carrierName, t.customerName, t.title, t.subject,
+          t.reason, t.description, t.to, t.proNumber, t.id,
+          t.displayLabel, t.displayStatus, t.invoiceNumber,
+        ].filter((v) => v != null && String(v).trim() !== "")
+            .join(" ").toLowerCase();
         return hay.includes(q);
       });
     }
@@ -790,9 +799,7 @@
           return a.isUrgentOld ? -1 : 1;
         }
       }
-      if (sort === "amount") {
-        return (Number(b.chargesTotal) || 0) - (Number(a.chargesTotal) || 0);
-      }
+      if (sort === "amount") return itemAmount(b) - itemAmount(a);
       const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
       const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
       return sort === "oldest" ? ta - tb : tb - ta;
@@ -968,6 +975,7 @@
   }
 
   let invoicesCache = [];
+  let invoiceLoadSeq = 0;
 
   function invoiceStatusText(inv) {
     return [
@@ -1002,8 +1010,10 @@
         /needs customer rate|missing rate|low margin/.test(text);
     }
     if (group === "missing_pod") {
-      // "Missing Pod" / missing_pod only — signed_pod is a different task.
-      return !completed && /\bmissing pod\b/.test(text);
+      // POD holds only. Signed-POD request tasks stay out of this filter.
+      if (/\bsigned pod\b|\bpod request\b/.test(text)) return false;
+      return !completed &&
+        /\bmissing pod\b|\bneeds pod\b|\bawaiting pod\b/.test(text);
     }
     return !completed;
   }
@@ -1055,53 +1065,54 @@
   }
 
   async function loadInvoices({reset = true} = {}) {
-    if (invoicesInFlight) {
-      try { await invoicesInFlight; } catch (_) { /* ignore */ }
-      if (!reset) return;
-    }
-    invoicesInFlight = (async () => {
-      if (reset) {
-        invoiceOffset = 0;
-        invoiceHasMore = false;
-        invoicesCache = [];
-        setButtonBusy(els.refreshInvoicesBtn, true, "Refreshing…");
+    const seq = ++invoiceLoadSeq;
+    const group = invoiceGroup;
+    if (reset) {
+      invoiceOffset = 0;
+      invoiceHasMore = false;
+      setButtonBusy(els.refreshInvoicesBtn, true, "Refreshing…");
+      if (!invoicesCache.length) {
         els.invoicesContainer.innerHTML = '<p class="panel-empty">Loading…</p>';
-      } else {
-        updateLoadMoreButton(true);
       }
-      try {
-        const data = await fetchJson(
-            `/getRecentInvoices?limit=${INVOICE_PAGE_SIZE}&offset=${invoiceOffset}` +
-            `&statusGroup=${encodeURIComponent(invoiceGroup)}`,
-        );
-        const invoices = data.invoices || [];
-        invoiceHasMore = typeof data.hasMore === "boolean" ?
-          data.hasMore : invoices.length === INVOICE_PAGE_SIZE;
-        invoiceOffset += invoices.length;
-        if (reset) renderInvoices(invoices);
-        else appendInvoices(invoices);
-      } catch (error) {
-        if (reset) {
-          els.invoicesContainer.innerHTML =
-            '<p class="panel-empty">Could not load invoices.</p>';
-        } else {
-          showError("Could not load more invoices.");
-        }
-        throw error;
-      } finally {
+    } else {
+      updateLoadMoreButton(true);
+    }
+    try {
+      const data = await fetchJson(
+          `/getRecentInvoices?limit=${INVOICE_PAGE_SIZE}&offset=${invoiceOffset}` +
+          `&statusGroup=${encodeURIComponent(group)}`,
+      );
+      if (seq !== invoiceLoadSeq || group !== invoiceGroup) return;
+      const invoices = data.invoices || [];
+      invoiceHasMore = typeof data.hasMore === "boolean" ?
+        data.hasMore : invoices.length === INVOICE_PAGE_SIZE;
+      invoiceOffset += invoices.length;
+      if (reset) renderInvoices(invoices);
+      else appendInvoices(invoices);
+    } catch (error) {
+      if (seq !== invoiceLoadSeq) return;
+      if (reset && !invoicesCache.length) {
+        els.invoicesContainer.innerHTML =
+          '<p class="panel-empty">Could not load invoices.</p>';
+      } else if (!reset) {
+        showError("Could not load more invoices.");
+      }
+      console.error("loadInvoices failed:", error);
+    } finally {
+      if (seq === invoiceLoadSeq) {
         if (reset) setButtonBusy(els.refreshInvoicesBtn, false);
         updateLoadMoreButton(false);
       }
-    })();
-    try { await invoicesInFlight; } finally { invoicesInFlight = null; }
+    }
   }
 
   document.querySelectorAll("[data-invoice-group]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      invoiceGroup = btn.dataset.invoiceGroup;
+      invoiceGroup = btn.getAttribute("data-invoice-group") || "open";
       document.querySelectorAll("[data-invoice-group]").forEach((b) => {
         b.classList.toggle("is-active", b === btn);
       });
+      paintInvoices(clientFilterSort(invoicesCache));
       loadInvoices({reset: true});
     });
   });

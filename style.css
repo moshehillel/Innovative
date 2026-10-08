@@ -109,6 +109,7 @@ body {
 .menu-row { display: flex; gap: 6px; padding: 0 6px 6px; }
 
 /* —— Buttons / inputs —— */
+[hidden] { display: none !important; }
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
   border-radius: var(--ic-radius-sm); border: 1px solid transparent;
