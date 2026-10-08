@@ -492,6 +492,7 @@
     .skel-card:nth-child(3) { animation-delay: 0.24s; }
 
     .quote-list { display: grid; gap: 12px; min-width: 0; max-width: 100%; }
+    .inbox-tab { display: grid; gap: 12px; min-width: 0; }
     .load-more-wrap {
       display: flex;
       justify-content: center;
@@ -1036,6 +1037,7 @@
     let inboxOffset = 0;
     let inboxHasMore = false;
     let loadMoreInFlight = false;
+    const inboxTabs = {};
     let thinkingTimer = null;
     let thinkingFadeTimer = null;
     let thinkingStep = 0;
@@ -1232,14 +1234,29 @@
       if (toEl && !toEl.value) toEl.value = iso(to);
     }
 
-    function applyLocalDismissStats(status) {
-      writeStat("stat-dismissed", readStat("stat-dismissed") + 1);
+    function bumpStat(id, delta) {
+      writeStat(id, readStat(id) + delta);
+    }
+
+    function statusStatId(status) {
       const s = quoteStatusOf({status: status});
-      if (s === "awaiting_dispatcher") {
-        writeStat("stat-awaiting", readStat("stat-awaiting") - 1);
-      } else if (s === "draft_ready") {
-        writeStat("stat-draft", readStat("stat-draft") - 1);
-      }
+      if (s === "awaiting_dispatcher") return "stat-awaiting";
+      if (s === "draft_ready") return "stat-draft";
+      if (s === "sent") return "stat-sent";
+      return "";
+    }
+
+    function applyLocalDismissStats(status) {
+      bumpStat("stat-dismissed", 1);
+      const sid = statusStatId(status);
+      if (sid) bumpStat(sid, -1);
+    }
+
+    function applyLocalCompleteStats(status, nowCompleted, wasReview) {
+      bumpStat("stat-completed", nowCompleted ? 1 : -1);
+      const sid = statusStatId(status);
+      if (sid) bumpStat(sid, nowCompleted ? -1 : 1);
+      if (nowCompleted && wasReview) bumpStat("stat-review", -1);
     }
 
     async function dismissQuoteById(quoteId) {
@@ -1370,23 +1387,29 @@
       }
     }
 
-    function filterInboxPage(raw) {
-      if (filterStatus === "completed") {
+    function filterInboxPage(raw, status) {
+      const st = status == null ? filterStatus : status;
+      if (st === "completed") {
         return (raw || []).filter(isCompletedItem);
       }
       const visible = (raw || []).filter((i) => !isInactiveItem(i));
-      if (filterStatus === "pending") return visible.filter(isPendingItem);
-      if (filterStatus === "sent") return visible.filter(isSentItem);
-      if (filterStatus === "for_review") return visible.filter(isForReviewItem);
+      if (st === "pending") return visible.filter(isPendingItem);
+      if (st === "sent") return visible.filter(isSentItem);
+      if (st === "for_review") return visible.filter(isForReviewItem);
       return visible;
     }
 
-    function inboxTabTotal(counts) {
+    function itemMatchesTab(item, status) {
+      return filterInboxPage([item], status).length > 0;
+    }
+
+    function inboxTabTotal(counts, status) {
+      const st = status == null ? filterStatus : status;
       const c = counts || {};
-      if (filterStatus === "pending") return Number(c.pending) || 0;
-      if (filterStatus === "sent") return Number(c.sent) || 0;
-      if (filterStatus === "for_review") return Number(c.forReview) || 0;
-      if (filterStatus === "completed") return Number(c.completed) || 0;
+      if (st === "pending") return Number(c.pending) || 0;
+      if (st === "sent") return Number(c.sent) || 0;
+      if (st === "for_review") return Number(c.forReview) || 0;
+      if (st === "completed") return Number(c.completed) || 0;
       return Math.max(0,
           (Number(c.total) || 0) -
           (Number(c.dismissed) || 0) -
@@ -1397,7 +1420,7 @@
       const wrap = document.getElementById("load-more-wrap");
       const btn = document.getElementById("btn-load-more");
       if (!wrap || !btn) return;
-      if (inboxHasMore && inboxItems.length) {
+      if (inboxHasMore) {
         wrap.classList.remove("hidden");
         btn.disabled = !!(inboxLoadInFlight || loadMoreInFlight);
         btn.textContent = loadMoreInFlight ? "Loading…" : "Load more";
@@ -1406,6 +1429,192 @@
         btn.disabled = false;
         btn.textContent = "Load more";
       }
+    }
+
+    function ensureTabRecord(status) {
+      const key = status == null ? filterStatus : status;
+      if (!inboxTabs[key]) {
+        inboxTabs[key] = {
+          items: [], offset: 0, hasMore: false, loaded: false,
+        };
+      }
+      return inboxTabs[key];
+    }
+
+    function tabPanelEl(status) {
+      const key = status == null ? filterStatus : status;
+      const rows = document.getElementById("rows");
+      const panels = rows.querySelectorAll(".inbox-tab");
+      for (let i = 0; i < panels.length; i++) {
+        if (panels[i].getAttribute("data-tab") === key) return panels[i];
+      }
+      const panel = document.createElement("div");
+      panel.className = "inbox-tab";
+      panel.setAttribute("data-tab", key);
+      rows.appendChild(panel);
+      return panel;
+    }
+
+    function showActiveTabPanel() {
+      const rows = document.getElementById("rows");
+      const panels = rows.querySelectorAll(".inbox-tab");
+      for (let i = 0; i < panels.length; i++) {
+        panels[i].classList.toggle(
+            "hidden", panels[i].getAttribute("data-tab") !== filterStatus);
+      }
+    }
+
+    function syncActiveTabGlobals() {
+      const tab = ensureTabRecord(filterStatus);
+      inboxItems = tab.items;
+      inboxOffset = tab.offset;
+      inboxHasMore = tab.hasMore;
+    }
+
+    function findCardEl(panel, id) {
+      const want = String(id);
+      const cards = panel.querySelectorAll(".quote-card");
+      for (let i = 0; i < cards.length; i++) {
+        if (cards[i].getAttribute("data-id") === want) return cards[i];
+      }
+      return null;
+    }
+
+    function findInboxItem(quoteId) {
+      const id = String(quoteId || "");
+      const lists = [inboxItems];
+      Object.keys(inboxTabs).forEach((key) => {
+        lists.push(inboxTabs[key].items);
+      });
+      for (let i = 0; i < lists.length; i++) {
+        const found = (lists[i] || []).find((item) => String(item.id) === id);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function patchQuoteCard(card, item) {
+      const pending = isPendingItem(item);
+      const forReview = isForReviewItem(item);
+      const completed = isCompletedItem(item);
+      const status = quoteStatusOf(item);
+      card.setAttribute("data-status", item.status || "");
+      card.setAttribute("data-for-review", forReview ? "1" : "0");
+      const badges = card.querySelector(".quote-card-badges");
+      const badge = badges &&
+        badges.querySelector(".badge:not(.for-review)");
+      if (badge) {
+        const badgeClass = completed ? "completed" :
+          (pending ? "pending" :
+            (status === "sent" ? "sent" :
+              (status === "draft_ready" ? "draft_ready" : "")));
+        badge.className = "badge" + (badgeClass ? " " + badgeClass : "");
+        badge.textContent = item.status || "";
+      }
+      let reviewBadge = badges && badges.querySelector(".badge.for-review");
+      if (forReview && !reviewBadge && badges) {
+        reviewBadge = document.createElement("span");
+        reviewBadge.className = "badge for-review";
+        reviewBadge.textContent = "For review";
+        badges.appendChild(reviewBadge);
+      } else if (!forReview && reviewBadge) {
+        reviewBadge.remove();
+      }
+      const completeBtn = card.querySelector(".btn-complete-card");
+      if (completeBtn) {
+        completeBtn.disabled = false;
+        completeBtn.setAttribute("data-completed", completed ? "1" : "0");
+        completeBtn.textContent = completed ? "Undo complete" : "Complete";
+      }
+      const reviewBtn = card.querySelector(".btn-review-card");
+      if (reviewBtn) {
+        reviewBtn.setAttribute("data-on", forReview ? "1" : "0");
+        reviewBtn.textContent = forReview ? "Unmark review" : "For review";
+        reviewBtn.classList.toggle("is-on", forReview);
+        reviewBtn.disabled = !!completed;
+      }
+      const dismissBtn = card.querySelector(".btn-dismiss-card");
+      if (dismissBtn) {
+        dismissBtn.disabled = !!completed;
+        if (!completed) {
+          dismissBtn.removeAttribute("data-confirm");
+          dismissBtn.textContent = "Dismiss";
+        }
+      }
+    }
+
+    function applyItemAcrossTabs(item) {
+      const id = String(item.id);
+      Object.keys(inboxTabs).forEach((key) => {
+        const tab = inboxTabs[key];
+        if (!tab.loaded) return;
+        const idx = tab.items.findIndex((i) => String(i.id) === id);
+        const matches = itemMatchesTab(item, key);
+        const panel = tabPanelEl(key);
+        if (idx >= 0) tab.items[idx] = item;
+        if (matches && idx < 0) {
+          tab.items.unshift(item);
+          if (!panel.querySelector(".quote-card")) {
+            panel.innerHTML = "";
+          }
+          const holder = document.createElement("div");
+          holder.innerHTML = quoteCardHtml(item);
+          bindInboxCardEvents(holder);
+          if (holder.firstChild) {
+            panel.insertBefore(holder.firstChild, panel.firstChild);
+          }
+        } else if (matches) {
+          const card = findCardEl(panel, id);
+          if (card) patchQuoteCard(card, item);
+        } else if (idx >= 0) {
+          tab.items.splice(idx, 1);
+          const card = findCardEl(panel, id);
+          if (card) card.remove();
+          if (!panel.querySelector(".quote-card")) {
+            panel.innerHTML =
+              '<div class="empty">No quotes assigned to you.</div>';
+          }
+        }
+      });
+      syncActiveTabGlobals();
+      syncLoadMoreButton();
+    }
+
+    function invalidateInactiveTabs(keepKeys) {
+      const keep = {};
+      (Array.isArray(keepKeys) ? keepKeys : [keepKeys]).forEach((key) => {
+        if (key != null) keep[key] = true;
+      });
+      Object.keys(inboxTabs).forEach((key) => {
+        if (keep[key]) return;
+        delete inboxTabs[key];
+        const rows = document.getElementById("rows");
+        const panels = rows.querySelectorAll(".inbox-tab");
+        for (let i = 0; i < panels.length; i++) {
+          if (panels[i].getAttribute("data-tab") === key) panels[i].remove();
+        }
+      });
+    }
+
+    function switchInboxTab(status) {
+      const tab = ensureTabRecord(status);
+      if (status === filterStatus && (tab.loaded || inboxLoadInFlight)) return;
+      filterStatus = status;
+      syncFilterButtons();
+      if (tab.loaded) {
+        syncActiveTabGlobals();
+        showActiveTabPanel();
+        const rows = document.getElementById("rows");
+        if (rows) rows.classList.remove("hidden");
+        showInboxThinking(false);
+        syncLoadMoreButton();
+        return;
+      }
+      showInboxThinking(false);
+      showActiveTabPanel();
+      const panel = tabPanelEl(status);
+      panel.innerHTML = '<div class="empty">Loading…</div>';
+      loadInbox({sync: false, keepChrome: true});
     }
 
     function bindInboxCardEvents(root) {
@@ -1427,8 +1636,27 @@
           btn.disabled = true;
           btn.textContent = currentlyDone ? "Restoring…" : "Completing…";
           try {
-            await completeQuoteById(quoteId, !currentlyDone);
-            await loadInbox({sync: false});
+            const res = await completeQuoteById(quoteId, !currentlyDone);
+            const item = findInboxItem(quoteId);
+            if (item) {
+              const prevStatus = quoteStatusOf(item);
+              const wasReview = isForReviewItem(item);
+              if (!currentlyDone) {
+                item.statusBeforeCompleted = prevStatus;
+                item.status = (res && res.status) || "completed";
+                item.completedAt = true;
+                item.forReview = false;
+                applyLocalCompleteStats(prevStatus, true, wasReview);
+              } else {
+                const restored = (res && res.status) ||
+                  item.statusBeforeCompleted || "draft_ready";
+                item.status = restored;
+                item.completedAt = null;
+                item.statusBeforeCompleted = null;
+                applyLocalCompleteStats(restored, false, false);
+              }
+              applyItemAcrossTabs(item);
+            }
           } catch (err) {
             btn.disabled = false;
             btn.textContent = prevLabel;
@@ -1447,7 +1675,12 @@
           btn.textContent = "Updating…";
           try {
             await markQuoteForReview(quoteId, !currentlyOn);
-            await loadInbox({sync: false});
+            const item = findInboxItem(quoteId);
+            if (item) {
+              item.forReview = !currentlyOn;
+              bumpStat("stat-review", currentlyOn ? -1 : 1);
+              applyItemAcrossTabs(item);
+            }
           } catch (err) {
             btn.disabled = false;
             btn.textContent = prevLabel;
@@ -1498,19 +1731,23 @@
           btn.textContent = "Dismissing…";
           try {
             await dismissQuoteById(quoteId);
-            const status = (card && card.getAttribute("data-status")) || "";
-            if (card) card.remove();
-            applyLocalDismissStats(status);
-            const removedId = String(quoteId || "");
-            inboxItems = inboxItems.filter((i) => String(i.id) !== removedId);
-            inboxOffset = inboxItems.length;
-            if (!document.querySelector("#rows .quote-card")) {
-              document.getElementById("rows").innerHTML =
-                '<div class="empty">No quotes assigned to you.</div>';
-              inboxHasMore = false;
+            const item = findInboxItem(quoteId);
+            const status = item ? quoteStatusOf(item) :
+              ((card && card.getAttribute("data-status")) || "");
+            const wasReview = item ? isForReviewItem(item) :
+              (card && card.getAttribute("data-for-review") === "1");
+            if (item) {
+              item.status = "dismissed";
+              item.dismissedAt = true;
+              item.forReview = false;
+              item.completedAt = null;
+              applyItemAcrossTabs(item);
+            } else if (card) {
+              card.remove();
             }
+            applyLocalDismissStats(status);
+            if (wasReview) bumpStat("stat-review", -1);
             syncLoadMoreButton();
-            await loadInbox({sync: false});
           } catch (err) {
             btn.disabled = false;
             btn.removeAttribute("data-confirm");
@@ -1536,14 +1773,7 @@
         "</div>";
     }
 
-    function renderInboxCards(items) {
-      const root = document.getElementById("rows");
-      if (!items.length) {
-        root.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
-        syncLoadMoreButton();
-        return;
-      }
-      root.innerHTML = items.map((item) => {
+    function quoteCardHtml(item) {
         const pending = isPendingItem(item);
         const forReview = isForReviewItem(item);
         const completed = isCompletedItem(item);
@@ -1645,8 +1875,29 @@
             </div>
           </div>
         </div>`;
-      }).join("");
-      bindInboxCardEvents(root);
+    }
+
+    function renderInboxCards(items, opts) {
+      const append = !!(opts && opts.append);
+      const fresh = (opts && opts.fresh) || [];
+      const tabKey = opts && opts.tab != null ? opts.tab : filterStatus;
+      const panel = tabPanelEl(tabKey);
+      if (!append) {
+        if (!items.length) {
+          panel.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
+        } else {
+          panel.innerHTML = items.map(quoteCardHtml).join("");
+          bindInboxCardEvents(panel);
+        }
+      } else if (fresh.length) {
+        const empty = panel.querySelector(".empty");
+        if (empty && !panel.querySelector(".quote-card")) empty.remove();
+        const holder = document.createElement("div");
+        holder.innerHTML = fresh.map(quoteCardHtml).join("");
+        bindInboxCardEvents(holder);
+        while (holder.firstChild) panel.appendChild(holder.firstChild);
+      }
+      if (tabKey === filterStatus) showActiveTabPanel();
       syncLoadMoreButton();
     }
 
@@ -1654,6 +1905,8 @@
       const sync = !!(opts && opts.sync);
       const silent = !!(opts && opts.silent);
       const append = !!(opts && opts.append);
+      const keepChrome = !!(opts && opts.keepChrome);
+      const requestFilter = filterStatus;
       if (inboxLoadInFlight) {
         try {
           await inboxLoadInFlight;
@@ -1661,81 +1914,92 @@
         // Quiet background refresh can skip; Load more must still run.
         if (silent && !append) return;
       }
-      const requestOffset = append ? inboxOffset : 0;
-      if (!append) {
-        inboxItems = [];
-        inboxOffset = 0;
-        inboxHasMore = false;
-      }
+      const tab = ensureTabRecord(requestFilter);
+      const requestOffset = append ? tab.offset : 0;
       let path = "/getQuoteDispatcherInbox?tenantId=" +
         encodeURIComponent(TENANT_ID) +
         "&limit=" + INBOX_PAGE_SIZE +
         "&offset=" + requestOffset +
         "&syncOutlook=" + (sync ? "1" : "0");
-      if (filterStatus === "pending") path += "&status=pending";
-      else if (filterStatus === "sent") path += "&status=sent";
-      else if (filterStatus === "for_review") path += "&status=for_review";
-      else if (filterStatus === "completed") path += "&status=completed";
-      syncFilterButtons();
-      if (!silent && !append) {
+      if (requestFilter === "pending") path += "&status=pending";
+      else if (requestFilter === "sent") path += "&status=sent";
+      else if (requestFilter === "for_review") path += "&status=for_review";
+      else if (requestFilter === "completed") path += "&status=completed";
+      const stillActive = () => filterStatus === requestFilter;
+      if (stillActive()) syncFilterButtons();
+      if (!silent && !append && !keepChrome && stillActive()) {
         showInboxThinking(true);
         setFilterBarBusy(true);
       }
-      if (append) {
+      if (append && stillActive()) {
         loadMoreInFlight = true;
         syncLoadMoreButton();
       }
       inboxLoadInFlight = (async () => {
+      let fresh = [];
       try {
       const res = await apiFetch(path);
-      const root = document.getElementById("rows");
+      const panel = tabPanelEl(requestFilter);
       if (!res.ok) {
         if (!append) {
-          inboxItems = [];
-          inboxOffset = 0;
-          inboxHasMore = false;
-          root.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
-          syncLoadMoreButton();
+          tab.items = [];
+          tab.offset = 0;
+          tab.hasMore = false;
+          tab.loaded = true;
+          panel.innerHTML = '<div class="empty">' + esc(res.error) + "</div>";
+          if (stillActive()) {
+            syncActiveTabGlobals();
+            showActiveTabPanel();
+            syncLoadMoreButton();
+          }
         }
         return;
       }
       const raw = res.items || [];
       const counts = res.counts || {};
-      applyCounts(counts);
-      const pageItems = filterInboxPage(raw);
+      if (stillActive()) applyCounts(counts);
+      const pageItems = filterInboxPage(raw, requestFilter);
       let added = pageItems.length;
       if (append) {
-        const seen = new Set(inboxItems.map((i) => String(i.id)));
-        const fresh = pageItems.filter((i) => !seen.has(String(i.id)));
+        const seen = new Set(tab.items.map((i) => String(i.id)));
+        fresh = pageItems.filter((i) => !seen.has(String(i.id)));
         added = fresh.length;
-        inboxItems = inboxItems.concat(fresh);
+        tab.items = tab.items.concat(fresh);
       } else {
-        inboxItems = pageItems;
+        tab.items = pageItems;
+        fresh = pageItems;
       }
-      inboxOffset = Number(res.offset) >= 0 ?
+      tab.offset = Number(res.offset) >= 0 ?
         Number(res.offset) + raw.length :
-        inboxItems.length;
-      const tabTotal = inboxTabTotal(counts);
+        tab.items.length;
+      const tabTotal = inboxTabTotal(counts, requestFilter);
       if (append && !added) {
-        inboxHasMore = false;
+        tab.hasMore = false;
       } else {
-        inboxHasMore = !!res.hasMore || tabTotal > inboxItems.length;
+        tab.hasMore = !!res.hasMore || tabTotal > tab.items.length;
       }
-      renderInboxCards(inboxItems);
+      tab.loaded = true;
+      if (stillActive()) syncActiveTabGlobals();
+      renderInboxCards(tab.items, {
+        append: append,
+        fresh: fresh,
+        tab: requestFilter,
+      });
+      if (sync) invalidateInactiveTabs([requestFilter, filterStatus]);
       } finally {
-        if (append) loadMoreInFlight = false;
-        if (!silent && !append) {
+        if (append && stillActive()) loadMoreInFlight = false;
+        if (!silent && !append && !keepChrome && stillActive()) {
           showInboxThinking(false);
           setFilterBarBusy(false);
         }
-        syncLoadMoreButton();
+        if (stillActive()) syncLoadMoreButton();
       }
       })();
       try {
         await inboxLoadInFlight;
       } finally {
         inboxLoadInFlight = null;
-        syncLoadMoreButton();
+        if (filterStatus === requestFilter) syncLoadMoreButton();
       }
     }
 
@@ -1890,19 +2154,19 @@
       }
     });
     document.getElementById("filter-pending").addEventListener("click", () => {
-      filterStatus = "pending"; loadInbox({sync: false});
+      switchInboxTab("pending");
     });
     document.getElementById("filter-sent").addEventListener("click", () => {
-      filterStatus = "sent"; loadInbox({sync: false});
+      switchInboxTab("sent");
     });
     document.getElementById("filter-review").addEventListener("click", () => {
-      filterStatus = "for_review"; loadInbox({sync: false});
+      switchInboxTab("for_review");
     });
     document.getElementById("filter-completed").addEventListener("click", () => {
-      filterStatus = "completed"; loadInbox({sync: false});
+      switchInboxTab("completed");
     });
     document.getElementById("filter-all").addEventListener("click", () => {
-      filterStatus = ""; loadInbox({sync: false});
+      switchInboxTab("");
     });
     document.getElementById("btn-load-more").addEventListener("click", () => {
       if (!inboxHasMore || loadMoreInFlight || inboxLoadInFlight) return;
