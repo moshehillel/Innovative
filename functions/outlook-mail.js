@@ -520,6 +520,7 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
           readAfter,
           readBefore,
           readMode,
+          ascending,
         } = {}) => {
           let url;
           if (pageToken) {
@@ -573,11 +574,14 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
               if (!filter) {
                 filter = "receivedDateTime ge 1970-01-01T00:00:00Z";
               }
-              orderBy = "receivedDateTime desc";
+              // Quote sync walks oldest-first so a cut-off page still
+              // continues from the last check instead of skipping it.
+              orderBy = ascending ?
+                "receivedDateTime asc" : "receivedDateTime desc";
             }
             const params = new URLSearchParams({
               "$filter": filter,
-              "$select": "id",
+              "$select": "id,receivedDateTime",
               "$top": String(maxResults),
               "$orderby": orderBy,
             });
@@ -586,7 +590,10 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
           const resp = await graphFetch(url, tokens, onTokenUpdate);
           return {
             data: {
-              messages: (resp.value || []).map((m) => ({id: m.id})),
+              messages: (resp.value || []).map((m) => ({
+                id: m.id,
+                receivedDateTime: m.receivedDateTime || null,
+              })),
               nextPageToken: resp["@odata.nextLink"] || null,
             },
           };

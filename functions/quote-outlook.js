@@ -11,8 +11,13 @@ const quoteIntake = require("./quote-intake");
 let tcolFn = null;
 let writeLogFn = null;
 
-/** One Graph page. A 2-minute check never brings 40 new messages. */
+/** One Graph page. Follow nextLink so an overnight gap is not cut at 40. */
 const QUOTE_SYNC_PAGE_SIZE = 40;
+/**
+ * Safety stop if a mailbox is flooded. The watermark then advances only
+ * through mail already listed, so the rest of the window is not dropped.
+ */
+const QUOTE_SYNC_MAX_PAGES = 50;
 /** Re-read this far before the watermark so mail arriving mid-check is kept. */
 const QUOTE_SYNC_OVERLAP_MS = 2 * 60 * 1000;
 /** No stored watermark yet: catch the deploy gap, not yesterday's cache. */
@@ -33,7 +38,29 @@ function quoteSyncReceivedAfter(storedWatermark, nowMs) {
   if (!storedMs || isNaN(storedMs)) {
     return new Date(now - QUOTE_SYNC_FIRST_WINDOW_MS);
   }
+  // Gap size does not matter. Yesterday 7pm stays yesterday 7pm.
   return new Date(storedMs - QUOTE_SYNC_OVERLAP_MS);
+}
+
+/**
+ * Watermark to persist after a list.
+ * A finished window uses the check time. A cut-off list (oldest first)
+ * uses the newest received time already listed so the next run continues
+ * through the rest of the window instead of skipping it.
+ * @param {Date} checkedAt When this check started.
+ * @param {Array<{receivedDateTime?: string}>} messages Listed rows.
+ * @param {boolean} listTruncated True when the page cap stopped the list.
+ * @return {string|null} ISO time, or null to leave the stored watermark.
+ */
+function quoteSyncWatermarkToStore(checkedAt, messages, listTruncated) {
+  if (!listTruncated) return checkedAt.toISOString();
+  let maxMs = 0;
+  for (const row of messages || []) {
+    const ms = row && row.receivedDateTime ?
+      new Date(row.receivedDateTime).getTime() : NaN;
+    if (ms && !isNaN(ms) && ms > maxMs) maxMs = ms;
+  }
+  return maxMs ? new Date(maxMs).toISOString() : null;
 }
 
 /**
@@ -519,26 +546,41 @@ async function syncDispatcherInbox(
   const receivedAfter = quoteSyncReceivedAfter(
       dispatcherDoc.outlookQuoteSyncWatermark,
       checkedAt.getTime());
-  let listResp;
-  try {
-    listResp = await client.users.messages.list({
-      maxResults: QUOTE_SYNC_PAGE_SIZE,
-      includeRead,
-      receivedAfter,
-    });
-  } catch (err) {
-    if (isOutlookInvalidGrant(err)) {
-      await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
-      return {
-        ok: true,
-        synced: drainedFirst.processed || 0,
-        skipped: "needs_reconnect",
-        processErrors: drainedFirst.errors || 0,
-      };
+  const messages = [];
+  let pageToken = null;
+  let pages = 0;
+  let listTruncated = false;
+  do {
+    let listResp;
+    try {
+      listResp = await client.users.messages.list({
+        maxResults: QUOTE_SYNC_PAGE_SIZE,
+        includeRead,
+        receivedAfter,
+        ascending: true,
+        pageToken: pageToken || undefined,
+      });
+    } catch (err) {
+      if (isOutlookInvalidGrant(err)) {
+        await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
+        return {
+          ok: true,
+          synced: drainedFirst.processed || 0,
+          skipped: "needs_reconnect",
+          processErrors: drainedFirst.errors || 0,
+        };
+      }
+      throw err;
     }
-    throw err;
-  }
-  const messages = (listResp.data && listResp.data.messages) || [];
+    const batch = (listResp.data && listResp.data.messages) || [];
+    messages.push(...batch);
+    pageToken = (listResp.data && listResp.data.nextPageToken) || null;
+    pages += 1;
+    if (pageToken && pages >= QUOTE_SYNC_MAX_PAGES) {
+      listTruncated = true;
+      pageToken = null;
+    }
+  } while (pageToken);
   let enqueued = 0;
   let skippedExisting = 0;
   let skippedNotQuote = 0;
@@ -708,10 +750,22 @@ async function syncDispatcherInbox(
     }
   }
 
-  // Check succeeded. Next run starts at this list time, minus a short overlap.
+  // Check succeeded. Next run starts at this list time, minus a short overlap,
+  // even when the last check was yesterday evening. A cut-off list advances
+  // only through mail already listed so the rest of the window is retried.
   // Do this even when every id was already stored, so we do not rescan a backlog.
-  await saveQuoteSyncWatermark(
-      tenant, dispatcher.id, checkedAt.toISOString());
+  const watermarkIso = quoteSyncWatermarkToStore(
+      checkedAt, messages, listTruncated);
+  if (watermarkIso) {
+    await saveQuoteSyncWatermark(tenant, dispatcher.id, watermarkIso);
+  } else if (listTruncated) {
+    writeLogFn("warn", "quote",
+        "Quote sync page cap hit without received times; watermark unchanged", {
+          dispatcherId: dispatcher.id,
+          pages,
+          scanned: messages.length,
+        });
+  }
 
   let drainedAfter = {processed: 0, errors: 0};
   try {
@@ -738,9 +792,11 @@ async function syncDispatcherInbox(
     synced,
     enqueued,
     scanned: messages.length,
+    pages,
+    listTruncated,
     includeRead,
     receivedAfter: receivedAfter.toISOString(),
-    watermark: checkedAt.toISOString(),
+    watermark: watermarkIso,
     skippedExisting,
     skippedNotQuote,
     processErrors,
@@ -845,5 +901,6 @@ module.exports = {
   handleOAuthCallback,
   syncDispatcherInbox,
   quoteSyncReceivedAfter,
+  quoteSyncWatermarkToStore,
   sendQuoteReply,
 };

@@ -50,6 +50,37 @@ check("stored watermark overlaps the last check by 2 minutes",
     quoteOutlook.quoteSyncReceivedAfter(
         "2026-10-08T20:00:00.000Z", nowMs).toISOString() ===
       "2026-10-08T19:58:00.000Z");
+check("overnight gap keeps yesterday 7pm minus 2 minutes",
+    quoteOutlook.quoteSyncReceivedAfter(
+        "2026-10-07T23:00:00.000Z",
+        Date.parse("2026-10-08T13:00:00.000Z")).toISOString() ===
+      "2026-10-07T22:58:00.000Z");
+check("finished list stores the check time",
+    quoteOutlook.quoteSyncWatermarkToStore(
+        new Date("2026-10-08T13:00:00.000Z"),
+        [{receivedDateTime: "2026-10-07T23:05:00.000Z"}],
+        false) === "2026-10-08T13:00:00.000Z");
+check("cut-off list stores only the newest listed received time",
+    quoteOutlook.quoteSyncWatermarkToStore(
+        new Date("2026-10-08T13:00:00.000Z"),
+        [
+          {receivedDateTime: "2026-10-07T23:05:00.000Z"},
+          {receivedDateTime: "2026-10-08T02:00:00.000Z"},
+        ],
+        true) === "2026-10-08T02:00:00.000Z");
+check("cut-off list with no received times leaves the watermark",
+    quoteOutlook.quoteSyncWatermarkToStore(
+        new Date("2026-10-08T13:00:00.000Z"),
+        [{id: "x"}],
+        true) === null);
+const syncStart = outlookSrc.indexOf("async function syncDispatcherInbox");
+const syncEnd = outlookSrc.indexOf("function extractPlainBody");
+const syncBody = outlookSrc.slice(syncStart, syncEnd);
+check("sync pages with nextPageToken inside the since-last-check window",
+    syncStart >= 0 && syncEnd > syncStart &&
+    syncBody.includes("nextPageToken") &&
+    syncBody.includes("ascending: true") &&
+    syncBody.includes("QUOTE_SYNC_MAX_PAGES"));
 check("sync does not use a 7-day received window",
     !outlookSrc.includes("7 * 24 * 60 * 60 * 1000") &&
     outlookSrc.includes("quoteSyncReceivedAfter") &&
@@ -114,6 +145,22 @@ function decoded(url) {
         !watermarked.includes("isRead"));
     check("watermark list keeps the 40-message cap",
         watermarked.includes("$top=40"));
+    check("default watermark order stays newest first",
+        watermarked.includes("$orderby=receivedDateTime desc"));
+
+    calls.length = 0;
+    await client.users.messages.list({
+      maxResults: 40,
+      includeRead: true,
+      receivedAfter: new Date("2026-10-07T23:00:00.000Z"),
+      ascending: true,
+    });
+    const overnight = decoded(calls[0].url);
+    check("oldest-first list still starts at the stored check",
+        overnight.includes("receivedDateTime gt 2026-10-07T23:00:00Z") &&
+        overnight.includes("$orderby=receivedDateTime asc") &&
+        overnight.includes("$top=40") &&
+        !overnight.includes("isRead"));
 
     calls.length = 0;
     await client.users.messages.list({
