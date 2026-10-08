@@ -89,6 +89,7 @@ function aggregateDailyActivity(logs) {
     billed: [],
     awaitingEmailApproval: [],
     insuranceInvoices: [],
+    portFeeInvoices: [],
     forwardedForReview: [],
     pastDueIgnored: [],
     alreadyBilledSkipped: [],
@@ -257,6 +258,17 @@ function aggregateDailyActivity(logs) {
         load: detail(d, "loadNumber") || null,
       });
     }
+    if (log.message === "Port fee invoice processed" ||
+        d.finalStatus === "port_fee_processed" ||
+        d.finalStatus === "port_fee_partial") {
+      agg.portFeeInvoices.push({
+        invoiceNumber: detail(d, "invoiceNumber"),
+        chargeCode: detail(d, "chargeCode"),
+        vendorName: detail(d, "vendorName"),
+        postedCount: detail(d, "postedCount"),
+        skippedCount: detail(d, "skippedCount"),
+      });
+    }
   }
 
   const recoveredLoads = new Set(
@@ -309,6 +321,18 @@ function buildDeterministicBullets(agg) {
     lines.push(
         `Processed insurance invoice${ins.invoiceNumber ?
           ` #${ins.invoiceNumber}` : ""}${loadPart}.`,
+    );
+  }
+
+  for (const fee of agg.portFeeInvoices || []) {
+    const who = [fee.vendorName, fee.chargeCode].filter(Boolean).join(" ");
+    const bill = fee.invoiceNumber ? ` #${fee.invoiceNumber}` : "";
+    const posted = Number(fee.postedCount || 0);
+    const skipped = Number(fee.skippedCount || 0);
+    const skipPart = skipped ? `, ${skipped} not entered` : "";
+    lines.push(
+        `Posted ${who || "port fee"} bill${bill} — ${posted} charge(s)` +
+        `${skipPart}.`,
     );
   }
 
@@ -991,6 +1015,7 @@ const IGNORE_CATEGORY_LABELS = {
   administrative_ignored: "Administrative",
   payment_inquiry_ignored_abe_cc: "Payment inquiry (Abe on thread)",
   insurance_duplicate: "Duplicate insurance intake",
+  port_fee_duplicate: "Duplicate port fee intake",
 };
 
 /**

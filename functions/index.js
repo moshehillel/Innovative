@@ -59,6 +59,7 @@ const {
   normalizePreCheckDocType,
 } = statementInvoiceBundle;
 const drayageIntake = require("./drayage-intake");
+const portFeeInvoices = require("./port-fee-invoices");
 const invoiceLoadEntry = require("./invoice-load-entry");
 const dashboardTasks = require("./dashboard-tasks");
 const mailProvider = require("./mail-provider");
@@ -8347,6 +8348,145 @@ async function fetchGmailMessageHeaders(gmail, messageId) {
 }
 
 /**
+ * Claims a Pier Pass / Port Check message so a second poll does not
+ * post the same bills again.
+ * @param {string} messageId Gmail message id.
+ * @param {object} tenant Tenant.
+ * @param {object} [meta] subject, from.
+ * @return {Promise<object>}
+ */
+async function claimPortFeeIntake(messageId, tenant, meta = {}) {
+  const ref = tcol(tenant, "emailIntake").doc(String(messageId));
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists) {
+        const status = (snap.data() || {}).finalStatus;
+        if (status === "port_fee_processed" ||
+            status === "port_fee_partial" ||
+            status === "port_fee_processing") {
+          return {ok: false, reason: "already", status};
+        }
+      }
+      tx.set(ref, {
+        gmailMessageId: String(messageId),
+        tenantId: tenant.tenantId,
+        subject: String(meta.subject || "").slice(0, 500),
+        from: String(meta.from || "").slice(0, 500),
+        finalStatus: "port_fee_processing",
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, {merge: true});
+      return {ok: true};
+    });
+  } catch (err) {
+    await writeLog("warn", "port-fee", "Port fee intake claim failed", {
+      messageId,
+      error: err.message,
+    });
+    return {ok: false, reason: "claim_error", error: err.message};
+  }
+}
+
+/**
+ * Runs port-fee intake after a PDF has already been recognized.
+ * @param {object} args Message context and sniff result.
+ * @return {Promise<void>}
+ */
+async function handleDetectedPortFeeEmail(args) {
+  const {
+    messageId, subject, from, tenant, queueDocId, portSniff,
+    forwardWithAnalysis,
+  } = args;
+  const claim = await claimPortFeeIntake(messageId, tenant, {subject, from});
+  if (!claim.ok) {
+    await writeLog("warn", "port-fee", "Skipped duplicate port fee intake", {
+      messageId,
+      subject,
+      reason: claim.reason,
+      priorStatus: claim.status || null,
+    });
+    await mailIntakeQueue.completeIntakeRecord({
+      tenant,
+      docId: queueDocId,
+      parentMessageId: messageId,
+      outcome: mailIntakeQueue.OUTCOME.IGNORED,
+      finalStatus: "port_fee_duplicate",
+      ignoreReason: claim.reason || "Duplicate port fee intake",
+      extra: {
+        gmailMessageId: messageId,
+        subject,
+        from,
+        priorStatus: claim.status || null,
+      },
+    });
+    return;
+  }
+
+  const result = await portFeeInvoices.processPortFeeEmail({
+    invoices: portSniff.matches,
+    rejected: portSniff.rejected,
+    from,
+    subject,
+    gmailMessageId: messageId,
+  });
+
+  if (!result.handled) {
+    await writeLog("warn", "port-fee",
+        "Port fee email not handled — forwarding", {
+          messageId,
+          subject,
+          reason: result.reason,
+        });
+    await forwardWithAnalysis(
+        `Pier Pass / Port Check invoice could not be posted ` +
+        `(${result.reason || "unknown"})`,
+        {department: "billing"},
+    );
+    await mailIntakeQueue.completeIntakeRecord({
+      tenant,
+      docId: queueDocId,
+      parentMessageId: messageId,
+      outcome: mailIntakeQueue.OUTCOME.FORWARDED,
+      finalStatus: "port_fee_failed",
+      forwardReason: result.reason || "Port fee processing failed",
+      extra: {
+        gmailMessageId: messageId,
+        subject,
+        from,
+        deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
+      },
+    });
+    return;
+  }
+
+  await mailIntakeQueue.completeIntakeRecord({
+    tenant,
+    docId: queueDocId,
+    parentMessageId: messageId,
+    outcome: result.finalStatus === "port_fee_failed" ?
+      mailIntakeQueue.OUTCOME.PARTIAL : mailIntakeQueue.OUTCOME.PROCESSED,
+    finalStatus: result.finalStatus,
+    extra: {
+      gmailMessageId: messageId,
+      subject,
+      from,
+      portFeePostedCount: result.postedCount,
+      portFeeAlreadyCount: result.alreadyCount,
+      portFeeSkippedCount: result.skippedCount,
+      portFeeInvoices: (result.summaries || []).map((row) => ({
+        invoiceNumber: row.invoiceNumber,
+        chargeCode: row.chargeCode,
+        vendorName: row.vendorName,
+        postedCount: row.postedCount,
+        alreadyCount: row.alreadyCount,
+        skippedCount: row.skippedCount,
+      })),
+      deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
+    },
+  });
+}
+
+/**
  * Atomically claims an insurance intake so the same Gmail message is not
  * posted or emailed twice when inbox polling overlaps.
  * @param {string} messageId Gmail message ID.
@@ -9302,6 +9442,38 @@ async function processGmailMessage(
             reason: earlyAdminIgnore.reason,
           });
           return;
+        }
+      }
+
+      if (!isTai && !isChildSplitJob && attachments.length > 0) {
+        try {
+          const portSniff = await portFeeInvoices.sniffPdfAttachments({
+            attachments,
+            downloadAttachment: async (att) => {
+              const buf = await resolveAttachmentBuffer(
+                  gmail, messageId, att);
+              if (buf && !Buffer.isBuffer(att.buffer)) att.buffer = buf;
+              return buf;
+            },
+          });
+          if (portSniff.matches.length || portSniff.rejected.length) {
+            await handleDetectedPortFeeEmail({
+              messageId,
+              subject,
+              from,
+              tenant,
+              queueDocId,
+              portSniff,
+              forwardWithAnalysis,
+            });
+            return;
+          }
+        } catch (portFeeErr) {
+          await writeLog("error", "port-fee",
+              "Port fee sniff failed — continuing normal intake", {
+                messageId,
+                error: portFeeErr.message,
+              });
         }
       }
 
@@ -16438,6 +16610,40 @@ innovativeInsurance.init({
   isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
   maybeAdjustBrokerAfterInsurance:
       brokerCommission.maybeAdjustAfterInsurancePremium,
+});
+
+portFeeInvoices.init({
+  writeLog,
+  saveOutboundEmail,
+  fetchPrimusBooking,
+  searchBookingsForTrackingQuery:
+      primusUiBridge.searchBookingsForTrackingQuery,
+  addPortFeeToLoad: primusUiBridge.addPortFeeToLoad,
+  resolveNamedVendor: primusUiBridge.resolveNamedVendor,
+  resolveDueOnReceiptTermId: primusUiBridge.resolveDueOnReceiptTermId,
+  isManagePhpEnabled: primusUiBridge.isManagePhpEnabled,
+  pendingCollection: () => tcol(DEFAULT_TENANT, "portFeePending"),
+});
+
+/** 8:00 AM ET — enter port fees whose loads were created overnight. */
+exports.retryPendingPortFees = onSchedule({
+  schedule: "0 8 * * *",
+  timeZone: "America/New_York",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+}, async () => {
+  try {
+    const result = await portFeeInvoices.retryPendingPortFees();
+    console.log("retryPendingPortFees:", JSON.stringify({
+      posted: result.posted && result.posted.length,
+      stillMissing: result.stillMissing && result.stillMissing.length,
+      waiting: result.waiting && result.waiting.length,
+      error: result.error || null,
+    }));
+  } catch (error) {
+    console.error("retryPendingPortFees error:", error.message);
+    throw error;
+  }
 });
 
 const tai = require("./tai");

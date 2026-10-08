@@ -3341,6 +3341,76 @@ function resolveTermsForCarrierBill(billDate, billDueDate, termsList) {
 }
 
 /**
+ * Primus term for a port-fee vendor bill. The entered transaction uses
+ * Due on receipt (due date = bill date), not the due date printed on the PDF.
+ * @param {Array<object>} termsList From fetchUiTerms.
+ * @return {object} ok, termsId, source, error
+ */
+function resolveDueOnReceiptTerms(termsList) {
+  const list = Array.isArray(termsList) ? termsList : [];
+  const byName = list.find((t) =>
+    /due\s+(?:on|upon)\s+receipt|upon\s+receipt/i.test(
+        `${t.description || ""} ${t.code || ""}`));
+  if (byName) {
+    return {
+      ok: true,
+      termsId: Number(byName.id),
+      source: "description",
+      days: byName.days,
+      code: byName.code,
+      description: byName.description,
+    };
+  }
+  const zero = list.find((t) => t.days === 0);
+  if (zero) {
+    return {
+      ok: true,
+      termsId: Number(zero.id),
+      source: "zero_days",
+      days: 0,
+      code: zero.code,
+      description: zero.description,
+    };
+  }
+  return {
+    ok: false,
+    error: "Primus has no Due on receipt term",
+  };
+}
+
+/**
+ * @return {Promise<object>} resolveDueOnReceiptTerms result.
+ */
+async function resolveDueOnReceiptTermId() {
+  const termsList = await fetchUiTerms();
+  return resolveDueOnReceiptTerms(termsList);
+}
+
+/**
+ * Master vendor lookup by the exact Primus vendor name.
+ * Does not fall back to an unrelated vendor.
+ * @param {string} vendorName Pier Pass or Port Check.
+ * @return {Promise<object>} {id, name}
+ */
+async function resolveNamedVendor(vendorName) {
+  const query = String(vendorName || "").trim();
+  if (!query) throw new Error("vendor name required");
+  const result = await managePhpPost({
+    action: "getVendors",
+    page: "1",
+    start: "0",
+    limit: "50",
+    query,
+  });
+  const vendors = parseVendorsFromResponse(result.json);
+  const match = findMasterVendorByName(vendors, query);
+  if (!match || !match.id) {
+    throw new Error(`Vendor not found in Primus: ${query}`);
+  }
+  return match;
+}
+
+/**
  * PRO and carrier bill number for manage.php vendor ref fields.
  * Falls back to load number when both are missing.
  * @param {object} args proNumber, vendorInvoiceNumber, loadNumber
@@ -4629,6 +4699,22 @@ function insuranceSaveInvoiceCloseFlags() {
 }
 
 /**
+ * Close flags when a port fee is added to an existing invoice.
+ * Customer cost stays open. A draft is not marked ready to invoice.
+ * An invoice that is already issued stays issued.
+ * @param {object} uiInvoice Invoice row from getBookingDocuments.
+ * @return {object}
+ */
+function portFeeSaveInvoiceFlags(uiInvoice) {
+  const issued = isIssuedUiInvoice(uiInvoice);
+  return {
+    costClosed: "0",
+    costActualClosed: issued ? "1" : "0",
+    readyToInvoice: issued ? "1" : "0",
+  };
+}
+
+/**
  * Close-cost insurance entry — mirrors the manual Primus UI sequence:
  * getTerms → addVendorRefNumber → saveInvoice (actual cost closed;
  * customer cost left open) → getInvoiceStores.
@@ -5229,8 +5315,365 @@ async function removeInsurancePremiumFromLoad(args) {
     },
   };
 }
+/**
+ * Adds one Pier Pass (TMF) or Port Check (CTF) actual-cost line.
+ * Does not create a customer freight invoice and does not change
+ * customer charges. Bill date and due date are the invoice date.
+ * PRO is the container number.
+ *
+ * @param {object} args Flow inputs.
+ * @param {object} args.booking Primus booking.
+ * @param {string} args.loadNumber Primus BOL.
+ * @param {number} args.amount Charge amount.
+ * @param {string} args.chargeCode TMF or CTF.
+ * @param {string} [args.description] Line description. Defaults to the code.
+ * @param {object} args.vendor {id, name}.
+ * @param {string} args.vendorInvoiceNumber Vendor bill number.
+ * @param {string|Date} args.billDate Invoice date.
+ * @param {string|Date} [args.dueDate] Due date. Defaults to the bill date.
+ * @param {string} args.proNumber Container number.
+ * @param {number} [args.termsId] Due on receipt terms id.
+ * @return {Promise<object>}
+ */
+async function addPortFeeToLoad(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  const amount = roundMoney(args.amount || 0);
+  const chargeCode = String(args.chargeCode || "").trim().toUpperCase();
+  const description = String(args.description || chargeCode);
+  const vendorInvoiceNumber = String(args.vendorInvoiceNumber || "").trim();
+  const proNumber = String(args.proNumber || "").trim().toUpperCase();
+  const billDate = args.billDate || new Date();
+  const dueDate = args.dueDate || billDate;
+  const vendor = args.vendor;
+
+  if (!loadNumber) return {ok: false, error: "loadNumber required"};
+  if (!(amount > 0)) return {ok: false, error: "amount must be > 0"};
+  if (chargeCode !== "TMF" && chargeCode !== "CTF") {
+    return {ok: false, error: "chargeCode must be TMF or CTF"};
+  }
+  if (!vendor || !vendor.id) return {ok: false, error: "vendor required"};
+  if (!vendorInvoiceNumber) {
+    return {ok: false, error: "vendorInvoiceNumber required"};
+  }
+  if (!proNumber) return {ok: false, error: "proNumber required"};
+  if (!args.booking) {
+    return {ok: false, notFound: true, error: "booking required"};
+  }
+
+  const bookingId = resolveManageBookingId(args.booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: loadNumber,
+  });
+  if (!docs.ok || !docs.data) {
+    return {ok: false, error: docs.error || "getBookingDocuments failed"};
+  }
+  const uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {
+      ok: false,
+      noInvoice: true,
+      error: "No Primus invoice on this load",
+      loadNumber,
+    };
+  }
+
+  const invoiceId = String(uiInvoice.id);
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+  let actualCosts = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+  const vendorId = String(vendor.id);
+
+  const sameCharge = (line) =>
+    String(line.carrierId) === vendorId &&
+    String(line.code || "").toUpperCase() === chargeCode;
+  const existingLines = actualCosts.filter(sameCharge);
+  const exact = existingLines.find((line) =>
+    String(line.vendorInvoiceNumber || "") === vendorInvoiceNumber);
+  if (exact && moneyEquals(exact.total, amount)) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: "already posted",
+      loadNumber,
+      invoiceId,
+      amount,
+    };
+  }
+  if (exact) {
+    return {
+      ok: false,
+      amountMismatch: true,
+      existingAmount: exact.total,
+      loadNumber,
+      invoiceId,
+      error: "Bill is already on this load at a different amount",
+    };
+  }
+  const otherBill = existingLines.find((line) => {
+    const billNo = String(line.vendorInvoiceNumber || "").trim();
+    return billNo && billNo !== vendorInvoiceNumber;
+  });
+  if (otherBill) {
+    return {
+      ok: false,
+      duplicate: true,
+      existingBill: otherBill.vendorInvoiceNumber || null,
+      existingAmount: otherBill.total,
+      loadNumber,
+      invoiceId,
+      error: `Load ${loadNumber} already has ${chargeCode}`,
+    };
+  }
+  const upgrade = existingLines.find((line) =>
+    !String(line.vendorInvoiceNumber || "").trim()) || null;
+
+  actualCosts = actualCosts.filter((line) => {
+    if (!sameCharge(line)) return true;
+    if (upgrade && String(line.id) === String(upgrade.id)) return false;
+    if (String(line.vendorInvoiceNumber || "") === vendorInvoiceNumber) {
+      return false;
+    }
+    return true;
+  });
+
+  let termsId = args.termsId;
+  if (termsId == null || termsId === "") {
+    const terms = await resolveDueOnReceiptTermId();
+    if (!terms.ok) {
+      return {
+        ok: false,
+        step: "validateTerms",
+        error: terms.error,
+      };
+    }
+    termsId = terms.termsId;
+  }
+
+  const feeBillsInfo = {
+    code: chargeCode,
+    vendorInvoiceNumber,
+    carrierId: vendorId,
+    carrierName: String(vendor.name || ""),
+    total: amount,
+    breakdown: [{
+      code: chargeCode,
+      description,
+      qty: 1,
+      rate: amount,
+      total: amount,
+      first: true,
+    }],
+    terms: Number(termsId),
+    PRO: proNumber,
+    billDate: toPrimusDateTime(toDateOnly(billDate)),
+    billDueDate: toPrimusDateTime(toDateOnly(dueDate)),
+  };
+
+  let billsInfo = extractBillsInfoFromStore(storeData);
+  if (!billsInfo || !billsInfo.length) {
+    billsInfo = reconstructBillsInfoFromActualCosts(actualCosts);
+  } else {
+    const oldBillNo = upgrade ?
+      String(upgrade.vendorInvoiceNumber || "") : "";
+    billsInfo = billsInfo.filter((bill) => {
+      if (String(bill.carrierId) !== vendorId) return true;
+      const billNo = String(bill.vendorInvoiceNumber || "");
+      if (billNo === vendorInvoiceNumber) return false;
+      if (upgrade && billNo === oldBillNo) return false;
+      return true;
+    });
+  }
+  billsInfo.push(feeBillsInfo);
+
+  const feeLine = {
+    id: upgrade && upgrade.id != null ? String(upgrade.id) : "",
+    code: chargeCode,
+    description,
+    carrierId: vendorId,
+    carrierName: String(vendor.name || ""),
+    qty: 1,
+    rate: amount,
+    total: amount.toFixed(2),
+    vendorInvoiceNumber,
+    terms: "",
+    PRO: proNumber,
+    isAccessorial: false,
+  };
+  const keptCosts = actualCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId),
+    carrierName: String(line.carrierName || ""),
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: String(line.PRO || ""),
+    isAccessorial: !!line.isAccessorial,
+  }));
+  const mergedActualCosts = [...keptCosts, feeLine];
+
+  const totalActual = roundMoney(
+      mergedActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const totalEstimated = roundMoney(
+      estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+  const profit = roundMoney(chargesTotal - totalActual);
+  const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+  const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+
+  const billtoResolution = await resolveManageBilltoId(args.booking);
+  const storedBillto = extractBilltoIdFromStore(storeData);
+  const billtoId = billtoResolution.id || storedBillto;
+  if (!billtoId) return {ok: false, error: "Could not resolve billtoId"};
+
+  const notes = {
+    internalNotes: String(args.booking.internalNotes || ""),
+    externalNotes: String(args.booking.externalNotes || ""),
+  };
+  const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+  const vendorRef = await managePhpPost({
+    action: "addVendorRefNumber",
+    invoiceId,
+    bookingId,
+    billsInfo,
+    actualCosts: mergedActualCosts,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    totalActualCost: totalActual,
+    ...refExtra,
+  });
+  if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+    return {
+      ok: false,
+      step: "addVendorRefNumber",
+      error: (vendorRef.json && vendorRef.json.message) ||
+        "addVendorRefNumber failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const phase2Estimated = estimatedCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId || ""),
+    carrierName: String(line.carrierName || ""),
+    editable: line.editable != null ? String(line.editable) : "0",
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    isAccessorial: !!line.isAccessorial,
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: "",
+  }));
+  const phase2Charges = charges.map((c) => ({
+    id: String(c.id),
+    code: c.code || "",
+    description: c.description || "",
+    qty: Number(c.qty || 1),
+    rate: roundMoney(c.rate),
+    total: roundMoney(c.total).toFixed(2),
+  }));
+  const saveResult = await managePhpPost({
+    action: "saveInvoice",
+    billsInfo,
+    charges: phase2Charges,
+    actualCosts: mergedActualCosts,
+    estimatedCosts: phase2Estimated,
+    chargesTotal,
+    totalEstimatedCosts: totalEstimated,
+    totalActualCosts: totalActual,
+    billtoId: String(billtoId),
+    bookingId,
+    ...notes,
+    ...portFeeSaveInvoiceFlags(uiInvoice),
+    estimatedProfitUSD: profit,
+    estimatedProfitPer: profitPer,
+    estimatedGP: gp,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    vendorInvoiceNumber: "",
+    vendorTerm: "",
+    PRONumber: "",
+    invoiceNumber: uiInvoice.invoiceNumber ?
+      String(uiInvoice.invoiceNumber) : "0",
+    id: invoiceId,
+  });
+  if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+    return {
+      ok: false,
+      step: "saveInvoice",
+      error: (saveResult.json && saveResult.json.message) ||
+        "saveInvoice failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const verify = await getInvoiceStores(invoiceId);
+  const verifiedCosts = verify.ok ?
+    extractActualCostsFromStore(verify.data) : null;
+  const verifiedLine = verifiedCosts && verifiedCosts.find((line) =>
+    String(line.carrierId) === vendorId &&
+    String(line.code || "").toUpperCase() === chargeCode &&
+    String(line.vendorInvoiceNumber || "") === vendorInvoiceNumber);
+
+  if (writeLog) {
+    await writeLog("info", "primus", "Port fee posted to load", {
+      loadNumber,
+      invoiceId,
+      chargeCode,
+      amount,
+      vendorInvoiceNumber,
+      vendorId,
+      proNumber,
+      termsId,
+      billDate: toDateOnly(billDate),
+      dueDate: toDateOnly(dueDate),
+      verified: !!verifiedLine,
+    });
+  }
+
+  return {
+    ok: true,
+    loadNumber,
+    invoiceId,
+    amount,
+    chargeCode,
+    vendorInvoiceNumber,
+    vendorId,
+    verifiedLine: verifiedLine || null,
+  };
+}
+
 exports.addInsurancePremiumToLoad = addInsurancePremiumToLoad;
 exports.removeInsurancePremiumFromLoad = removeInsurancePremiumFromLoad;
+exports.addPortFeeToLoad = addPortFeeToLoad;
+exports.resolveNamedVendor = resolveNamedVendor;
+exports.resolveDueOnReceiptTerms = resolveDueOnReceiptTerms;
+exports.resolveDueOnReceiptTermId = resolveDueOnReceiptTermId;
+exports.portFeeSaveInvoiceFlags = portFeeSaveInvoiceFlags;
 exports.resolveInsuranceVendor = resolveInsuranceVendor;
 exports.lookupVendorByCarrierHint = lookupVendorByCarrierHint;
 exports.applyVendorProfileTypes = applyVendorProfileTypes;
