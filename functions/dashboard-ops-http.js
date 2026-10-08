@@ -5,6 +5,7 @@
 "use strict";
 
 const dashboardOps = require("./dashboard-ops");
+const dashboardEmailFiles = require("./dashboard-email-files");
 
 let deps = {};
 
@@ -44,6 +45,9 @@ async function handleListNotifications(req, res) {
       dispatcherKey: req.query.dispatcherKey || null,
       urgentFirst: req.query.urgentFirst !== "0",
       additionalChargesMod: deps.additionalCharges || null,
+      backfillMail: typeof deps.backfillDashboardMail === "function" ?
+        (items) => deps.backfillDashboardMail(
+            items, tenant, "notification") : null,
     });
     return res.json({
       ok: true,
@@ -375,6 +379,144 @@ async function handleDeleteUnhandledEmail(req, res) {
 }
 
 /**
+ * @param {string} source task|notification|additionalCharges.
+ * @param {string} id Document id.
+ * @return {Promise<object|null>}
+ */
+async function loadMailDoc(source, id) {
+  let collection = null;
+  if (source === "notification") {
+    collection = dashboardOps.NOTIF_COLLECTION;
+  } else if (source === "additionalCharges" && deps.additionalCharges) {
+    collection = deps.additionalCharges.FOLLOW_UP_COLLECTION;
+  } else if (deps.dashboardTasks) {
+    collection = deps.dashboardTasks.TASK_COLLECTION;
+  }
+  if (!collection) return null;
+  const snap = await deps.db.collection(collection).doc(id).get();
+  if (!snap.exists) return null;
+  return snap.data() || {};
+}
+
+/**
+ * Streams one stored or mailbox attachment.
+ * @param {object} res Response.
+ * @param {object} att Attachment metadata.
+ * @param {object} tenant Tenant.
+ * @return {Promise<object>}
+ */
+async function streamDashboardAttachment(res, att, tenant) {
+  const sendBytes = (buf) => {
+    res.set("Content-Type", att.mimeType || "application/octet-stream");
+    res.set("Content-Disposition",
+        dashboardEmailFiles.contentDisposition(att));
+    res.set("Cache-Control", "private, max-age=120");
+    res.set("X-Content-Type-Options", "nosniff");
+    res.send(buf);
+  };
+
+  if (att.storagePath && typeof deps.getBucket === "function") {
+    const file = deps.getBucket().file(att.storagePath);
+    const [exists] = await file.exists();
+    if (exists) {
+      res.set("Content-Type", att.mimeType || "application/octet-stream");
+      res.set("Content-Disposition",
+          dashboardEmailFiles.contentDisposition(att));
+      res.set("Cache-Control", "private, max-age=120");
+      res.set("X-Content-Type-Options", "nosniff");
+      await new Promise((resolve, reject) => {
+        file.createReadStream()
+            .on("error", reject)
+            .on("end", resolve)
+            .pipe(res);
+      });
+      return;
+    }
+  }
+
+  if (att.gmailMessageId && att.gmailAttachmentId &&
+      typeof deps.getMailClient === "function" &&
+      typeof deps.downloadGmailAttachmentBuffer === "function") {
+    const mail = await deps.getMailClient(tenant);
+    if (!mail) {
+      res.status(404).json({
+        ok: false,
+        error: "Mailbox is not connected.",
+      });
+      return;
+    }
+    const buf = await deps.downloadGmailAttachmentBuffer(
+        mail, att.gmailMessageId, att.gmailAttachmentId);
+    sendBytes(buf);
+    return;
+  }
+
+  res.status(404).json({
+    ok: false,
+    error: "Attachment file is no longer available.",
+  });
+}
+
+/**
+ * GET one email attachment for a task or notification drawer.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<object>}
+ */
+async function handleDownloadEmailAttachment(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const tenant = await deps.resolveDashboardTenant(req);
+    const source = String(req.query.source || "task");
+    const id = String(req.query.id || "").trim();
+    const index = Number(req.query.index);
+    if (!id || !Number.isInteger(index) || index < 0 || index > 40) {
+      return res.status(400).json({
+        ok: false,
+        error: "id and index are required.",
+      });
+    }
+    const data = await loadMailDoc(source, id);
+    if (!data) {
+      return res.status(404).json({ok: false, error: "Not found."});
+    }
+    if (data.tenantId && tenant && data.tenantId !== tenant.tenantId) {
+      return res.status(404).json({ok: false, error: "Not found."});
+    }
+    let att = Array.isArray(data.attachments) ?
+      data.attachments[index] : null;
+    if (!att && data.invoiceId && typeof deps.tcol === "function") {
+      const invSnap = await deps.tcol(tenant, "invoices")
+          .doc(String(data.invoiceId)).get();
+      if (invSnap.exists) {
+        const fromInv = dashboardEmailFiles.attachmentsFromInvoice(
+            invSnap.data() || {}, {
+              includePod: data.type === "pod_discrepancy" ||
+                data.type === "signed_pod",
+            });
+        att = fromInv[index] || null;
+      }
+    }
+    if (!att) {
+      return res.status(404).json({
+        ok: false,
+        error: "Attachment not found.",
+      });
+    }
+    await streamDashboardAttachment(res, att, tenant);
+    return undefined;
+  } catch (error) {
+    console.error("getDashboardEmailAttachment error:", error);
+    if (res.headersSent) return undefined;
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to open attachment.",
+      details: error.message,
+    });
+  }
+}
+
+/**
  * @param {string} from Header value.
  * @return {string}
  */
@@ -394,4 +536,5 @@ module.exports = {
   handleAdditionalChargeDecision,
   handleReplyUnhandledEmail,
   handleDeleteUnhandledEmail,
+  handleDownloadEmailAttachment,
 };

@@ -8,8 +8,11 @@
 
 const admin = require("firebase-admin");
 const ownership = require("./dashboard-ownership");
+const mailFiles = require("./dashboard-email-files");
+const dedupe = require("./dashboard-dedupe");
 
 const TASK_COLLECTION = "dashboardTasks";
+const FOLLOW_UP_COLLECTION = "additionalCharges";
 
 const TASK_TYPE = Object.freeze({
   HUMAN_REVIEW: "human_review",
@@ -24,7 +27,123 @@ const TASK_STATUS = Object.freeze({
 });
 
 /**
+ * @param {*} value Firestore timestamp or date-like value.
+ * @return {string|null}
+ */
+function isoFrom(value) {
+  const ms = dedupe.timestampMs(value);
+  return ms == null ? null : new Date(ms).toISOString();
+}
+
+/**
+ * Loads chargesTotal for follow-ups when the task row did not store it.
+ * @param {object} db Firestore.
+ * @param {string[]} ids Follow-up ids.
+ * @return {Promise<Map<string, *>>}
+ */
+async function loadFollowUpAmounts(db, ids) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  const chunks = [];
+  for (let i = 0; i < unique.length; i += 10) {
+    chunks.push(unique.slice(i, i + 10));
+  }
+  const snaps = (await Promise.all(chunks.map((chunk) => {
+    const refs = chunk.map((id) =>
+      db.collection(FOLLOW_UP_COLLECTION).doc(id));
+    return db.getAll(...refs);
+  }))).flat();
+  const amounts = new Map();
+  snaps.forEach((snap) => {
+    if (!snap.exists) return;
+    const total = (snap.data() || {}).chargesTotal;
+    if (total != null) amounts.set(snap.id, total);
+  });
+  return amounts;
+}
+
+/**
+ * Finds an open task for the same charge, follow-up, or message.
+ * @param {object} db Firestore.
+ * @param {object} data Incoming task fields.
+ * @return {Promise<object|null>}
+ */
+async function findOpenDuplicateTask(db, data) {
+  const loadNumber = String(data.loadNumber || "").trim();
+  const messageId = String(data.messageId || "").trim();
+  const followUpId = String(data.followUpId || "").trim();
+  const tenantId = String(data.tenantId || "default");
+  const type = data.type || TASK_TYPE.HUMAN_REVIEW;
+  let docs = [];
+  if (loadNumber) {
+    const snap = await db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", loadNumber)
+        .limit(200)
+        .get();
+    docs = snap.docs;
+  } else if (messageId) {
+    const snap = await db.collection(TASK_COLLECTION)
+        .where("messageId", "==", messageId)
+        .limit(20)
+        .get();
+    docs = snap.docs;
+  } else if (followUpId) {
+    const snap = await db.collection(TASK_COLLECTION)
+        .where("followUpId", "==", followUpId)
+        .limit(20)
+        .get();
+    docs = snap.docs;
+  } else {
+    return null;
+  }
+
+  const openDocs = docs.filter((doc) => {
+    const row = doc.data() || {};
+    if ((row.status || "") !== TASK_STATUS.OPEN) return false;
+    return String(row.tenantId || "default") === tenantId;
+  });
+  const amounts = await loadFollowUpAmounts(db, openDocs
+      .filter((doc) => {
+        const row = doc.data() || {};
+        return row.chargesTotal == null && row.followUpId;
+      })
+      .map((doc) => doc.data().followUpId));
+  const incoming = {
+    type,
+    loadNumber: loadNumber || null,
+    reason: data.reason || data.category || null,
+    chargesTotal: data.chargesTotal,
+    messageId: messageId || null,
+    followUpId: followUpId || null,
+  };
+  let best = null;
+  for (const doc of openDocs) {
+    const row = doc.data() || {};
+    const candidate = {
+      type: row.type || null,
+      loadNumber: row.loadNumber || null,
+      reason: row.reason || null,
+      chargesTotal: row.chargesTotal != null ? row.chargesTotal :
+        amounts.get(row.followUpId),
+      messageId: row.messageId || null,
+      followUpId: row.followUpId || null,
+      chargePhase: row.chargePhase || null,
+      followUpStatus: row.followUpStatus || null,
+      createdAt: isoFrom(row.createdAt),
+      receivedAt: isoFrom(row.receivedAt),
+      emailReceivedAt: isoFrom(row.emailReceivedAt),
+    };
+    if (!dedupe.isExactDuplicateItem(incoming, candidate)) continue;
+    if (!best ||
+        dedupe.compareDuplicatePreference(candidate, best.item) > 0) {
+      best = {id: doc.id, ref: doc.ref, data: row, item: candidate};
+    }
+  }
+  return best;
+}
+
+/**
  * Creates an open dashboard task (fire-and-forget safe).
+ * Reuses an open task when this is the same additional charge.
  * @param {object} db Firestore instance.
  * @param {object} data Task fields.
  * @return {Promise<string|null>} Doc id or null on failure.
@@ -35,6 +154,52 @@ async function createDashboardTask(db, data) {
     let body = data.body != null ? String(data.body) : null;
     if (body && body.length > MAX_BODY) body = body.slice(0, MAX_BODY);
     const owner = ownership.ownershipFieldsForCreate(data);
+    const mail = mailFiles.fieldsForCreate(data);
+    try {
+      const existing = await findOpenDuplicateTask(db, data);
+      if (existing) {
+        const patch = {};
+        if (body) patch.body = body;
+        if (data.subject) patch.subject = data.subject;
+        if (data.chargesTotal != null &&
+            existing.data.chargesTotal == null) {
+          patch.chargesTotal = data.chargesTotal;
+        }
+        if (data.messageId && !existing.data.messageId) {
+          patch.messageId = data.messageId;
+        }
+        if (data.followUpId && !existing.data.followUpId) {
+          patch.followUpId = data.followUpId;
+        }
+        const incomingMs = dedupe.timestampMs(
+            data.receivedAt || data.emailReceivedAt || null) || 0;
+        const existingMs = dedupe.timestampMs(existing.data.receivedAt) || 0;
+        if (mail.receivedAt && incomingMs > existingMs) {
+          patch.receivedAt = mail.receivedAt;
+          if (mail.receivedAtSource) {
+            patch.receivedAtSource = mail.receivedAtSource;
+          }
+        }
+        const hasFiles = Array.isArray(existing.data.attachments) &&
+          existing.data.attachments.length;
+        if (Array.isArray(mail.attachments) && mail.attachments.length &&
+            !hasFiles) {
+          patch.attachments = mail.attachments;
+        }
+        if (Object.keys(patch).length) {
+          patch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+          await existing.ref.update(patch);
+        }
+        console.log(
+            "[createDashboardTask] exact duplicate open task — reused",
+            existing.id, data.loadNumber || "", data.chargesTotal,
+            data.reason || "");
+        return existing.id;
+      }
+    } catch (dedupeErr) {
+      console.error("[createDashboardTask] dedupe lookup failed:",
+          dedupeErr.message);
+    }
     const doc = await db.collection(TASK_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || TASK_TYPE.HUMAN_REVIEW,
@@ -55,6 +220,7 @@ async function createDashboardTask(db, data) {
       reason: data.reason || null,
       chargesTotal: data.chargesTotal != null ? data.chargesTotal : null,
       ...owner,
+      ...mail,
       status: TASK_STATUS.OPEN,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       dismissedAt: null,
@@ -103,6 +269,7 @@ function serializeTaskDoc(doc) {
       followUpStatus: d.followUpStatus || null,
       ownershipHistory: Array.isArray(d.ownershipHistory) ?
         d.ownershipHistory : [],
+      ...mailFiles.serializeMailFields(d),
       createdAt: d.createdAt && d.createdAt.toDate ?
         d.createdAt.toDate().toISOString() : null,
       dismissedAt: d.dismissedAt && d.dismissedAt.toDate ?
@@ -186,6 +353,29 @@ function buildAdditionalChargeFallbackHtml(additionalChargesMod, d) {
 }
 
 /**
+ * Copies mailbox time and attachments from a follow-up onto a task row.
+ * @param {object} target Serialized task.
+ * @param {object} source Follow-up data.
+ * @return {void}
+ */
+function applyStoredMail(target, source) {
+  if (!target || !source) return;
+  if (!target.receivedAt) {
+    const iso = mailFiles.toIso(source.receivedAt || source.emailReceivedAt);
+    if (iso) {
+      target.receivedAt = iso;
+      target.receivedAtSource = source.receivedAtSource || "mailbox";
+    }
+  }
+  if (!Array.isArray(target.attachments)) {
+    const raw = Array.isArray(source.attachments) ? source.attachments :
+      (Array.isArray(source.mailboxAttachments) ?
+        source.mailboxAttachments : null);
+    if (raw) target.attachments = mailFiles.publicAttachments(raw);
+  }
+}
+
+/**
  * Lists open tasks for a tenant plus unresolved additional-charge follow-ups.
  * @param {object} db Firestore instance.
  * @param {object} additionalChargesMod additional-charges module.
@@ -245,6 +435,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       task.ownerBucket = task.ownerBucket || d.ownerBucket || null;
       task.awaitingReplyFrom = task.awaitingReplyFrom ||
         d.awaitingReplyFrom || null;
+      applyStoredMail(task, d);
     }
   }
 
@@ -273,7 +464,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       loadNumber: d.loadNumber || null,
       proNumber: null,
       carrierName: d.carrierName || null,
-      messageId: null,
+      messageId: d.messageId || null,
       invoiceId: d.invoiceId || null,
       followUpId: doc.id,
       department: null,
@@ -290,6 +481,10 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       followUpStatus: d.status || null,
       ownershipHistory: Array.isArray(d.ownershipHistory) ?
         d.ownershipHistory : [],
+      ...mailFiles.serializeMailFields({
+        ...d,
+        receivedAt: d.receivedAt || d.emailReceivedAt || null,
+      }),
       createdAt: d.createdAt && d.createdAt.toDate ?
         d.createdAt.toDate().toISOString() : null,
       dismissedAt: null,
@@ -309,16 +504,23 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     }
   }
 
-  const chargePhase = String(opts.chargePhase || "").toLowerCase();
-  let working = tasks;
-  if (chargePhase === "dispute") {
-    working = tasks.filter((t) => t.chargePhase === "dispute");
-  } else if (chargePhase === "open" || !chargePhase) {
-    // Default task folders hide items already in dispute.
-    working = tasks.filter((t) => t.chargePhase !== "dispute");
+  if (typeof opts.backfillMail === "function") {
+    await opts.backfillMail(tasks);
   }
 
-  const disputeCount = tasks.filter((t) => t.chargePhase === "dispute").length;
+  const visibleTasks = dedupe.collapseExactDuplicateItems(tasks);
+
+  const chargePhase = String(opts.chargePhase || "").toLowerCase();
+  let working = visibleTasks;
+  if (chargePhase === "dispute") {
+    working = visibleTasks.filter((t) => t.chargePhase === "dispute");
+  } else if (chargePhase === "open" || !chargePhase) {
+    // Default task folders hide items already in dispute.
+    working = visibleTasks.filter((t) => t.chargePhase !== "dispute");
+  }
+
+  const disputeCount = visibleTasks.filter((t) =>
+    t.chargePhase === "dispute").length;
 
   const page = ownership.filterSortPaginate(working, {
     ownerBucket: chargePhase === "dispute" ?

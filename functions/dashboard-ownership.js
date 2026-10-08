@@ -149,7 +149,8 @@ function applyOwnerDefaults(item) {
         String(out.dispatcherName).trim().toLowerCase() : null);
     out.awaitingReplyFrom = out.awaitingReplyFrom || out.ownerBucket;
   }
-  const createdMs = out.createdAt ? Date.parse(out.createdAt) : 0;
+  const ageStamp = out.receivedAt || out.createdAt;
+  const createdMs = ageStamp ? Date.parse(ageStamp) : 0;
   out.isUrgentOld = Boolean(createdMs &&
     (Date.now() - createdMs) >= URGENT_AGE_MS);
   out.ageLabel = out.isUrgentOld ? "URGENT/OLD" : null;
@@ -278,8 +279,8 @@ function filterSortPaginate(items, opts) {
         return a.isUrgentOld ? -1 : 1;
       }
     }
-    const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
-    const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+    const ta = Date.parse(a.receivedAt || a.createdAt || "") || 0;
+    const tb = Date.parse(b.receivedAt || b.createdAt || "") || 0;
     return tb - ta;
   });
 

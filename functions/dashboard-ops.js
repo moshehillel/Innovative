@@ -12,6 +12,8 @@
 
 const admin = require("firebase-admin");
 const ownership = require("./dashboard-ownership");
+const mailFiles = require("./dashboard-email-files");
+const dedupe = require("./dashboard-dedupe");
 
 const NOTIF_COLLECTION = "dashboardNotifications";
 
@@ -83,6 +85,7 @@ function serializeNotif(doc) {
     dispatcherKey: d.dispatcherKey || null,
     ownershipHistory: Array.isArray(d.ownershipHistory) ?
       d.ownershipHistory : [],
+    ...mailFiles.serializeMailFields(d),
     createdAt: tsIso(d.createdAt),
     dismissedAt: tsIso(d.dismissedAt),
     flaggedAt: tsIso(d.flaggedAt),
@@ -91,7 +94,76 @@ function serializeNotif(doc) {
 }
 
 /**
+ * Finds an open notification for the same charge or the same message.
+ * @param {object} db Firestore.
+ * @param {object} data Incoming notification fields.
+ * @return {Promise<object|null>}
+ */
+async function findOpenDuplicateNotification(db, data) {
+  const loadNumber = String(data.loadNumber || "").trim();
+  const messageId = String(data.messageId || "").trim();
+  const followUpId = String(data.followUpId || "").trim();
+  const tenantId = String(data.tenantId || "default");
+  const type = data.type || NOTIF_TYPE.OPS_EMAIL;
+  let docs = [];
+  if (loadNumber) {
+    const snap = await db.collection(NOTIF_COLLECTION)
+        .where("loadNumber", "==", loadNumber)
+        .limit(80)
+        .get();
+    docs = snap.docs;
+  } else if (messageId) {
+    const snap = await db.collection(NOTIF_COLLECTION)
+        .where("messageId", "==", messageId)
+        .limit(20)
+        .get();
+    docs = snap.docs;
+  } else if (followUpId) {
+    const snap = await db.collection(NOTIF_COLLECTION)
+        .where("followUpId", "==", followUpId)
+        .limit(20)
+        .get();
+    docs = snap.docs;
+  } else {
+    return null;
+  }
+
+  const incoming = {
+    type,
+    loadNumber: loadNumber || null,
+    reason: data.reason || data.category || null,
+    chargesTotal: data.chargesTotal,
+    messageId: messageId || null,
+    followUpId: followUpId || null,
+  };
+  let best = null;
+  for (const doc of docs) {
+    const row = doc.data() || {};
+    if ((row.status || "") !== NOTIF_STATUS.OPEN) continue;
+    if (String(row.tenantId || "default") !== tenantId) continue;
+    const candidate = {
+      type: row.type || null,
+      loadNumber: row.loadNumber || null,
+      reason: row.reason || null,
+      chargesTotal: row.chargesTotal,
+      messageId: row.messageId || null,
+      followUpId: row.followUpId || null,
+      createdAt: tsIso(row.createdAt),
+      receivedAt: mailFiles.toIso(row.receivedAt),
+      emailReceivedAt: mailFiles.toIso(row.emailReceivedAt),
+    };
+    if (!dedupe.isExactDuplicateItem(incoming, candidate)) continue;
+    if (!best ||
+        dedupe.compareDuplicatePreference(candidate, best.item) > 0) {
+      best = {id: doc.id, ref: doc.ref, data: row, item: candidate};
+    }
+  }
+  return best;
+}
+
+/**
  * Creates an open dashboard notification.
+ * Reuses an open row when this is the same email or additional charge.
  * @param {object} db Firestore.
  * @param {object} data Fields.
  * @return {Promise<string|null>}
@@ -105,6 +177,48 @@ async function createNotification(db, data) {
       ...data,
       type: data.type || NOTIF_TYPE.OPS_EMAIL,
     });
+    const mail = mailFiles.fieldsForCreate(data);
+    try {
+      const existing = await findOpenDuplicateNotification(db, data);
+      if (existing) {
+        const patch = {};
+        if (body) patch.body = body;
+        if (data.subject) patch.subject = data.subject;
+        if (data.chargesTotal != null &&
+            existing.data.chargesTotal == null) {
+          patch.chargesTotal = data.chargesTotal;
+        }
+        if (data.followUpId && !existing.data.followUpId) {
+          patch.followUpId = data.followUpId;
+        }
+        const incomingMs = dedupe.timestampMs(
+            data.receivedAt || data.emailReceivedAt || null) || 0;
+        const existingMs = dedupe.timestampMs(existing.data.receivedAt) || 0;
+        if (mail.receivedAt && incomingMs > existingMs) {
+          patch.receivedAt = mail.receivedAt;
+          if (mail.receivedAtSource) {
+            patch.receivedAtSource = mail.receivedAtSource;
+          }
+        }
+        const hasFiles = Array.isArray(existing.data.attachments) &&
+          existing.data.attachments.length;
+        if (Array.isArray(mail.attachments) && mail.attachments.length &&
+            !hasFiles) {
+          patch.attachments = mail.attachments;
+        }
+        if (Object.keys(patch).length) {
+          patch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
+          await existing.ref.update(patch);
+        }
+        console.log(
+            "[createNotification] exact duplicate — reused",
+            existing.id, data.loadNumber || "", data.messageId || "");
+        return existing.id;
+      }
+    } catch (dedupeErr) {
+      console.error("[dashboard-ops] dedupe lookup failed:",
+          dedupeErr.message);
+    }
     const ref = await db.collection(NOTIF_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || NOTIF_TYPE.OPS_EMAIL,
@@ -128,6 +242,7 @@ async function createNotification(db, data) {
       chargeOptions: data.chargeOptions || null,
       emailSent: data.emailSent === true,
       ...owner,
+      ...mail,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       dismissedAt: null,
       flaggedAt: null,
@@ -246,12 +361,29 @@ async function listNotifications(db, opts) {
       n.dispatcherEmail = n.dispatcherEmail || d.dispatcherEmail || null;
       n.dispatcherName = n.dispatcherName || d.dispatcherName || null;
       n.ownerBucket = n.ownerBucket || d.ownerBucket || null;
+      if (!n.receivedAt) {
+        const iso = mailFiles.toIso(d.receivedAt || d.emailReceivedAt);
+        if (iso) {
+          n.receivedAt = iso;
+          n.receivedAtSource = d.receivedAtSource || "mailbox";
+        }
+      }
+      if (!Array.isArray(n.attachments) && Array.isArray(d.attachments)) {
+        n.attachments = mailFiles.publicAttachments(d.attachments);
+      }
     } catch (err) {
       console.error("[listNotifications] charge enrich:", err.message);
     }
   }
 
-  const page = ownership.filterSortPaginate(notifications, {
+  if (typeof opts.backfillMail === "function") {
+    await opts.backfillMail(notifications);
+  }
+
+  const visibleNotifications =
+    dedupe.collapseExactDuplicateItems(notifications);
+
+  const page = ownership.filterSortPaginate(visibleNotifications, {
     ownerBucket: opts.ownerBucket || null,
     dispatcherKey: opts.dispatcherKey || null,
     offset: opts.offset,

@@ -54,6 +54,7 @@ const invoiceLoadEntry = require("./invoice-load-entry");
 const dashboardTasks = require("./dashboard-tasks");
 const dashboardOps = require("./dashboard-ops");
 const dashboardOpsHttp = require("./dashboard-ops-http");
+const dashboardEmailFiles = require("./dashboard-email-files");
 const mailProvider = require("./mail-provider");
 const emailBranding = require("./email-branding");
 const mailIntakeQueue = require("./mail-intake-queue");
@@ -102,6 +103,210 @@ let _bucket = null;
 function getBucket() {
   if (!_bucket) _bucket = admin.storage().bucket();
   return _bucket;
+}
+
+/** Recent mailbox captures, keyed by message id (process-local). */
+const mailboxContextByMessage = new Map();
+
+/**
+ * @param {string} messageId Mailbox message id.
+ * @param {object} bundle Capture result.
+ * @return {void}
+ */
+function rememberMailboxContext(messageId, bundle) {
+  const key = String(messageId || "");
+  if (!key || !bundle) return;
+  mailboxContextByMessage.set(key, bundle);
+  while (mailboxContextByMessage.size > 40) {
+    const first = mailboxContextByMessage.keys().next().value;
+    mailboxContextByMessage.delete(first);
+  }
+}
+
+/**
+ * @param {string} messageId Mailbox message id.
+ * @return {object|null}
+ */
+function recallMailboxContext(messageId) {
+  return mailboxContextByMessage.get(String(messageId || "")) || null;
+}
+
+/**
+ * Fields for dashboard create calls from a mailbox capture.
+ * @param {object|null} bundle Capture result.
+ * @param {Array<object>} [extra] Additional stored files.
+ * @return {object}
+ */
+function mailCreateFromBundle(bundle, extra) {
+  const hasBundle = bundle && Array.isArray(bundle.attachments);
+  const hasExtra = Array.isArray(extra);
+  const fields = {};
+  if (bundle && bundle.receivedAt) {
+    fields.receivedAt = bundle.receivedAt;
+    fields.receivedAtSource = "mailbox";
+  }
+  if (hasBundle || hasExtra) {
+    fields.attachments = dashboardEmailFiles.mergeAttachments(
+        extra || [], bundle && bundle.attachments);
+  }
+  return fields;
+}
+
+/**
+ * Loads cached or freshly stored mailbox files for a dashboard item.
+ * @param {object} gmail Mail client.
+ * @param {string} messageId Mailbox message id.
+ * @return {Promise<object>}
+ */
+async function mailFieldsForInbound(gmail, messageId) {
+  if (!messageId) return {};
+  let bundle = recallMailboxContext(messageId);
+  if ((!bundle || !bundle.captured) && gmail) {
+    try {
+      bundle = await ensureDashboardMailFiles({gmail, messageId});
+    } catch (err) {
+      console.error("[mailFieldsForInbound]", err.message);
+    }
+  }
+  return mailCreateFromBundle(bundle);
+}
+
+/**
+ * Saves the mailbox message's attachments and received time for the dashboard.
+ * @param {object} opts gmail, messageId, payload, messageData, force.
+ * @return {Promise<object>}
+ */
+async function ensureDashboardMailFiles(opts) {
+  const messageId = String((opts && opts.messageId) || "");
+  if (!messageId) {
+    return {captured: true, receivedAt: null, attachments: []};
+  }
+  if (!opts.force) {
+    const cached = recallMailboxContext(messageId);
+    if (cached && cached.captured) return cached;
+  }
+  let messageData = opts.messageData || null;
+  let payload = opts.payload || null;
+  if ((!payload || !messageData) && opts.gmail) {
+    const full = await opts.gmail.users.messages.get({
+      userId: "me",
+      id: messageId,
+    });
+    messageData = full.data || {};
+    payload = messageData.payload || {};
+  }
+  const prior = recallMailboxContext(messageId);
+  const receivedAt = dashboardEmailFiles.mailboxReceivedIso(messageData) ||
+    (prior && prior.receivedAt) || null;
+  const collected = collectMessageAttachments(payload);
+  let attachments = [];
+  try {
+    attachments = await dashboardEmailFiles.captureMailboxAttachments({
+      messageId,
+      collected,
+      bucket: getBucket(),
+      download: async (att) => resolveAttachmentBuffer(
+          opts.gmail, messageId, att),
+      onError: (err, att) => {
+        console.error("[dashboardMail] attachment save failed:",
+            att && att.filename, err && err.message);
+      },
+    });
+  } catch (err) {
+    console.error("[dashboardMail] capture failed:", err.message);
+  }
+  const bundle = {captured: true, receivedAt, attachments};
+  rememberMailboxContext(messageId, bundle);
+  return bundle;
+}
+
+/**
+ * Lists attachment ids and received time without downloading bytes.
+ * @param {object} gmail Mail client.
+ * @param {string} messageId Mailbox message id.
+ * @return {Promise<object>}
+ */
+async function peekMailboxMeta(gmail, messageId) {
+  try {
+    const full = await gmail.users.messages.get({
+      userId: "me",
+      id: String(messageId),
+    });
+    const data = full.data || {};
+    const collected = collectMessageAttachments(data.payload || {});
+    const attachments = [];
+    for (const att of collected) {
+      if (!att || !att.attachmentId) continue;
+      attachments.push({
+        filename: att.filename || "attachment",
+        mimeType: att.mimeType || "application/octet-stream",
+        size: Number(att.size) || null,
+        storagePath: null,
+        gmailMessageId: String(messageId),
+        gmailAttachmentId: String(att.attachmentId),
+      });
+      if (attachments.length >= dashboardEmailFiles.MAX_ATTACHMENTS) break;
+    }
+    return {
+      missing: false,
+      receivedAt: dashboardEmailFiles.mailboxReceivedIso(data),
+      attachments,
+    };
+  } catch (err) {
+    const msg = String(err && err.message || err);
+    if (/404|not found|ErrorItemNotFound|ResourceNotFound/i.test(msg)) {
+      return {missing: true, receivedAt: null, attachments: []};
+    }
+    throw err;
+  }
+}
+
+/**
+ * Backfills mailbox time and attachments onto listed dashboard rows.
+ * @param {Array<object>} items Serialized rows.
+ * @param {object} tenant Tenant config.
+ * @param {string} kind task|notification.
+ * @return {Promise<void>}
+ */
+async function backfillDashboardMail(items, tenant, kind) {
+  try {
+    const writes = await dashboardEmailFiles.backfillListedItems(items, {
+      kind,
+      collections: {
+        tasks: dashboardTasks.TASK_COLLECTION,
+        notifications: dashboardOps.NOTIF_COLLECTION,
+        followUps: additionalCharges.FOLLOW_UP_COLLECTION,
+      },
+      serverTimestamp: admin.firestore.FieldValue.serverTimestamp(),
+      loadInvoices: async (ids) => {
+        const refs = ids.map((id) => tcol(tenant, "invoices").doc(id));
+        const snaps = refs.length ? await db.getAll(...refs) : [];
+        const map = new Map();
+        snaps.forEach((snap) => {
+          map.set(snap.id, snap.exists ? (snap.data() || {}) : null);
+        });
+        return map;
+      },
+      peekMailbox: async (messageId) => {
+        const mail = await mailProvider.getTenantMailClient(tenant);
+        if (!mail) return null;
+        return peekMailboxMeta(mail, messageId);
+      },
+      onPeekError: (err) => {
+        console.error("[backfillDashboardMail]", err && err.message);
+      },
+    });
+    for (const write of writes) {
+      try {
+        await db.collection(write.collection).doc(write.id)
+            .set(write.data, {merge: true});
+      } catch (err) {
+        console.error("[backfillDashboardMail] persist:", err.message);
+      }
+    }
+  } catch (err) {
+    console.error("[backfillDashboardMail]", err && err.message);
+  }
 }
 
 /**
@@ -4841,6 +5046,16 @@ async function forwardToHumanReview(
     notifBody = notifBody.slice(0, MAX_NOTIF_BODY);
   }
 
+  let reviewMail = recallMailboxContext(messageId);
+  if (!reviewMail || !reviewMail.captured) {
+    try {
+      reviewMail = await ensureDashboardMailFiles({gmail, messageId});
+    } catch (err) {
+      console.error("[forwardToHumanReview] mail files:", err.message);
+    }
+  }
+  const reviewMailFields = mailCreateFromBundle(reviewMail);
+
   await dashboardOps.createNotification(db, {
     tenantId,
     type: dashboardOps.NOTIF_TYPE.UNHANDLED_EMAIL,
@@ -4855,6 +5070,7 @@ async function forwardToHumanReview(
     reason: safeReason,
     emailType: "human_review",
     emailSent: !opsPrimary,
+    ...reviewMailFields,
   });
 
   if (!opsPrimary) {
@@ -5186,6 +5402,9 @@ async function notifyLisaPodDiscrepancy(opts) {
     carrierName,
     proNumber,
     discrepancies,
+    messageId,
+    podStoragePath,
+    podFilename,
   } = opts || {};
   const podFollowup = require("./pod-followup");
   const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
@@ -5222,6 +5441,19 @@ async function notifyLisaPodDiscrepancy(opts) {
     `<p>Please review the POD on the load and follow up with the customer ` +
     `or carrier as needed.</p>`;
 
+  const podFile = podStoragePath ? [{
+    filename: podFilename || "pod.pdf",
+    mimeType: "application/pdf",
+    storagePath: podStoragePath,
+  }] : [];
+  const podMail = mailCreateFromBundle(
+      recallMailboxContext(messageId) || {
+        receivedAt: opts.emailReceivedAt || null,
+        attachments: opts.dashboardAttachments || [],
+      },
+      podFile.concat(opts.dashboardAttachments || []),
+  );
+
   await saveOutboundEmail({
     type: "pod_discrepancy_review",
     invoiceId: invoiceId || null,
@@ -5229,6 +5461,9 @@ async function notifyLisaPodDiscrepancy(opts) {
     to: lisa,
     subject: `Review POD — ${flagLabel} — Load ${loadNumber || "—"}`,
     html,
+    messageId: messageId || null,
+    emailReceivedAt: podMail.receivedAt || null,
+    dashboardAttachments: podMail.attachments || [],
   });
 
   await writeLog("info", "email", "POD discrepancy review sent to Lisa", {
@@ -5251,7 +5486,9 @@ async function notifyLisaPodDiscrepancy(opts) {
     proNumber: proNumber || null,
     carrierName: carrierName || null,
     invoiceId: invoiceId || null,
+    messageId: messageId || null,
     reason: flagLabel,
+    ...podMail,
   });
 
   return {ok: true, sent: true, to: lisa, discrepancies: disc};
@@ -5300,6 +5537,13 @@ async function maybeNotifyLisaPodDiscrepancy(opts) {
     carrierName: invoice.carrierName,
     proNumber: invoice.proNumber,
     discrepancies,
+    messageId: invoice.gmailMessageId || null,
+    emailReceivedAt: invoice.emailReceivedAt || null,
+    dashboardAttachments: dashboardEmailFiles.attachmentsFromInvoice(
+        invoice, {includePod: true}),
+    podStoragePath: path,
+    podFilename: "pod.pdf",
+    tenant: opts.tenant || null,
   });
 
   if (notify.sent && invoiceRef) {
@@ -5337,7 +5581,7 @@ function customerNameFromPrimusBooking(booking) {
  * @return {Promise<void>}
  */
 async function sendAdditionalChargeApprovalEmail(opts) {
-  const {invoiceId, tenant, aiResult, pending} = opts;
+  const {invoiceId, tenant, aiResult, pending, messageId, gmail} = opts;
   const primusUiBridge = require("./primus-ui-bridge");
 
   let dispatcher = {ok: false};
@@ -5464,6 +5708,17 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     dispatcherEmail: dispatcherEmail || null,
     dispatcherName: resolvedDispatcherName,
   });
+  let chargeBundle = recallMailboxContext(messageId);
+  if ((!chargeBundle || !chargeBundle.captured) && gmail && messageId) {
+    try {
+      chargeBundle = await ensureDashboardMailFiles({gmail, messageId});
+    } catch (err) {
+      console.error("[additionalCharge] mail files:", err.message);
+    }
+  }
+  const chargeMail = mailCreateFromBundle(
+      chargeBundle, opts.invoiceAttachments);
+  const chargeMailStored = dashboardEmailFiles.fieldsForCreate(chargeMail);
   try {
     await db.collection(additionalCharges.FOLLOW_UP_COLLECTION)
         .doc(followUpId).update({
@@ -5471,7 +5726,9 @@ async function sendAdditionalChargeApprovalEmail(opts) {
           emailSubject: email.subject || null,
           emailTo: approver,
           emailCc: emailCc || null,
+          messageId: messageId || null,
           ...chargeOwner,
+          ...chargeMailStored,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         });
   } catch (updErr) {
@@ -5491,11 +5748,13 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     carrierName: aiResult.carrierName || null,
     invoiceId,
     followUpId,
+    messageId: messageId || null,
     reason: pending.category || null,
     chargesTotal: pending.chargesTotal || null,
     dispatcherEmail: dispatcherEmail || null,
     dispatcherName: resolvedDispatcherName,
     ownerBucket: chargeOwner.ownerBucket,
+    ...chargeMail,
   });
 
   await dashboardOps.createNotification(db, {
@@ -5508,6 +5767,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     cc: emailCc,
     invoiceId,
     followUpId,
+    messageId: messageId || null,
     loadNumber: aiResult.loadNumber || null,
     carrierName: aiResult.carrierName || null,
     emailType: "additional_charge_approval",
@@ -5517,6 +5777,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     dispatcherEmail: dispatcherEmail || null,
     dispatcherName: resolvedDispatcherName,
     ownerBucket: chargeOwner.ownerBucket,
+    ...chargeMail,
   });
 
   if (!dashboardOps.isDashboardOpsPrimary()) {
@@ -6111,6 +6372,65 @@ function isSystemErrorOutboundEmail(email) {
 }
 
 /**
+ * Copies outbound email files into dashboard metadata (GCS, not base64).
+ * @param {object} email Outbound email payload.
+ * @return {Promise<object>}
+ */
+async function dashboardFilesFromOutboundEmail(email) {
+  const hinted = dashboardEmailFiles.sanitizeStoredAttachments(
+      email && email.dashboardAttachments);
+  const recalled = recallMailboxContext(
+      email && (email.messageId || email.gmailMessageId));
+  let merged = dashboardEmailFiles.mergeAttachments(
+      hinted, recalled && recalled.attachments);
+  const rawAtt = Array.isArray(email && email.attachments) ?
+    email.attachments : [];
+  const saved = [];
+  let index = 0;
+  for (const att of rawAtt) {
+    if (!att || saved.length >= 8) continue;
+    if (att.storagePath) {
+      saved.push(att);
+      continue;
+    }
+    const b64 = att.contentBase64 || att.content;
+    if (!b64 || typeof b64 !== "string") continue;
+    try {
+      const buf = Buffer.from(b64, "base64");
+      if (!buf.length ||
+        buf.length > dashboardEmailFiles.MAX_ATTACHMENT_BYTES) {
+        continue;
+      }
+      const storagePath = await dashboardEmailFiles.saveAttachmentBuffer(
+          getBucket(),
+          (email && (email.messageId || email.invoiceId)) || "outbound",
+          index,
+          att.filename || "attachment",
+          att.contentType || att.mimeType || "application/octet-stream",
+          buf,
+      );
+      saved.push({
+        filename: att.filename || "attachment",
+        mimeType: att.contentType || att.mimeType ||
+          "application/octet-stream",
+        size: buf.length,
+        storagePath,
+      });
+      index += 1;
+    } catch (err) {
+      console.error("[dashboardMail] outbound save:", err.message);
+    }
+  }
+  merged = dashboardEmailFiles.mergeAttachments(merged, saved);
+  const receivedAt = (email && email.emailReceivedAt) ||
+    (recalled && recalled.receivedAt) || null;
+  return mailCreateFromBundle({
+    receivedAt,
+    attachments: merged,
+  });
+}
+
+/**
  * Persists and sends an outbound email.
  * @param {object} email - Email fields (type, subject, html, to, attachments).
  * @return {Promise<void>}
@@ -6155,6 +6475,8 @@ async function saveOutboundEmail(email) {
   delete emailToStore.tenant;
   delete emailToStore.skipAgentGreeting;
   delete emailToStore.forceRecipient;
+  delete emailToStore.dashboardAttachments;
+  delete emailToStore.emailReceivedAt;
   const emailRef = await tcol(tenant, "outboundEmails").add({
     ...emailToStore,
     to,
@@ -6180,6 +6502,7 @@ async function saveOutboundEmail(email) {
     if (notifBody.length > MAX_NOTIF_BODY) {
       notifBody = notifBody.slice(0, MAX_NOTIF_BODY);
     }
+    const outboundMail = await dashboardFilesFromOutboundEmail(email);
     await dashboardOps.createNotification(db, {
       tenantId: tenant.tenantId || "default",
       type: dashboardOps.NOTIF_TYPE.OPS_EMAIL,
@@ -6190,8 +6513,10 @@ async function saveOutboundEmail(email) {
       cc,
       invoiceId: email.invoiceId || null,
       loadNumber: email.loadNumber || null,
+      messageId: email.messageId || email.gmailMessageId || null,
       emailType: email.type || null,
       emailSent: !parkOpsOnDashboard,
+      ...outboundMail,
     }).catch((err) => {
       console.error("saveOutboundEmail notification:", err.message);
     });
@@ -7223,6 +7548,8 @@ async function notifyLisaSignedPodRequest(opts) {
       `<p style="margin:12px 0"><em>${escapeHtml(
           String(emailBody).slice(0, 800))}</em></p>` : "");
 
+  const signedMail = await mailFieldsForInbound(opts && opts.gmail, messageId);
+
   await saveOutboundEmail({
     type: "signed_pod_request",
     forceRecipient: true,
@@ -7230,6 +7557,9 @@ async function notifyLisaSignedPodRequest(opts) {
     subject: `Signed POD requested — Load ${loadNumber || "—"}`,
     html,
     tenant: opts && opts.tenant,
+    messageId: messageId || null,
+    emailReceivedAt: signedMail.receivedAt || null,
+    dashboardAttachments: signedMail.attachments || null,
   });
 
   await writeLog("info", "email", "Signed POD request escalated to Lisa", {
@@ -7254,6 +7584,7 @@ async function notifyLisaSignedPodRequest(opts) {
     proNumber: proNumber || null,
     messageId: messageId || null,
     reason: "signed_pod_request",
+    ...signedMail,
   });
 
   return {ok: true, sent: true, to: lisa};
@@ -7303,6 +7634,8 @@ async function notifyLisaPodRequestBlockedRecipient(opts) {
       `<p style="margin:12px 0"><em>${escapeHtml(
           String(emailBody).slice(0, 800))}</em></p>` : "");
 
+  const blockedMail = await mailFieldsForInbound(opts && opts.gmail, messageId);
+
   await saveOutboundEmail({
     type: "pod_request_blocked_recipient",
     forceRecipient: true,
@@ -7310,6 +7643,9 @@ async function notifyLisaPodRequestBlockedRecipient(opts) {
     subject: `POD request needs review — Load ${loadNumber || "—"}`,
     html,
     tenant: opts && opts.tenant,
+    messageId: messageId || null,
+    emailReceivedAt: blockedMail.receivedAt || null,
+    dashboardAttachments: blockedMail.attachments || null,
   });
 
   await writeLog("info", "email",
@@ -7335,6 +7671,7 @@ async function notifyLisaPodRequestBlockedRecipient(opts) {
     proNumber: proNumber || null,
     messageId: messageId || null,
     reason: "pod_request_blocked_recipient",
+    ...blockedMail,
   });
 
   return {ok: true, sent: true, to: reviewTo};
@@ -7349,7 +7686,7 @@ async function notifyLisaPodRequestBlockedRecipient(opts) {
  */
 async function handlePodRequestEmail(opts) {
   const {
-    messageId, subject, from, emailBody, tenant, emailClassification,
+    gmail, messageId, subject, from, emailBody, tenant, emailClassification,
   } = opts;
 
   const intent = emailClassification && emailClassification.intent;
@@ -7392,6 +7729,7 @@ async function handlePodRequestEmail(opts) {
 
   if (requesterEmail && podSendDedup.isBlockedPodRecipient(requesterEmail)) {
     await notifyLisaPodRequestBlockedRecipient({
+      gmail,
       messageId,
       subject,
       from,
@@ -7412,6 +7750,7 @@ async function handlePodRequestEmail(opts) {
 
   if (wantsSignedPod) {
     await notifyLisaSignedPodRequest({
+      gmail,
       messageId,
       subject,
       from,
@@ -8552,6 +8891,11 @@ async function processGmailMessage(
 
     const emailBody = extractEmailBody(payload);
     const emailHtml = extractEmailHtml(payload);
+    rememberMailboxContext(messageId, {
+      captured: false,
+      receivedAt: dashboardEmailFiles.mailboxReceivedIso(fullMessage.data),
+      attachments: null,
+    });
 
     // Used when the system doesn't know how to handle an email.
     // Asks Claude what the email is about, then forwards it to the reviewer
@@ -9067,6 +9411,7 @@ async function processGmailMessage(
                   });
             } else {
               const podReqResult = await handlePodRequestEmail({
+                gmail,
                 messageId,
                 subject,
                 from,
@@ -11097,6 +11442,10 @@ async function processGmailMessage(
           gmailMessageId: messageId,
           gmailSubject: subject,
           gmailFrom: from,
+          emailReceivedAt: (recallMailboxContext(messageId) || {})
+              .receivedAt || null,
+          mailboxAttachments: dashboardEmailFiles.sanitizeStoredAttachments(
+              storedAttachments),
           flowId: flowId,
           workflowPausedAtStep: null,
           processingLock: false,
@@ -11156,6 +11505,8 @@ async function processGmailMessage(
             aiResult,
             pending: pendingAdditionalCharge,
             invoiceAttachments,
+            messageId,
+            gmail,
           });
           await writeLog(
               "info",
@@ -11569,6 +11920,7 @@ function extractAttachmentsRecursive(parts) {
         mimeType: mimeType || "application/octet-stream",
         attachmentId: part.body.attachmentId || null,
         inlineData: part.body.data || null,
+        size: Number(part.body && part.body.size) || null,
         unwrap: isRfc822 || isEml,
       });
     }
@@ -12510,6 +12862,8 @@ function mapDashboardInvoice(doc, tenant) {
     currentStep: data.currentStep || null,
     isCompleted,
     createdAt,
+    receivedAt: dashboardEmailFiles.toIso(data.emailReceivedAt),
+    receivedAtSource: data.emailReceivedAt ? "mailbox" : null,
   };
 }
 
@@ -12710,6 +13064,8 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
           dispatcherKey: req.query.dispatcherKey || null,
           chargePhase: req.query.chargePhase || null,
           urgentFirst: req.query.urgentFirst !== "0",
+          backfillMail: (items) =>
+            backfillDashboardMail(items, tenant, "task"),
         });
     return res.json({
       ok: true,
@@ -12855,6 +13211,7 @@ async function applyAdditionalChargeFromDashboard(opts) {
 dashboardOpsHttp.init({
   db,
   tcol,
+  getBucket,
   applyDashboardCors,
   resolveDashboardTenant,
   resolveSystemErrorEmail,
@@ -12864,10 +13221,16 @@ dashboardOpsHttp.init({
   dashboardTasks,
   additionalCharges,
   trashGmailMessage,
+  backfillDashboardMail,
+  downloadGmailAttachmentBuffer,
+  getMailClient: (tenant) => mailProvider.getTenantMailClient(tenant),
 });
 
 exports.getDashboardNotifications = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
+exports.getDashboardEmailAttachment = onRequest(
+    {invoker: "public", timeoutSeconds: 120, memory: "512MiB"},
+    dashboardOpsHttp.handleDownloadEmailAttachment);
 exports.dismissDashboardNotification = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleDismissNotification);
 exports.flagDashboardNotification = onRequest(
