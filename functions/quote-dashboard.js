@@ -1361,6 +1361,8 @@ function handleQuoteAuthClient(req, res) {
 /**
  * Scheduled sync: every connected dispatcher Outlook inbox.
  * Mirror of Jerry checkMailInbox — Cloud Scheduler hits this every 20 min.
+ * Lists the last 7 days (newest 40), including mail that is already read.
+ * Dedup is the stored Outlook message id. Quoted mail stays unread.
  * Dashboard inbox loads use syncOutlook=0 by default; syncOutlook=1 is opt-in.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -1370,9 +1372,8 @@ async function handleSyncQuoteOutlookInboxes(req, res) {
   if (cors(req, res)) return;
   try {
     const tenant = await deps.resolveDashboardTenant(req);
-    const includeRead =
-      req.query.includeRead === "1" ||
-      req.query.includeRead === "true";
+    // Scheduled sync always includes already-read mail (no isRead filter).
+    const includeRead = true;
     const forceReprocess =
       req.query.forceReprocess === "1" ||
       req.query.forceReprocess === "true";

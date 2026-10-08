@@ -334,15 +334,13 @@ function shouldRetryIntake(prev, opts) {
 
 /**
  * Drain quoteMailQueue for one dispatcher.
+ * Creating a quote does not mark the Outlook message read.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {Function} processQuoteEmail Handler.
- * @param {object} [outlookClient] Optional Graph client; when set, mark
- *   Outlook messages read only after a quoteRequest is created.
  * @return {Promise<object>} {processed, errors}
  */
-async function drainQuoteQueue(
-    tenant, dispatcher, processQuoteEmail, outlookClient) {
+async function drainQuoteQueue(tenant, dispatcher, processQuoteEmail) {
   const quoteMailQueue = require("./quote-mail-queue");
   const queued = await quoteMailQueue.listQueuedForDispatcher(
       tcolFn, tenant, dispatcher.id, 15);
@@ -395,21 +393,7 @@ async function drainQuoteQueue(
         } catch (_) {
           // non-fatal
         }
-        if (outlookClient && claimed.outlookMessageId) {
-          try {
-            await outlookClient.users.messages.modify({
-              id: claimed.outlookMessageId,
-              requestBody: {removeLabelIds: ["UNREAD"]},
-            });
-          } catch (markReadErr) {
-            writeLogFn("warn", "quote", "Outlook mark read failed", {
-              dispatcherId: dispatcher.id,
-              messageId: claimed.outlookMessageId,
-              quoteId: result.quoteId,
-              error: markReadErr.message,
-            });
-          }
-        }
+        // Leave the Outlook message unread after the quote is created.
       } else {
         errors += 1;
         const reason = result.reason || result.status || "not_a_quote";
@@ -441,7 +425,8 @@ async function drainQuoteQueue(
 /**
  * Sync recent quote RFQs from a dispatcher's connected Outlook inbox.
  * Luna classifies from email body; quotes are enqueued then drained.
- * Outlook mark-read happens only after quoteRequest creation (in drain).
+ * Quoted mail stays unread. includeRead lists already-read mail in the
+ * same 7-day / newest-40 window. Dedup is the stored Outlook message id.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row.
  * @param {Function} processQuoteEmail quote-automation.processQuoteEmail.
@@ -482,7 +467,7 @@ async function syncDispatcherInbox(
   let drainedFirst;
   try {
     drainedFirst = await drainQuoteQueue(
-        tenant, dispatcher, processQuoteEmail, client);
+        tenant, dispatcher, processQuoteEmail);
   } catch (err) {
     if (isOutlookInvalidGrant(err)) {
       await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
@@ -672,7 +657,7 @@ async function syncDispatcherInbox(
           prev.createdAt : admin.firestore.FieldValue.serverTimestamp(),
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       }, {merge: true});
-      // Leave unread until drain creates quoteRequest (mark-read there).
+      // Quoted mail stays unread. Drain does not mark the message read.
     } catch (err) {
       processErrors += 1;
       writeLogFn("error", "quote", "Outlook sync quote enqueue failed", {
@@ -686,7 +671,7 @@ async function syncDispatcherInbox(
   let drainedAfter = {processed: 0, errors: 0};
   try {
     drainedAfter = await drainQuoteQueue(
-        tenant, dispatcher, processQuoteEmail, client);
+        tenant, dispatcher, processQuoteEmail);
   } catch (err) {
     if (isOutlookInvalidGrant(err)) {
       await flagOutlookNeedsReconnect(tenant, dispatcher.id, err.message);
