@@ -16504,25 +16504,39 @@ exports.getQuoteAdminConfig = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteAdminConfig);
 exports.getQuoteRequests = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteRequests);
-exports.getQuoteDispatcherData = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteDispatcherData);
-exports.saveQuoteSelection = onRequest({invoker: "public"},
-    quoteDashboard.handleSaveQuoteSelection);
-exports.saveQuoteSelections = onRequest({invoker: "public"},
-    quoteDashboard.handleSaveQuoteSelections);
-exports.updateQuoteDetails = onRequest({invoker: "public"},
-    quoteDashboard.handleUpdateQuoteDetails);
+exports.getQuoteDispatcherData = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleGetQuoteDispatcherData);
+exports.saveQuoteSelection = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleSaveQuoteSelection);
+exports.saveQuoteSelections = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleSaveQuoteSelections);
+exports.updateQuoteDetails = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleUpdateQuoteDetails);
 exports.generateQuoteEmail = onRequest({
   invoker: "public",
   timeoutSeconds: 300,
   memory: "512MiB",
 }, quoteDashboard.handleGenerateQuoteEmail);
-exports.approveQuoteEmail = onRequest({invoker: "public"},
-    quoteDashboard.handleApproveQuoteEmail);
-exports.dismissQuote = onRequest({invoker: "public"},
-    quoteDashboard.handleDismissQuote);
-exports.completeQuote = onRequest({invoker: "public"},
-    quoteDashboard.handleCompleteQuote);
+exports.approveQuoteEmail = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleApproveQuoteEmail);
+exports.dismissQuote = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleDismissQuote);
+exports.completeQuote = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleCompleteQuote);
 exports.markQuoteForReview = onRequest({invoker: "public"},
     quoteDashboard.handleMarkQuoteForReview);
 exports.exportQuoteDispatcherReport = onRequest({
@@ -16569,10 +16583,14 @@ exports.getQuoteDispatchers = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteDispatchers);
 exports.quoteAdminPage = onRequest({invoker: "public"},
     quoteDashboard.handleQuoteAdminPage);
-exports.quoteDispatcherPage = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteDispatcherPage);
-exports.quoteDispatcherHomePage = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteDispatcherHomePage);
+exports.quoteDispatcherPage = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleQuoteDispatcherPage);
+exports.quoteDispatcherHomePage = onRequest({
+  invoker: "public",
+  memory: "1GiB",
+}, quoteDashboard.handleQuoteDispatcherHomePage);
 exports.getQuoteAuthConfig = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteAuthConfig);
 exports.sendQuotePasswordReset = onRequest({invoker: "public"},
