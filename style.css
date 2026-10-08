@@ -361,6 +361,20 @@ body {
 .notif-body-frame, .email-frame-wrap iframe {
   width: 100%; min-height: 320px; border: 0; display: block; background: #fff;
 }
+.email-attachments {
+  margin: 12px 0 0; padding: 12px; border: 1px solid var(--ic-border);
+  border-radius: 8px; background: var(--ic-surface-2);
+}
+.email-attachments-label {
+  margin: 0 0 8px; font-size: 11px; font-weight: 700; letter-spacing: .04em;
+  text-transform: uppercase; color: var(--ic-text-faint);
+}
+.email-attachments ul { margin: 0; padding-left: 18px; }
+.email-attachments li { margin: 4px 0; font-size: 13px; }
+.email-attachments a { color: var(--ic-brand); font-weight: 600; }
+.email-attachments .att-size {
+  margin-left: 8px; color: var(--ic-text-faint); font-size: 12px; font-weight: 500;
+}
 .charge-opt-grid { display: grid; gap: 6px; width: 100%; }
 .charge-opt {
   text-align: left; justify-content: flex-start;

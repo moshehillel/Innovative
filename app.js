@@ -171,6 +171,48 @@
     })}`;
   }
 
+  function receivedInfo(item) {
+    if (item && item.receivedAt) {
+      const mailbox = item.receivedAtSource !== "logged";
+      return {
+        text: formatLogTime(item.receivedAt),
+        title: mailbox ?
+          "Received in the mailbox" :
+          "Logged time",
+      };
+    }
+    return {
+      text: formatLogTime(item && item.createdAt),
+      title: "Logged when Jerry parked this item — mailbox received time unavailable",
+    };
+  }
+
+  function formatBytes(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    if (n < 1024) return `${Math.round(n)} B`;
+    if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function attachmentListHtml(item, source) {
+    const list = Array.isArray(item && item.attachments) ? item.attachments : [];
+    if (!list.length || !item || !item.id) return "";
+    const rows = list.map((att) => {
+      const name = att.filename || "Attachment";
+      const size = formatBytes(att.size);
+      const href = `${BASE_URL}/getDashboardEmailAttachment?${tenantQuery}` +
+        `&source=${encodeURIComponent(source)}` +
+        `&id=${encodeURIComponent(item.id)}` +
+        `&index=${encodeURIComponent(att.index)}`;
+      return `<li><a href="${href}" target="_blank" rel="noopener">${bodyEsc(name)}</a>` +
+        (size ? `<span class="att-size">${bodyEsc(size)}</span>` : "") +
+        `</li>`;
+    }).join("");
+    return `<div class="email-attachments">` +
+      `<p class="email-attachments-label">Attachments</p><ul>${rows}</ul></div>`;
+  }
+
   function formatLogTime(iso) {
     if (!iso) return "—";
     const d = new Date(iso);
@@ -390,13 +432,18 @@
         ["Owner", bodyEsc(task.ownerBucket || "—")],
         ["To", bodyEsc(task.to || "—")],
         ["Cc", bodyEsc(task.cc || "—")],
-        ["Received", bodyEsc(formatLogTime(task.createdAt))],
+        ["Received", (() => {
+          const info = receivedInfo(task);
+          return `<span title="${bodyEsc(info.title)}">${bodyEsc(info.text)}</span>`;
+        })()],
         ["Dispatcher", bodyEsc(task.dispatcherName || task.dispatcherEmail || "—")],
       ]) +
       `<div class="why-box"><strong>Why it needs attention:</strong> ${bodyEsc(why)}</div>` +
       (task.isUrgentOld || task.ageLabel ?
         `<p><span class="age-badge">URGENT/OLD</span></p>` : "") +
-      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>`;
+      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>` +
+      attachmentListHtml(task, task.source === "additionalCharges" ?
+        "additionalCharges" : "task");
     const footer =
       renderChargeButtons(task) +
       `<button type="button" class="btn btn-outline btn-sm drawer-dismiss">Done / Resolve</button>`;
@@ -421,7 +468,10 @@
             inv.primusAmount != null ? inv.primusAmount : inv.customerRate))],
         ["Difference", diff == null ? "—" : bodyEsc(formatMoney(diff))],
         ["Status", bodyEsc(inv.displayLabel || inv.displayStatus || "—")],
-        ["Received", bodyEsc(formatLogTime(inv.createdAt))],
+        ["Received", (() => {
+          const info = receivedInfo(inv);
+          return `<span title="${bodyEsc(info.title)}">${bodyEsc(info.text)}</span>`;
+        })()],
         ["Invoice ID", bodyEsc(inv.id)],
       ]) +
       `<div class="why-box"><strong>Automation note:</strong> ${bodyEsc(why)}</div>`;
@@ -451,12 +501,16 @@
         ["Reason", bodyEsc(n.reason || "—")],
         ["Load", bodyEsc(n.loadNumber || "—")],
         ["Carrier", bodyEsc(n.carrierName || "—")],
-        ["Received", bodyEsc(formatLogTime(n.createdAt))],
+        ["Received", (() => {
+          const info = receivedInfo(n);
+          return `<span title="${bodyEsc(info.title)}">${bodyEsc(info.text)}</span>`;
+        })()],
       ]) +
       (n.reason ?
         `<div class="why-box"><strong>Why review:</strong> ${bodyEsc(n.reason)}</div>` :
         "") +
       `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>` +
+      attachmentListHtml(n, "notification") +
       `<div class="flag-form" hidden></div><div class="reply-form" hidden></div>`;
     const unhandled = n.type === "unhandled_email";
     const footer =
@@ -800,8 +854,8 @@
         }
       }
       if (sort === "amount") return itemAmount(b) - itemAmount(a);
-      const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
-      const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+      const ta = Date.parse(a.receivedAt || a.createdAt || "") || 0;
+      const tb = Date.parse(b.receivedAt || b.createdAt || "") || 0;
       return sort === "oldest" ? ta - tb : tb - ta;
     });
     return list;
@@ -853,7 +907,7 @@
           <td>${bodyEsc(formatMoney(task.chargesTotal))}</td>
           <td>${bodyEsc(shortText(task.reason || task.description, 40) || "—")}</td>
           <td>${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">URGENT/OLD</span>' : ""}</td>
-          <td title="When Jerry logged this item (not Gmail received time)">${bodyEsc(formatLogTime(task.createdAt))}</td>
+          <td title="${bodyEsc(receivedInfo(task).title)}">${bodyEsc(receivedInfo(task).text)}</td>
           <td class="row-actions">
             <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
             <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
@@ -962,7 +1016,7 @@
         `<a class="load-link" href="#">${bodyEsc(inv.loadNumber)}</a>` : "—"}</td>
       <td>${bodyEsc(inv.proNumber || "—")}</td>
       <td>${bodyEsc(formatMoney(inv.invoiceAmount))}</td>
-      <td>${bodyEsc(formatLogTime(inv.createdAt))}</td>
+      <td>${bodyEsc(receivedInfo(inv).text)}</td>
       <td><span class="status-pill ${statusClass(status)}">${bodyEsc(status)}</span></td>
     </tr>`;
   }
@@ -1148,7 +1202,7 @@
           <td>${bodyEsc(shortText(n.subject || n.title, 70) || "(no subject)")}</td>
           <td>${bodyEsc(shortText(n.from || n.to, 36) || "—")}</td>
           <td>${bodyEsc(n.type || "ops")}</td>
-          <td>${bodyEsc(formatLogTime(n.createdAt))}</td>
+          <td title="${bodyEsc(receivedInfo(n).title)}">${bodyEsc(receivedInfo(n).text)}</td>
           <td><button type="button" class="btn btn-sm btn-outline notif-open">Open</button></td>
         </tr>`;
       }).join("")}</tbody></table>`;
