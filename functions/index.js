@@ -15659,6 +15659,74 @@ exports.refreshPrimusUiSession = onSchedule("every 12 hours", async () => {
   await primusUiBridge.renewUiSession();
 });
 
+/**
+ * Clears a missing-POD pause and re-enters processPrimusWorkflow.
+ * Same handoff as Resume Workflow: rate checks, customer email, and the
+ * other gates still run inside that workflow.
+ * @param {string} invoiceId Firestore invoice id.
+ * @param {string} resumeFrom Step stored on workflowPausedAtStep.
+ * @return {Promise<object>} Workflow HTTP result.
+ */
+async function resumeMissingPodWorkflow(invoiceId, resumeFrom) {
+  const step = resumeFrom || "pod_extraction";
+  const invoiceRef = tcol(DEFAULT_TENANT, "invoices").doc(String(invoiceId));
+  await invoiceRef.update({
+    workflowPausedAtStep: null,
+    workflowPausedAt: null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  await writeLog("info", "workflow",
+      "Daily missing-POD check resuming workflow", {
+        invoiceId: String(invoiceId),
+        resumeFrom: step,
+      });
+  return kickPrimusWorkflow(String(invoiceId), {resumeFrom: step});
+}
+
+const missingPodDaily = require("./missing-pod-daily");
+missingPodDaily.init({
+  FieldPath: admin.firestore.FieldPath,
+  FieldValue: admin.firestore.FieldValue,
+  invoicesCollection: () => tcol(DEFAULT_TENANT, "invoices"),
+  settingsDoc: () => db.collection("settings").doc("missingPodDaily"),
+  fetchPrimusBooking,
+  checkBookingHasPod: (args) => primusUiBridge.checkBookingHasPod(args),
+  resumeWorkflow: resumeMissingPodWorkflow,
+  writeLog,
+});
+
+/**
+ * Once a day: Innovative invoices held at missing_pod. If Primus now has a
+ * POD, resume the normal billing workflow. Otherwise leave the hold.
+ * 7:00 AM America/Cayman.
+ */
+exports.checkMissingPodDaily = onSchedule({
+  schedule: "0 7 * * *",
+  timeZone: "America/Cayman",
+  timeoutSeconds: 540,
+  memory: "512MiB",
+}, async () => {
+  try {
+    const result = await missingPodDaily.runMissingPodDailyCheck();
+    console.log("checkMissingPodDaily:", JSON.stringify({
+      checked: result.checked,
+      stillMissing: result.stillMissing,
+      resumed: result.resumed,
+      skipped: result.skipped,
+      failed: result.failed,
+      deferred: result.deferred,
+      truncated: result.truncated,
+    }));
+  } catch (error) {
+    console.error("checkMissingPodDaily error:", error.message);
+    await writeLog("error", "workflow",
+        "Daily missing-POD check failed", {
+          error: error.message,
+        });
+    throw error;
+  }
+});
+
 // --- Quote automation (LTL RFQ → rate shop → dispatcher review) ---
 const quoteAutomation = require("./quote-automation");
 const quoteDashboard = require("./quote-dashboard");
