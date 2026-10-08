@@ -826,8 +826,14 @@ async function retryPendingTransientWorkflows() {
 exports.retryPendingTransientWorkflows = retryPendingTransientWorkflows;
 
 /**
- * Pushes the carrier payable to QuickBooks via Primus REST.
- * Idempotent via primusSteps.qbBillingSynced. Alerts ops on failure.
+ * Pushes the Primus customer invoice / payable to QuickBooks Desktop
+ * via manage.php rePushToQB.
+ * Idempotent via primusSteps.qbBillingSynced (this doc) and a cross-doc
+ * check on the same Primus customerInvoiceId. Alerts ops on failure.
+ *
+ * Do not call with reuseAlreadyIssued=true after a Primus re-issue skip —
+ * rePushToQB creates a second QB invoice with the same DocNumber.
+ *
  * @param {object} args Args.
  * @param {object} args.req Express request (for alert links).
  * @param {object} args.invoiceDoc Firestore invoice snapshot.
@@ -836,6 +842,8 @@ exports.retryPendingTransientWorkflows = retryPendingTransientWorkflows;
  * @param {object} args.primusSteps Mutable primusSteps map (updated in place).
  * @param {string|number} args.customerInvoiceId Primus UI customer invoice id.
  * @param {string|number} [args.invoiceNumber] Issued customer invoice number.
+ * @param {boolean} [args.reuseAlreadyIssued] When true, mark synced without
+ *   calling rePushToQB ( Primus already queued QB on original issue).
  * @return {Promise<object>} {synced, skipped, uploaded, failed, error}.
  */
 async function pushCarrierBillToQuickBooks(args) {
@@ -847,6 +855,7 @@ async function pushCarrierBillToQuickBooks(args) {
     primusSteps,
     customerInvoiceId,
     invoiceNumber: invoiceNumberArg,
+    reuseAlreadyIssued,
   } = args;
   if (!customerInvoiceId) {
     return {synced: false, skipped: true, reason: "no customerInvoiceId"};
@@ -866,9 +875,10 @@ async function pushCarrierBillToQuickBooks(args) {
 
   /**
    * @param {object} syncInfo Success metadata for logs.
+   * @param {string} [logMessage] Override default success log message.
    * @return {Promise<object>}
    */
-  async function markSynced(syncInfo) {
+  async function markSynced(syncInfo, logMessage) {
     if (primusSteps) {
       primusSteps.qbBillingSynced = true;
       primusSteps.qbBillingSyncedAt = new Date().toISOString();
@@ -892,19 +902,20 @@ async function pushCarrierBillToQuickBooks(args) {
       }
     }
     await invoiceDoc.ref.update(updatePayload);
-    await writeLog("info", "workflow",
-        "Carrier bill pushed to QuickBooks", {
-          invoiceId,
-          loadNumber,
-          customerInvoiceId: uiInvoiceId,
-          invoiceNumber,
-          method: syncInfo.method,
-          ...syncInfo.extra,
-        });
+    const msg = logMessage || "Carrier bill pushed to QuickBooks";
+    await writeLog("info", "workflow", msg, {
+      invoiceId,
+      loadNumber,
+      customerInvoiceId: uiInvoiceId,
+      invoiceNumber,
+      method: syncInfo.method,
+      ...syncInfo.extra,
+    });
     await logWorkflowStep({
       invoiceId,
       stepName: "qb_billing_sync",
-      stepStatus: "success",
+      stepStatus: syncInfo.skipped ? "skipped" : "success",
+      reason: syncInfo.skipped ? (syncInfo.reason || syncInfo.method) : null,
       output: {
         customerInvoiceId: uiInvoiceId,
         invoiceNumber,
@@ -912,7 +923,59 @@ async function pushCarrierBillToQuickBooks(args) {
         ...syncInfo.extra,
       },
     });
-    return {synced: true, method: syncInfo.method, ...syncInfo.extra};
+    return {
+      synced: true,
+      skipped: !!syncInfo.skipped,
+      method: syncInfo.method,
+      ...syncInfo.extra,
+    };
+  }
+
+  // Reusing an already-issued Primus invoice: never rePushToQB.
+  // Aug 2026: bulk resumes re-pushed BLF/Brumis invoices and created
+  // duplicate AR invoices in QuickBooks Desktop with the same DocNumber.
+  if (reuseAlreadyIssued) {
+    return markSynced({
+      method: "skipped_already_issued",
+      skipped: true,
+      reason: "already_issued_reuse",
+      extra: {},
+    }, "QB push skipped — Primus invoice already issued (avoid QB duplicate)");
+  }
+
+  // Cross-doc idempotency: another Firestore invoice may have already
+  // pushed this same Primus customerInvoiceId to QB.
+  try {
+    const idVariants = [uiInvoiceId];
+    const asNum = Number(uiInvoiceId);
+    if (Number.isFinite(asNum) && String(asNum) === uiInvoiceId) {
+      idVariants.push(asNum);
+    }
+    const siblingSnap = await db.collection("invoices")
+        .where("customerInvoiceId", "in", idVariants)
+        .limit(25)
+        .get();
+    const siblingSynced = siblingSnap.docs.some((doc) => {
+      if (doc.id === invoiceId) return false;
+      const steps = doc.data().primusSteps || {};
+      return !!steps.qbBillingSynced &&
+        steps.qbBillingMethod !== "skipped_already_issued";
+    });
+    if (siblingSynced) {
+      return markSynced({
+        method: "skipped_sibling_synced",
+        skipped: true,
+        reason: "sibling_qbBillingSynced",
+        extra: {},
+      }, "QB push skipped — sibling invoice already synced this Primus id");
+    }
+  } catch (siblingErr) {
+    await writeLog("warn", "workflow",
+        "QB sibling sync check failed — continuing with push", {
+          invoiceId,
+          customerInvoiceId: uiInvoiceId,
+          error: siblingErr.message,
+        });
   }
 
   /**
@@ -2962,7 +3025,7 @@ exports.processPrimusWorkflow = onRequest(
                 });
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_exists");
-                // Backfill QB if issued before sync moved earlier.
+                // Already issued: do NOT rePushToQB (creates QB duplicates).
                 await pushCarrierBillToQuickBooks({
                   req,
                   invoiceDoc,
@@ -2971,6 +3034,7 @@ exports.processPrimusWorkflow = onRequest(
                   primusSteps,
                   customerInvoiceId: invoice.customerInvoiceId,
                   invoiceNumber: invoice.issuedInvoiceNumber,
+                  reuseAlreadyIssued: true,
                 });
               } else {
                 const bk = await fetchPrimusBooking(invoice.loadNumber);
@@ -3130,9 +3194,8 @@ exports.processPrimusWorkflow = onRequest(
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_generated");
 
-                // Push carrier bill to QB immediately — do not wait for
-                // customer-email approval (loads parked at that gate never
-                // reached the old end-of-workflow QB call).
+                // Push to QB only on a fresh issue. Reusing an already-issued
+                // Primus invoice must not rePushToQB (duplicate DocNumbers).
                 await pushCarrierBillToQuickBooks({
                   req,
                   invoiceDoc,
@@ -3141,6 +3204,7 @@ exports.processPrimusWorkflow = onRequest(
                   primusSteps,
                   customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
                   invoiceNumber: invoiceGenerationResult.invoiceNumber,
+                  reuseAlreadyIssued: !!invoiceGenerationResult.reused,
                 });
               }
             } else if (invoice.customerInvoiceId) {
@@ -3174,6 +3238,7 @@ exports.processPrimusWorkflow = onRequest(
                 primusSteps,
                 customerInvoiceId: invoice.customerInvoiceId,
                 invoiceNumber: invoice.issuedInvoiceNumber,
+                reuseAlreadyIssued: true,
               });
             } else {
               invoiceGenerationResult =
@@ -3273,6 +3338,7 @@ exports.processPrimusWorkflow = onRequest(
                 primusSteps,
                 customerInvoiceId: invoiceGenerationResult.customerInvoiceId,
                 invoiceNumber: invoiceGenerationResult.invoiceNumber,
+                reuseAlreadyIssued: !!invoiceGenerationResult.reused,
               });
             }
           } // end runBillingPipeline

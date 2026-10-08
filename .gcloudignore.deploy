@@ -1,0 +1,7 @@
+﻿# Deploy upload — include functions/node_modules for Firebase packaging
+.git/
+.cursor/
+deliverables/
+*.zip
+*.pdf
+deploy-*-cloudbuild-out*.txt
