@@ -1596,6 +1596,51 @@ function quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail) {
 }
 
 /**
+ * @return {object} Zeroed inbox counters.
+ */
+function emptyDispatcherQuoteCounts() {
+  return {
+    total: 0,
+    pending: 0,
+    awaiting: 0,
+    draftReady: 0,
+    sent: 0,
+    forReview: 0,
+    dismissed: 0,
+    completed: 0,
+  };
+}
+
+/**
+ * Adds one dispatcher-owned quote into inbox counters.
+ * @param {object} counts Mutable counters.
+ * @param {object} data Quote fields.
+ * @return {void}
+ */
+function tallyDispatcherQuote(counts, data) {
+  counts.total += 1;
+  if (isDismissedQuote(data)) {
+    counts.dismissed += 1;
+    return;
+  }
+  if (isCompletedQuote(data)) {
+    counts.completed += 1;
+    return;
+  }
+  if (isForReviewQuote(data)) counts.forReview += 1;
+  const status = normalizeQuoteStatus(data.status);
+  if (status === "awaiting_dispatcher") {
+    counts.awaiting += 1;
+    counts.pending += 1;
+  } else if (status === "draft_ready") {
+    counts.draftReady += 1;
+    counts.pending += 1;
+  } else if (status === "sent") {
+    counts.sent += 1;
+  }
+}
+
+/**
  * Counts all quotes assigned to one dispatcher by status.
  * @param {object} tenant Tenant.
  * @param {object} dispatcher Dispatcher row (id + email).
@@ -1611,41 +1656,13 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
           "status", "dismissedAt", "completedAt",
           "assignedDispatcherEmail", "forReview")
       .get();
-  const counts = {
-    total: 0,
-    pending: 0,
-    awaiting: 0,
-    draftReady: 0,
-    sent: 0,
-    forReview: 0,
-    dismissed: 0,
-    completed: 0,
-  };
+  const counts = emptyDispatcherQuoteCounts();
   for (const doc of snap.docs) {
     const data = doc.data();
     if (!quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail)) {
       continue;
     }
-    counts.total += 1;
-    if (isDismissedQuote(data)) {
-      counts.dismissed += 1;
-      continue;
-    }
-    if (isCompletedQuote(data)) {
-      counts.completed += 1;
-      continue;
-    }
-    if (isForReviewQuote(data)) counts.forReview += 1;
-    const status = normalizeQuoteStatus(data.status);
-    if (status === "awaiting_dispatcher") {
-      counts.awaiting += 1;
-      counts.pending += 1;
-    } else if (status === "draft_ready") {
-      counts.draftReady += 1;
-      counts.pending += 1;
-    } else if (status === "sent") {
-      counts.sent += 1;
-    }
+    tallyDispatcherQuote(counts, data);
   }
   return counts;
 }
@@ -1670,40 +1687,49 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
   const dispatcherId = String(dispatcher.id || dispatcher);
   const dispatcherEmail = quoteDispatchers.normalizeEmail(
       dispatcher.email || "");
-  // Over-fetch because many quoteRequests are not this dispatcher's.
-  // Need offset+limit matches (+1 to detect hasMore).
-  const fetchCap = Math.min(
-      Math.max((offset + limit + 1) * 5, (limit + 1) * 5),
-      500);
-  const [snap, counts] = await Promise.all([
-    col(tenant, "quoteRequests")
-        .orderBy("createdAt", "desc")
-        .limit(fetchCap)
-        .get(),
-    countQuotesForDispatcher(tenant, dispatcher),
-  ]);
-  const items = [];
-  let skipped = 0;
-  let hasMore = false;
+  // Scan this dispatcher's quotes only. A global createdAt window hides
+  // older assigned quotes and reports hasMore=false before the page fills.
+  const snap = await col(tenant, "quoteRequests")
+      .where("assignedDispatcherId", "==", dispatcherId)
+      .select(
+          "status", "dismissedAt", "completedAt",
+          "assignedDispatcherEmail", "forReview", "createdAt")
+      .get();
+  const counts = emptyDispatcherQuoteCounts();
+  const matches = [];
   for (const doc of snap.docs) {
     const data = doc.data();
     if (!quoteBelongsToDispatcher(data, dispatcherId, dispatcherEmail)) {
       continue;
     }
+    tallyDispatcherQuote(counts, data);
     if (!matchesInboxStatus(data, opts.status)) continue;
-    if (skipped < offset) {
-      skipped++;
-      continue;
-    }
-    if (items.length >= limit) {
-      hasMore = true;
-      break;
-    }
-    items.push(serializeInboxQuote(doc, data));
+    const created = coerceDate(data.createdAt);
+    matches.push({
+      id: doc.id,
+      createdAtMs: created ? created.getTime() : 0,
+    });
   }
-  if (!hasMore && items.length === limit && snap.docs.length >= fetchCap) {
-    // Hit scan cap with a full page — more may exist beyond the window.
-    hasMore = true;
+  matches.sort((a, b) => {
+    if (b.createdAtMs !== a.createdAtMs) return b.createdAtMs - a.createdAtMs;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? 1 : -1;
+  });
+  const page = matches.slice(offset, offset + limit);
+  const hasMore = matches.length > offset + limit;
+  const items = [];
+  if (page.length) {
+    const refs = page.map((row) =>
+      col(tenant, "quoteRequests").doc(row.id));
+    const full = deps.db ?
+      await deps.db.getAll(...refs) :
+      await Promise.all(refs.map((ref) => ref.get()));
+    const byId = new Map(full.map((doc) => [doc.id, doc]));
+    for (const row of page) {
+      const doc = byId.get(row.id);
+      if (!doc || !doc.exists) continue;
+      items.push(serializeInboxQuote(doc, doc.data()));
+    }
   }
   return {items, counts, limit, offset, hasMore};
 }

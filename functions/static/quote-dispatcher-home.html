@@ -1377,6 +1377,18 @@
       return visible;
     }
 
+    function inboxTabTotal(counts) {
+      const c = counts || {};
+      if (filterStatus === "pending") return Number(c.pending) || 0;
+      if (filterStatus === "sent") return Number(c.sent) || 0;
+      if (filterStatus === "for_review") return Number(c.forReview) || 0;
+      if (filterStatus === "completed") return Number(c.completed) || 0;
+      return Math.max(0,
+          (Number(c.total) || 0) -
+          (Number(c.dismissed) || 0) -
+          (Number(c.completed) || 0));
+    }
+
     function syncLoadMoreButton() {
       const wrap = document.getElementById("load-more-wrap");
       const btn = document.getElementById("btn-load-more");
@@ -1653,9 +1665,11 @@
       const counts = res.counts || {};
       applyCounts(counts);
       const pageItems = filterInboxPage(raw);
+      let added = pageItems.length;
       if (append) {
         const seen = new Set(inboxItems.map((i) => String(i.id)));
         const fresh = pageItems.filter((i) => !seen.has(String(i.id)));
+        added = fresh.length;
         inboxItems = inboxItems.concat(fresh);
       } else {
         inboxItems = pageItems;
@@ -1663,9 +1677,12 @@
       inboxOffset = Number(res.offset) >= 0 ?
         Number(res.offset) + raw.length :
         inboxItems.length;
-      // Prefer server hasMore; if client filtered some away, still trust
-      // server pagination cursor based on raw page size.
-      inboxHasMore = !!res.hasMore;
+      const tabTotal = inboxTabTotal(counts);
+      if (append && !added) {
+        inboxHasMore = false;
+      } else {
+        inboxHasMore = !!res.hasMore || tabTotal > inboxItems.length;
+      }
       renderInboxCards(inboxItems);
       } finally {
         if (append) loadMoreInFlight = false;
