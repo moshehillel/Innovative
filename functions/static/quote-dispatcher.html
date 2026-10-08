@@ -2991,9 +2991,15 @@
         return;
       }
       try {
-        await QuoteAuth.sendPasswordResetEmail(email);
+        const res = await apiFetch("/sendQuotePasswordReset?tenantId=" +
+          encodeURIComponent(TENANT_ID), {
+          method: "POST",
+          body: JSON.stringify({email: email}),
+        });
+        if (!res.ok) throw new Error(res.error || "Could not send reset email");
         document.getElementById("login-success").textContent =
-          "Password reset email sent. Check your inbox.";
+          res.message ||
+          "If that email is on the quote roster, a reset link was sent.";
         document.getElementById("login-success").classList.remove("hidden");
       } catch (err) {
         const errEl = document.getElementById("login-error");

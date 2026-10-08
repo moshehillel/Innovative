@@ -16575,6 +16575,8 @@ exports.quoteDispatcherHomePage = onRequest({invoker: "public"},
     quoteDashboard.handleQuoteDispatcherHomePage);
 exports.getQuoteAuthConfig = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteAuthConfig);
+exports.sendQuotePasswordReset = onRequest({invoker: "public"},
+    quoteDashboard.handleSendQuotePasswordReset);
 exports.getQuoteOutlookConnectUrl = onRequest({invoker: "public"},
     quoteDashboard.handleGetQuoteOutlookConnectUrl);
 exports.quoteOutlookDisconnect = onRequest({invoker: "public"},
