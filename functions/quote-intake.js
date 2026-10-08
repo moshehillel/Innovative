@@ -2943,6 +2943,261 @@ function moveAddressOntoConsignee(fromParty, consignee) {
 }
 
 /**
+ * Five-digit US ZIP, or "" when the party has none.
+ * Four-digit and ZIP+4 values count as already present.
+ * @param {object|null|undefined} party Address party.
+ * @return {string}
+ */
+function partyStoredZip(party) {
+  if (!party || typeof party !== "object") return "";
+  const digits = String(
+      party.zipCode || party.zipcode || party.zip || "")
+      .replace(/\D/g, "");
+  if (digits.length === 9) return digits.slice(0, 5);
+  if (digits.length === 5 || digits.length === 4) return digits;
+  return "";
+}
+
+/**
+ * Plausible USPS ZIP (00501–99950). Same 5-digit shape as zip fill.
+ * @param {string} zip Five digits.
+ * @return {boolean}
+ */
+function isPlausibleUsZip(zip) {
+  if (!/^\d{5}$/.test(String(zip || ""))) return false;
+  const n = Number(zip);
+  return n >= 501 && n <= 99950;
+}
+
+/**
+ * True when a subject token is a PO, quote id, phone fragment, or weight.
+ * @param {string} subject Full subject.
+ * @param {number} index Start of the matched token.
+ * @param {number} rawLen Length of the matched token (ZIP or ZIP+4).
+ * @return {boolean}
+ */
+function subjectZipTokenRejected(subject, index, rawLen) {
+  const before = String(subject || "")
+      .slice(Math.max(0, index - 40), index);
+  const after = String(subject || "")
+      .slice(index + rawLen, index + rawLen + 24);
+  if (/#\s*$/.test(before)) return true;
+  const idPrefix = new RegExp(
+      "(?:^|[^A-Za-z])(?:" +
+      "P\\.?\\s*O\\.?|purchase\\s+order|" +
+      "S\\.?\\s*O\\.?|sales\\s+order|order|" +
+      "ref(?:erence)?|inv(?:oice)?|" +
+      "bol|pro|tracking|load|ext|id" +
+      ")\\s*[#:.-]?\\s*$",
+      "i",
+  );
+  if (idPrefix.test(before)) return true;
+  if (/(?:^|[^A-Za-z])(?:quote|rfq)\s*#\s*$/i.test(before)) return true;
+  if (/(?:^|[^A-Za-z])Q\s*[-#]?\s*$/.test(before)) return true;
+  if (/(?:\(\s*\d{3}\s*\)|\b\d{3})\s*[-.\s]\s*$/.test(before)) return true;
+  if (/^\s*(?:lbs?|pounds?|kgs?|kilos?|class)\b/i.test(after)) return true;
+  return false;
+}
+
+/**
+ * Plausible US ZIPs in a subject, in order, skipping ids and phones.
+ * @param {string} subject Email subject.
+ * @return {Array<{zip: string, index: number, end: number}>}
+ */
+function plausibleSubjectZips(subject) {
+  const text = String(subject || "");
+  const out = [];
+  const re = /(?<!\d)(\d{5})(?:-\d{4})?(?!\d)/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const zip = match[1];
+    if (!isPlausibleUsZip(zip)) continue;
+    if (subjectZipTokenRejected(text, match.index, match[0].length)) {
+      continue;
+    }
+    out.push({
+      zip,
+      index: match.index,
+      end: match.index + match[0].length,
+    });
+  }
+  return out;
+}
+
+/**
+ * True when the text between two ZIPs is an origin→dest separator.
+ * @param {string} between Text between two ZIP tokens.
+ * @return {boolean}
+ */
+function isSubjectLaneSeparator(between) {
+  const text = String(between || "");
+  if (/^\s*(?:to|->|=>|→|>|\/|-|–|—)\s*$/i.test(text)) return true;
+  return /^\s+$/.test(text);
+}
+
+/**
+ * Origin/dest pair when the subject pattern makes the lane clear.
+ * @param {string} subject Email subject.
+ * @param {Array<{zip: string, index: number, end: number}>} tokens ZIPs.
+ * @return {{origin: string, dest: string}|null}
+ */
+function directionalSubjectZips(subject, tokens) {
+  const text = String(subject || "");
+  const list = tokens || [];
+  for (let i = 0; i < list.length - 1; i++) {
+    const between = text.slice(list[i].end, list[i + 1].index);
+    if (isSubjectLaneSeparator(between)) {
+      return {origin: list[i].zip, dest: list[i + 1].zip};
+    }
+  }
+  const allowed = new Set(list.map((t) => t.zip));
+  const patterns = [
+    // eslint-disable-next-line max-len
+    /\bfrom\b[^0-9]{0,48}(\d{5})(?!\d)[\s\S]{0,60}?\bto\b[^0-9]{0,48}(\d{5})(?!\d)/i,
+    // eslint-disable-next-line max-len
+    /\b(?:pickup|pick\s*up|origin)\b[^0-9]{0,40}(\d{5})(?!\d)[\s\S]{0,80}?\b(?:deliver(?:y)?|destination|dest)\b[^0-9]{0,40}(\d{5})(?!\d)/i,
+  ];
+  for (const re of patterns) {
+    const match = text.match(re);
+    if (!match) continue;
+    if (allowed.has(match[1]) && allowed.has(match[2])) {
+      return {origin: match[1], dest: match[2]};
+    }
+  }
+  return null;
+}
+
+/**
+ * Write a ZIP onto a party without touching other fields.
+ * @param {object|null|undefined} party Address party.
+ * @param {string} zip Five-digit ZIP.
+ * @return {object}
+ */
+function partyWithZip(party, zip) {
+  const base = party && typeof party === "object" ? party : {};
+  return {
+    ...base,
+    zipCode: zip,
+    country: String(base.country || "US").trim() || "US",
+  };
+}
+
+/**
+ * Lane shipper, falling back to the shared extract shipper.
+ * @param {object} extracted Quote extract.
+ * @param {object} lane Lane.
+ * @return {object}
+ */
+function laneShipperParty(extracted, lane) {
+  if (lane && lane.shipper && typeof lane.shipper === "object") {
+    return lane.shipper;
+  }
+  if (extracted && extracted.shipper &&
+      typeof extracted.shipper === "object") {
+    return extracted.shipper;
+  }
+  return {};
+}
+
+/**
+ * When the body/AI left a lane ZIP empty, fill it from the subject.
+ * Does not overwrite a ZIP already on the party.
+ * @param {object} extracted Parsed quote request.
+ * @param {object} [opts] subject, body.
+ * @return {object}
+ */
+function applySubjectLineZips(extracted, opts) {
+  if (!extracted || typeof extracted !== "object") return extracted;
+  if (!Array.isArray(extracted.lanes) || !extracted.lanes.length) {
+    return extracted;
+  }
+  const subject = String(
+      (opts && opts.subject) || extracted._sourceSubject || "");
+  if (!subject.trim()) return extracted;
+  const tokens = plausibleSubjectZips(subject);
+  if (!tokens.length) return extracted;
+  const directed = directionalSubjectZips(subject, tokens);
+  const unique = [];
+  for (const token of tokens) {
+    if (!unique.includes(token.zip)) unique.push(token.zip);
+  }
+  const lanes = extracted.lanes.filter(
+      (lane) => lane && typeof lane === "object");
+  const missingDest = lanes.filter(
+      (lane) => !partyStoredZip(lane.consignee));
+  let applied = false;
+
+  /**
+   * @param {object} lane Lane.
+   * @param {string} zip ZIP to store on the shipper.
+   */
+  const fillOrigin = (lane, zip) => {
+    const ship = laneShipperParty(extracted, lane);
+    if (partyStoredZip(ship)) return;
+    const consZip = partyStoredZip(lane.consignee);
+    if (consZip && consZip === zip) return;
+    lane.shipper = partyWithZip(ship, zip);
+    applied = true;
+    if (!extracted.shipper || typeof extracted.shipper !== "object") {
+      extracted.shipper = partyWithZip(null, zip);
+    } else if (!partyStoredZip(extracted.shipper)) {
+      extracted.shipper = partyWithZip(extracted.shipper, zip);
+    }
+  };
+
+  /**
+   * @param {object} lane Lane.
+   * @param {string} zip ZIP to store on the consignee.
+   */
+  const fillDest = (lane, zip) => {
+    if (missingDest.length !== 1 && lanes.length !== 1) return;
+    const cons = lane.consignee && typeof lane.consignee === "object" ?
+      lane.consignee : {};
+    if (partyStoredZip(cons)) return;
+    const shipZip = partyStoredZip(laneShipperParty(extracted, lane));
+    if (shipZip && shipZip === zip) return;
+    lane.consignee = partyWithZip(cons, zip);
+    applied = true;
+  };
+
+  if (directed) {
+    for (const lane of lanes) {
+      if (!partyStoredZip(laneShipperParty(extracted, lane))) {
+        fillOrigin(lane, directed.origin);
+      }
+      if (!partyStoredZip(lane.consignee)) {
+        fillDest(lane, directed.dest);
+      }
+    }
+  } else if (unique.length === 1) {
+    const zip = unique[0];
+    const missingOrigin = lanes.filter(
+        (lane) => !partyStoredZip(laneShipperParty(extracted, lane)));
+    const anyMissingDest = missingDest.length > 0;
+    if (missingOrigin.length && !anyMissingDest) {
+      for (const lane of missingOrigin) fillOrigin(lane, zip);
+    } else if (!missingOrigin.length && missingDest.length === 1) {
+      fillDest(missingDest[0], zip);
+    }
+  } else if (unique.length >= 2) {
+    for (const lane of lanes) {
+      const shipZip = partyStoredZip(laneShipperParty(extracted, lane));
+      const consZip = partyStoredZip(lane.consignee);
+      if (!shipZip && consZip && unique.includes(consZip)) {
+        const other = unique.filter((z) => z !== consZip);
+        if (other.length === 1) fillOrigin(lane, other[0]);
+      } else if (shipZip && !consZip && unique.includes(shipZip)) {
+        const other = unique.filter((z) => z !== shipZip);
+        if (other.length === 1) fillDest(lane, other[0]);
+      }
+    }
+  }
+
+  if (applied) pushExtractWarning(extracted, "zip from subject");
+  return extracted;
+}
+
+/**
  * Fill empty lane shipper from "(STG City, ST)" in the lane label.
  * @param {object} extracted Parsed quote request.
  * @return {object}
