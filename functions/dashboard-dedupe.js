@@ -163,7 +163,7 @@ function isExactDuplicateItem(a, b) {
  * Groups items that are the same charge or the same email/follow-up.
  * Items we cannot tell apart stay in their own group.
  * @param {object[]} items Items.
- * @return {object[][]}
+ * @return {Array<Array<object>>}
  */
 function groupExactDuplicates(items) {
   const list = Array.isArray(items) ? items : [];
@@ -183,6 +183,7 @@ function groupExactDuplicates(items) {
   /**
    * @param {number} a Index.
    * @param {number} b Index.
+   * @return {void}
    */
   const union = (a, b) => {
     const pa = find(a);
