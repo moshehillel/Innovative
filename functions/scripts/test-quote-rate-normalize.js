@@ -313,6 +313,19 @@ check("pickFakPricingFromCarrierMarkups All/P",
       type: "P", active: "1", erased: "0",
     }])),
     JSON.stringify({rate: 15, type: "profit%", min: 80}));
+// Pricing-tab Profit% is a floor: sell = cost + max(cost×rate%, min$).
+// 25% of $380.93 is $95.23, so the $150 minimum applies → $531.
+const fak25 = {rate: 25, type: "P", min: 150};
+check("pick All-carrier FAK 25% min $150",
+    JSON.stringify(rateShop.pickFakPricingFromCarrierMarkups([{
+      carrier: "0", carrierName: "All", rate: "25", min: "150",
+      type: "P", active: "1", erased: "0",
+    }])),
+    JSON.stringify({rate: 25, type: "profit%", min: 150}));
+check("FAK 25% min $150 floors a $380.93 cost",
+    rateShop.computeSellRate(380.93, {fak: fak25}), 531);
+check("FAK 25% min $150 uses percent above $600",
+    rateShop.computeSellRate(800, {fak: fak25}), 1000);
 check("normalizeFak rejects bad rows",
     rateShop.normalizeFakPricing({rate: "x", min: 80}), null);
 
