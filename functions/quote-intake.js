@@ -127,10 +127,12 @@ function normalizeExtractedQuote(extracted, opts) {
   applyStgShippingFromSections(next, opts && opts.body);
   applyCoreHomePoTableFreight(next, opts && opts.body);
   fillShipperFromLaneLabelOrigin(next);
+  applySubjectLineZips(next, opts);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
   applyMixedPalletDimLines(next, opts && opts.body);
   applyPerPalletWeightTable(next, opts && opts.body);
+  applyStandaloneStackedPalletSpec(next, opts && opts.body);
   normalizeFreightOnExtract(next, opts && opts.body, dimOpts);
   redistributeEvenTotalWeight(next, opts && opts.body);
   senderRules.applySenderDefaultedDimOverrides(
@@ -2307,6 +2309,150 @@ function buildSingleLaneExtract(opts) {
 }
 
 /**
+ * Own-line stack: "1 Pallet" / "620 lbs" / "48x40x32" (blank lines ok).
+ * Exactly one dim line and one lbs line, close together. Does not scan
+ * mid-sentence triples (those stay with labeled / compact parsers).
+ * @param {string} body Email body.
+ * @return {object|null} qty, weight, length, width, height.
+ */
+function extractStandaloneStackedPalletSpec(body) {
+  const lines = String(body || "").split(/\r?\n/);
+  const dims = [];
+  const weights = [];
+  const pallets = [];
+  const dimRe =
+    /^([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*$/i;
+  const wtRe = /^([\d,][\d,]*(?:\.\d+)?)\s*lbs?\s*$/i;
+  const pltRe = /^(\d{1,3})\s+pallets?\s*$/i;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    let m = line.match(dimRe);
+    if (m) {
+      const length = Number(m[1]);
+      const width = Number(m[2]);
+      const height = Number(m[3]);
+      if (length > 0 && length < 200 && width > 0 && width < 200 &&
+          height > 0 && height <= 120) {
+        dims.push({i, length, width, height});
+      }
+      continue;
+    }
+    m = line.match(wtRe);
+    if (m) {
+      const weight = parseLooseNumber(m[1]);
+      if (weight != null && weight >= 50 && weight <= 20000) {
+        weights.push({i, weight});
+      }
+      continue;
+    }
+    m = line.match(pltRe);
+    if (m) {
+      const qty = Number(m[1]);
+      if (qty >= 1 && qty <= 20) pallets.push({i, qty});
+    }
+  }
+  if (dims.length !== 1 || weights.length !== 1) return null;
+  if (Math.abs(dims[0].i - weights[0].i) > 8) return null;
+  if (pallets.length > 1) return null;
+  let qty = 1;
+  if (pallets.length === 1) {
+    if (Math.abs(pallets[0].i - dims[0].i) > 8) return null;
+    qty = pallets[0].qty;
+  }
+  return {
+    qty,
+    weight: weights[0].weight,
+    length: dims[0].length,
+    width: dims[0].width,
+    height: dims[0].height,
+  };
+}
+
+/**
+ * True when a pallet row is the global 40×48×60 fill (any L/W order).
+ * @param {object} row Freight row.
+ * @return {boolean}
+ */
+function freightRowUsesDefaultPalletDims(row) {
+  if (!row || !freightDims.isPalletPackaging(row)) return false;
+  const n = freightDims.normalizePalletDims({...row});
+  return Number(n.length) === freightDims.STANDARD_PALLET_LENGTH &&
+    Number(n.width) === freightDims.STANDARD_PALLET_WIDTH &&
+    Number(n.height) === freightDims.DEFAULT_PALLET_HEIGHT;
+}
+
+/**
+ * Fill a single pallet line from an own-line "N Pallet / lbs / LxWxH"
+ * stack (Q#D7898: 1 Pallet, 620 lbs, 48x40x32). Replaces only missing
+ * dims or the 40×48×60 default — a real AI size is left alone.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyStandaloneStackedPalletSpec(extracted, body) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return extracted;
+  if (extracted.lanes.length !== 1) return extracted;
+  const spec = extractStandaloneStackedPalletSpec(body);
+  if (!spec) return extracted;
+  const labeled = parseLabeledFreightTotals(body);
+  if (labeled.length != null) return extracted;
+  if (labeled.palletCount != null && labeled.palletCount !== spec.qty) {
+    return extracted;
+  }
+  const lane = extracted.lanes[0];
+  if (!lane || typeof lane !== "object") return extracted;
+  const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+  if (rows.length > 1) return extracted;
+  if (rows.length === 1 && !freightDims.isPalletPackaging(rows[0])) {
+    return extracted;
+  }
+
+  const base = rows[0] && typeof rows[0] === "object" ? {...rows[0]} : {};
+  const candidate = freightDims.normalizePalletDims({
+    qty: Number(base.qty) > 0 ? base.qty : spec.qty,
+    weight: spec.weight,
+    weightType: "total",
+    class: base.class != null ? base.class : null,
+    length: spec.length,
+    width: spec.width,
+    height: spec.height,
+    dimType: "PLT",
+  });
+  const missingDims = !(Number(base.length) > 0) ||
+    !(Number(base.width) > 0) || !(Number(base.height) > 0);
+  const defaulted = rows.length === 1 && freightRowUsesDefaultPalletDims(base);
+  const candDefault = freightRowUsesDefaultPalletDims(candidate);
+  const normalizedBase = rows.length === 1 ?
+    freightDims.normalizePalletDims({...base}) : null;
+  const dimsDiffer = !normalizedBase ||
+    Number(normalizedBase.length) !== Number(candidate.length) ||
+    Number(normalizedBase.width) !== Number(candidate.width) ||
+    Number(normalizedBase.height) !== Number(candidate.height);
+  let changed = false;
+  if (rows.length === 0 || missingDims ||
+      (defaulted && dimsDiffer && !candDefault)) {
+    base.length = candidate.length;
+    base.width = candidate.width;
+    base.height = candidate.height;
+    base.dimType = "PLT";
+    if (!(Number(base.qty) > 0)) base.qty = spec.qty;
+    changed = true;
+  }
+  if (!hasNumericFreightWeight(base) && spec.weight > 0 &&
+      labeled.weight == null) {
+    base.weight = spec.weight;
+    base.weightType = "total";
+    changed = true;
+  }
+  if (!changed) return extracted;
+  if (!base.weightType) base.weightType = "total";
+  lane.freightInfo = [freightDims.normalizePalletDims(base)];
+  pushExtractWarning(extracted, "stacked pallet spec");
+  return extracted;
+}
+
+/**
  * Informal "1 pallet: LxWxH, N lbs" / "Each pallet is L*W*H".
  * @param {string} body Body text.
  * @return {Array<object>}
@@ -2375,6 +2521,18 @@ function extractInformalPalletFreight(body) {
       }
     }
   }
+  if (freight.length) return freight;
+  const spec = extractStandaloneStackedPalletSpec(body);
+  if (!spec) return freight;
+  freight.push(freightDims.normalizePalletDims({
+    qty: spec.qty,
+    length: spec.length,
+    width: spec.width,
+    height: spec.height,
+    weight: spec.weight,
+    weightType: "total",
+    dimType: "PLT",
+  }));
   return freight;
 }
 
@@ -3769,6 +3927,7 @@ module.exports = {
   sanitizeEmailBodyForStore,
   normalizeSoleAddressToConsignee,
   fillShipperFromLaneLabelOrigin,
+  applySubjectLineZips,
   applyStgShippingFromSections,
   isCoreHomePoTable,
   parseCoreHomeTableRows,
@@ -3792,6 +3951,8 @@ module.exports = {
   extractMixedQtyAtDimLines,
   extractPalletFreight,
   extractInformalPalletFreight,
+  extractStandaloneStackedPalletSpec,
+  applyStandaloneStackedPalletSpec,
   extractNumberedShipmentSections,
   applyNumberedShipmentPalletBlocks,
   applyEmailPalletBlocks,

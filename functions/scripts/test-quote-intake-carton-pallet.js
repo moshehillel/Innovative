@@ -366,6 +366,71 @@ check("normalizeExtractedQuote defaults 40x48x60", [
 check("normalizeExtractedQuote warns defaulted dims",
     (missingNorm.extractionWarnings || []).includes("defaulted dims"), true);
 
+// Q#D7898: own-line "1 Pallet / 620 lbs / 48x40x32" must not become 40x48x60.
+const D7898_BODY = [
+  "From: Shaya Jacobowitz",
+  "Sent: Thursday, October 8, 2026 11:55 AM",
+  "Subject: 45371-11220",
+  "Please quote",
+  "",
+  "1 Pallet",
+  "",
+  "620 lbs",
+  "48x40x32",
+  "",
+  "Shaya Jacobowitz Sales Support Specialists",
+  "718-417-1116 ext. 221",
+  "shaya@primepackaging.com",
+].join("\n");
+const d7898Spec = intake.extractStandaloneStackedPalletSpec(D7898_BODY);
+check("D7898 stacked spec", d7898Spec && [
+  d7898Spec.qty, d7898Spec.weight, d7898Spec.length, d7898Spec.width,
+  d7898Spec.height,
+], [1, 620, 48, 40, 32]);
+const d7898Heuristic = intake.heuristicExtractQuote({
+  subject: "FW: 45371-11220",
+  body: D7898_BODY,
+});
+const d7898Row = d7898Heuristic && d7898Heuristic.lanes[0].freightInfo[0];
+check("D7898 heuristic qty/weight", d7898Row && [d7898Row.qty, d7898Row.weight],
+    [1, 620]);
+check("D7898 heuristic 48x40x32 stored 40x48x32", d7898Row && [
+  d7898Row.length, d7898Row.width, d7898Row.height, d7898Row.dimType,
+], [40, 48, 32, "PLT"]);
+const d7898Defaulted = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: null, weightType: "total", class: null,
+      length: 40, width: 48, height: 60, dimType: "PLT",
+    }],
+  }],
+}, {subject: "FW: 45371-11220", body: D7898_BODY});
+const d7898Fixed = d7898Defaulted.lanes[0].freightInfo[0];
+check("D7898 default 40x48x60 repaired", [
+  d7898Fixed.qty, d7898Fixed.weight, d7898Fixed.length, d7898Fixed.width,
+  d7898Fixed.height,
+], [1, 620, 40, 48, 32]);
+check("D7898 stacked pallet spec warning",
+    (d7898Defaulted.extractionWarnings || []).includes("stacked pallet spec"),
+    true);
+const d7898AiKept = intake.normalizeExtractedQuote({
+  lanes: [{
+    freightInfo: [{
+      qty: 1, weight: 900, length: 50, width: 42, height: 36, dimType: "PLT",
+    }],
+  }],
+}, {body: D7898_BODY});
+check("D7898 does not clobber non-default AI dims", [
+  d7898AiKept.lanes[0].freightInfo[0].weight,
+  d7898AiKept.lanes[0].freightInfo[0].length,
+  d7898AiKept.lanes[0].freightInfo[0].width,
+  d7898AiKept.lanes[0].freightInfo[0].height,
+], [900, 50, 42, 36]);
+check("D7898 two dim lines are not a stack",
+    intake.extractStandaloneStackedPalletSpec(
+        "1 Pallet\n620 lbs\n48x40x32\n48x40x40"),
+    null);
+
 const noApptNorm = intake.normalizeExtractedQuote({
   lanes: [{
     specialInstructions: "No Appointment necessary",
