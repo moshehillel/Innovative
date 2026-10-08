@@ -1970,6 +1970,61 @@ function filterBlockedCarriers(rates, blockContains = []) {
   });
 }
 
+/** Dispatcher rate list page size (home card + open quote). */
+const RATE_PAGE_SIZE = 20;
+
+/**
+ * Max rates persisted on a lane. Cheapest-first, multiple pages of
+ * RATE_PAGE_SIZE. High enough that "Load more rates" is a real next
+ * page, low enough that a multi-lane quote stays under Firestore's 1MB cap.
+ */
+const STORED_RATE_CAP = 100;
+
+/**
+ * Rates to save on a quote lane: every returned rate, cheapest first,
+ * capped at STORED_RATE_CAP. Does not invent carriers that were not rated.
+ * @param {Array<object>} rates Tagged rates with sellRate.
+ * @param {object} [opts] ensureGuaranteed, mode, cap.
+ * @return {Array<object>}
+ */
+function ratesToPersist(rates, opts = {}) {
+  const list = Array.isArray(rates) ? rates : [];
+  const capRaw = Number(opts.cap);
+  const cap = Number.isFinite(capRaw) && capRaw > 0 ?
+    Math.floor(capRaw) : STORED_RATE_CAP;
+  const n = Math.min(list.length, Math.max(cap, 0));
+  return pickTopOptions(list, n, {
+    ensureGuaranteed: !!opts.ensureGuaranteed,
+    mode: opts.mode || "cheapest",
+  });
+}
+
+/**
+ * One page of stored rates for the dispatcher UI.
+ * @param {Array<object>} options Stored lane options, cheapest first.
+ * @param {number} [offset] How many are already shown.
+ * @param {number} [pageSize] Defaults to RATE_PAGE_SIZE.
+ * @return {{page: Array<object>, offset: number, nextOffset: number,
+ *   pageSize: number, total: number, hasMore: boolean}}
+ */
+function sliceRatePage(options, offset = 0, pageSize = RATE_PAGE_SIZE) {
+  const list = Array.isArray(options) ? options : [];
+  const start = Math.max(0, Math.floor(Number(offset) || 0));
+  const sizeRaw = Number(pageSize);
+  const size = Number.isFinite(sizeRaw) && sizeRaw > 0 ?
+    Math.floor(sizeRaw) : RATE_PAGE_SIZE;
+  const page = list.slice(start, start + size);
+  const nextOffset = start + page.length;
+  return {
+    page,
+    offset: start,
+    nextOffset,
+    pageSize: size,
+    total: list.length,
+    hasMore: nextOffset < list.length,
+  };
+}
+
 /**
  * Picks top N options per lane.
  * @param {Array<object>} rates Tagged rates with sellRate.
@@ -2114,6 +2169,10 @@ module.exports = {
   marketFallbackFakWarning,
   tagRateOptions,
   filterBlockedCarriers,
+  RATE_PAGE_SIZE,
+  STORED_RATE_CAP,
+  ratesToPersist,
+  sliceRatePage,
   pickTopOptions,
   normalizeRateRow,
   collectCarrierNotes,

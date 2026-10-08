@@ -443,6 +443,52 @@ check("explicit timeout 60 honored", qCustom.timeout, "60");
 if (prevTimeoutEnv == null) delete process.env.QUOTE_RATE_TIMEOUT;
 else process.env.QUOTE_RATE_TIMEOUT = prevTimeoutEnv;
 
+check("rate page size is 20", rateShop.RATE_PAGE_SIZE, 20);
+check("stored rate cap is 100", rateShop.STORED_RATE_CAP, 100);
+
+const underCap = Array.from({length: 45}, (_, i) => ({
+  name: "C" + i,
+  sellRate: 500 - i,
+}));
+const persisted = rateShop.ratesToPersist(underCap, {
+  mode: "cheapest",
+  ensureGuaranteed: true,
+});
+check("persist every rated carrier under the cap", persisted.length, 45);
+check("persisted cheapest first", persisted[0].sellRate, 456);
+check("persisted does not invent carriers",
+    persisted.every((r) => underCap.some((s) => s.name === r.name)), true);
+
+const overCap = Array.from({length: 250}, (_, i) => ({
+  name: "H" + i,
+  sellRate: i + 1,
+}));
+const capped = rateShop.ratesToPersist(overCap, {mode: "cheapest"});
+check("cap keeps 100 cheapest", capped.length, 100);
+check("cap starts at cheapest", capped[0].sellRate, 1);
+check("cap ends at 100th cheapest", capped[99].sellRate, 100);
+check("cap drops carriers past the limit",
+    capped.some((r) => r.sellRate === 101), false);
+
+const page1 = rateShop.sliceRatePage(capped, 0);
+check("first rate page length", page1.page.length, 20);
+check("first rate page has more", page1.hasMore, true);
+const page2 = rateShop.sliceRatePage(capped, page1.nextOffset);
+check("second rate page starts at 21", page2.page[0].sellRate, 21);
+check("second rate page length", page2.page.length, 20);
+const lastPage = rateShop.sliceRatePage(capped, 80);
+check("last rate page length", lastPage.page.length, 20);
+check("last rate page hides load more", lastPage.hasMore, false);
+
+const noExtra = rateShop.ratesToPersist([
+  {name: "A", sellRate: 10},
+  {name: "B", sellRate: 30, guaranteed: true},
+], {mode: "cheapest", ensureGuaranteed: true});
+check("rated guaranteed is kept", noExtra.length, 2);
+check("cheapest stays ahead of guaranteed", noExtra[0].name, "A");
+check("no carrier added beyond the rate results",
+    noExtra.every((r) => r.name === "A" || r.name === "B"), true);
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

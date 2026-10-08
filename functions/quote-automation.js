@@ -1026,8 +1026,9 @@ async function rateLane(lane, ctx) {
   });
 
   const tagged = rateShop.tagRateOptions(enriched, ctx.customerPrefs || {});
-  const topN = Number(process.env.QUOTE_TOP_RATES) || 20;
-  let options = rateShop.pickTopOptions(tagged, topN, {
+  // Keep every rated carrier (cheapest first, capped) so the dispatcher
+  // can page "Load more rates". Do not shrink back to a cheapest-20 slice.
+  let options = rateShop.ratesToPersist(tagged, {
     ensureGuaranteed: wantsGuaranteed,
     mode: "cheapest",
   });
@@ -1524,6 +1525,23 @@ function matchesInboxStatus(row, statusFilter) {
 }
 
 /**
+ * Slim rate row for the dispatcher home card (client pages these).
+ * @param {object} o Stored lane option.
+ * @return {object}
+ */
+function slimInboxRate(o) {
+  return {
+    rateId: quoteOutput.optionRateId(o),
+    // Strip J&I on list preview so pre-fix stored names stay clean.
+    name: quoteOutput.customerFacingCarrierName(o, []),
+    SCAC: o.SCAC,
+    sellRate: o.sellRate != null ? o.sellRate : o.total,
+    cost: o.total != null ? o.total : o.cost,
+    transitDays: o.transitDays,
+  };
+}
+
+/**
  * @param {object} doc Quote firestore doc.
  * @param {object} data Quote fields.
  * @return {object}
@@ -1561,15 +1579,8 @@ function serializeInboxQuote(doc, data) {
         name: r.name,
         notes: r.notes || null,
       })),
-      topOptions: (lane.options || []).slice(0, 5).map((o) => ({
-        rateId: quoteOutput.optionRateId(o),
-        // Strip J&I on list preview so pre-fix stored names stay clean.
-        name: quoteOutput.customerFacingCarrierName(o, []),
-        SCAC: o.SCAC,
-        sellRate: o.sellRate != null ? o.sellRate : o.total,
-        cost: o.total != null ? o.total : o.cost,
-        transitDays: o.transitDays,
-      })),
+      topOptions: (lane.options || []).slice(0, 5).map(slimInboxRate),
+      options: (lane.options || []).map(slimInboxRate),
       optionCount: (lane.options || []).length,
       rateError: lane.rateError || null,
       rateWarning: lane.rateWarning || null,

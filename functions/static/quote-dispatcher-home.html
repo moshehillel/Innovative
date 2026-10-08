@@ -620,6 +620,9 @@
       font-size: 0.75rem;
       margin-top: 4px;
     }
+    .lane-preview .btn-load-more-rates {
+      margin-top: 8px;
+    }
     .outlook-bar {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -1028,6 +1031,7 @@
     let syncInFlight = null;
     let inboxLoadInFlight = null;
     const INBOX_PAGE_SIZE = 20;
+    const RATE_PAGE_SIZE = 20;
     let inboxItems = [];
     let inboxOffset = 0;
     let inboxHasMore = false;
@@ -1451,6 +1455,28 @@
           }
         });
       });
+      root.querySelectorAll(".btn-load-more-rates").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const quoteId = btn.getAttribute("data-quote-id") || "";
+          const laneKey = btn.getAttribute("data-lane-key") || "";
+          const item = inboxItems.find((i) => String(i.id) === quoteId);
+          const lane = ((item && item.lanesPreview) || []).find((l) =>
+            String(l.laneKey || "") === laneKey);
+          const all = laneRateOptions(lane || {});
+          let shown = Number(btn.getAttribute("data-shown")) || 0;
+          const next = all.slice(shown, shown + RATE_PAGE_SIZE);
+          if (!next.length) {
+            btn.remove();
+            return;
+          }
+          btn.insertAdjacentHTML("beforebegin", next.map(rateLineHtml).join(""));
+          shown += next.length;
+          btn.setAttribute("data-shown", String(shown));
+          if (shown >= all.length) btn.remove();
+        });
+      });
       root.querySelectorAll(".btn-dismiss-card").forEach((btn) => {
         btn.addEventListener("click", async (e) => {
           e.preventDefault();
@@ -1495,6 +1521,21 @@
       });
     }
 
+    function laneRateOptions(lane) {
+      if (lane && Array.isArray(lane.options) && lane.options.length) {
+        return lane.options;
+      }
+      return (lane && lane.topOptions) || [];
+    }
+
+    function rateLineHtml(o) {
+      return '<div class="rate-line"><span class="sell">$' +
+        num(o.sellRate != null ? o.sellRate : o.cost) + "</span> · " +
+        esc(o.name || o.SCAC || "Carrier") +
+        (o.transitDays ? " · " + o.transitDays + " days" : "") +
+        "</div>";
+    }
+
     function renderInboxCards(items) {
       const root = document.getElementById("rows");
       if (!items.length) {
@@ -1509,17 +1550,14 @@
         const status = quoteStatusOf(item);
         const lanes = item.lanesPreview || [];
         const lanesHtml = lanes.map((lane) => {
-          const opts = (lane.topOptions || []).map((o) =>
-            '<div class="rate-line"><span class="sell">$' +
-            num(o.sellRate != null ? o.sellRate : o.cost) + "</span> · " +
-            esc(o.name || o.SCAC || "Carrier") +
-            (o.transitDays ? " · " + o.transitDays + " days" : "") +
-            "</div>"
-          ).join("");
-          const more = (lane.optionCount || 0) > (lane.topOptions || []).length ?
-            '<div class="more-rates">+' +
-              ((lane.optionCount || 0) - (lane.topOptions || []).length) +
-              " more rates on full review</div>" : "";
+          const allRates = laneRateOptions(lane);
+          const shownRates = allRates.slice(0, RATE_PAGE_SIZE);
+          const opts = shownRates.map(rateLineHtml).join("");
+          const more = allRates.length > shownRates.length ?
+            '<button type="button" class="ghost btn-load-more-rates" data-quote-id="' +
+              esc(item.id) + '" data-lane-key="' + esc(lane.laneKey || "") +
+              '" data-shown="' + shownRates.length +
+              '">Load more rates</button>' : "";
           const acc = (lane.accessorials || []).length ?
             '<div class="more-rates">Accessorials: ' +
               esc((lane.appliedRules || []).map((r) => r.name).join(", ") ||

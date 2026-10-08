@@ -478,6 +478,7 @@
     }
     .rates-section.open .rates-list,
     .rules-section.open .rates-list { display: block; }
+    .rates-list .btn-load-more-rates { margin-top: 10px; }
     .acc-section label {
       display: flex;
       align-items: flex-start;
@@ -1055,6 +1056,7 @@
 
   <script src="__API_BASE__/quoteAuthClient?v=__AUTH_CLIENT_VERSION__"></script>
   <script>
+    const RATE_PAGE_SIZE = 20;
     const TENANT_ID = "__TENANT_ID__";
     const QUOTE_ID = "__QUOTE_ID__";
     const DISPATCHER_ID = "__DISPATCHER_ID__";
@@ -2378,6 +2380,93 @@
       });
     }
 
+    function rateOptionCardHtml(lane, opt) {
+      const rateId = optionRateId(opt);
+      const selectedSet = new Set(selections[lane.laneKey] || []);
+      const isChecked = rateId ? selectedSet.has(rateId) : false;
+      const custVal = rateId && customerPrices[lane.laneKey] &&
+        customerPrices[lane.laneKey][rateId] != null ?
+        customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
+      const custStr = custVal === "" || custVal == null ? "" :
+        (isFinite(Number(custVal)) ?
+          String(Math.ceil(Number(custVal))) : "");
+      const sellHint = Number(opt.sellRate);
+      const showSuggested = isFinite(sellHint) &&
+        Number(custVal) !== Math.ceil(sellHint);
+      const note = cleanNote(opt.warnings);
+      return `<div class="opt${isChecked ? " checked" : ""}">
+        <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(rateId)}"${isChecked ? " checked" : ""}>
+        <div>
+        <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
+        <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
+          <div class="rate-row">
+            <span class="rate-cost">Cost $${num(opt.cost)}</span>
+            <label class="customer-rate-field">Customer rate $
+              <input type="number" min="1" step="1"
+                data-customer-rate="1"
+                data-lane="${esc(lane.laneKey)}"
+                data-rate="${esc(rateId)}"
+                value="${esc(custStr)}">
+            </label>
+            ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
+            <span class="rate-meta">${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}${opt.costQuoteId ? " · saved" : ""}</span>
+          </div>
+          ${note ? formatCarrierNote(note) : ""}
+        </div>
+      </div>`;
+    }
+
+    function bindRateOptionInputs(scope) {
+      if (!scope) return;
+      scope.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
+        if (input.dataset.boundRate === "1") return;
+        input.dataset.boundRate = "1";
+        input.addEventListener("change", () => {
+          const laneKey = input.dataset.lane;
+          const rateId = String(input.dataset.rate);
+          const set = new Set(selections[laneKey] || []);
+          if (input.checked) set.add(rateId);
+          else set.delete(rateId);
+          selections[laneKey] = [...set];
+          input.closest(".opt").classList.toggle("checked", input.checked);
+          const laneEl = input.closest(".lane");
+          const headMeta = laneEl && laneEl.querySelector(".lane-head span:last-child");
+          if (headMeta) {
+            const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+            headMeta.textContent =
+              ((lane && lane.options) || []).length + " rates · " +
+              set.size + " selected";
+          }
+          updateRatesSectionCount(laneEl, set.size);
+          draftReady = false;
+          document.getElementById("btn-approve").disabled = true;
+          persistSelections();
+        });
+      });
+      scope.querySelectorAll("input[data-customer-rate]").forEach((input) => {
+        if (input.dataset.boundCust === "1") return;
+        input.dataset.boundCust = "1";
+        const sync = () => {
+          const laneKey = input.dataset.lane;
+          const rateId = String(input.dataset.rate);
+          if (!customerPrices[laneKey]) customerPrices[laneKey] = {};
+          customerPrices[laneKey][rateId] = input.value;
+          draftReady = false;
+          document.getElementById("btn-approve").disabled = true;
+        };
+        input.addEventListener("click", (e) => e.stopPropagation());
+        input.addEventListener("mousedown", (e) => e.stopPropagation());
+        input.addEventListener("change", () => {
+          sync();
+          persistSelections();
+        });
+        input.addEventListener("blur", () => {
+          sync();
+          persistSelections();
+        });
+      });
+    }
+
     function renderLanes() {
       const root = document.getElementById("lanes");
       root.innerHTML = "";
@@ -2434,42 +2523,16 @@
           }
           optsHtml += "<div class='warn'>" + esc(w) + "</div>";
         });
-        (lane.options || []).forEach((opt) => {
-          const rateId = optionRateId(opt);
-          const isChecked = rateId ? selected.has(rateId) : false;
-          const custVal = rateId && customerPrices[lane.laneKey] &&
-            customerPrices[lane.laneKey][rateId] != null ?
-            customerPrices[lane.laneKey][rateId] : defaultCustomerPrice(opt);
-          const custStr = custVal === "" || custVal == null ? "" :
-            (isFinite(Number(custVal)) ?
-              String(Math.ceil(Number(custVal))) : "");
-          const sellHint = Number(opt.sellRate);
-          const showSuggested = isFinite(sellHint) &&
-            Number(custVal) !== Math.ceil(sellHint);
-          optsHtml += `<div class="opt${isChecked ? " checked" : ""}">
-            <input type="checkbox" data-lane="${esc(lane.laneKey)}" data-rate="${esc(rateId)}"${isChecked ? " checked" : ""}>
-            <div>
-            <div class="tags">${(opt.tags||[]).map(t => '<span class="tag">'+esc(t)+'</span>').join("")}</div>
-            <div><strong>${esc(opt.name||opt.SCAC)}</strong></div>
-              <div class="rate-row">
-                <span class="rate-cost">Cost $${num(opt.cost)}</span>
-                <label class="customer-rate-field">Customer rate $
-                  <input type="number" min="1" step="1"
-                    data-customer-rate="1"
-                    data-lane="${esc(lane.laneKey)}"
-                    data-rate="${esc(rateId)}"
-                    value="${esc(custStr)}">
-                </label>
-                ${showSuggested ? `<span class="suggested-sell">suggested sell $${num(opt.sellRate)}</span>` : ""}
-                <span class="rate-meta">${opt.transitDays||"?"} days${opt.quoteNumber ? " · Q# " + esc(opt.quoteNumber) : ""}${opt.costQuoteId ? " · saved" : ""}</span>
-              </div>
-              ${(() => {
-                const note = cleanNote(opt.warnings);
-                return note ? formatCarrierNote(note) : "";
-              })()}
-            </div>
-          </div>`;
+        const allRateOpts = lane.options || [];
+        const firstRates = allRateOpts.slice(0, RATE_PAGE_SIZE);
+        firstRates.forEach((opt) => {
+          optsHtml += rateOptionCardHtml(lane, opt);
         });
+        if (allRateOpts.length > firstRates.length) {
+          optsHtml += "<button type='button' class='ghost btn-load-more-rates' data-lane='" +
+            esc(lane.laneKey) + "' data-shown='" + firstRates.length +
+            "'>Load more rates</button>";
+        }
         if (!(lane.options || []).length && !lane.rateError) {
           optsHtml = "<p style='color:var(--muted);font-size:0.875rem'>No rates returned.</p>";
         }
@@ -2517,48 +2580,26 @@
       bindAccCheckboxHandlers(root);
       if (detailsEditMode) bindFreightEditors(root);
 
-      root.querySelectorAll("input[data-rate]:not([data-customer-rate])").forEach((input) => {
-        input.addEventListener("change", () => {
-          const laneKey = input.dataset.lane;
-          const rateId = String(input.dataset.rate);
-          const set = new Set(selections[laneKey] || []);
-          if (input.checked) set.add(rateId);
-          else set.delete(rateId);
-          selections[laneKey] = [...set];
-          input.closest(".opt").classList.toggle("checked", input.checked);
-          const laneEl = input.closest(".lane");
-          const headMeta = laneEl && laneEl.querySelector(".lane-head span:last-child");
-          if (headMeta) {
-            const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
-            headMeta.textContent =
-              ((lane && lane.options) || []).length + " rates · " +
-              set.size + " selected";
+      bindRateOptionInputs(root);
+      root.querySelectorAll(".btn-load-more-rates").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const laneKey = btn.getAttribute("data-lane");
+          const lane = (quote.lanes || []).find((l) => l.laneKey === laneKey);
+          const all = (lane && lane.options) || [];
+          let shown = Number(btn.getAttribute("data-shown")) || 0;
+          const next = all.slice(shown, shown + RATE_PAGE_SIZE);
+          if (!next.length) {
+            btn.remove();
+            return;
           }
-          updateRatesSectionCount(laneEl, set.size);
-          draftReady = false;
-          document.getElementById("btn-approve").disabled = true;
-          persistSelections();
-        });
-      });
-
-      root.querySelectorAll("input[data-customer-rate]").forEach((input) => {
-        const sync = () => {
-          const laneKey = input.dataset.lane;
-          const rateId = String(input.dataset.rate);
-          if (!customerPrices[laneKey]) customerPrices[laneKey] = {};
-          customerPrices[laneKey][rateId] = input.value;
-          draftReady = false;
-          document.getElementById("btn-approve").disabled = true;
-        };
-        input.addEventListener("click", (e) => e.stopPropagation());
-        input.addEventListener("mousedown", (e) => e.stopPropagation());
-        input.addEventListener("change", () => {
-          sync();
-          persistSelections();
-        });
-        input.addEventListener("blur", () => {
-          sync();
-          persistSelections();
+          btn.insertAdjacentHTML("beforebegin",
+              next.map((opt) => rateOptionCardHtml(lane, opt)).join(""));
+          bindRateOptionInputs(btn.closest(".rates-list") || root);
+          shown += next.length;
+          btn.setAttribute("data-shown", String(shown));
+          if (shown >= all.length) btn.remove();
         });
       });
 
