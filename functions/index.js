@@ -16782,8 +16782,10 @@ exports.completeQuote = onRequest({
   invoker: "public",
   memory: "1GiB",
 }, quoteDashboard.handleCompleteQuote);
-exports.markQuoteForReview = onRequest({invoker: "public"},
-    quoteDashboard.handleMarkQuoteForReview);
+exports.markQuoteForReview = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleMarkQuoteForReview);
 exports.exportQuoteDispatcherReport = onRequest({
   invoker: "public",
   timeoutSeconds: 120,
