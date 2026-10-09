@@ -1196,28 +1196,35 @@
   }
 
   function selectedAccessorials() {
-    const sel = document.getElementById("bulk-accessorials");
-    if (!sel) return [];
-    return Array.from(sel.selectedOptions || [])
-        .map((o) => String(o.value || "").trim())
+    const root = document.getElementById("bulk-accessorials");
+    if (!root) return [];
+    return Array.from(root.querySelectorAll("input[type='checkbox']:checked"))
+        .map((el) => String(el.value || "").trim())
         .filter(Boolean);
   }
 
+  function updateAccessorialCount() {
+    const el = document.getElementById("bulk-acc-count");
+    if (!el) return;
+    const n = selectedAccessorials().length;
+    el.textContent = n ? (n + " selected") : "none selected";
+    el.classList.toggle("is-on", n > 0);
+  }
+
   function fillAccessorialSelect(catalog) {
-    const sel = document.getElementById("bulk-accessorials");
-    if (!sel) return;
+    const root = document.getElementById("bulk-accessorials");
+    if (!root) return;
+    const kept = new Set(selectedAccessorials());
     const sections = [
       {key: "destination", label: "Destination"},
       {key: "origin", label: "Origin"},
       {key: "other", label: "Other"},
     ];
-    const frag = document.createDocumentFragment();
-    // Prefer APD near top of destination for easy find
+    root.innerHTML = "";
+    let any = false;
     for (const sec of sections) {
       const items = (catalog && catalog[sec.key]) || [];
       if (!items.length) continue;
-      const group = document.createElement("optgroup");
-      group.label = sec.label;
       const sorted = items.slice().sort((a, b) => {
         const ac = String(a.code || "");
         const bc = String(b.code || "");
@@ -1225,26 +1232,42 @@
         if (bc === "APD") return 1;
         return String(a.label || ac).localeCompare(String(b.label || bc));
       });
-      for (const item of sorted) {
-        if (item.selectable === false) continue;
+      const usable = sorted.filter((item) => {
+        if (item.selectable === false) return false;
+        return !!String(item.code || "").trim();
+      });
+      if (!usable.length) continue;
+      any = true;
+      const group = document.createElement("div");
+      group.className = "bulk-acc-group";
+      const title = document.createElement("h4");
+      title.textContent = sec.label;
+      group.appendChild(title);
+      const grid = document.createElement("div");
+      grid.className = "bulk-acc-grid";
+      for (const item of usable) {
         const code = String(item.code || "").trim();
-        if (!code) continue;
-        const opt = document.createElement("option");
-        opt.value = code;
-        opt.textContent = (item.label || code) + " (" + code + ")";
-        group.appendChild(opt);
+        const label = document.createElement("label");
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.value = code;
+        if (kept.has(code)) input.checked = true;
+        const text = document.createElement("span");
+        text.textContent = (item.label || code) + " (" + code + ")";
+        label.appendChild(input);
+        label.appendChild(text);
+        grid.appendChild(label);
       }
-      if (group.childNodes.length) frag.appendChild(group);
+      group.appendChild(grid);
+      root.appendChild(group);
     }
-    sel.innerHTML = "";
-    if (!frag.childNodes.length) {
-      const opt = document.createElement("option");
-      opt.disabled = true;
-      opt.textContent = "No accessorials available";
-      sel.appendChild(opt);
-      return;
+    if (!any) {
+      const empty = document.createElement("p");
+      empty.className = "bulk-acc-empty";
+      empty.textContent = "No accessorials available";
+      root.appendChild(empty);
     }
-    sel.appendChild(frag);
+    updateAccessorialCount();
   }
 
   async function loadBulkAccessorialCatalog() {
@@ -1346,6 +1369,9 @@
   });
   document.getElementById("bulk-modal").addEventListener("click", (ev) => {
     if (ev.target && ev.target.id === "bulk-modal") setBulkModalOpen(false);
+  });
+  document.getElementById("bulk-accessorials").addEventListener("change", () => {
+    updateAccessorialCount();
   });
 
   document.getElementById("btn-bulk-start").addEventListener("click", async () => {
