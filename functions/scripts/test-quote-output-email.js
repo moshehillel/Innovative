@@ -528,6 +528,94 @@ check("optionRateId reads rateId",
 check("optionRateId prefers id",
     quoteOutput.optionRateId({id: "A", rateId: "B"}), "A");
 
+const freightEmail = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#F100",
+  lanes: [{
+    freightInfo: [
+      {qty: 1, weight: 600, weightType: "total", length: 40, width: 48, height: 60, dimType: "PLT"},
+      {qty: 1, weight: 600, weightType: "each", length: 40, width: 48, height: 60, dimType: "PLT"},
+    ],
+    selectedOptions: [{
+      name: "Estes", sellRate: 400, transitDays: 3, quoteNumber: "F1",
+    }],
+  }],
+}, {style: "bullet"});
+checkIncludes(
+    "email groups identical dims and sums pallet weight",
+    freightEmail,
+    "See quote for 2 pallets, 1,200 lbs, 40x48x60",
+);
+checkIncludes(
+    "shipment line sits above the rate bullet",
+    freightEmail,
+    "See quote for 2 pallets, 1,200 lbs, 40x48x60\n\n• $400",
+);
+
+const mixedDims = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#F200",
+  lanes: [{
+    freightInfo: [
+      {qty: 1, weight: 500, weightType: "total", length: 40, width: 48, height: 48},
+      {qty: 1, weight: 800, weightType: "total", length: 48, width: 40, height: 60},
+    ],
+    selectedOptions: [{
+      name: "Estes", sellRate: 250, transitDays: 2, quoteNumber: "F2",
+    }],
+  }],
+}, {style: "bullet"});
+checkIncludes(
+    "email lists different dims separately",
+    mixedDims,
+    "See quote for 1 pallet, 500 lbs, 40x48x48 and 1 pallet, 800 lbs, 48x40x60",
+);
+
+const multiLaneFreight = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#F300",
+  lanes: [
+    {
+      label: "TO Brooklyn",
+      freightInfo: [{qty: 2, weight: 400, weightType: "each", length: 40, width: 48, height: 50}],
+      selectedOptions: [{name: "Estes", sellRate: 100, transitDays: 2, quoteNumber: "A"}],
+    },
+    {
+      label: "TO Queens",
+      freightInfo: [{qty: 1, weight: 900, weightType: "total", length: 48, width: 40, height: 70}],
+      selectedOptions: [{name: "Saia", sellRate: 120, transitDays: 3, quoteNumber: "B"}],
+    },
+  ],
+}, {style: "bullet"});
+checkIncludes(
+    "each lane gets its own shipment line",
+    multiLaneFreight,
+    "TO Brooklyn\nSee quote for 2 pallets, 800 lbs, 40x48x50",
+);
+checkIncludes(
+    "second lane shipment line",
+    multiLaneFreight,
+    "TO Queens\nSee quote for 1 pallet, 900 lbs, 48x40x70",
+);
+
+const noFreight = quoteOutput.buildCustomerEmailFromSelections({
+  batchQuoteId: "Q#F400",
+  lanes: [{
+    selectedOptions: [{name: "Estes", sellRate: 100, transitDays: 2, quoteNumber: "Z"}],
+  }],
+}, {style: "bullet"});
+checkNotIncludes("email does not invent freight", noFreight, "See quote for");
+
+const draftFreight = quoteOutput.buildCustomerDraftText({
+  batchQuoteId: "Q#F500",
+  lanes: [{
+    label: "TO Newark",
+    freightInfo: [{qty: 3, weight: 1500, weightType: "total", length: 40, width: 48, height: 60}],
+  }],
+});
+checkIncludes(
+    "placeholder draft includes shipment details",
+    draftFreight,
+    "See quote for 3 pallets, 1,500 lbs, 40x48x60",
+);
+
 if (failures) {
   console.error(`\n${failures} assertion(s) failed`);
   process.exit(1);

@@ -210,6 +210,171 @@ function buildAccessorialWhy(lane) {
 }
 
 /**
+ * @param {*} value Raw number.
+ * @return {number} Positive finite number, else 0.
+ */
+function positiveNum(value) {
+  if (value == null || value === "") return 0;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+/**
+ * @param {string|null|undefined} weightType Stored weight type.
+ * @return {boolean}
+ */
+function isEachWeight(weightType) {
+  const wt = String(weightType || "").trim().toLowerCase();
+  return wt === "each" || wt === "perpiece" || wt === "per-piece" ||
+    wt === "per piece";
+}
+
+/**
+ * @param {*} value Dimension component.
+ * @return {string}
+ */
+function dimComponent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  const rounded = Math.round(n * 100) / 100;
+  return String(rounded);
+}
+
+/**
+ * @param {object} row Freight row.
+ * @return {string} LxWxH, or "" when any side is missing.
+ */
+function freightDimsText(row) {
+  const length = dimComponent(row && row.length);
+  const width = dimComponent(row && row.width);
+  const height = dimComponent(row && row.height);
+  if (!length || !width || !height) return "";
+  return `${length}x${width}x${height}`;
+}
+
+/**
+ * @param {object} row Freight row.
+ * @return {string} pallet or carton.
+ */
+function freightPieceKind(row) {
+  const dimType = String((row && (row.dimType || row.packaging)) || "")
+      .trim().toUpperCase();
+  if (dimType === "CTN" || dimType === "CARTON" || dimType === "CARTONS") {
+    return "carton";
+  }
+  return "pallet";
+}
+
+/**
+ * @param {number} qty Piece count.
+ * @param {string} kind pallet or carton.
+ * @return {string}
+ */
+function freightPieceWord(qty, kind) {
+  const n = Number(qty) === 1 ? 1 : Number(qty);
+  if (kind === "carton") return n === 1 ? "carton" : "cartons";
+  return n === 1 ? "pallet" : "pallets";
+}
+
+/**
+ * Thousands separator for a weight, keeping one decimal when needed.
+ * @param {number} n Pounds.
+ * @return {string}
+ */
+function formatLbs(n) {
+  const rounded = Math.round(Number(n) * 10) / 10;
+  const text = Number.isInteger(rounded) ? String(rounded) : String(rounded);
+  const parts = text.split(".");
+  parts[0] = parts[0].replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return parts.join(".");
+}
+
+/**
+ * Customer-facing freight line from a lane's freight rows.
+ * Does not invent pieces when freightInfo is missing or empty.
+ * Identical dims are grouped. weightType "each" is qty × weight;
+ * "total" (the default) is already the line total.
+ * @param {Array<object>|null|undefined} freightInfo Lane freight rows.
+ * @return {string} "See quote for …", or "".
+ */
+function formatShipmentDetails(freightInfo) {
+  const rows = Array.isArray(freightInfo) ? freightInfo.filter(Boolean) : [];
+  if (!rows.length) return "";
+  const groups = [];
+  const index = new Map();
+  for (const row of rows) {
+    const qtyRaw = positiveNum(row.qty);
+    const weight = positiveNum(row.weight);
+    const dims = freightDimsText(row);
+    if (!qtyRaw && !weight && !dims) continue;
+    const qty = qtyRaw || 1;
+    const lbs = !weight ? 0 :
+      (isEachWeight(row.weightType) ? weight * qty : weight);
+    const kind = freightPieceKind(row);
+    const key = kind + "|" + dims;
+    let group = index.get(key);
+    if (!group) {
+      group = {kind, dims, qty: 0, lbs: 0};
+      index.set(key, group);
+      groups.push(group);
+    }
+    group.qty += qty;
+    group.lbs += lbs;
+  }
+  if (!groups.length) return "";
+  const bits = groups.map((group) => {
+    const parts = [
+      `${group.qty} ${freightPieceWord(group.qty, group.kind)}`,
+    ];
+    if (group.lbs > 0) parts.push(`${formatLbs(group.lbs)} lbs`);
+    if (group.dims) parts.push(group.dims);
+    return parts.join(", ");
+  });
+  return "See quote for " + bits.join(" and ");
+}
+
+/**
+ * Opening lines shared by the placeholder draft and the priced email.
+ * A single lane's freight sits directly under the quote id. Multi-lane
+ * freight is written with each lane instead.
+ * @param {object} quote Quote doc.
+ * @return {Array<string>}
+ */
+function buildCustomerEmailIntro(quote) {
+  const batchId = quote.batchQuoteId || "Q#????";
+  const lines = [
+    "Hi,",
+    "",
+    `See your options below — ${batchId}:`,
+  ];
+  const lanes = quote.lanes || [];
+  if (lanes.length <= 1) {
+    const ship = formatShipmentDetails(lanes[0] && lanes[0].freightInfo);
+    if (ship) lines.push(ship);
+  }
+  lines.push("");
+  return lines;
+}
+
+/**
+ * Lane label plus shipment details when a quote has more than one lane.
+ * @param {Array<string>} lines Email lines.
+ * @param {object} lane Rated lane.
+ * @param {boolean} multiLane True when the quote has several lanes.
+ * @return {void}
+ */
+function pushLaneShipmentHeading(lines, lane, multiLane) {
+  if (multiLane) {
+    const destCity =
+      lane.consignee && lane.consignee.city || "DESTINATION";
+    lines.push(lane.label || `TO ${destCity}`);
+    const ship = formatShipmentDetails(lane.freightInfo);
+    if (ship) lines.push(ship);
+    return;
+  }
+}
+
+/**
  * Universal customer draft — same template for all customers.
  * Pricing lines are placeholders for dispatcher.
  * Primus customer match stays on the dispatcher UI only (not in draft).
@@ -217,18 +382,17 @@ function buildAccessorialWhy(lane) {
  * @return {string} Plain-text email draft.
  */
 function buildCustomerDraftText(quote) {
-  const batchId = quote.batchQuoteId || "Q#????";
-  const lines = [
-    "Hi,",
-    "",
-    `See your options below — ${batchId}:`,
-    "",
-  ];
+  const lines = buildCustomerEmailIntro(quote);
+  const lanes = quote.lanes || [];
+  const multiLane = lanes.length > 1;
 
-  for (const lane of quote.lanes || []) {
-    const destCity =
-      lane.consignee && lane.consignee.city || "DESTINATION";
-    lines.push(lane.label || `TO ${destCity}`);
+  for (const lane of lanes) {
+    pushLaneShipmentHeading(lines, lane, multiLane);
+    if (!multiLane) {
+      const destCity =
+        lane.consignee && lane.consignee.city || "DESTINATION";
+      lines.push(lane.label || `TO ${destCity}`);
+    }
     lines.push(
         "[Dispatcher fills: $___ — Carrier | Q# _____ | ___-day transit]",
     );
@@ -520,23 +684,14 @@ function resolveSelectedOptions(lane) {
  * @return {string}
  */
 function buildCustomerEmailFromSelections(quote, opts = {}) {
-  const batchId = quote.batchQuoteId || "Q#????";
   const cleanRules = opts.carrierCleanRules || [];
   const formatLine = pricingFormatter(opts.style || "bullet", cleanRules);
-  const lines = [
-    "Hi,",
-    "",
-    `See your options below — ${batchId}:`,
-    "",
-  ];
+  const lines = buildCustomerEmailIntro(quote);
 
-  const multiLane = (quote.lanes || []).length > 1;
-  for (const lane of quote.lanes || []) {
-    if (multiLane) {
-      const destCity =
-        lane.consignee && lane.consignee.city || "DESTINATION";
-      lines.push(lane.label || `TO ${destCity}`);
-    }
+  const lanes = quote.lanes || [];
+  const multiLane = lanes.length > 1;
+  for (const lane of lanes) {
+    pushLaneShipmentHeading(lines, lane, multiLane);
     const selected = resolveSelectedOptions(lane);
     if (!selected.length) {
       lines.push("[No rates selected for this lane]");
@@ -752,6 +907,7 @@ module.exports = {
   ceilWholeDollar,
   optionRateId,
   buildCustomerDraftText,
+  formatShipmentDetails,
   buildCustomerDraftHtml,
   buildCustomerEmailFromSelections,
   buildSelectedCarrierNoteLines,
