@@ -62,7 +62,7 @@ body {
   position: sticky; top: 0; z-index: 40;
   display: flex; align-items: center; gap: 16px;
   min-height: var(--ic-topbar-h);
-  padding: 8px 20px;
+  padding: 8px 28px;
   background: rgba(255, 255, 255, 0.92);
   border-bottom: 1px solid var(--ic-border);
   backdrop-filter: blur(10px);
@@ -83,13 +83,14 @@ body {
 .topbar-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
 .main {
-  width: min(1180px, calc(100% - 32px));
-  margin: 0 auto;
-  padding: 18px 0 48px;
+  width: auto;
+  max-width: none;
+  margin: 0;
+  padding: 20px 28px 56px;
   min-width: 0;
 }
-body.page-quote .main { width: min(1040px, calc(100% - 32px)); }
-body.page-admin .main { width: min(960px, calc(100% - 32px)); }
+body.page-quote .main { max-width: 1560px; margin: 0 auto; }
+body.page-admin .main { max-width: 1280px; margin: 0 auto; }
 
 /* ——— Buttons / inputs ——— */
 button, .btn {
@@ -348,9 +349,18 @@ input, select, textarea {
   font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
 }
 
+/* Filters and report share one full-width bar */
+.inbox-toolbar {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 12px 20px; margin-bottom: 16px;
+  padding: 10px 12px;
+  background: var(--ic-surface); border: 1px solid var(--ic-border);
+  border-radius: var(--ic-radius-lg); box-shadow: var(--ic-shadow);
+}
+
 /* Filter tabs */
 .filter-bar {
-  display: inline-flex; gap: 4px; margin-bottom: 14px; flex-wrap: wrap;
+  display: inline-flex; gap: 4px; margin-bottom: 0; flex-wrap: wrap;
   background: #e7ecf0; padding: 3px; border-radius: 9px; border: 1px solid var(--ic-border);
 }
 .filter-bar button {
@@ -364,10 +374,8 @@ input, select, textarea {
 
 /* Report bar */
 .report-bar {
-  display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: end;
-  padding: 12px 14px;
-  background: var(--ic-surface); border: 1px solid var(--ic-border);
-  border-radius: var(--ic-radius); box-shadow: var(--ic-shadow);
+  display: flex; gap: 10px; margin-bottom: 0; flex-wrap: wrap; align-items: end;
+  padding: 0; background: transparent; border: 0; box-shadow: none;
 }
 .report-bar label {
   display: grid; gap: 4px; font-size: 11px; font-weight: 700; color: var(--ic-text-muted);
@@ -380,8 +388,22 @@ input, select, textarea {
 .report-bar .report-note { font-size: 12px; color: var(--ic-text-faint); align-self: center; margin-left: auto; }
 
 /* Quote cards */
-.quote-list { display: grid; gap: 10px; min-width: 0; max-width: 100%; }
-.inbox-tab { display: grid; gap: 10px; min-width: 0; }
+.quote-list { display: grid; gap: 12px; min-width: 0; max-width: 100%; }
+.inbox-tab {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  align-items: start;
+}
+@media (min-width: 1100px) {
+  .inbox-tab { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .inbox-tab > .empty,
+  .inbox-tab > .quote-card.open { grid-column: 1 / -1; }
+}
+@media (min-width: 1680px) {
+  .inbox-tab { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr); }
+}
 .quote-card {
   background: var(--ic-surface); border: 1px solid var(--ic-border);
   border-radius: var(--ic-radius); box-shadow: var(--ic-shadow);
@@ -940,7 +962,9 @@ body.page-admin .rules-list { display: flex; flex-direction: column; gap: 8px; }
   .topbar { padding: 10px 14px; }
   .tabs { margin-left: 0; width: 100%; }
   .tabs button { flex: 1; text-align: center; padding: 9px 8px; font-size: 11.5px; }
-  .main { width: calc(100% - 20px); }
+  .topbar, .main { padding-left: 14px; padding-right: 14px; }
+  .main { width: auto; }
+  .inbox-toolbar { padding: 10px; }
   .panel { padding: 18px; }
   .chat-input { flex-direction: column; align-items: stretch; }
   .chat-input button.primary { width: 100%; }
