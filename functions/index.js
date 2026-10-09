@@ -16734,21 +16734,31 @@ exports.jerrySupportChatWidget = onRequest({invoker: "public"},
 exports.jerrySupportChatLogo = onRequest({invoker: "public"},
     jerrySupportChatWidget.handleJerrySupportChatLogo);
 
-exports.getQuoteRules = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteRules);
-exports.applyQuoteRule = onRequest({invoker: "public"},
-    quoteDashboard.handleApplyQuoteRule);
-exports.testQuoteRules = onRequest({invoker: "public"},
-    quoteDashboard.handleTestQuoteRules);
+exports.getQuoteRules = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteRules);
+exports.applyQuoteRule = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleApplyQuoteRule);
+exports.testQuoteRules = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleTestQuoteRules);
 exports.quoteRulesChat = onRequest({
   invoker: "public",
   timeoutSeconds: 120,
   memory: "512MiB",
 }, quoteDashboard.handleQuoteRulesChat);
-exports.getQuoteAdminConfig = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteAdminConfig);
-exports.getQuoteRequests = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteRequests);
+exports.getQuoteAdminConfig = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteAdminConfig);
+exports.getQuoteRequests = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteRequests);
 exports.getQuoteDispatcherData = onRequest({
   invoker: "public",
   memory: "1GiB",
@@ -16811,25 +16821,33 @@ exports.processBulkRateShopJob = onRequest({
   timeoutSeconds: 540,
   memory: "1GiB",
 }, quoteDashboard.handleProcessBulkRateShopJob);
-exports.getBulkRateShopJob = onRequest({invoker: "public"},
-    quoteDashboard.handleGetBulkRateShopJob);
+exports.getBulkRateShopJob = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetBulkRateShopJob);
 exports.downloadBulkRateShopResults = onRequest({
   invoker: "public",
   timeoutSeconds: 120,
   memory: "512MiB",
 }, quoteDashboard.handleDownloadBulkRateShopResults);
-exports.getQuoteDispatcherProfile = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteDispatcherProfile);
+exports.getQuoteDispatcherProfile = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteDispatcherProfile);
 exports.getQuoteDispatcherInbox = onRequest({
   invoker: "public",
   // Sync Outlook path can scan/process mail; fast path returns Firestore only.
   timeoutSeconds: 300,
   memory: "512MiB",
 }, quoteDashboard.handleGetQuoteDispatcherInbox);
-exports.getQuoteDispatchers = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteDispatchers);
-exports.quoteAdminPage = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteAdminPage);
+exports.getQuoteDispatchers = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteDispatchers);
+exports.quoteAdminPage = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleQuoteAdminPage);
 exports.quoteDispatcherPage = onRequest({
   invoker: "public",
   memory: "1GiB",
@@ -16838,18 +16856,30 @@ exports.quoteDispatcherHomePage = onRequest({
   invoker: "public",
   memory: "1GiB",
 }, quoteDashboard.handleQuoteDispatcherHomePage);
-exports.getQuoteAuthConfig = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteAuthConfig);
-exports.sendQuotePasswordReset = onRequest({invoker: "public"},
-    quoteDashboard.handleSendQuotePasswordReset);
-exports.getQuoteOutlookConnectUrl = onRequest({invoker: "public"},
-    quoteDashboard.handleGetQuoteOutlookConnectUrl);
-exports.quoteOutlookDisconnect = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteOutlookDisconnect);
-exports.quoteOutlookOAuthCallback = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteOutlookOAuthCallback);
-exports.quoteAuthClient = onRequest({invoker: "public"},
-    quoteDashboard.handleQuoteAuthClient);
+exports.getQuoteAuthConfig = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteAuthConfig);
+exports.sendQuotePasswordReset = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleSendQuotePasswordReset);
+exports.getQuoteOutlookConnectUrl = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleGetQuoteOutlookConnectUrl);
+exports.quoteOutlookDisconnect = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleQuoteOutlookDisconnect);
+exports.quoteOutlookOAuthCallback = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleQuoteOutlookOAuthCallback);
+exports.quoteAuthClient = onRequest({
+  invoker: "public",
+  memory: "512MiB",
+}, quoteDashboard.handleQuoteAuthClient);
 // Cloud Scheduler every 20 min (see setup-quote-outlook-http-scheduler.ps1).
 // Public like checkMailInbox — no shared-secret pattern on that job either.
 exports.syncQuoteOutlookInboxes = onRequest({
