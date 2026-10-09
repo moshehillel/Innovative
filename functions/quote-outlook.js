@@ -50,9 +50,18 @@ function quoteSyncReceivedAfter(storedWatermark, nowMs) {
  * @param {Date} checkedAt When this check started.
  * @param {Array<{receivedDateTime?: string}>} messages Listed rows.
  * @param {boolean} listTruncated True when the page cap stopped the list.
+ * @param {number|null} [holdBeforeMs] Earliest message still needing a
+ *   retry. 0 means retry without a received time (leave the watermark).
  * @return {string|null} ISO time, or null to leave the stored watermark.
  */
-function quoteSyncWatermarkToStore(checkedAt, messages, listTruncated) {
+function quoteSyncWatermarkToStore(
+    checkedAt, messages, listTruncated, holdBeforeMs) {
+  // A failed classify/read must be listed again. gt is exclusive, so stay
+  // 1s before that message. Do not jump to "now" and skip it.
+  if (holdBeforeMs === 0) return null;
+  if (typeof holdBeforeMs === "number" && holdBeforeMs > 0) {
+    return new Date(holdBeforeMs - 1000).toISOString();
+  }
   if (!listTruncated) return checkedAt.toISOString();
   let maxMs = 0;
   for (const row of messages || []) {
@@ -585,6 +594,19 @@ async function syncDispatcherInbox(
   let skippedExisting = 0;
   let skippedNotQuote = 0;
   let processErrors = 0;
+  // Earliest message that was not durably stored. null = none.
+  // 0 = retry needed but the row had no received time.
+  let holdBeforeMs = null;
+  const noteRetry = (row) => {
+    const ms = row && row.receivedDateTime ?
+      new Date(row.receivedDateTime).getTime() : NaN;
+    if (!ms || isNaN(ms)) {
+      holdBeforeMs = 0;
+      return;
+    }
+    if (holdBeforeMs === 0) return;
+    if (holdBeforeMs == null || ms < holdBeforeMs) holdBeforeMs = ms;
+  };
 
   for (const row of messages) {
     const messageId = row.id;
@@ -634,6 +656,7 @@ async function syncDispatcherInbox(
         messageId,
         error: err.message,
       });
+      noteRetry(row);
       continue;
     }
 
@@ -651,6 +674,7 @@ async function syncDispatcherInbox(
         messageId,
         error: err.message,
       });
+      noteRetry(row);
       continue;
     }
 
@@ -666,6 +690,7 @@ async function syncDispatcherInbox(
               subject,
               reason: classify.reasoning || null,
             });
+        noteRetry(row);
         continue;
       }
       await col(tenant, "emailIntake").doc(intakeId).set({
@@ -718,6 +743,7 @@ async function syncDispatcherInbox(
           messageId,
           reason: enq.reason,
         });
+        noteRetry(row);
         continue;
       }
 
@@ -747,15 +773,17 @@ async function syncDispatcherInbox(
         messageId,
         error: err.message,
       });
+      noteRetry(row);
     }
   }
 
   // Check succeeded. Next run starts at this list time, minus a short overlap,
   // even when the last check was yesterday evening. A cut-off list advances
   // only through mail already listed so the rest of the window is retried.
+  // Mail left for retry holds the watermark so today's message is listed again.
   // Do this even when every id was already stored, so we do not rescan a backlog.
   const watermarkIso = quoteSyncWatermarkToStore(
-      checkedAt, messages, listTruncated);
+      checkedAt, messages, listTruncated, holdBeforeMs);
   if (watermarkIso) {
     await saveQuoteSyncWatermark(tenant, dispatcher.id, watermarkIso);
   } else if (listTruncated) {

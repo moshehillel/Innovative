@@ -73,6 +73,19 @@ check("cut-off list with no received times leaves the watermark",
         new Date("2026-10-08T13:00:00.000Z"),
         [{id: "x"}],
         true) === null);
+check("retry hold stays 1 second before the unstored message",
+    quoteOutlook.quoteSyncWatermarkToStore(
+        new Date("2026-10-09T14:04:00.000Z"),
+        [{receivedDateTime: "2026-10-09T13:40:00.000Z"}],
+        false,
+        Date.parse("2026-10-09T13:40:00.000Z")) ===
+      "2026-10-09T13:39:59.000Z");
+check("retry without a received time leaves the watermark",
+    quoteOutlook.quoteSyncWatermarkToStore(
+        new Date("2026-10-09T14:04:00.000Z"),
+        [],
+        false,
+        0) === null);
 const syncStart = outlookSrc.indexOf("async function syncDispatcherInbox");
 const syncEnd = outlookSrc.indexOf("function extractPlainBody");
 const syncBody = outlookSrc.slice(syncStart, syncEnd);
@@ -85,6 +98,16 @@ check("sync does not use a 7-day received window",
     !outlookSrc.includes("7 * 24 * 60 * 60 * 1000") &&
     outlookSrc.includes("quoteSyncReceivedAfter") &&
     outlookSrc.includes("saveQuoteSyncWatermark"));
+check("sync holds the watermark for messages left to retry",
+    syncBody.includes("noteRetry") &&
+    syncBody.includes("holdBeforeMs"));
+const intakeSrc = fs.readFileSync(
+    path.join(__dirname, "../quote-intake.js"), "utf8");
+const classifyStart = intakeSrc.indexOf("async function classifyIsQuoteRequest");
+const classifyEnd = intakeSrc.indexOf("module.exports", classifyStart);
+const classify = intakeSrc.slice(classifyStart, classifyEnd);
+check("quote classify disables luna reasoning so JSON is returned",
+    classify.includes("reasoning_effort: \"none\""));
 
 const tokens = {
   access_token: "test-token",
