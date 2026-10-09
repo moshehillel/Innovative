@@ -25,6 +25,9 @@
   const CATALOG_KEY = "qd:accCatalog:" + TENANT_ID;
   const CATALOG_TTL = 12 * 60 * 60 * 1000;
   let filterStatus = "pending";
+  let periodFilter = "all";
+  let serverCounts = null;
+  let periodCatalog = null;
   let outlookConnected = false;
   let syncInFlight = null;
   let inboxLoadInFlight = null;
@@ -293,7 +296,8 @@
 
   function setFilterBarBusy(busy) {
     ["filter-pending", "filter-sent", "filter-review", "filter-completed",
-      "filter-all"]
+      "filter-all", "period-day", "period-week", "period-month",
+      "period-year", "period-all"]
         .forEach((id) => {
           const el = document.getElementById(id);
           if (el) el.disabled = !!busy;
@@ -414,6 +418,7 @@
     Object.keys(inboxTabs).forEach((key) => {
       lists.push(inboxTabs[key].items);
     });
+    if (periodCatalog) lists.push(periodCatalog);
     for (let i = 0; i < lists.length; i++) {
       const found = (lists[i] || []).find((item) => String(item.id) === id);
       if (found) return found;
@@ -525,7 +530,260 @@
     });
   }
 
+  function createdAtMs(item) {
+    const v = item && item.createdAt;
+    if (v == null || v === "") return 0;
+    if (typeof v === "number") return v < 1e12 ? v * 1000 : v;
+    if (typeof v === "string") {
+      const t = Date.parse(v);
+      return isFinite(t) ? t : 0;
+    }
+    if (typeof v === "object") {
+      const sec = v.seconds != null ? v.seconds : v._seconds;
+      if (sec != null && sec !== "") {
+        const nano = Number(v.nanoseconds != null ? v.nanoseconds : v._nanoseconds) || 0;
+        return Number(sec) * 1000 + Math.floor(nano / 1e6);
+      }
+    }
+    return 0;
+  }
+
+  function nyWallParts(date) {
+    const fmt = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      weekday: "short",
+      hourCycle: "h23",
+    });
+    const out = {};
+    fmt.formatToParts(date).forEach((p) => {
+      if (p.type !== "literal") out[p.type] = p.value;
+    });
+    let hour = Number(out.hour);
+    if (hour === 24) hour = 0;
+    return {
+      y: Number(out.year),
+      m: Number(out.month),
+      d: Number(out.day),
+      hour: hour,
+      weekday: out.weekday,
+    };
+  }
+
+  function addCalDays(y, m, d, n) {
+    const dt = new Date(Date.UTC(y, m - 1, d + n));
+    return {y: dt.getUTCFullYear(), m: dt.getUTCMonth() + 1, d: dt.getUTCDate()};
+  }
+
+  function nyMidnightMs(y, m, d) {
+    const hours = [4, 5];
+    for (let i = 0; i < hours.length; i++) {
+      const ms = Date.UTC(y, m - 1, d, hours[i], 0, 0);
+      const wall = nyWallParts(new Date(ms));
+      if (wall.y === y && wall.m === m && wall.d === d && wall.hour === 0) {
+        return ms;
+      }
+    }
+    return Date.UTC(y, m - 1, d, 5, 0, 0);
+  }
+
+  function periodBounds(period, now) {
+    if (!period || period === "all") return null;
+    const wall = nyWallParts(now || new Date());
+    let start = {y: wall.y, m: wall.m, d: wall.d};
+    let end;
+    if (period === "day") {
+      end = addCalDays(start.y, start.m, start.d, 1);
+    } else if (period === "week") {
+      const dow = {Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6};
+      const back = ((dow[wall.weekday] || 0) + 6) % 7;
+      start = addCalDays(wall.y, wall.m, wall.d, -back);
+      end = addCalDays(start.y, start.m, start.d, 7);
+    } else if (period === "month") {
+      start = {y: wall.y, m: wall.m, d: 1};
+      end = wall.m === 12 ?
+        {y: wall.y + 1, m: 1, d: 1} :
+        {y: wall.y, m: wall.m + 1, d: 1};
+    } else if (period === "year") {
+      start = {y: wall.y, m: 1, d: 1};
+      end = {y: wall.y + 1, m: 1, d: 1};
+    } else {
+      return null;
+    }
+    return {
+      startMs: nyMidnightMs(start.y, start.m, start.d),
+      endMs: nyMidnightMs(end.y, end.m, end.d),
+    };
+  }
+
+  function inPeriod(item, bounds) {
+    if (!bounds) return true;
+    const ms = createdAtMs(item);
+    if (!ms) return false;
+    return ms >= bounds.startMs && ms < bounds.endMs;
+  }
+
+  function countsFromItems(items) {
+    const c = {
+      total: 0, pending: 0, awaiting: 0, draftReady: 0,
+      sent: 0, forReview: 0, dismissed: 0, completed: 0,
+    };
+    (items || []).forEach((item) => {
+      c.total += 1;
+      if (isDismissedItem(item)) {
+        c.dismissed += 1;
+        return;
+      }
+      if (isCompletedItem(item)) {
+        c.completed += 1;
+        return;
+      }
+      if (isForReviewItem(item)) c.forReview += 1;
+      const status = quoteStatusOf(item);
+      if (status === "awaiting_dispatcher") {
+        c.awaiting += 1;
+        c.pending += 1;
+      } else if (status === "draft_ready") {
+        c.draftReady += 1;
+        c.pending += 1;
+      } else if (status === "sent") {
+        c.sent += 1;
+      }
+    });
+    return c;
+  }
+
+  function syncPeriodButtons() {
+    const map = {
+      day: "period-day",
+      week: "period-week",
+      month: "period-month",
+      year: "period-year",
+      all: "period-all",
+    };
+    Object.keys(map).forEach((key) => {
+      const el = document.getElementById(map[key]);
+      if (!el) return;
+      el.classList.toggle("active", periodFilter === key);
+    });
+  }
+
+  async function fetchInboxStatus(status) {
+    const items = [];
+    let offset = 0;
+    for (let guard = 0; guard < 40; guard++) {
+      let path = "/getQuoteDispatcherInbox?" + QD.tenantQS +
+        "&limit=100&offset=" + offset + "&syncOutlook=0";
+      if (status) path += "&status=" + encodeURIComponent(status);
+      const res = await apiFetch(path);
+      if (!res.ok) throw new Error(res.error || "Inbox failed");
+      const raw = res.items || [];
+      raw.forEach((item) => items.push(item));
+      if (!res.hasMore || !raw.length) break;
+      offset += raw.length;
+    }
+    return items;
+  }
+
+  async function ensurePeriodCatalog() {
+    if (periodCatalog) return periodCatalog;
+    const groups = await Promise.all([
+      fetchInboxStatus(""),
+      fetchInboxStatus("completed"),
+      fetchInboxStatus("dismissed"),
+    ]);
+    const seen = new Set();
+    const items = [];
+    groups.forEach((list) => {
+      list.forEach((item) => {
+        const id = String(item && item.id || "");
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        items.push(item);
+      });
+    });
+    periodCatalog = items;
+    return items;
+  }
+
+  async function renderPeriodInbox() {
+    const requestPeriod = periodFilter;
+    const requestStatus = filterStatus;
+    syncPeriodButtons();
+    syncFilterButtons();
+    if (requestPeriod === "all") return;
+    showInboxThinking(true);
+    setFilterBarBusy(true);
+    try {
+      const catalog = await ensurePeriodCatalog();
+      if (periodFilter !== requestPeriod || filterStatus !== requestStatus) return;
+      const inWindow = catalog.filter((item) =>
+        inPeriod(item, periodBounds(requestPeriod)));
+      applyCounts(countsFromItems(inWindow));
+      const visible = filterInboxPage(inWindow, requestStatus);
+      inboxItems = visible;
+      inboxHasMore = false;
+      const panel = tabPanelEl(requestStatus);
+      if (!visible.length) {
+        panel.innerHTML = '<div class="empty">No quotes in this period.</div>';
+      } else {
+        panel.innerHTML = visible.map(quoteCardHtml).join("");
+        bindInboxCardEvents(panel);
+      }
+      const rows = document.getElementById("rows");
+      if (rows) rows.classList.remove("hidden");
+      showActiveTabPanel();
+    } catch (err) {
+      const panel = tabPanelEl(requestStatus);
+      panel.innerHTML = '<div class="empty">' +
+        esc(err.message || "Could not filter quotes") + "</div>";
+    } finally {
+      if (periodFilter === requestPeriod) {
+        showInboxThinking(false);
+        setFilterBarBusy(false);
+        syncLoadMoreButton();
+      }
+    }
+  }
+
+  function showAllPeriod() {
+    syncPeriodButtons();
+    if (serverCounts) applyCounts(serverCounts);
+    const tab = ensureTabRecord(filterStatus);
+    inboxItems = tab.items || [];
+    inboxHasMore = !!tab.hasMore;
+    if (tab.loaded) {
+      renderInboxCards(tab.items, {tab: filterStatus});
+      showActiveTabPanel();
+      const rows = document.getElementById("rows");
+      if (rows) rows.classList.remove("hidden");
+      syncLoadMoreButton();
+      return;
+    }
+    loadInbox({sync: false, keepChrome: true});
+  }
+
+  function setPeriod(period) {
+    if (period === periodFilter) return;
+    periodFilter = period;
+    syncPeriodButtons();
+    if (period === "all") {
+      showAllPeriod();
+      return;
+    }
+    renderPeriodInbox();
+  }
+
   function switchInboxTab(status) {
+    if (periodFilter !== "all") {
+      filterStatus = status;
+      syncFilterButtons();
+      renderPeriodInbox();
+      return;
+    }
     const tab = ensureTabRecord(status);
     if (status === filterStatus && (tab.loaded || inboxLoadInFlight)) return;
     filterStatus = status;
@@ -559,7 +817,10 @@
     tab.offset = Number(cached.offset) || tab.items.length;
     tab.hasMore = !!cached.hasMore;
     tab.loaded = true;
-    if (cached.counts) applyCounts(cached.counts);
+    if (cached.counts) {
+      serverCounts = cached.counts;
+      applyCounts(cached.counts);
+    }
     if (filterStatus === tabKey) {
       syncActiveTabGlobals();
       renderInboxCards(tab.items, {tab: tabKey});
@@ -609,16 +870,21 @@
               item.status = (res && res.status) || "completed";
               item.completedAt = true;
               item.forReview = false;
-              applyLocalCompleteStats(prevStatus, true, wasReview);
+              if (periodFilter === "all") {
+                applyLocalCompleteStats(prevStatus, true, wasReview);
+              }
             } else {
               const restored = (res && res.status) ||
                 item.statusBeforeCompleted || "draft_ready";
               item.status = restored;
               item.completedAt = null;
               item.statusBeforeCompleted = null;
-              applyLocalCompleteStats(restored, false, false);
+              if (periodFilter === "all") {
+                applyLocalCompleteStats(restored, false, false);
+              }
             }
-            applyItemAcrossTabs(item);
+            if (periodFilter !== "all") renderPeriodInbox();
+            else applyItemAcrossTabs(item);
           }
         } catch (err) {
           btn.disabled = false;
@@ -641,8 +907,12 @@
           const item = findInboxItem(quoteId);
           if (item) {
             item.forReview = !currentlyOn;
-            bumpStat("stat-review", currentlyOn ? -1 : 1);
-            applyItemAcrossTabs(item);
+            if (periodFilter !== "all") {
+              renderPeriodInbox();
+            } else {
+              bumpStat("stat-review", currentlyOn ? -1 : 1);
+              applyItemAcrossTabs(item);
+            }
           }
         } catch (err) {
           btn.disabled = false;
@@ -704,12 +974,15 @@
             item.dismissedAt = true;
             item.forReview = false;
             item.completedAt = null;
-            applyItemAcrossTabs(item);
+            if (periodFilter !== "all") renderPeriodInbox();
+            else applyItemAcrossTabs(item);
           } else if (card) {
             card.remove();
           }
-          applyLocalDismissStats(status);
-          if (wasReview) bumpStat("stat-review", -1);
+          if (periodFilter === "all") {
+            applyLocalDismissStats(status);
+            if (wasReview) bumpStat("stat-review", -1);
+          }
           syncLoadMoreButton();
         } catch (err) {
           btn.disabled = false;
@@ -917,7 +1190,8 @@
         }
         const raw = res.items || [];
         const counts = res.counts || {};
-        if (stillActive()) applyCounts(counts);
+        serverCounts = counts;
+        if (periodFilter === "all" && stillActive()) applyCounts(counts);
         else lastCounts = counts;
         const pageItems = filterInboxPage(raw, requestFilter);
         let added = pageItems.length;
@@ -941,13 +1215,19 @@
         }
         tab.loaded = true;
         if (stillActive()) syncActiveTabGlobals();
-        renderInboxCards(tab.items, {
-          append: append,
-          fresh: fresh,
-          tab: requestFilter,
-        });
+        if (periodFilter === "all") {
+          renderInboxCards(tab.items, {
+            append: append,
+            fresh: fresh,
+            tab: requestFilter,
+          });
+        }
         saveTabCache(requestFilter);
-        if (sync) invalidateInactiveTabs([requestFilter, filterStatus]);
+        if (sync) {
+          periodCatalog = null;
+          invalidateInactiveTabs([requestFilter, filterStatus]);
+          if (periodFilter !== "all" && stillActive()) renderPeriodInbox();
+        }
       } finally {
         if (append && stillActive()) loadMoreInFlight = false;
         if (!silent && !append && !keepChrome && stillActive()) {
@@ -1122,6 +1402,21 @@
   });
   document.getElementById("filter-all").addEventListener("click", () => {
     switchInboxTab("");
+  });
+  document.getElementById("period-day").addEventListener("click", () => {
+    setPeriod("day");
+  });
+  document.getElementById("period-week").addEventListener("click", () => {
+    setPeriod("week");
+  });
+  document.getElementById("period-month").addEventListener("click", () => {
+    setPeriod("month");
+  });
+  document.getElementById("period-year").addEventListener("click", () => {
+    setPeriod("year");
+  });
+  document.getElementById("period-all").addEventListener("click", () => {
+    setPeriod("all");
   });
   document.getElementById("btn-load-more").addEventListener("click", () => {
     if (!inboxHasMore || loadMoreInFlight || inboxLoadInFlight) return;

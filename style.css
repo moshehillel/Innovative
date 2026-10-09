@@ -107,7 +107,7 @@ body {
   padding: 20px 28px 56px;
   min-width: 0;
 }
-body.page-quote .main { max-width: 1560px; margin: 0 auto; }
+body.page-quote .main { max-width: none; margin: 0; }
 body.page-admin .main { max-width: none; margin: 0; }
 
 /* ——— Buttons / inputs ——— */
@@ -351,11 +351,16 @@ input, select, textarea {
 }
 
 /* KPI stats */
+.stats-wrap {
+  display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between;
+  gap: 12px 16px; margin-bottom: 16px;
+}
 .stats {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
-  gap: 10px; margin-bottom: 16px;
+  gap: 10px; margin-bottom: 0; flex: 1 1 720px;
 }
+.period-bar { flex: 0 0 auto; margin-bottom: 2px; }
 .stat {
   position: relative;
   background: linear-gradient(180deg, #fff 0%, #f7fbfb 100%);
@@ -470,6 +475,23 @@ input, select, textarea {
   gap: 12px; align-items: start;
   padding: 14px 16px;
   cursor: pointer; user-select: none; min-width: 0; max-width: 100%;
+}
+.quote-card:not(.open) .quote-card-head {
+  gap: 8px; padding: 8px 12px; align-items: center;
+}
+.quote-card:not(.open) .quote-card-title { font-size: 13px; }
+.quote-card:not(.open) .quote-card-sub {
+  font-size: 11.5px; margin-top: 2px; line-height: 1.3;
+}
+.quote-card:not(.open) .quote-card-customer { font-size: 12px; margin-top: 1px; }
+.quote-card:not(.open) .quote-card-warn { font-size: 11px; margin-top: 2px; }
+.quote-card:not(.open) .quote-card-actions,
+.quote-card:not(.open) .quote-card-badges { gap: 3px; }
+.quote-card:not(.open) .quote-card-head .btn-dismiss-card,
+.quote-card:not(.open) .quote-card-head .btn-review-card,
+.quote-card:not(.open) .quote-card-head .btn-complete-card,
+.quote-card:not(.open) .quote-card-head .btn-open-quote {
+  padding: 3px 8px; font-size: 11px;
 }
 .quote-card-head:hover { background: #f4faf9; }
 .quote-card-main { min-width: 0; max-width: 100%; }
