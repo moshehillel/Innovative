@@ -21,8 +21,8 @@ $Schedule = "*/5 7-20 * * 1-5"
 $TimeZone = "America/New_York"
 
 # Hot endpoints behind dashboard buttons (inbox, open quote, save/generate/
-# approve, re-rate, catalog). Each gets its own tiny job so one slow endpoint
-# never blocks warming the others.
+# approve, dismiss, re-rate, catalog). Each gets its own tiny job so one slow
+# endpoint never blocks warming the others.
 $Endpoints = @(
   "getQuoteDispatcherInbox",
   "getQuoteDispatcherProfile",
@@ -31,7 +31,8 @@ $Endpoints = @(
   "saveQuoteSelections",
   "generateQuoteEmail",
   "rerunQuoteRates",
-  "approveQuoteEmail"
+  "approveQuoteEmail",
+  "dismissQuote"
 )
 
 Write-Host "Project:  $Project"
