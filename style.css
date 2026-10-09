@@ -108,7 +108,7 @@ body {
   min-width: 0;
 }
 body.page-quote .main { max-width: 1560px; margin: 0 auto; }
-body.page-admin .main { max-width: 1280px; margin: 0 auto; }
+body.page-admin .main { max-width: none; margin: 0; }
 
 /* ——— Buttons / inputs ——— */
 button, .btn {
@@ -914,12 +914,19 @@ input, select, textarea {
   padding: 7px 13px; border-radius: 7px; cursor: pointer;
   font-size: 12.5px; font-weight: 600; box-shadow: none;
 }
-.tabs button:hover { color: var(--ic-text); background: rgba(255,255,255,0.7); }
-.tabs button.active { background: #fff; color: var(--ic-brand-ink); box-shadow: 0 1px 2px rgba(20,33,43,.08); }
+.tabs button:hover:not(.active) { color: var(--ic-text); background: rgba(255,255,255,0.7); }
+.tabs button.active {
+  background: var(--ic-brand); color: #fff;
+  box-shadow: 0 4px 12px rgba(13, 110, 110, 0.28);
+}
+.tabs button.active:hover { background: #0b5f5f; color: #fff; }
 
 .panel {
   background: var(--ic-surface); border: 1px solid var(--ic-border);
   border-radius: var(--ic-radius-lg); padding: 22px 24px; box-shadow: var(--ic-shadow);
+}
+body.page-admin #panel-rules {
+  background: transparent; border: 0; box-shadow: none; padding: 2px 0 0;
 }
 .panel h2 {
   font-family: var(--ic-display);
@@ -929,16 +936,51 @@ input, select, textarea {
 .panel-intro { font-size: 14px; color: var(--ic-text-muted); margin: 0 0 18px; line-height: 1.6; }
 .panel-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 #status { font-size: 12.5px; color: var(--ic-text-faint); }
-#rules-count { font-size: 12.5px; color: var(--ic-text-faint); }
-
-body.page-admin .rules-list { display: flex; flex-direction: column; gap: 8px; }
-.rule-card {
-  border: 1px solid var(--ic-border); border-radius: var(--ic-radius);
-  padding: 0; background: var(--ic-surface-2);
-  transition: box-shadow 0.15s ease, border-color 0.15s ease; overflow: hidden;
+#rules-count {
+  font-size: 12px; font-weight: 700; color: var(--ic-brand-ink);
+  background: var(--ic-brand-soft); border: 1px solid #b7dddd;
+  border-radius: 999px; padding: 3px 10px;
 }
-.rule-card:hover { border-color: var(--ic-brand); box-shadow: var(--ic-shadow); }
-.rule-card.inactive { opacity: 0.65; }
+
+#rules-list.rules-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+@media (min-width: 1100px) {
+  #rules-list.rules-list { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  #rules-list > .empty-state,
+  #rules-list > .rule-card.open { grid-column: 1 / -1; }
+}
+@media (min-width: 1680px) {
+  #rules-list.rules-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.rule-card {
+  border: 1px solid var(--ic-border);
+  border-left: 3px solid var(--ic-brand);
+  border-radius: var(--ic-radius-lg);
+  padding: 0;
+  background: linear-gradient(180deg, #fff 0%, #f7fbfb 100%);
+  box-shadow: var(--ic-shadow);
+  overflow: hidden;
+  transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+.rule-card:hover {
+  transform: translateY(-2px);
+  border-color: #c5e0e0;
+  border-left-color: var(--ic-brand);
+  box-shadow: 0 12px 28px rgba(13, 110, 110, 0.12);
+}
+.rule-card.open {
+  border-left-color: var(--ic-brand);
+  box-shadow: 0 14px 32px rgba(13, 110, 110, 0.14);
+}
+.rule-card.inactive {
+  opacity: 1;
+  border-left-color: #cbd5e1;
+  background: #f8fafc;
+}
 .rule-toggle {
   display: flex; align-items: flex-start; gap: 10px; width: 100%; margin: 0;
   padding: 12px 14px; border: 0; background: transparent; cursor: pointer;
@@ -986,7 +1028,7 @@ body.page-admin .rules-list { display: flex; flex-direction: column; gap: 8px; }
 /* Admin chat */
 .chat-panel { display: flex; flex-direction: column; min-height: 520px; }
 .chat-log {
-  flex: 1; min-height: 360px; max-height: 480px; overflow-y: auto;
+  flex: 1; min-height: 420px; max-height: min(62vh, 640px); overflow-y: auto;
   border: 1px solid var(--ic-border); border-radius: var(--ic-radius);
   padding: 16px; margin-bottom: 14px; background: var(--ic-surface-2);
   display: flex; flex-direction: column; gap: 12px;
