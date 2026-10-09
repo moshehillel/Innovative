@@ -395,6 +395,9 @@ function shouldRetryIntake(prev, opts) {
     if (src === "heuristic_fallback" || /Luna failed/i.test(reason)) {
       return true;
     }
+    // Missing extract key is not a real "not a quote". Retry after the
+    // fallback model is available.
+    if (/not configured/i.test(reason)) return true;
     return false;
   }
   // Failed / errored intakes: allow forceReprocess recovery (enqueue

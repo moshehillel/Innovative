@@ -111,6 +111,10 @@ check("quote classify reasons and still budgets the JSON answer",
     classify.includes("max_completion_tokens: 4000") &&
     classify.includes("response_format: {type: \"json_object\"}") &&
     !classify.includes("reasoning_effort: \"none\""));
+check("missing Cursor key still falls through to Haiku",
+    intakeSrc.includes("useHaikuInstead"));
+check("missing extract key is retried instead of a permanent skip",
+    outlookSrc.includes("/not configured/i.test(reason)"));
 
 const tokens = {
   access_token: "test-token",

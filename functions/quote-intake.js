@@ -3960,7 +3960,16 @@ async function extractQuoteRequest(opts) {
   } else {
     missingKeyError = "ANTHROPIC_API_KEY not configured";
   }
-  if (!canCallModel) {
+  let raw = "";
+  let lastErr = null;
+  // Grok/Cursor is the default extract model, but this project often has
+  // Anthropic configured and no Cursor key. Do not stop at the heuristic
+  // and record "CRSR_API_KEY not configured" — that permanently drops RFQs
+  // the heuristic cannot parse. Haiku below is the configured fallback.
+  const useHaikuInstead = !canCallModel &&
+    isCursorExtractModel(extractModel) &&
+    Boolean(process.env.ANTHROPIC_API_KEY);
+  if (!canCallModel && !useHaikuInstead) {
     const heuristic = heuristicExtractQuote({subject, from, body});
     if (heuristic) {
       heuristic.extractModel = "heuristic";
@@ -3970,9 +3979,9 @@ async function extractQuoteRequest(opts) {
     fallback.extractModel = extractModel;
     return fallback;
   }
-
-  let raw = "";
-  let lastErr = null;
+  if (useHaikuInstead) {
+    lastErr = new Error(missingKeyError);
+  } else {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       raw = await callQuoteExtractionModel({subject, from, body}, extractModel);
@@ -3992,8 +4001,10 @@ async function extractQuoteRequest(opts) {
       lastErr = err;
     }
   }
+  }
 
-  // Cursor path: fall back to Haiku so quoting still works if Agent fails.
+  // Cursor path: fall back to Haiku so quoting still works if Agent fails
+  // or the Cursor key is not configured.
   if (isCursorExtractModel(extractModel) && process.env.ANTHROPIC_API_KEY) {
     try {
       raw = await callClaudeQuoteExtraction(
