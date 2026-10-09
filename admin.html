@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Innovative Carriers — Quote Rules Admin</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=20261009a">
+</head>
+<body class="page-admin">
+  <div id="app">
+    <header class="topbar">
+      <div class="topbar-brand">
+        <p class="brand-mark">Innovative Carriers</p>
+        <h1 class="topbar-title">Quote rules</h1>
+        <span id="status" class="topbar-sub"></span>
+      </div>
+      <div class="topbar-actions">
+        <div class="tabs">
+          <button type="button" data-tab="rules" class="active">Rules list</button>
+          <button type="button" data-tab="chat">Ask AI to change rules</button>
+          <button type="button" data-tab="test">Try an address</button>
+        </div>
+        <a class="home-link" id="home-link" href="index.html">← Dashboard</a>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="panel" id="panel-rules">
+        <h2>Automatic quote rules</h2>
+        <p class="panel-intro">
+          These rules run when a quote email comes in. Each rule checks the delivery location and instructions,
+          then adds the right accessorials (liftgate, appointment, limited access, etc.) before rate shopping.
+          Rules with lower priority numbers run first.
+        </p>
+        <div class="panel-toolbar">
+          <button type="button" class="ghost" id="reload-rules">Refresh list</button>
+          <span id="rules-count"></span>
+        </div>
+        <div class="rules-list" id="rules-list"></div>
+      </section>
+
+      <section class="panel hidden chat-panel" id="panel-chat">
+        <h2>Change rules in plain English</h2>
+        <p class="panel-intro">
+          Describe what you want in plain English — like any AI chat.
+          I'll ask a quick clarifying question if needed, propose a rule,
+          and save it when you say <strong>yes</strong>, <strong>sounds good</strong>,
+          <strong>go ahead</strong>, <strong>that's right</strong>, or click
+          <strong>Confirm</strong>.
+          Press Enter to send (Shift+Enter for a new line).
+        </p>
+        <div class="chat-log" id="chat-log"></div>
+        <div class="chat-quick-replies" id="chat-quick-replies" aria-label="Quick replies"></div>
+        <div class="chat-input">
+          <textarea id="chat-input" placeholder="Describe the rule you want…"></textarea>
+          <button type="button" class="primary" id="chat-send">Send</button>
+        </div>
+        <div id="proposal-box" class="proposal hidden">
+          <strong id="proposal-box-title">Proposed rule — review below</strong>
+          <p class="hint" id="proposal-box-hint" style="margin:6px 0 10px">Reply naturally (yes, sounds good, go ahead, that's right) or click Confirm to save this rule.</p>
+          <div id="proposal-summary" class="proposal-summary"></div>
+          <details class="rule-advanced">
+            <summary>Technical details (for IT)</summary>
+            <pre id="proposal-json"></pre>
+          </details>
+          <div style="margin-top:12px;display:flex;gap:8px">
+            <button type="button" class="primary" id="confirm-proposal">Confirm</button>
+            <button type="button" class="ghost" id="dismiss-proposal">Cancel</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel hidden" id="panel-test">
+        <h2>Try an address</h2>
+        <p class="panel-intro">
+          Enter Ship From and/or Ship To addresses to see which rules would apply and what accessorials
+          would be added — without sending a real quote.
+        </p>
+        <div class="test-form">
+          <label for="test-from-name">Who is shipping the freight?</label>
+          <p class="hint">Shipper / pickup location name (Ship From)</p>
+          <input id="test-from-name" placeholder="Weida Freight System">
+          <label for="test-from-address">Pickup address</label>
+          <p class="hint">Street, city, and state</p>
+          <input id="test-from-address" placeholder="9050 Hermosa Ave, Rancho Cucamonga CA">
+          <label for="test-name">Who is receiving the freight?</label>
+          <p class="hint">Consignee / delivery location name (Ship To)</p>
+          <input id="test-name" placeholder="Sunrise Nursing Home">
+          <label for="test-address">Delivery address</label>
+          <p class="hint">Street, city, and state</p>
+          <input id="test-address" placeholder="123 Main St, Dallas TX">
+          <label for="test-instructions">Special instructions from the email</label>
+          <p class="hint">Anything about dock, liftgate, appointment, etc.</p>
+          <textarea id="test-instructions" rows="3" placeholder="No loading dock — liftgate required"></textarea>
+          <label class="checkbox-row">
+            <input type="checkbox" id="test-classify">
+            Classify From + To (Google Places or AI lookup + cache)
+          </label>
+          <button type="button" class="primary" id="run-test">Check which rules apply</button>
+          <div id="test-result" class="test-result hidden"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="config.js?v=20261009a"></script>
+  <script src="shared.js?v=20261009a"></script>
+  <script src="admin.js?v=20261009a"></script>
+</body>
+</html>

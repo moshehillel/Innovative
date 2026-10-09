@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Innovative Carriers — Quote Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css?v=20261009a">
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+</head>
+<body class="page-home">
+  <div id="login-screen" class="login-page">
+    <section class="login">
+      <div class="login-brand">
+        <div class="login-icon" aria-hidden="true">&#9993;</div>
+        <h2>Quote Dashboard</h2>
+        <p class="login-desc">Sign in with your dispatcher account.<br>New users are added by admin only.</p>
+      </div>
+      <form id="login-form" class="login-form">
+        <label>Email
+          <input type="email" id="login-email" autocomplete="username" placeholder="you@innovativecarriers.com" required>
+        </label>
+        <label>Password
+          <input type="password" id="login-password" autocomplete="current-password" placeholder="Enter your password" required>
+        </label>
+        <button type="submit" class="btn-login">Sign in</button>
+      </form>
+      <p class="login-links">
+        <button type="button" class="link-btn" id="btn-forgot">Forgot password?</button>
+      </p>
+      <div class="login-msg ok hidden" id="login-success"></div>
+      <div class="err" id="login-error"></div>
+      <p class="login-footer">Each dispatcher only sees quotes assigned to their own email address.</p>
+    </section>
+  </div>
+
+  <div id="app" class="hidden">
+    <header class="topbar">
+      <div class="topbar-brand">
+        <p class="brand-mark">Innovative Carriers</p>
+        <h1 class="topbar-title" id="title">Quote Dashboard</h1>
+        <span class="brand-sub" id="subtitle"></span>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" class="ghost" id="btn-rules">Quote rules</button>
+        <button type="button" class="ghost" id="btn-signout">Sign out</button>
+      </div>
+    </header>
+    <main class="main">
+      <div class="outlook-bar">
+        <div class="status warn" id="outlook-status">
+          Connect your Outlook mailbox to receive quotes sent to your email.
+        </div>
+        <button type="button" class="ghost" id="btn-outlook-connect">Connect Outlook</button>
+        <button type="button" class="ghost hidden" id="btn-outlook-disconnect">Disconnect</button>
+      </div>
+
+      <section class="bulk-panel" id="bulk-panel" aria-labelledby="bulk-title">
+        <div class="bulk-launch-row">
+          <button type="button" id="btn-bulk-open">Bulk rate shop</button>
+          <span class="bulk-hint" id="bulk-title">Upload destinations in a compact dialog</span>
+          <button type="button" class="ghost hidden" id="btn-bulk-download">Download XLSX</button>
+          <button type="button" class="ghost hidden" id="btn-bulk-download-csv">Download CSV</button>
+        </div>
+        <div class="bulk-progress hidden" id="bulk-progress">
+          <div id="bulk-progress-text">Ready</div>
+          <div class="bar" aria-hidden="true"><span id="bulk-progress-bar"></span></div>
+        </div>
+        <div class="bulk-msg hidden" id="bulk-msg"></div>
+      </section>
+
+      <div class="bulk-modal-backdrop hidden" id="bulk-modal" role="dialog" aria-modal="true" aria-labelledby="bulk-modal-title">
+        <div class="bulk-modal">
+          <div class="bulk-modal-head">
+            <div>
+              <h3 id="bulk-modal-title">Bulk rate shop</h3>
+              <p>Upload destinations — results include carrier cost + quote numbers.</p>
+            </div>
+            <button type="button" class="ghost" id="btn-bulk-close" aria-label="Close bulk rate shop">Close</button>
+          </div>
+          <div class="bulk-cols">
+            <strong>Required columns</strong> (Book5-style preferred):<br>
+            <code>CNSG City</code>, <code>CNSG State</code>,
+            <code>CNSG Zipcode</code>, <code>Total Weight</code>,
+            <code>Total Pieces</code>, <code>dims</code>
+            (e.g. <code>40x48x60</code>)<br>
+            Also accepted (Book4-style): <code>city</code>, <code>st</code>,
+            <code>zip</code>, <code>PALLET</code>, <code>WEIGHT</code>
+            (optional second weight column), <code>dims</code>
+          </div>
+          <div class="bulk-field">
+            <label>File *
+              <input type="file" id="bulk-file" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel">
+            </label>
+          </div>
+          <div class="bulk-grid">
+            <label>From street (optional)
+              <input type="text" id="bulk-from-street" placeholder="Street address" autocomplete="shipping street-address">
+            </label>
+            <label>From city *
+              <input type="text" id="bulk-from-city" required placeholder="City" autocomplete="shipping address-level2">
+            </label>
+            <label>From state *
+              <input type="text" id="bulk-from-state" required placeholder="CA" maxlength="2" autocomplete="shipping address-level1">
+            </label>
+            <label>From zip *
+              <input type="text" id="bulk-from-zip" required placeholder="91752" autocomplete="shipping postal-code">
+            </label>
+            <label>Primus customer ID (optional)
+              <input type="text" id="bulk-customer-id" placeholder="shippingLocationId — leave blank for market">
+            </label>
+          </div>
+          <div class="bulk-field">
+            <label>Accessorials (optional — Ctrl/Cmd+click multi-select)
+              <select id="bulk-accessorials" class="bulk-acc" multiple size="6">
+                <option value="" disabled>Loading catalog…</option>
+              </select>
+            </label>
+          </div>
+          <div class="bulk-options">
+            <label>
+              <input type="checkbox" id="bulk-estes-only" checked>
+              Estes Standard only
+            </label>
+            <label>
+              <input type="checkbox" id="bulk-guaranteed">
+              Include Guaranteed + ERG
+            </label>
+          </div>
+          <div class="bulk-modal-actions">
+            <button type="button" id="btn-bulk-start">Start bulk rate shop</button>
+            <button type="button" class="ghost" id="btn-bulk-done">Done</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="stats">
+        <div class="stat"><div class="num" id="stat-total">—</div><div class="lbl">Total quotes</div></div>
+        <div class="stat"><div class="num" id="stat-awaiting">—</div><div class="lbl">Awaiting</div></div>
+        <div class="stat"><div class="num" id="stat-draft">—</div><div class="lbl">Draft ready</div></div>
+        <div class="stat"><div class="num" id="stat-sent">—</div><div class="lbl">Sent</div></div>
+        <div class="stat"><div class="num" id="stat-review">—</div><div class="lbl">For review</div></div>
+        <div class="stat"><div class="num" id="stat-completed">—</div><div class="lbl">Completed</div></div>
+        <div class="stat"><div class="num muted" id="stat-dismissed">—</div><div class="lbl">Dismissed</div></div>
+      </div>
+      <div class="filter-bar">
+        <button type="button" id="filter-pending" class="ghost active">Pending</button>
+        <button type="button" id="filter-sent" class="ghost">Sent</button>
+        <button type="button" id="filter-review" class="ghost">For review</button>
+        <button type="button" id="filter-completed" class="ghost">Completed</button>
+        <button type="button" id="filter-all" class="ghost">All</button>
+      </div>
+      <div class="report-bar" id="report-bar">
+        <label>From
+          <input type="date" id="report-from" />
+        </label>
+        <label>To
+          <input type="date" id="report-to" />
+        </label>
+        <button type="button" id="btn-report-pull">Report pull (CSV)</button>
+        <span class="report-note">Saved drafts + sent + completed</span>
+      </div>
+      <div id="page-thinking" class="page-thinking hidden" aria-live="polite" aria-busy="false">
+        <div class="thinking-panel">
+          <p class="thinking-eyebrow">Quote dashboard</p>
+          <p class="thinking-status" id="thinking-status">
+            Searching out all carriers for you<span class="thinking-dots" aria-hidden="true"><span>.</span><span>.</span><span>.</span></span>
+          </p>
+          <div class="thinking-pulse" aria-hidden="true"></div>
+        </div>
+        <div class="thinking-skel" aria-hidden="true">
+          <div class="skel skel-card"></div>
+          <div class="skel skel-card"></div>
+          <div class="skel skel-card"></div>
+        </div>
+      </div>
+      <div class="quote-list hidden" id="rows"></div>
+      <div class="load-more-wrap hidden" id="load-more-wrap">
+        <button type="button" class="ghost" id="btn-load-more">Load more</button>
+      </div>
+    </main>
+  </div>
+
+  <script src="config.js?v=20261009a"></script>
+  <script src="shared.js?v=20261009a"></script>
+  <script src="app.js?v=20261009a"></script>
+</body>
+</html>
