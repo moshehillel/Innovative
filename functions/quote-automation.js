@@ -1665,7 +1665,7 @@ async function countQuotesForDispatcher(tenant, dispatcher) {
       .where("assignedDispatcherId", "==", dispatcherId)
       .select(
           "status", "dismissedAt", "completedAt",
-          "assignedDispatcherEmail", "forReview")
+          "assignedDispatcherId", "assignedDispatcherEmail", "forReview")
       .get();
   const counts = emptyDispatcherQuoteCounts();
   for (const doc of snap.docs) {
@@ -1700,11 +1700,14 @@ async function listQuotesForDispatcher(tenant, dispatcher, opts = {}) {
       dispatcher.email || "");
   // Scan this dispatcher's quotes only. A global createdAt window hides
   // older assigned quotes and reports hasMore=false before the page fills.
+  // Include assignedDispatcherId. quoteBelongsToDispatcher rejects a row
+  // when that field is missing, and a field mask omits it by default.
   const snap = await col(tenant, "quoteRequests")
       .where("assignedDispatcherId", "==", dispatcherId)
       .select(
           "status", "dismissedAt", "completedAt",
-          "assignedDispatcherEmail", "forReview", "createdAt")
+          "assignedDispatcherId", "assignedDispatcherEmail",
+          "forReview", "createdAt")
       .get();
   const counts = emptyDispatcherQuoteCounts();
   const matches = [];
