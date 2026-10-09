@@ -106,8 +106,11 @@ const intakeSrc = fs.readFileSync(
 const classifyStart = intakeSrc.indexOf("async function classifyIsQuoteRequest");
 const classifyEnd = intakeSrc.indexOf("module.exports", classifyStart);
 const classify = intakeSrc.slice(classifyStart, classifyEnd);
-check("quote classify disables luna reasoning so JSON is returned",
-    classify.includes("reasoning_effort: \"none\""));
+check("quote classify reasons and still budgets the JSON answer",
+    classify.includes("reasoning_effort: \"medium\"") &&
+    classify.includes("max_completion_tokens: 4000") &&
+    classify.includes("response_format: {type: \"json_object\"}") &&
+    !classify.includes("reasoning_effort: \"none\""));
 
 const tokens = {
   access_token: "test-token",

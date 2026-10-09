@@ -4104,11 +4104,12 @@ async function classifyIsQuoteRequest(opts) {
     // gpt-5.6-luna rejects temperature (only default 1). Omit it.
     const completion = await client.chat.completions.create({
       model,
-      // gpt-5.6-luna spends the token budget on reasoning and returns
-      // empty content ("Unexpected end of JSON input") unless reasoning
-      // is off. Empty output was treated as not-a-quote and then skipped.
-      max_completion_tokens: 500,
-      reasoning_effort: "none",
+      // gpt-5.6-luna counts hidden reasoning against max_completion_tokens.
+      // A 200–500 cap was spent entirely on reasoning and returned an empty
+      // body ("Unexpected end of JSON input"). 4000 leaves room to think
+      // and still emit the small yes/no JSON on the first try.
+      max_completion_tokens: 4000,
+      reasoning_effort: "medium",
       response_format: {type: "json_object"},
       messages: [
         {
