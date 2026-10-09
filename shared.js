@@ -210,19 +210,10 @@
     "approveQuoteEmail",
   ];
 
-  function warmUp(names, opts) {
-    const force = !!(opts && opts.force);
-    const last = Number(ssGet(WARM_KEY) || 0);
-    if (!force && Date.now() - last < WARM_THROTTLE_MS) return;
-    ssSet(WARM_KEY, Date.now());
-    (names || WARM_ENDPOINTS).forEach((name) => {
-      try {
-        fetch(API + "/" + name + "?warm=1&" + tenantQS, {
-          method: "GET",
-          keepalive: true,
-        }).catch(() => {});
-      } catch (_) { /* ignore */ }
-    });
+  function warmUp() {
+    // Cloud Scheduler already pings these endpoints on a timer. Doing it
+    // from the browser always logs 401/400/405 in the console (the pings
+    // are unsigned GETs), so the page does not send them.
   }
 
   // ---------- Thinking rotation (shared across pages) ----------
