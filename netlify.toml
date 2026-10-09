@@ -1,6 +1,14 @@
 [build]
   publish = "."
 
+# Browser calls /fn/<function> on this site. Netlify forwards them to Cloud
+# Functions, including the method, body, query string, and Authorization header.
+[[redirects]]
+  from = "/fn/*"
+  to = "https://us-central1-tai-invoice-automation.cloudfunctions.net/:splat"
+  status = 200
+  force = true
+
 [[headers]]
   for = "/*"
   [headers.values]
