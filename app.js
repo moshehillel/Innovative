@@ -575,6 +575,7 @@
         if (e.target.closest(".btn-dismiss-card")) return;
         if (e.target.closest(".btn-review-card")) return;
         if (e.target.closest(".btn-complete-card")) return;
+        if (e.target.closest(".btn-open-quote")) return;
         el.parentElement.classList.toggle("open");
       });
       // Prefetch detail data the moment the user shows interest.
@@ -825,6 +826,7 @@
           ${reviewBadge}
         </div>
         <div class="quote-card-actions">
+          <a class="btn btn-open-quote" data-id="${esc(item.id)}" href="${esc(quoteOpenUrl(item))}">Open full review</a>
           <button type="button" class="ghost btn-complete-card" data-id="${esc(item.id)}" data-completed="${completed ? "1" : "0"}">${completed ? "Undo complete" : "Complete"}</button>
           <button type="button" class="ghost btn-review-card${forReview ? " is-on" : ""}" data-id="${esc(item.id)}" data-on="${forReview ? "1" : "0"}"${completed ? " disabled" : ""}>${forReview ? "Unmark review" : "For review"}</button>
           <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}"${completed ? " disabled" : ""}>Dismiss</button>
@@ -832,9 +834,6 @@
       </div>
       <div class="quote-card-body">
         ${lanesHtml || '<div class="empty" style="padding:12px">No lane preview</div>'}
-        <div class="card-actions">
-          <a class="btn btn-open-quote" data-id="${esc(item.id)}" href="${esc(quoteOpenUrl(item))}">Open full review</a>
-        </div>
       </div>
     </div>`;
   }

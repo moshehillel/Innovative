@@ -499,8 +499,12 @@ input, select, textarea {
 .quote-card-actions { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
 .quote-card-head .btn-dismiss-card,
 .quote-card-head .btn-review-card,
-.quote-card-head .btn-complete-card {
+.quote-card-head .btn-complete-card,
+.quote-card-head .btn-open-quote {
   padding: 6px 11px; font-size: 12px; align-self: stretch; white-space: nowrap;
+}
+.quote-card-head .btn-open-quote {
+  box-shadow: 0 4px 12px rgba(13, 110, 110, 0.22);
 }
 .quote-card-head .btn-review-card.is-on {
   background: var(--ic-purple-bg); border-color: var(--ic-purple-border); color: var(--ic-purple);
