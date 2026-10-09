@@ -13063,17 +13063,56 @@ exports.mailOAuthCallback = exports.gmailOAuthCallback;
 exports.outlookOAuthCallback = exports.gmailOAuthCallback;
 
 /**
- * Applies CORS headers so the static dashboard can call these endpoints
- * directly from the browser. Set the DASHBOARD_ORIGIN env var to the
- * dashboard's URL (e.g. https://your-site.netlify.app) to restrict access;
- * it falls back to "*" so the dashboard works before that's configured.
+ * Dashboards that may call these endpoints from the browser.
+ * DASHBOARD_ORIGIN may add more (comma-separated). A comma-separated value
+ * must never be sent as one Access-Control-Allow-Origin header — browsers
+ * allow exactly one origin (or "*").
+ */
+const DASHBOARD_BROWSER_ORIGINS = [
+  "https://www.advancedautomations.net",
+  "https://advancedautomations.net",
+  "https://innovative-jerry.netlify.app",
+  "https://innovative-quotes.netlify.app",
+];
+
+/**
+ * @return {{allowAll: boolean, origins: string[]}} Allowed browser origins.
+ */
+function dashboardCorsPolicy() {
+  const raw = String(process.env.DASHBOARD_ORIGIN || "").trim();
+  if (!raw || raw === "*") {
+    return {allowAll: true, origins: DASHBOARD_BROWSER_ORIGINS.slice()};
+  }
+  const fromEnv = raw.split(",")
+      .map((s) => s.trim())
+      .filter((s) => s && s !== "*");
+  const origins = [...new Set(DASHBOARD_BROWSER_ORIGINS.concat(fromEnv))];
+  return {allowAll: false, origins};
+}
+
+/**
+ * Applies CORS headers so the static dashboards can call these endpoints
+ * directly from the browser. Echoes the request Origin when it is allowed,
+ * so the header is always a single valid value.
  * @param {object} req Express request.
  * @param {object} res Express response.
  * @return {boolean} True if this was an OPTIONS preflight that was already
  *   responded to, meaning the caller should stop handling the request.
  */
 function applyDashboardCors(req, res) {
-  res.set("Access-Control-Allow-Origin", process.env.DASHBOARD_ORIGIN || "*");
+  const policy = dashboardCorsPolicy();
+  const origin = String(
+      (req.get && req.get("Origin")) ||
+      (req.headers && req.headers.origin) ||
+      "").trim();
+  let allowOrigin = "*";
+  if (origin && (policy.allowAll || policy.origins.indexOf(origin) >= 0)) {
+    allowOrigin = origin;
+  } else if (!policy.allowAll && policy.origins.length) {
+    allowOrigin = policy.origins[0];
+  }
+  res.set("Access-Control-Allow-Origin", allowOrigin);
+  res.set("Vary", "Origin");
   res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (req.method === "OPTIONS") {
