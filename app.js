@@ -173,6 +173,22 @@
 
   function bumpStat(id, delta) {
     writeStat(id, readStat(id) + delta);
+    if (!serverCounts) return;
+    const key = {
+      "stat-total": "total",
+      "stat-awaiting": "awaiting",
+      "stat-draft": "draftReady",
+      "stat-sent": "sent",
+      "stat-review": "forReview",
+      "stat-completed": "completed",
+      "stat-dismissed": "dismissed",
+    }[id];
+    if (!key) return;
+    serverCounts[key] = Math.max(0, (Number(serverCounts[key]) || 0) + delta);
+    if (key === "awaiting" || key === "draftReady") {
+      serverCounts.pending = Math.max(0,
+          (Number(serverCounts.pending) || 0) + delta);
+    }
   }
 
   function statusStatId(status) {
@@ -474,6 +490,80 @@
         dismissBtn.textContent = "Dismiss";
       }
     }
+  }
+
+  function quoteSnap(item) {
+    return {
+      status: item.status,
+      forReview: !!item.forReview,
+      completedAt: item.completedAt,
+      dismissedAt: item.dismissedAt,
+      statusBeforeCompleted: item.statusBeforeCompleted,
+    };
+  }
+
+  function applyQuoteSnap(item, snap) {
+    item.status = snap.status;
+    item.forReview = snap.forReview;
+    item.completedAt = snap.completedAt;
+    item.dismissedAt = snap.dismissedAt;
+    item.statusBeforeCompleted = snap.statusBeforeCompleted;
+  }
+
+  function countSnap() {
+    return {
+      server: serverCounts ? Object.assign({}, serverCounts) : null,
+      display: {
+        total: readStat("stat-total"),
+        awaiting: readStat("stat-awaiting"),
+        draft: readStat("stat-draft"),
+        sent: readStat("stat-sent"),
+        review: readStat("stat-review"),
+        completed: readStat("stat-completed"),
+        dismissed: readStat("stat-dismissed"),
+      },
+    };
+  }
+
+  function restoreCountSnap(snap) {
+    if (!snap) return;
+    if (snap.server) serverCounts = snap.server;
+    const d = snap.display || {};
+    writeStat("stat-total", d.total || 0);
+    writeStat("stat-awaiting", d.awaiting || 0);
+    writeStat("stat-draft", d.draft || 0);
+    writeStat("stat-sent", d.sent || 0);
+    writeStat("stat-review", d.review || 0);
+    writeStat("stat-completed", d.completed || 0);
+    writeStat("stat-dismissed", d.dismissed || 0);
+  }
+
+  function paintQuoteChange(item) {
+    if (periodFilter !== "all" && periodCatalog) {
+      const inWindow = periodCatalog.filter((row) =>
+        inPeriod(row, periodBounds(periodFilter)));
+      applyCounts(countsFromItems(inWindow));
+      const visible = filterInboxPage(inWindow, filterStatus);
+      inboxItems = visible;
+      inboxHasMore = false;
+      const panel = tabPanelEl(filterStatus);
+      if (!visible.length) {
+        panel.innerHTML = '<div class="empty">No quotes in this period.</div>';
+      } else {
+        panel.innerHTML = visible.map(quoteCardHtml).join("");
+        bindInboxCardEvents(panel);
+      }
+      showActiveTabPanel();
+      syncLoadMoreButton();
+      return;
+    }
+    applyItemAcrossTabs(item);
+  }
+
+  function revertQuoteChange(item, snap, counts) {
+    if (item && snap) applyQuoteSnap(item, snap);
+    if (periodFilter === "all") restoreCountSnap(counts);
+    if (item) paintQuoteChange(item);
   }
 
   function applyItemAcrossTabs(item) {
@@ -851,74 +941,70 @@
       }, {once: true});
     });
     root.querySelectorAll(".btn-complete-card").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
+      btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
         const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+        const item = findInboxItem(quoteId);
+        if (item && item._quoteAction) return;
         const currentlyDone = btn.getAttribute("data-completed") === "1";
-        const prevLabel = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = currentlyDone ? "Restoring…" : "Completing…";
-        try {
-          const res = await completeQuoteById(quoteId, !currentlyDone);
-          const item = findInboxItem(quoteId);
-          if (item) {
-            const prevStatus = quoteStatusOf(item);
-            const wasReview = isForReviewItem(item);
-            if (!currentlyDone) {
-              item.statusBeforeCompleted = prevStatus;
-              item.status = (res && res.status) || "completed";
-              item.completedAt = true;
-              item.forReview = false;
-              if (periodFilter === "all") {
-                applyLocalCompleteStats(prevStatus, true, wasReview);
-              }
-            } else {
-              const restored = (res && res.status) ||
-                item.statusBeforeCompleted || "draft_ready";
-              item.status = restored;
-              item.completedAt = null;
-              item.statusBeforeCompleted = null;
-              if (periodFilter === "all") {
-                applyLocalCompleteStats(restored, false, false);
-              }
+        const snap = item ? quoteSnap(item) : null;
+        const counts = countSnap();
+        if (item) {
+          item._quoteAction = true;
+          const prevStatus = quoteStatusOf(item);
+          const wasReview = isForReviewItem(item);
+          if (!currentlyDone) {
+            item.statusBeforeCompleted = prevStatus;
+            item.status = "completed";
+            item.completedAt = true;
+            item.forReview = false;
+            if (periodFilter === "all") {
+              applyLocalCompleteStats(prevStatus, true, wasReview);
             }
-            if (periodFilter !== "all") renderPeriodInbox();
-            else applyItemAcrossTabs(item);
+          } else {
+            const restored = item.statusBeforeCompleted || "draft_ready";
+            item.status = restored;
+            item.completedAt = null;
+            item.statusBeforeCompleted = null;
+            if (periodFilter === "all") {
+              applyLocalCompleteStats(restored, false, false);
+            }
           }
-        } catch (err) {
-          btn.disabled = false;
-          btn.textContent = prevLabel;
-          alert(err.message || "Could not update completed state");
+          paintQuoteChange(item);
         }
+        completeQuoteById(quoteId, !currentlyDone).catch((err) => {
+          revertQuoteChange(item, snap, counts);
+          alert(err.message || "Could not update completed state");
+        }).finally(() => {
+          if (item) item._quoteAction = false;
+        });
       });
     });
     root.querySelectorAll(".btn-review-card").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
+      btn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
         const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+        const item = findInboxItem(quoteId);
+        if (item && item._quoteAction) return;
         const currentlyOn = btn.getAttribute("data-on") === "1";
-        const prevLabel = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = "Updating…";
-        try {
-          await markQuoteForReview(quoteId, !currentlyOn);
-          const item = findInboxItem(quoteId);
-          if (item) {
-            item.forReview = !currentlyOn;
-            if (periodFilter !== "all") {
-              renderPeriodInbox();
-            } else {
-              bumpStat("stat-review", currentlyOn ? -1 : 1);
-              applyItemAcrossTabs(item);
-            }
+        const snap = item ? quoteSnap(item) : null;
+        const counts = countSnap();
+        if (item) {
+          item._quoteAction = true;
+          item.forReview = !currentlyOn;
+          if (periodFilter === "all") {
+            bumpStat("stat-review", currentlyOn ? -1 : 1);
           }
-        } catch (err) {
-          btn.disabled = false;
-          btn.textContent = prevLabel;
-          alert(err.message || "Could not update review flag");
+          paintQuoteChange(item);
         }
+        markQuoteForReview(quoteId, !currentlyOn).catch((err) => {
+          revertQuoteChange(item, snap, counts);
+          alert(err.message || "Could not update review flag");
+        }).finally(() => {
+          if (item) item._quoteAction = false;
+        });
       });
     });
     root.querySelectorAll(".btn-load-more-rates").forEach((btn) => {
@@ -960,36 +1046,34 @@
         }
         const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
         const card = btn.closest(".quote-card");
-        btn.disabled = true;
-        btn.textContent = "Dismissing…";
-        try {
-          await dismissQuoteById(quoteId);
-          const item = findInboxItem(quoteId);
-          const status = item ? quoteStatusOf(item) :
-            ((card && card.getAttribute("data-status")) || "");
-          const wasReview = item ? isForReviewItem(item) :
-            (card && card.getAttribute("data-for-review") === "1");
-          if (item) {
-            item.status = "dismissed";
-            item.dismissedAt = true;
-            item.forReview = false;
-            item.completedAt = null;
-            if (periodFilter !== "all") renderPeriodInbox();
-            else applyItemAcrossTabs(item);
-          } else if (card) {
-            card.remove();
-          }
+        const item = findInboxItem(quoteId);
+        if (item && item._quoteAction) return;
+        const status = item ? quoteStatusOf(item) :
+          ((card && card.getAttribute("data-status")) || "");
+        const wasReview = item ? isForReviewItem(item) :
+          (card && card.getAttribute("data-for-review") === "1");
+        const snap = item ? quoteSnap(item) : null;
+        const counts = countSnap();
+        if (item) {
+          item._quoteAction = true;
+          item.status = "dismissed";
+          item.dismissedAt = true;
+          item.forReview = false;
+          item.completedAt = null;
           if (periodFilter === "all") {
             applyLocalDismissStats(status);
             if (wasReview) bumpStat("stat-review", -1);
           }
-          syncLoadMoreButton();
-        } catch (err) {
-          btn.disabled = false;
-          btn.removeAttribute("data-confirm");
-          btn.textContent = "Dismiss";
-          alert(err.message || "Dismiss failed");
+          paintQuoteChange(item);
+        } else if (card) {
+          card.remove();
         }
+        dismissQuoteById(quoteId).catch((err) => {
+          revertQuoteChange(item, snap, counts);
+          alert(err.message || "Dismiss failed");
+        }).finally(() => {
+          if (item) item._quoteAction = false;
+        });
       });
     });
   }
