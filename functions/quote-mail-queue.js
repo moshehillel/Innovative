@@ -103,8 +103,13 @@ async function enqueueQuoteEmail(opts) {
       return {ok: false, reason: "already_queued", docId};
     }
     if (status === QUEUE_STATUS.FAILED && !opts.forceReprocess) {
-      // Allow re-enqueue of failed jobs when forceReprocess is set.
-      return {ok: false, reason: "already_failed", docId};
+      const err = String(prev.error || "");
+      // Missing Cursor key / wrong model is not a final "not a quote".
+      // Re-queue so the Haiku fallback can extract. Other failures stay put.
+      const retryable = /not configured|Cannot use this model/i.test(err);
+      if (!retryable) {
+        return {ok: false, reason: "already_failed", docId};
+      }
     }
   }
 

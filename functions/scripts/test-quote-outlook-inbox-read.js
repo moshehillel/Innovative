@@ -115,6 +115,10 @@ check("missing Cursor key still falls through to Haiku",
     intakeSrc.includes("useHaikuInstead"));
 check("missing extract key is retried instead of a permanent skip",
     outlookSrc.includes("/not configured/i.test(reason)"));
+const failedEnqueue = syncBody.slice(syncBody.indexOf("already_failed"));
+check("stored queue failures do not pin the watermark",
+    syncBody.includes("already_failed") &&
+    !failedEnqueue.slice(0, 280).includes("noteRetry"));
 
 const tokens = {
   access_token: "test-token",

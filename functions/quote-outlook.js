@@ -740,6 +740,11 @@ async function syncDispatcherInbox(
       });
 
       if (!enq.ok && enq.reason !== "already_queued") {
+        if (enq.reason === "already_failed") {
+          // A stored failure must not pin the watermark forever.
+          skippedExisting += 1;
+          continue;
+        }
         processErrors += 1;
         writeLogFn("warn", "quote", "Quote enqueue failed", {
           dispatcherId: dispatcher.id,
