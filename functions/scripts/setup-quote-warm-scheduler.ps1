@@ -32,7 +32,9 @@ $Endpoints = @(
   "generateQuoteEmail",
   "rerunQuoteRates",
   "approveQuoteEmail",
-  "dismissQuote"
+  "dismissQuote",
+  "completeQuote",
+  "markQuoteForReview"
 )
 
 Write-Host "Project:  $Project"
