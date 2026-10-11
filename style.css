@@ -28,15 +28,64 @@ html, body { margin: 0; min-height: 100%; }
 body {
   font-family: var(--ic-font);
   color: var(--ic-text);
-  background:
-    radial-gradient(1200px 500px at 10% -10%, rgba(13, 110, 110, 0.08), transparent 55%),
-    linear-gradient(180deg, #f4f7f8 0%, var(--ic-bg) 40%, #e8edf1 100%);
+  background: #e8eef1;
   font-size: 14px;
   line-height: 1.45;
   -webkit-font-smoothing: antialiased;
 }
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, rgba(244, 247, 248, 0.62) 0%, rgba(238, 241, 244, 0.7) 48%, rgba(232, 237, 241, 0.66) 100%),
+    radial-gradient(1100px 420px at 8% -8%, rgba(13, 110, 110, 0.06), transparent 58%),
+    url("assets/ops-bg-highway.jpg") center 78% / cover no-repeat;
+}
 
 .shell { min-height: 100vh; display: flex; flex-direction: column; }
+
+/* —— Decorative freight imagery —— */
+.decor-band {
+  position: relative;
+  overflow: hidden;
+  pointer-events: none;
+  flex: 0 0 auto;
+}
+.decor-band img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+}
+.decor-band::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.decor-band-top { height: 44px; }
+.decor-band-top::after {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.12) 0%, rgba(244, 247, 248, 0.38) 100%);
+}
+.decor-band-bottom {
+  height: 48px;
+  width: min(1440px, calc(100% - 120px));
+  margin-top: auto;
+  margin-bottom: 18px;
+  margin-left: max(16px, calc((100% - 1440px) / 2));
+  margin-right: auto;
+  border-radius: 12px;
+  box-shadow: var(--ic-shadow);
+}
+.decor-band-bottom::after {
+  border-radius: inherit;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.28), rgba(244, 247, 248, 0.36));
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4);
+}
 
 /* —— Top bar —— */
 .topbar {
@@ -44,7 +93,7 @@ body {
   display: flex; align-items: center; gap: 16px;
   min-height: var(--ic-topbar-h);
   padding: 0 20px;
-  background: rgba(255, 255, 255, 0.92);
+  background: rgba(255, 255, 255, 0.96);
   border-bottom: 1px solid var(--ic-border);
   backdrop-filter: blur(10px);
 }
@@ -133,7 +182,7 @@ body {
 .input-search { min-width: 220px; flex: 1; max-width: 320px; }
 .input-select { min-width: 140px; }
 
-.main { width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 18px 0 48px; }
+.main { width: min(1440px, calc(100% - 32px)); margin: 0 auto; padding: 18px 0 12px; }
 
 .banner {
   margin: 0 0 12px; padding: 10px 12px; border-radius: var(--ic-radius-sm);
@@ -441,6 +490,12 @@ body {
 @media (max-width: 1100px) {
   .kpi-row { grid-template-columns: repeat(3, 1fr); }
   .kpi-controls { grid-column: 1 / -1; flex-direction: row; align-items: center; }
+  .decor-band-top { height: 30px; }
+  .decor-band-bottom { height: 36px; }
+}
+@media (max-height: 880px) {
+  .decor-band-top { height: 26px; }
+  .decor-band-bottom { height: 30px; }
 }
 @media (max-width: 860px) {
   .panel.is-active { flex-direction: column; }
@@ -449,4 +504,8 @@ body {
   .topbar { flex-wrap: wrap; height: auto; padding: 10px 14px; }
   .main { width: calc(100% - 20px); }
   .detail-grid { grid-template-columns: 1fr; }
+  .decor-band-bottom { margin-left: 10px; width: calc(100% - 108px); }
+}
+@media (max-width: 860px), (max-height: 700px) {
+  .decor-band { display: none; }
 }
