@@ -2,9 +2,11 @@
 # Netlify dashboard (innovative-quotes.netlify.app) respond without cold starts.
 #
 # One Cloud Scheduler job pings each endpoint every 5 minutes during the
-# working day (7am-8pm ET, Mon-Fri). Unauthenticated GETs return 401/400
-# immediately, but that still boots the Cloud Run container — loading
-# functions/index.js is the slow part of a cold start.
+# working day (7am-8pm ET, Mon-Fri). GET ?warm=1 with no quote id returns
+# HTTP 200 before auth and does not mutate a quote. That boots the Cloud
+# Run container — loading functions/index.js is the slow part of a cold
+# start — and Cloud Scheduler marks the job Succeeded. Real POST/GET work
+# still requires a signed-in dispatcher.
 #
 # Cost: Cloud Scheduler is ~$0.10/job/month after the 3 free jobs;
 # the pinged requests themselves are fractions of a cent.

@@ -52,6 +52,35 @@ function cors(req, res) {
 }
 
 /**
+ * Scheduler warm ping: GET ?warm=1 and no quote id.
+ * Returns 200 before auth so the instance boots and the job succeeds.
+ * Does not dismiss, complete, mark, save, or re-rate a quote.
+ * POST work and any request that names a quote still require auth.
+ * @param {object} req Request.
+ * @return {boolean} True when this is a no-op warm ping.
+ */
+function isQuoteWarmPing(req) {
+  if (!req || String(req.method || "").toUpperCase() !== "GET") return false;
+  const warm = req.query && String(req.query.warm || "");
+  if (warm !== "1" && warm !== "true") return false;
+  const q = req.query || {};
+  const body = (req.body && typeof req.body === "object") ? req.body : {};
+  const quoteId = q.id || q.quoteId || body.id || body.quoteId;
+  return !quoteId;
+}
+
+/**
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {boolean} True if the warm response was sent.
+ */
+function respondQuoteWarmPing(req, res) {
+  if (!isQuoteWarmPing(req)) return false;
+  res.status(200).json({ok: true, warm: true});
+  return true;
+}
+
+/**
  * Legacy bookmark token access.
  * @param {object} req Request.
  * @return {object|null} {tenant, dispatcherId, token} or null if invalid.
@@ -489,6 +518,7 @@ async function handleGetQuoteRequests(req, res) {
  */
 async function handleGetQuoteDispatcherData(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   try {
     const id = req.query.id;
     if (!id) return res.status(400).json({ok: false, error: "id required"});
@@ -563,6 +593,8 @@ async function handleSaveQuoteSelection(req, res) {
  * @return {Promise<void>}
  */
 async function handleSaveQuoteSelections(req, res) {
+  if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   return handleSaveQuoteSelection(req, res);
 }
 
@@ -606,6 +638,7 @@ async function handleUpdateQuoteDetails(req, res) {
  */
 async function handleGenerateQuoteEmail(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Use POST"});
   }
@@ -678,6 +711,7 @@ async function handleApproveQuoteEmail(req, res) {
  */
 async function handleDismissQuote(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Use POST"});
   }
@@ -722,6 +756,7 @@ async function handleDismissQuote(req, res) {
  */
 async function handleMarkQuoteForReview(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Use POST"});
   }
@@ -768,6 +803,7 @@ async function handleMarkQuoteForReview(req, res) {
  */
 async function handleCompleteQuote(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Use POST"});
   }
@@ -898,6 +934,7 @@ async function handleExportQuoteDispatcherReport(req, res) {
  */
 async function handleRerunQuoteRates(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Use POST"});
   }
@@ -935,6 +972,7 @@ async function handleRerunQuoteRates(req, res) {
  */
 async function handleGetQuoteAccessorialCatalog(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   try {
     const user = await resolveDashboardUser(req);
     if (!user.ok) {
@@ -968,6 +1006,7 @@ async function handleGetQuoteAccessorialCatalog(req, res) {
  */
 async function handleGetQuoteDispatcherProfile(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   try {
     const user = await resolveDashboardUser(req);
     if (!user.ok) {
@@ -1001,6 +1040,7 @@ async function handleGetQuoteDispatcherProfile(req, res) {
  */
 async function handleGetQuoteDispatcherInbox(req, res) {
   if (cors(req, res)) return;
+  if (respondQuoteWarmPing(req, res)) return;
   try {
     const user = await resolveDashboardUser(req);
     if (!user.ok) {
