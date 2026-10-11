@@ -736,8 +736,13 @@ async function handleDismissQuote(req, res) {
         error: auth.error,
       });
     }
+    const restore = body.restore === true || body.restore === "true" ||
+      body.restore === 1 || body.restore === "1" ||
+      body.dismissed === false || body.dismissed === "false" ||
+      body.dismissed === 0 || body.dismissed === "0";
     const result = await quoteAutomation.dismissQuote(
         auth.tenant, String(quoteId), {
+          restore,
           reason: body.reason,
           dismissedBy: (auth.dispatcher && auth.dispatcher.email) ||
             auth.email || auth.dispatcherId,

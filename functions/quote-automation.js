@@ -2109,8 +2109,39 @@ async function dismissQuote(tenant, quoteId, opts = {}) {
   const ref = col(tenant, "quoteRequests").doc(quoteId);
   const snap = await ref.get();
   if (!snap.exists) throw new Error("Quote not found");
+  const data = snap.data() || {};
+  const restore = opts.restore === true || opts.restore === "true" ||
+    opts.restore === 1 || opts.restore === "1" ||
+    opts.dismissed === false || opts.dismissed === "false" ||
+    opts.dismissed === 0 || opts.dismissed === "0";
+  if (restore) {
+    if (!isDismissedQuote(data)) {
+      return {
+        ok: true,
+        dismissed: false,
+        status: data.status || null,
+      };
+    }
+    let restoreStatus = normalizeQuoteStatus(data.statusBeforeDismissed) ||
+      "draft_ready";
+    if (restoreStatus === "dismissed" || restoreStatus === "completed") {
+      restoreStatus = "draft_ready";
+    }
+    await ref.update({
+      status: restoreStatus,
+      dismissedAt: null,
+      dismissedBy: null,
+      dismissReason: null,
+      statusBeforeDismissed: null,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return {ok: true, dismissed: false, status: restoreStatus};
+  }
+  const prev = normalizeQuoteStatus(data.status);
   await ref.update({
     status: "dismissed",
+    statusBeforeDismissed: prev && prev !== "dismissed" ?
+      prev : (data.statusBeforeDismissed || "draft_ready"),
     dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
     dismissedBy: opts.dismissedBy || null,
     dismissReason: opts.reason || null,
@@ -2122,7 +2153,7 @@ async function dismissQuote(tenant, quoteId, opts = {}) {
     forReviewBy: null,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
-  return {ok: true, status: "dismissed"};
+  return {ok: true, status: "dismissed", dismissed: true};
 }
 
 /**
