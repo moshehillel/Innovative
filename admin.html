@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=20261009i">
+  <link rel="stylesheet" href="style.css?v=20261011b">
 </head>
 <body class="page-admin">
   <div id="app">
@@ -29,12 +29,17 @@
 
     <main class="main">
       <section class="panel" id="panel-rules">
+        <div class="rules-hero">
+          <img src="images/quote-rules-intro.jpg" alt="">
+          <div>
         <h2>Automatic quote rules</h2>
         <p class="panel-intro">
           These rules run when a quote email comes in. Each rule checks the delivery location and instructions,
           then adds the right accessorials (liftgate, appointment, limited access, etc.) before rate shopping.
           Rules with lower priority numbers run first.
         </p>
+          </div>
+        </div>
         <div class="panel-toolbar">
           <button type="button" class="ghost" id="reload-rules">Refresh list</button>
           <span id="rules-count"></span>

@@ -42,18 +42,30 @@
 * { box-sizing: border-box; }
 html, body { margin: 0; min-height: 100%; }
 html { overflow-x: hidden; }
+html { background: #e6eef3; }
 body {
   font-family: var(--ic-font);
   color: var(--ic-text);
-  background:
-    radial-gradient(980px 460px at -5% -12%, rgba(13, 110, 110, 0.20), transparent 58%),
-    radial-gradient(760px 420px at 108% -8%, rgba(26, 95, 158, 0.14), transparent 52%),
-    radial-gradient(640px 320px at 70% 110%, rgba(13, 110, 110, 0.08), transparent 60%),
-    linear-gradient(165deg, #f3fafa 0%, #eef3f7 42%, #e6eef3 100%);
+  background: transparent;
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
+}
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(980px 460px at -5% -12%, rgba(13, 110, 110, 0.20), transparent 58%),
+    radial-gradient(760px 420px at 108% -8%, rgba(26, 95, 158, 0.14), transparent 52%),
+    radial-gradient(640px 320px at 70% 110%, rgba(13, 110, 110, 0.08), transparent 60%),
+    linear-gradient(165deg, rgba(243, 250, 250, 0.9) 0%, rgba(238, 243, 247, 0.92) 42%, rgba(230, 238, 243, 0.94) 100%),
+    url("images/quote-dock-banner.jpg") right -6% top -10% / min(780px, 54vw) no-repeat,
+    url("images/quote-login-hero.jpg") left -10% bottom -18% / min(560px, 42vw) no-repeat,
+    linear-gradient(165deg, #f3fafa 0%, #eef3f7 42%, #e6eef3 100%);
 }
 
 .hidden { display: none !important; }
@@ -196,14 +208,29 @@ input, select, textarea {
   padding: 32px 20px;
 }
 .login {
-  width: 100%; max-width: 420px;
+  width: 100%; max-width: 920px;
+  display: grid;
+  grid-template-columns: minmax(220px, 0.92fr) minmax(280px, 1fr);
   background: var(--ic-surface);
   border: 1px solid var(--ic-border);
   border-radius: var(--ic-radius-lg);
-  padding: 40px 36px 30px;
+  padding: 0;
+  overflow: hidden;
   box-shadow: var(--ic-shadow-lg);
 }
+.login-visual { min-height: 100%; background: #0a3d3d; }
+.login-visual img {
+  display: block; width: 100%; height: 100%; min-height: 320px;
+  object-fit: cover; object-position: center 40%;
+}
+.login-panel { padding: 36px 32px 28px; }
 .login-brand { text-align: center; margin-bottom: 28px; }
+.login-mascot {
+  width: 72px; height: 72px; object-fit: cover; border-radius: 50%;
+  margin: 0 auto 12px; display: block;
+  box-shadow: 0 8px 20px rgba(13, 110, 110, 0.22);
+  background: #fff;
+}
 .login-icon {
   display: inline-flex; align-items: center; justify-content: center;
   width: 52px; height: 52px; border-radius: 14px;
@@ -257,10 +284,17 @@ input, select, textarea {
 .page-thinking { display: flex; flex-direction: column; gap: 20px; min-height: 36vh; padding: 4px 0 16px; }
 .page-thinking.hidden { display: none !important; }
 .thinking-panel {
+  display: flex; align-items: center; gap: 16px;
   background: var(--ic-surface); border: 1px solid var(--ic-border);
-  border-radius: var(--ic-radius-lg); padding: 26px 24px 22px;
-  box-shadow: var(--ic-shadow); max-width: 520px;
+  border-radius: var(--ic-radius-lg); padding: 18px 22px;
+  box-shadow: var(--ic-shadow); max-width: 640px;
 }
+.thinking-art {
+  width: 72px; height: 72px; object-fit: cover; border-radius: 50%;
+  flex: 0 0 auto; background: #fff;
+  box-shadow: 0 8px 18px rgba(13, 110, 110, 0.16);
+}
+.thinking-panel > div { min-width: 0; flex: 1; }
 .thinking-eyebrow {
   margin: 0 0 10px; font-size: 11px; font-weight: 700;
   letter-spacing: 0.06em; text-transform: uppercase; color: var(--ic-brand);
@@ -330,6 +364,15 @@ input, select, textarea {
 }
 .quote-ready.is-visible { opacity: 1; transform: none; pointer-events: auto; }
 .quote-ready.hidden { display: none !important; }
+.review-head {
+  display: flex; align-items: center; gap: 14px; margin-bottom: 12px;
+}
+.review-art {
+  width: 64px; height: 64px; object-fit: cover; border-radius: 50%;
+  flex: 0 0 auto; background: #fff;
+  box-shadow: 0 8px 18px rgba(13, 110, 110, 0.16);
+}
+.review-head .page-title { margin-bottom: 2px; }
 
 /* ═══════════ Home (inbox) ═══════════ */
 
@@ -386,6 +429,43 @@ input, select, textarea {
   transform: translateY(-2px);
   box-shadow: 0 10px 24px rgba(13, 110, 110, 0.12);
 }
+.stat-action { cursor: pointer; }
+.stat-action:focus-visible {
+  outline: 2px solid var(--ic-brand); outline-offset: 2px;
+}
+.stat-action.active {
+  border-color: #9dcccc;
+  box-shadow: 0 10px 24px rgba(13, 110, 110, 0.16);
+}
+.section-hero {
+  position: relative; height: 128px; margin: 0 0 16px;
+  border-radius: var(--ic-radius-lg); overflow: hidden;
+  box-shadow: var(--ic-shadow);
+}
+.section-hero img {
+  width: 100%; height: 100%; object-fit: cover; object-position: center 42%;
+  display: block;
+}
+.section-hero::after {
+  content: "";
+  position: absolute; inset: 0;
+  background: linear-gradient(105deg, rgba(10, 61, 61, 0.55), rgba(13, 110, 110, 0.18) 46%, rgba(255, 255, 255, 0.05));
+}
+.dismissed-note {
+  margin: 0 0 14px; padding: 10px 14px;
+  border-radius: var(--ic-radius); background: var(--ic-surface);
+  border: 1px solid #b7dddd; color: var(--ic-brand-ink);
+  font-weight: 650; box-shadow: var(--ic-shadow);
+}
+.empty-visual {
+  display: grid; justify-items: center; gap: 8px;
+  padding: 28px 16px 32px;
+}
+.empty-visual img {
+  width: 96px; height: 96px; object-fit: cover; border-radius: 50%;
+  background: #fff; box-shadow: 0 8px 20px rgba(13, 110, 110, 0.16);
+}
+.empty-visual p { margin: 0; }
 .stat .num { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; color: var(--ic-brand-ink); line-height: 1.1; }
 .stat .num.muted { color: var(--ic-text-faint); }
 .stat .lbl {
@@ -488,6 +568,7 @@ input, select, textarea {
 .quote-card:not(.open) .quote-card-actions,
 .quote-card:not(.open) .quote-card-badges { gap: 3px; }
 .quote-card:not(.open) .quote-card-head .btn-dismiss-card,
+.quote-card:not(.open) .quote-card-head .btn-undismiss-card,
 .quote-card:not(.open) .quote-card-head .btn-review-card,
 .quote-card:not(.open) .quote-card-head .btn-complete-card,
 .quote-card:not(.open) .quote-card-head .btn-open-quote {
@@ -520,6 +601,7 @@ input, select, textarea {
 .quote-card-badges { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; }
 .quote-card-actions { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
 .quote-card-head .btn-dismiss-card,
+.quote-card-head .btn-undismiss-card,
 .quote-card-head .btn-review-card,
 .quote-card-head .btn-complete-card,
 .quote-card-head .btn-open-quote {
@@ -960,6 +1042,20 @@ body.page-admin #panel-rules {
   font-weight: 700; letter-spacing: -0.02em;
 }
 .panel-intro { font-size: 14px; color: var(--ic-text-muted); margin: 0 0 18px; line-height: 1.6; }
+.rules-hero {
+  display: grid; grid-template-columns: 240px minmax(0, 1fr);
+  gap: 18px; align-items: center; margin-bottom: 4px;
+}
+.rules-hero img {
+  width: 100%; height: 140px; object-fit: cover; object-position: center 60%;
+  border-radius: var(--ic-radius); box-shadow: var(--ic-shadow); display: block;
+}
+.rules-hero .panel-intro { margin-bottom: 0; }
+@media (max-width: 760px) {
+  .login { grid-template-columns: 1fr; }
+  .login-visual img { min-height: 160px; max-height: 200px; }
+  .rules-hero { grid-template-columns: 1fr; }
+}
 .panel-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
 #status { font-size: 12.5px; color: var(--ic-text-faint); }
 #rules-count {
@@ -1161,8 +1257,9 @@ body.page-admin #panel-rules {
   .chat-input button.primary { width: 100%; }
 }
 @media (max-width: 640px) {
-  .login { padding: 32px 24px 26px; }
-  .thinking-panel { padding: 22px 18px 20px; }
+  .login { padding: 0; }
+  .login-panel { padding: 28px 20px 22px; }
+  .thinking-panel { padding: 16px 14px; }
   .quote-card-head { grid-template-columns: 16px minmax(0, 1fr); }
   .quote-card-badges, .quote-card-actions {
     grid-column: 2; flex-direction: row; flex-wrap: wrap;

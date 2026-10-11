@@ -32,6 +32,7 @@
   let syncInFlight = null;
   let inboxLoadInFlight = null;
   const INBOX_PAGE_SIZE = 20;
+  const DISMISSED_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
   const RATE_PAGE_SIZE = 20;
   let inboxItems = [];
   let inboxOffset = 0;
@@ -95,6 +96,47 @@
     return !!item.dismissedAt;
   }
 
+  function quoteTimeMs(value) {
+    if (value === true) return Date.now();
+    if (value == null || value === false || value === "") return 0;
+    if (typeof value === "number") {
+      if (!isFinite(value) || value <= 0) return 0;
+      return value < 1e12 ? value * 1000 : value;
+    }
+    if (typeof value === "string") {
+      const t = Date.parse(value);
+      return isFinite(t) ? t : 0;
+    }
+    if (typeof value === "object") {
+      const sec = value._seconds != null ? value._seconds :
+        (value.seconds != null ? value.seconds : null);
+      if (sec != null && isFinite(Number(sec))) return Number(sec) * 1000;
+      if (typeof value.toDate === "function") {
+        try {
+          const d = value.toDate();
+          if (d && isFinite(d.getTime())) return d.getTime();
+        } catch (_) { /* ignore */ }
+      }
+    }
+    return 0;
+  }
+
+  function isRecentDismissed(item) {
+    if (!isDismissedItem(item)) return false;
+    const ms = quoteTimeMs(item.dismissedAt);
+    if (!ms) return false;
+    const age = Date.now() - ms;
+    return age <= DISMISSED_WINDOW_MS && age >= -60000;
+  }
+
+  function syncDismissedNote() {
+    const note = document.getElementById("dismissed-note");
+    if (!note) return;
+    note.classList.toggle("hidden", filterStatus !== "dismissed");
+    const stat = document.getElementById("stat-dismissed-open");
+    if (stat) stat.classList.toggle("active", filterStatus === "dismissed");
+  }
+
   function isCompletedItem(item) {
     if (!item) return false;
     if (quoteStatusOf(item) === "completed") return true;
@@ -151,6 +193,7 @@
       sent: "filter-sent",
       for_review: "filter-review",
       completed: "filter-completed",
+      dismissed: "filter-dismissed",
       "": "filter-all",
     };
     Object.keys(map).forEach((key) => {
@@ -158,6 +201,7 @@
       if (!el) return;
       el.classList.toggle("active", filterStatus === key);
     });
+    syncDismissedNote();
   }
 
   function defaultReportDates() {
@@ -205,6 +249,12 @@
     if (sid) bumpStat(sid, -1);
   }
 
+  function applyLocalUndismissStats(restoredStatus) {
+    bumpStat("stat-dismissed", -1);
+    const sid = statusStatId(restoredStatus);
+    if (sid) bumpStat(sid, 1);
+  }
+
   function applyLocalCompleteStats(status, nowCompleted, wasReview) {
     bumpStat("stat-completed", nowCompleted ? 1 : -1);
     const sid = statusStatId(status);
@@ -226,6 +276,29 @@
           }),
         });
     if (!res2.ok) throw new Error(res2.error || "Dismiss failed");
+    return res2;
+  }
+
+  async function restoreDismissedQuote(quoteId) {
+    const id = String(quoteId || "").trim();
+    if (!id) throw new Error("Missing quote id");
+    const res2 = await apiFetch(
+        "/dismissQuote?" + QD.tenantQS +
+        "&quoteId=" + encodeURIComponent(id), {
+          method: "POST",
+          body: JSON.stringify({
+            tenantId: TENANT_ID,
+            quoteId: id,
+            id: id,
+            restore: true,
+            dismissed: false,
+          }),
+        });
+    if (!res2.ok) throw new Error(res2.error || "Undo dismiss failed");
+    const st = String(res2.status || "").toLowerCase();
+    if (!st || st === "dismissed" || res2.dismissed === true) {
+      throw new Error(res2.error || "Could not restore this quote");
+    }
     return res2;
   }
 
@@ -312,8 +385,8 @@
 
   function setFilterBarBusy(busy) {
     ["filter-pending", "filter-sent", "filter-review", "filter-completed",
-      "filter-all", "period-day", "period-week", "period-month",
-      "period-year", "period-all"]
+      "filter-dismissed", "filter-all", "period-day", "period-week",
+      "period-month", "period-year", "period-all"]
         .forEach((id) => {
           const el = document.getElementById(id);
           if (el) el.disabled = !!busy;
@@ -326,6 +399,9 @@
 
   function filterInboxPage(raw, status) {
     const st = status == null ? filterStatus : status;
+    if (st === "dismissed") {
+      return (raw || []).filter(isRecentDismissed);
+    }
     if (st === "completed") {
       return (raw || []).filter(isCompletedItem);
     }
@@ -347,6 +423,7 @@
     if (st === "sent") return Number(c.sent) || 0;
     if (st === "for_review") return Number(c.forReview) || 0;
     if (st === "completed") return Number(c.completed) || 0;
+    if (st === "dismissed") return Number(c.dismissed) || 0;
     return Math.max(0,
         (Number(c.total) || 0) -
         (Number(c.dismissed) || 0) -
@@ -499,6 +576,7 @@
       completedAt: item.completedAt,
       dismissedAt: item.dismissedAt,
       statusBeforeCompleted: item.statusBeforeCompleted,
+      statusBeforeDismissed: item.statusBeforeDismissed,
     };
   }
 
@@ -508,6 +586,7 @@
     item.completedAt = snap.completedAt;
     item.dismissedAt = snap.dismissedAt;
     item.statusBeforeCompleted = snap.statusBeforeCompleted;
+    item.statusBeforeDismissed = snap.statusBeforeDismissed;
   }
 
   function countSnap() {
@@ -548,7 +627,9 @@
       inboxHasMore = false;
       const panel = tabPanelEl(filterStatus);
       if (!visible.length) {
-        panel.innerHTML = '<div class="empty">No quotes in this period.</div>';
+        panel.innerHTML = emptyInboxMarkup(filterStatus === "dismissed" ?
+          "No dismissed quotes in the last few days." :
+          "No quotes in this period.");
       } else {
         panel.innerHTML = visible.map(quoteCardHtml).join("");
         bindInboxCardEvents(panel);
@@ -594,8 +675,7 @@
         const card = findCardEl(panel, id);
         if (card) card.remove();
         if (!panel.querySelector(".quote-card")) {
-          panel.innerHTML =
-            '<div class="empty">No quotes assigned to you.</div>';
+          panel.innerHTML = emptyInboxMarkup("No quotes assigned to you.");
         }
       }
       saveTabCache(key);
@@ -818,7 +898,9 @@
       inboxHasMore = false;
       const panel = tabPanelEl(requestStatus);
       if (!visible.length) {
-        panel.innerHTML = '<div class="empty">No quotes in this period.</div>';
+        panel.innerHTML = emptyInboxMarkup(requestStatus === "dismissed" ?
+          "No dismissed quotes in the last few days." :
+          "No quotes in this period.");
       } else {
         panel.innerHTML = visible.map(quoteCardHtml).join("");
         bindInboxCardEvents(panel);
@@ -924,6 +1006,7 @@
     root.querySelectorAll(".quote-card-head").forEach((el) => {
       el.addEventListener("click", (e) => {
         if (e.target.closest(".btn-dismiss-card")) return;
+        if (e.target.closest(".btn-undismiss-card")) return;
         if (e.target.closest(".btn-review-card")) return;
         if (e.target.closest(".btn-complete-card")) return;
         if (e.target.closest(".btn-open-quote")) return;
@@ -1056,8 +1139,10 @@
         const counts = countSnap();
         if (item) {
           item._quoteAction = true;
+          const prev = status && status !== "dismissed" ? status : "draft_ready";
+          item.statusBeforeDismissed = prev;
           item.status = "dismissed";
-          item.dismissedAt = true;
+          item.dismissedAt = Date.now();
           item.forReview = false;
           item.completedAt = null;
           if (periodFilter === "all") {
@@ -1071,6 +1156,42 @@
         dismissQuoteById(quoteId).catch((err) => {
           revertQuoteChange(item, snap, counts);
           alert(err.message || "Dismiss failed");
+        }).finally(() => {
+          if (item) item._quoteAction = false;
+        });
+      });
+    });
+    root.querySelectorAll(".btn-undismiss-card").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const quoteId = btn.getAttribute("data-id") || btn.dataset.id;
+        const item = findInboxItem(quoteId);
+        if (item && item._quoteAction) return;
+        const snap = item ? quoteSnap(item) : null;
+        const counts = countSnap();
+        if (item) {
+          item._quoteAction = true;
+          let restored = item.statusBeforeDismissed || "draft_ready";
+          if (restored === "dismissed" || restored === "completed") {
+            restored = "draft_ready";
+          }
+          item.status = restored;
+          item.dismissedAt = null;
+          item.statusBeforeDismissed = null;
+          if (periodFilter === "all") applyLocalUndismissStats(restored);
+          paintQuoteChange(item);
+        }
+        restoreDismissedQuote(quoteId).then((res2) => {
+          const serverStatus = String((res2 && res2.status) || "").toLowerCase();
+          if (item && serverStatus && serverStatus !== "dismissed" &&
+              serverStatus !== quoteStatusOf(item)) {
+            item.status = serverStatus;
+            paintQuoteChange(item);
+          }
+        }).catch((err) => {
+          revertQuoteChange(item, snap, counts);
+          alert(err.message || "Could not undo dismiss");
         }).finally(() => {
           if (item) item._quoteAction = false;
         });
@@ -1097,6 +1218,7 @@
     const pending = isPendingItem(item);
     const forReview = isForReviewItem(item);
     const completed = isCompletedItem(item);
+    const dismissed = isDismissedItem(item);
     const status = quoteStatusOf(item);
     const lanes = item.lanesPreview || [];
     const lanesHtml = lanes.map((lane) => {
@@ -1162,12 +1284,17 @@
       '<div class="quote-card-warn">' +
         esc(warnBits.join(" · ")) + "</div>" : "";
 
-    const badgeClass = completed ? "completed" :
-      (pending ? "pending" :
-        (status === "sent" ? "sent" :
-          (status === "draft_ready" ? "draft_ready" : "")));
+    const badgeClass = dismissed ? "dismissed" :
+      (completed ? "completed" :
+        (pending ? "pending" :
+          (status === "sent" ? "sent" :
+            (status === "draft_ready" ? "draft_ready" : ""))));
     const reviewBadge = forReview ?
       '<span class="badge for-review">For review</span>' : "";
+    const locked = completed || dismissed ? " disabled" : "";
+    const dismissAction = dismissed ?
+      `<button type="button" class="ghost btn-undismiss-card" data-id="${esc(item.id)}">Undo dismiss</button>` :
+      `<button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}"${completed ? " disabled" : ""}>Dismiss</button>`;
 
     return `<div class="quote-card" data-id="${esc(item.id)}" data-status="${esc(item.status || "")}" data-for-review="${forReview ? "1" : "0"}">
       <div class="quote-card-head">
@@ -1184,15 +1311,21 @@
         </div>
         <div class="quote-card-actions">
           <a class="btn btn-open-quote" data-id="${esc(item.id)}" href="${esc(quoteOpenUrl(item))}">Open full review</a>
-          <button type="button" class="ghost btn-complete-card" data-id="${esc(item.id)}" data-completed="${completed ? "1" : "0"}">${completed ? "Undo complete" : "Complete"}</button>
-          <button type="button" class="ghost btn-review-card${forReview ? " is-on" : ""}" data-id="${esc(item.id)}" data-on="${forReview ? "1" : "0"}"${completed ? " disabled" : ""}>${forReview ? "Unmark review" : "For review"}</button>
-          <button type="button" class="ghost btn-dismiss-card" data-id="${esc(item.id)}"${completed ? " disabled" : ""}>Dismiss</button>
+          <button type="button" class="ghost btn-complete-card" data-id="${esc(item.id)}" data-completed="${completed ? "1" : "0"}"${dismissed ? " disabled" : ""}>${completed ? "Undo complete" : "Complete"}</button>
+          <button type="button" class="ghost btn-review-card${forReview ? " is-on" : ""}" data-id="${esc(item.id)}" data-on="${forReview ? "1" : "0"}"${locked}>${forReview ? "Unmark review" : "For review"}</button>
+          ${dismissAction}
         </div>
       </div>
       <div class="quote-card-body">
         ${lanesHtml || '<div class="empty" style="padding:12px">No lane preview</div>'}
       </div>
     </div>`;
+  }
+
+  function emptyInboxMarkup(message) {
+    return '<div class="empty empty-visual">' +
+      '<img src="images/quote-mascot.jpg" alt="" width="96" height="96">' +
+      "<p>" + message + "</p></div>";
   }
 
   function renderInboxCards(items, opts) {
@@ -1202,7 +1335,9 @@
     const panel = tabPanelEl(tabKey);
     if (!append) {
       if (!items.length) {
-        panel.innerHTML = '<div class="empty">No quotes assigned to you.</div>';
+        panel.innerHTML = emptyInboxMarkup(filterStatus === "dismissed" ?
+          "No dismissed quotes in the last few days." :
+          "No quotes assigned to you.");
       } else {
         panel.innerHTML = items.map(quoteCardHtml).join("");
         bindInboxCardEvents(panel);
@@ -1242,6 +1377,7 @@
     else if (requestFilter === "sent") path += "&status=sent";
     else if (requestFilter === "for_review") path += "&status=for_review";
     else if (requestFilter === "completed") path += "&status=completed";
+    else if (requestFilter === "dismissed") path += "&status=dismissed";
     const stillActive = () => filterStatus === requestFilter;
     if (stillActive()) syncFilterButtons();
     if (!silent && !append && !keepChrome && stillActive()) {
@@ -1292,7 +1428,9 @@
           Number(res.offset) + raw.length :
           tab.items.length;
         const tabTotal = inboxTabTotal(counts, requestFilter);
-        if (append && !added) {
+        if (requestFilter === "dismissed") {
+          tab.hasMore = !!res.hasMore;
+        } else if (append && !added) {
           tab.hasMore = false;
         } else {
           tab.hasMore = !!res.hasMore || tabTotal > tab.items.length;
@@ -1484,6 +1622,20 @@
   document.getElementById("filter-completed").addEventListener("click", () => {
     switchInboxTab("completed");
   });
+  document.getElementById("filter-dismissed").addEventListener("click", () => {
+    switchInboxTab("dismissed");
+  });
+  const dismissedStat = document.getElementById("stat-dismissed-open");
+  if (dismissedStat) {
+    const openDismissed = () => switchInboxTab("dismissed");
+    dismissedStat.addEventListener("click", openDismissed);
+    dismissedStat.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openDismissed();
+      }
+    });
+  }
   document.getElementById("filter-all").addEventListener("click", () => {
     switchInboxTab("");
   });
