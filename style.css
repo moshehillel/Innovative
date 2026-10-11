@@ -58,9 +58,9 @@ body::before {
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  background-color: #d7ebe8;
+  background-color: #f4faf9;
   background-image:
-    linear-gradient(rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.12)),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.62), rgba(217, 239, 239, 0.48)),
     url("images/quote-highway-bg.jpg");
   background-repeat: no-repeat;
   background-position: center center;
@@ -222,7 +222,7 @@ input, select, textarea {
 .login-visual { min-height: 100%; background: #0a3d3d; }
 .login-visual img {
   display: block; width: 100%; height: 100%; min-height: 560px;
-  object-fit: cover; object-position: center 42%;
+  object-fit: cover; object-position: center 46%;
 }
 .login-panel { padding: 48px 40px 40px; }
 .login-brand { text-align: center; margin-bottom: 28px; }
@@ -230,7 +230,7 @@ input, select, textarea {
   width: 72px; height: 72px; object-fit: cover; border-radius: 18px;
   margin: 0 auto 12px; display: block;
   box-shadow: 0 8px 20px rgba(13, 110, 110, 0.22);
-  background: #f7f4ee;
+  background: #fff;
 }
 .login-icon {
   display: inline-flex; align-items: center; justify-content: center;
@@ -292,7 +292,7 @@ input, select, textarea {
 }
 .thinking-art {
   width: 72px; height: 72px; object-fit: cover; border-radius: 18px;
-  flex: 0 0 auto; background: #f7f4ee;
+  flex: 0 0 auto; background: #fff;
   box-shadow: 0 8px 18px rgba(13, 110, 110, 0.16);
 }
 .thinking-panel > div { min-width: 0; flex: 1; }
@@ -370,7 +370,7 @@ input, select, textarea {
 }
 .review-art {
   width: 64px; height: 64px; object-fit: cover; border-radius: 16px;
-  flex: 0 0 auto; background: #f7f4ee;
+  flex: 0 0 auto; background: #fff;
   box-shadow: 0 8px 18px rgba(13, 110, 110, 0.16);
 }
 .review-head .page-title { margin-bottom: 2px; }
@@ -450,7 +450,7 @@ input, select, textarea {
 }
 .empty-visual img {
   width: 96px; height: 96px; object-fit: cover; border-radius: 22px;
-  background: #f7f4ee; box-shadow: 0 8px 20px rgba(13, 110, 110, 0.16);
+  background: #fff; box-shadow: 0 8px 20px rgba(13, 110, 110, 0.16);
 }
 .empty-visual p { margin: 0; }
 .stat .num { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; color: var(--ic-brand-ink); line-height: 1.1; }
