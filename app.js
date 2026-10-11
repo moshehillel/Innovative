@@ -1324,7 +1324,7 @@
 
   function emptyInboxMarkup(message) {
     return '<div class="empty empty-visual">' +
-      '<img src="images/quote-truck-mascot.jpg" alt="" width="96" height="96">' +
+      '<img src="images/quote-ai-mark.jpg?v=20261011d" alt="" width="96" height="96">' +
       "<p>" + message + "</p></div>";
   }
 

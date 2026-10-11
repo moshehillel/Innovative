@@ -222,15 +222,15 @@ input, select, textarea {
 .login-visual { min-height: 100%; background: #0a3d3d; }
 .login-visual img {
   display: block; width: 100%; height: 100%; min-height: 560px;
-  object-fit: cover; object-position: center 40%;
+  object-fit: cover; object-position: center 42%;
 }
 .login-panel { padding: 48px 40px 40px; }
 .login-brand { text-align: center; margin-bottom: 28px; }
 .login-mascot {
-  width: 72px; height: 72px; object-fit: cover; border-radius: 50%;
+  width: 72px; height: 72px; object-fit: cover; border-radius: 18px;
   margin: 0 auto 12px; display: block;
   box-shadow: 0 8px 20px rgba(13, 110, 110, 0.22);
-  background: #fff;
+  background: #f7f4ee;
 }
 .login-icon {
   display: inline-flex; align-items: center; justify-content: center;
@@ -291,8 +291,8 @@ input, select, textarea {
   box-shadow: var(--ic-shadow); max-width: 640px;
 }
 .thinking-art {
-  width: 72px; height: 72px; object-fit: cover; border-radius: 50%;
-  flex: 0 0 auto; background: #fff;
+  width: 72px; height: 72px; object-fit: cover; border-radius: 18px;
+  flex: 0 0 auto; background: #f7f4ee;
   box-shadow: 0 8px 18px rgba(13, 110, 110, 0.16);
 }
 .thinking-panel > div { min-width: 0; flex: 1; }
@@ -369,8 +369,8 @@ input, select, textarea {
   display: flex; align-items: center; gap: 14px; margin-bottom: 12px;
 }
 .review-art {
-  width: 64px; height: 64px; object-fit: cover; border-radius: 50%;
-  flex: 0 0 auto; background: #fff;
+  width: 64px; height: 64px; object-fit: cover; border-radius: 16px;
+  flex: 0 0 auto; background: #f7f4ee;
   box-shadow: 0 8px 18px rgba(13, 110, 110, 0.16);
 }
 .review-head .page-title { margin-bottom: 2px; }
@@ -449,8 +449,8 @@ input, select, textarea {
   padding: 28px 16px 32px;
 }
 .empty-visual img {
-  width: 96px; height: 96px; object-fit: cover; border-radius: 50%;
-  background: #fff; box-shadow: 0 8px 20px rgba(13, 110, 110, 0.16);
+  width: 96px; height: 96px; object-fit: cover; border-radius: 22px;
+  background: #f7f4ee; box-shadow: 0 8px 20px rgba(13, 110, 110, 0.16);
 }
 .empty-visual p { margin: 0; }
 .stat .num { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; color: var(--ic-brand-ink); line-height: 1.1; }
