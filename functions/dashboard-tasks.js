@@ -375,6 +375,108 @@ function applyStoredMail(target, source) {
   }
 }
 
+/** Fields needed to filter, sort, and count. Email HTML is loaded later. */
+const TASK_LIST_FIELDS = [
+  "tenantId", "type", "title", "description", "subject", "from", "to", "cc",
+  "loadNumber", "proNumber", "carrierName", "messageId", "invoiceId",
+  "followUpId", "department", "reason", "status", "chargesTotal",
+  "ownerBucket", "awaitingReplyFrom", "dispatcherEmail", "dispatcherName",
+  "dispatcherKey", "chargePhase", "followUpStatus", "ownershipHistory",
+  "receivedAt", "receivedAtSource", "emailReceivedAt", "attachments",
+  "mailboxLookupAt", "createdAt", "dismissedAt",
+];
+
+/** Follow-up fields for list/merge. Excludes emailHtml. */
+const CHARGE_LIST_FIELDS = [
+  "tenantId", "status", "chargePhase", "notes", "emailSubject", "emailTo",
+  "emailCc", "loadNumber", "carrierName", "messageId", "invoiceId",
+  "category", "chargesTotal", "invoiceAmount", "ownerBucket",
+  "awaitingReplyFrom", "dispatcherEmail", "dispatcherName", "dispatcherKey",
+  "ownershipHistory", "receivedAt", "emailReceivedAt", "receivedAtSource",
+  "attachments", "mailboxAttachments", "createdAt", "resolved",
+];
+
+const PAGE_BODY_CAP = 120000;
+
+/**
+ * @param {*} value Email HTML or text.
+ * @return {string|null}
+ */
+function capEmailBody(value) {
+  if (value == null || value === "") return null;
+  const text = String(value);
+  if (text.length <= PAGE_BODY_CAP) return text;
+  return text.slice(0, PAGE_BODY_CAP);
+}
+
+/**
+ * @param {object} db Firestore.
+ * @param {string} collectionName Collection.
+ * @param {string[]} ids Document ids.
+ * @return {Promise<Map<string, object>>}
+ */
+async function loadDocsById(db, collectionName, ids) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  const snaps = [];
+  for (let i = 0; i < unique.length; i += 50) {
+    const refs = unique.slice(i, i + 50).map((id) =>
+      db.collection(collectionName).doc(id));
+    // eslint-disable-next-line no-await-in-loop
+    snaps.push(...await db.getAll(...refs));
+  }
+  const map = new Map();
+  snaps.forEach((snap) => {
+    if (snap.exists) map.set(snap.id, snap.data() || {});
+  });
+  return map;
+}
+
+/**
+ * Loads email HTML only for the rows that will be returned.
+ * The list query omits bodies so a few hundred open tasks cannot
+ * exceed the function memory limit.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object[]} items Page items.
+ * @return {Promise<void>}
+ */
+async function hydratePageBodies(db, additionalChargesMod, items) {
+  const list = Array.isArray(items) ? items : [];
+  if (!list.length) return;
+  const taskIds = [];
+  const followIds = [];
+  for (const item of list) {
+    if (item.source !== "additionalCharges" && item.id) taskIds.push(item.id);
+    const followId = item.followUpId ||
+      (item.source === "additionalCharges" ? item.id : null);
+    if (followId) followIds.push(followId);
+  }
+  const [taskDocs, followDocs] = await Promise.all([
+    loadDocsById(db, TASK_COLLECTION, taskIds),
+    loadDocsById(
+        db, additionalChargesMod.FOLLOW_UP_COLLECTION, followIds),
+  ]);
+  for (const item of list) {
+    const followId = item.followUpId ||
+      (item.source === "additionalCharges" ? item.id : null);
+    const follow = followId ? followDocs.get(followId) : null;
+    const taskDoc = item.source !== "additionalCharges" ?
+      taskDocs.get(item.id) : null;
+    const stored = taskDoc ? capEmailBody(taskDoc.body) : null;
+    const emailHtml = follow ? capEmailBody(follow.emailHtml) : null;
+    if (item.source === "additionalCharges") {
+      item.body = emailHtml || (follow ?
+        buildAdditionalChargeFallbackHtml(additionalChargesMod, follow) :
+        null);
+    } else if (stored || emailHtml) {
+      item.body = stored || emailHtml;
+    } else if (follow && item.type === TASK_TYPE.ADDITIONAL_CHARGE) {
+      item.body = buildAdditionalChargeFallbackHtml(
+          additionalChargesMod, follow);
+    }
+  }
+}
+
 /**
  * Lists open tasks for a tenant plus unresolved additional-charge follow-ups.
  * @param {object} db Firestore instance.
@@ -392,6 +494,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       .where("status", "==", TASK_STATUS.OPEN)
       .orderBy("createdAt", "desc")
       .limit(fetchLimit)
+      .select(...TASK_LIST_FIELDS)
       .get();
 
   // Drop legacy human_review rows — those belong in Notifications.
@@ -406,26 +509,27 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       .where("resolved", "==", false)
       .orderBy("createdAt", "desc")
       .limit(fetchLimit)
+      .select(...CHARGE_LIST_FIELDS)
       .get();
 
-  // Enrich linked dashboardTasks that are missing the approval email body.
+  // Copy routing fields onto linked tasks. Email HTML stays off this path.
   for (const task of tasks) {
     if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE) continue;
     let fuDoc = task.followUpId ?
       chargeSnap.docs.find((x) => x.id === task.followUpId) : null;
     if (task.followUpId && !fuDoc) {
       // eslint-disable-next-line no-await-in-loop
-      const snap = await db
+      const missed = await db
           .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
-          .doc(task.followUpId).get();
-      if (snap.exists) fuDoc = snap;
+          .where(admin.firestore.FieldPath.documentId(), "==",
+              task.followUpId)
+          .select(...CHARGE_LIST_FIELDS)
+          .limit(1)
+          .get();
+      if (!missed.empty) fuDoc = missed.docs[0];
     }
     if (fuDoc) {
       const d = fuDoc.data() || {};
-      if (!task.body) {
-        task.body = d.emailHtml ||
-          buildAdditionalChargeFallbackHtml(additionalChargesMod, d);
-      }
       task.subject = task.subject || d.emailSubject || null;
       task.to = task.to || d.emailTo || null;
       task.cc = task.cc || d.emailCc || null;
@@ -455,8 +559,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
         `Charge in dispute — Load ${d.loadNumber || "—"}` :
         `Additional charge — Load ${d.loadNumber || "—"}`,
       description: d.notes || null,
-      body: d.emailHtml ||
-        buildAdditionalChargeFallbackHtml(additionalChargesMod, d),
+      body: null,
       subject: d.emailSubject || null,
       from: null,
       to: d.emailTo || null,
@@ -531,6 +634,8 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     limit: opts.limit || 50,
     urgentFirst: opts.urgentFirst,
   });
+
+  await hydratePageBodies(db, additionalChargesMod, page.items);
 
   return {
     tasks: page.items,

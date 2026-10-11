@@ -13049,7 +13049,9 @@ exports.getDashboardStats = onRequest(async (req, res) => {
   }
 });
 
-exports.getDashboardTasks = onRequest(async (req, res) => {
+exports.getDashboardTasks = onRequest(
+    {invoker: "public", memory: "512MiB"},
+    async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   try {
     const tenant = await resolveDashboardTenant(req);
