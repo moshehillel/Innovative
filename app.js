@@ -1530,10 +1530,13 @@
       submitBtn.textContent = "Signing in…";
     }
     try {
+      QD.beginLoginHighway();
       await QuoteAuth.signInWithEmailPassword(
           document.getElementById("login-email").value,
           document.getElementById("login-password").value);
+      QD.showLoginHighway();
     } catch (err) {
+      QD.cancelLoginHighway();
       document.getElementById("login-error").textContent =
         err.message || "Sign-in failed";
     } finally {
@@ -1574,6 +1577,7 @@
     try {
       sessionStorage.clear();
     } catch (_) { /* ignore */ }
+    QD.cancelLoginHighway();
     QuoteAuth.signOut();
   });
   document.getElementById("btn-outlook-connect").addEventListener("click", async () => {
@@ -1981,9 +1985,11 @@
       await QuoteAuth.init();
       QuoteAuth.onAuth(async (user) => {
         if (!user) {
+          QD.dismissLoginHighwayIfSignedOut();
           showApp(false);
           return;
         }
+        QD.markLoginShellReady();
         showApp(true);
         // Instant paint from session cache while fresh data loads.
         const cachedProfile = QD.ssGet(PROFILE_KEY, INBOX_CACHE_TTL);
@@ -2007,6 +2013,7 @@
           ]);
           maybeDeferredSync();
         } catch (e) {
+          QD.cancelLoginHighway();
           document.getElementById("login-error").textContent = e.message;
           showApp(false);
           await QuoteAuth.signOut();

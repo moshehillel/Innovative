@@ -1909,10 +1909,13 @@
       submitBtn.textContent = "Signing in…";
     }
     try {
+      QD.beginLoginHighway();
       await QuoteAuth.signInWithEmailPassword(
           document.getElementById("login-email").value,
           document.getElementById("login-password").value);
+      QD.showLoginHighway();
     } catch (err) {
+      QD.cancelLoginHighway();
       const errEl = document.getElementById("login-error");
       errEl.textContent = err.message;
       errEl.classList.remove("hidden");
@@ -1966,9 +1969,11 @@
       QuoteAuth.onAuth((user) => {
         if (!user) {
           thinking.stop();
+          QD.dismissLoginHighwayIfSignedOut();
           showApp(false);
           return;
         }
+        QD.markLoginShellReady();
         showApp(true);
         load();
       });

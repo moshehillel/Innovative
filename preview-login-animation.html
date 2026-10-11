@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Login animation preview</title>
+  <link rel="stylesheet" href="style.css?v=20261011h">
+  <style>
+    .preview-dash {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: #14212b;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-size: 1.6rem;
+      letter-spacing: 0.02em;
+    }
+    .preview-hud {
+      position: fixed;
+      left: 16px;
+      right: 16px;
+      bottom: 16px;
+      z-index: 300;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      max-width: 720px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: rgba(7, 16, 24, 0.72);
+      color: #f4f7fb;
+      backdrop-filter: blur(8px);
+      font-family: "Segoe UI", system-ui, sans-serif;
+    }
+    .preview-hud p { margin: 0; font-size: 0.95rem; }
+    .preview-hud button {
+      border: 0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      background: #38bdf8;
+      color: #082f49;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+    .preview-hud button:disabled { opacity: 0.65; cursor: default; }
+  </style>
+</head>
+<body>
+  <div id="dash" class="preview-dash">Dashboard</div>
+  <div id="clip" class="login-highway-overlay" aria-hidden="true">
+    <img id="clip-img" src="media/login-highway-6s.gif" alt="">
+  </div>
+  <div class="preview-hud">
+    <p>Preview only. Same 5s hold, then a 400ms fade. Not on the live site.</p>
+    <button id="replay" type="button">Replay</button>
+  </div>
+  <script>
+    var MIN_MS = 5000;
+    var FADE_MS = 400;
+    var clip = document.getElementById("clip");
+    var img = document.getElementById("clip-img");
+    var btn = document.getElementById("replay");
+    var timer = null;
+    var reduced = false;
+    try {
+      reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    } catch (e) { reduced = false; }
+
+    function reveal() {
+      clip.classList.add("is-fading");
+      btn.disabled = false;
+    }
+
+    function play() {
+      if (timer) clearTimeout(timer);
+      btn.disabled = true;
+      if (reduced) {
+        clip.classList.add("is-fading");
+        btn.disabled = false;
+        return;
+      }
+      clip.classList.remove("is-fading");
+      img.src = "media/login-highway-6s.gif?t=" + Date.now();
+      var shownAt = performance.now();
+      var shellReady = true;
+      function tick() {
+        var elapsed = performance.now() - shownAt;
+        if (elapsed >= MIN_MS && shellReady) reveal();
+        else timer = setTimeout(tick, Math.max(0, MIN_MS - elapsed));
+      }
+      timer = setTimeout(tick, MIN_MS);
+    }
+
+    btn.addEventListener("click", play);
+    play();
+  </script>
+</body>
+</html>

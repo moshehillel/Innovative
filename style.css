@@ -281,6 +281,29 @@ input, select, textarea {
   text-align: center; font-size: 12px; color: var(--ic-text-faint); line-height: 1.5;
 }
 
+/* Fresh sign-in clip. Covers the shell until the minimum play time elapses. */
+.login-highway-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: #071018;
+  opacity: 1;
+  transition: opacity 400ms ease;
+}
+.login-highway-overlay.is-fading {
+  opacity: 0;
+  pointer-events: none;
+}
+.login-highway-overlay img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-highway-overlay { display: none !important; }
+}
+
 /* ——— Thinking / skeleton loaders ——— */
 .page-thinking { display: flex; flex-direction: column; gap: 20px; min-height: 36vh; padding: 4px 0 16px; }
 .page-thinking.hidden { display: none !important; }

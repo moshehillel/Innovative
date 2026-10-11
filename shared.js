@@ -309,6 +309,128 @@
     return page + (s ? "?" + s : "");
   }
 
+  // ---------- Fresh-login highway clip ----------
+  // Armed only from a login-form success path. Token restore never arms it.
+  const HIGHWAY_MIN_MS = 5000;
+  const HIGHWAY_FADE_MS = 400;
+  const HIGHWAY_SRC = "media/login-highway-6s.gif";
+  let highwayArmed = false;
+  let highwaySignInPending = false;
+  let highwayOverlay = null;
+  let highwayShownAt = 0;
+  let highwayShellReady = false;
+  let highwayFadeTimer = null;
+  let highwayRemoveTimer = null;
+
+  function highwayReducedMotion() {
+    try {
+      return !!(global.matchMedia &&
+        global.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function highwayClearTimers() {
+    if (highwayFadeTimer) {
+      clearTimeout(highwayFadeTimer);
+      highwayFadeTimer = null;
+    }
+    if (highwayRemoveTimer) {
+      clearTimeout(highwayRemoveTimer);
+      highwayRemoveTimer = null;
+    }
+  }
+
+  function highwayRemoveNow() {
+    highwayClearTimers();
+    if (highwayOverlay && highwayOverlay.parentNode) {
+      highwayOverlay.parentNode.removeChild(highwayOverlay);
+    }
+    highwayOverlay = null;
+    highwayShownAt = 0;
+    highwayShellReady = false;
+  }
+
+  /** Mark the next auth callback as a form sign-in, before the await. */
+  function beginLoginHighway() {
+    highwayArmed = true;
+    highwaySignInPending = true;
+    highwayShellReady = false;
+  }
+
+  function cancelLoginHighway() {
+    highwayArmed = false;
+    highwaySignInPending = false;
+    highwayRemoveNow();
+  }
+
+  /**
+   * Auth dropped to signed-out. Ignore the initial null that can arrive
+   * while a form sign-in is still in flight.
+   */
+  function dismissLoginHighwayIfSignedOut() {
+    if (highwaySignInPending) return;
+    cancelLoginHighway();
+  }
+
+  function scheduleHighwayFade() {
+    if (!highwayOverlay || !highwayShellReady || highwayFadeTimer) return;
+    const wait = Math.max(0, HIGHWAY_MIN_MS - (performance.now() - highwayShownAt));
+    highwayFadeTimer = setTimeout(() => {
+      highwayFadeTimer = null;
+      if (!highwayOverlay) return;
+      highwayOverlay.classList.add("is-fading");
+      const node = highwayOverlay;
+      highwayRemoveTimer = setTimeout(() => {
+        highwayRemoveTimer = null;
+        if (node.parentNode) node.parentNode.removeChild(node);
+        if (highwayOverlay === node) highwayOverlay = null;
+        highwayArmed = false;
+        highwayShellReady = false;
+      }, HIGHWAY_FADE_MS);
+    }, wait);
+  }
+
+  /** Show the looping clip. No-op until a form sign-in armed it. */
+  function showLoginHighway() {
+    if (!highwayArmed || highwayReducedMotion()) {
+      if (highwayReducedMotion()) highwaySignInPending = false;
+      return;
+    }
+    highwaySignInPending = false;
+    if (highwayOverlay) return;
+    const el = document.createElement("div");
+    el.className = "login-highway-overlay";
+    el.setAttribute("aria-hidden", "true");
+    const img = document.createElement("img");
+    img.src = HIGHWAY_SRC;
+    img.alt = "";
+    el.appendChild(img);
+    document.body.appendChild(el);
+    highwayOverlay = el;
+    highwayShownAt = performance.now();
+    scheduleHighwayFade();
+  }
+
+  /**
+   * Post-login shell can be shown. Fade only after the clip has played
+   * for at least HIGHWAY_MIN_MS. Returns true while the clip is covering.
+   */
+  function markLoginShellReady() {
+    if (!highwayArmed) return false;
+    if (highwayReducedMotion()) {
+      highwayArmed = false;
+      highwaySignInPending = false;
+      highwayRemoveNow();
+      return false;
+    }
+    showLoginHighway();
+    highwayShellReady = true;
+    scheduleHighwayFade();
+    return !!highwayOverlay;
+  }
+
   global.QD = {
     API,
     TENANT_ID,
@@ -325,5 +447,10 @@
     esc,
     num,
     pageUrl,
+    beginLoginHighway,
+    showLoginHighway,
+    cancelLoginHighway,
+    dismissLoginHighwayIfSignedOut,
+    markLoginShellReady,
   };
 })(window);
