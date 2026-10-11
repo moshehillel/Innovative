@@ -313,7 +313,7 @@
   // Armed only from a login-form success path. Token restore never arms it.
   const HIGHWAY_MIN_MS = 5000;
   const HIGHWAY_FADE_MS = 400;
-  const HIGHWAY_SRC = "media/login-highway-6s.gif";
+  const HIGHWAY_SRC = "media/login-highway-6s.gif?v=20261011i";
   let highwayArmed = false;
   let highwaySignInPending = false;
   let highwayOverlay = null;

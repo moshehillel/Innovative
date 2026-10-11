@@ -53,7 +53,7 @@
 <body>
   <div id="dash" class="preview-dash">Dashboard</div>
   <div id="clip" class="login-highway-overlay" aria-hidden="true">
-    <img id="clip-img" src="media/login-highway-6s.gif" alt="">
+    <img id="clip-img" src="media/login-highway-6s.gif?v=20261011i" alt="">
   </div>
   <div class="preview-hud">
     <p>Preview only. Same 5s hold, then a 400ms fade. Not on the live site.</p>
@@ -85,7 +85,7 @@
         return;
       }
       clip.classList.remove("is-fading");
-      img.src = "media/login-highway-6s.gif?t=" + Date.now();
+      img.src = "media/login-highway-6s.gif?v=20261011i&t=" + Date.now();
       var shownAt = performance.now();
       var shellReady = true;
       function tick() {
