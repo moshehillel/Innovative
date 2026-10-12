@@ -311,11 +311,13 @@
 
   // ---------- Fresh-login highway clip ----------
   // Armed only from a login-form success path. Token restore never arms it.
-  // Short, once-through clip in a small frame so peripheral vision stays still.
-  const HIGHWAY_MIN_MS = 2500;
+  // Plays once, nearly full-screen. Fade starts when the camera swings from
+  // the side view toward the rear (4.25s). The chase-shot cut is at 5.0s.
+  const HIGHWAY_TURN_S = 4.25;
+  const HIGHWAY_TURN_END_S = 5;
   const HIGHWAY_FADE_MS = 700;
   const HIGHWAY_PLAYBACK_RATE = 0.85;
-  const HIGHWAY_CACHE = "20261011k";
+  const HIGHWAY_CACHE = "20261012a";
   const HIGHWAY_MP4 = "media/login-highway.mp4?v=" + HIGHWAY_CACHE;
   const HIGHWAY_WEBM = "media/login-highway.webm?v=" + HIGHWAY_CACHE;
   let highwayArmed = false;
@@ -324,7 +326,7 @@
   let highwayShownAt = 0;
   let highwayShellReady = false;
   let highwayHoldDone = false;
-  let highwayHoldTimer = null;
+  let highwayWatchRaf = 0;
   let highwayFadeTimer = null;
 
   function highwayReducedMotion() {
@@ -337,9 +339,9 @@
   }
 
   function highwayClearTimers() {
-    if (highwayHoldTimer) {
-      clearTimeout(highwayHoldTimer);
-      highwayHoldTimer = null;
+    if (highwayWatchRaf) {
+      cancelAnimationFrame(highwayWatchRaf);
+      highwayWatchRaf = 0;
     }
     if (highwayFadeTimer) {
       clearTimeout(highwayFadeTimer);
@@ -398,25 +400,49 @@
     highwayStopVideo(highwayOverlay);
   }
 
+  function highwayVideo(node) {
+    return node ? node.querySelector("video") : null;
+  }
+
+  function highwayPastTurn(video) {
+    if (!video) return false;
+    return !!video.ended || (video.currentTime || 0) >= HIGHWAY_TURN_END_S;
+  }
+
   /**
-   * After the short hold, stop motion. Fade only once the shell is ready.
-   * Waiting longer keeps the still background, never a looping clip.
+   * Watch media time. At the turn, fade if the shell is up so the dashboard
+   * appears while the view swings around. If the shell is late, freeze on
+   * that frame and do not play into the chase shot.
    */
-  function armHighwayHold() {
-    if (!highwayOverlay || highwayHoldTimer) return;
-    const wait = Math.max(0, HIGHWAY_MIN_MS - (performance.now() - highwayShownAt));
-    highwayHoldTimer = setTimeout(() => {
-      highwayHoldTimer = null;
+  function highwayWatchTurn() {
+    highwayWatchRaf = 0;
+    if (!highwayOverlay) return;
+    const video = highwayVideo(highwayOverlay);
+    if (!video) return;
+    const t = video.currentTime || 0;
+    if (!highwayHoldDone && (t >= HIGHWAY_TURN_S || video.ended)) {
       highwayHoldDone = true;
-      if (!highwayOverlay) return;
+      if (!highwayShellReady || highwayPastTurn(video)) highwayPauseMotion();
+    } else if (highwayHoldDone && highwayPastTurn(video)) {
       highwayPauseMotion();
-      scheduleHighwayFade();
-    }, wait);
+    }
+    if (highwayHoldDone) scheduleHighwayFade();
+    const playingThroughTurn = highwayHoldDone && highwayShellReady &&
+      !video.paused && !highwayPastTurn(video);
+    if (!highwayHoldDone || playingThroughTurn) {
+      highwayWatchRaf = requestAnimationFrame(highwayWatchTurn);
+    }
+  }
+
+  function armHighwayWatch() {
+    if (!highwayOverlay || highwayWatchRaf) return;
+    highwayWatchRaf = requestAnimationFrame(highwayWatchTurn);
   }
 
   function scheduleHighwayFade() {
     if (!highwayOverlay || !highwayShellReady || !highwayHoldDone || highwayFadeTimer) return;
-    highwayPauseMotion();
+    const video = highwayVideo(highwayOverlay);
+    if (highwayPastTurn(video)) highwayPauseMotion();
     highwayOverlay.classList.add("is-fading");
     const node = highwayOverlay;
     highwayFadeTimer = setTimeout(() => {
@@ -430,7 +456,7 @@
     }, HIGHWAY_FADE_MS);
   }
 
-  /** Show the clip once, inside a small frame. No-op until a form sign-in armed it. */
+  /** Show the clip once, nearly full-screen. No-op until a form sign-in armed it. */
   function showLoginHighway() {
     if (!highwayArmed || highwayReducedMotion()) {
       if (highwayReducedMotion()) highwaySignInPending = false;
@@ -464,9 +490,14 @@
     mp4.type = "video/mp4";
     video.appendChild(webm);
     video.appendChild(mp4);
-    video.addEventListener("ended", highwayPauseMotion);
+    video.addEventListener("ended", function () {
+      highwayHoldDone = true;
+      highwayPauseMotion();
+      scheduleHighwayFade();
+    });
     video.addEventListener("playing", function onPlaying() {
       highwayApplyRate(video);
+      armHighwayWatch();
     });
     frame.appendChild(video);
     el.appendChild(frame);
@@ -474,17 +505,20 @@
     highwayApplyRate(video);
     const kick = video.play();
     if (kick && typeof kick.then === "function") {
-      kick.then(() => highwayApplyRate(video)).catch(() => {});
+      kick.then(() => highwayApplyRate(video)).catch(() => {
+        highwayHoldDone = true;
+        scheduleHighwayFade();
+      });
     }
     highwayOverlay = el;
     highwayShownAt = performance.now();
-    armHighwayHold();
+    armHighwayWatch();
     scheduleHighwayFade();
   }
 
   /**
-   * Post-login shell can be shown. Fade only after the short hold.
-   * If the shell is late, motion is already paused on the still backdrop.
+   * Post-login shell can be shown. Fade only once the camera reaches the turn.
+   * If the shell is late, motion is already paused on that frame.
    * Returns true while the overlay is covering.
    */
   function markLoginShellReady() {

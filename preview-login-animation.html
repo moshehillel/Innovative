@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Login animation preview</title>
-  <link rel="stylesheet" href="style.css?v=20261011k">
+  <link rel="stylesheet" href="style.css?v=20261012a">
   <style>
     .preview-dash {
       position: fixed;
@@ -55,29 +55,32 @@
   <div id="clip" class="login-highway-overlay" aria-hidden="true">
     <div class="login-highway-frame">
       <video id="clip-video" muted autoplay playsinline preload="auto">
-        <source src="media/login-highway.webm?v=20261011k" type="video/webm">
-        <source src="media/login-highway.mp4?v=20261011k" type="video/mp4">
+        <source src="media/login-highway.webm?v=20261012a" type="video/webm">
+        <source src="media/login-highway.mp4?v=20261012a" type="video/mp4">
       </video>
     </div>
   </div>
   <div class="preview-hud">
-    <p>Preview only. 2.5s hold, then a 700ms fade. Motion pauses if the shell is late.</p>
+    <p>Preview only. Fade starts at the 4.25s turn, over 700ms. Motion pauses on that frame if the shell is late.</p>
     <button id="replay" type="button">Replay</button>
   </div>
   <script>
-    var MIN_MS = 2500;
+    var TURN_S = 4.25;
+    var TURN_END_S = 5;
     var FADE_MS = 700;
     var clip = document.getElementById("clip");
     var video = document.getElementById("clip-video");
     var btn = document.getElementById("replay");
     var timer = null;
+    var fading = false;
     var reduced = false;
     try {
       reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     } catch (e) { reduced = false; }
 
     function reveal() {
-      try { video.pause(); } catch (e) {}
+      if (fading) return;
+      fading = true;
       clip.classList.add("is-fading");
       btn.disabled = false;
     }
@@ -90,6 +93,7 @@
         btn.disabled = false;
         return;
       }
+      fading = false;
       clip.classList.remove("is-fading");
       video.loop = false;
       video.playbackRate = 0.85;
@@ -97,14 +101,16 @@
       var kick = video.play();
       if (kick && kick.then) kick.then(function () { video.playbackRate = 0.85; }).catch(function () {});
       else if (kick && kick.catch) kick.catch(function () {});
-      var shownAt = performance.now();
       var shellReady = true;
       function tick() {
-        var elapsed = performance.now() - shownAt;
-        if (elapsed >= MIN_MS && shellReady) reveal();
-        else timer = setTimeout(tick, Math.max(0, MIN_MS - elapsed));
+        var t = video.currentTime || 0;
+        if (t >= TURN_END_S) {
+          try { video.pause(); } catch (e) {}
+        }
+        if ((t >= TURN_S || video.ended) && shellReady) reveal();
+        if (!video.paused && t < TURN_END_S) timer = setTimeout(tick, 50);
       }
-      timer = setTimeout(tick, MIN_MS);
+      timer = setTimeout(tick, 50);
     }
 
     btn.addEventListener("click", play);

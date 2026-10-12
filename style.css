@@ -281,8 +281,8 @@ input, select, textarea {
   text-align: center; font-size: 12px; color: var(--ic-text-faint); line-height: 1.5;
 }
 
-/* Fresh sign-in clip. Still teal backdrop; motion stays inside a small frame
-   so peripheral vision does not fill with optic flow. */
+/* Fresh sign-in clip. Still light backdrop shows as a thin margin; the clip
+   fills most of the screen and fades while the camera turns. */
 .login-highway-overlay {
   position: fixed;
   inset: 0;
@@ -290,7 +290,7 @@ input, select, textarea {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: 0;
   background: #f7fcfb;
   background-image: linear-gradient(180deg, #ffffff 0%, #e4f3f1 100%);
   opacity: 1;
@@ -303,10 +303,8 @@ input, select, textarea {
   pointer-events: none;
 }
 .login-highway-frame {
-  width: min(720px, calc(100vw - 48px));
-  height: min(400px, calc(100vh - 64px));
-  max-width: 720px;
-  max-height: 400px;
+  width: 92vw;
+  height: min(86vh, calc(92vw * 9 / 16));
   border-radius: 18px;
   overflow: hidden;
   background: #e7f3f1;
@@ -484,7 +482,7 @@ input, select, textarea {
 .dismissed-note {
   margin: 0 0 14px; padding: 10px 14px;
   border-radius: var(--ic-radius); background: var(--ic-surface);
-  border: 1px solid #b7dddd; color: var(--ic-brand-ink);
+  border: 1px solid #b7dddd; color: var(--ic-red);
   font-weight: 650; box-shadow: var(--ic-shadow);
 }
 .empty-visual {
