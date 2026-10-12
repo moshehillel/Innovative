@@ -71,6 +71,8 @@ check("several hits without the container are not guessed",
 
 const draftFlags = bridge.portFeeSaveInvoiceFlags({id: 1, invoiceNumber: "0"});
 check("draft does not close customer cost", draftFlags.costClosed === "0");
+check("draft closes the vendor charge for QuickBooks",
+    draftFlags.costActualClosed === "1");
 check("draft is not marked ready to invoice",
     draftFlags.readyToInvoice === "0");
 const issuedFlags = bridge.portFeeSaveInvoiceFlags({

@@ -700,7 +700,22 @@ async function listPendingRecords() {
 }
 
 /**
+ * Charges already entered on a waited load, before the vendor cost was closed.
+ * @return {Promise<Array<object>>}
+ */
+async function listPostedNeedingVendorClose() {
+  const col = pendingCollection();
+  if (!col) return [];
+  const snap = await col.where("status", "==", "posted").get();
+  return snap.docs
+      .map((doc) => ({id: doc.id, ...doc.data()}))
+      .filter((row) => !row.vendorCostClosed);
+}
+
+/**
  * Each morning: post any waiting port fee whose load now exists.
+ * Charges already entered on a waited load are saved again once so the
+ * vendor cost is closed and can transfer to QuickBooks.
  * Does not email Josef and Leo again.
  * @return {Promise<object>}
  */
@@ -711,8 +726,9 @@ async function retryPendingPortFees() {
     return {ok: false, error: "manage.php off"};
   }
   const pending = await listPendingRecords();
+  const needsClose = await listPostedNeedingVendorClose();
   let termsId = null;
-  if (pending.length &&
+  if ((pending.length || needsClose.length) &&
       typeof deps.resolveDueOnReceiptTermId === "function") {
     const terms = await deps.resolveDueOnReceiptTermId();
     if (!terms || !terms.ok) {
@@ -751,6 +767,7 @@ async function retryPendingPortFees() {
       dueDate: row.invoiceDate,
       proNumber: row.container,
       termsId,
+      ensureVendorCostClosed: true,
     });
     if (result && result.ok) {
       posted.push({
@@ -763,6 +780,7 @@ async function retryPendingPortFees() {
       if (col) {
         await col.doc(row.id).set({
           status: "posted",
+          vendorCostClosed: true,
           loadNumber: found.loadNumber,
           postedAt: now,
           lastCheckedAt: now,
@@ -783,11 +801,66 @@ async function retryPendingPortFees() {
       }, {merge: true});
     }
   }
+  const closed = [];
+  for (const row of needsClose) {
+    const found = await findLoadByContainer(row.container);
+    if (!found.ok) {
+      if (col) {
+        await col.doc(row.id).set({
+          lastError: "load not found while closing vendor cost",
+          lastCheckedAt: now,
+        }, {merge: true});
+      }
+      continue;
+    }
+    let vendor = row.vendorId ?
+      {id: row.vendorId, name: row.vendorName} : null;
+    if (!vendor && typeof deps.resolveNamedVendor === "function") {
+      vendor = await deps.resolveNamedVendor(row.vendorName);
+    }
+    const result = await deps.addPortFeeToLoad({
+      loadNumber: found.loadNumber,
+      booking: found.booking,
+      amount: row.amount,
+      chargeCode: row.chargeCode,
+      description: row.description || row.chargeCode,
+      vendor,
+      vendorInvoiceNumber: row.invoiceNumber,
+      billDate: row.invoiceDate,
+      dueDate: row.invoiceDate,
+      proNumber: row.container,
+      termsId,
+      ensureVendorCostClosed: true,
+    });
+    if (result && result.ok) {
+      closed.push({
+        container: row.container,
+        loadNumber: found.loadNumber,
+        chargeCode: row.chargeCode,
+        invoiceNumber: row.invoiceNumber,
+      });
+      if (col) {
+        await col.doc(row.id).set({
+          vendorCostClosed: true,
+          loadNumber: found.loadNumber,
+          lastCheckedAt: now,
+        }, {merge: true});
+      }
+      continue;
+    }
+    if (col) {
+      await col.doc(row.id).set({
+        lastError: (result && result.error) || "vendor cost not closed",
+        lastCheckedAt: now,
+      }, {merge: true});
+    }
+  }
   await log("info", "port-fee", "Pending port fees checked", {
     pending: pending.length,
     posted: posted.length,
     stillMissing: stillMissing.length,
     waiting: waiting.length,
+    closed: closed.length,
   });
   if (posted.length && typeof deps.saveOutboundEmail === "function") {
     const lines = posted.map((row) =>
@@ -803,7 +876,7 @@ async function retryPendingPortFees() {
         `${lines}</ul>`,
     });
   }
-  return {ok: true, posted, stillMissing, waiting};
+  return {ok: true, posted, stillMissing, waiting, closed};
 }
 
 /**

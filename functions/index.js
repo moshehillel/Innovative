@@ -16677,6 +16677,7 @@ exports.retryPendingPortFees = onSchedule({
       posted: result.posted && result.posted.length,
       stillMissing: result.stillMissing && result.stillMissing.length,
       waiting: result.waiting && result.waiting.length,
+      closed: result.closed && result.closed.length,
       error: result.error || null,
     }));
   } catch (error) {

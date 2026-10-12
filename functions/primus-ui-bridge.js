@@ -4699,8 +4699,10 @@ function insuranceSaveInvoiceCloseFlags() {
 }
 
 /**
- * Close flags when a port fee is added to an existing invoice.
- * Customer cost stays open. A draft is not marked ready to invoice.
+ * Close flags when a port fee is added to an invoice.
+ * Customer cost stays open. The vendor charge is always closed so the
+ * payable can transfer to QuickBooks, including on a new load whose
+ * customer invoice is still a draft. A draft is not marked ready to invoice.
  * An invoice that is already issued stays issued.
  * @param {object} uiInvoice Invoice row from getBookingDocuments.
  * @return {object}
@@ -4709,7 +4711,7 @@ function portFeeSaveInvoiceFlags(uiInvoice) {
   const issued = isIssuedUiInvoice(uiInvoice);
   return {
     costClosed: "0",
-    costActualClosed: issued ? "1" : "0",
+    costActualClosed: "1",
     readyToInvoice: issued ? "1" : "0",
   };
 }
@@ -5403,16 +5405,19 @@ async function addPortFeeToLoad(args) {
   const exact = existingLines.find((line) =>
     String(line.vendorInvoiceNumber || "") === vendorInvoiceNumber);
   if (exact && moneyEquals(exact.total, amount)) {
-    return {
-      ok: true,
-      skipped: true,
-      reason: "already posted",
-      loadNumber,
-      invoiceId,
-      amount,
-    };
-  }
-  if (exact) {
+    // A line entered while waiting for the load was saved with the vendor
+    // cost still open. Re-save once so that charge closes for QuickBooks.
+    if (!args.ensureVendorCostClosed) {
+      return {
+        ok: true,
+        skipped: true,
+        reason: "already posted",
+        loadNumber,
+        invoiceId,
+        amount,
+      };
+    }
+  } else if (exact) {
     return {
       ok: false,
       amountMismatch: true,
