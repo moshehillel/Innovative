@@ -313,7 +313,9 @@
   // Armed only from a login-form success path. Token restore never arms it.
   const HIGHWAY_MIN_MS = 5000;
   const HIGHWAY_FADE_MS = 400;
-  const HIGHWAY_SRC = "media/login-highway-6s.gif?v=20261011i";
+  const HIGHWAY_CACHE = "20261011j";
+  const HIGHWAY_MP4 = "media/login-highway.mp4?v=" + HIGHWAY_CACHE;
+  const HIGHWAY_WEBM = "media/login-highway.webm?v=" + HIGHWAY_CACHE;
   let highwayArmed = false;
   let highwaySignInPending = false;
   let highwayOverlay = null;
@@ -342,8 +344,16 @@
     }
   }
 
+  function highwayStopVideo(node) {
+    if (!node) return;
+    const video = node.querySelector("video");
+    if (!video) return;
+    try { video.pause(); } catch (_) { /* already gone */ }
+  }
+
   function highwayRemoveNow() {
     highwayClearTimers();
+    highwayStopVideo(highwayOverlay);
     if (highwayOverlay && highwayOverlay.parentNode) {
       highwayOverlay.parentNode.removeChild(highwayOverlay);
     }
@@ -384,6 +394,7 @@
       const node = highwayOverlay;
       highwayRemoveTimer = setTimeout(() => {
         highwayRemoveTimer = null;
+        highwayStopVideo(node);
         if (node.parentNode) node.parentNode.removeChild(node);
         if (highwayOverlay === node) highwayOverlay = null;
         highwayArmed = false;
@@ -403,11 +414,32 @@
     const el = document.createElement("div");
     el.className = "login-highway-overlay";
     el.setAttribute("aria-hidden", "true");
-    const img = document.createElement("img");
-    img.src = HIGHWAY_SRC;
-    img.alt = "";
-    el.appendChild(img);
+    const video = document.createElement("video");
+    video.muted = true;
+    video.defaultMuted = true;
+    video.autoplay = true;
+    video.loop = true;
+    video.playsInline = true;
+    video.preload = "auto";
+    video.controls = false;
+    video.disablePictureInPicture = true;
+    video.setAttribute("muted", "");
+    video.setAttribute("autoplay", "");
+    video.setAttribute("loop", "");
+    video.setAttribute("playsinline", "");
+    video.setAttribute("webkit-playsinline", "");
+    const webm = document.createElement("source");
+    webm.src = HIGHWAY_WEBM;
+    webm.type = "video/webm";
+    const mp4 = document.createElement("source");
+    mp4.src = HIGHWAY_MP4;
+    mp4.type = "video/mp4";
+    video.appendChild(webm);
+    video.appendChild(mp4);
+    el.appendChild(video);
     document.body.appendChild(el);
+    const kick = video.play();
+    if (kick && typeof kick.catch === "function") kick.catch(() => {});
     highwayOverlay = el;
     highwayShownAt = performance.now();
     scheduleHighwayFade();

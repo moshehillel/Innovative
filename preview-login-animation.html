@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Login animation preview</title>
-  <link rel="stylesheet" href="style.css?v=20261011h">
+  <link rel="stylesheet" href="style.css?v=20261011j">
   <style>
     .preview-dash {
       position: fixed;
@@ -53,7 +53,10 @@
 <body>
   <div id="dash" class="preview-dash">Dashboard</div>
   <div id="clip" class="login-highway-overlay" aria-hidden="true">
-    <img id="clip-img" src="media/login-highway-6s.gif?v=20261011i" alt="">
+    <video id="clip-video" muted autoplay loop playsinline preload="auto">
+      <source src="media/login-highway.webm?v=20261011j" type="video/webm">
+      <source src="media/login-highway.mp4?v=20261011j" type="video/mp4">
+    </video>
   </div>
   <div class="preview-hud">
     <p>Preview only. Same 5s hold, then a 400ms fade. Not on the live site.</p>
@@ -63,7 +66,7 @@
     var MIN_MS = 5000;
     var FADE_MS = 400;
     var clip = document.getElementById("clip");
-    var img = document.getElementById("clip-img");
+    var video = document.getElementById("clip-video");
     var btn = document.getElementById("replay");
     var timer = null;
     var reduced = false;
@@ -85,7 +88,9 @@
         return;
       }
       clip.classList.remove("is-fading");
-      img.src = "media/login-highway-6s.gif?v=20261011i&t=" + Date.now();
+      video.currentTime = 0;
+      var kick = video.play();
+      if (kick && kick.catch) kick.catch(function () {});
       var shownAt = performance.now();
       var shellReady = true;
       function tick() {
