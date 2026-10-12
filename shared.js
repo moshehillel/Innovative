@@ -316,8 +316,8 @@
   const HIGHWAY_TURN_S = 4.25;
   const HIGHWAY_TURN_END_S = 5;
   const HIGHWAY_FADE_MS = 700;
-  const HIGHWAY_PLAYBACK_RATE = 0.85;
-  const HIGHWAY_CACHE = "20261012a";
+  const HIGHWAY_PLAYBACK_RATE = 1;
+  const HIGHWAY_CACHE = "20261012b";
   const HIGHWAY_MP4 = "media/login-highway.mp4?v=" + HIGHWAY_CACHE;
   const HIGHWAY_WEBM = "media/login-highway.webm?v=" + HIGHWAY_CACHE;
   let highwayArmed = false;

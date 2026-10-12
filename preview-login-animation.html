@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Login animation preview</title>
-  <link rel="stylesheet" href="style.css?v=20261012a">
+  <link rel="stylesheet" href="style.css?v=20261012b">
   <style>
     .preview-dash {
       position: fixed;
@@ -55,8 +55,8 @@
   <div id="clip" class="login-highway-overlay" aria-hidden="true">
     <div class="login-highway-frame">
       <video id="clip-video" muted autoplay playsinline preload="auto">
-        <source src="media/login-highway.webm?v=20261012a" type="video/webm">
-        <source src="media/login-highway.mp4?v=20261012a" type="video/mp4">
+        <source src="media/login-highway.webm?v=20261012b" type="video/webm">
+        <source src="media/login-highway.mp4?v=20261012b" type="video/mp4">
       </video>
     </div>
   </div>
@@ -96,10 +96,10 @@
       fading = false;
       clip.classList.remove("is-fading");
       video.loop = false;
-      video.playbackRate = 0.85;
+      video.playbackRate = 1;
       video.currentTime = 0;
       var kick = video.play();
-      if (kick && kick.then) kick.then(function () { video.playbackRate = 0.85; }).catch(function () {});
+      if (kick && kick.then) kick.then(function () { video.playbackRate = 1; }).catch(function () {});
       else if (kick && kick.catch) kick.catch(function () {});
       var shellReady = true;
       function tick() {

@@ -295,8 +295,15 @@ input, select, textarea {
   background-image: linear-gradient(180deg, #ffffff 0%, #e4f3f1 100%);
   opacity: 1;
   transition: opacity 700ms ease;
-  transform: translateZ(0);
-  will-change: opacity;
+}
+.login-highway-overlay video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: #e7f3f1;
+  pointer-events: none;
+  transform: none;
 }
 .login-highway-overlay.is-fading {
   opacity: 0;
@@ -309,14 +316,6 @@ input, select, textarea {
   overflow: hidden;
   background: #e7f3f1;
   box-shadow: 0 16px 40px rgba(13, 70, 70, 0.12);
-}
-.login-highway-overlay video {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  background: #e7f3f1;
-  pointer-events: none;
 }
 @media (prefers-reduced-motion: reduce) {
   .login-highway-overlay { display: none !important; }
