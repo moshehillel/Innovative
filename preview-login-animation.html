@@ -108,7 +108,7 @@
           try { video.pause(); } catch (e) {}
         }
         if ((t >= TURN_S || video.ended) && shellReady) reveal();
-        if (!video.paused && t < TURN_END_S) timer = setTimeout(tick, 50);
+        if (!video.ended && t < TURN_END_S) timer = setTimeout(tick, 50);
       }
       timer = setTimeout(tick, 50);
     }
