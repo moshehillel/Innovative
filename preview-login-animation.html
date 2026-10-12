@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Login animation preview</title>
-  <link rel="stylesheet" href="style.css?v=20261011j">
+  <link rel="stylesheet" href="style.css?v=20261011k">
   <style>
     .preview-dash {
       position: fixed;
@@ -53,18 +53,20 @@
 <body>
   <div id="dash" class="preview-dash">Dashboard</div>
   <div id="clip" class="login-highway-overlay" aria-hidden="true">
-    <video id="clip-video" muted autoplay loop playsinline preload="auto">
-      <source src="media/login-highway.webm?v=20261011j" type="video/webm">
-      <source src="media/login-highway.mp4?v=20261011j" type="video/mp4">
-    </video>
+    <div class="login-highway-frame">
+      <video id="clip-video" muted autoplay playsinline preload="auto">
+        <source src="media/login-highway.webm?v=20261011k" type="video/webm">
+        <source src="media/login-highway.mp4?v=20261011k" type="video/mp4">
+      </video>
+    </div>
   </div>
   <div class="preview-hud">
-    <p>Preview only. Same 5s hold, then a 400ms fade. Not on the live site.</p>
+    <p>Preview only. 2.5s hold, then a 700ms fade. Motion pauses if the shell is late.</p>
     <button id="replay" type="button">Replay</button>
   </div>
   <script>
-    var MIN_MS = 5000;
-    var FADE_MS = 400;
+    var MIN_MS = 2500;
+    var FADE_MS = 700;
     var clip = document.getElementById("clip");
     var video = document.getElementById("clip-video");
     var btn = document.getElementById("replay");
@@ -75,6 +77,7 @@
     } catch (e) { reduced = false; }
 
     function reveal() {
+      try { video.pause(); } catch (e) {}
       clip.classList.add("is-fading");
       btn.disabled = false;
     }
@@ -88,9 +91,12 @@
         return;
       }
       clip.classList.remove("is-fading");
+      video.loop = false;
+      video.playbackRate = 0.85;
       video.currentTime = 0;
       var kick = video.play();
-      if (kick && kick.catch) kick.catch(function () {});
+      if (kick && kick.then) kick.then(function () { video.playbackRate = 0.85; }).catch(function () {});
+      else if (kick && kick.catch) kick.catch(function () {});
       var shownAt = performance.now();
       var shellReady = true;
       function tick() {

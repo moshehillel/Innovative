@@ -311,9 +311,11 @@
 
   // ---------- Fresh-login highway clip ----------
   // Armed only from a login-form success path. Token restore never arms it.
-  const HIGHWAY_MIN_MS = 5000;
-  const HIGHWAY_FADE_MS = 400;
-  const HIGHWAY_CACHE = "20261011j";
+  // Short, once-through clip in a small frame so peripheral vision stays still.
+  const HIGHWAY_MIN_MS = 2500;
+  const HIGHWAY_FADE_MS = 700;
+  const HIGHWAY_PLAYBACK_RATE = 0.85;
+  const HIGHWAY_CACHE = "20261011k";
   const HIGHWAY_MP4 = "media/login-highway.mp4?v=" + HIGHWAY_CACHE;
   const HIGHWAY_WEBM = "media/login-highway.webm?v=" + HIGHWAY_CACHE;
   let highwayArmed = false;
@@ -321,8 +323,9 @@
   let highwayOverlay = null;
   let highwayShownAt = 0;
   let highwayShellReady = false;
+  let highwayHoldDone = false;
+  let highwayHoldTimer = null;
   let highwayFadeTimer = null;
-  let highwayRemoveTimer = null;
 
   function highwayReducedMotion() {
     try {
@@ -334,13 +337,13 @@
   }
 
   function highwayClearTimers() {
+    if (highwayHoldTimer) {
+      clearTimeout(highwayHoldTimer);
+      highwayHoldTimer = null;
+    }
     if (highwayFadeTimer) {
       clearTimeout(highwayFadeTimer);
       highwayFadeTimer = null;
-    }
-    if (highwayRemoveTimer) {
-      clearTimeout(highwayRemoveTimer);
-      highwayRemoveTimer = null;
     }
   }
 
@@ -360,6 +363,7 @@
     highwayOverlay = null;
     highwayShownAt = 0;
     highwayShellReady = false;
+    highwayHoldDone = false;
   }
 
   /** Mark the next auth callback as a form sign-in, before the await. */
@@ -367,6 +371,7 @@
     highwayArmed = true;
     highwaySignInPending = true;
     highwayShellReady = false;
+    highwayHoldDone = false;
   }
 
   function cancelLoginHighway() {
@@ -384,26 +389,48 @@
     cancelLoginHighway();
   }
 
-  function scheduleHighwayFade() {
-    if (!highwayOverlay || !highwayShellReady || highwayFadeTimer) return;
+  function highwayApplyRate(video) {
+    try { video.playbackRate = HIGHWAY_PLAYBACK_RATE; } catch (_) { /* ignore */ }
+  }
+
+  /** Freeze on the current frame. The still backdrop stays up. */
+  function highwayPauseMotion() {
+    highwayStopVideo(highwayOverlay);
+  }
+
+  /**
+   * After the short hold, stop motion. Fade only once the shell is ready.
+   * Waiting longer keeps the still background, never a looping clip.
+   */
+  function armHighwayHold() {
+    if (!highwayOverlay || highwayHoldTimer) return;
     const wait = Math.max(0, HIGHWAY_MIN_MS - (performance.now() - highwayShownAt));
-    highwayFadeTimer = setTimeout(() => {
-      highwayFadeTimer = null;
+    highwayHoldTimer = setTimeout(() => {
+      highwayHoldTimer = null;
+      highwayHoldDone = true;
       if (!highwayOverlay) return;
-      highwayOverlay.classList.add("is-fading");
-      const node = highwayOverlay;
-      highwayRemoveTimer = setTimeout(() => {
-        highwayRemoveTimer = null;
-        highwayStopVideo(node);
-        if (node.parentNode) node.parentNode.removeChild(node);
-        if (highwayOverlay === node) highwayOverlay = null;
-        highwayArmed = false;
-        highwayShellReady = false;
-      }, HIGHWAY_FADE_MS);
+      highwayPauseMotion();
+      scheduleHighwayFade();
     }, wait);
   }
 
-  /** Show the looping clip. No-op until a form sign-in armed it. */
+  function scheduleHighwayFade() {
+    if (!highwayOverlay || !highwayShellReady || !highwayHoldDone || highwayFadeTimer) return;
+    highwayPauseMotion();
+    highwayOverlay.classList.add("is-fading");
+    const node = highwayOverlay;
+    highwayFadeTimer = setTimeout(() => {
+      highwayFadeTimer = null;
+      highwayStopVideo(node);
+      if (node.parentNode) node.parentNode.removeChild(node);
+      if (highwayOverlay === node) highwayOverlay = null;
+      highwayArmed = false;
+      highwayShellReady = false;
+      highwayHoldDone = false;
+    }, HIGHWAY_FADE_MS);
+  }
+
+  /** Show the clip once, inside a small frame. No-op until a form sign-in armed it. */
   function showLoginHighway() {
     if (!highwayArmed || highwayReducedMotion()) {
       if (highwayReducedMotion()) highwaySignInPending = false;
@@ -414,18 +441,19 @@
     const el = document.createElement("div");
     el.className = "login-highway-overlay";
     el.setAttribute("aria-hidden", "true");
+    const frame = document.createElement("div");
+    frame.className = "login-highway-frame";
     const video = document.createElement("video");
     video.muted = true;
     video.defaultMuted = true;
     video.autoplay = true;
-    video.loop = true;
+    video.loop = false;
     video.playsInline = true;
     video.preload = "auto";
     video.controls = false;
     video.disablePictureInPicture = true;
     video.setAttribute("muted", "");
     video.setAttribute("autoplay", "");
-    video.setAttribute("loop", "");
     video.setAttribute("playsinline", "");
     video.setAttribute("webkit-playsinline", "");
     const webm = document.createElement("source");
@@ -436,18 +464,28 @@
     mp4.type = "video/mp4";
     video.appendChild(webm);
     video.appendChild(mp4);
-    el.appendChild(video);
+    video.addEventListener("ended", highwayPauseMotion);
+    video.addEventListener("playing", function onPlaying() {
+      highwayApplyRate(video);
+    });
+    frame.appendChild(video);
+    el.appendChild(frame);
     document.body.appendChild(el);
+    highwayApplyRate(video);
     const kick = video.play();
-    if (kick && typeof kick.catch === "function") kick.catch(() => {});
+    if (kick && typeof kick.then === "function") {
+      kick.then(() => highwayApplyRate(video)).catch(() => {});
+    }
     highwayOverlay = el;
     highwayShownAt = performance.now();
+    armHighwayHold();
     scheduleHighwayFade();
   }
 
   /**
-   * Post-login shell can be shown. Fade only after the clip has played
-   * for at least HIGHWAY_MIN_MS. Returns true while the clip is covering.
+   * Post-login shell can be shown. Fade only after the short hold.
+   * If the shell is late, motion is already paused on the still backdrop.
+   * Returns true while the overlay is covering.
    */
   function markLoginShellReady() {
     if (!highwayArmed) return false;
