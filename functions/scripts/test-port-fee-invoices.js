@@ -246,8 +246,14 @@ async function runMissingLoadEmail() {
   const second = await portFees.rememberMissingLoads(summaries);
   check("missing-load email goes to Josef",
       sent[0] && sent[0].to === "Josef@innovativecarriers.com");
-  check("missing-load email copies Leo",
-      sent[0] && sent[0].cc === "Leo@innovativecarriers.com");
+  check("missing-load email copies Leo and Abe",
+      sent[0] && sent[0].cc ===
+      "Leo@innovativecarriers.com, Abe@innovativecarriers.com");
+check("Abe is copied once",
+      portFees.portFeeEmailCc("Abe@innovativecarriers.com") ===
+      "Abe@innovativecarriers.com");
+check("Abe is added when nobody is copied",
+      portFees.portFeeEmailCc() === "Abe@innovativecarriers.com");
   check("missing load is emailed once",
       first.fresh.length === 1 && second.fresh.length === 0 &&
       sent.length === 1);

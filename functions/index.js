@@ -8537,7 +8537,10 @@ async function handleDetectedPortFeeEmail(args) {
     await forwardWithAnalysis(
         `Pier Pass / Port Check invoice could not be posted ` +
         `(${result.reason || "unknown"})`,
-        {department: "billing"},
+        {
+          department: "billing",
+          cc: portFeeInvoices.portFeeEmailCc(),
+        },
     );
     await mailIntakeQueue.completeIntakeRecord({
       tenant,

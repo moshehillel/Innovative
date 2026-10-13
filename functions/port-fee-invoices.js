@@ -44,6 +44,30 @@ const SKIP_REASON = {
 
 const MISSING_LOAD_TO = "Josef@innovativecarriers.com";
 const MISSING_LOAD_CC = "Leo@innovativecarriers.com";
+const PORT_FEE_CC = "Abe@innovativecarriers.com";
+
+/**
+ * Abe is copied on every TMF / CTF email. Existing recipients stay.
+ * @param {string|Array<string>|null|undefined} existing Current CC.
+ * @return {string} Comma-separated CC list.
+ */
+function portFeeEmailCc(existing) {
+  const parts = [];
+  const raw = Array.isArray(existing) ? existing.join(",") :
+    String(existing || "");
+  for (const piece of raw.split(/[,;]/)) {
+    const addr = piece.trim();
+    if (!addr) continue;
+    if (parts.some((have) => have.toLowerCase() === addr.toLowerCase())) {
+      continue;
+    }
+    parts.push(addr);
+  }
+  if (!parts.some((have) => have.toLowerCase() === PORT_FEE_CC.toLowerCase())) {
+    parts.push(PORT_FEE_CC);
+  }
+  return parts.join(", ");
+}
 
 const CHARGE_PROFILES = {
   TMF: {
@@ -580,8 +604,8 @@ function buildReconciliationEmail(summaries, rejected) {
     );
     skippedTotal += rejected.length;
   }
-  const subject = `Port fee: ${postedTotal} entered, ${skippedTotal} skipped`;
-  const html = `<h2>Pier Pass / Port Check</h2>` + sections.join("");
+  const subject = `TMF / CTF: ${postedTotal} entered, ${skippedTotal} skipped`;
+  const html = `<h2>Pier Pass TMF / Port Check CTF</h2>` + sections.join("");
   return {subject, html};
 }
 
@@ -629,10 +653,11 @@ function buildMissingLoadEmail(rows) {
     `<td style="padding:4px 10px">${escapeHtml(row.invoiceNumber)}</td>` +
     `</tr>`).join("");
   const html =
-    `<h2>Port fee loads to create</h2>` +
+    `<h2>TMF / CTF loads to create</h2>` +
     `<p>These container numbers are not on a Primus load yet, so the ` +
-    `port fee could not be entered. Please create the load. Jerry checks ` +
-    `each morning and will enter the charge once the load exists.</p>` +
+    `TMF or CTF charge could not be entered. Please create the load. ` +
+    `Jerry checks each morning and will enter the charge once the load ` +
+    `exists.</p>` +
     `<table style="border-collapse:collapse;font-size:13px">` +
     `<tr><th style="text-align:left;padding:4px 10px">Container</th>` +
     `<th style="text-align:left;padding:4px 10px">Charge</th>` +
@@ -641,7 +666,7 @@ function buildMissingLoadEmail(rows) {
     `<th style="text-align:left;padding:4px 10px">Bill #</th></tr>` +
     table +
     `</table>`;
-  const subject = `Create Primus loads for ${rows.length} port fee` +
+  const subject = `Create Primus loads for ${rows.length} TMF / CTF charge` +
     `${rows.length === 1 ? "" : "s"}`;
   return {subject, html};
 }
@@ -699,7 +724,7 @@ async function rememberMissingLoads(summaries) {
         subject: email.subject,
         html: email.html,
         to: MISSING_LOAD_TO,
-        cc: MISSING_LOAD_CC,
+        cc: portFeeEmailCc(MISSING_LOAD_CC),
         forceRecipient: true,
       });
       if (col) {
@@ -898,11 +923,12 @@ async function retryPendingPortFees() {
       `(bill ${escapeHtml(row.invoiceNumber)})</li>`).join("");
     await deps.saveOutboundEmail({
       type: "port_fee_pending_posted",
-      subject: `Entered ${posted.length} port fee` +
+      subject: `Entered ${posted.length} TMF / CTF charge` +
         `${posted.length === 1 ? "" : "s"} after the load was created`,
-      html: `<p>These charges were waiting for a Primus load. ` +
+      html: `<p>These TMF / CTF charges were waiting for a Primus load. ` +
         `The load is there now, and the charge is entered.</p><ul>` +
         `${lines}</ul>`,
+      cc: portFeeEmailCc(),
     });
   }
   return {ok: true, posted, stillMissing, waiting, closed};
@@ -1083,6 +1109,7 @@ async function processPortFeeEmail(opts) {
       type: "port_fee_reconciliation",
       subject: email.subject,
       html: email.html,
+      cc: portFeeEmailCc(),
       gmailMessageId: opts.gmailMessageId || null,
     });
   }
@@ -1129,4 +1156,6 @@ module.exports = {
   retryPendingPortFees,
   MISSING_LOAD_TO,
   MISSING_LOAD_CC,
+  PORT_FEE_CC,
+  portFeeEmailCc,
 };
