@@ -546,6 +546,30 @@ exports.finalizeAdditionalChargeInvoice = onRequest(
               "This finalize link only applies to Option B approvals.");
         }
 
+        if (req.method !== "POST" && String(req.query.poll || "") === "1") {
+          const wf = String(invoice.finalWorkflowStatus || "");
+          const done = wf === "completed" ||
+            wf === "completed_no_customer_email";
+          const failed = wf === "failed" ||
+            wf === "customer_email_failed" ||
+            wf === "needs_invoice_review" ||
+            wf === "stopped_drayage" ||
+            wf === "carrier_invoice_number_missing_in_primus";
+          return res.status(200).json({
+            ok: !failed,
+            status: done ? "completed" : (failed ? "failed" : "running"),
+            loadNumber,
+            message: done ?
+              `Load ${loadNumber} is invoiced. You can close this page.` :
+              null,
+            error: failed ?
+              (invoice.decisionReason ||
+                "The invoice workflow stopped before the customer invoice " +
+                "was sent.") :
+              null,
+          });
+        }
+
         if (charge.customerNotifiedAt && !charge.awaitingCustomerNotify) {
           return res.status(200).send(pages.simpleResultPage(
               "Already completed", "#6b7280",
@@ -607,27 +631,29 @@ exports.finalizeAdditionalChargeInvoice = onRequest(
           // Best-effort follow-up update.
         }
 
+        const pollUrl =
+          `${PUBLIC_BASE.replace(/\/$/, "")}/finalizeAdditionalChargeInvoice` +
+          `?poll=1` +
+          `&invoiceId=${encodeURIComponent(String(invoiceId))}` +
+          `&option=${encodeURIComponent(option || "complete")}` +
+          `&tenantId=${encodeURIComponent(tenant.tenantId || "")}` +
+          `&exp=${encodeURIComponent(String(exp || ""))}` +
+          `&sig=${encodeURIComponent(String(sig || ""))}`;
         res.status(200).send(pages.buildEmailActionProcessingPage({
           title: "Completing invoice",
-          message: "Customer notification confirmed. Jerry is resuming " +
-            "the invoice workflow — you can close this page.",
+          message: "Customer notification confirmed. Jerry is generating " +
+            "and sending the customer invoice. This page updates when " +
+            "that finishes — you can close it.",
           loadNumber,
+          pollUrl,
         }));
 
-        const workflowUrl = workflowUrlForTenant(tenant);
-        if (workflowUrl) {
-          fetch(workflowUrl, {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({
-              invoiceId: String(invoiceId),
-              tenantId: tenant.tenantId,
-            }),
-          }).catch((e) =>
-            console.error(
-                "finalizeAdditionalChargeInvoice: resume failed",
-                e.message));
-        }
+        // The invoice workflow can take a few minutes. Kick the fat worker
+        // and return so this page is not held open until billing finishes.
+        kickFatWorker("executeFinalizeAdditionalChargeInvoice", {
+          invoiceId: String(invoiceId),
+          tenantId: tenant.tenantId,
+        });
         return;
       } catch (error) {
         console.error("finalizeAdditionalChargeInvoice error:", error);

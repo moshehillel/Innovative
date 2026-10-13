@@ -2866,6 +2866,111 @@ exports.executeAdditionalChargeDecision = onRequest(
     handleExecuteAdditionalChargeDecision);
 
 /**
+ * Fat worker for option B's last step. The email-action page returns
+ * immediately; this call runs the Primus invoice workflow after accepting.
+ */
+exports.executeFinalizeAdditionalChargeInvoice = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "1GiB"},
+    async (req, res) => {
+      if (!emailActionWorkerAuthOk(req)) {
+        return res.status(403).json({ok: false, error: "Forbidden"});
+      }
+      const invoiceId = req.body && req.body.invoiceId;
+      const tenantId = (req.body && req.body.tenantId) || null;
+      if (!invoiceId) {
+        return res.status(400).json({ok: false, error: "Missing invoiceId"});
+      }
+      const tenant = await getTenant(tenantId);
+      const workflowUrl = workflowUrlForTenant(tenant);
+      if (!workflowUrl) {
+        return res.status(400).json({ok: false, error: "No workflow URL"});
+      }
+
+      res.status(200).json({ok: true, accepted: true});
+
+      try {
+        const workflowRes = await fetch(workflowUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            invoiceId: String(invoiceId),
+            tenantId: tenant.tenantId,
+          }),
+        });
+        const parsed = await readWorkflowResponse(workflowRes);
+        const alreadyRunning = workflowRes.status === 409;
+        if (!parsed.ok && !alreadyRunning) {
+          await writeLog("error", "workflow",
+              "Option B finalize workflow returned an error", {
+                invoiceId: String(invoiceId),
+                httpStatus: workflowRes.status,
+                error: parsed.text ? String(parsed.text).slice(0, 300) : null,
+              }).catch(() => {});
+        }
+      } catch (err) {
+        console.error("executeFinalizeAdditionalChargeInvoice:", err);
+        await writeLog("error", "workflow",
+            "Option B finalize workflow call failed", {
+              invoiceId: String(invoiceId),
+              error: err.message,
+            }).catch(() => {});
+      }
+    });
+
+/**
+ * Fat worker for option B's last step. The email-action page returns
+ * immediately; this call runs the Primus invoice workflow (up to a few
+ * minutes) after accepting the request.
+ */
+exports.executeFinalizeAdditionalChargeInvoice = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "1GiB"},
+    async (req, res) => {
+      if (!emailActionWorkerAuthOk(req)) {
+        return res.status(403).json({ok: false, error: "Forbidden"});
+      }
+      const invoiceId = req.body && req.body.invoiceId;
+      const tenantId = (req.body && req.body.tenantId) || null;
+      if (!invoiceId) {
+        return res.status(400).json({ok: false, error: "Missing invoiceId"});
+      }
+      const tenant = await getTenant(tenantId);
+      const workflowUrl = workflowUrlForTenant(tenant);
+      if (!workflowUrl) {
+        return res.status(400).json({ok: false, error: "No workflow URL"});
+      }
+
+      res.status(200).json({ok: true, accepted: true});
+
+      try {
+        const workflowRes = await fetch(workflowUrl, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            invoiceId: String(invoiceId),
+            tenantId: tenant.tenantId,
+          }),
+        });
+        const parsed = await readWorkflowResponse(workflowRes);
+        const alreadyRunning = workflowRes.status === 409;
+        if (!parsed.ok && !alreadyRunning) {
+          await writeLog("error", "workflow",
+              "Option B finalize workflow returned an error", {
+                invoiceId: String(invoiceId),
+                httpStatus: workflowRes.status,
+                error: parsed.text ? String(parsed.text).slice(0, 300) : null,
+              }).catch(() => {});
+        }
+      } catch (err) {
+        console.error("executeFinalizeAdditionalChargeInvoice:", err);
+        await writeLog("error", "workflow",
+            "Option B finalize workflow call failed", {
+              invoiceId: String(invoiceId),
+              error: err.message,
+            }).catch(() => {});
+      }
+    });
+
+/**
  * @param {object} req HTTPS request.
  * @param {object} res HTTPS response.
  * @return {Promise<object>}
