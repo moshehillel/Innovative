@@ -6031,6 +6031,103 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
 }
 
 /**
+ * Classifies one invoice PDF and stamps its filename when the model omits it.
+ * @param {object} pdf Attachment with buffer and filename.
+ * @param {number|null} lastKnownLoadNumber Last known valid load number.
+ * @return {Promise<Array<object>>}
+ */
+async function classifyOneInvoicePdf(pdf, lastKnownLoadNumber) {
+  const result = await classifyInvoiceData([pdf], lastKnownLoadNumber);
+  const items = normalizeClassificationToInvoices(result);
+  for (const item of items) {
+    if (!String(item.attachmentFilename || "").trim()) {
+      item.attachmentFilename = pdf.filename;
+    }
+  }
+  return items;
+}
+
+/**
+ * Classifies carrier invoice PDFs. Three or more separate invoice files are
+ * classified one at a time so a truncated batch reply cannot drop the rest.
+ * Any invoice PDF still not named by a result is retried once.
+ * @param {Array<object>} pdfAttachments Saved PDF attachments.
+ * @param {number|null} lastKnownLoadNumber Last known valid load number.
+ * @param {string} [messageId] Parent message id for logs.
+ * @return {Promise<object>} Classifier JSON with invoices[].
+ */
+async function classifyCarrierInvoiceAttachments(
+    pdfAttachments, lastKnownLoadNumber, messageId) {
+  const invoicePdfs = podUtils.listInvoicePdfAttachments(pdfAttachments)
+      .filter((a) => a && a.buffer);
+  const separate = podUtils.shouldClassifyEachInvoicePdf(invoicePdfs);
+  let merged = [];
+
+  if (!separate) {
+    const combined = await classifyInvoiceData(
+        pdfAttachments, lastKnownLoadNumber);
+    merged = normalizeClassificationToInvoices(combined);
+  } else {
+    await writeLog("info", "ai",
+        "Classifying each invoice PDF separately", {
+          messageId: messageId || null,
+          invoicePdfCount: invoicePdfs.length,
+        });
+    for (const pdf of invoicePdfs) {
+      try {
+        const items = await classifyOneInvoicePdf(pdf, lastKnownLoadNumber);
+        merged.push(...items);
+      } catch (err) {
+        await writeLog("warn", "ai",
+            "Per-invoice PDF classification failed", {
+              messageId: messageId || null,
+              filename: pdf.filename,
+              error: err.message,
+            });
+      }
+    }
+  }
+
+  let uncovered = podUtils.listUncoveredInvoiceAttachments(
+      merged, invoicePdfs);
+  if (uncovered.length > 0) {
+    await writeLog("warn", "ai",
+        "Retrying invoice PDFs missing from classification", {
+          messageId: messageId || null,
+          filenames: uncovered.map((a) => a.filename),
+          extractedCount: merged.length,
+        });
+    for (const pdf of uncovered) {
+      try {
+        const items = await classifyOneInvoicePdf(pdf, lastKnownLoadNumber);
+        merged.push(...items);
+      } catch (err) {
+        await writeLog("warn", "ai",
+            "Uncovered invoice PDF retry failed", {
+              messageId: messageId || null,
+              filename: pdf.filename,
+              error: err.message,
+            });
+      }
+    }
+    uncovered = podUtils.listUncoveredInvoiceAttachments(merged, invoicePdfs);
+    if (uncovered.length > 0) {
+      await writeLog("error", "ai",
+          "Invoice PDFs still unclassified after retry", {
+            messageId: messageId || null,
+            filenames: uncovered.map((a) => a.filename),
+          });
+    }
+  }
+
+  if (merged.length === 0) {
+    throw new Error(
+        `No invoices classified from ${invoicePdfs.length} invoice PDF(s)`);
+  }
+  return {invoices: merged};
+}
+
+/**
  * Re-classifies page chunks of a multi-load statement PDF to recover
  * loads the first full-PDF pass missed.
  * @param {Array<object>} pdfAttachments Saved PDF attachments.
@@ -10783,9 +10880,10 @@ async function processGmailMessage(
           input: {attachmentCount: pdfAttachments.length},
         });
 
-        aiResult = await classifyInvoiceData(
+        aiResult = await classifyCarrierInvoiceAttachments(
             pdfAttachments,
             lastKnownLoadNumber,
+            messageId,
         );
 
         await logWorkflowStep({
