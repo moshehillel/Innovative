@@ -93,6 +93,14 @@ check("LLC suffix still matches Golden King",
         [{id: "2", name: "Golden King Transport LLC", type: "Truckload"}],
         "Golden King Transport") || {}).id,
     "2");
+check("PierPASS slash bill-to matches Pier Pass, not Innovative Carriers",
+    (bridge.findMasterVendorByName([
+      {id: "9", name: "Innovative Carriers", type: "DRAYAGE"},
+      {id: "113303", name: "Pier Pass", type: "Vendor"},
+    ], "PierPASS/INNOVATIVE CARRIERS") || {}).id,
+    "113303");
+check("PierPASS header is a port fee carrier",
+    dray.isPortFeeCarrierName("PierPASS/INNOVATIVE CARRIERS"), true);
 
 // Container alone never returns a routing container anymore.
 check("Mark Evans inbound container alone does not route",
@@ -122,6 +130,24 @@ async function runAsyncChecks() {
     lookupVendor: async () => ({id: "1", name: "Loup", type: "Intermodal"}),
   });
   check("Loup ORIGINAL BILL not drayage", loupSignal.isDrayage, false);
+
+  const pierPassSignal = await dray.resolveInboundDrayageSignal({
+    from: "Pierpass.OffPeak-Invoice@pierpass.net",
+    invoiceItems: [{
+      carrierName: "PierPASS/INNOVATIVE CARRIERS",
+      invoiceAmount: 893.86,
+    }],
+    subject: "Account 84389: Your PierPass Invoice 84389-10213171-IN",
+    body: "",
+    lookupVendor: async () => ({
+      id: "9",
+      name: "Innovative Carriers",
+      type: "DRAYAGE",
+      types: ["LTL", "FTL", "DRAYAGE", "Vendor"],
+    }),
+  });
+  check("Pier Pass invoice is not forwarded as drayage",
+      pierPassSignal.isDrayage, false);
   check("Loup still extracts container metadata",
       loupSignal.containerNumber, "MSCU1234567");
 

@@ -4300,6 +4300,9 @@ function vendorNamesMeaningfullyOverlap(a, b) {
   const right = String(b || "").trim().toLowerCase();
   if (!left || !right) return false;
   if (left === right) return true;
+  const compactLeft = left.replace(/\s+/g, "");
+  const compactRight = right.replace(/\s+/g, "");
+  if (compactLeft.length >= 8 && compactLeft === compactRight) return true;
   const shorter = left.length <= right.length ? left : right;
   const longer = left.length <= right.length ? right : left;
   if (shorter.length < 8) return false;
@@ -4318,7 +4321,13 @@ function findMasterVendorByName(vendors, hint) {
   if (!query || !vendors.length) return null;
   const queryLower = query.toLowerCase();
   const queryKey = normalizeVendorNameKey(query);
-  const firstToken = query.split(/[,\n/]/)[0].trim().toLowerCase();
+  const firstSegment = query.split(/[,\n/]/)[0].trim();
+  const firstToken = firstSegment.toLowerCase();
+  const firstKey = normalizeVendorNameKey(firstSegment);
+  // "PierPASS/INNOVATIVE CARRIERS" is the carrier, then the bill-to name.
+  // Overlap on the full string lets the bill-to half match Innovative
+  // Carriers and sends a port-fee invoice down the drayage path.
+  const overlapKey = /[,\n/]/.test(query) ? firstKey : queryKey;
   return vendors.find((v) => (v.name || "").toLowerCase() === queryLower) ||
     vendors.find((v) => {
       const key = normalizeVendorNameKey(v.name);
@@ -4329,7 +4338,8 @@ function findMasterVendorByName(vendors, hint) {
       const n = (v.name || "").toLowerCase();
       const nKey = normalizeVendorNameKey(v.name);
       return vendorNamesMeaningfullyOverlap(firstToken, n) ||
-        vendorNamesMeaningfullyOverlap(queryKey, nKey);
+        vendorNamesMeaningfullyOverlap(firstKey, nKey) ||
+        vendorNamesMeaningfullyOverlap(overlapKey, nKey);
     }) ||
     null;
 }

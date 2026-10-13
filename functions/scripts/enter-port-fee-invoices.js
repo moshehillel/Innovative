@@ -43,6 +43,7 @@ if (!admin.apps.length) {
   admin.initializeApp({projectId: "tai-invoice-automation"});
 }
 const db = admin.firestore();
+db.settings({preferRest: true});
 
 const bridge = require("../primus-ui-bridge");
 const portFees = require("../port-fee-invoices");

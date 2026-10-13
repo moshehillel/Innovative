@@ -113,6 +113,23 @@ function detectPortFeeKind(text) {
 }
 
 /**
+ * Pier Pass and Port Check invoices must stay on the port-fee path.
+ * A suspension notice from the same domain is not an invoice.
+ * @param {string} from Sender.
+ * @param {string} subject Subject.
+ * @return {boolean}
+ */
+function isPortFeeMessage(from, subject) {
+  const fromL = String(from || "").toLowerCase();
+  const subjectL = String(subject || "").toLowerCase();
+  const portSender = /pierpass\.net|portcheck\.org/.test(fromL);
+  const invoiceSubject = /\binvoice\b/.test(subjectL);
+  const namedInvoice = invoiceSubject &&
+    /pier\s*pass|pierpass|port\s*check|portcheck/.test(subjectL);
+  return namedInvoice || (portSender && invoiceSubject);
+}
+
+/**
  * @param {string} mdy MM/DD/YYYY.
  * @return {string|null} YYYY-MM-DD.
  */
@@ -283,6 +300,18 @@ function pickContainerMatch(rows, container) {
       row,
       echoed: rowHasContainer(row, container),
     });
+  }
+  const byCarrierRef = valid.filter((r) => {
+    const ref = String(r.row && r.row.carrierRef || "").trim().toUpperCase();
+    return ref && ref === String(container || "").trim().toUpperCase();
+  });
+  if (byCarrierRef.length === 1) {
+    return {
+      ok: true,
+      loadNumber: byCarrierRef[0].loadNumber,
+      row: byCarrierRef[0].row,
+      source: "carrier_ref",
+    };
   }
   const echoed = valid.filter((r) => r.echoed);
   const pool = echoed.length ? echoed : (valid.length === 1 ? valid : []);
@@ -1084,6 +1113,7 @@ module.exports = {
   SKIP_REASON,
   CHARGE_PROFILES,
   detectPortFeeKind,
+  isPortFeeMessage,
   parsePortFeeInvoiceText,
   parseContainerLines,
   pickContainerMatch,

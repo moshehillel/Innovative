@@ -9542,18 +9542,58 @@ async function processGmailMessage(
         }
       }
 
-      if (!isTai && !isChildSplitJob && attachments.length > 0) {
+      if (!isTai && !isChildSplitJob &&
+          (attachments.length > 0 ||
+            portFeeInvoices.isPortFeeMessage(from, subject))) {
+        const portFeeMail = portFeeInvoices.isPortFeeMessage(from, subject);
+        let portSniff = {matches: [], rejected: []};
         try {
-          const portSniff = await portFeeInvoices.sniffPdfAttachments({
-            attachments,
-            downloadAttachment: async (att) => {
-              const buf = await resolveAttachmentBuffer(
-                  gmail, messageId, att);
-              if (buf && !Buffer.isBuffer(att.buffer)) att.buffer = buf;
-              return buf;
-            },
+          if (attachments.length > 0) {
+            portSniff = await portFeeInvoices.sniffPdfAttachments({
+              attachments,
+              downloadAttachment: async (att) => {
+                const buf = await resolveAttachmentBuffer(
+                    gmail, messageId, att);
+                if (buf && !Buffer.isBuffer(att.buffer)) att.buffer = buf;
+                return buf;
+              },
+            });
+          }
+        } catch (portFeeErr) {
+          await writeLog("error", "port-fee",
+              portFeeMail ?
+                "Port fee sniff failed" :
+                "Port fee sniff failed — continuing normal intake", {
+                messageId,
+                error: portFeeErr.message,
+              });
+          if (portFeeMail) {
+            portSniff = {
+              matches: [],
+              rejected: [{
+                filename: "port-fee",
+                error: portFeeErr.message ||
+                  "Port fee invoice could not be read",
+              }],
+            };
+          }
+        }
+        if (portFeeMail &&
+            !portSniff.matches.length &&
+            !portSniff.rejected.length) {
+          await writeLog("error", "port-fee",
+              "Pier Pass / Port Check invoice was not read as a port fee", {
+                messageId,
+                subject,
+                from,
+              });
+          portSniff.rejected.push({
+            filename: String(subject || "port-fee").slice(0, 180),
+            error: "Pier Pass / Port Check invoice was not read from the PDF",
           });
-          if (portSniff.matches.length || portSniff.rejected.length) {
+        }
+        if (portSniff.matches.length || portSniff.rejected.length) {
+          try {
             await handleDetectedPortFeeEmail({
               messageId,
               subject,
@@ -9563,14 +9603,14 @@ async function processGmailMessage(
               portSniff,
               forwardWithAnalysis,
             });
-            return;
+          } catch (portFeeErr) {
+            await writeLog("error", "port-fee",
+                "Port fee intake failed — not forwarded as drayage", {
+                  messageId,
+                  error: portFeeErr.message,
+                });
           }
-        } catch (portFeeErr) {
-          await writeLog("error", "port-fee",
-              "Port fee sniff failed — continuing normal intake", {
-                messageId,
-                error: portFeeErr.message,
-              });
+          return;
         }
       }
 

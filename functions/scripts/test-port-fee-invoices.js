@@ -49,6 +49,22 @@ check("rejects a total that does not match the lines", badTotal.ok === false);
 const ctOnly = portFees.detectPortFeeKind("Clean Truck Fee on a rate con");
 check("clean truck wording alone is not an invoice", ctOnly === null);
 
+check("Pier Pass invoice subject stays on the port-fee path",
+    portFees.isPortFeeMessage(
+        "Pierpass.OffPeak-Invoice@pierpass.net",
+        "Account 84389: Your PierPass Invoice 84389-10213171-IN",
+    ) === true);
+check("Port Check invoice subject stays on the port-fee path",
+    portFees.isPortFeeMessage(
+        "invoices@portcheck.org",
+        "Your Portcheck Invoice 101054-10213586-IN",
+    ) === true);
+check("Pier Pass suspension is not an invoice",
+    portFees.isPortFeeMessage(
+        "Pierpass.OffPeak-TMF@pierpass.net",
+        "PierPASS Account 84389 has been suspended",
+    ) === false);
+
 const one = portFees.pickContainerMatch([
   {BOL: "267634", carrierRef: "FFAU8880029"},
   {BOL: "267700", carrierRef: "OTHER"},
@@ -68,6 +84,22 @@ const many = portFees.pickContainerMatch([
 ], "FFAU8880029");
 check("several hits without the container are not guessed",
     many.ok === false && many.ambiguous === true);
+
+const byRef = portFees.pickContainerMatch([
+  {
+    BOL: "268737",
+    carrierRef: "CSGU8040546",
+    thirdPartyReferenceNumber: "UETU9056194",
+  },
+  {
+    BOL: "268529",
+    carrierRef: "UETU9056194",
+    thirdPartyReferenceNumber: "UETU9056194",
+  },
+], "UETU9056194");
+check("carrier ref wins when another load only mentions the container",
+    byRef.ok === true && byRef.loadNumber === "268529" &&
+    byRef.source === "carrier_ref");
 
 const draftFlags = bridge.portFeeSaveInvoiceFlags({id: 1, invoiceNumber: "0"});
 check("draft does not close customer cost", draftFlags.costClosed === "0");

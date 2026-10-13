@@ -209,6 +209,19 @@ function isKnownDrayageCarrierName(name) {
 }
 
 /**
+ * Pier Pass and Port Check are port fees. The invoice header is often
+ * "PierPASS/INNOVATIVE CARRIERS" — the bill-to half must not make this
+ * a drayage bill.
+ * @param {string|null|undefined} name Invoice carrier name.
+ * @return {boolean}
+ */
+function isPortFeeCarrierName(name) {
+  const key = normalizeCarrierNameKey(name);
+  if (!key) return false;
+  return /^(pierpass|pier pass|portcheck|port check)\b/.test(key);
+}
+
+/**
  * Looks up the Primus master vendor by invoice carrier name only.
  * Never uses the email From header — forwards often come from customers
  * (e.g. *@gmail.com) and would match the wrong vendor.
@@ -625,10 +638,10 @@ async function resolveInboundDrayageSignal(args) {
   const containerNumber = resolveContainerNumber(
       invoiceItems, probedContainer, subject, body);
 
-  if (!carrierName) {
+  if (!carrierName || isPortFeeCarrierName(carrierName)) {
     return {
       isDrayage: false,
-      carrierName: null,
+      carrierName: carrierName || null,
       vendorType: null,
       containerNumber,
     };
@@ -693,6 +706,7 @@ module.exports = {
   isDrayageVendorType,
   vendorTypeLabels,
   isKnownDrayageCarrierName,
+  isPortFeeCarrierName,
   carrierNameFromInvoiceItems,
   resolveContainerNumber,
   parseLeoReturnInstructions,
