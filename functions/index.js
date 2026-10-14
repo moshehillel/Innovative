@@ -13133,6 +13133,7 @@ exports.getDashboardTasks = onRequest(
         dispatcher: req.query.dispatcher || "",
         limit,
         offset,
+        sort: req.query.sort || "",
         urgentFirst: req.query.urgentFirst !== "0",
       });
       return res.json({
@@ -13178,6 +13179,7 @@ exports.getDashboardTasks = onRequest(
           ownerBucket: req.query.ownerBucket || null,
           dispatcherKey: req.query.dispatcherKey || null,
           chargePhase: req.query.chargePhase || null,
+          sort: req.query.sort || "",
           urgentFirst: req.query.urgentFirst !== "0",
           backfillMail: (items) =>
             backfillDashboardMail(items, tenant, "task"),
@@ -13304,6 +13306,8 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
           taskId,
           source,
           tenantId: tenant.tenantId,
+          collectionPrefix: tenant.collectionPrefix,
+          invoiceId: body.invoiceId || req.query.invoiceId || null,
         });
     if (!result.ok) {
       return res.status(400).json(result);

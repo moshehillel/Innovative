@@ -105,4 +105,227 @@ assert.ok(!other.some((e) => /innovativecarriers.com/i.test(e)));
 assert.ok(other.includes("ops@aa.example"));
 assert.ok(other.includes("disp@aa.example"));
 
-console.log("ok");
+const queue = require("../dashboard-queue");
+const september = {
+  id: "sep",
+  receivedAt: "2026-09-01T12:00:00.000Z",
+  ownerBucket: "dispatch",
+  chargesTotal: 175,
+};
+const october = {
+  id: "oct",
+  receivedAt: "2026-10-12T12:00:00.000Z",
+  ownerBucket: "dispatch",
+  chargesTotal: 40,
+};
+const newestPage = ownership.filterSortPaginate([september, october], {
+  sort: "newest",
+  limit: 1,
+  offset: 0,
+  maxLimit: 50,
+});
+assert.strictEqual(newestPage.items[0].id, "oct");
+assert.strictEqual(newestPage.hasMore, true);
+const newestNext = ownership.filterSortPaginate([september, october], {
+  sort: "newest",
+  limit: 1,
+  offset: 1,
+  maxLimit: 50,
+});
+assert.strictEqual(newestNext.items[0].id, "sep");
+const urgentPage = ownership.filterSortPaginate([october, september], {
+  sort: "urgent",
+  limit: 1,
+  offset: 0,
+  maxLimit: 50,
+});
+assert.strictEqual(urgentPage.items[0].id, "sep");
+
+const rateInvoice = {
+  tenantId: "default",
+  decisionStage: "needs_customer_rate_review",
+  decisionReason: "MISSING_RATE",
+  loadNumber: "268900",
+};
+assert.strictEqual(queue.holdIssueForInvoice(rateInvoice), "missing_rate");
+assert.strictEqual(queue.invoiceHoldRow({
+  id: "inv-rate",
+  data: () => rateInvoice,
+}, "default").id, "invoice:inv-rate");
+assert.strictEqual(queue.invoiceHoldRow({
+  id: "inv-rate",
+  data: () => ({
+    ...rateInvoice,
+    dashboardDismissedIssues: ["missing_rate"],
+  }),
+}, "default"), null);
+assert.strictEqual(queue.invoiceHoldRow({
+  id: "inv-legacy",
+  data: () => ({
+    decisionStage: "needs_customer_rate_review",
+    loadNumber: "1",
+  }),
+}, "aa"), null);
+assert.ok(queue.invoiceHoldRow({
+  id: "inv-legacy",
+  data: () => ({
+    decisionStage: "needs_customer_rate_review",
+    loadNumber: "1",
+  }),
+}, "default"));
+
+/**
+ * @param {object} initial Documents keyed by collection/id.
+ * @return {object}
+ */
+function mockDb(initial) {
+  const store = {};
+  Object.keys(initial).forEach((path) => {
+    store[path] = {...initial[path]};
+  });
+  function refFor(path) {
+    return {
+      async get() {
+        if (!Object.prototype.hasOwnProperty.call(store, path)) {
+          return {exists: false, data() { return undefined; }};
+        }
+        return {
+          exists: true,
+          id: path.split("/").pop(),
+          data() { return store[path]; },
+        };
+      },
+      async update(patch) {
+        store[path] = {...store[path], ...patch};
+      },
+    };
+  }
+  return {
+    store,
+    collection(name) {
+      return {
+        doc(id) {
+          return refFor(`${name}/${id}`);
+        },
+        where(field, _op, value) {
+          return {
+            limit() {
+              return this;
+            },
+            async get() {
+              const docs = Object.keys(store)
+                  .filter((path) => path.startsWith(`${name}/`) &&
+                    store[path][field] === value)
+                  .map((path) => ({
+                    id: path.split("/").pop(),
+                    data() {
+                      return store[path];
+                    },
+                    ref: refFor(path),
+                  }));
+              return {docs};
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+async function testDismiss() {
+  const tasks = require("../dashboard-tasks");
+  const db = mockDb({
+    "invoices/inv-rate": {...rateInvoice},
+    "dashboardTasks/rate-task": {
+      tenantId: "default",
+      status: "open",
+      type: "missing_rate",
+      reason: "MISSING_RATE",
+      invoiceId: "inv-rate",
+      loadNumber: "268900",
+    },
+    "dashboardTasks/charge-task": {
+      tenantId: "default",
+      status: "open",
+      type: "additional_charge",
+      reason: "accessorial",
+      invoiceId: "inv-rate",
+      loadNumber: "268900",
+    },
+    "dashboardTasks/other-load": {
+      tenantId: "default",
+      status: "open",
+      type: "missing_rate",
+      reason: "MISSING_RATE",
+      invoiceId: "inv-other",
+      loadNumber: "999",
+    },
+  });
+  const synthetic = await tasks.dismissDashboardTask(db, {}, {
+    taskId: "invoice:inv-rate",
+    source: "invoice",
+    tenantId: "default",
+    invoiceId: "inv-rate",
+  });
+  assert.strictEqual(synthetic.ok, true);
+  assert.deepStrictEqual(
+      db.store["invoices/inv-rate"].dashboardDismissedIssues,
+      ["missing_rate"]);
+  assert.strictEqual(
+      db.store["invoices/inv-rate"].decisionStage,
+      "needs_customer_rate_review");
+  assert.strictEqual(db.store["dashboardTasks/rate-task"].status, "dismissed");
+  assert.strictEqual(db.store["dashboardTasks/charge-task"].status, "open");
+  assert.strictEqual(db.store["dashboardTasks/other-load"].status, "open");
+
+  const missing = await tasks.dismissDashboardTask(mockDb({}), {}, {
+    taskId: "does-not-exist",
+    source: "dashboardTasks",
+    tenantId: "default",
+  });
+  assert.strictEqual(missing.ok, false);
+  assert.strictEqual(missing.error, "Task not found.");
+
+  const foreign = mockDb({"invoices/inv-rate": {...rateInvoice}});
+  const denied = await tasks.dismissDashboardTask(foreign, {}, {
+    taskId: "invoice:inv-rate",
+    source: "invoice",
+    tenantId: "aa",
+  });
+  assert.strictEqual(denied.ok, false);
+  assert.strictEqual(denied.error, "Task not found.");
+  assert.strictEqual(
+      foreign.store["invoices/inv-rate"].dashboardDismissedIssues,
+      undefined);
+
+  const real = mockDb({
+    "invoices/inv-rate": {...rateInvoice},
+    "dashboardTasks/rate-task": {
+      tenantId: "default",
+      status: "open",
+      type: "missing_rate",
+      reason: "MISSING_RATE",
+      invoiceId: "inv-rate",
+      loadNumber: "268900",
+    },
+  });
+  const dismissedTask = await tasks.dismissDashboardTask(real, {}, {
+    taskId: "rate-task",
+    source: "dashboardTasks",
+    tenantId: "default",
+  });
+  assert.strictEqual(dismissedTask.ok, true);
+  assert.ok(real.store["invoices/inv-rate"].dashboardDismissedIssues
+      .includes("missing_rate"));
+  assert.strictEqual(
+      real.store["invoices/inv-rate"].decisionStage,
+      "needs_customer_rate_review");
+  assert.strictEqual(real.store["dashboardTasks/rate-task"].status, "dismissed");
+}
+
+testDismiss().then(() => {
+  console.log("ok");
+}).catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

@@ -12,6 +12,7 @@ const mailFiles = require("./dashboard-email-files");
 const dedupe = require("./dashboard-dedupe");
 
 const scope = require("./dashboard-scope");
+const queue = require("./dashboard-queue");
 
 const TASK_COLLECTION = "dashboardTasks";
 const FOLLOW_UP_COLLECTION = "additionalCharges";
@@ -490,6 +491,10 @@ async function hydratePageBodies(db, additionalChargesMod, items, tenantId) {
   const taskIds = [];
   const followIds = [];
   for (const item of list) {
+    if (item.source === "invoice" ||
+        String(item.id || "").startsWith("invoice:")) {
+      continue;
+    }
     if (item.source !== "additionalCharges" && item.id) taskIds.push(item.id);
     const followId = item.followUpId ||
       (item.source === "additionalCharges" ? item.id : null);
@@ -746,6 +751,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     offset: opts.offset,
     limit: opts.limit || 50,
     maxLimit: opts.maxLimit,
+    sort: opts.sort,
     urgentFirst: opts.urgentFirst,
   });
 
@@ -774,11 +780,144 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
  * @param {object} opts taskId, source, tenantId.
  * @return {Promise<object>} {ok: boolean, error?: string}
  */
+/**
+ * Invoice id for a synthesized hold row (`invoice:{id}`).
+ * Real dashboard tasks and additional-charge rows return "".
+ * @param {string} taskId Row id.
+ * @param {string} source Row source.
+ * @param {string} invoiceId Explicit invoice id.
+ * @return {string}
+ */
+function syntheticInvoiceId(taskId, source, invoiceId) {
+  const id = String(taskId || "").trim();
+  const src = String(source || "");
+  const explicit = String(invoiceId || "").trim();
+  if (src === "invoice" || id.startsWith("invoice:")) {
+    const parsed = id.startsWith("invoice:") ?
+      id.slice("invoice:".length).trim() : "";
+    return parsed || explicit;
+  }
+  return "";
+}
+
+/**
+ * @param {object} data Invoice fields.
+ * @param {string} tenantId Caller tenant.
+ * @return {boolean}
+ */
+function invoiceVisibleToTenant(data, tenantId) {
+  return scope.rowBelongsToTenant(data, tenantId) ||
+    ownership.sameTenant(data && data.tenantId, tenantId);
+}
+
+/**
+ * Remembers that this hold was cleared on the work list.
+ * Does not change decisionStage or complete the invoice.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, collectionPrefix, issue.
+ * @return {Promise<object>}
+ */
+async function stampInvoiceHoldDismissed(db, opts) {
+  const invoiceId = String(opts.invoiceId || "").trim();
+  const issue = String(opts.issue || "").trim().toLowerCase();
+  if (!invoiceId || !issue) return {ok: false};
+  const ref = db.collection(scope.collectionName({
+    collectionPrefix: opts.collectionPrefix,
+  }, "invoices")).doc(invoiceId);
+  const snap = await ref.get();
+  if (!snap.exists) return {ok: false};
+  const data = snap.data() || {};
+  if (!invoiceVisibleToTenant(data, opts.tenantId)) return {ok: false};
+  const dismissed = scope.dismissedIssueList(data);
+  if (!dismissed.includes(issue)) dismissed.push(issue);
+  await ref.update({
+    dashboardDismissedIssues: dismissed,
+    dashboardDismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return {ok: true, invoiceId, issue, loadNumber: data.loadNumber || null};
+}
+
+/**
+ * Dismisses open tasks that would re-list this invoice hold.
+ * Other issues on the same invoice stay open.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, issue.
+ * @return {Promise<number>}
+ */
+async function dismissOpenTasksForHold(db, opts) {
+  const invoiceId = String(opts.invoiceId || "").trim();
+  const issue = String(opts.issue || "").trim().toLowerCase();
+  if (!invoiceId || !issue) return 0;
+  const snap = await db.collection(TASK_COLLECTION)
+      .where("invoiceId", "==", invoiceId)
+      .limit(40)
+      .get();
+  let count = 0;
+  for (const doc of snap.docs) {
+    const row = doc.data() || {};
+    if ((row.status || "") !== TASK_STATUS.OPEN) continue;
+    if (!ownership.sameTenant(row.tenantId, opts.tenantId)) continue;
+    if (String(row.invoiceId || "") !== invoiceId) continue;
+    if (scope.classifyIssue(row) !== issue) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await doc.ref.update({
+      status: TASK_STATUS.DISMISSED,
+      dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Clears a synthesized invoice-hold row and the task that would replace it.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, collectionPrefix.
+ * @return {Promise<object>}
+ */
+async function dismissInvoiceHold(db, opts) {
+  const invoiceId = String(opts.invoiceId || "").trim();
+  if (!invoiceId) return {ok: false, error: "Task not found."};
+  const ref = db.collection(scope.collectionName({
+    collectionPrefix: opts.collectionPrefix,
+  }, "invoices")).doc(invoiceId);
+  const snap = await ref.get();
+  if (!snap.exists) return {ok: false, error: "Task not found."};
+  const data = snap.data() || {};
+  if (!invoiceVisibleToTenant(data, opts.tenantId)) {
+    return {ok: false, error: "Task not found."};
+  }
+  const issue = queue.holdIssueForInvoice(data);
+  if (!issue) return {ok: false, error: "Task not found."};
+  const stamped = await stampInvoiceHoldDismissed(db, {
+    invoiceId,
+    tenantId: opts.tenantId,
+    collectionPrefix: opts.collectionPrefix,
+    issue,
+  });
+  if (!stamped.ok) return {ok: false, error: "Task not found."};
+  await dismissOpenTasksForHold(db, {
+    invoiceId,
+    tenantId: opts.tenantId,
+    issue,
+  });
+  return {ok: true};
+}
+
 async function dismissDashboardTask(db, additionalChargesMod, opts) {
   const taskId = String(opts.taskId || "").trim();
   const source = String(opts.source || "dashboardTasks");
   if (!taskId) {
     return {ok: false, error: "taskId is required."};
+  }
+
+  const syntheticId = syntheticInvoiceId(taskId, source, opts.invoiceId);
+  if (syntheticId) {
+    return dismissInvoiceHold(db, {
+      invoiceId: syntheticId,
+      tenantId: opts.tenantId,
+      collectionPrefix: opts.collectionPrefix,
+    });
   }
 
   if (source === "additionalCharges") {
@@ -813,6 +952,31 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     status: TASK_STATUS.DISMISSED,
     dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+  const taskIssue = scope.classifyIssue(data);
+  if (data.invoiceId && taskIssue) {
+    const invoiceRef = db.collection(scope.collectionName({
+      collectionPrefix: opts.collectionPrefix,
+    }, "invoices")).doc(String(data.invoiceId));
+    const invoiceSnap = await invoiceRef.get();
+    if (invoiceSnap.exists) {
+      const invoice = invoiceSnap.data() || {};
+      const holdIssue = invoiceVisibleToTenant(invoice, opts.tenantId) ?
+        queue.holdIssueForInvoice(invoice) : null;
+      if (holdIssue && holdIssue === taskIssue) {
+        await stampInvoiceHoldDismissed(db, {
+          invoiceId: String(data.invoiceId),
+          tenantId: opts.tenantId,
+          collectionPrefix: opts.collectionPrefix,
+          issue: holdIssue,
+        });
+        await dismissOpenTasksForHold(db, {
+          invoiceId: String(data.invoiceId),
+          tenantId: opts.tenantId,
+          issue: holdIssue,
+        });
+      }
+    }
+  }
   return {ok: true};
 }
 
@@ -1008,6 +1172,7 @@ async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
   for (const doc of snap.docs) {
     const inv = doc.data() || {};
     if (!ownership.isMissingCarrierRateHold(inv)) continue;
+    if (scope.isIssueDismissed(inv, scope.ISSUE.MISSING_RATE)) continue;
     try {
     // eslint-disable-next-line no-await-in-loop
     const existing = await findOpenDuplicateTask(db, {

@@ -159,6 +159,30 @@ function issueLabel(issue) {
 }
 
 /**
+ * Issues a dispatcher already cleared from the work list.
+ * The invoice workflow itself is left unchanged.
+ * @param {object} row Invoice or task fields.
+ * @return {string[]}
+ */
+function dismissedIssueList(row) {
+  const raw = row && row.dashboardDismissedIssues;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((value) => String(value || "").trim().toLowerCase())
+      .filter(Boolean);
+}
+
+/**
+ * @param {object} row Invoice or task fields.
+ * @param {string} issue Issue id.
+ * @return {boolean}
+ */
+function isIssueDismissed(row, issue) {
+  const want = String(issue || "").trim().toLowerCase();
+  if (!want) return false;
+  return dismissedIssueList(row).includes(want);
+}
+
+/**
  * @param {object} item Row.
  * @param {string} query Name, email, or dispatcher key. Blank matches all.
  * @return {boolean}
@@ -328,6 +352,8 @@ module.exports = {
   isRateHold,
   classifyIssue,
   issueLabel,
+  dismissedIssueList,
+  isIssueDismissed,
   dispatcherMatches,
   queueDedupeKey,
   mergeQueueItems,

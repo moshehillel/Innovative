@@ -317,6 +317,17 @@ function buildOwnerSummaries(items) {
  * @param {object} opts ownerBucket, dispatcherKey, offset, limit, urgentFirst.
  * @return {object}
  */
+function queueSortTime(item) {
+  return Date.parse((item && (item.receivedAt || item.createdAt)) || "") || 0;
+}
+
+function queueSortAmount(item) {
+  const raw = item && (item.chargesTotal != null ?
+    item.chargesTotal : item.invoiceAmount);
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : 0;
+}
+
 function filterSortPaginate(items, opts) {
   const ownerBucket = opts.ownerBucket ?
     String(opts.ownerBucket).toLowerCase() : null;
@@ -325,7 +336,12 @@ function filterSortPaginate(items, opts) {
   const offset = Math.max(0, Number(opts.offset) || 0);
   const cap = Math.min(Math.max(Number(opts.maxLimit) || 100, 1), 5000);
   const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), cap);
-  const urgentFirst = opts.urgentFirst !== false;
+  const sort = String(opts.sort || "").toLowerCase();
+  // Newest / oldest / amount must page in that order. Urgent-first would
+  // fill the first page with old rows and hide newer work.
+  const urgentFirst = sort === "newest" || sort === "oldest" ||
+      sort === "amount" ? false :
+    (sort === "urgent" || opts.urgentFirst !== false);
 
   let list = items.map(applyOwnerDefaults);
   const summaries = buildOwnerSummaries(list);
@@ -338,14 +354,15 @@ function filterSortPaginate(items, opts) {
   }
 
   list.sort((a, b) => {
+    if (sort === "amount") return queueSortAmount(b) - queueSortAmount(a);
     if (urgentFirst) {
-      if (a.isUrgentOld !== b.isUrgentOld) {
+      if (Boolean(a.isUrgentOld) !== Boolean(b.isUrgentOld)) {
         return a.isUrgentOld ? -1 : 1;
       }
     }
-    const ta = Date.parse(a.receivedAt || a.createdAt || "") || 0;
-    const tb = Date.parse(b.receivedAt || b.createdAt || "") || 0;
-    return tb - ta;
+    const ta = queueSortTime(a);
+    const tb = queueSortTime(b);
+    return sort === "oldest" ? ta - tb : tb - ta;
   });
 
   const totalFiltered = list.length;

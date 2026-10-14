@@ -15,6 +15,28 @@ const HOLD_STAGES = [
 ];
 
 /**
+ * Issue a live invoice hold would show, before dashboard dismissal.
+ * @param {object} data Invoice fields.
+ * @return {string|null}
+ */
+function holdIssueForInvoice(data) {
+  const wf = String((data && data.finalWorkflowStatus) || "");
+  const stage = String((data && data.decisionStage) || "");
+  if (wf === "completed" || stage === "completed") return null;
+  const issueType = scope.classifyIssue({
+    decisionStage: stage,
+    finalWorkflowStatus: wf,
+    decisionReason: data && data.decisionReason,
+    reason: data && data.decisionReason,
+  });
+  if (issueType === scope.ISSUE.MISCELLANEOUS &&
+      !HOLD_STAGES.includes(stage)) {
+    return null;
+  }
+  return issueType;
+}
+
+/**
  * @param {object} doc Invoice snapshot.
  * @param {string} tenantId Tenant id.
  * @return {object|null}
@@ -25,19 +47,11 @@ function invoiceHoldRow(doc, tenantId) {
       !ownership.sameTenant(data.tenantId, tenantId)) {
     return null;
   }
-  const wf = String(data.finalWorkflowStatus || "");
+  const issueType = holdIssueForInvoice(data);
+  if (!issueType) return null;
+  if (scope.isIssueDismissed(data, issueType)) return null;
   const stage = String(data.decisionStage || "");
-  if (wf === "completed" || stage === "completed") return null;
-  const issueType = scope.classifyIssue({
-    decisionStage: stage,
-    finalWorkflowStatus: wf,
-    decisionReason: data.decisionReason,
-    reason: data.decisionReason,
-  });
-  if (issueType === scope.ISSUE.MISCELLANEOUS &&
-      !HOLD_STAGES.includes(stage)) {
-    return null;
-  }
+  const wf = String(data.finalWorkflowStatus || "");
   const rateHold = ownership.isMissingCarrierRateHold(data) ||
     scope.isRateHold({
       decisionStage: stage,
@@ -85,15 +99,16 @@ function invoiceHoldRow(doc, tenantId) {
 async function listOperationalQueue(db, deps, opts) {
   const tenant = deps.tenant;
   const tenantId = tenant.tenantId;
+  const sort = String(opts.sort || "").toLowerCase();
+  // Full open set (newest createdAt first, capped in the task query).
+  // Paging below applies Newest / Oldest / amount. Urgent-first here used
+  // to make Newest a reorder of the old urgent page.
   const listed = await deps.dashboardTasks.listDashboardTasks(
       db, deps.additionalCharges, {
         tenantId,
         collectionPrefix: tenant.collectionPrefix,
-        limit: 2000,
-        maxLimit: 2000,
-        offset: 0,
         chargePhase: "all",
-        urgentFirst: true,
+        unpaged: true,
         skipHydrate: true,
       });
   const tasks = (listed.tasks || []).map((task) => ({
@@ -106,7 +121,7 @@ async function listOperationalQueue(db, deps, opts) {
     try {
       const snap = await deps.tcol(tenant, "invoices")
           .where("decisionStage", "in", HOLD_STAGES)
-          .limit(500)
+          .limit(2000)
           .get();
       snap.forEach((doc) => {
         const row = invoiceHoldRow(doc, tenantId);
@@ -130,6 +145,7 @@ async function listOperationalQueue(db, deps, opts) {
     offset: opts.offset,
     limit: opts.limit || 50,
     maxLimit: 100,
+    sort,
     urgentFirst: opts.urgentFirst !== false,
   });
   if (typeof deps.dashboardTasks.hydratePageBodies === "function") {
@@ -153,4 +169,5 @@ async function listOperationalQueue(db, deps, opts) {
 module.exports = {
   listOperationalQueue,
   invoiceHoldRow,
+  holdIssueForInvoice,
 };
