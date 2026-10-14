@@ -932,6 +932,34 @@ function bookingHasFileType(docData, fileType) {
 }
 
 /**
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string} filename File name to match.
+ * @return {boolean}
+ */
+function bookingHasFilename(docData, filename) {
+  const want = String(filename || "").trim().toLowerCase();
+  if (!want || !docData) return false;
+  const lists = [
+    docData.files,
+    docData.documents,
+    docData.driveFiles,
+    docData.drive,
+    docData.data && docData.data.files,
+    docData.data && docData.data.documents,
+  ].filter(Array.isArray);
+  for (const list of lists) {
+    const found = list.some((f) => {
+      const name = String(
+          f.name || f.fileName || f.filename || f.description || "",
+      ).trim().toLowerCase();
+      return name === want;
+    });
+    if (found) return true;
+  }
+  return false;
+}
+
+/**
  * uploadDriveFile — carrier bill PDF or POD (DevTools capture #29 / #82).
  * @param {object} args bookingId, bookingBOL, fileType, fileBuffer, filename
  * @return {Promise<object>}
@@ -1051,7 +1079,11 @@ async function maybeUploadBookingPdf(args) {
     }
     return {ok: false, error: msg, fileType: args.fileType};
   }
-  if (args.docData && bookingHasFileType(args.docData, args.fileType)) {
+  if (args.allowAdditional) {
+    if (args.docData && bookingHasFilename(args.docData, file.filename)) {
+      return {ok: true, skipped: true, reason: "filename already uploaded"};
+    }
+  } else if (args.docData && bookingHasFileType(args.docData, args.fileType)) {
     return {ok: true, skipped: true, reason: "already uploaded"};
   }
   const up = await uploadDriveFile({
@@ -2024,8 +2056,9 @@ async function emailBOLDocs(args) {
     ],
   });
 
-  const driveFileIds = [...new Set(resolvedDriveIds || podDriveIds || [])];
-  if (!podDriveIds || !podDriveIds.length) {
+  const driveFileIds = args.invoiceOnly ? [] :
+    [...new Set(resolvedDriveIds || podDriveIds || [])];
+  if (!args.invoiceOnly && (!podDriveIds || !podDriveIds.length)) {
     return {
       ok: false,
       error: "No POD document on Primus — customer email blocked",
@@ -2084,20 +2117,24 @@ async function emailBOLDocs(args) {
   params["email-docs-to"] = customerEmail;
   params["email-docs-subject"] = subject;
   params["email-docs-body"] = body;
-  params["email-docs-bol"] = "on";
+  if (!args.invoiceOnly) {
+    params["email-docs-bol"] = "on";
+  }
   // UI checkbox: attach issued customer invoice
   params[`email-docs-invoice-${customerInvoiceId}`] = "on";
-  // UI checkbox(es): attach POD / quote approval / customer drive file(s)
-  for (const driveId of driveFileIds) {
-    params[`email-docs-drive-${driveId}`] = "on";
+  if (!args.invoiceOnly) {
+    // UI checkbox(es): attach POD / quote approval / customer drive file(s)
+    for (const driveId of driveFileIds) {
+      params[`email-docs-drive-${driveId}`] = "on";
+    }
   }
 
   const result = await managePhpPost(params);
   const success = isEmailBOLDocsSuccess(result.json);
   const attachments = {
     invoiceSelected: true,
-    bolSelected: true,
-    podDriveIdsSelected: podDriveIds || [],
+    bolSelected: !args.invoiceOnly,
+    podDriveIdsSelected: args.invoiceOnly ? [] : (podDriveIds || []),
     quoteApprovalDriveIdsSelected: quoteApprovalDriveIds || [],
     miworld: !!miworld,
     customerName: resolvedCustomerName || null,
@@ -7003,6 +7040,355 @@ async function ensureCarrierBillUploadedToPrimus(args) {
   };
 }
 exports.ensureCarrierBillUploadedToPrimus = ensureCarrierBillUploadedToPrimus;
+
+/**
+ * Uploads the drayage invoice and every backup file as Carrier Bill.
+ * Does not upload a POD.
+ * @param {object} args booking, loadNumber, files [{buffer, filename}].
+ * @return {Promise<object>}
+ */
+async function uploadDrayageCarrierDocuments(args) {
+  const booking = args && args.booking;
+  const loadNumber = args && args.loadNumber ? String(args.loadNumber) : "";
+  const files = (args && args.files) || [];
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  if (!booking || !loadNumber) {
+    return {ok: false, error: "Missing booking or loadNumber"};
+  }
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  let uploadFileTypes;
+  try {
+    uploadFileTypes = await resolveUploadFileTypes();
+  } catch (err) {
+    return {ok: false, error: err.message || String(err)};
+  }
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: loadNumber,
+  });
+  const uploaded = [];
+  const skipped = [];
+  for (const file of files) {
+    if (!file || !file.buffer || !file.buffer.length) continue;
+    const result = await maybeUploadBookingPdf({
+      docData: docs.ok ? docs.data : null,
+      bookingId,
+      bookingBOL: loadNumber,
+      fileType: uploadFileTypes.carrierBill.id,
+      fileTypeName: uploadFileTypes.carrierBill.name,
+      allowAdditional: true,
+      file: {
+        buffer: file.buffer,
+        filename: file.filename || `carrier-bill-${loadNumber}.pdf`,
+      },
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.error || "Carrier document upload failed",
+        filename: file.filename || null,
+        uploaded,
+      };
+    }
+    if (result.uploaded) uploaded.push(file.filename || null);
+    else skipped.push(file.filename || result.reason || "skipped");
+  }
+  if (writeLog) {
+    await writeLog("info", "primus", "Drayage documents uploaded as Carrier Bill", {
+      loadNumber,
+      uploaded,
+      skipped,
+    });
+  }
+  return {ok: true, uploaded, skipped};
+}
+exports.uploadDrayageCarrierDocuments = uploadDrayageCarrierDocuments;
+
+/**
+ * Records the drayage invoice on Actual Cost without changing charges
+ * already on the load, closes that cost, marks Ready to Invoice, and
+ * generates the customer invoice.
+ * @param {object} args booking, loadNumber, invoiceAmount, invoiceNumber,
+ *   billDate, dueDate, proNumber.
+ * @return {Promise<object>}
+ */
+async function enterDrayageInvoice(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  const booking = args.booking;
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  const amount = roundMoney(args.invoiceAmount || 0);
+  const vendorInvoiceNumber = String(args.invoiceNumber || "").trim();
+  const billDate = args.billDate || new Date();
+  const dueDate = args.dueDate || billDate;
+  const proNumber = String(args.proNumber || loadNumber).trim();
+  if (!booking || !loadNumber) {
+    return {ok: false, error: "Missing booking or loadNumber"};
+  }
+  if (!(amount > 0)) return {ok: false, error: "invoice amount required"};
+  if (!vendorInvoiceNumber) {
+    return {ok: false, error: "invoice number required"};
+  }
+  const vendor = booking.vendor || {};
+  if (!vendor.id) return {ok: false, error: "Load has no vendor"};
+
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: loadNumber,
+  });
+  if (!docs.ok || !docs.data) {
+    return {ok: false, error: docs.error || "getBookingDocuments failed"};
+  }
+  const uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {
+      ok: false,
+      noInvoice: true,
+      error: "No Primus invoice on this load",
+      loadNumber,
+    };
+  }
+  if (isIssuedUiInvoice(uiInvoice)) {
+    return {
+      ok: true,
+      alreadyIssued: true,
+      loadNumber,
+      customerInvoiceId: String(uiInvoice.id),
+      invoiceNumber: String(uiInvoice.invoiceNumber),
+    };
+  }
+
+  const invoiceId = String(uiInvoice.id);
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+  const actualCosts = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+  const keptCosts = actualCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId),
+    carrierName: String(line.carrierName || ""),
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: String(line.PRO || ""),
+    isAccessorial: !!line.isAccessorial,
+  }));
+  const feeLine = {
+    id: "",
+    code: "FRT",
+    description: "FREIGHT CHARGE",
+    carrierId: String(vendor.id),
+    carrierName: String(vendor.name || ""),
+    qty: 1,
+    rate: amount,
+    total: amount.toFixed(2),
+    vendorInvoiceNumber,
+    terms: "",
+    PRO: proNumber,
+    isAccessorial: false,
+  };
+  const billNoAlready = keptCosts.some((line) =>
+    String(line.vendorInvoiceNumber || "").trim() === vendorInvoiceNumber);
+  const mergedActualCosts = billNoAlready ?
+    keptCosts : [...keptCosts, feeLine];
+
+  let termsId = null;
+  const terms = await resolveDueOnReceiptTermId();
+  if (!terms.ok) return {ok: false, error: terms.error || "no terms"};
+  termsId = terms.termsId;
+
+  let billsInfo = extractBillsInfoFromStore(storeData);
+  if (!billsInfo || !billsInfo.length) {
+    billsInfo = reconstructBillsInfoFromActualCosts(keptCosts);
+  } else {
+    billsInfo = billsInfo.slice();
+  }
+  if (!billNoAlready) {
+    billsInfo.push({
+      code: "FRT",
+      vendorInvoiceNumber,
+      carrierId: String(vendor.id),
+      carrierName: String(vendor.name || ""),
+      total: amount,
+      breakdown: [{
+        code: "FRT",
+        description: "FREIGHT CHARGE",
+        qty: 1,
+        rate: amount,
+        total: amount,
+        first: true,
+      }],
+      terms: Number(termsId),
+      PRO: proNumber,
+      billDate: toPrimusDateTime(toDateOnly(billDate)),
+      billDueDate: toPrimusDateTime(toDateOnly(dueDate)),
+    });
+  }
+
+  const totalActual = roundMoney(
+      mergedActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const totalEstimated = roundMoney(
+      estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+  const profit = roundMoney(chargesTotal - totalActual);
+  const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+  const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+  const billtoResolution = await resolveManageBilltoId(booking);
+  const storedBillto = extractBilltoIdFromStore(storeData);
+  const billtoId = billtoResolution.id || storedBillto;
+  if (!billtoId) return {ok: false, error: "Could not resolve billtoId"};
+
+  const phase2Charges = charges.map((c) => ({
+    id: String(c.id),
+    code: c.code || "",
+    description: c.description || "",
+    qty: Number(c.qty || 1),
+    rate: roundMoney(c.rate),
+    total: roundMoney(c.total).toFixed(2),
+  }));
+  const phase2Estimated = estimatedCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId || ""),
+    carrierName: String(line.carrierName || ""),
+    editable: line.editable != null ? String(line.editable) : "0",
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    isAccessorial: !!line.isAccessorial,
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: "",
+  }));
+  const notes = {
+    internalNotes: String(booking.internalNotes || ""),
+    externalNotes: String(booking.externalNotes || ""),
+  };
+  const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+  const vendorRef = await managePhpPost({
+    action: "addVendorRefNumber",
+    invoiceId,
+    bookingId,
+    billsInfo,
+    actualCosts: mergedActualCosts,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    totalActualCost: totalActual,
+    ...refExtra,
+  });
+  if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+    return {
+      ok: false,
+      step: "addVendorRefNumber",
+      error: (vendorRef.json && vendorRef.json.message) ||
+        "addVendorRefNumber failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+  const saveResult = await managePhpPost({
+    action: "saveInvoice",
+    billsInfo,
+    charges: phase2Charges,
+    actualCosts: mergedActualCosts,
+    estimatedCosts: phase2Estimated,
+    chargesTotal,
+    totalEstimatedCosts: totalEstimated,
+    totalActualCosts: totalActual,
+    billtoId: String(billtoId),
+    bookingId,
+    ...notes,
+    costClosed: "0",
+    costActualClosed: "1",
+    readyToInvoice: "1",
+    estimatedProfitUSD: profit,
+    estimatedProfitPer: profitPer,
+    estimatedGP: gp,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    vendorInvoiceNumber: "",
+    vendorTerm: "",
+    PRONumber: "",
+    invoiceNumber: "0",
+    id: invoiceId,
+  });
+  if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+    return {
+      ok: false,
+      step: "saveInvoice",
+      error: (saveResult.json && saveResult.json.message) ||
+        "saveInvoice failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  const genAction = process.env.PRIMUS_UI_GENERATE_ACTION ||
+    "consolidateInvoices";
+  const phase3 = await managePhpPost({
+    action: genAction,
+    billToId: String(billtoId),
+    invoices: [invoiceId],
+    generationDate: toDateOnly(new Date()),
+  });
+  if (!phase3.json || !isManageSuccess(phase3.json)) {
+    return {
+      ok: false,
+      step: "consolidateInvoices",
+      error: (phase3.json && phase3.json.message) ||
+        "consolidateInvoices failed",
+      loadNumber,
+      customerInvoiceId: invoiceId,
+    };
+  }
+  const issuedNumber = phase3.json.maxInvoiceNumber ||
+    (phase3.json.message &&
+      (String(phase3.json.message).match(/Invoice#(\d+)/) || [])[1]) ||
+    null;
+  if (writeLog) {
+    await writeLog("info", "primus", "Drayage invoice generated", {
+      loadNumber,
+      invoiceId,
+      vendorInvoiceNumber,
+      amount,
+      addedBill: !billNoAlready,
+      preservedLines: keptCosts.length,
+      issuedNumber,
+    });
+  }
+  return {
+    ok: true,
+    loadNumber,
+    customerInvoiceId: invoiceId,
+    invoiceNumber: issuedNumber ? String(issuedNumber) : null,
+    chargesTotal,
+    addedBill: !billNoAlready,
+    preservedLines: keptCosts.length,
+  };
+}
+exports.enterDrayageInvoice = enterDrayageInvoice;
 
 /**
  * Normalizes Bill To Reference# text (nbsp / mojibake / whitespace).

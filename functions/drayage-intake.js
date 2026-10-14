@@ -65,7 +65,7 @@ function extractContainerFromText(subject, body) {
     const clean = sanitizeContainerNumber(labeled[1]);
     if (clean) return clean;
   }
-  const isoInline = text.match(/\b([A-Z]{4}\s?\d{7})\b/i);
+  const isoInline = text.match(/\b([A-Z]{4}\s?\d{7})\d?\b/i);
   if (isoInline && isoInline[1]) {
     const clean = sanitizeContainerNumber(isoInline[1]);
     if (clean) return clean;
@@ -219,6 +219,20 @@ function isPortFeeCarrierName(name) {
   const key = normalizeCarrierNameKey(name);
   if (!key) return false;
   return /^(pierpass|pier pass|portcheck|port check)\b/.test(key);
+}
+
+/**
+ * Innovative Carriers' own Primus vendor includes DRAYAGE along with LTL
+ * and FTL. An invoice whose carrier was read as that name is not an
+ * inbound drayage bill.
+ * @param {string|null|undefined} name Invoice or Primus vendor name.
+ * @return {boolean}
+ */
+function isOwnCompanyCarrierName(name) {
+  const key = normalizeCarrierNameKey(name);
+  if (!key) return false;
+  return key === "innovative carriers" ||
+    key.startsWith("innovative carriers ");
 }
 
 /**
@@ -437,6 +451,90 @@ async function resolveLeoReturnInstructions(body, subject) {
   return parsed;
 }
 
+/** Invoice vs load Total Cost. Under $5 can proceed. $5 and over stops. */
+const DRAYAGE_AMOUNT_TOLERANCE = 5;
+
+/**
+ * Leo's reply means the load charges are entered and Jerry may invoice.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function isGtgConfirmation(subject, body) {
+  const text = `${subject || ""}\n${body || ""}`;
+  return /\bGTG\b/i.test(text) || /\bgood to go\b/i.test(text);
+}
+
+/**
+ * Total Cost on the load rate quote. This is the figure in the
+ * booking's Total Cost box, stored as the vendor cost once the rate is saved.
+ * @param {object|null|undefined} booking Primus booking.
+ * @return {number|null}
+ */
+function readDrayageTotalCost(booking) {
+  if (!booking) return null;
+  const vendor = booking.vendor || {};
+  const raw = vendor.cost != null && String(vendor.cost).trim() !== "" ?
+    vendor.cost :
+    (booking.totalCost != null ? booking.totalCost : booking.total);
+  const amount = parseMoney(raw);
+  return amount != null && amount > 0 ? amount : null;
+}
+
+/**
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @param {number|null} totalCost Load Total Cost.
+ * @return {{ok: boolean, difference: number|null, invoiceAmount: number,
+ *   totalCost: number|null}}
+ */
+function drayageAmountsAcceptable(invoiceAmount, totalCost) {
+  const invoice = Number(invoiceAmount);
+  const total = totalCost == null ? null : Number(totalCost);
+  if (!(invoice > 0) || total == null || !(total > 0)) {
+    return {
+      ok: false,
+      difference: null,
+      invoiceAmount: invoice,
+      totalCost: total,
+    };
+  }
+  const difference = Math.round(Math.abs(invoice - total) * 100) / 100;
+  return {
+    ok: difference < DRAYAGE_AMOUNT_TOLERANCE,
+    difference,
+    invoiceAmount: invoice,
+    totalCost: total,
+  };
+}
+
+/**
+ * Adds the drayage bill without changing lines already on the load.
+ * @param {Array<object>} existingLines Actual cost lines.
+ * @param {object} feeLine New carrier-bill line.
+ * @return {{lines: Array<object>, added: boolean}}
+ */
+function mergeDrayageActualCost(existingLines, feeLine) {
+  const lines = Array.isArray(existingLines) ? existingLines.slice() : [];
+  const billNo = String(feeLine && feeLine.vendorInvoiceNumber || "").trim();
+  const already = billNo && lines.some((line) =>
+    String(line.vendorInvoiceNumber || "").trim() === billNo);
+  if (already) return {lines, added: false};
+  lines.push(feeLine);
+  return {lines, added: true};
+}
+
+/**
+ * Backup paperwork is uploaded as Carrier Bill. A POD is not.
+ * @param {object} file Attachment.
+ * @return {boolean}
+ */
+function isDrayagePodAttachment(file) {
+  if (!file) return false;
+  if (String(file.docType || "").toUpperCase() === "POD") return true;
+  const name = String(file.filename || file.name || "");
+  return /\bPOD\b|proof of delivery/i.test(name);
+}
+
 /** Required fields Leo must include for Jerry to process. */
 const LEO_REQUIRED_FIELDS = [
   "loadNumber",
@@ -527,18 +625,12 @@ function buildLeoForwardNotes(opts = {}) {
   return (
     `Hi Leo,\n\n` +
     `See attached — drayage invoice.${containerLine}${carrierLine}\n\n` +
-    `When you're done validating, please reply to ${returnTo} ` +
-    `using this format:\n\n` +
-    `---\n` +
-    `Hi,\n\n` +
-    `This invoice is for load number: [6-digit Primus load #]\n\n` +
-    `Enter in Primus:\n` +
-    `Vendor name: [carrier / vendor name]\n\n` +
-    `Charges (use these descriptions in Primus):\n` +
-    `- [Charge description]: $[amount]\n` +
-    `- [Charge description]: $[amount]\n\n` +
-    `Customer rate should be: $[amount]\n` +
-    `---\n\n` +
+    `Please enter the charges on the load. When it is ready to invoice, ` +
+    `reply to ${returnTo} and include GTG (Good to Go) plus the ` +
+    `container number or the Primus load number.\n\n` +
+    `Example:\n` +
+    `GTG\n` +
+    `${opts.containerNumber || "[container number]"}\n\n` +
     `Thank you,\n` +
     `Jerry`
   );
@@ -664,6 +756,16 @@ async function resolveInboundDrayageSignal(args) {
   const knownByName = isKnownDrayageCarrierName(carrierName) ||
     isKnownDrayageCarrierName(vendorName);
   const drayageByVendorType = !!(vendor && isDrayageVendorType(vendor));
+  if (isOwnCompanyCarrierName(carrierName) ||
+      isOwnCompanyCarrierName(vendorName)) {
+    return {
+      isDrayage: false,
+      carrierName,
+      vendorType,
+      containerNumber,
+      primusVendorId: vendor && vendor.id || null,
+    };
+  }
   if (knownByName || drayageByVendorType) {
     const displayName = carrierName || vendorName;
     const reason = drayageByVendorType ?
@@ -695,7 +797,13 @@ module.exports = {
   DRAYAGE_FORWARD_EMAIL_DEFAULT,
   DRAYAGE_RETURN_EMAIL_DEFAULT,
   DRAYAGE_OPS_EMAIL_DEFAULT,
+  DRAYAGE_AMOUNT_TOLERANCE,
   LEO_REQUIRED_FIELDS,
+  isGtgConfirmation,
+  readDrayageTotalCost,
+  drayageAmountsAcceptable,
+  mergeDrayageActualCost,
+  isDrayagePodAttachment,
   normalizeContainerNumber,
   isPlausibleContainerNumber,
   sanitizeContainerNumber,
@@ -707,6 +815,7 @@ module.exports = {
   vendorTypeLabels,
   isKnownDrayageCarrierName,
   isPortFeeCarrierName,
+  isOwnCompanyCarrierName,
   carrierNameFromInvoiceItems,
   resolveContainerNumber,
   parseLeoReturnInstructions,

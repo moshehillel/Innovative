@@ -4169,6 +4169,220 @@ async function handleDrayageMissingDetailsFromLeo(args) {
 }
 
 /**
+ * Leo marked the drayage load GTG. Upload the paperwork, check Total Cost,
+ * and invoice without changing charges already on the load.
+ * @param {object} args Handler arguments.
+ * @return {Promise<object>} {handled, ok}
+ */
+async function handleDrayageGtgReturn(args) {
+  const {
+    emailBody, subject, invoiceItems, pdfAttachments,
+    messageId, tenant, queueDocId,
+  } = args;
+  if (!drayageIntake.isGtgConfirmation(subject, emailBody)) {
+    return {handled: false};
+  }
+
+  const docId = queueDocId || messageId;
+  const leoParsed = drayageIntake.parseLeoReturnInstructions(
+      emailBody, subject);
+  const item = (invoiceItems || []).find((row) =>
+    row && Number(row.invoiceAmount) > 0) || null;
+  let loadNumber = (leoParsed && leoParsed.loadNumber) ||
+    (item && item.loadNumber) || null;
+  const containerNumber = (leoParsed && leoParsed.containerNumber) ||
+    (item && item.containerNumber) ||
+    drayageIntake.extractContainerFromText(subject, emailBody);
+  if (!loadNumber && containerNumber &&
+      primusUiBridge.searchBookingsForTrackingQuery) {
+    try {
+      const rows = await primusUiBridge.searchBookingsForTrackingQuery(
+          containerNumber, {
+            limit: 25,
+            dateFrom: new Date(Date.now() - 540 * 24 * 60 * 60 * 1000),
+          });
+      const picked = portFeeInvoices.pickContainerMatch(
+          rows, containerNumber);
+      if (picked.ok) loadNumber = picked.loadNumber;
+    } catch (lookupErr) {
+      await writeLog("warn", "mail",
+          "Drayage GTG container lookup failed", {
+            messageId,
+            containerNumber,
+            error: lookupErr.message,
+          });
+    }
+  }
+  const invoiceAmount = item ? Number(item.invoiceAmount) : null;
+  const invoiceNumber = item && item.invoiceNumber ?
+    String(item.invoiceNumber).trim() : "";
+  const invoiceDate = (item && (item.invoiceDate || item.billDate)) ||
+    new Date();
+  const files = (pdfAttachments || []).filter((file) =>
+    file && file.buffer && file.buffer.length &&
+    !drayageIntake.isDrayagePodAttachment(file));
+  const missing = [];
+  if (!loadNumber) missing.push("Load number");
+  if (!(invoiceAmount > 0)) missing.push("Invoice amount");
+  if (!invoiceNumber) missing.push("Invoice number");
+  if (!files.length) missing.push("Invoice or backup PDF");
+
+  const lisaEmail = String(
+      process.env.DRAYAGE_OPS_EMAIL ||
+      process.env.LOW_PROFIT_CC_EMAIL ||
+      drayageIntake.DRAYAGE_OPS_EMAIL_DEFAULT,
+  ).trim();
+
+  /**
+   * @param {string} reason Why Jerry stopped.
+   * @param {string} finalStatus Intake status.
+   * @return {Promise<object>}
+   */
+  async function stopGtg(reason, finalStatus) {
+    await saveOutboundEmail({
+      type: "drayage_gtg_stopped",
+      forceRecipient: true,
+      to: lisaEmail,
+      subject: `Drayage GTG stopped — load ${loadNumber || "unknown"}`,
+      html: `<p>Jerry stopped a drayage invoice after Leo's GTG reply.</p>` +
+        `<p><strong>Load:</strong> ${escapeHtml(loadNumber || "—")}</p>` +
+        `<p><strong>Invoice:</strong> ${escapeHtml(invoiceNumber || "—")} ` +
+        `${invoiceAmount > 0 ? `$${Number(invoiceAmount).toFixed(2)}` : ""}` +
+        `</p>` +
+        `<p><strong>Reason:</strong> ${escapeHtml(reason)}</p>` +
+        `<p><strong>Subject:</strong> ${escapeHtml(subject || "")}</p>`,
+      tenant,
+    });
+    await writeLog("warn", "mail", "Drayage GTG stopped", {
+      messageId,
+      loadNumber,
+      invoiceNumber,
+      reason,
+    });
+    await mailIntakeQueue.completeIntakeRecord({
+      tenant,
+      docId,
+      parentMessageId: messageId,
+      outcome: mailIntakeQueue.OUTCOME.FORWARDED,
+      finalStatus,
+      forwardReason: reason,
+      extra: {
+        gmailMessageId: messageId,
+        subject,
+        loadNumber,
+        deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
+      },
+    });
+    return {handled: true, ok: false};
+  }
+
+  if (missing.length) {
+    return stopGtg(
+        `Missing ${missing.join(", ")}`,
+        "drayage_gtg_missing_details");
+  }
+
+  const booking = await fetchPrimusBooking(loadNumber);
+  if (!booking) {
+    return stopGtg(
+        `Load ${loadNumber} was not found in Primus`,
+        "drayage_gtg_no_load");
+  }
+
+  const upload = await primusUiBridge.uploadDrayageCarrierDocuments({
+    booking,
+    loadNumber,
+    files,
+  });
+  if (!upload.ok) {
+    return stopGtg(
+        upload.error || "Could not upload the carrier documents",
+        "drayage_gtg_upload_failed");
+  }
+
+  const totalCost = drayageIntake.readDrayageTotalCost(booking);
+  const check = drayageIntake.drayageAmountsAcceptable(
+      invoiceAmount, totalCost);
+  if (!check.ok) {
+    const diff = check.difference == null ?
+      "Total Cost is missing on the load" :
+      `Invoice $${Number(invoiceAmount).toFixed(2)} vs Total Cost ` +
+      `$${Number(totalCost).toFixed(2)} (difference $${check.difference.toFixed(2)})`;
+    return stopGtg(diff, "drayage_gtg_amount_mismatch");
+  }
+
+  const entered = await primusUiBridge.enterDrayageInvoice({
+    booking,
+    loadNumber,
+    invoiceAmount,
+    invoiceNumber,
+    billDate: invoiceDate,
+    dueDate: (item && item.dueDate) || invoiceDate,
+    proNumber: (item && item.containerNumber) || containerNumber ||
+      loadNumber,
+  });
+  if (!entered.ok) {
+    return stopGtg(
+        entered.error || "Could not enter the drayage invoice",
+        "drayage_gtg_invoice_failed");
+  }
+
+  let customerEmail = null;
+  if (typeof primusUiBridge.resolveCustomerAccountingEmails === "function") {
+    const resolved = await primusUiBridge.resolveCustomerAccountingEmails(
+        booking);
+    if (resolved && resolved.emails && resolved.emails.length) {
+      customerEmail = resolved.emails.join(",");
+    }
+  }
+  if (!customerEmail) {
+    return stopGtg(
+        "The invoice was generated, but no customer accounting email " +
+        "was found, so it was not sent",
+        "drayage_gtg_missing_email");
+  }
+
+  const mailed = await primusUiBridge.emailBOLDocs({
+    booking,
+    loadNumber,
+    customerEmail,
+    customerInvoiceId: entered.customerInvoiceId,
+    invoiceNumber: entered.invoiceNumber || "0",
+    chargesTotal: entered.chargesTotal != null ? entered.chargesTotal : 0,
+    invoiceOnly: true,
+  });
+  if (!mailed.ok) {
+    return stopGtg(
+        mailed.error || "The invoice was generated, but the email failed",
+        "drayage_gtg_email_failed");
+  }
+
+  await writeLog("info", "mail", "Drayage GTG invoiced", {
+    messageId,
+    loadNumber,
+    invoiceNumber,
+    customerInvoiceId: entered.customerInvoiceId,
+    issuedNumber: entered.invoiceNumber || null,
+    addedBill: entered.addedBill !== false,
+    to: customerEmail,
+  });
+  await mailIntakeQueue.completeIntakeRecord({
+    tenant,
+    docId,
+    parentMessageId: messageId,
+    outcome: mailIntakeQueue.OUTCOME.PROCESSED,
+    finalStatus: "drayage_gtg_invoiced",
+    extra: {
+      gmailMessageId: messageId,
+      subject,
+      loadNumber,
+      deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
+    },
+  });
+  return {handled: true, ok: false};
+}
+
+/**
  * Parses Leo's return email and merges Primus entry instructions into items.
  * @param {object} args Handler arguments.
  * @return {Promise<object>} {handled, ok}
@@ -4181,6 +4395,9 @@ async function applyLeoDrayageReturnIfPresent(args) {
   if (!drayageIntake.isDrayageValidatorEmail(from)) {
     return {handled: false, ok: false};
   }
+
+  const gtg = await handleDrayageGtgReturn(args);
+  if (gtg.handled) return gtg;
 
   const leoParsed = await drayageIntake.resolveLeoReturnInstructions(
       emailBody, subject);

@@ -148,6 +148,24 @@ async function runAsyncChecks() {
   });
   check("Pier Pass invoice is not forwarded as drayage",
       pierPassSignal.isDrayage, false);
+
+  const ownCompany = await dray.resolveInboundDrayageSignal({
+    from: "ap@hivoltselectrical.com",
+    invoiceItems: [{
+      carrierName: "Innovative Carriers",
+      invoiceAmount: 500,
+    }],
+    subject: "RE: Invoice #29882 for BOL #267608",
+    body: "",
+    lookupVendor: async () => ({
+      id: "9",
+      name: "Innovative Carriers",
+      type: "DRAYAGE",
+      types: ["LTL", "FTL", "DRAYAGE", "Vendor"],
+    }),
+  });
+  check("Innovative Carriers own vendor is not inbound drayage",
+      ownCompany.isDrayage, false);
   check("Loup still extracts container metadata",
       loupSignal.containerNumber, "MSCU1234567");
 
@@ -417,6 +435,46 @@ runAsyncChecks().then(() => {
       dray.buildLeoForwardNotes({containerNumber: "MSCU1234567"})
           .includes("accounting@innovativecarriers.com"),
       true);
+  check("Leo forward note asks for GTG",
+      dray.buildLeoForwardNotes({}).includes("GTG"),
+      true);
+  check("GTG is recognized",
+      dray.isGtgConfirmation("Load 265551", "GTG"), true);
+check("container plus Gtg is recognized",
+      dray.isGtgConfirmation(
+          "FW: Invoice 10628", "HAMU46559475 Gtg"), true);
+check("container is read from a Gtg reply",
+      dray.extractContainerFromText("", "HAMU46559475 Gtg"),
+      "HAMU4655947");
+check("own company name is not an inbound drayage carrier",
+      dray.isOwnCompanyCarrierName("Innovative Carriers"), true);
+  check("Good to go is recognized",
+      dray.isGtgConfirmation("", "This load is good to go"), true);
+  check("A reply without GTG is not ready",
+      dray.isGtgConfirmation("Invoice", "Please enter these charges"), false);
+  const closeMatch = dray.drayageAmountsAcceptable(1001, 1005);
+  check("Difference under $5 can proceed", closeMatch.ok, true);
+  const over = dray.drayageAmountsAcceptable(1000, 1005);
+  check("Difference of $5 stops", over.ok, false);
+  check("Missing Total Cost stops",
+      dray.drayageAmountsAcceptable(1005, null).ok, false);
+  check("Total Cost is the vendor cost",
+      dray.readDrayageTotalCost({vendor: {cost: "1005.00"}}), 1005);
+  const merged = dray.mergeDrayageActualCost([
+    {code: "TMF", vendorInvoiceNumber: "84389-1-IN", total: 81.26},
+  ], {code: "FRT", vendorInvoiceNumber: "INV-9", total: 1005});
+  check("Port fee line is kept", merged.lines.length, 2);
+  check("Drayage bill is added", merged.added, true);
+  check("Port fee bill number is unchanged",
+      merged.lines[0].vendorInvoiceNumber, "84389-1-IN");
+  const again = dray.mergeDrayageActualCost(merged.lines, {
+    code: "FRT", vendorInvoiceNumber: "INV-9", total: 1005,
+  });
+  check("Same invoice number is not added twice", again.added, false);
+  check("POD is not uploaded",
+      dray.isDrayagePodAttachment({filename: "signed-POD.pdf"}), true);
+  check("Invoice pdf is uploaded",
+      dray.isDrayagePodAttachment({filename: "carrier-invoice.pdf"}), false);
 
   if (failures) {
     console.error(`\n${failures} test(s) failed`);
