@@ -1515,6 +1515,49 @@ check("Pro Funding invoice is not quiet-ignored",
         .status !== "customer_paid_confirmation_ignored");
 check("Pro Funding invoice subject is still an invoice",
     adm.looksLikeInvoiceEmailContent(proFundingSubject, proFundingBody));
+
+// Unknown factor, reply/forward, numeric PDF name, remit wording.
+// Must not depend on a domain list or on the filename containing "invoice".
+const apexSubject = "Fw: Invoice #10759; Load #268592";
+const apexFrom = "Billing <billing@apexcapital.com>";
+const apexBody =
+  "Invoice attached. Remittance instructions are below. " +
+  "Please remit payment.";
+const apexAtt = [
+  {filename: "1-10759.pdf", mimeType: "application/pdf"},
+];
+check("Carrier Invoice; Load subject is a bill submission",
+    adm.subjectLooksLikeCarrierBillSubmission(apexSubject));
+check("Carrier Invoice; Load subject is a bill submission without Fw",
+    adm.subjectLooksLikeCarrierBillSubmission(
+        "Invoice #10759; Load #268592"));
+check("Customer Invoice for BOL is not a carrier bill submission",
+    !adm.subjectLooksLikeCarrierBillSubmission(
+        "Re: Invoice #29414 for BOL #266781"));
+check("Apex remit wording is an inbound bill request",
+    adm.bodyLooksLikeInboundBillRequest(apexBody));
+check("Customer has-been-paid is not an inbound bill request",
+    !adm.bodyLooksLikeInboundBillRequest(bestSellerBody));
+check("Forwarded carrier bill is not a customer paid confirmation",
+    !adm.isCustomerInvoicePaidConfirmation(
+        apexSubject, apexFrom, apexBody, apexAtt));
+check("Forwarded carrier bill is not quiet-ignored",
+    adm.evaluateAdministrativeIgnore(
+        apexSubject, apexFrom, apexBody, apexAtt)
+        .status !== "customer_paid_confirmation_ignored");
+check("Forwarded carrier bill is not quiet-ignored before attachments",
+    adm.evaluateAdministrativeIgnore(
+        apexSubject, apexFrom, apexBody, [])
+        .status !== "customer_paid_confirmation_ignored");
+check("Numeric invoice PDF on our BOL thread is not a paid confirmation",
+    !adm.isCustomerInvoicePaidConfirmation(
+        "Re: Invoice #29414 for BOL #266781",
+        "Billing <billing@somecarrier.com>",
+        "This invoice has been paid. Remittance enclosed.",
+        [{filename: "1-10759.pdf", mimeType: "application/pdf"}]));
+check("Bare remittance word is not a customer paid notice",
+    !adm.bodyLooksLikeCustomerPaidNotice(
+        "Remittance instructions for the attached invoice."));
 check("Best Seller not remittance→Abe",
     !adm.isCustomerPaymentRemittanceEmail(
         bestSellerSubject, bestSellerFrom, bestSellerBody));

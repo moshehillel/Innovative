@@ -690,7 +690,6 @@ function bodyLooksLikeCustomerPaidNotice(body) {
   const top = topOfThreadBody(body).toLowerCase();
   if (!top.trim()) return false;
   const patterns = [
-    /\bremittance\b/,
     /\bpayment\s+(?:was\s+)?(?:sent|made|submitted|completed|received)\b/,
     /\b(?:we|i)\s+(?:have\s+)?(?:just\s+)?paid\b/,
     /\bpaid\s+(?:in\s+full|via|by|through|already|today)\b/,
@@ -747,9 +746,73 @@ function bodyLooksLikeInvoiceDisputeOrQuestion(body) {
 }
 
 /**
+ * Carrier / factor bill subjects: "Invoice #10759; Load #268592".
+ * Our customer threads say "Invoice … for BOL/Load", not semicolon or comma.
+ * @param {string} subject Email subject.
+ * @return {boolean}
+ */
+function subjectLooksLikeCarrierBillSubmission(subject) {
+  const sub = String(subject || "").trim()
+      .replace(/^(?:(?:re|fw|fwd):\s*)+/i, "")
+      .replace(/^\[(?:external|secure)\]\s*/i, "")
+      .trim();
+  return /\binvoice\s*#?\s*[a-z]{0,4}\d+\s*[;,]\s*(?:load|bol)\b/i.test(sub);
+}
+
+/**
+ * Sender is billing us (remit / attached invoice), not telling us they paid.
+ * @param {string} body Plain body.
+ * @return {boolean}
+ */
+function bodyLooksLikeInboundBillRequest(body) {
+  const top = topOfThreadBody(body).toLowerCase();
+  if (!top.trim()) return false;
+  const patterns = [
+    /\bplease\s+remit\b/,
+    /\bremit\s+(?:payment|to|funds)\b/,
+    /\bremittance\s+(?:instructions?|address|information|details)\b/,
+    /\bamount\s+due\b/,
+    /\b(?:carrier\s+)?invoice\s+(?:is\s+)?attached\b/,
+    /\battached\s+(?:is\s+)?(?:the\s+|your\s+|our\s+|a\s+)?(?:carrier\s+)?invoice\b/,
+    /\bplease\s+(?:process|pay)\b/,
+    /\bpay\s+this\s+invoice\b/,
+  ];
+  return patterns.some((re) => re.test(top));
+}
+
+/**
+ * Filename is a customer payment receipt, not a freight bill.
+ * @param {string} filename Attachment filename.
+ * @return {boolean}
+ */
+function attachmentFilenameLooksLikePaymentReceipt(filename) {
+  const name = String(filename || "").toLowerCase();
+  if (!name) return false;
+  if (attachmentFilenameLooksLikeInvoice(filename)) return false;
+  return /zelle|receipt|proof|check|ck[\s._-]?\d|remittance/.test(name);
+}
+
+/**
+ * A PDF that is not clearly a payment receipt may be the freight bill.
+ * Numeric names such as "1-10759.pdf" count. Images do not.
+ * @param {Array<object>} attachments Attachment metadata.
+ * @return {boolean}
+ */
+function attachmentsIncludePossibleFreightBill(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.some((a) => {
+    if (!isPdfLikeAttachment(a)) return false;
+    if (attachmentFilenameLooksLikePaymentReceipt(a.filename)) return false;
+    return true;
+  });
+}
+
+/**
  * Quiet-ignore: customer reply on our Invoice #… for BOL #… thread that only
  * confirms the invoice was paid / attaches a Zelle (or similar) payment
  * receipt — no freight bill to enter, no Lisa ACTION REQUIRED.
+ * A carrier or factor bill is never this, including replies and forwards,
+ * unknown sender domains, and PDFs whose names are only an invoice number.
  * Moshe: simple receipt-on-invoice-thread wins over remittance→Abe.
  * Full remittance-advice / check# / payment-date subjects still go to Abe.
  * @param {string} subject Email subject.
@@ -771,11 +834,14 @@ function isCustomerInvoicePaidConfirmation(
     return false;
   }
 
-  // A new bill ("Invoice #10759; Load #268592") is not a customer reply
-  // confirming they paid our invoice.
+  // A new bill is not a customer reply. Replies and forwards of a carrier
+  // submission ("Fw: Invoice #10759; Load #268592") are not either.
   if (!/^(?:(?:re|fw|fwd):\s*)+/i.test(String(subject || "").trim())) {
     return false;
   }
+  if (subjectLooksLikeCarrierBillSubmission(subject)) return false;
+  if (bodyLooksLikeInboundBillRequest(body)) return false;
+  if (attachmentsIncludePossibleFreightBill(attachments)) return false;
 
   // Dedicated remittance packages still route to Abe.
   if (subjectLooksLikeRemittanceAdvice(subject)) return false;
@@ -2051,6 +2117,8 @@ module.exports = {
   subjectLooksLikeRemittanceAdvice,
   subjectLooksLikeCustomerPaymentNotice,
   subjectLooksLikeInvoiceForBolReply,
+  subjectLooksLikeCarrierBillSubmission,
+  bodyLooksLikeInboundBillRequest,
   bodyLooksLikeCustomerPaidNotice,
   bodyLooksLikeInvoiceDisputeOrQuestion,
   isCustomerInvoicePaidConfirmation,

@@ -9703,11 +9703,15 @@ async function processGmailMessage(
     // Automatic reply / OOO must ignore before attachment work and before
     // the no-attachment invoice-veto forward. "Automatic reply: Invoice #…
     // for BOL #…" has no PDF; the Invoice/BOL subject used to leak to Moshe.
+    // Customer-paid confirmation waits until attachments are loaded. A
+    // carrier bill PDF is often named only with the invoice number, and
+    // deciding "they paid" before that file is seen drops the bill.
     if (!isChildSplitJob && !isTai) {
       const oooIgnore =
         administrativeEmailIntake.evaluateAdministrativeIgnore(
             subject, from, emailBody, [], headers);
       if (oooIgnore.ignore &&
+          oooIgnore.status !== "customer_paid_confirmation_ignored" &&
           administrativeIgnoreBypassesInvoiceVeto(oooIgnore.status)) {
         await completeAdministrativeIgnore({
           messageId,
