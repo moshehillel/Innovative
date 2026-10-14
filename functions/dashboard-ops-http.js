@@ -39,6 +39,7 @@ async function handleListNotifications(req, res) {
     const tenant = await deps.resolveDashboardTenant(req);
     const result = await dashboardOps.listNotifications(deps.db, {
       tenantId: tenant.tenantId,
+      collectionPrefix: tenant.collectionPrefix,
       limit: req.query.limit,
       offset: req.query.offset,
       type: req.query.type || null,

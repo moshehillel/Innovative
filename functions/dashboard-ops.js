@@ -315,24 +315,46 @@ function enrichUnhandledNotifBody(n) {
  * @param {object} opts tenantId, limit, type, additionalChargesMod?
  * @return {Promise<object>}
  */
+async function collectNotifPage(baseQuery, maxDocs) {
+  const pageSize = 200;
+  const docs = [];
+  let last = null;
+  while (docs.length < maxDocs) {
+    let query = baseQuery.limit(Math.min(pageSize, maxDocs - docs.length));
+    if (last) query = query.startAfter(last);
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await query.get();
+    if (snap.empty) break;
+    docs.push(...snap.docs);
+    last = snap.docs[snap.docs.length - 1];
+    if (snap.size < pageSize) break;
+  }
+  return docs;
+}
+
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
-  const fetchLimit = Math.min(Math.max(Number(opts.fetchLimit) || 300, 50), 500);
-  let query = db.collection(NOTIF_COLLECTION)
+  const fetchLimit = Math.min(
+      Math.max(Number(opts.fetchLimit) || 2000, 50), 2000);
+  const scope = require("./dashboard-scope");
+  const notifName = scope.collectionName({
+    collectionPrefix: opts.collectionPrefix,
+  }, NOTIF_COLLECTION);
+  let base = db.collection(notifName)
       .where("tenantId", "==", tenantId)
       .where("status", "==", NOTIF_STATUS.OPEN)
-      .orderBy("createdAt", "desc")
-      .limit(fetchLimit);
+      .orderBy("createdAt", "desc");
   if (opts.type) {
-    query = db.collection(NOTIF_COLLECTION)
+    base = db.collection(notifName)
         .where("tenantId", "==", tenantId)
         .where("status", "==", NOTIF_STATUS.OPEN)
         .where("type", "==", String(opts.type))
-        .orderBy("createdAt", "desc")
-        .limit(fetchLimit);
+        .orderBy("createdAt", "desc");
   }
-  const snap = await query.get();
-  const notifications = snap.docs.map(serializeNotif);
+  const docs = await collectNotifPage(base, fetchLimit);
+  const notifications = docs.map(serializeNotif)
+      .filter((n) => ownership.sameTenant(n.tenantId, tenantId))
+      .filter((n) => scope.isOpenNotification(n));
 
   for (const n of notifications) {
     if (n.type === NOTIF_TYPE.UNHANDLED_EMAIL) {
@@ -389,6 +411,7 @@ async function listNotifications(db, opts) {
     dispatcherKey: opts.dispatcherKey || null,
     offset: opts.offset,
     limit: opts.limit || 50,
+    maxLimit: opts.maxLimit,
     urgentFirst: opts.urgentFirst,
   });
 

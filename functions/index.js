@@ -53,6 +53,8 @@ const drayageIntake = require("./drayage-intake");
 const invoiceLoadEntry = require("./invoice-load-entry");
 const dashboardTasks = require("./dashboard-tasks");
 const dashboardOps = require("./dashboard-ops");
+const dashboardScope = require("./dashboard-scope");
+const dashboardQueue = require("./dashboard-queue");
 const dashboardOpsHttp = require("./dashboard-ops-http");
 const dashboardEmailFiles = require("./dashboard-email-files");
 const mailProvider = require("./mail-provider");
@@ -5387,7 +5389,10 @@ async function notifyDispatcherRateIssue(opts) {
     try {
       await dashboardTasks.createDashboardTask(db,
           dashboardTasks.missingRateTaskPayload({
-            tenantId: tenantId || "default",
+            tenantId: (currentTenant() && currentTenant().tenantId) ||
+              tenantId || "default",
+            collectionPrefix: currentTenant() &&
+              currentTenant().collectionPrefix,
             loadNumber: loadNumber || (context && context.loadNumber) || null,
             carrierName: (context && context.carrierName) || null,
             invoiceId: invoiceId || null,
@@ -6500,6 +6505,7 @@ async function saveOutboundEmail(email) {
   delete emailToStore.tenant;
   delete emailToStore.skipAgentGreeting;
   delete emailToStore.forceRecipient;
+  delete emailToStore.forceSend;
   delete emailToStore.dashboardAttachments;
   delete emailToStore.emailReceivedAt;
   const emailRef = await tcol(tenant, "outboundEmails").add({
@@ -6514,8 +6520,14 @@ async function saveOutboundEmail(email) {
   const isCustomerBill = email.type === "generated_bill";
   const isSystemErr = isSystemErrorOutboundEmail(email);
   const isDashboardMeta = email.type === "dashboard_flag" ||
-    email.type === "dashboard_reply";
-  const parkOpsOnDashboard = dashboardOps.isDashboardOpsPrimary() &&
+    email.type === "dashboard_reply" ||
+    email.type === "dashboard_assignment" ||
+    email.type === "dashboard_notification_digest";
+  const forceSend = email.forceSend === true ||
+    email.type === "dashboard_notification_digest" ||
+    email.type === "dashboard_assignment";
+  const parkOpsOnDashboard = !forceSend &&
+    dashboardOps.isDashboardOpsPrimary() &&
     !isCustomerBill && !isSystemErr && !isDashboardMeta;
 
   // additional_charge_approval already creates a richer notification upstream.
@@ -12289,8 +12301,17 @@ function buildLogsCsv(rows) {
  * @return {Promise<object>} Tenant config.
  */
 async function resolveDashboardTenant(req) {
-  const tenantId = (req.query && req.query.tenantId) ||
-    (req.body && req.body.tenantId) || "default";
+  const origin = (req.get && (req.get("Origin") || req.get("origin"))) || "";
+  const mapped = dashboardScope.tenantIdForDashboardOrigin(origin);
+  if (mapped === false) {
+    const error = new Error("This dashboard site is not mapped to a client.");
+    error.statusCode = 403;
+    throw error;
+  }
+  // A known site always wins. A copied config cannot ask for another client.
+  const requested = (req.query && req.query.tenantId) ||
+    (req.body && req.body.tenantId) || null;
+  const tenantId = mapped || (requested ? String(requested) : "default");
   return getTenant(String(tenantId));
 }
 
@@ -13082,11 +13103,59 @@ exports.getDashboardTasks = onRequest(
     const tenant = await resolveDashboardTenant(req);
     const limit = Math.min(Number(req.query.limit || 50), 100);
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    if (String(req.query.view || "") === "queue") {
+      if (!req.query.offset || Number(req.query.offset) === 0) {
+        const primusUiBridgeLocal = require("./primus-ui-bridge");
+        await dashboardTasks.ensureMissingRateDispatchTasks(
+            db, tcol(tenant, "invoices"), {
+              tenantId: tenant.tenantId,
+              collectionPrefix: tenant.collectionPrefix,
+              resolveDispatcher: tenant.tms === "primus" ? async (inv) => {
+                const found = await primusUiBridgeLocal.resolveDispatcherEmail({
+                  loadNumber: inv && inv.loadNumber,
+                  fetchBooking: fetchPrimusBooking,
+                });
+                if (!found || !found.ok || !found.email) return null;
+                return {
+                  email: found.email,
+                  name: found.displayName || found.userName || null,
+                };
+              } : null,
+            });
+      }
+      const queued = await dashboardQueue.listOperationalQueue(db, {
+        tenant,
+        tcol,
+        dashboardTasks,
+        additionalCharges,
+      }, {
+        issue: req.query.issue || "all",
+        dispatcher: req.query.dispatcher || "",
+        limit,
+        offset,
+        urgentFirst: req.query.urgentFirst !== "0",
+      });
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        tasks: queued.tasks,
+        openCount: queued.openCount,
+        filteredCount: queued.filteredCount,
+        hasMore: queued.hasMore,
+        nextOffset: queued.nextOffset,
+        offset: queued.offset,
+        limit: queued.limit,
+        bucketCounts: queued.bucketCounts,
+        dispatchers: queued.dispatchers,
+        disputeCount: queued.disputeCount || 0,
+      });
+    }
     if (!req.query.chargePhase) {
       const primusUiBridgeLocal = require("./primus-ui-bridge");
       await dashboardTasks.ensureMissingRateDispatchTasks(
           db, tcol(tenant, "invoices"), {
             tenantId: tenant.tenantId,
+            collectionPrefix: tenant.collectionPrefix,
             resolveDispatcher: tenant.tms === "primus" ? async (inv) => {
               const found = await primusUiBridgeLocal.resolveDispatcherEmail({
                 loadNumber: inv && inv.loadNumber,
@@ -13103,6 +13172,7 @@ exports.getDashboardTasks = onRequest(
     const result = await dashboardTasks.listDashboardTasks(
         db, additionalCharges, {
           tenantId: tenant.tenantId,
+          collectionPrefix: tenant.collectionPrefix,
           limit,
           offset,
           ownerBucket: req.query.ownerBucket || null,
@@ -13128,9 +13198,92 @@ exports.getDashboardTasks = onRequest(
     });
   } catch (error) {
     console.error("getDashboardTasks error:", error);
-    return res.status(500).json({
+    const status = error.statusCode === 403 ? 403 : 500;
+    return res.status(status).json({
       ok: false,
-      error: "Failed to load tasks.",
+      error: status === 403 ?
+        error.message : "Failed to load tasks.",
+      details: status === 403 ? undefined : error.message,
+    });
+  }
+});
+
+exports.reassignDashboardWork = onRequest({invoker: "public"}, async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const body = req.body || {};
+    let result;
+    if (String(body.source || "") === "invoice") {
+      const bucket = String(body.bucket || "").toLowerCase();
+      const createdId = await dashboardTasks.createDashboardTask(db, {
+        tenantId: tenant.tenantId,
+        collectionPrefix: tenant.collectionPrefix,
+        type: body.issue === "missing_rate" ? "missing_rate" : "invoice_hold",
+        title: body.subject || `Load ${body.loadNumber || "—"}`,
+        subject: body.subject || null,
+        loadNumber: body.loadNumber || null,
+        carrierName: body.carrierName || null,
+        invoiceId: body.invoiceId || null,
+        reason: body.issue || null,
+        ownerBucket: bucket,
+        dispatcherEmail: body.dispatcherEmail || null,
+        dispatcherName: body.dispatcherName || null,
+        ownershipReason: "dashboard_reassign",
+      });
+      if (!createdId) {
+        return res.status(400).json({ok: false, error: "Could not assign."});
+      }
+      const emailTo = bucket === "sarah" ?
+        (process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+          "Sarah@innovativecarriers.com") :
+        (bucket === "dispatch" ? body.dispatcherEmail :
+          (process.env.HUMAN_REVIEW_EMAIL || "Lisa@innovativecarriers.com"));
+      result = {
+        ok: true,
+        loadNumber: body.loadNumber || null,
+        subject: body.subject || null,
+        issueLabel: body.issue || "dashboard item",
+        emailTo,
+      };
+    } else {
+      result = await dashboardTasks.reassignDashboardWork(db, {
+        taskId: body.taskId,
+        source: body.source || "dashboardTasks",
+        tenantId: tenant.tenantId,
+        collectionPrefix: tenant.collectionPrefix,
+        bucket: body.bucket,
+        dispatcherEmail: body.dispatcherEmail,
+        dispatcherName: body.dispatcherName,
+      });
+    }
+    if (!result.ok) return res.status(400).json(result);
+    if (result.emailTo) {
+      const load = result.loadNumber || "—";
+      await saveOutboundEmail({
+        type: "dashboard_assignment",
+        forceSend: true,
+        forceRecipient: true,
+        tenant,
+        to: result.emailTo,
+        subject: `Assigned to you — Load ${load}`,
+        html: `<p>Load <strong>${escapeHtml(load)}</strong> ` +
+          `(${escapeHtml(result.issueLabel || "dashboard item")}) ` +
+          `was assigned to you.</p>` +
+          `<p>${escapeHtml(result.subject || "")}</p>` +
+          `<p>It is on the Jerry dashboard.</p>`,
+      });
+    }
+    return res.json({ok: true, tenantId: tenant.tenantId});
+  } catch (error) {
+    console.error("reassignDashboardWork error:", error);
+    const status = error.statusCode === 403 ? 403 : 500;
+    return res.status(status).json({
+      ok: false,
+      error: "Could not reassign.",
       details: error.message,
     });
   }
@@ -16108,6 +16261,29 @@ missingPodDaily.init({
  * POD, resume the normal billing workflow. Otherwise leave the hold.
  * 7:00 AM America/Cayman.
  */
+const dashboardNotificationDigest = require("./dashboard-notification-digest");
+dashboardNotificationDigest.init({
+  db,
+  getActiveTenants,
+  listNotifications: (database, opts) =>
+    dashboardOps.listNotifications(database, opts),
+  saveOutboundEmail,
+});
+
+/**
+ * Weekday and weekend morning digest of unfinished dashboard notifications.
+ * 7:30 AM America/New_York. One send per tenant per Eastern calendar day.
+ */
+exports.sendDashboardNotificationDigest = onSchedule({
+  schedule: "30 7 * * *",
+  timeZone: "America/New_York",
+  timeoutSeconds: 300,
+  memory: "512MiB",
+}, async () => {
+  const result = await dashboardNotificationDigest.runDailyNotificationDigest();
+  console.log("sendDashboardNotificationDigest:", JSON.stringify(result));
+});
+
 exports.checkMissingPodDaily = onSchedule({
   schedule: "0 7 * * *",
   timeZone: "America/Cayman",

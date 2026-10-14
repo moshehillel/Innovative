@@ -11,8 +11,11 @@ const ownership = require("./dashboard-ownership");
 const mailFiles = require("./dashboard-email-files");
 const dedupe = require("./dashboard-dedupe");
 
+const scope = require("./dashboard-scope");
+
 const TASK_COLLECTION = "dashboardTasks";
 const FOLLOW_UP_COLLECTION = "additionalCharges";
+const OPEN_SCAN_CAP = 2000;
 
 const TASK_TYPE = Object.freeze({
   HUMAN_REVIEW: "human_review",
@@ -74,9 +77,10 @@ async function findOpenDuplicateTask(db, data) {
   const followUpId = String(data.followUpId || "").trim();
   const tenantId = String(data.tenantId || "default");
   const type = data.type || TASK_TYPE.HUMAN_REVIEW;
+  const tasksCol = tenantCollection(db, TASK_COLLECTION, data);
   const invoiceId = String(data.invoiceId || "").trim();
   if (ownership.isMissingRateType(type) && invoiceId) {
-    const byInvoice = await db.collection(TASK_COLLECTION)
+    const byInvoice = await tasksCol
         .where("invoiceId", "==", invoiceId)
         .limit(20)
         .get();
@@ -97,19 +101,19 @@ async function findOpenDuplicateTask(db, data) {
   }
   let docs = [];
   if (loadNumber) {
-    const snap = await db.collection(TASK_COLLECTION)
+    const snap = await tasksCol
         .where("loadNumber", "==", loadNumber)
         .limit(200)
         .get();
     docs = snap.docs;
   } else if (messageId) {
-    const snap = await db.collection(TASK_COLLECTION)
+    const snap = await tasksCol
         .where("messageId", "==", messageId)
         .limit(20)
         .get();
     docs = snap.docs;
   } else if (followUpId) {
-    const snap = await db.collection(TASK_COLLECTION)
+    const snap = await tasksCol
         .where("followUpId", "==", followUpId)
         .limit(20)
         .get();
@@ -239,7 +243,7 @@ async function createDashboardTask(db, data) {
       console.error("[createDashboardTask] dedupe lookup failed:",
           dedupeErr.message);
     }
-    const doc = await db.collection(TASK_COLLECTION).add({
+    const doc = await tenantCollection(db, TASK_COLLECTION, data).add({
       tenantId: data.tenantId || "default",
       type: data.type || TASK_TYPE.HUMAN_REVIEW,
       title: data.title || "Action required",
@@ -522,24 +526,54 @@ async function hydratePageBodies(db, additionalChargesMod, items, tenantId) {
 }
 
 /**
- * Lists open tasks for a tenant plus unresolved additional-charge follow-ups.
- * @param {object} db Firestore instance.
- * @param {object} additionalChargesMod additional-charges module.
- * @param {object} opts tenantId, limit, offset, ownerBucket, dispatcherKey.
- * @return {Promise<object>}
+ * Pages a descending query so open work is not cut off at the newest N rows.
+ * @param {FirebaseFirestore.Query} baseQuery Query with orderBy already set.
+ * @param {number} maxDocs Cap.
+ * @return {Promise<object[]>}
  */
+async function collectPaged(baseQuery, maxDocs) {
+  const pageSize = 200;
+  const docs = [];
+  let last = null;
+  while (docs.length < maxDocs) {
+    let query = baseQuery.limit(Math.min(pageSize, maxDocs - docs.length));
+    if (last) query = query.startAfter(last);
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await query.get();
+    if (snap.empty) break;
+    docs.push(...snap.docs);
+    last = snap.docs[snap.docs.length - 1];
+    if (snap.size < pageSize) break;
+  }
+  return docs;
+}
+
+/**
+ * @param {object} db Firestore.
+ * @param {string} base Collection base name.
+ * @param {object} opts collectionPrefix.
+ * @return {FirebaseFirestore.CollectionReference}
+ */
+function tenantCollection(db, base, opts) {
+  const name = scope.collectionName({
+    collectionPrefix: opts && opts.collectionPrefix,
+  }, base);
+  return db.collection(name);
+}
+
 async function listDashboardTasks(db, additionalChargesMod, opts) {
   const tenantId = String(opts.tenantId || "default");
-  // Fetch a wider window so folder filters still have enough rows.
-  const fetchLimit = Math.min(Math.max(Number(opts.fetchLimit) || 300, 50), 500);
+  // Open rows are kept until someone finishes them. The old 300-row cap
+  // hid anything older than about two weeks once the queue filled up.
+  const fetchLimit = Math.min(
+      Math.max(Number(opts.fetchLimit) || 2000, 50), 2000);
 
-  const taskSnap = await db.collection(TASK_COLLECTION)
-      .where("tenantId", "==", tenantId)
-      .where("status", "==", TASK_STATUS.OPEN)
-      .orderBy("createdAt", "desc")
-      .limit(fetchLimit)
-      .select(...TASK_LIST_FIELDS)
-      .get();
+  const taskDocs = await loadScopedPages(db, TASK_COLLECTION, opts, (col) =>
+    col.where("tenantId", "==", tenantId)
+        .where("status", "==", TASK_STATUS.OPEN)
+        .orderBy("createdAt", "desc")
+        .select(...TASK_LIST_FIELDS), fetchLimit);
+  const taskSnap = {docs: taskDocs};
 
   // Drop legacy human_review rows — those belong in Notifications.
   const tasks = taskSnap.docs.map(serializeTaskDoc)
@@ -549,13 +583,12 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       tasks.map((t) => t.followUpId).filter(Boolean),
   );
 
-  const chargeSnap = await db
-      .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
-      .where("resolved", "==", false)
-      .orderBy("createdAt", "desc")
-      .limit(fetchLimit)
-      .select(...CHARGE_LIST_FIELDS)
-      .get();
+  const chargeDocs = await loadScopedPages(
+      db, additionalChargesMod.FOLLOW_UP_COLLECTION, opts, (col) =>
+        col.where("resolved", "==", false)
+            .orderBy("createdAt", "desc")
+            .select(...CHARGE_LIST_FIELDS), fetchLimit);
+  const chargeSnap = {docs: chargeDocs};
 
   // Copy routing fields onto linked tasks. Email HTML stays off this path.
   for (const task of tasks) {
@@ -589,7 +622,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     }
   }
 
-  chargeSnap.forEach((doc) => {
+  chargeSnap.docs.forEach((doc) => {
     if (linkedFollowUpIds.has(doc.id)) return;
     const d = doc.data() || {};
     // Shared collection. A missing tenantId is the legacy default tenant,
@@ -656,7 +689,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     }
   }
 
-  if (typeof opts.backfillMail === "function") {
+  if (typeof opts.backfillMail === "function" && !opts.skipHydrate) {
     await opts.backfillMail(tasks);
   }
 
@@ -666,6 +699,8 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   let working = visibleTasks;
   if (chargePhase === "dispute") {
     working = visibleTasks.filter((t) => t.chargePhase === "dispute");
+  } else if (chargePhase === "all") {
+    working = visibleTasks;
   } else if (chargePhase === "open" || !chargePhase) {
     // Default task folders hide items already in dispute.
     working = visibleTasks.filter((t) => t.chargePhase !== "dispute");
@@ -674,6 +709,17 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   const disputeCount = visibleTasks.filter((t) =>
     t.chargePhase === "dispute").length;
 
+  if (opts.unpaged) {
+    return {
+      tasks: working.map((task) => ({
+        ...task,
+        issueType: task.issueType || scope.classifyIssue(task),
+      })),
+      disputeCount,
+      openCount: working.length,
+    };
+  }
+
   const page = ownership.filterSortPaginate(working, {
     ownerBucket: chargePhase === "dispute" ?
       null : (opts.ownerBucket || null),
@@ -681,10 +727,13 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       null : (opts.dispatcherKey || null),
     offset: opts.offset,
     limit: opts.limit || 50,
+    maxLimit: opts.maxLimit,
     urgentFirst: opts.urgentFirst,
   });
 
-  await hydratePageBodies(db, additionalChargesMod, page.items, tenantId);
+  if (!opts.skipHydrate) {
+    await hydratePageBodies(db, additionalChargesMod, page.items, tenantId);
+  }
 
   return {
     tasks: page.items,
@@ -890,6 +939,7 @@ function missingRateTaskPayload(opts) {
     String(opts.dispatcherName).trim() : null;
   return {
     tenantId: opts.tenantId || "default",
+    collectionPrefix: opts.collectionPrefix || "",
     type: TASK_TYPE.MISSING_RATE,
     title: `Missing carrier rate — Load ${loadNumber || "—"}`,
     description: "The carrier rate is missing. The dispatcher needs to reply.",
@@ -944,6 +994,7 @@ async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
     // eslint-disable-next-line no-await-in-loop
     const existing = await findOpenDuplicateTask(db, {
       tenantId,
+      collectionPrefix: opts.collectionPrefix,
       type: TASK_TYPE.MISSING_RATE,
       invoiceId: doc.id,
       loadNumber: inv.loadNumber || null,
@@ -987,6 +1038,7 @@ async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
     // eslint-disable-next-line no-await-in-loop
     const id = await createDashboardTask(db, missingRateTaskPayload({
       tenantId,
+      collectionPrefix: opts.collectionPrefix,
       loadNumber: inv.loadNumber,
       proNumber: inv.proNumber,
       carrierName: inv.carrierName,
@@ -1004,15 +1056,85 @@ async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
   return {ensured};
 }
 
+/**
+ * Moves a task to accounting, Sarah, or a dispatcher and records history.
+ * Does not send email; the HTTP handler does that once.
+ * @param {object} db Firestore.
+ * @param {object} opts taskId, source, tenantId, collectionPrefix, bucket,
+ *   dispatcherEmail, dispatcherName.
+ * @return {Promise<object>}
+ */
+async function reassignDashboardWork(db, opts) {
+  const bucket = String(opts.bucket || "").toLowerCase();
+  if (!["accounting", "sarah", "dispatch"].includes(bucket)) {
+    return {ok: false, error: "Pick accounting, Sarah, or a dispatcher."};
+  }
+  const dispatcherEmail = ownership.normEmail(opts.dispatcherEmail) || null;
+  const dispatcherName = opts.dispatcherName ?
+    String(opts.dispatcherName).trim() : null;
+  if (bucket === "dispatch" && !dispatcherEmail && !dispatcherName) {
+    return {ok: false, error: "Enter the dispatcher name or email."};
+  }
+  const taskId = String(opts.taskId || "").trim();
+  if (!taskId) return {ok: false, error: "taskId is required."};
+
+  const source = String(opts.source || "dashboardTasks");
+  const colName = source === "additionalCharges" ?
+    (opts.followUpCollection || "additionalCharges") : TASK_COLLECTION;
+  const ref = tenantCollection(db, colName, opts).doc(taskId);
+  const snap = await ref.get();
+  if (!snap.exists) return {ok: false, error: "Task not found."};
+  const data = snap.data() || {};
+  if (!ownership.sameTenant(data.tenantId, opts.tenantId || "default")) {
+    return {ok: false, error: "Task not found."};
+  }
+  const history = Array.isArray(data.ownershipHistory) ?
+    data.ownershipHistory.slice() : [];
+  history.push({
+    bucket,
+    at: new Date().toISOString(),
+    reason: "dashboard_reassign",
+    dispatcherEmail,
+  });
+  const patch = {
+    ownerBucket: bucket,
+    awaitingReplyFrom: bucket,
+    ownershipHistory: history,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (bucket === "dispatch") {
+    patch.dispatcherEmail = dispatcherEmail;
+    patch.dispatcherName = dispatcherName;
+    patch.dispatcherKey = dispatcherEmail ||
+      (dispatcherName ? dispatcherName.toLowerCase() : null);
+  }
+  await ref.update(patch);
+  const issue = scope.classifyIssue({...data, type: data.type});
+  return {
+    ok: true,
+    loadNumber: data.loadNumber || null,
+    subject: data.subject || data.title || null,
+    issue,
+    issueLabel: scope.issueLabel(issue),
+    emailTo: bucket === "dispatch" ? dispatcherEmail :
+      (bucket === "sarah" ? ownership.sarahEmail() :
+        (process.env.HUMAN_REVIEW_EMAIL ||
+          "Lisa@innovativecarriers.com")),
+  };
+}
+
 module.exports = {
   TASK_COLLECTION,
   TASK_TYPE,
   TASK_STATUS,
   createDashboardTask,
   listDashboardTasks,
+  hydratePageBodies,
   dismissDashboardTask,
   handoffTaskToDispatch,
   markTaskInDispute,
   missingRateTaskPayload,
   ensureMissingRateDispatchTasks,
+  reassignDashboardWork,
+  tenantCollection,
 };
