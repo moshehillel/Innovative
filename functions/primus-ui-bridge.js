@@ -690,6 +690,182 @@ function listQuoteApprovalDriveFileIds(docData, quoteApprovalFileTypeId) {
   return [...new Set(ids)];
 }
 
+/** Customer-facing label for the Redkik certificate attachment. */
+const CERTIFICATE_OF_INSURANCE_ATTACHMENT_NAME = "Certificate of Insurance";
+
+/**
+ * Primus file types whose code is COI (system Redkik cert and the editable
+ * copy). Used when getFileTypes cannot be read.
+ */
+const KNOWN_COI_FILE_TYPE_IDS = ["1", "367"];
+
+/**
+ * File type ids whose code or name is Certificate of Insurance (COI).
+ * Primus has more than one COI type (system Redkik cert and an editable copy).
+ * @param {Array<object>} types getFileTypes rows.
+ * @return {string[]}
+ */
+function listCertificateOfInsuranceTypeIds(types) {
+  const ids = [];
+  for (const t of types || []) {
+    const code = String(t.code || "").trim().toUpperCase();
+    const name = String(
+        t.name || t.description || t.typeName || t.fileTypeName || "",
+    ).trim().toLowerCase();
+    if (code !== "COI" && name !== "certificate of insurance") continue;
+    const id = t.id != null ? t.id :
+      (t.fileTypeId != null ? t.fileTypeId : t.type);
+    if (id == null || String(id) === "") continue;
+    ids.push(String(id));
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * @param {object} file Drive row from getBookingDocuments.
+ * @return {string}
+ */
+function driveFileDisplayName(file) {
+  const raw = String(
+      (file && (file.fileName || file.name)) || "",
+  );
+  if (!raw) return "";
+  try {
+    return decodeURIComponent(raw);
+  } catch (_) {
+    return raw;
+  }
+}
+
+/**
+ * True for the per-load Redkik / Primus Certificate of Insurance.
+ * Matches the COI file type, the type name, or the "Redkik COI File"
+ * description Primus writes when it files the certificate. Other
+ * certificates (detention, reweigh, MC, carrier cargo) do not match.
+ * @param {object} file Drive row.
+ * @param {string[]} [coiTypeIds] Certificate of Insurance type ids.
+ * @return {boolean}
+ */
+function isCertificateOfInsuranceFile(file, coiTypeIds) {
+  if (!file || typeof file !== "object") return false;
+  const want = new Set((coiTypeIds || []).map(String));
+  const ft = readFileTypeId(file);
+  if (ft && want.has(ft)) return true;
+  const typeName = String(file.fileTypeName || "").trim().toLowerCase();
+  if (typeName === "certificate of insurance") return true;
+  const name = driveFileDisplayName(file).toUpperCase();
+  if (/CERTIFICATE OF INSURANCE/.test(name)) return true;
+  // Redkik stores the per-load PDF as COI_BOL#<load>.pdf.
+  if (/(?:^|[^A-Z0-9])COI(?:[^A-Z0-9]|$)/.test(name)) return true;
+  const desc = String(file.fileDescription || "");
+  return /redkik\s+coi\b/i.test(desc);
+}
+
+/**
+ * Names the certificate in the customer email when one is attached.
+ * Leaves the invoice body unchanged when the load has no COI.
+ * @param {string} body Existing email HTML.
+ * @param {object} coi Selection from selectCustomerInvoiceCoi.
+ * @return {string}
+ */
+function emailBodyWithCoiNote(body, coi) {
+  const ids = coi && coi.coiDriveIds;
+  if (!ids || !ids.length) return body;
+  const html = String(body || "");
+  if (/certificate of insurance/i.test(html)) return html;
+  const note = "<p>A Certificate of Insurance is attached for this shipment." +
+    "</p>";
+  const thankYou = html.indexOf("<p>Thank you!</p>");
+  if (thankYou >= 0) {
+    return html.slice(0, thankYou) + note + html.slice(thankYou);
+  }
+  return html + note;
+}
+
+/**
+ * Per-load Certificate of Insurance drive files.
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string[]} [coiTypeIds] COI file type ids.
+ * @return {Array<{driveId: string, fileName: string}>}
+ */
+function listCoiDriveFiles(docData, coiTypeIds) {
+  const found = [];
+  const seen = new Set();
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      if (!isCertificateOfInsuranceFile(f, coiTypeIds)) continue;
+      const driveId = readDriveFileId(f);
+      if (!driveId || seen.has(driveId)) continue;
+      seen.add(driveId);
+      found.push({
+        driveId,
+        fileName: driveFileDisplayName(f),
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * True when the Redkik premium has been posted on the load.
+ * Same rule as addInsurancePremiumToLoad: an actual-cost line whose
+ * carrier is the insurance vendor.
+ * @param {Array<object>|null} actualCosts Invoice actual-cost lines.
+ * @param {string|number|null} vendorId Insurance vendor id.
+ * @return {boolean}
+ */
+function loadHasPostedInsurance(actualCosts, vendorId) {
+  if (vendorId == null || String(vendorId) === "") return false;
+  const want = String(vendorId);
+  return (Array.isArray(actualCosts) ? actualCosts : []).some((line) =>
+    line && String(line.carrierId) === want);
+}
+
+/**
+ * Decides whether the customer invoice email should include a COI.
+ * A load has insurance when its booking already has the Redkik certificate,
+ * or when the insurance vendor's premium is on the invoice. The certificate
+ * is attached only when that file is on the load. A posted premium with no
+ * file is reported as missing so the invoice can still be sent.
+ * @param {object} args docData, coiTypeIds, carrierBillDriveIds,
+ *   actualCosts (null when costs were not loaded), insuranceVendorId.
+ * @return {object}
+ */
+function selectCustomerInvoiceCoi(args) {
+  const opts = args || {};
+  const blocked = new Set(
+      (opts.carrierBillDriveIds || []).map((id) => String(id)));
+  const files = listCoiDriveFiles(opts.docData, opts.coiTypeIds)
+      .filter((f) => !blocked.has(String(f.driveId)));
+  if (files.length) {
+    return {
+      hasInsurance: true,
+      coiDriveIds: files.map((f) => f.driveId),
+      coiFileNames: files.map((f) => f.fileName),
+      coiAttachmentName: CERTIFICATE_OF_INSURANCE_ATTACHMENT_NAME,
+      missing: false,
+    };
+  }
+  if (opts.actualCosts == null) {
+    return {
+      hasInsurance: false,
+      coiDriveIds: [],
+      coiFileNames: [],
+      coiAttachmentName: null,
+      missing: false,
+    };
+  }
+  const hasInsurance = loadHasPostedInsurance(
+      opts.actualCosts, opts.insuranceVendorId);
+  return {
+    hasInsurance,
+    coiDriveIds: [],
+    coiFileNames: [],
+    coiAttachmentName: null,
+    missing: hasInsurance,
+  };
+}
+
 /**
  * @param {object} docData getBookingDocuments JSON body.
  * @param {string|number} fileType Primus fileType id.
@@ -1691,7 +1867,124 @@ async function resolvePodDriveIdsForEmail(args) {
     blockedDriveFileIds: blocked,
     miworld,
     customerName,
+    docData,
   };
+}
+
+/**
+ * Loads the per-load Redkik certificate for the customer invoice email.
+ * Does not throw: a lookup failure is logged and the invoice email continues.
+ * @param {object|null} docData getBookingDocuments body.
+ * @param {string} loadNumber BOL number.
+ * @return {Promise<object>}
+ */
+async function resolveCustomerInvoiceCoi(docData, loadNumber) {
+  const empty = {
+    hasInsurance: false,
+    coiDriveIds: [],
+    coiFileNames: [],
+    coiAttachmentName: null,
+    missing: false,
+    lookupFailed: false,
+  };
+  try {
+    const uploadTypes = await resolveUploadFileTypes();
+    let typeIds = KNOWN_COI_FILE_TYPE_IDS.slice();
+    try {
+      const discovered = listCertificateOfInsuranceTypeIds(
+          await fetchUiFileTypes());
+      if (discovered.length) typeIds = discovered;
+    } catch (typeErr) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "COI file types unavailable — using known Certificate of " +
+            "Insurance type ids", {
+              loadNumber,
+              error: typeErr && typeErr.message,
+            });
+      }
+    }
+    const carrierBillIds = listFileTypeDriveIds(
+        docData, uploadTypes.carrierBill && uploadTypes.carrierBill.id);
+    let selection = selectCustomerInvoiceCoi({
+      docData,
+      coiTypeIds: typeIds,
+      carrierBillDriveIds: carrierBillIds,
+      actualCosts: null,
+      insuranceVendorId: null,
+    });
+    if (!selection.coiDriveIds.length) {
+      const invoice = findUiInvoice(docData);
+      if (invoice && invoice.id != null) {
+        const vendor = await resolveInsuranceVendor();
+        const stores = await getInvoiceStores(invoice.id);
+        if (!stores.ok) {
+          if (writeLog) {
+            await writeLog("warn", "primus",
+                "Could not read invoice costs to check insurance for COI", {
+                  loadNumber,
+                  error: stores.error || null,
+                });
+          }
+        } else {
+          selection = selectCustomerInvoiceCoi({
+            docData,
+            coiTypeIds: typeIds,
+            carrierBillDriveIds: carrierBillIds,
+            actualCosts: extractActualCostsFromStore(stores.data) || [],
+            insuranceVendorId: vendor && vendor.id,
+          });
+        }
+      }
+    }
+    if (selection.coiDriveIds.length && writeLog) {
+      await writeLog("info", "primus",
+          "Customer invoice email — including Certificate of Insurance", {
+            loadNumber,
+            coiDriveIds: selection.coiDriveIds,
+            coiFileNames: selection.coiFileNames,
+            coiAttachmentName: selection.coiAttachmentName,
+          });
+    } else if (selection.missing && writeLog) {
+      await writeLog("warn", "primus",
+          "Insured load has no Certificate of Insurance — " +
+          "customer invoice email will still send", {
+            loadNumber,
+          });
+    }
+    return Object.assign({lookupFailed: false}, selection);
+  } catch (err) {
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Certificate of Insurance lookup failed — " +
+          "customer invoice email will still send", {
+            loadNumber,
+            error: err && err.message,
+          });
+    }
+    return Object.assign({}, empty, {lookupFailed: true});
+  }
+}
+
+/**
+ * Names the certificate in the invoice email when one is attached.
+ * Primus keeps the stored drive filename; this sentence tells the customer
+ * that file is the Certificate of Insurance.
+ * @param {string} bodyHtml Email HTML.
+ * @param {object} coi resolveCustomerInvoiceCoi result.
+ * @return {string}
+ */
+function emailBodyWithCoiNote(bodyHtml, coi) {
+  if (!coi || !coi.coiDriveIds || !coi.coiDriveIds.length) {
+    return bodyHtml;
+  }
+  const html = String(bodyHtml || "");
+  if (/certificate of insurance/i.test(html)) return html;
+  const paragraph =
+    "<p>A Certificate of Insurance for this shipment is attached.</p>";
+  const marker = "<p>Please see your invoices attached.</p>";
+  if (html.includes(marker)) return html.replace(marker, marker + paragraph);
+  return paragraph + html;
 }
 
 /**
@@ -1736,6 +2029,7 @@ async function emailBOLDocs(args) {
     blockedDriveFileIds,
     miworld,
     customerName: resolvedCustomerName,
+    docData,
   } = await resolvePodDriveIdsForEmail({
     booking,
     loadNumber,
@@ -1746,8 +2040,6 @@ async function emailBOLDocs(args) {
       ...(Array.isArray(args.driveFileIds) ? args.driveFileIds : []),
     ],
   });
-
-  const driveFileIds = [...new Set(resolvedDriveIds || podDriveIds || [])];
   if (!podDriveIds || !podDriveIds.length) {
     return {
       ok: false,
@@ -1764,9 +2056,21 @@ async function emailBOLDocs(args) {
         blockedCarrierBillDriveIds: blockedDriveFileIds || [],
         customerInvoiceId: String(customerInvoiceId),
         invoiceNumber,
+        hasInsurance: false,
+        coiDriveIdsSelected: [],
+        coiFileNames: [],
+        coiAttachmentName: null,
+        coiMissing: false,
       },
     };
   }
+
+  const coi = await resolveCustomerInvoiceCoi(docData, loadNumber);
+  const coiDriveIds = coi.coiDriveIds || [];
+  const driveFileIds = [...new Set([
+    ...(resolvedDriveIds || podDriveIds || []),
+    ...coiDriveIds,
+  ])];
 
   const subject = toOutboundEmailSafeSubject(
       args.subject || `Invoice for BOL#${loadNumber}`);
@@ -1776,7 +2080,7 @@ async function emailBOLDocs(args) {
       customBody :
       appendCustomerInvoiceEmailSignature(customBody)) :
     DEFAULT_EMAIL_DOCS_BODY;
-  const body = toOutboundEmailSafeText(bodyRaw);
+  const body = toOutboundEmailSafeText(emailBodyWithCoiNote(bodyRaw, coi));
   const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
     "accounting@innovativecarriers.com";
 
@@ -1809,7 +2113,7 @@ async function emailBOLDocs(args) {
   params["email-docs-bol"] = "on";
   // UI checkbox: attach issued customer invoice
   params[`email-docs-invoice-${customerInvoiceId}`] = "on";
-  // UI checkbox(es): attach POD / quote approval / customer drive file(s)
+  // UI checkbox(es): POD, Miworld quote approval, and Certificate of Insurance
   for (const driveId of driveFileIds) {
     params[`email-docs-drive-${driveId}`] = "on";
   }
@@ -1826,6 +2130,12 @@ async function emailBOLDocs(args) {
     blockedCarrierBillDriveIds: blockedDriveFileIds || [],
     customerInvoiceId: String(customerInvoiceId),
     invoiceNumber,
+    hasInsurance: !!coi.hasInsurance,
+    coiDriveIdsSelected: coiDriveIds,
+    coiFileNames: coi.coiFileNames || [],
+    coiAttachmentName: coi.coiAttachmentName || null,
+    coiMissing: !!coi.missing,
+    coiLookupFailed: !!coi.lookupFailed,
   };
   return {
     ok: success,
@@ -5464,6 +5774,11 @@ exports._internal = {
   listPodDriveFileIds,
   listCustomerDriveFileIds,
   listQuoteApprovalDriveFileIds,
+  listCertificateOfInsuranceTypeIds,
+  listCoiDriveFiles,
+  loadHasPostedInsurance,
+  selectCustomerInvoiceCoi,
+  emailBodyWithCoiNote,
   isMiworldCustomer,
   customerNameFromBooking,
   fetchUiFileTypes,
