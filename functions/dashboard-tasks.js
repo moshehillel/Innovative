@@ -19,6 +19,7 @@ const TASK_TYPE = Object.freeze({
   ADDITIONAL_CHARGE: "additional_charge",
   SIGNED_POD: "signed_pod",
   POD_DISCREPANCY: "pod_discrepancy",
+  MISSING_RATE: "missing_rate",
 });
 
 const TASK_STATUS = Object.freeze({
@@ -73,6 +74,27 @@ async function findOpenDuplicateTask(db, data) {
   const followUpId = String(data.followUpId || "").trim();
   const tenantId = String(data.tenantId || "default");
   const type = data.type || TASK_TYPE.HUMAN_REVIEW;
+  const invoiceId = String(data.invoiceId || "").trim();
+  if (ownership.isMissingRateType(type) && invoiceId) {
+    const byInvoice = await db.collection(TASK_COLLECTION)
+        .where("invoiceId", "==", invoiceId)
+        .limit(20)
+        .get();
+    const match = byInvoice.docs.find((doc) => {
+      const row = doc.data() || {};
+      if ((row.status || "") !== TASK_STATUS.OPEN) return false;
+      if (!ownership.sameTenant(row.tenantId, tenantId)) return false;
+      return ownership.isMissingRateType(row.type);
+    });
+    if (match) {
+      return {
+        id: match.id,
+        ref: match.ref,
+        data: match.data() || {},
+        item: {},
+      };
+    }
+  }
   let docs = [];
   if (loadNumber) {
     const snap = await db.collection(TASK_COLLECTION)
@@ -186,6 +208,23 @@ async function createDashboardTask(db, data) {
             !hasFiles) {
           patch.attachments = mail.attachments;
         }
+        if (ownership.isMissingRateType(data.type)) {
+          if (data.dispatcherEmail && !existing.data.dispatcherEmail) {
+            patch.dispatcherEmail = ownership.normEmail(data.dispatcherEmail);
+            patch.dispatcherName = data.dispatcherName ||
+              existing.data.dispatcherName || null;
+            patch.dispatcherKey = patch.dispatcherEmail ||
+              (patch.dispatcherName ?
+                String(patch.dispatcherName).trim().toLowerCase() : null);
+          }
+          if (existing.data.ownerBucket !== ownership.OWNER_BUCKET.DISPATCH) {
+            patch.ownerBucket = ownership.OWNER_BUCKET.DISPATCH;
+            patch.awaitingReplyFrom = ownership.OWNER_BUCKET.DISPATCH;
+          }
+          if (data.dispatcherResolved && !existing.data.dispatcherResolved) {
+            patch.dispatcherResolved = true;
+          }
+        }
         if (Object.keys(patch).length) {
           patch.updatedAt = admin.firestore.FieldValue.serverTimestamp();
           await existing.ref.update(patch);
@@ -222,6 +261,7 @@ async function createDashboardTask(db, data) {
       ...owner,
       ...mail,
       status: TASK_STATUS.OPEN,
+      ...(data.dispatcherResolved ? {dispatcherResolved: true} : {}),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       dismissedAt: null,
     });
@@ -440,7 +480,7 @@ async function loadDocsById(db, collectionName, ids) {
  * @param {object[]} items Page items.
  * @return {Promise<void>}
  */
-async function hydratePageBodies(db, additionalChargesMod, items) {
+async function hydratePageBodies(db, additionalChargesMod, items, tenantId) {
   const list = Array.isArray(items) ? items : [];
   if (!list.length) return;
   const taskIds = [];
@@ -459,7 +499,11 @@ async function hydratePageBodies(db, additionalChargesMod, items) {
   for (const item of list) {
     const followId = item.followUpId ||
       (item.source === "additionalCharges" ? item.id : null);
-    const follow = followId ? followDocs.get(followId) : null;
+    let follow = followId ? followDocs.get(followId) : null;
+    if (follow && tenantId &&
+        !ownership.sameTenant(follow.tenantId, tenantId)) {
+      follow = null;
+    }
     const taskDoc = item.source !== "additionalCharges" ?
       taskDocs.get(item.id) : null;
     const stored = taskDoc ? capEmailBody(taskDoc.body) : null;
@@ -499,7 +543,8 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
 
   // Drop legacy human_review rows — those belong in Notifications.
   const tasks = taskSnap.docs.map(serializeTaskDoc)
-      .filter((t) => t.type !== TASK_TYPE.HUMAN_REVIEW);
+      .filter((t) => t.type !== TASK_TYPE.HUMAN_REVIEW)
+      .filter((t) => ownership.sameTenant(t.tenantId, tenantId));
   const linkedFollowUpIds = new Set(
       tasks.map((t) => t.followUpId).filter(Boolean),
   );
@@ -530,6 +575,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     }
     if (fuDoc) {
       const d = fuDoc.data() || {};
+      if (!ownership.sameTenant(d.tenantId, tenantId)) continue;
       task.subject = task.subject || d.emailSubject || null;
       task.to = task.to || d.emailTo || null;
       task.cc = task.cc || d.emailCc || null;
@@ -546,7 +592,9 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   chargeSnap.forEach((doc) => {
     if (linkedFollowUpIds.has(doc.id)) return;
     const d = doc.data() || {};
-    if (d.tenantId && d.tenantId !== tenantId) return;
+    // Shared collection. A missing tenantId is the legacy default tenant,
+    // not a pass for every client.
+    if (!ownership.sameTenant(d.tenantId, tenantId)) return;
     const isDispute = d.status ===
       additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
       d.chargePhase === "dispute";
@@ -600,6 +648,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     const fuDoc = chargeSnap.docs.find((x) => x.id === task.followUpId);
     if (!fuDoc) continue;
     const d = fuDoc.data() || {};
+    if (!ownership.sameTenant(d.tenantId, tenantId)) continue;
     task.followUpStatus = d.status || task.followUpStatus || null;
     if (d.status === additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
         d.chargePhase === "dispute" || task.chargePhase === "dispute") {
@@ -635,7 +684,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     urgentFirst: opts.urgentFirst,
   });
 
-  await hydratePageBodies(db, additionalChargesMod, page.items);
+  await hydratePageBodies(db, additionalChargesMod, page.items, tenantId);
 
   return {
     tasks: page.items,
@@ -672,6 +721,10 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     if (!snap.exists) {
       return {ok: false, error: "Task not found."};
     }
+    const charge = snap.data() || {};
+    if (!ownership.sameTenant(charge.tenantId, opts.tenantId)) {
+      return {ok: false, error: "Task not found."};
+    }
     await ref.update({
       resolved: true,
       status: additionalChargesMod.FOLLOW_UP_STATUS.RESOLVED,
@@ -686,8 +739,7 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     return {ok: false, error: "Task not found."};
   }
   const data = snap.data() || {};
-  if (opts.tenantId && data.tenantId &&
-      data.tenantId !== opts.tenantId) {
+  if (!ownership.sameTenant(data.tenantId, opts.tenantId)) {
     return {ok: false, error: "Task not found."};
   }
   await ref.update({
@@ -717,7 +769,8 @@ async function markTaskInDispute(db, additionalChargesMod, opts) {
   if (opts.taskId && opts.source !== "additionalCharges") {
     const ref = db.collection(TASK_COLLECTION).doc(String(opts.taskId));
     const snap = await ref.get();
-    if (snap.exists) {
+    if (snap.exists &&
+        ownership.sameTenant((snap.data() || {}).tenantId, opts.tenantId)) {
       await ref.update(patch);
       updates.push("task");
     }
@@ -729,7 +782,8 @@ async function markTaskInDispute(db, additionalChargesMod, opts) {
     const ref = db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
         .doc(String(followUpId));
     const snap = await ref.get();
-    if (snap.exists) {
+    if (snap.exists &&
+        ownership.sameTenant((snap.data() || {}).tenantId, opts.tenantId)) {
       await ref.update({
         status: additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING,
         chargePhase: "dispute",
@@ -747,6 +801,8 @@ async function markTaskInDispute(db, additionalChargesMod, opts) {
         .limit(10)
         .get();
     for (const doc of q.docs) {
+      const row = doc.data() || {};
+      if (!ownership.sameTenant(row.tenantId, opts.tenantId)) continue;
       // eslint-disable-next-line no-await-in-loop
       await doc.ref.update(patch);
       updates.push(doc.id);
@@ -772,11 +828,13 @@ async function handoffTaskToDispatch(db, additionalChargesMod, opts) {
     const snap = await ref.get();
     if (snap.exists) {
       const data = snap.data() || {};
-      await ref.update(ownership.handoffToDispatchUpdate(data, {
-        reason: "sarah_dashboard_action",
-        option,
-      }));
-      updates.push("task");
+      if (ownership.sameTenant(data.tenantId, opts.tenantId)) {
+        await ref.update(ownership.handoffToDispatchUpdate(data, {
+          reason: "sarah_dashboard_action",
+          option,
+        }));
+        updates.push("task");
+      }
     }
   }
 
@@ -788,11 +846,13 @@ async function handoffTaskToDispatch(db, additionalChargesMod, opts) {
     const snap = await ref.get();
     if (snap.exists) {
       const data = snap.data() || {};
-      await ref.update(ownership.handoffToDispatchUpdate(data, {
-        reason: "sarah_dashboard_action",
-        option,
-      }));
-      updates.push("followUp");
+      if (ownership.sameTenant(data.tenantId, opts.tenantId)) {
+        await ref.update(ownership.handoffToDispatchUpdate(data, {
+          reason: "sarah_dashboard_action",
+          option,
+        }));
+        updates.push("followUp");
+      }
     }
   }
 
@@ -804,9 +864,7 @@ async function handoffTaskToDispatch(db, additionalChargesMod, opts) {
         .get();
     for (const doc of q.docs) {
       const data = doc.data() || {};
-      if (opts.tenantId && data.tenantId && data.tenantId !== opts.tenantId) {
-        continue;
-      }
+      if (!ownership.sameTenant(data.tenantId, opts.tenantId)) continue;
       // eslint-disable-next-line no-await-in-loop
       await doc.ref.update(ownership.handoffToDispatchUpdate(data, {
         reason: "sarah_dashboard_action",
@@ -819,6 +877,133 @@ async function handoffTaskToDispatch(db, additionalChargesMod, opts) {
   return {ok: true, updates};
 }
 
+/**
+ * Fields for a dispatcher-owned missing-rate task.
+ * @param {object} opts Load and dispatcher fields.
+ * @return {object}
+ */
+function missingRateTaskPayload(opts) {
+  const loadNumber = opts.loadNumber || null;
+  const dispatcherEmail = opts.dispatcherEmail ?
+    ownership.normEmail(opts.dispatcherEmail) : null;
+  const dispatcherName = opts.dispatcherName ?
+    String(opts.dispatcherName).trim() : null;
+  return {
+    tenantId: opts.tenantId || "default",
+    type: TASK_TYPE.MISSING_RATE,
+    title: `Missing carrier rate — Load ${loadNumber || "—"}`,
+    description: "The carrier rate is missing. The dispatcher needs to reply.",
+    body: opts.body || null,
+    subject: opts.subject ||
+      `Action needed — missing carrier rate — Load ${loadNumber || "—"}`,
+    to: dispatcherEmail,
+    cc: opts.cc || null,
+    loadNumber,
+    proNumber: opts.proNumber || null,
+    carrierName: opts.carrierName || null,
+    invoiceId: opts.invoiceId || null,
+    reason: "MISSING_RATE",
+    invoiceAmount: opts.invoiceAmount != null ? opts.invoiceAmount : null,
+    ownerBucket: ownership.OWNER_BUCKET.DISPATCH,
+    dispatcherEmail,
+    dispatcherName,
+    ownershipReason: "missing_carrier_rate",
+    dispatcherResolved: opts.dispatcherResolved === true,
+  };
+}
+
+/**
+ * Opens dispatcher tasks for invoices already held on a missing rate.
+ * Does not move low-margin holds. Dispatcher lookup is capped per call.
+ * @param {object} db Firestore.
+ * @param {object} invoicesCol Tenant invoice collection.
+ * @param {object} opts tenantId, resolveDispatcher(inv).
+ * @return {Promise<object>}
+ */
+async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
+  if (!invoicesCol || typeof invoicesCol.where !== "function") {
+    return {ensured: 0};
+  }
+  const tenantId = String((opts && opts.tenantId) || "default");
+  let snap;
+  try {
+    snap = await invoicesCol
+        .where("decisionStage", "==", "needs_customer_rate_review")
+        .limit(40)
+        .get();
+  } catch (err) {
+    console.error("[ensureMissingRateDispatchTasks]", err.message);
+    return {ensured: 0};
+  }
+  let ensured = 0;
+  let lookupsLeft = 5;
+  for (const doc of snap.docs) {
+    const inv = doc.data() || {};
+    if (!ownership.isMissingCarrierRateHold(inv)) continue;
+    try {
+    // eslint-disable-next-line no-await-in-loop
+    const existing = await findOpenDuplicateTask(db, {
+      tenantId,
+      type: TASK_TYPE.MISSING_RATE,
+      invoiceId: doc.id,
+      loadNumber: inv.loadNumber || null,
+      reason: "MISSING_RATE",
+    });
+    if (existing && (existing.data.dispatcherEmail ||
+        existing.data.dispatcherResolved)) {
+      continue;
+    }
+    let dispatcherEmail = inv.dispatcherEmail || null;
+    let dispatcherName = inv.dispatcherName || null;
+    let lookedUp = false;
+    if (!dispatcherEmail && lookupsLeft > 0 &&
+        typeof opts.resolveDispatcher === "function") {
+      lookupsLeft -= 1;
+      lookedUp = true;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const found = await opts.resolveDispatcher(inv);
+        if (found && found.email) {
+          dispatcherEmail = found.email;
+          dispatcherName = found.name || dispatcherName;
+        }
+      } catch (err) {
+        console.error("[ensureMissingRateDispatchTasks] dispatcher:",
+            err.message);
+      }
+    }
+    if (existing && !dispatcherEmail) {
+      if (lookedUp) {
+        // eslint-disable-next-line no-await-in-loop
+        await existing.ref.update({
+          dispatcherResolved: true,
+          ownerBucket: ownership.OWNER_BUCKET.DISPATCH,
+          awaitingReplyFrom: ownership.OWNER_BUCKET.DISPATCH,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    const id = await createDashboardTask(db, missingRateTaskPayload({
+      tenantId,
+      loadNumber: inv.loadNumber,
+      proNumber: inv.proNumber,
+      carrierName: inv.carrierName,
+      invoiceId: doc.id,
+      invoiceAmount: inv.invoiceAmount,
+      dispatcherEmail,
+      dispatcherName,
+      dispatcherResolved: lookedUp || Boolean(dispatcherEmail),
+    }));
+    if (id) ensured += 1;
+    } catch (err) {
+      console.error("[ensureMissingRateDispatchTasks] row:", err.message);
+    }
+  }
+  return {ensured};
+}
+
 module.exports = {
   TASK_COLLECTION,
   TASK_TYPE,
@@ -828,4 +1013,6 @@ module.exports = {
   dismissDashboardTask,
   handoffTaskToDispatch,
   markTaskInDispute,
+  missingRateTaskPayload,
+  ensureMissingRateDispatchTasks,
 };

@@ -1102,10 +1102,11 @@ async function findUnresolvedDuplicateFollowUp(db, data) {
     chargesTotal: data.chargesTotal,
   };
   let best = null;
+  const ownership = require("./dashboard-ownership");
   for (const doc of snap.docs) {
     const row = doc.data() || {};
     if (row.resolved === true) continue;
-    if (data.tenantId && row.tenantId && row.tenantId !== data.tenantId) {
+    if (!ownership.sameTenant(row.tenantId, data.tenantId || "default")) {
       continue;
     }
     const candidate = {
@@ -1175,7 +1176,7 @@ async function createFollowUp(db, data) {
       carrierName: data.carrierName || null,
       customerName: data.customerName || null,
       invoiceId: data.invoiceId || null,
-      tenantId: data.tenantId || null,
+      tenantId: data.tenantId || "default",
       category: data.category || null,
       charges: Array.isArray(data.charges) ? data.charges : [],
       chargesTotal: Number(data.chargesTotal) || 0,

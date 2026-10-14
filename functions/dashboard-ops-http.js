@@ -6,6 +6,7 @@
 
 const dashboardOps = require("./dashboard-ops");
 const dashboardEmailFiles = require("./dashboard-email-files");
+const ownership = require("./dashboard-ownership");
 
 let deps = {};
 
@@ -287,7 +288,7 @@ async function handleReplyUnhandledEmail(req, res) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     const n = snap.data() || {};
-    if (n.tenantId && n.tenantId !== tenant.tenantId) {
+    if (!ownership.sameTenant(n.tenantId, tenant.tenantId)) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     const to = extractEmailAddress(n.from);
@@ -356,7 +357,7 @@ async function handleDeleteUnhandledEmail(req, res) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     const n = snap.data() || {};
-    if (n.tenantId && n.tenantId !== tenant.tenantId) {
+    if (!ownership.sameTenant(n.tenantId, tenant.tenantId)) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     if (n.messageId && typeof deps.trashGmailMessage === "function") {
@@ -480,7 +481,7 @@ async function handleDownloadEmailAttachment(req, res) {
     if (!data) {
       return res.status(404).json({ok: false, error: "Not found."});
     }
-    if (data.tenantId && tenant && data.tenantId !== tenant.tenantId) {
+    if (!ownership.sameTenant(data.tenantId, tenant && tenant.tenantId)) {
       return res.status(404).json({ok: false, error: "Not found."});
     }
     let att = Array.isArray(data.attachments) ?

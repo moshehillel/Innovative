@@ -10,6 +10,55 @@ const OWNER_BUCKET = Object.freeze({
   DISPATCH: "dispatch",
 });
 
+/**
+ * Empty tenant ids are the legacy default tenant. They are never "every tenant".
+ * @param {string|null|undefined} value Stored or requested tenant id.
+ * @return {string}
+ */
+function canonicalTenantId(value) {
+  const id = String(value == null ? "" : value).trim();
+  return id || "default";
+}
+
+/**
+ * @param {string|null|undefined} rowTenantId Tenant stored on the row.
+ * @param {string|null|undefined} callerTenantId Tenant of the caller.
+ * @return {boolean}
+ */
+function sameTenant(rowTenantId, callerTenantId) {
+  return canonicalTenantId(rowTenantId) === canonicalTenantId(callerTenantId);
+}
+
+/**
+ * @param {string|null|undefined} type Task or email type.
+ * @return {boolean}
+ */
+function isMissingRateType(type) {
+  const value = String(type || "").trim().toLowerCase();
+  return value === "missing_rate" || value === "rate_missing";
+}
+
+/**
+ * True for an invoice hold where the carrier/customer rate is missing.
+ * Low-margin pauses share the rate-review stage and stay off this path.
+ * @param {object} inv Invoice fields.
+ * @return {boolean}
+ */
+function isMissingCarrierRateHold(inv) {
+  if (!inv || typeof inv !== "object") return false;
+  const stage = String(inv.decisionStage || "").toLowerCase();
+  const wf = String(inv.finalWorkflowStatus || "").toLowerCase();
+  if (wf === "completed" || stage === "completed") return false;
+  const onRateHold = stage === "needs_customer_rate_review" ||
+    wf === "needs_customer_rate_review";
+  if (!onRateHold) return false;
+  const rate = Number(inv.customerRate || 0);
+  if (Number.isFinite(rate) && rate > 0) return false;
+  const reason = String(inv.decisionReason || "").toLowerCase();
+  if (/too low|low margin|low_margin/.test(reason)) return false;
+  return true;
+}
+
 const URGENT_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 /**
@@ -69,15 +118,35 @@ function accountingEmails() {
  * @return {object}
  */
 function classifyDashboardOwner(opts) {
+  const typeEarly = String(opts.type || opts.emailType || "").toLowerCase();
+  // Missing carrier rate is dispatcher work even when Lisa is CC'd.
+  if (isMissingRateType(typeEarly)) {
+    const rateDispatcherEmail = normEmail(opts.dispatcherEmail);
+    const rateDispatcherName = opts.dispatcherName ?
+      String(opts.dispatcherName).trim() : null;
+    return {
+      ownerBucket: OWNER_BUCKET.DISPATCH,
+      awaitingReplyFrom: OWNER_BUCKET.DISPATCH,
+      dispatcherEmail: rateDispatcherEmail || null,
+      dispatcherName: rateDispatcherName || null,
+      dispatcherKey: rateDispatcherEmail ||
+        (rateDispatcherName ? rateDispatcherName.toLowerCase() : null),
+    };
+  }
+
+  const dispatcherEmail = normEmail(opts.dispatcherEmail);
+  const dispatcherName = opts.dispatcherName ?
+    String(opts.dispatcherName).trim() : null;
+  const dispatcherKey = dispatcherEmail ||
+    (dispatcherName ? dispatcherName.toLowerCase() : null);
   const forced = String(opts.ownerBucket || "").toLowerCase();
   if (Object.values(OWNER_BUCKET).includes(forced)) {
     return {
       ownerBucket: forced,
       awaitingReplyFrom: forced,
-      dispatcherEmail: normEmail(opts.dispatcherEmail) || null,
-      dispatcherName: opts.dispatcherName || null,
-      dispatcherKey: normEmail(opts.dispatcherEmail) ||
-        String(opts.dispatcherName || "").trim().toLowerCase() || null,
+      dispatcherEmail: dispatcherEmail || null,
+      dispatcherName,
+      dispatcherKey,
     };
   }
 
@@ -86,9 +155,6 @@ function classifyDashboardOwner(opts) {
   const all = new Set([...toList, ...ccList]);
   const sarah = sarahEmail();
   const accounting = accountingEmails();
-  const dispatcherEmail = normEmail(opts.dispatcherEmail);
-  const dispatcherName = opts.dispatcherName ?
-    String(opts.dispatcherName).trim() : null;
 
   const hasSarah = all.has(sarah) || toList.includes(sarah);
   const hasDispatcher = Boolean(dispatcherEmail && all.has(dispatcherEmail));
@@ -115,9 +181,6 @@ function classifyDashboardOwner(opts) {
   } else if (type === "signed_pod" || type === "pod_discrepancy") {
     ownerBucket = OWNER_BUCKET.ACCOUNTING;
   }
-
-  const dispatcherKey = dispatcherEmail ||
-    (dispatcherName ? dispatcherName.toLowerCase() : null);
 
   return {
     ownerBucket,
@@ -260,7 +323,8 @@ function filterSortPaginate(items, opts) {
   const dispatcherKey = opts.dispatcherKey ?
     String(opts.dispatcherKey).toLowerCase() : null;
   const offset = Math.max(0, Number(opts.offset) || 0);
-  const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), 100);
+  const cap = Math.min(Math.max(Number(opts.maxLimit) || 100, 1), 5000);
+  const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), cap);
   const urgentFirst = opts.urgentFirst !== false;
 
   let list = items.map(applyOwnerDefaults);
@@ -305,6 +369,10 @@ function filterSortPaginate(items, opts) {
 module.exports = {
   OWNER_BUCKET,
   URGENT_AGE_MS,
+  canonicalTenantId,
+  sameTenant,
+  isMissingRateType,
+  isMissingCarrierRateHold,
   normEmail,
   splitEmails,
   sarahEmail,

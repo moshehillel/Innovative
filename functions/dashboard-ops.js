@@ -352,6 +352,7 @@ async function listNotifications(db, opts) {
           .doc(n.followUpId).get();
       if (!fu.exists) continue;
       const d = fu.data() || {};
+      if (!ownership.sameTenant(d.tenantId, n.tenantId || tenantId)) continue;
       if (d.emailHtml) {
         n.body = String(d.emailHtml);
         n.subject = n.subject || d.emailSubject || null;
@@ -416,7 +417,7 @@ async function dismissNotification(db, opts) {
   const snap = await ref.get();
   if (!snap.exists) return {ok: false, error: "Notification not found."};
   const data = snap.data() || {};
-  if (opts.tenantId && data.tenantId && data.tenantId !== opts.tenantId) {
+  if (!ownership.sameTenant(data.tenantId, opts.tenantId)) {
     return {ok: false, error: "Notification not found."};
   }
   await ref.update({
@@ -443,7 +444,7 @@ async function flagNotification(db, opts) {
   const snap = await ref.get();
   if (!snap.exists) return {ok: false, error: "Notification not found."};
   const data = snap.data() || {};
-  if (opts.tenantId && data.tenantId && data.tenantId !== opts.tenantId) {
+  if (!ownership.sameTenant(data.tenantId, opts.tenantId)) {
     return {ok: false, error: "Notification not found."};
   }
   await ref.update({
@@ -472,6 +473,10 @@ async function markActed(db, opts) {
   const ref = db.collection(NOTIF_COLLECTION).doc(id);
   const snap = await ref.get();
   if (!snap.exists) return {ok: false, error: "Notification not found."};
+  const data = snap.data() || {};
+  if (!ownership.sameTenant(data.tenantId, opts.tenantId)) {
+    return {ok: false, error: "Notification not found."};
+  }
   await ref.update({
     status: NOTIF_STATUS.ACTED,
     actedAt: admin.firestore.FieldValue.serverTimestamp(),

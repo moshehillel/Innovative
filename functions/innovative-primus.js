@@ -2102,7 +2102,8 @@ exports.processPrimusWorkflow = onRequest(
             additionalChargesMod.buildAdditionalChargeApprovalEmail({
               baseUrl: `https://${req.get("host")}`,
               invoiceId,
-              tenantId: (req.body && req.body.tenantId) || null,
+              tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
               loadNumber: invoice.loadNumber,
               carrierName: invoice.carrierName,
               customerName: invoice.customerName || null,
@@ -2141,7 +2142,8 @@ exports.processPrimusWorkflow = onRequest(
                 carrierName: invoice.carrierName,
                 customerName: invoice.customerName || null,
                 invoiceId,
-                tenantId: (req.body && req.body.tenantId) || null,
+                tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                 category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
                 charges: actionCharges,
                 chargesTotal: proofTotal,
@@ -2489,7 +2491,8 @@ exports.processPrimusWorkflow = onRequest(
                   req,
                   code: "MISSING_CUSTOMER",
                   invoiceId,
-                  tenantId: (req.body && req.body.tenantId) || null,
+                  tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                   loadNumber: invoice.loadNumber,
                   context: {
                     loadNumber: invoice.loadNumber,
@@ -2654,7 +2657,8 @@ exports.processPrimusWorkflow = onRequest(
                   req,
                   code: "MISSING_RATE",
                   invoiceId,
-                  tenantId: (req.body && req.body.tenantId) || null,
+                  tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                   loadNumber: invoice.loadNumber,
                   context: {
                     loadNumber: invoice.loadNumber,
@@ -2760,7 +2764,8 @@ exports.processPrimusWorkflow = onRequest(
                   req,
                   code: isLowMargin ? "LOW_MARGIN" : "MISSING_RATE",
                   invoiceId,
-                  tenantId: (req.body && req.body.tenantId) || null,
+                  tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                   loadNumber: invoice.loadNumber,
                   context: {
                     loadNumber: invoice.loadNumber,

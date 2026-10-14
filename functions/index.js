@@ -5381,6 +5381,31 @@ async function notifyDispatcherRateIssue(opts) {
         dispatcherUserName: dispatcher.userName || null,
       });
 
+  if ((code || "MISSING_RATE") === "MISSING_RATE") {
+    const dispatcherEmail = (dispatcher.ok && dispatcher.email) ?
+      dispatcher.email : null;
+    try {
+      await dashboardTasks.createDashboardTask(db,
+          dashboardTasks.missingRateTaskPayload({
+            tenantId: tenantId || "default",
+            loadNumber: loadNumber || (context && context.loadNumber) || null,
+            carrierName: (context && context.carrierName) || null,
+            invoiceId: invoiceId || null,
+            invoiceAmount: context && context.invoiceAmount != null ?
+              context.invoiceAmount : null,
+            body: html,
+            subject: alert.subject,
+            cc: emailPayload.cc || null,
+            dispatcherEmail,
+            dispatcherName: dispatcher.displayName ||
+              dispatcher.userName || null,
+            dispatcherResolved: true,
+          }));
+    } catch (taskErr) {
+      console.error("[notifyDispatcherRateIssue] task:", taskErr.message);
+    }
+  }
+
   return {
     ok: true,
     to: emailPayload.to,
@@ -13057,6 +13082,24 @@ exports.getDashboardTasks = onRequest(
     const tenant = await resolveDashboardTenant(req);
     const limit = Math.min(Number(req.query.limit || 50), 100);
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    if (!req.query.chargePhase) {
+      const primusUiBridgeLocal = require("./primus-ui-bridge");
+      await dashboardTasks.ensureMissingRateDispatchTasks(
+          db, tcol(tenant, "invoices"), {
+            tenantId: tenant.tenantId,
+            resolveDispatcher: tenant.tms === "primus" ? async (inv) => {
+              const found = await primusUiBridgeLocal.resolveDispatcherEmail({
+                loadNumber: inv && inv.loadNumber,
+                fetchBooking: fetchPrimusBooking,
+              });
+              if (!found || !found.ok || !found.email) return null;
+              return {
+                email: found.email,
+                name: found.displayName || found.userName || null,
+              };
+            } : null,
+          });
+    }
     const result = await dashboardTasks.listDashboardTasks(
         db, additionalCharges, {
           tenantId: tenant.tenantId,
