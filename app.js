@@ -95,6 +95,7 @@
   let dispatcherKey = null;
   let taskOffset = 0;
   let taskHasMore = false;
+  let taskLoadSeq = 0;
   let tasksCache = [];
   let disputeCount = 0;
   let bucketCounts = {accounting: {}, sarah: {}, dispatch: {}};
@@ -857,9 +858,11 @@
       renderTasks(tasksCache.slice(), {append: false, preserveCache: true});
     });
 
+    showError(null);
     postJson("/dismissDashboardTask", {
       taskId: task.id,
       source: task.source,
+      invoiceId: task.invoiceId || null,
     }).catch((error) => {
       showError(error.message || "Could not dismiss task.");
       // Soft recovery — pull fresh list without forcing scroll to top.
@@ -1000,6 +1003,7 @@
   }
 
   async function loadTasks({reset = true} = {}) {
+    const seq = ++taskLoadSeq;
     if (reset) {
       taskOffset = 0;
       taskHasMore = false;
@@ -1009,14 +1013,17 @@
       updateTasksLoadMore(true);
     }
     try {
+      const sort = els.workspaceSort?.value || "urgent";
       const params = new URLSearchParams({
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
         view: "queue",
         issue: issueFilter || "all",
+        sort,
       });
       if (dispatcherQuery) params.set("dispatcher", dispatcherQuery);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
+      if (seq !== taskLoadSeq) return;
       openTaskCount = data.openCount || 0;
       disputeCount = data.disputeCount != null ? data.disputeCount : disputeCount;
       bucketCounts = data.bucketCounts || bucketCounts;
@@ -1031,6 +1038,7 @@
       if (savedTop != null && scrollEl) scrollEl.scrollTop = savedTop;
       updateTasksLoadMore(false);
     } catch (error) {
+      if (seq !== taskLoadSeq) return;
       if (reset) {
         els.tasksContainer.innerHTML =
           '<p class="panel-empty">Could not load tasks.</p>';
@@ -1510,6 +1518,10 @@
     }
   });
   els.workspaceSort?.addEventListener("change", () => {
+    if (activeTab === "tasks") {
+      loadTasks({reset: true});
+      return;
+    }
     els.workspaceSearch?.dispatchEvent(new Event("input"));
   });
   if (els.logExportDate) els.logExportDate.value = todayEasternIsoDate();
