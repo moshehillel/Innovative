@@ -403,6 +403,10 @@
     if (t === "signed_pod") {
       return {label: "Signed POD", cls: "type-badge-signed"};
     }
+    if (t === "missing_rate" || t === "rate_missing" ||
+        reason === "missing_rate") {
+      return {label: "Missing rate", cls: "type-badge-review"};
+    }
     if (/missing/i.test(reason)) {
       return {label: "Missing Information", cls: "type-badge-review"};
     }
