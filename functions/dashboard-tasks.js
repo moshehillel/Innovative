@@ -561,6 +561,24 @@ function tenantCollection(db, base, opts) {
   return db.collection(name);
 }
 
+/**
+ * Loads open rows for the shared collection. Tasks and charges are stored
+ * once and separated by tenantId, so a prefixed collection is included only
+ * when it is a different name.
+ * @param {object} db Firestore.
+ * @param {string} base Collection name.
+ * @param {object} opts collectionPrefix.
+ * @param {Function} buildQuery Receives a collection and returns a query.
+ * @param {number} maxDocs Cap.
+ * @return {Promise<object[]>}
+ */
+async function loadScopedPages(db, base, _opts, buildQuery, maxDocs) {
+  const cap = Math.min(Math.max(Number(maxDocs) || 2000, 1), 2000);
+  // Shared collections are partitioned by tenantId. A prefixed name is a
+  // different collection and is not indexed for these list queries.
+  return collectPaged(buildQuery(db.collection(base)), cap);
+}
+
 async function listDashboardTasks(db, additionalChargesMod, opts) {
   const tenantId = String(opts.tenantId || "default");
   // Open rows are kept until someone finishes them. The old 300-row cap
