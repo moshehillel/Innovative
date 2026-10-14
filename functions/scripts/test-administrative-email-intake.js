@@ -1497,6 +1497,24 @@ check("Best Seller evaluate quiet-ignores paid confirm",
     adm.evaluateAdministrativeIgnore(
         bestSellerSubject, bestSellerFrom, bestSellerBody, bestSellerAtt)
         .status === "customer_paid_confirmation_ignored");
+
+const proFundingSubject = "Invoice #10759; Load #268592";
+const proFundingFrom = "billing@profunding.com <billing@profunding.com>";
+const proFundingBody =
+  "Please see the attached carrier invoice. Remit payment to " +
+  "Pro Funding. Thank you.";
+const proFundingAtt = [
+  {filename: "Invoice_10759.pdf", mimeType: "application/pdf"},
+];
+check("Pro Funding invoice is not a customer paid confirmation",
+    !adm.isCustomerInvoicePaidConfirmation(
+        proFundingSubject, proFundingFrom, proFundingBody, proFundingAtt));
+check("Pro Funding invoice is not quiet-ignored",
+    adm.evaluateAdministrativeIgnore(
+        proFundingSubject, proFundingFrom, proFundingBody, [])
+        .status !== "customer_paid_confirmation_ignored");
+check("Pro Funding invoice subject is still an invoice",
+    adm.looksLikeInvoiceEmailContent(proFundingSubject, proFundingBody));
 check("Best Seller not remittance→Abe",
     !adm.isCustomerPaymentRemittanceEmail(
         bestSellerSubject, bestSellerFrom, bestSellerBody));

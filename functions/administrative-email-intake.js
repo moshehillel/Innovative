@@ -564,6 +564,7 @@ function isCarrierOrFactorSender(from) {
     "arcb.com",
     "csx.com",
     "notification.intuit.com",
+    "profunding.com",
   ];
   if (carrierFactorDomains.some((d) =>
     domain === d || domain.endsWith("." + d))) {
@@ -759,12 +760,20 @@ function bodyLooksLikeInvoiceDisputeOrQuestion(body) {
  */
 function isCustomerInvoicePaidConfirmation(
     subject, from, body, attachments) {
-  if (isCarrierOrFactorSender(from)) return false;
+  if (isCarrierOrFactorSender(from) || senderDomainLooksLikeFactor(from)) {
+    return false;
+  }
   if (isOutOfOfficeAutoReply(subject, from, body)) return false;
 
   const addr = emailAddressFromHeader(from);
   if (addr.endsWith("@innovativecarriers.com") ||
       addr.endsWith("@innovativechb.com")) {
+    return false;
+  }
+
+  // A new bill ("Invoice #10759; Load #268592") is not a customer reply
+  // confirming they paid our invoice.
+  if (!/^(?:(?:re|fw|fwd):\s*)+/i.test(String(subject || "").trim())) {
     return false;
   }
 
@@ -1099,7 +1108,7 @@ function senderDomainLooksLikeFactor(from) {
   const at = addr.lastIndexOf("@");
   if (at < 0) return false;
   const domain = addr.slice(at + 1).toLowerCase();
-  return /(?:financ|factor)/.test(domain);
+  return /(?:financ|factor|funding)/.test(domain);
 }
 
 /**
