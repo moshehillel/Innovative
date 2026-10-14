@@ -67,6 +67,7 @@
     tabPanelInvoices: document.getElementById("tabPanelInvoices"),
     tabPanelNotifications: document.getElementById("tabPanelNotifications"),
     dispatcherFolders: document.getElementById("dispatcherFolders"),
+    dispatcherFilter: document.getElementById("dispatcherFilter"),
     workspaceSearch: document.getElementById("workspaceSearch"),
     workspaceSort: document.getElementById("workspaceSort"),
     drawer: document.getElementById("detailDrawer"),
@@ -88,6 +89,8 @@
   let statsInFlight = null;
   let activeTab = "tasks";
   let ownerBucket = "accounting";
+  let issueFilter = "all";
+  let dispatcherQuery = "";
   let chargePhase = null; // null | "dispute"
   let dispatcherKey = null;
   let taskOffset = 0;
@@ -450,7 +453,17 @@
         "additionalCharges" : "task");
     const footer =
       renderChargeButtons(task) +
-      `<button type="button" class="btn btn-outline btn-sm drawer-dismiss">Done / Resolve</button>`;
+      `<div class="assign-row">` +
+      `<select class="input input-select assign-bucket" aria-label="Assign to">` +
+      `<option value="accounting">Accounting</option>` +
+      `<option value="sarah">Sarah</option>` +
+      `<option value="dispatch">Dispatcher</option>` +
+      `</select>` +
+      `<input class="input assign-who" type="text" placeholder="Dispatcher name or email" />` +
+      `<button type="button" class="btn btn-sm btn-primary assign-send">Assign and email</button>` +
+      `</div>` +
+      (task.source === "invoice" ? "" :
+        `<button type="button" class="btn btn-outline btn-sm drawer-dismiss">Done / Resolve</button>`);
     openDrawer("task", task, task.title || meta.label, meta.label, body, footer);
   }
 
@@ -535,6 +548,35 @@
     const foot = els.drawerFooter;
     const body = els.drawerBody;
     if (!foot || !drawerItem) return;
+
+    foot.querySelector(".assign-send")?.addEventListener("click", async () => {
+      const bucket = foot.querySelector(".assign-bucket")?.value || "accounting";
+      const who = foot.querySelector(".assign-who")?.value.trim() || "";
+      const email = (who.match(/[^\s@]+@[^\s@]+\.[^\s@]+/) || [])[0] || "";
+      if (bucket === "dispatch" && !who) {
+        showError("Enter the dispatcher name or email.");
+        return;
+      }
+      try {
+        await postJson("/reassignDashboardWork", {
+          taskId: drawerItem.id,
+          source: drawerItem.source || "dashboardTasks",
+          bucket,
+          dispatcherEmail: email || (bucket === "dispatch" ? who : ""),
+          dispatcherName: email ? who.replace(email, "").trim() || who : who,
+          loadNumber: drawerItem.loadNumber,
+          invoiceId: drawerItem.invoiceId,
+          carrierName: drawerItem.carrierName,
+          subject: drawerItem.subject || drawerItem.title,
+          issue: drawerItem.issueType || drawerItem.type,
+        });
+        showRunResult("Assigned. They were emailed.", false);
+        closeDrawer();
+        await loadTasks({reset: true});
+      } catch (error) {
+        showError(error.message);
+      }
+    });
 
     foot.querySelectorAll(".drawer-dismiss").forEach((btn) => {
       btn.addEventListener("click", () => {
@@ -880,7 +922,7 @@
     }
     if (!list.length) {
       els.tasksContainer.innerHTML =
-        '<p class="panel-empty">No open tasks in this folder.</p>';
+        '<p class="panel-empty">No open work for this filter.</p>';
       return;
     }
 
@@ -900,8 +942,8 @@
         const meta = taskTypeMeta(task);
         const high = Number(task.chargesTotal) >= HIGH_DOLLAR;
         const urgent = Boolean(task.isUrgentOld || task.ageLabel);
-        const statusLabel = task.chargePhase === "dispute" ?
-          "dispute" : (task.ownerBucket || "—");
+        const statusLabel = task.dispatcherName || task.dispatcherEmail ||
+          (task.chargePhase === "dispute" ? "dispute" : (task.issueLabel || task.ownerBucket || "—"));
         rows += `<tr class="${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
           <td><span class="type-badge ${meta.cls}">${bodyEsc(meta.label)}</span></td>
           <td>${task.loadNumber ?
@@ -970,13 +1012,10 @@
       const params = new URLSearchParams({
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
+        view: "queue",
+        issue: issueFilter || "all",
       });
-      if (chargePhase === "dispute") {
-        params.set("chargePhase", "dispute");
-      } else {
-        params.set("ownerBucket", ownerBucket);
-        if (dispatcherKey) params.set("dispatcherKey", dispatcherKey);
-      }
+      if (dispatcherQuery) params.set("dispatcher", dispatcherQuery);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
       openTaskCount = data.openCount || 0;
       disputeCount = data.disputeCount != null ? data.disputeCount : disputeCount;
@@ -1163,6 +1202,24 @@
       }
     }
   }
+
+  document.querySelectorAll("[data-issue]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      issueFilter = btn.getAttribute("data-issue") || "all";
+      document.querySelectorAll("[data-issue]").forEach((el) => {
+        el.classList.toggle("is-active", el === btn);
+      });
+      loadTasks({reset: true});
+    });
+  });
+  let dispatcherTimer = null;
+  els.dispatcherFilter?.addEventListener("input", () => {
+    clearTimeout(dispatcherTimer);
+    dispatcherTimer = setTimeout(() => {
+      dispatcherQuery = els.dispatcherFilter.value.trim();
+      loadTasks({reset: true});
+    }, 300);
+  });
 
   document.querySelectorAll("[data-invoice-group]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1584,7 +1641,6 @@
   switchTab("tasks");
   loadMailStatus();
   setActiveRange(activeRange);
-  loadInvoices({reset: true});
   loadTasks({reset: true});
   loadNotifications({reset: true});
 })();

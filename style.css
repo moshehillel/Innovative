@@ -247,6 +247,7 @@ body::before {
 .workspace-body { min-height: 420px; }
 .panel { display: none; }
 .panel.is-active { display: flex; min-height: 420px; }
+#tabPanelTasks.is-active { flex-direction: column; background: #fff; border: 1px solid var(--ic-border); border-radius: 12px; overflow: hidden; }
 #tabPanelInvoices.is-active, #tabPanelNotifications.is-active {
   display: block;
   background: #fff;
@@ -260,6 +261,7 @@ body::before {
   background: #fff; border: 1px solid var(--ic-border); border-radius: 0 12px 12px 0;
   box-shadow: var(--ic-shadow); overflow: hidden;
 }
+.panel-main-full { border-radius: 0 0 12px 12px; border-top: 0; }
 .panel-empty { margin: 0; padding: 36px 20px; text-align: center; color: var(--ic-text-muted); }
 
 .folder-rail {
@@ -303,6 +305,8 @@ body::before {
   border-radius: 999px; cursor: pointer;
 }
 .subnav-btn.is-active { background: var(--ic-brand); border-color: var(--ic-brand); color: #fff; }
+.assign-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.assign-row .assign-who { min-width: 180px; flex: 1; }
 
 .table-wrap { overflow: auto; flex: 1; background: #fff; }
 .data-table { width: 100%; border-collapse: collapse; background: #fff; }
