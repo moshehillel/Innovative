@@ -446,6 +446,30 @@ check("container plus Gtg is recognized",
 check("container is read from a Gtg reply",
       dray.extractContainerFromText("", "HAMU46559475 Gtg"),
       "HAMU4655947");
+const arrowGtg =
+  "MSMU7346080 &nbsp; Gtg &nbsp; Leo Operations Excellence Manager";
+check("nbsp between container and Gtg is recognized",
+    dray.isGtgConfirmation(
+        "FW: Invoice 10627 from GLOBAL ARROW LLC", arrowGtg),
+    true);
+check("nbsp Gtg reply keeps container MSMU7346080",
+    dray.extractContainerFromText("", arrowGtg),
+    "MSMU7346080");
+check("HTML nbsp between container and Gtg is recognized",
+    dray.isGtgConfirmation(
+        "",
+        "MSMU7346080<span>&nbsp;</span>Gtg"),
+    true);
+check("HTML nbsp reply keeps container MSMU7346080",
+    dray.extractContainerFromText(
+        "",
+        "MSMU7346080<span style=\"mso-spacerun:yes\">&nbsp;</span>Gtg"),
+    "MSMU7346080");
+check("extra digit still drops the last digit",
+    dray.extractContainerFromText(
+        "",
+        "HAMU46559475&nbsp;Gtg"),
+    "HAMU4655947");
 check("own company name is not an inbound drayage carrier",
       dray.isOwnCompanyCarrierName("Innovative Carriers"), true);
   check("Good to go is recognized",

@@ -52,12 +52,62 @@ function sanitizeContainerNumber(value) {
 }
 
 /**
+ * Flattens Outlook HTML so container numbers and GTG are tokens.
+ * Mail clients leave literal `&nbsp;`, numeric entities, and tags in the
+ * plain-text part. Those must not keep a GTG reply off the invoice path.
+ * @param {string} value Raw subject or body.
+ * @return {string}
+ */
+function decodeDrayageMarkup(value) {
+  let text = String(value || "");
+  text = text.replace(/<[^>]+>/g, " ");
+  for (let i = 0; i < 3; i++) {
+    const next = text.replace(/&amp;/gi, "&");
+    if (next === text) break;
+    text = next;
+  }
+  text = text
+      .replace(/&nbsp;|&#0*160;|&#x0*a0;/gi, " ")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;|&#0*34;/gi, "\"")
+      .replace(/&#(\d+);/g, (_, digits) => {
+        const code = Number(digits);
+        if (code === 160 || code === 32) return " ";
+        if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) {
+          return " ";
+        }
+        return String.fromCodePoint(code);
+      })
+      .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+        const code = parseInt(hex, 16);
+        if (code === 0xa0 || code === 0x20) return " ";
+        if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) {
+          return " ";
+        }
+        return String.fromCodePoint(code);
+      })
+      .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, " ")
+      .replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
+  return text.replace(/[ \t\r\n\f\v]+/g, " ").trim();
+}
+
+/**
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {string}
+ */
+function drayageMatchText(subject, body) {
+  return decodeDrayageMarkup(`${subject || ""}\n${body || ""}`);
+}
+
+/**
  * @param {string} subject Email subject.
  * @param {string} body Email body.
  * @return {string|null}
  */
 function extractContainerFromText(subject, body) {
-  const text = `${subject || ""}\n${body || ""}`;
+  const text = drayageMatchText(subject, body);
   const labeled = text.match(
       /(?:container|cntr|unit)\s*(?:#|no\.?|number)?\s*:?\s*/i +
       /([A-Z]{3,4}[\s-]?\d{6,7})/i);
@@ -65,7 +115,7 @@ function extractContainerFromText(subject, body) {
     const clean = sanitizeContainerNumber(labeled[1]);
     if (clean) return clean;
   }
-  const isoInline = text.match(/\b([A-Z]{4}\s?\d{7})\d?\b/i);
+  const isoInline = text.match(/\b([A-Z]{4}\s*\d{7})\d?\b/i);
   if (isoInline && isoInline[1]) {
     const clean = sanitizeContainerNumber(isoInline[1]);
     if (clean) return clean;
@@ -461,7 +511,7 @@ const DRAYAGE_AMOUNT_TOLERANCE = 5;
  * @return {boolean}
  */
 function isGtgConfirmation(subject, body) {
-  const text = `${subject || ""}\n${body || ""}`;
+  const text = drayageMatchText(subject, body);
   return /\bGTG\b/i.test(text) || /\bgood to go\b/i.test(text);
 }
 
