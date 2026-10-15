@@ -484,17 +484,78 @@ check("own company name is not an inbound drayage carrier",
       dray.drayageAmountsAcceptable(1005, null).ok, false);
   check("Total Cost is the vendor cost",
       dray.readDrayageTotalCost({vendor: {cost: "1005.00"}}), 1005);
+  const portFee = {
+    code: "TMF",
+    carrierId: "99",
+    carrierName: "Pier Pass",
+    vendorInvoiceNumber: "84389-1-IN",
+    total: 81.26,
+  };
+  const billedCtf = {
+    code: "CTF",
+    carrierId: "98",
+    carrierName: "Port Check",
+    vendorInvoiceNumber: "CTF-220",
+    total: 40,
+  };
+  const unbilled = {
+    code: "FRT",
+    carrierId: "10",
+    carrierName: "Draft Carrier",
+    vendorInvoiceNumber: "",
+    total: 500,
+  };
+  const blankBill = {
+    code: "LUM",
+    carrierId: "11",
+    carrierName: "Lumper",
+    vendorInvoiceNumber: "   ",
+    total: 75,
+  };
+  const missingBill = {
+    code: "ACC",
+    carrierId: "12",
+    carrierName: "Accessorial",
+    total: 20,
+  };
+  const feeLine = {
+    code: "FRT",
+    carrierId: "55",
+    carrierName: "Dray Carrier",
+    vendorInvoiceNumber: "INV-9",
+    total: 1005,
+  };
   const merged = dray.mergeDrayageActualCost([
-    {code: "TMF", vendorInvoiceNumber: "84389-1-IN", total: 81.26},
-  ], {code: "FRT", vendorInvoiceNumber: "INV-9", total: 1005});
-  check("Port fee line is kept", merged.lines.length, 2);
+    unbilled, portFee, blankBill, billedCtf, missingBill,
+  ], feeLine);
+  check("Unbilled actual cost lines are removed", merged.removed, 3);
+  check("Billed lines plus the new FRT remain", merged.lines.length, 3);
   check("Drayage bill is added", merged.added, true);
+  check("Port fee line is unchanged", merged.lines[0], portFee);
+  check("Port fee vendor is unchanged", merged.lines[0].carrierName,
+      "Pier Pass");
+  check("Port fee code is unchanged", merged.lines[0].code, "TMF");
+  check("Port fee amount is unchanged", merged.lines[0].total, 81.26);
   check("Port fee bill number is unchanged",
       merged.lines[0].vendorInvoiceNumber, "84389-1-IN");
+  check("Other billed line is unchanged", merged.lines[1], billedCtf);
+  check("Drayage FRT line is appended", merged.lines[2], feeLine);
+  check("Drayage FRT uses the carrier invoice number",
+      merged.lines[2].vendorInvoiceNumber, "INV-9");
+  check("Empty bill number is not a bill",
+      dray.actualCostHasVendorBillNumber({vendorInvoiceNumber: ""}), false);
+  check("Null bill number is not a bill",
+      dray.actualCostHasVendorBillNumber({vendorInvoiceNumber: null}), false);
+  check("Whitespace bill number is not a bill",
+      dray.actualCostHasVendorBillNumber({vendorInvoiceNumber: "  "}), false);
+  check("Numeric zero bill number is not a bill",
+      dray.actualCostHasVendorBillNumber({vendorInvoiceNumber: 0}), false);
   const again = dray.mergeDrayageActualCost(merged.lines, {
     code: "FRT", vendorInvoiceNumber: "INV-9", total: 1005,
   });
   check("Same invoice number is not added twice", again.added, false);
+  check("Second merge does not remove billed lines", again.removed, 0);
+  check("Second merge keeps the port fee", again.lines[0], portFee);
   check("POD is not uploaded",
       dray.isDrayagePodAttachment({filename: "signed-POD.pdf"}), true);
   check("Invoice pdf is uploaded",

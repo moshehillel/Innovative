@@ -558,19 +558,44 @@ function drayageAmountsAcceptable(invoiceAmount, totalCost) {
 }
 
 /**
- * Adds the drayage bill without changing lines already on the load.
+ * True when an actual-cost line already has a vendor bill number.
+ * Uses vendorInvoiceNumber, the field Primus stores for the vendor bill.
+ * Empty, null, and whitespace are unbilled. Numeric 0 is unbilled because
+ * the existing posting code reads it with `value || ""`. The string "0"
+ * is a bill number.
+ * @param {object|null|undefined} line Actual-cost or billsInfo row.
+ * @return {boolean}
+ */
+function actualCostHasVendorBillNumber(line) {
+  return !!String(line && line.vendorInvoiceNumber || "").trim();
+}
+
+/**
+ * Removes actual-cost lines that do not yet have a vendor bill number,
+ * then adds the drayage carrier bill. Lines that already have a bill
+ * number are left unchanged. The carrier bill is not added again when
+ * that invoice number is already on a line.
  * @param {Array<object>} existingLines Actual cost lines.
  * @param {object} feeLine New carrier-bill line.
- * @return {{lines: Array<object>, added: boolean}}
+ * @return {{lines: Array<object>, added: boolean, removed: number}}
  */
 function mergeDrayageActualCost(existingLines, feeLine) {
-  const lines = Array.isArray(existingLines) ? existingLines.slice() : [];
+  const source = Array.isArray(existingLines) ? existingLines : [];
+  const lines = [];
+  let removed = 0;
+  for (const line of source) {
+    if (!actualCostHasVendorBillNumber(line)) {
+      removed += 1;
+      continue;
+    }
+    lines.push(line);
+  }
   const billNo = String(feeLine && feeLine.vendorInvoiceNumber || "").trim();
   const already = billNo && lines.some((line) =>
     String(line.vendorInvoiceNumber || "").trim() === billNo);
-  if (already) return {lines, added: false};
+  if (already) return {lines, added: false, removed};
   lines.push(feeLine);
-  return {lines, added: true};
+  return {lines, added: true, removed};
 }
 
 /**
@@ -852,6 +877,7 @@ module.exports = {
   isGtgConfirmation,
   readDrayageTotalCost,
   drayageAmountsAcceptable,
+  actualCostHasVendorBillNumber,
   mergeDrayageActualCost,
   isDrayagePodAttachment,
   normalizeContainerNumber,

@@ -4170,7 +4170,8 @@ async function handleDrayageMissingDetailsFromLeo(args) {
 
 /**
  * Leo marked the drayage load GTG. Upload the paperwork, check Total Cost,
- * and invoice without changing charges already on the load.
+ * and invoice. Actual-cost charges without a bill number are removed.
+ * Charges that already have a bill number stay.
  * @param {object} args Handler arguments.
  * @return {Promise<object>} {handled, ok}
  */

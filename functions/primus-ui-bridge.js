@@ -41,6 +41,7 @@ const {
   toOutboundEmailSafeText,
 } = require("./email-outbound-safe");
 const workflowErrors = require("./workflow-error-messages");
+const drayageIntake = require("./drayage-intake");
 
 const admin = require("firebase-admin");
 
@@ -7110,9 +7111,11 @@ async function uploadDrayageCarrierDocuments(args) {
 exports.uploadDrayageCarrierDocuments = uploadDrayageCarrierDocuments;
 
 /**
- * Records the drayage invoice on Actual Cost without changing charges
- * already on the load, closes that cost, marks Ready to Invoice, and
- * generates the customer invoice.
+ * Records the drayage invoice on Actual Cost. Charges that do not yet
+ * have a vendor bill number are removed. Charges that already have a
+ * bill number are left as they are. The carrier FRT line is then added
+ * when that invoice number is not already on the load. Closes actual
+ * cost, marks Ready to Invoice, and generates the customer invoice.
  * @param {object} args booking, loadNumber, invoiceAmount, invoiceNumber,
  *   billDate, dueDate, proNumber.
  * @return {Promise<object>}
@@ -7177,7 +7180,7 @@ async function enterDrayageInvoice(args) {
   const actualCosts = extractActualCostsFromStore(storeData) || [];
   const charges = extractChargesFromStore(storeData) || [];
   const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
-  const keptCosts = actualCosts.map((line) => ({
+  const mappedCosts = actualCosts.map((line) => ({
     id: String(line.id),
     code: line.code || "",
     description: line.description || "",
@@ -7205,10 +7208,12 @@ async function enterDrayageInvoice(args) {
     PRO: proNumber,
     isAccessorial: false,
   };
-  const billNoAlready = keptCosts.some((line) =>
-    String(line.vendorInvoiceNumber || "").trim() === vendorInvoiceNumber);
-  const mergedActualCosts = billNoAlready ?
-    keptCosts : [...keptCosts, feeLine];
+  const merged = drayageIntake.mergeDrayageActualCost(mappedCosts, feeLine);
+  const mergedActualCosts = merged.lines;
+  const billNoAlready = !merged.added;
+  const preservedLines = mappedCosts.length - merged.removed;
+  const billedExisting = merged.added ?
+    mergedActualCosts.slice(0, -1) : mergedActualCosts.slice();
 
   let termsId = null;
   const terms = await resolveDueOnReceiptTermId();
@@ -7217,9 +7222,10 @@ async function enterDrayageInvoice(args) {
 
   let billsInfo = extractBillsInfoFromStore(storeData);
   if (!billsInfo || !billsInfo.length) {
-    billsInfo = reconstructBillsInfoFromActualCosts(keptCosts);
+    billsInfo = reconstructBillsInfoFromActualCosts(billedExisting);
   } else {
-    billsInfo = billsInfo.slice();
+    billsInfo = billsInfo.filter((bill) =>
+      drayageIntake.actualCostHasVendorBillNumber(bill));
   }
   if (!billNoAlready) {
     billsInfo.push({
@@ -7374,7 +7380,8 @@ async function enterDrayageInvoice(args) {
       vendorInvoiceNumber,
       amount,
       addedBill: !billNoAlready,
-      preservedLines: keptCosts.length,
+      preservedLines,
+      removedUnbilledActualCosts: merged.removed,
       issuedNumber,
     });
   }
@@ -7385,7 +7392,8 @@ async function enterDrayageInvoice(args) {
     invoiceNumber: issuedNumber ? String(issuedNumber) : null,
     chargesTotal,
     addedBill: !billNoAlready,
-    preservedLines: keptCosts.length,
+    preservedLines,
+    removedUnbilledActualCosts: merged.removed,
   };
 }
 exports.enterDrayageInvoice = enterDrayageInvoice;
