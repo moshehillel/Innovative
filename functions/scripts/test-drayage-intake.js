@@ -550,6 +550,72 @@ check("own company name is not an inbound drayage carrier",
       dray.actualCostHasVendorBillNumber({vendorInvoiceNumber: "  "}), false);
   check("Numeric zero bill number is not a bill",
       dray.actualCostHasVendorBillNumber({vendorInvoiceNumber: 0}), false);
+  const globalArrowBilled = {
+    code: "FRT",
+    description: "FREIGHT CHARGE",
+    carrierId: "54611259",
+    carrierName: "GLOBAL ARROW LLC",
+    qty: 1,
+    rate: 490,
+    total: 490,
+    vendorInvoiceNumber: "10627",
+  };
+  const globalArrowUnbilledFreight = {
+    code: "FRT",
+    description: "FREIGHT CHARGE",
+    carrierId: "54611259",
+    carrierName: "GLOBAL ARROW LLC",
+    qty: 1,
+    rate: 420,
+    total: 420,
+    vendorInvoiceNumber: "",
+  };
+  const globalArrowChassis = {
+    code: "CR",
+    description: "Chassis Rental",
+    carrierId: "54611259",
+    carrierName: "GLOBAL ARROW LLC",
+    qty: 2,
+    rate: 35,
+    total: 70,
+    vendorInvoiceNumber: "",
+  };
+  const screenshot = dray.mergeDrayageActualCost([
+    globalArrowUnbilledFreight,
+    globalArrowBilled,
+    globalArrowChassis,
+  ], {
+    code: "FRT",
+    description: "FREIGHT CHARGE",
+    carrierId: "54611259",
+    carrierName: "GLOBAL ARROW LLC",
+    qty: 1,
+    rate: 490,
+    total: "490.00",
+    vendorInvoiceNumber: "10627",
+  });
+  check("Screenshot unbilled lines are removed", screenshot.removed, 2);
+  check("Screenshot keeps only the billed line", screenshot.lines.length, 1);
+  check("Screenshot bill 10627 is not duplicated", screenshot.added, false);
+  check("Screenshot kept line is the 490 bill",
+      screenshot.lines[0], globalArrowBilled);
+  check("Screenshot bill number stays 10627",
+      screenshot.lines[0].vendorInvoiceNumber, "10627");
+  check("Screenshot vendor stays Global Arrow",
+      screenshot.lines[0].carrierName, "GLOBAL ARROW LLC");
+  check("Screenshot code stays FRT", screenshot.lines[0].code, "FRT");
+  check("Screenshot amount stays 490", screenshot.lines[0].total, 490);
+  const screenshotAgain = dray.mergeDrayageActualCost(screenshot.lines, {
+    code: "FRT",
+    vendorInvoiceNumber: "10627",
+    total: 490,
+  });
+  check("Second screenshot merge does not add 10627 again",
+      screenshotAgain.added, false);
+  check("Second screenshot merge keeps one line",
+      screenshotAgain.lines.length, 1);
+  check("Second screenshot merge keeps bill 10627",
+      screenshotAgain.lines[0].vendorInvoiceNumber, "10627");
   const again = dray.mergeDrayageActualCost(merged.lines, {
     code: "FRT", vendorInvoiceNumber: "INV-9", total: 1005,
   });

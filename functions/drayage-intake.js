@@ -559,7 +559,7 @@ function drayageAmountsAcceptable(invoiceAmount, totalCost) {
 
 /**
  * True when an actual-cost line already has a vendor bill number.
- * Uses vendorInvoiceNumber, the field Primus stores for the vendor bill.
+ * vendorInvoiceNumber is the Primus Actual Cost Bill# column.
  * Empty, null, and whitespace are unbilled. Numeric 0 is unbilled because
  * the existing posting code reads it with `value || ""`. The string "0"
  * is a bill number.

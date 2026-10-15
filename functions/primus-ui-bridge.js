@@ -7112,10 +7112,13 @@ exports.uploadDrayageCarrierDocuments = uploadDrayageCarrierDocuments;
 
 /**
  * Records the drayage invoice on Actual Cost. Charges that do not yet
- * have a vendor bill number are removed. Charges that already have a
- * bill number are left as they are. The carrier FRT line is then added
- * when that invoice number is not already on the load. Closes actual
- * cost, marks Ready to Invoice, and generates the customer invoice.
+ * have a vendor bill number (the Actual Cost Bill# column) are removed.
+ * Charges that already have a bill number are left as they are. The
+ * carrier FRT line is added when that invoice number is not already on
+ * the load. This runs when the carrier bill is first posted and again
+ * when the customer invoice is already issued, so a later GTG still
+ * drops unbilled lines. Closes actual cost and marks Ready to Invoice.
+ * Generates the customer invoice only when it has not been issued.
  * @param {object} args booking, loadNumber, invoiceAmount, invoiceNumber,
  *   billDate, dueDate, proNumber.
  * @return {Promise<object>}
@@ -7161,16 +7164,7 @@ async function enterDrayageInvoice(args) {
       loadNumber,
     };
   }
-  if (isIssuedUiInvoice(uiInvoice)) {
-    return {
-      ok: true,
-      alreadyIssued: true,
-      loadNumber,
-      customerInvoiceId: String(uiInvoice.id),
-      invoiceNumber: String(uiInvoice.invoiceNumber),
-    };
-  }
-
+  const alreadyIssued = isIssuedUiInvoice(uiInvoice);
   const invoiceId = String(uiInvoice.id);
   const stores = await getInvoiceStores(invoiceId);
   if (!stores.ok) {
@@ -7215,12 +7209,48 @@ async function enterDrayageInvoice(args) {
   const billedExisting = merged.added ?
     mergedActualCosts.slice(0, -1) : mergedActualCosts.slice();
 
+  if (alreadyIssued && merged.removed === 0 && billNoAlready) {
+    return {
+      ok: true,
+      alreadyIssued: true,
+      loadNumber,
+      customerInvoiceId: invoiceId,
+      invoiceNumber: String(uiInvoice.invoiceNumber),
+      addedBill: false,
+      preservedLines,
+      removedUnbilledActualCosts: 0,
+    };
+  }
+
   let termsId = null;
   const terms = await resolveDueOnReceiptTermId();
   if (!terms.ok) return {ok: false, error: terms.error || "no terms"};
   termsId = terms.termsId;
 
+  let issuedInvoiceData = null;
+  if (alreadyIssued) {
+    const issuedInvoice = await managePhpPost({
+      action: "getInvoice",
+      id: invoiceId,
+    });
+    issuedInvoiceData = (issuedInvoice.json &&
+      issuedInvoice.json.invoiceData) || null;
+  }
+
   let billsInfo = extractBillsInfoFromStore(storeData);
+  if ((!billsInfo || !billsInfo.length) && issuedInvoiceData) {
+    const raw = issuedInvoiceData.billsInfo;
+    if (typeof raw === "string" && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) billsInfo = parsed;
+      } catch (_) {
+        billsInfo = null;
+      }
+    } else if (Array.isArray(raw)) {
+      billsInfo = raw;
+    }
+  }
   if (!billsInfo || !billsInfo.length) {
     billsInfo = reconstructBillsInfoFromActualCosts(billedExisting);
   } else {
@@ -7258,6 +7288,18 @@ async function enterDrayageInvoice(args) {
   const profit = roundMoney(chargesTotal - totalActual);
   const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
   const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+  const storedEstimatedProfit = alreadyIssued && issuedInvoiceData ?
+    Number(issuedInvoiceData.estimatedProfitUSD) : NaN;
+  const estimatedProfitUSD = Number.isFinite(storedEstimatedProfit) ?
+    roundMoney(storedEstimatedProfit) : profit;
+  const storedEstimatedProfitPer = alreadyIssued && issuedInvoiceData ?
+    Number(issuedInvoiceData.estimatedProfitPer) : NaN;
+  const estimatedProfitPer = Number.isFinite(storedEstimatedProfitPer) ?
+    storedEstimatedProfitPer : profitPer;
+  const storedEstimatedGp = alreadyIssued && issuedInvoiceData ?
+    Number(issuedInvoiceData.estimatedGP) : NaN;
+  const estimatedGP = Number.isFinite(storedEstimatedGp) ?
+    storedEstimatedGp : gp;
   const billtoResolution = await resolveManageBilltoId(booking);
   const storedBillto = extractBilltoIdFromStore(storeData);
   const billtoId = billtoResolution.id || storedBillto;
@@ -7328,16 +7370,16 @@ async function enterDrayageInvoice(args) {
     costClosed: "0",
     costActualClosed: "1",
     readyToInvoice: "1",
-    estimatedProfitUSD: profit,
-    estimatedProfitPer: profitPer,
-    estimatedGP: gp,
+    estimatedProfitUSD: estimatedProfitUSD,
+    estimatedProfitPer: estimatedProfitPer,
+    estimatedGP: estimatedGP,
     actualProfitUSD: profit,
     actualProfitPer: profitPer,
     actualGP: gp,
     vendorInvoiceNumber: "",
     vendorTerm: "",
     PRONumber: "",
-    invoiceNumber: "0",
+    invoiceNumber: alreadyIssued ? String(uiInvoice.invoiceNumber) : "0",
     id: invoiceId,
   });
   if (!saveResult.json || !isManageSuccess(saveResult.json)) {
@@ -7351,30 +7393,35 @@ async function enterDrayageInvoice(args) {
     };
   }
 
-  const genAction = process.env.PRIMUS_UI_GENERATE_ACTION ||
-    "consolidateInvoices";
-  const phase3 = await managePhpPost({
-    action: genAction,
-    billToId: String(billtoId),
-    invoices: [invoiceId],
-    generationDate: toDateOnly(new Date()),
-  });
-  if (!phase3.json || !isManageSuccess(phase3.json)) {
-    return {
-      ok: false,
-      step: "consolidateInvoices",
-      error: (phase3.json && phase3.json.message) ||
-        "consolidateInvoices failed",
-      loadNumber,
-      customerInvoiceId: invoiceId,
-    };
+  let issuedNumber = alreadyIssued ? String(uiInvoice.invoiceNumber) : null;
+  if (!alreadyIssued) {
+    const genAction = process.env.PRIMUS_UI_GENERATE_ACTION ||
+      "consolidateInvoices";
+    const phase3 = await managePhpPost({
+      action: genAction,
+      billToId: String(billtoId),
+      invoices: [invoiceId],
+      generationDate: toDateOnly(new Date()),
+    });
+    if (!phase3.json || !isManageSuccess(phase3.json)) {
+      return {
+        ok: false,
+        step: "consolidateInvoices",
+        error: (phase3.json && phase3.json.message) ||
+          "consolidateInvoices failed",
+        loadNumber,
+        customerInvoiceId: invoiceId,
+      };
+    }
+    issuedNumber = phase3.json.maxInvoiceNumber ||
+      (phase3.json.message &&
+        (String(phase3.json.message).match(/Invoice#(\d+)/) || [])[1]) ||
+      null;
   }
-  const issuedNumber = phase3.json.maxInvoiceNumber ||
-    (phase3.json.message &&
-      (String(phase3.json.message).match(/Invoice#(\d+)/) || [])[1]) ||
-    null;
   if (writeLog) {
-    await writeLog("info", "primus", "Drayage invoice generated", {
+    await writeLog("info", "primus", alreadyIssued ?
+      "Drayage unbilled actual costs removed on issued invoice" :
+      "Drayage invoice generated", {
       loadNumber,
       invoiceId,
       vendorInvoiceNumber,
@@ -7382,11 +7429,13 @@ async function enterDrayageInvoice(args) {
       addedBill: !billNoAlready,
       preservedLines,
       removedUnbilledActualCosts: merged.removed,
+      alreadyIssued,
       issuedNumber,
     });
   }
   return {
     ok: true,
+    alreadyIssued,
     loadNumber,
     customerInvoiceId: invoiceId,
     invoiceNumber: issuedNumber ? String(issuedNumber) : null,
