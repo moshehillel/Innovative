@@ -197,6 +197,20 @@ check("plain invoice filename stays INVOICE",
       filename: "INV-MAV-INNOV-26.pdf",
       pageCount: 1,
     }), "INVOICE");
+check("Jar-Cris INVOICE POD filename stays the bill when labeled POD",
+    bundle.normalizePreCheckDocType("POD", {
+      filename: "INNOVATIVE CARRIERS INVOICE POD 318943 DTD 20261015 - " +
+        "LOAD 269261.pdf",
+      subject: "INNOVATIVE CARRIERS INVOICE POD 318943 DTD 20261015 - " +
+        "LOAD 269261",
+      pageCount: 2,
+    }), "INVOICE");
+check("Jar-Cris INVOICE POD filename stays the bill when labeled INVOICE",
+    bundle.normalizePreCheckDocType("INVOICE", {
+      filename: "INNOVATIVE CARRIERS INVOICE POD 318943 DTD 20261015 - " +
+        "LOAD 269261.pdf",
+      pageCount: 2,
+    }), "INVOICE");
 check("low-confidence statement does not short-circuit",
     bundle.shouldShortCircuitAsStatementOnly({
       intent: "statement",

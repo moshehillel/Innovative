@@ -1566,7 +1566,12 @@ function looksLikePodCompanionFilename(filename) {
       .pop() || "";
   const stem = base.replace(/\.pdf$/i, "").trim();
   if (!stem) return false;
-  return /(?:^|[^a-z0-9])pod(?:[^a-z0-9]|$)/i.test(stem);
+  const hasWord = (word) => new RegExp(
+      "(?:^|[^a-z0-9])" + word + "(?:[^a-z0-9]|$)", "i").test(stem);
+  if (!hasWord("pod")) return false;
+  // "INVOICE POD 318943 ... LOAD 269261.pdf" is the freight bill.
+  if (hasWord("invoice")) return false;
+  return true;
 }
 
 /**

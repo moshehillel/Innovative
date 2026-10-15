@@ -41,6 +41,11 @@ check("looksLikePodCompanionFilename MAV",
     podUtils.looksLikePodCompanionFilename("MAV-INNOV-26-POD.pdf"), true);
 check("looksLikePodCompanionFilename invoice",
     podUtils.looksLikePodCompanionFilename("INV-MAV-INNOV-26.pdf"), false);
+check("combined INVOICE POD filename is not a POD sidecar",
+    podUtils.looksLikePodCompanionFilename(
+        "INNOVATIVE CARRIERS INVOICE POD 318943 DTD 20261015 - " +
+        "LOAD 269261.pdf"),
+    false);
 
 const stored = [
   {

@@ -546,18 +546,50 @@ function shouldKeepAttachmentAsInvoice(context = {}) {
  * @param {string|null|undefined} filename Attachment filename.
  * @return {boolean}
  */
-function looksLikePodCompanionFilename(filename) {
+function attachmentFilenameStem(filename) {
   const base = String(filename || "")
       .replace(/\\/g, "/")
       .split("/")
       .pop() || "";
-  const stem = base.replace(/\.pdf$/i, "").trim();
+  return base.replace(/\.pdf$/i, "").trim();
+}
+
+/**
+ * @param {string} stem Filename without extension.
+ * @param {string} word Whole word to match.
+ * @return {boolean}
+ */
+function filenameStemHasWord(stem, word) {
+  return new RegExp(
+      "(?:^|[^a-z0-9])" + word + "(?:[^a-z0-9]|$)", "i").test(stem);
+}
+
+/**
+ * One PDF that is the freight bill and the POD (Jar-Cris names these
+ * "INVOICE POD <n> ... LOAD <n>.pdf"). Not a standalone POD sidecar.
+ * @param {string|null|undefined} filename Attachment filename.
+ * @return {boolean}
+ */
+function looksLikeCombinedInvoicePodFilename(filename) {
+  const stem = attachmentFilenameStem(filename);
   if (!stem) return false;
-  return /(?:^|[^a-z0-9])pod(?:[^a-z0-9]|$)/i.test(stem);
+  return filenameStemHasWord(stem, "invoice") &&
+    filenameStemHasWord(stem, "pod");
+}
+
+function looksLikePodCompanionFilename(filename) {
+  const stem = attachmentFilenameStem(filename);
+  if (!stem) return false;
+  if (!filenameStemHasWord(stem, "pod")) return false;
+  if (looksLikeCombinedInvoicePodFilename(filename)) return false;
+  return true;
 }
 
 function normalizePreCheckDocType(docType, context = {}) {
   const label = sanitizePreCheckLabel(docType);
+  // Combined invoice+POD packet must be classified as the bill, even when
+  // the first-page check or the word POD would otherwise mark it POD-only.
+  if (looksLikeCombinedInvoicePodFilename(context.filename)) return "INVOICE";
   // Filename wins when Haiku mis-labels a scanned POD as INVOICE.
   if (looksLikePodCompanionFilename(context.filename)) return "POD";
   if (label === "INVOICE" || label === "POD") return label;
