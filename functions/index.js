@@ -3528,9 +3528,8 @@ async function handleAdditionalChargeAction(req, res) {
           customerBillLines:
             approvalUpdate["additionalCharge.customerBillLines"] || [],
         });
-        const podFollowup = require("./pod-followup");
-        const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-          podFollowup.SARAH_EMAIL;
+        // Dispatcher task only. Sarah stays off To and CC; she already
+        // approved on the separate approval email. Lisa is added on CC below.
         const reminderPayload = {
           type: "additional_charge_dispatcher_task",
           invoiceId: String(invoiceId),
@@ -3540,7 +3539,6 @@ async function handleAdditionalChargeAction(req, res) {
         if (dispatcher.ok && dispatcher.email) {
           reminderPayload.forceRecipient = true;
           reminderPayload.to = dispatcher.email;
-          if (approver) reminderPayload.cc = approver;
           extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
             `to notify the customer.`;
         } else {
