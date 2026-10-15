@@ -4844,8 +4844,7 @@ async function forwardToHumanReview(
 
   const departmentEmail =
     (department === "invoice_veto" &&
-      (process.env.INVOICE_VETO_REVIEW_EMAIL ||
-        process.env.HUMAN_REVIEW_EMAIL)) ||
+      require("./pod-followup").LISA_EMAIL) ||
     (department === "billing" && process.env.REVIEW_EMAIL_BILLING) ||
     (department === "operations" && process.env.REVIEW_EMAIL_OPERATIONS) ||
     (department === "statement" &&
@@ -4858,7 +4857,7 @@ async function forwardToHumanReview(
 
   if (!departmentEmail) {
     const missingVar = department === "invoice_veto" ?
-      "INVOICE_VETO_REVIEW_EMAIL" :
+      "Lisa review email" :
       department === "billing" ? "REVIEW_EMAIL_BILLING" :
       department === "operations" ? "REVIEW_EMAIL_OPERATIONS" :
       department === "statement" ? "REVIEW_EMAIL_STATEMENT" :

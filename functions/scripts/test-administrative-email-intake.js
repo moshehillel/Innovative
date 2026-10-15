@@ -683,7 +683,7 @@ check("Easton Star multi-load follow-up body pattern",
         "When will payment be sent?"));
 
 // RS Freight: "Re: Invoice N Load M" payment-status follow-up (no PDF) must
-// hit payment-inquiry → Abe, not invoice_veto → Moshe.
+// hit payment-inquiry → Abe, not invoice_veto → Lisa.
 const rsFreightSubject = "Re: Invoice 731 Load 267038";
 const rsFreightFrom =
   "RS Freight Lines LLC <rsfreight207@gmail.com>";
