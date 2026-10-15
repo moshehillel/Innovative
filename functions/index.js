@@ -9005,6 +9005,26 @@ async function processGmailMessage(
       return;
     }
 
+    // The unfinished-notification digest is sent from this mailbox. If a
+    // copy lands here, do not open a dashboard row and do not reply
+    // (a reply becomes "Re:" and re-enters the inbox).
+    if (dashboardNotificationDigest.isInboundDigestEmail({
+      subject,
+      body: emailBody,
+      html: emailHtml,
+    })) {
+      await completeAdministrativeIgnore({
+        messageId,
+        subject,
+        from,
+        tenant,
+        queueDocId,
+        finalStatus: "dashboard_digest_ignored",
+        reason: "Unfinished-notification digest is Jerry's own mail",
+      });
+      return;
+    }
+
     if (isChildSplitJob) {
       const splitCtx = await loadSplitChildContext(
           tenant, parentMessageId, childItemIndex);
@@ -16275,12 +16295,15 @@ dashboardNotificationDigest.init({
 /**
  * Weekday and weekend morning digest of unfinished dashboard notifications.
  * 7:30 AM America/New_York. One send per tenant per Eastern calendar day.
+ * retryCount 0: Cloud Scheduler must not redeliver after a failure.
+ * The function also refuses any invocation outside the 7 AM Eastern hour.
  */
 exports.sendDashboardNotificationDigest = onSchedule({
   schedule: "30 7 * * *",
   timeZone: "America/New_York",
   timeoutSeconds: 300,
   memory: "512MiB",
+  retryCount: 0,
 }, async () => {
   const result = await dashboardNotificationDigest.runDailyNotificationDigest();
   console.log("sendDashboardNotificationDigest:", JSON.stringify(result));

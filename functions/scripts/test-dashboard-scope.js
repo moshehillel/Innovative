@@ -91,12 +91,75 @@ assert.strictEqual(scope.isOpenNotification({
   emailType: "noa_ignored",
 }), false);
 
-const recipients = require("../dashboard-notification-digest").digestRecipients(
+const digestMod = require("../dashboard-notification-digest");
+const recipients = digestMod.digestRecipients(
     {tenantId: "default"},
-    [{dispatcherEmail: "pat@innovativecarriers.com"}]);
+    [
+      {dispatcherEmail: "pat@innovativecarriers.com"},
+      {dispatcherEmail: "accounting@innovativecarriers.com"},
+    ]);
 assert.ok(recipients.some((e) => /lisa@innovativecarriers.com/i.test(e)));
 assert.ok(recipients.some((e) => /sarah@innovativecarriers.com/i.test(e)));
 assert.ok(recipients.some((e) => /pat@innovativecarriers.com/i.test(e)));
+assert.ok(!recipients.some((e) => /accounting@innovativecarriers.com/i.test(e)));
+assert.strictEqual(digestMod.isIntakeAddress(
+    "Innovative Accounting <accounting@innovativecarriers.com>"), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Jerry ignored emails — Oct 15, 2026",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Jerry inbox digest — Oct 15, 2026",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Jerry broker commission swaps — Oct 15, 2026",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Jerry daily activity — Oct 15, 2026",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Re: Jerry — 111 unfinished notification(s) — Oct 15, 2026",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Jerry — 3 delivered + 1 past ETA, not invoiced",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Report — 4 shipment(s) missing delivery date (5+ days since pickup)",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  emailType: "delivered_uninvoiced_report",
+  subject: "Weekly report",
+}), true);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Approval needed — additional charge",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "No POD",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "No customer rate",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Low margin",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Mark delivered failed",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Review POD",
+}), false);
+assert.strictEqual(digestMod.isInboundDigestEmail({
+  subject: "Re: Jerry — 111 unfinished notification(s) — Oct 15, 2026",
+}), true);
+assert.strictEqual(digestMod.isInboundDigestEmail({
+  subject: "No POD on load 100",
+  body: "Please review the POD",
+}), false);
+assert.strictEqual(digestMod.inScheduledSendWindow(
+    new Date("2026-10-15T11:30:00Z")), true);
+assert.strictEqual(digestMod.inScheduledSendWindow(
+    new Date("2026-10-15T14:01:00Z")), false);
+assert.strictEqual(digestMod.inScheduledSendWindow(
+    new Date("2026-10-15T17:02:00Z")), false);
 
 const other = require("../dashboard-notification-digest").digestRecipients(
     {tenantId: "aa", alertEmail: "ops@aa.example"},
@@ -323,9 +386,121 @@ async function testDismiss() {
   assert.strictEqual(real.store["dashboardTasks/rate-task"].status, "dismissed");
 }
 
-testDismiss().then(() => {
-  console.log("ok");
-}).catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+/**
+ * Firestore stand-in with a transaction that commits the day claim.
+ * @return {object}
+ */
+function claimDb() {
+  const docs = {};
+  function refFor(path) {
+    return {
+      path,
+      async get() {
+        if (!Object.prototype.hasOwnProperty.call(docs, path)) {
+          return {exists: false, data() {
+            return undefined;
+          }};
+        }
+        return {exists: true, data() {
+          return docs[path];
+        }};
+      },
+      async set(data) {
+        docs[path] = {...(docs[path] || {}), ...data};
+      },
+    };
+  }
+  return {
+    docs,
+    collection(name) {
+      return {doc(id) {
+        return refFor(`${name}/${id}`);
+      }};
+    },
+    async runTransaction(fn) {
+      const tx = {
+        async get(ref) {
+          return ref.get();
+        },
+        set(ref, data) {
+          docs[ref.path] = {...(docs[ref.path] || {}), ...data};
+        },
+      };
+      return fn(tx);
+    },
+  };
+}
+
+async function testDigestSendsOnce() {
+  const sent = [];
+  const db = claimDb();
+  digestMod.init({
+    db,
+    listNotifications: async () => ({
+      notifications: [
+        {
+          status: "open",
+          tenantId: "default",
+          subject: "Approval needed — additional charge",
+          dispatcherEmail: "pat@innovativecarriers.com",
+        },
+        {
+          status: "open",
+          tenantId: "default",
+          subject: "Jerry inbox digest — Oct 14, 2026",
+        },
+        {
+          status: "open",
+          tenantId: "default",
+          subject: "No POD",
+          dispatcherEmail: "accounting@innovativecarriers.com",
+        },
+      ],
+    }),
+    saveOutboundEmail: async (email) => {
+      sent.push(email);
+    },
+  });
+  const morning = new Date("2026-10-15T11:30:00.000Z");
+  const tenants = [{tenantId: "default"}];
+  const first = await digestMod.runDailyNotificationDigest({
+    now: morning,
+    tenants,
+  });
+  const second = await digestMod.runDailyNotificationDigest({
+    now: morning,
+    tenants,
+  });
+  const afternoon = await digestMod.runDailyNotificationDigest({
+    now: new Date("2026-10-15T17:02:00.000Z"),
+    tenants,
+  });
+  assert.strictEqual(sent.length, 1);
+  assert.strictEqual(first.results[0].sent, true);
+  assert.strictEqual(first.results[0].open, 2);
+  assert.strictEqual(second.results[0].skipped, true);
+  assert.strictEqual(afternoon.skipped, true);
+  assert.ok(!/accounting@innovativecarriers.com/i.test(sent[0].to));
+  assert.ok(/lisa@innovativecarriers.com/i.test(sent[0].to));
+  assert.ok(/sarah@innovativecarriers.com/i.test(sent[0].to));
+  assert.ok(/pat@innovativecarriers.com/i.test(sent[0].to));
+  assert.strictEqual(sent[0].cc, null);
+  const claim = db.docs["settings/dashboardNotificationDigest_default"];
+  claim.status = "error";
+  const retry = await digestMod.runDailyNotificationDigest({
+    now: morning,
+    tenants,
+  });
+  assert.strictEqual(retry.results[0].skipped, true);
+  assert.strictEqual(sent.length, 1);
+}
+
+testDismiss()
+    .then(() => testDigestSendsOnce())
+    .then(() => {
+      console.log("ok");
+    })
+    .catch((err) => {
+      console.error(err);
+      process.exit(1);
+    });

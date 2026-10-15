@@ -170,6 +170,12 @@ async function findOpenDuplicateNotification(db, data) {
  */
 async function createNotification(db, data) {
   try {
+    const digestMail = require("./dashboard-notification-digest");
+    if (digestMail.isInboundDigestEmail(data)) {
+      console.log("[createNotification] skipped digest email",
+          (data && (data.subject || data.messageId)) || "");
+      return null;
+    }
     const MAX_BODY = 120000;
     let body = data.body != null ? String(data.body) : null;
     if (body && body.length > MAX_BODY) body = body.slice(0, MAX_BODY);
