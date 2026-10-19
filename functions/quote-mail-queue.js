@@ -18,6 +18,19 @@ const QUEUE_STATUS = Object.freeze({
 const QUEUE_EMAIL_BODY_MAX = 20000;
 
 /**
+ * Drop HTML tags. `<local@domain>` is a forwarded address, not a tag,
+ * so a later pass cannot delete an address the first pass just decoded.
+ * Real tags (`<div>`, `<br>`, `<mailto:...>`) still match.
+ * @param {string} text Fragment.
+ * @return {string}
+ */
+function stripHtmlTagsKeepEmails(text) {
+  return String(text || "").replace(
+      /<(?![a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}>)[^>]+>/gi,
+      " ");
+}
+
+/**
  * Plain-text + truncate for quoteMailQueue persistence.
  * @param {string} raw Body from Outlook (may be HTML).
  * @return {string}
@@ -32,8 +45,8 @@ function sanitizeQueueEmailBody(raw) {
         .replace(/<!--[\s\S]*?-->/g, " ")
         .replace(/<br\s*\/?>/gi, "\n")
         .replace(/<\/p>/gi, "\n")
-        .replace(/<\/div>/gi, "\n")
-        .replace(/<[^>]+>/g, " ")
+        .replace(/<\/div>/gi, "\n");
+    text = stripHtmlTagsKeepEmails(text)
         .replace(/&nbsp;/gi, " ")
         .replace(/&amp;/gi, "&")
         .replace(/&lt;/gi, "<")

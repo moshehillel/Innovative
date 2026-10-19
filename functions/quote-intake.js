@@ -23,10 +23,61 @@ const FALLBACK_QUOTE_EXTRACT_MODEL = "claude-haiku-4-5";
 /** Max plain-text body kept for extract / queue persistence. */
 const QUOTE_BODY_STORE_MAX = 20000;
 
+/** local@domain inside angle brackets (forwarded From/To lines). */
+const ANGLE_EMAIL_RE =
+  /([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i;
+
+/**
+ * Keep a forwarded From/To address when the visible link text is only a name.
+ * @param {string} html HTML fragment.
+ * @return {string}
+ */
+function expandMailtoAnchors(html) {
+  return String(html || "").replace(
+      /<a\b[^>]*\bhref\s*=\s*(?:"mailto:([^"?]*)"|'mailto:([^'?]*)'|mailto:([^\s>?]+))[^>]*>([\s\S]*?)<\/a>/gi,
+      (full, d1, d2, d3, inner) => {
+        let email = String(d1 || d2 || d3 || "").trim();
+        try {
+          email = decodeURIComponent(email.replace(/&amp;/gi, "&"));
+        } catch (_) {
+          email = email.replace(/&amp;/gi, "&");
+        }
+        if (!ANGLE_EMAIL_RE.test(email)) return full;
+        const visible = String(inner || "").replace(/<[^>]+>/g, " ");
+        if (visible.toLowerCase().includes(email.toLowerCase())) return full;
+        return `${inner} &lt;${email}&gt;`;
+      });
+}
+
+/**
+ * Park `<email>` / `&lt;email&gt;` so tag stripping cannot delete them.
+ * Outlook forwards put the real sender in angle brackets, and `<user@host>`
+ * matches an HTML tag.
+ * @param {string} text Body.
+ * @param {Array<string>} vault Restored later as `<email>`.
+ * @return {string}
+ */
+function protectAngleEmails(text, vault) {
+  const email = "([a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,})";
+  let out = String(text || "");
+  out = out.replace(new RegExp("&lt;" + email + "&gt;", "gi"), (_, addr) => {
+    const token = `\uE000${vault.length}\uE001`;
+    vault.push(`<${addr}>`);
+    return token;
+  });
+  out = out.replace(new RegExp("<" + email + ">", "gi"), (_, addr) => {
+    const token = `\uE000${vault.length}\uE001`;
+    vault.push(`<${addr}>`);
+    return token;
+  });
+  return out;
+}
+
 /**
  * Flatten HTML / MIME bodies into plain text for heuristics + AI.
  * Strips styles/scripts and data-URI blobs so huge HTML never reaches
  * Firestore queue docs or the model prompt.
+ * Forwarded From/To addresses in `<user@host>` are kept.
  * @param {string} input Raw body.
  * @return {string}
  */
@@ -34,6 +85,9 @@ function toPlainText(input) {
   let text = String(input || "");
   // Drop embedded base64 / data-URI blobs before tag stripping.
   text = text.replace(/data:[a-z0-9.+/-]+;base64,[a-z0-9+/=\s]+/gi, " ");
+  text = expandMailtoAnchors(text);
+  const emailVault = [];
+  text = protectAngleEmails(text, emailVault);
   if (/<[a-z][\s\S]*>/i.test(text)) {
     text = text
         .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -43,8 +97,10 @@ function toPlainText(input) {
         .replace(/<\/p>/gi, "\n")
         .replace(/<\/div>/gi, "\n")
         .replace(/<\/tr>/gi, "\n")
-        .replace(/<\/li>/gi, "\n")
-        .replace(/<[^>]+>/g, " ")
+        .replace(/<\/li>/gi, "\n");
+    text = text.replace(
+        /<(?![a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}>)[^>]+>/gi,
+        " ")
         .replace(/&nbsp;/gi, " ")
         .replace(/&amp;/gi, "&")
         .replace(/&lt;/gi, "<")
@@ -52,12 +108,13 @@ function toPlainText(input) {
         .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
         .replace(/&quot;/gi, "\"");
   }
-  return text
+  text = text
       .replace(/\r/g, "")
       .replace(/[ \t]+\n/g, "\n")
       .replace(/\n{3,}/g, "\n\n")
       .replace(/[ \t]{2,}/g, " ")
       .trim();
+  return text.replace(/\uE000(\d+)\uE001/g, (_, i) => emailVault[Number(i)] || "");
 }
 
 /**
