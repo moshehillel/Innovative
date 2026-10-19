@@ -2875,6 +2875,10 @@ exports.processPrimusWorkflow = onRequest(
             invoiceNumber: invoice.issuedInvoiceNumber || null,
             reused: true,
           } : null;
+          // Set only when this run's billing call finds Primus already
+          // issued the customer invoice. A pre-seeded reused flag on a
+          // resume must still be allowed to send the first email.
+          let customerInvoicePredatedThisRun = false;
 
           if (skipToCustomerEmail) {
             await logWorkflowStep({
@@ -3733,6 +3737,8 @@ exports.processPrimusWorkflow = onRequest(
                   billtoSource: uiResult.billtoSource || null,
                   billtoPartyName: uiResult.billtoPartyName || null,
                 };
+                customerInvoicePredatedThisRun =
+                  !!invoiceGenerationResult.reused;
 
                 if (!uiOk) {
                   await writeLog(
@@ -3821,10 +3827,11 @@ exports.processPrimusWorkflow = onRequest(
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_generated");
 
-                if (!carrierBillOnlyMode) {
+                if (!carrierBillOnlyMode && !customerInvoicePredatedThisRun) {
                   // Push carrier bill to QB immediately — do not wait for
                   // customer-email approval (loads parked at that gate never
-                  // reached the old end-of-workflow QB call).
+                  // reached the old end-of-workflow QB call). An invoice
+                  // Primus already issued was already synced; do not repush.
                   await pushCarrierBillToQuickBooks({
                     req,
                     invoiceDoc,
@@ -4127,6 +4134,66 @@ exports.processPrimusWorkflow = onRequest(
               workflowStatus: "completed_carrier_bill_only",
               customerInvoiceId: finalCustomerInvoiceId,
               qbBillingSynced: false,
+            });
+          }
+
+          if (workflowErrors.shouldSuppressCustomerInvoiceResend({
+            customerInvoicePredatedThisRun,
+            currentStep,
+          })) {
+            const issuedInvoiceNumberReuse =
+              (invoiceGenerationResult &&
+                invoiceGenerationResult.invoiceNumber) ||
+              invoice.issuedInvoiceNumber || null;
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "final_email_sent",
+              stepStatus: "skipped",
+              reason: "Customer invoice was already issued — not resent",
+              output: {customerInvoiceId: finalCustomerInvoiceId},
+            });
+            await invoiceDoc.ref.update({
+              decisionStage: "completed",
+              decisionReason:
+                "Customer invoice already sent — not emailed again",
+              customerName: customerName,
+              customerRate: customerRate,
+              profit: profit,
+              primusSteps: primusSteps,
+              finalWorkflowStatus: "completed",
+              customerInvoiceId: finalCustomerInvoiceId,
+              issuedInvoiceNumber: issuedInvoiceNumberReuse || null,
+              processingLock: false,
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await writeLog("info", "workflow",
+                "Customer invoice already sent — not emailed again", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  customerInvoiceId: finalCustomerInvoiceId,
+                  invoiceNumber: issuedInvoiceNumberReuse,
+                });
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "workflow_completed",
+              stepStatus: "success",
+              output: {
+                customerName,
+                profit,
+                customerInvoiceId: finalCustomerInvoiceId,
+                mode: "already_sent_not_resent",
+              },
+            });
+            if (typeof scheduleFlowSummary === "function") {
+              scheduleFlowSummary(
+                  invoice.flowId || invoice.gmailMessageId || invoiceId);
+            }
+            return res.json({
+              ok: true,
+              message: "Customer invoice already sent — not emailed again",
+              workflowStatus: "completed",
+              customerInvoiceId: finalCustomerInvoiceId,
+              qbBillingSynced: !!primusSteps.qbBillingSynced,
             });
           }
 

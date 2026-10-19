@@ -36,6 +36,21 @@ function shouldRunBillingPipelineOnResume(resumeStep) {
 }
 
 /**
+ * Do not email a customer invoice Primus already had before this run.
+ * A resume whose only job is the first customer email still sends.
+ * @param {object} [opts] Flags from the billing run.
+ * @param {boolean} [opts.customerInvoicePredatedThisRun] UI found an
+ *   issued invoice instead of creating one.
+ * @param {string|null} [opts.currentStep] Workflow resume step.
+ * @return {boolean}
+ */
+function shouldSuppressCustomerInvoiceResend(opts) {
+  if (!opts || !opts.customerInvoicePredatedThisRun) return false;
+  if (String(opts.currentStep || "") === "send_customer_email") return false;
+  return true;
+}
+
+/**
  * Maps a workflow POST response to user-facing resume outcome copy.
  * @param {boolean} httpOk fetch response.ok
  * @param {object} payload Parsed workflow JSON body
@@ -862,6 +877,7 @@ module.exports = {
   shouldSuppressRepeatHoldAlert,
   shouldDelayWorkflowRetry,
   shouldRunBillingPipelineOnResume,
+  shouldSuppressCustomerInvoiceResend,
   interpretWorkflowResumeResult,
   transientRetryDelayMs,
   TRANSIENT_NETWORK_RETRY_MS,

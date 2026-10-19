@@ -34,6 +34,21 @@ check("carrier_invoice_number resume runs billing pipeline",
 // Early verify uses pauseOnMissing:false so resume can reach UI billing.
 check("send_customer_email resume does not run billing alone",
     shouldRunBillingPipelineOnResume("send_customer_email"), false);
+check("already-issued customer invoice is not emailed again",
+    workflowErrors.shouldSuppressCustomerInvoiceResend({
+      customerInvoicePredatedThisRun: true,
+      currentStep: null,
+    }), true);
+check("first customer-email resume still sends",
+    workflowErrors.shouldSuppressCustomerInvoiceResend({
+      customerInvoicePredatedThisRun: true,
+      currentStep: "send_customer_email",
+    }), false);
+check("newly issued customer invoice is emailed",
+    workflowErrors.shouldSuppressCustomerInvoiceResend({
+      customerInvoicePredatedThisRun: false,
+      currentStep: null,
+    }), false);
 
 const missingPodAlert = buildWorkflowAlertEmail({
   code: "MISSING_POD",
