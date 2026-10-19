@@ -604,6 +604,33 @@ check("fully extracted index does not alert",
         })), false);
 
 check("EXTERNAL customer invoice reply not statement-only short-circuit",
+    bundle.shouldShortCircuitAsStatementOnly({
+      intent: "statement",
+      confidence: "high",
+    }, "Re: Invoice for BOL#265028", "a@b.com", "paid", null),
+    false);
+check("gmail load-number subject plus invoice PDF is a carrier invoice",
+    bundle.promoteAttachedInvoiceClassification({
+      intent: "unknown",
+      confidence: "medium",
+      reasoning: "Personal Gmail",
+    }, "269395",
+    "Please find the invoice attached for your review.",
+    [{filename: "Invoice_MS-1001_Innovative_Carriers.pdf"}]).intent,
+    "carrier_invoice");
+check("invoice filename alone promotes unknown to carrier invoice",
+    bundle.promoteAttachedInvoiceClassification({
+      intent: "unknown",
+    }, "269395", "",
+    [{filename: "Invoice_MS-1001_Innovative_Carriers.pdf"}]).intent,
+    "carrier_invoice");
+check("known non-invoice intent is not promoted",
+    bundle.promoteAttachedInvoiceClassification({
+      intent: "pod_request",
+    }, "269395", "Please find the invoice attached.",
+    [{filename: "Invoice_MS-1001.pdf"}]).intent,
+    "pod_request");
+check("EXTERNAL customer invoice reply not statement-only short-circuit",
     bundle.shouldShortCircuitAsStatementOnly(
         {
           intent: "statement",

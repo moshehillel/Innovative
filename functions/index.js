@@ -3800,10 +3800,10 @@ function isPdfMagicBytes(fileBuffer) {
     fileBuffer[3] === 0x46;
 }
 
-/** Filters logos/tiny stubs; compact carrier invoices can be ~5–8 KB. */
+/** Filters logos/tiny stubs; compact carrier invoices can be ~2–8 KB. */
 const MIN_PDF_ATTACHMENT_BYTES = 5000;
-/** INV*.pdf-style names (e.g. Forward Air) may be smaller but valid. */
-const MIN_INVOICE_LIKE_PDF_BYTES = 3000;
+/** Invoice-named PDFs (e.g. Invoice_MS-1001.pdf) can be under 3 KB. */
+const MIN_INVOICE_LIKE_PDF_BYTES = 1500;
 
 /**
  * True when the filename suggests a carrier invoice PDF.
@@ -3844,9 +3844,15 @@ function isPdfAttachment(attachment, fileBuffer) {
  * @param {Buffer} fileBuffer File bytes.
  * @return {boolean}
  */
-function isPdfTooSmallForIntake(attachment, fileBuffer) {
+function isPdfTooSmallForIntake(attachment, fileBuffer, context) {
   if (!isPdfAttachment(attachment, fileBuffer)) return false;
-  return fileBuffer.length < minPdfBytesForAttachment(attachment);
+  let floor = minPdfBytesForAttachment(attachment);
+  const intent = context && context.emailClassification &&
+    context.emailClassification.intent;
+  if (intent === "carrier_invoice") {
+    floor = Math.min(floor, MIN_INVOICE_LIKE_PDF_BYTES);
+  }
+  return fileBuffer.length < floor;
 }
 
 /**
@@ -3855,7 +3861,7 @@ function isPdfTooSmallForIntake(attachment, fileBuffer) {
  * @param {Buffer} fileBuffer - File bytes.
  * @return {boolean}
  */
-function shouldProcessAttachment(attachment, fileBuffer) {
+function shouldProcessAttachment(attachment, fileBuffer, context) {
   const mime = String(attachment && attachment.mimeType || "").toLowerCase();
   const name = String(attachment && attachment.filename || "").toLowerCase();
   // Nested .eml / RFC822 wrappers are expanded separately.
@@ -3867,7 +3873,7 @@ function shouldProcessAttachment(attachment, fileBuffer) {
     return false;
   }
   if (!isPdfAttachment(attachment, fileBuffer)) return false;
-  if (isPdfTooSmallForIntake(attachment, fileBuffer)) return false;
+  if (isPdfTooSmallForIntake(attachment, fileBuffer, context)) return false;
   return true;
 }
 
@@ -9380,6 +9386,11 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
       "  additional charge). Classify as carrier_invoice, not unknown.",
       "- Factor invoices that include ACH/wire/banking remittance",
       "  instructions (how to pay the factor) are still carrier_invoice.",
+      "- When the email body says an invoice is attached, or a PDF",
+      "  filename contains \"invoice\", classify as carrier_invoice even",
+      "  if the sender is a personal Gmail address and the subject is",
+      "  only a load number. Read the email text. Do not return unknown",
+      "  only because the sender is not a known carrier domain.",
       "- pod_delivery: reply attaching Proof of Delivery / signed BOL /",
       "  delivery photos — not asking us to send one.",
       "- pod_request: sender asks Innovative to SEND or provide a POD /",
@@ -9963,6 +9974,9 @@ async function processGmailMessage(
               .overrideStatementClassificationIfInvoicePacket(
                   emailClassification, subject, from, emailBody,
                   attachments);
+          emailClassification = statementInvoiceBundle
+              .promoteAttachedInvoiceClassification(
+                  emailClassification, subject, emailBody, attachments);
           await writeLog("info", "ai", "Incoming email classified", {
             messageId,
             subject,
@@ -10650,7 +10664,9 @@ async function processGmailMessage(
         // Skip non-PDFs — except JPEG/PNG POD images (invoice companion or
         // POD-only / trailer replies).
         const podFollowup = require("./pod-followup");
-        if (!shouldProcessAttachment(attachment, fileBuffer)) {
+        if (!shouldProcessAttachment(attachment, fileBuffer, {
+          emailClassification,
+        })) {
           if (podFollowup.isPodImageAttachment(attachment, fileBuffer)) {
             const imageMime = podFollowup.detectImageMime(
                 attachment, fileBuffer);
@@ -10696,7 +10712,9 @@ async function processGmailMessage(
           const isExpandedZip =
             Boolean(attachment.zipExpanded) ||
             invoiceZipAttachments.isZipAttachment(attachment, fileBuffer);
-          if (isPdfMime && isPdfTooSmallForIntake(attachment, fileBuffer)) {
+          if (isPdfMime && isPdfTooSmallForIntake(attachment, fileBuffer, {
+            emailClassification,
+          })) {
           // Small PDF — likely a real document but too short to be an invoice
             skippedDocTypes.push("small PDF");
           } else if (!isPdfMime && !isExpandedZip &&
@@ -10828,7 +10846,9 @@ async function processGmailMessage(
                 });
           }
           for (const attachment of rawPdfs) {
-            if (!shouldProcessAttachment(attachment, attachment.buffer)) {
+            if (!shouldProcessAttachment(attachment, attachment.buffer, {
+              emailClassification,
+            })) {
               continue;
             }
             let docType = "INVOICE";

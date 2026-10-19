@@ -801,6 +801,59 @@ function buildStatementGapSummarySuffix(gap) {
   return "statement PDF may be under-extracted";
 }
 
+/**
+ * True when the email text says an invoice file is attached.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function emailTextSaysAttachedInvoice(subject, body) {
+  const text = `${subject || ""}\n${body || ""}`;
+  return /\binvoice\b/i.test(text) &&
+    /\b(attach(?:ed|ment)?|enclosed|please find|see attached)\b/i.test(text);
+}
+
+/**
+ * True when an attachment filename contains the word invoice.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {boolean}
+ */
+function attachmentFilenameSaysInvoice(attachments) {
+  return (Array.isArray(attachments) ? attachments : []).some((a) =>
+    /invoice/i.test(String(a && a.filename || "")));
+}
+
+/**
+ * Trust the email text and the PDF name when the classifier hedges.
+ * A personal Gmail with subject "269395" and "invoice attached" is a bill.
+ * @param {object} classification Incoming email classifier result.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @param {Array<object>} [attachments] Attachment metadata.
+ * @return {object} Classification, promoted to carrier_invoice when needed.
+ */
+function promoteAttachedInvoiceClassification(
+    classification, subject, body, attachments) {
+  const current = classification && typeof classification === "object" ?
+    classification : {intent: "unknown"};
+  if (current.intent && current.intent !== "unknown") return current;
+  const named = attachmentFilenameSaysInvoice(attachments);
+  const said = emailTextSaysAttachedInvoice(subject, body);
+  if (!named && !said) return current;
+  let reasoning = "Email text says an invoice is attached.";
+  if (named && said) {
+    reasoning = "Email says an invoice is attached and the PDF is named " +
+      "as an invoice.";
+  } else if (named) {
+    reasoning = "Attachment filename is an invoice PDF.";
+  }
+  return Object.assign({}, current, {
+    intent: "carrier_invoice",
+    confidence: "high",
+    reasoning,
+  });
+}
+
 module.exports = {
   sanitizePreCheckLabel,
   looksLikeNumberedStatementSubject,
@@ -827,6 +880,7 @@ module.exports = {
   normalizePreCheckDocType,
   shouldShortCircuitAsStatementOnly,
   overrideStatementClassificationIfInvoicePacket,
+  promoteAttachedInvoiceClassification,
   parseStatementIndexLoadNumbers,
   estimateStatementInvoiceCount,
   analyzeStatementExtractionGap,
