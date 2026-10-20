@@ -49,6 +49,43 @@ check("rejects a total that does not match the lines", badTotal.ok === false);
 const ctOnly = portFees.detectPortFeeKind("Clean Truck Fee on a rate con");
 check("clean truck wording alone is not an invoice", ctOnly === null);
 
+const feeWordOnly = portFees.detectPortFeeKind(
+    "Traffic Mitigation Fee discussed in a rate confirmation",
+);
+check("fee wording alone is not an invoice", feeWordOnly === null);
+
+// PierPASS now paints "Traffic Mitigation Fee Invoice" in a header image.
+// The text layer keeps the column, the payment note, and the bill number.
+const IMAGE_TITLE_TMF = [
+  "Page 1 of 1",
+  "Invoice #: Invoice Period: Invoice Date: Account #:",
+  "Total Due: Due Date:",
+  "84389-10000001-IN 10/10/2026 - 10/16/2026 10/20/2026 84389",
+  "$81.26 10/29/2026",
+  "PLEASE NOTE: INVOICES ARE PAYABLE BY ACH ONLY.",
+  "PierPASS's banking information is: Bank of America.",
+  "Container Number Booking #/BoL # Traffic Mitigation Fee",
+  "10/10/26 23:51:00 APMT FFAU8880029 40 I BOOKING1 VESSEL 015E 81.26",
+  "Total 81.26",
+].join(" ");
+check("image-title pdf is still TMF",
+    portFees.detectPortFeeKind(IMAGE_TITLE_TMF) === "TMF");
+const imageTitleParsed = portFees.parsePortFeeInvoiceText(IMAGE_TITLE_TMF);
+check("image-title pdf parses", imageTitleParsed.ok === true);
+check("image-title bill number",
+    imageTitleParsed.invoice &&
+    imageTitleParsed.invoice.invoiceNumber === "84389-10000001-IN");
+check("image-title bill date",
+    imageTitleParsed.invoice &&
+    imageTitleParsed.invoice.invoiceDate === "2026-10-20");
+check("image-title one container",
+    imageTitleParsed.invoice &&
+    imageTitleParsed.invoice.lines.length === 1 &&
+    imageTitleParsed.invoice.lines[0].amount === 81.26);
+check("image-title total",
+    imageTitleParsed.invoice &&
+    imageTitleParsed.invoice.invoiceTotal === 81.26);
+
 check("Pier Pass invoice subject stays on the port-fee path",
     portFees.isPortFeeMessage(
         "Pierpass.OffPeak-Invoice@pierpass.net",

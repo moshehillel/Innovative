@@ -133,6 +133,13 @@ function detectPortFeeKind(text) {
       /Clean Truck Fee|PortCheck/i.test(raw)) {
     return "CTF";
   }
+  // Newer PierPASS PDFs draw the title in a header image. The text layer
+  // still has the fee column, the PierPASS payment note, and the bill number.
+  if (/Traffic Mitigation Fee/i.test(raw) &&
+      /Pier\s*PASS/i.test(raw) &&
+      /\b\d{4,8}-\d{5,}-IN\b/.test(raw)) {
+    return "TMF";
+  }
   return null;
 }
 
