@@ -53,6 +53,7 @@ const {
 const administrativeEmailIntake = require("./administrative-email-intake");
 const paymentNotificationClassify = require("./payment-notification-classify");
 const statementInvoiceBundle = require("./statement-invoice-bundle");
+const multiBillPdfSplit = require("./multi-bill-pdf-split");
 const {
   sanitizePreCheckLabel,
   shouldKeepAttachmentAsInvoice,
@@ -6602,27 +6603,21 @@ async function handleStatementUnderExtractionAlert(args) {
 
   const missingList = Array.isArray(gap.missingLoads) ?
     gap.missingLoads : [];
-  const missingLabel = missingList.length > 0 ?
+  const detail = statementInvoiceBundle.buildStatementGapSummarySuffix(gap);
+  const missingLabel = detail || (missingList.length > 0 ?
     missingList.join(", ") :
-    `expected ~${gap.expectedCount}, extracted ${gap.extractedCount}`;
+    `expected ~${gap.expectedCount}, extracted ${gap.extractedCount}`);
 
-  const reason =
+  const reason = detail ?
+    `Invoice packet incomplete — ${detail}` :
     "Statement PDF missing freight invoices — manual review required";
   const notes =
     `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
-    `I received a numbered carrier statement packet ` +
-    `(subject: ${subject || "—"}) that contains multiple freight ` +
-    `invoices in one PDF.\n\n` +
-    `I extracted ${gap.extractedCount} invoice(s) but ` +
-    (missingList.length > 0 ?
-      `${missingList.length} load(s) from the statement index were NOT ` +
-      `extracted and were not queued for processing:\n` +
-      `${missingList.join("\n")}\n\n` :
-      `the PDF appears to contain more invoices than I extracted ` +
-      `(expected ~${gap.expectedCount}, got ${gap.extractedCount}).\n\n`) +
-    `I processed the invoice(s) I could identify. Please review the ` +
-    `attached PDF and enter any missing loads manually, or reprocess ` +
-    `after correcting.\n\nThank you,\n${AI_AGENT_NAME}`;
+    `I read a carrier PDF (subject: ${subject || "—"}) ` +
+    `that contains more than one freight bill.\n\n` +
+    `${missingLabel}\n\n` +
+    `I queued the bill(s) I could separate. Please enter any bill ` +
+    `named above that was not opened.\n\nThank you,\n${AI_AGENT_NAME}`;
 
   await forwardToHumanReview(
       gmail, messageId, subject, from, reason, notes,
@@ -11338,15 +11333,49 @@ async function processGmailMessage(
       }
 
       try {
-        const recovered = await recoverStatementInvoiceItems({
-          messageId,
-          subject,
+        const split = await multiBillPdfSplit.splitSinglePdfInvoiceItems({
           pdfAttachments,
           invoiceItems,
-          lastKnownLoadNumber,
+          classifySlice: async (buffer) => {
+            const classified = await classifyOneInvoicePdf({
+              filename: "statement-bill.pdf",
+              mimeType: "application/pdf",
+              buffer,
+              docType: "INVOICE",
+            }, null);
+            return classified && classified[0] ? classified[0] : null;
+          },
         });
-        invoiceItems = recovered.invoiceItems;
-        statementExtractionGap = recovered.gap;
+        if (split.warnings && split.warnings.length) {
+          await writeLog("warn", "ai", "Multi-bill PDF split warning", {
+            messageId,
+            warnings: split.warnings.slice(0, 5),
+          });
+        }
+        if (split.applied) {
+          invoiceItems = split.invoiceItems;
+          statementExtractionGap = split.gap;
+          await writeLog("info", "ai",
+              "Split one PDF into one job per bill", {
+                messageId,
+                invoiceCount: invoiceItems.length,
+                loadNumbers: invoiceItems.map((item) =>
+                  item && item.loadNumber),
+                firstPassCount: split.firstPassCount || null,
+                underExtracted: !!(
+                  split.gap && split.gap.underExtracted),
+              });
+        } else {
+          const recovered = await recoverStatementInvoiceItems({
+            messageId,
+            subject,
+            pdfAttachments,
+            invoiceItems,
+            lastKnownLoadNumber,
+          });
+          invoiceItems = recovered.invoiceItems;
+          statementExtractionGap = recovered.gap;
+        }
       } catch (stmtErr) {
         await writeLog("warn", "ai",
             "Statement under-extraction recovery failed", {

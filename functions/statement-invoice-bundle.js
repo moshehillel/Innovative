@@ -781,12 +781,71 @@ function shouldAlertStatementUnderExtraction(gap) {
 }
 
 /**
- * One-line suffix for intake summaries when a statement PDF is under-extracted.
+ * Short label for one bill on a statement cover or an unread page.
+ * @param {object} bill invoiceNumber, proNumber, loadNumber, amount, page.
+ * @return {string}
+ */
+function formatStatementBillLabel(bill) {
+  const row = bill && typeof bill === "object" ? bill : {};
+  const invoice = String(row.invoiceNumber || "").trim();
+  const pro = String(row.proNumber || "").trim();
+  const load = String(row.loadNumber || "").trim();
+  const parts = [];
+  if (invoice) parts.push(`invoice ${invoice}`);
+  if (pro && pro.replace(/\D/g, "").replace(/^0+/, "") !==
+      invoice.replace(/\D/g, "").replace(/^0+/, "")) {
+    parts.push(`PRO ${pro}`);
+  }
+  if (load) parts.push(`load ${load}`);
+  const amount = Number(row.amount);
+  if (Number.isFinite(amount) && amount > 0) {
+    parts.push(`$${amount.toFixed(2)}`);
+  }
+  if (row.page) parts.push(`page ${row.page}`);
+  return parts.join(" ") || "unidentified bill";
+}
+
+/**
+ * @param {Array<object>} bills Bill rows.
+ * @param {number} limit How many to spell out.
+ * @return {string}
+ */
+function joinBillLabels(bills, limit) {
+  const rows = Array.isArray(bills) ? bills : [];
+  const cap = Number.isFinite(limit) ? limit : 8;
+  const list = rows.slice(0, cap).map(formatStatementBillLabel).join("; ");
+  const extra = rows.length > cap ? ` (+${rows.length - cap} more)` : "";
+  return `${list}${extra}`;
+}
+
+/**
+ * One-line suffix for intake summaries when a packet is under-extracted.
+ * Names missing invoice numbers, PROs, loads, and amounts when present.
  * @param {object|null|undefined} gap analyzeStatementExtractionGap result.
  * @return {string}
  */
 function buildStatementGapSummarySuffix(gap) {
   if (!gap || !gap.underExtracted) return "";
+  const missingBills = Array.isArray(gap.missingBills) ?
+    gap.missingBills : [];
+  const unclaimed = Array.isArray(gap.unclaimedBills) ?
+    gap.unclaimedBills : [];
+  const named = missingBills.concat(unclaimed);
+  if (named.length > 0 || Array.isArray(gap.foundBills)) {
+    const found = Number(gap.extractedCount) || 0;
+    const listed = Number(gap.expectedCount) || 0;
+    const head = listed > 0 ?
+      `found ${found} of ${listed} bill(s)` :
+      `found ${found} bill(s)`;
+    const foundRows = Array.isArray(gap.foundBills) ? gap.foundBills : [];
+    const foundLabel = foundRows.length ?
+      ` (${joinBillLabels(foundRows, 6)})` : "";
+    if (named.length > 0) {
+      return `${head}${foundLabel}. Not opened: ` +
+        joinBillLabels(named, 8);
+    }
+    return `${head}${foundLabel}`;
+  }
   const missing = Array.isArray(gap.missingLoads) ? gap.missingLoads : [];
   if (missing.length > 0) {
     const list = missing.slice(0, 8).join(", ");
