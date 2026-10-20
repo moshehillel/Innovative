@@ -9892,6 +9892,7 @@ async function processGmailMessage(
           if (attachments.length > 0) {
             portSniff = await portFeeInvoices.sniffPdfAttachments({
               attachments,
+              expectInvoice: portFeeMail,
               downloadAttachment: async (att) => {
                 const buf = await resolveAttachmentBuffer(
                     gmail, messageId, att);
@@ -9928,9 +9929,14 @@ async function processGmailMessage(
                 subject,
                 from,
               });
+          const hasPdf = attachments.some((att) => {
+            const name = String(att && att.filename || "");
+            const mime = String(att && att.mimeType || "");
+            return /\.pdf$/i.test(name) || mime === "application/pdf";
+          });
           portSniff.rejected.push({
             filename: String(subject || "port-fee").slice(0, 180),
-            error: "Pier Pass / Port Check invoice was not read from the PDF",
+            error: hasPdf ? "no text" : "no PDF invoice was attached",
           });
         }
         if (portSniff.matches.length || portSniff.rejected.length) {

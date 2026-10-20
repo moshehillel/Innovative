@@ -8,6 +8,12 @@
  *
  * Bill date and due date are the invoice date. Terms are Due on receipt.
  * Customer charges are left alone.
+ *
+ * A PDF is a bill when the text has a bill number, an invoice date, fee
+ * wording (Traffic Mitigation Fee / TMF / PierPASS, or Clean Truck Fee /
+ * CTF / Port Check / Port Rate), and at least one container amount. The
+ * title line is a hint. Same vendor, code, bill number, and amount is
+ * already on the load and is not posted again.
  */
 
 "use strict";
@@ -122,25 +128,76 @@ function isIsoContainer(value) {
   return /^[A-Z]{3}[UJZ]\d{7}$/.test(String(value || "").toUpperCase());
 }
 
+/** Pier Pass / Port Check bill numbers: account, sequence, then IN. */
+const BILL_NUMBER_RE = /\b(\d{4,8}-\d{5,}-IN)\b/i;
+
 /**
+ * Fee wording that shows up in the text layer. The painted title is not
+ * required. "PierPASS/INNOVATIVE CARRIERS" alone is the bill-to line, not
+ * a TMF charge.
  * @param {string} text PDF text.
- * @return {string|null} "TMF", "CTF", or null.
+ * @return {object}
  */
-function detectPortFeeKind(text) {
+function readFeeWording(text) {
   const raw = String(text || "");
-  if (/Traffic Mitigation Fee Invoice/i.test(raw)) return "TMF";
-  if (/Port Rate Invoice/i.test(raw) &&
-      /Clean Truck Fee|PortCheck/i.test(raw)) {
-    return "CTF";
+  return {
+    tmfPhrase: /Traffic Mitigation Fee/i.test(raw),
+    tmfCode: /\bTMF\b/.test(raw),
+    mitigation: /Mitigation\s+Fee/i.test(raw),
+    pierpass: /Pier\s*-?\s*Pass/i.test(raw),
+    ctfPhrase: /Clean Truck Fee/i.test(raw),
+    ctfCode: /\bCTF\b/.test(raw),
+    ctfTitle: /Port Rate Invoice/i.test(raw),
+    portRate: /Port Rate/i.test(raw),
+    portCheck: /Port\s*-?\s*Check/i.test(raw),
+  };
+}
+
+/**
+ * @param {object} wording readFeeWording result.
+ * @return {string|null} "TMF", "CTF", or null when the two families conflict.
+ */
+function kindFromWording(wording) {
+  const w = wording || {};
+  const tmf = w.tmfPhrase || w.tmfCode || (w.pierpass && w.mitigation);
+  const ctf = w.ctfPhrase || w.ctfCode || w.portCheck || w.ctfTitle ||
+    (w.portRate && (w.ctfPhrase || w.portCheck || w.ctfTitle || w.ctfCode));
+  if (tmf && ctf) return null;
+  if (tmf) return "TMF";
+  if (ctf) return "CTF";
+  return null;
+}
+
+/**
+ * Suspension notices, newsletters, and payment receipts are not bills,
+ * even when they come from pierpass.net or mention a fee.
+ * @param {string} text PDF text.
+ * @return {string|null}
+ */
+function nonInvoiceReason(text) {
+  const raw = String(text || "");
+  if (/\b(?:suspended|suspension)\b/i.test(raw)) {
+    return "suspension notice is not an invoice";
   }
-  // Newer PierPASS PDFs draw the title in a header image. The text layer
-  // still has the fee column, the PierPASS payment note, and the bill number.
-  if (/Traffic Mitigation Fee/i.test(raw) &&
-      /Pier\s*PASS/i.test(raw) &&
-      /\b\d{4,8}-\d{5,}-IN\b/.test(raw)) {
-    return "TMF";
+  if (/\bnewsletter\b/i.test(raw)) return "newsletter is not an invoice";
+  const receipt = new RegExp(
+      "\\b(payment receipt|thank you for your payment|" +
+      "payment confirmation|receipt of payment)\\b",
+      "i",
+  );
+  if (receipt.test(raw)) {
+    return "payment receipt is not an invoice";
   }
   return null;
+}
+
+/**
+ * @param {string} text PDF text.
+ * @return {string|null} "TMF" or "CTF" only when the text is a real bill.
+ */
+function detectPortFeeKind(text) {
+  const assessed = assessPortFeeText(text);
+  return assessed.complete ? assessed.kind : null;
 }
 
 /**
@@ -153,6 +210,13 @@ function detectPortFeeKind(text) {
 function isPortFeeMessage(from, subject) {
   const fromL = String(from || "").toLowerCase();
   const subjectL = String(subject || "").toLowerCase();
+  const notInvoice = new RegExp(
+      "\\b(?:suspended|suspension|newsletter|" +
+      "payment receipt|payment confirmation)\\b",
+  );
+  if (notInvoice.test(subjectL)) {
+    return false;
+  }
   const portSender = /pierpass\.net|portcheck\.org/.test(fromL);
   const invoiceSubject = /\binvoice\b/.test(subjectL);
   const namedInvoice = invoiceSubject &&
@@ -165,9 +229,64 @@ function isPortFeeMessage(from, subject) {
  * @return {string|null} YYYY-MM-DD.
  */
 function usDateToIso(mdy) {
-  const m = String(mdy || "").match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  const m = String(mdy || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (!m) return null;
-  return `${m[3]}-${m[1]}-${m[2]}`;
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const mm = String(month).padStart(2, "0");
+  const dd = String(day).padStart(2, "0");
+  return `${m[3]}-${mm}-${dd}`;
+}
+
+/**
+ * Invoice date from a labeled date, or from the classic
+ * period-start / period-end / invoice-date triple after the bill number.
+ * The due date that follows the dollar total is not the bill date.
+ * @param {string} raw Full text.
+ * @param {string|null} invoiceNumber Bill number.
+ * @return {string|null} YYYY-MM-DD.
+ */
+function findInvoiceDate(raw, invoiceNumber) {
+  const labeledRe = new RegExp(
+      "(?:Invoice\\s*Date|Bill\\s*Date|Date\\s+of\\s+Invoice)" +
+      "\\s*[:#-]?\\s*(\\d{1,2}/\\d{1,2}/\\d{4})",
+      "i",
+  );
+  const labeled = String(raw || "").match(labeledRe);
+  if (labeled) {
+    const iso = usDateToIso(labeled[1]);
+    if (iso) return iso;
+  }
+  const periodRe = new RegExp(
+      "(\\d{1,2}/\\d{1,2}/\\d{4})\\s*-\\s*" +
+      "(\\d{1,2}/\\d{1,2}/\\d{4})\\s+" +
+      "(\\d{1,2}/\\d{1,2}/\\d{4})",
+  );
+  let scope = String(raw || "");
+  if (invoiceNumber) {
+    const at = scope.toUpperCase().indexOf(String(invoiceNumber).toUpperCase());
+    if (at >= 0) scope = scope.slice(at);
+  }
+  const period = scope.match(periodRe) || String(raw || "").match(periodRe);
+  if (!period) return null;
+  return usDateToIso(period[3]);
+}
+
+/**
+ * @param {string} raw Full text.
+ * @return {number}
+ */
+function resolveInvoiceTotal(raw) {
+  const dollar = String(raw || "").match(/\$\s*([0-9,]+\.\d{2})/);
+  if (dollar) return roundMoney(String(dollar[1]).replace(/,/g, ""));
+  const totals = [
+    ...String(raw || "").matchAll(
+        /\bTotal(?:\s+Due)?\b[^0-9$]{0,40}\$?\s*([0-9,]+\.\d{2})/gi,
+    ),
+  ];
+  if (!totals.length) return 0;
+  return roundMoney(String(totals[totals.length - 1][1]).replace(/,/g, ""));
 }
 
 /**
@@ -179,7 +298,7 @@ function usDateToIso(mdy) {
  */
 function parseContainerLines(text) {
   const raw = String(text || "");
-  const detailAt = raw.search(/Container Number/i);
+  const detailAt = raw.search(/\b(?:Container|Cntr)\b/i);
   const detail = detailAt >= 0 ? raw.slice(detailAt) : raw;
   const re = /\b([A-Z]{4}\d{7})\b/g;
   const hits = [];
@@ -205,53 +324,138 @@ function parseContainerLines(text) {
 }
 
 /**
+ * @param {string} text PDF text.
+ * @return {string|null}
+ */
+function billNumberFrom(text) {
+  const match = String(text || "").match(BILL_NUMBER_RE);
+  return match ? match[1].toUpperCase() : null;
+}
+
+/**
+ * Decides whether extracted text is a Pier Pass or Port Check bill.
+ * A bill has a bill number, an invoice date, fee wording, and at least
+ * one container line with an amount. The title is only a hint.
+ * @param {string} text PDF text.
+ * @return {object}
+ */
+function assessPortFeeText(text) {
+  const raw = String(text || "");
+  if (!raw.trim()) {
+    return {
+      complete: false,
+      partial: false,
+      notInvoice: false,
+      kind: null,
+      error: "no text",
+    };
+  }
+
+  const wording = readFeeWording(raw);
+  const kind = kindFromWording(wording);
+  const invoiceNumber = billNumberFrom(raw);
+  const invoiceDate = findInvoiceDate(raw, invoiceNumber);
+  const parsedLines = parseContainerLines(raw);
+  const hasAmount = parsedLines.some((line) => line.amount > 0);
+  const invoiceTotal = resolveInvoiceTotal(raw);
+  const lineSum = roundMoney(
+      parsedLines.reduce((sum, line) => sum + line.amount, 0));
+  const totalOk = invoiceTotal > 0 && moneyEquals(lineSum, invoiceTotal);
+  const complete = !!(kind && invoiceNumber && invoiceDate &&
+    parsedLines.length && hasAmount && totalOk);
+
+  if (complete) {
+    return {
+      complete: true,
+      partial: false,
+      notInvoice: false,
+      kind,
+      invoiceNumber,
+      invoiceDate,
+      invoiceTotal,
+      lines: parsedLines,
+      printedDueDate: printedDueDateFrom(raw),
+      error: null,
+    };
+  }
+
+  const veto = nonInvoiceReason(raw);
+  if (veto) {
+    return {
+      complete: false,
+      partial: false,
+      notInvoice: true,
+      kind: null,
+      error: veto,
+    };
+  }
+
+  const missing = [];
+  if (!invoiceNumber) missing.push("no invoice number");
+  if (!invoiceDate) missing.push("no invoice date");
+  if (!parsedLines.length) missing.push("no container lines");
+  else if (!hasAmount || !(invoiceTotal > 0)) missing.push("no amount");
+  if (!kind) missing.push("no TMF or CTF fee wording");
+  if (kind && invoiceNumber && invoiceDate && hasAmount &&
+      invoiceTotal > 0 && !totalOk) {
+    return {
+      complete: false,
+      partial: true,
+      notInvoice: false,
+      kind,
+      invoiceNumber,
+      error: `line total ${lineSum.toFixed(2)} does not match ` +
+        `invoice total ${invoiceTotal.toFixed(2)}`,
+    };
+  }
+
+  const partial = !!(
+    (invoiceNumber && (kind || wording.pierpass || wording.portCheck ||
+      wording.tmfPhrase || wording.ctfPhrase || wording.portRate)) ||
+    (parsedLines.length && kind && (invoiceNumber || invoiceDate))
+  );
+  return {
+    complete: false,
+    partial,
+    notInvoice: false,
+    kind,
+    invoiceNumber,
+    error: missing.join("; ") || "no text",
+  };
+}
+
+/**
+ * @param {string} raw Full text.
+ * @return {string|null}
+ */
+function printedDueDateFrom(raw) {
+  const dueMatch = String(raw || "").match(
+      /\$\s*[0-9,]+\.\d{2}\s+(\d{1,2}\/\d{1,2}\/\d{4})/,
+  );
+  return dueMatch ? usDateToIso(dueMatch[1]) : null;
+}
+
+/**
  * @param {string} text Extracted PDF text.
  * @param {object} [meta] filename.
  * @return {object} {ok, error?, invoice?}
  */
 function parsePortFeeInvoiceText(text, meta) {
-  const raw = String(text || "");
-  const kind = detectPortFeeKind(raw);
-  if (!kind) return {ok: false, error: "not a port fee invoice"};
-  const profile = CHARGE_PROFILES[kind];
-
-  const invMatch = raw.match(/\b(\d{4,8}-\d{5,}-IN)\b/);
-  if (!invMatch) {
-    return {ok: false, error: "invoice number not found", kind};
+  const assessed = assessPortFeeText(text);
+  if (!assessed.complete) {
+    return {
+      ok: false,
+      error: assessed.error,
+      kind: assessed.kind || null,
+      partial: !!assessed.partial,
+      notInvoice: !!assessed.notInvoice,
+      invoiceNumber: assessed.invoiceNumber || null,
+    };
   }
-  const invoiceNumber = invMatch[1];
-  const afterInv = raw.slice(invMatch.index + invoiceNumber.length);
-  const periodRe = new RegExp(
-      "(\\d{2}/\\d{2}/\\d{4})\\s*-\\s*" +
-      "(\\d{2}/\\d{2}/\\d{4})\\s+" +
-      "(\\d{2}/\\d{2}/\\d{4})",
-  );
-  const period = afterInv.match(periodRe);
-  if (!period) {
-    return {ok: false, error: "invoice date not found", kind};
-  }
-  const invoiceDate = usDateToIso(period[3]);
-  if (!invoiceDate) {
-    return {ok: false, error: "invoice date not found", kind};
-  }
-
-  const dollar = raw.match(/\$\s*([0-9,]+\.\d{2})/);
-  const invoiceTotal = dollar ?
-    roundMoney(String(dollar[1]).replace(/,/g, "")) : 0;
-  if (!(invoiceTotal > 0)) {
-    return {ok: false, error: "invoice total not found", kind};
-  }
-  const dueMatch = raw.match(/\$\s*[0-9,]+\.\d{2}\s+(\d{2}\/\d{2}\/\d{4})/);
-  const printedDueDate = dueMatch ? usDateToIso(dueMatch[1]) : null;
-
-  const parsedLines = parseContainerLines(raw);
-  if (!parsedLines.length) {
-    return {ok: false, error: "no container lines", kind};
-  }
-
+  const profile = CHARGE_PROFILES[assessed.kind];
   const seen = new Set();
   const lines = [];
-  for (const line of parsedLines) {
+  for (const line of assessed.lines) {
     const row = {
       container: line.container,
       amount: line.amount,
@@ -265,30 +469,18 @@ function parsePortFeeInvoiceText(text, meta) {
     }
     lines.push(row);
   }
-
-  const lineSum = roundMoney(lines.reduce((s, l) => s + l.amount, 0));
-  if (!moneyEquals(lineSum, invoiceTotal)) {
-    return {
-      ok: false,
-      error: `line total ${lineSum.toFixed(2)} does not match ` +
-        `invoice total ${invoiceTotal.toFixed(2)}`,
-      kind,
-      invoiceNumber,
-    };
-  }
-
   return {
     ok: true,
     invoice: {
-      kind,
+      kind: assessed.kind,
       chargeCode: profile.code,
       description: profile.description,
       vendorName: profile.vendorName,
       label: profile.label,
-      invoiceNumber,
-      invoiceDate,
-      printedDueDate,
-      invoiceTotal,
+      invoiceNumber: assessed.invoiceNumber,
+      invoiceDate: assessed.invoiceDate,
+      printedDueDate: assessed.printedDueDate,
+      invoiceTotal: assessed.invoiceTotal,
       lines,
       filename: (meta && meta.filename) || null,
     },
@@ -983,46 +1175,103 @@ async function lookupLoadByContainer(container) {
 }
 
 /**
- * Reads PDFs and keeps only Pier Pass / Port Check invoices.
- * Caches bytes on the attachment so later intake can reuse them.
- * @param {object} opts attachments, downloadAttachment.
+ * @param {Buffer|Uint8Array} buffer PDF bytes.
+ * @return {Promise<string>}
+ */
+async function extractAttachmentText(buffer) {
+  if (!buffer) return "";
+  const pages = await podUtils.extractPdfPageTexts(buffer);
+  if (!pages || !pages.length) return "";
+  return pages.map((page) => String(page || "")).join("\n").trim();
+}
+
+/**
+ * @param {object} att Attachment.
+ * @return {boolean}
+ */
+function isPdfAttachment(att) {
+  const name = String(att && att.filename || "");
+  const mime = String(att && att.mimeType || "");
+  return /\.pdf$/i.test(name) || mime === "application/pdf";
+}
+
+/**
+ * Reads PDFs and keeps Pier Pass / Port Check bills.
+ * A CSV with the same name is ignored. When the message is already known
+ * to be one of these invoices, a PDF that does not parse is returned with
+ * the piece that was missing.
+ * @param {object} opts attachments, downloadAttachment, expectInvoice.
  * @return {Promise<{matches: Array, rejected: Array}>}
  */
 async function sniffPdfAttachments(opts) {
   const attachments = (opts && opts.attachments) || [];
   const download = opts && opts.downloadAttachment;
+  const expectInvoice = !!(opts && opts.expectInvoice);
+  const extractText = (opts && opts.extractText) || extractAttachmentText;
   const matches = [];
   const rejected = [];
+  const failures = [];
   if (typeof download !== "function") {
     return {matches, rejected};
   }
+  let sawPdf = false;
   for (const att of attachments) {
-    if (!att) continue;
+    if (!att || !isPdfAttachment(att)) continue;
+    sawPdf = true;
     const name = String(att.filename || "");
-    const mime = String(att.mimeType || "");
-    const isPdf = /\.pdf$/i.test(name) || mime === "application/pdf";
-    if (!isPdf) continue;
-    let buffer;
+    let text = "";
     try {
-      buffer = await download(att);
+      const buffer = await download(att);
+      text = buffer ? await extractText(buffer) : "";
     } catch (_) {
-      continue;
+      text = "";
     }
-    if (!buffer) continue;
-    const pages = await podUtils.extractPdfPageTexts(buffer);
-    if (!pages || !pages.length) continue;
-    const text = pages.join("\n");
-    if (!detectPortFeeKind(text)) continue;
-    const parsed = parsePortFeeInvoiceText(text, {filename: name});
-    if (!parsed.ok) {
-      rejected.push({
+    if (!String(text || "").trim()) {
+      failures.push({
         filename: name,
-        kind: parsed.kind || null,
-        error: parsed.error || "parse failed",
+        kind: null,
+        error: "no text",
+        partial: false,
+        notInvoice: false,
       });
       continue;
     }
-    matches.push(parsed.invoice);
+    const parsed = parsePortFeeInvoiceText(text, {filename: name});
+    if (parsed.ok) {
+      matches.push(parsed.invoice);
+      continue;
+    }
+    failures.push({
+      filename: name,
+      kind: parsed.kind || null,
+      error: parsed.error || "no text",
+      partial: !!parsed.partial,
+      notInvoice: !!parsed.notInvoice,
+    });
+  }
+  const keep = (row) => {
+    if (row.partial) return true;
+    if (!expectInvoice) return false;
+    if (matches.length && !row.notInvoice && !row.partial) {
+      return false;
+    }
+    return true;
+  };
+  if (!matches.length && expectInvoice && !sawPdf) {
+    rejected.push({
+      filename: "port-fee",
+      kind: null,
+      error: "no PDF invoice was attached",
+    });
+  }
+  for (const row of failures) {
+    if (!keep(row)) continue;
+    if (matches.length && !row.partial && !row.notInvoice) continue;
+    rejected.push({
+      filename: row.filename,
+      kind: row.kind,
+      error: row.error,
+    });
   }
   return {matches, rejected};
 }

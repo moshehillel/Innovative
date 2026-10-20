@@ -86,6 +86,167 @@ check("image-title total",
     imageTitleParsed.invoice &&
     imageTitleParsed.invoice.invoiceTotal === 81.26);
 
+// Title gone, column renamed to TMF, PierPASS still in the text.
+const ABBREV_TMF = [
+  "PierPASS",
+  "Invoice #: Invoice Period: Invoice Date: Account #:",
+  "84389-10231001-IN 10/10/2026 - 10/16/2026 10/20/2026 84389",
+  "$81.26 10/29/2026",
+  "Container Number Booking TMF",
+  "10/10/26 23:51:00 APMT FFAU8880029 40 I BOOK1 81.26",
+  "Total 81.26",
+].join(" ");
+check("abbreviated TMF column is still TMF",
+    portFees.detectPortFeeKind(ABBREV_TMF) === "TMF");
+const abbrevParsed = portFees.parsePortFeeInvoiceText(ABBREV_TMF);
+check("abbreviated TMF parses", abbrevParsed.ok === true);
+check("abbreviated TMF bill date",
+    abbrevParsed.invoice && abbrevParsed.invoice.invoiceDate === "2026-10-20");
+check("abbreviated TMF amount",
+    abbrevParsed.invoice && abbrevParsed.invoice.lines[0].amount === 81.26);
+
+// Labels moved off the classic header. No exact title, no "Container Number".
+const MOVED_TMF = [
+  "Pier Pass",
+  "Invoice Date: 10/20/2026",
+  "Bill 84389-10231002-IN",
+  "Cntr No  Mitigation Fee",
+  "FFAU8880029  81.26",
+  "MSCU1234567  81.26",
+  "Total Due $162.52",
+].join(" ");
+const movedTmf = portFees.parsePortFeeInvoiceText(MOVED_TMF);
+check("moved TMF labels parse", movedTmf.ok === true);
+check("moved TMF is Pier Pass",
+    movedTmf.invoice && movedTmf.invoice.vendorName === "Pier Pass" &&
+    movedTmf.invoice.chargeCode === "TMF");
+check("moved TMF date and two containers",
+    movedTmf.invoice && movedTmf.invoice.invoiceDate === "2026-10-20" &&
+    movedTmf.invoice.lines.length === 2 &&
+    movedTmf.invoice.invoiceTotal === 162.52);
+
+const CLASSIC_CTF = [
+  "Port Rate Invoice",
+  "Invoice #: Invoice Period: Invoice Date: Account #:",
+  "Total Due: Due Date:",
+  "101054-10168351-IN 09/12/2026 - 09/18/2026 09/22/2026 101054",
+  "$40.00 10/01/2026",
+  "PortCheck's banking information is: Bank of America.",
+  "Container Number Booking #/BoL # Port Rate",
+  "09/12/26 14:08:00 APMT FFAU8880029 40 I 274247993 35105494 A22 20.00",
+  "09/12/26 17:00:00 APMT FFAU8880060 40 I 274247993 34996766 A22 20.00",
+  "Total 40.00",
+  "Truck subject to the Clean Truck Fee imposed as of 2022",
+].join(" ");
+const classicCtf = portFees.parsePortFeeInvoiceText(CLASSIC_CTF);
+check("classic CTF parses", classicCtf.ok === true);
+check("classic CTF is Port Check",
+    classicCtf.invoice && classicCtf.invoice.chargeCode === "CTF" &&
+    classicCtf.invoice.vendorName === "Port Check");
+check("classic CTF bill and date",
+    classicCtf.invoice &&
+    classicCtf.invoice.invoiceNumber === "101054-10168351-IN" &&
+    classicCtf.invoice.invoiceDate === "2026-09-22");
+check("classic CTF lines",
+    classicCtf.invoice && classicCtf.invoice.lines.length === 2 &&
+    classicCtf.invoice.lines[0].amount === 20 &&
+    classicCtf.invoice.invoiceTotal === 40);
+
+const IMAGE_CTF = [
+  "Invoice #: Invoice Period: Invoice Date: Account #:",
+  "101054-10231003-IN 10/10/2026 - 10/16/2026 10/20/2026 101054",
+  "$20.00 10/29/2026",
+  "PortCheck's banking information is: Bank of America.",
+  "Container Number Port Rate",
+  "10/10/26 23:51:00 APMT FFAU8880029 40 I BOOK1 20.00",
+  "Total 20.00",
+  "Clean Truck Fee",
+].join(" ");
+const imageCtf = portFees.parsePortFeeInvoiceText(IMAGE_CTF);
+check("header-image CTF parses without the title", imageCtf.ok === true);
+check("header-image CTF code",
+    imageCtf.invoice && imageCtf.invoice.chargeCode === "CTF" &&
+    imageCtf.invoice.invoiceDate === "2026-10-20");
+
+const MOVED_CTF = [
+  "Port Check",
+  "Invoice Date: 10/13/2026",
+  "Invoice No 101054-10231004-IN",
+  "Container #   CTF Amount",
+  "FFAU8880029  20.00",
+  "Total $20.00",
+].join(" ");
+const movedCtf = portFees.parsePortFeeInvoiceText(MOVED_CTF);
+check("moved CTF labels parse", movedCtf.ok === true);
+check("moved CTF vendor and amount",
+    movedCtf.invoice && movedCtf.invoice.vendorName === "Port Check" &&
+    movedCtf.invoice.chargeCode === "CTF" &&
+    movedCtf.invoice.lines[0].amount === 20);
+
+const SUSPENSION_TEXT = [
+  "PierPASS Account 84389 has been suspended.",
+  "Traffic Mitigation Fee will not be billed until the account is restored.",
+].join(" ");
+const suspensionPdf = portFees.parsePortFeeInvoiceText(SUSPENSION_TEXT);
+check("suspension text is not a bill",
+    suspensionPdf.ok === false &&
+    portFees.detectPortFeeKind(SUSPENSION_TEXT) === null);
+check("suspension skip says it is not an invoice",
+    suspensionPdf.error && /suspension/i.test(suspensionPdf.error));
+
+const NEWSLETTER_TEXT = "PierPASS newsletter — terminal hours for October.";
+const newsletterPdf = portFees.parsePortFeeInvoiceText(NEWSLETTER_TEXT);
+check("newsletter is not a bill",
+    newsletterPdf.ok === false && /newsletter/i.test(newsletterPdf.error));
+
+const RECEIPT_TEXT = [
+  "PierPASS payment receipt",
+  "Thank you for your payment",
+  "Invoice 84389-10167937-IN",
+  "Amount $1,543.94",
+].join(" ");
+const receiptPdf = portFees.parsePortFeeInvoiceText(RECEIPT_TEXT);
+check("payment receipt is not a bill",
+    receiptPdf.ok === false && /payment receipt/i.test(receiptPdf.error));
+
+const DRAYAGE_HEADER = [
+  "PierPASS/INNOVATIVE CARRIERS",
+  "Invoice 12345",
+  "Container FFAU8880029",
+  "Drayage 450.00",
+  "Total $450.00",
+].join(" ");
+check("PierPASS bill-to line without a TMF charge is not a bill",
+    portFees.detectPortFeeKind(DRAYAGE_HEADER) === null &&
+    portFees.parsePortFeeInvoiceText(DRAYAGE_HEADER).ok === false);
+
+check("empty extract says no text",
+    portFees.parsePortFeeInvoiceText("").error === "no text");
+const noContainers = portFees.parsePortFeeInvoiceText([
+  "PierPASS Traffic Mitigation Fee",
+  "84389-10231005-IN 10/10/2026 - 10/16/2026 10/20/2026",
+  "$81.26",
+].join(" "));
+check("missing containers says no container lines",
+    noContainers.ok === false &&
+    String(noContainers.error).includes("no container lines"));
+const noAmount = portFees.parsePortFeeInvoiceText([
+  "PierPASS Traffic Mitigation Fee",
+  "84389-10231006-IN",
+  "Invoice Date: 10/20/2026",
+  "Container Number FFAU8880029",
+].join(" "));
+check("missing charge says no amount",
+    noAmount.ok === false && String(noAmount.error).includes("no amount"));
+
+const unreadMail = portFees.buildReconciliationEmail([], [{
+  filename: "scan.pdf",
+  error: "no text",
+}]);
+check("Lisa email names the missing piece",
+    unreadMail.html.includes("no text") &&
+    !unreadMail.html.includes("not read from the PDF"));
+
 check("Pier Pass invoice subject stays on the port-fee path",
     portFees.isPortFeeMessage(
         "Pierpass.OffPeak-Invoice@pierpass.net",
@@ -100,6 +261,21 @@ check("Pier Pass suspension is not an invoice",
     portFees.isPortFeeMessage(
         "Pierpass.OffPeak-TMF@pierpass.net",
         "PierPASS Account 84389 has been suspended",
+    ) === false);
+check("forwarded PierPass invoice subject stays on the port-fee path",
+    portFees.isPortFeeMessage(
+        "dispatcher@innovativecarriers.com",
+        "Fw: Account 84389: Your PierPass Invoice 84389-10213171-IN",
+    ) === true);
+check("PierPASS newsletter subject is not an invoice",
+    portFees.isPortFeeMessage(
+        "news@pierpass.net",
+        "PierPASS newsletter for October",
+    ) === false);
+check("payment receipt subject is not an invoice",
+    portFees.isPortFeeMessage(
+        "Pierpass.OffPeak-Invoice@pierpass.net",
+        "PierPASS payment receipt for your invoice",
     ) === false);
 
 const one = portFees.pickContainerMatch([
@@ -243,6 +419,77 @@ async function runRealPdfs() {
   }
 }
 
+async function runDuplicate() {
+  const result = await portFees.applyPortFeeLines({
+    invoice: {
+      ...parsed.invoice,
+      lines: [parsed.invoice.lines[0]],
+    },
+    vendor: {id: "113303", name: "Pier Pass"},
+    termsId: 4,
+    findLoad: async () => ({ok: true, loadNumber: "267634", booking: {id: 9}}),
+    postCharge: async () => ({
+      duplicate: true,
+      existingBill: parsed.invoice.invoiceNumber,
+    }),
+  });
+  check("same bill is not posted twice",
+      result.posted.length === 0 &&
+      result.skipped.some((row) =>
+        row.reason === portFees.SKIP_REASON.DUPLICATE_FEE));
+}
+
+async function runSniff() {
+  let extracted = 0;
+  const both = await portFees.sniffPdfAttachments({
+    expectInvoice: true,
+    attachments: [
+      {filename: "84389_fees.csv", mimeType: "text/csv"},
+      {filename: "84389_invoice.pdf", mimeType: "application/pdf"},
+    ],
+    downloadAttachment: async () => Buffer.from("pdf"),
+    extractText: async () => {
+      extracted++;
+      return CLASSIC_CTF;
+    },
+  });
+  check("CSV is ignored and the PDF is the bill",
+      extracted === 1 && both.matches.length === 1 &&
+      both.matches[0].chargeCode === "CTF");
+
+  const empty = await portFees.sniffPdfAttachments({
+    expectInvoice: true,
+    attachments: [{filename: "scan.pdf", mimeType: "application/pdf"}],
+    downloadAttachment: async () => Buffer.from("pdf"),
+    extractText: async () => "",
+  });
+  check("empty PDF says no text",
+      empty.matches.length === 0 &&
+      empty.rejected.some((row) => row.error === "no text"));
+
+  const csvOnly = await portFees.sniffPdfAttachments({
+    expectInvoice: true,
+    attachments: [{filename: "84389_fees.csv", mimeType: "text/csv"}],
+    downloadAttachment: async () => Buffer.from("csv"),
+    extractText: async () => {
+      throw new Error("csv should not be read");
+    },
+  });
+  check("CSV alone is not read as the bill",
+      csvOnly.matches.length === 0 &&
+      csvOnly.rejected.some((row) => /no PDF/i.test(row.error)));
+
+  const notice = await portFees.sniffPdfAttachments({
+    expectInvoice: true,
+    attachments: [{filename: "notice.pdf", mimeType: "application/pdf"}],
+    downloadAttachment: async () => Buffer.from("pdf"),
+    extractText: async () => SUSPENSION_TEXT,
+  });
+  check("expected invoice that is a suspension is refused",
+      notice.matches.length === 0 &&
+      notice.rejected.some((row) => /suspension/i.test(row.error)));
+}
+
 async function runMissingLoadEmail() {
   const store = new Map();
   const sent = [];
@@ -296,7 +543,8 @@ check("Abe is added when nobody is copied",
       sent.length === 1);
 }
 
-Promise.all([runBatch(), runRealPdfs()]).then(() => runMissingLoadEmail())
+Promise.all([runBatch(), runDuplicate(), runSniff(), runRealPdfs()])
+    .then(() => runMissingLoadEmail())
     .then(() => {
       if (failures) process.exit(1);
       console.log("OK");
