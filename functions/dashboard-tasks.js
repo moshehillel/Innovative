@@ -645,8 +645,15 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     }
   }
 
+  const unlinkedFollowUpIds = chargeSnap.docs
+      .map((doc) => doc.id)
+      .filter((id) => !linkedFollowUpIds.has(id));
+  const closedFollowUps = await followUpIdsClosedByDismissedTask(
+      db, unlinkedFollowUpIds, tenantId);
+
   chargeSnap.docs.forEach((doc) => {
     if (linkedFollowUpIds.has(doc.id)) return;
+    if (closedFollowUps.has(doc.id)) return;
     const d = doc.data() || {};
     // Shared collection. A missing tenantId is the legacy default tenant,
     // not a pass for every client.
@@ -904,6 +911,112 @@ async function dismissInvoiceHold(db, opts) {
   return {ok: true};
 }
 
+async function resolveFollowUpDoc(db, additionalChargesMod, followUpId) {
+  const id = String(followUpId || "").trim();
+  const collection = additionalChargesMod &&
+    additionalChargesMod.FOLLOW_UP_COLLECTION;
+  if (!id || !collection) return;
+  const ref = db.collection(collection).doc(id);
+  const snap = await ref.get();
+  if (!snap.exists) return;
+  const row = snap.data() || {};
+  if (row.resolved === true) return;
+  const resolved = additionalChargesMod.FOLLOW_UP_STATUS &&
+    additionalChargesMod.FOLLOW_UP_STATUS.RESOLVED;
+  await ref.update({
+    resolved: true,
+    status: resolved || "resolved",
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
+async function dismissTasksForFollowUp(db, opts) {
+  const followUpId = String(opts.followUpId || "").trim();
+  if (!followUpId) return;
+  const snap = await db.collection(TASK_COLLECTION)
+      .where("followUpId", "==", followUpId)
+      .limit(20)
+      .get();
+  for (const doc of snap.docs) {
+    const row = doc.data() || {};
+    if ((row.status || "") !== TASK_STATUS.OPEN) continue;
+    if (!ownership.sameTenant(row.tenantId, opts.tenantId)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await doc.ref.update({
+      status: TASK_STATUS.DISMISSED,
+      dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+}
+
+/**
+ * Follow-ups whose dashboard task was already marked done.
+ * The unresolved charge row would otherwise reappear as a new task.
+ * @param {object} db Firestore.
+ * @param {string[]} followUpIds Candidate follow-up ids.
+ * @param {string} tenantId Tenant.
+ * @return {Promise<Set<string>>}
+ */
+async function followUpIdsClosedByDismissedTask(db, followUpIds, tenantId) {
+  const ids = [...new Set((followUpIds || []).map((id) =>
+    String(id || "").trim()).filter(Boolean))];
+  const closed = new Set();
+  for (let i = 0; i < ids.length; i += 10) {
+    const chunk = ids.slice(i, i + 10);
+    let snap;
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      snap = await db.collection(TASK_COLLECTION)
+          .where("followUpId", "in", chunk)
+          .get();
+    } catch (err) {
+      console.error("[dashboard-tasks] dismissed follow-ups:", err.message);
+      return closed;
+    }
+    const open = new Set();
+    const done = new Set();
+    snap.forEach((doc) => {
+      const row = doc.data() || {};
+      if (!ownership.sameTenant(row.tenantId, tenantId)) return;
+      const id = String(row.followUpId || "");
+      if ((row.status || "") === TASK_STATUS.OPEN) open.add(id);
+      if ((row.status || "") === TASK_STATUS.DISMISSED) done.add(id);
+    });
+    done.forEach((id) => {
+      if (!open.has(id)) closed.add(id);
+    });
+  }
+  return closed;
+}
+
+async function stampHoldsForLoad(db, opts) {
+  const load = String(opts.loadNumber || "").trim();
+  const issue = String(opts.issue || "").trim().toLowerCase();
+  if (!load || !issue) return;
+  const values = [load];
+  if (/^\d+$/.test(load)) values.push(Number(load));
+  const col = db.collection(scope.collectionName({
+    collectionPrefix: opts.collectionPrefix,
+  }, "invoices"));
+  for (const value of values) {
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await col.where("loadNumber", "==", value).limit(15).get();
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+      if (!invoiceVisibleToTenant(data, opts.tenantId)) continue;
+      const holdIssue = queue.holdIssueForInvoice(data);
+      if (holdIssue !== issue) continue;
+      // eslint-disable-next-line no-await-in-loop
+      await stampInvoiceHoldDismissed(db, {
+        invoiceId: doc.id,
+        tenantId: opts.tenantId,
+        collectionPrefix: opts.collectionPrefix,
+        issue,
+      });
+    }
+  }
+}
+
 async function dismissDashboardTask(db, additionalChargesMod, opts) {
   const taskId = String(opts.taskId || "").trim();
   const source = String(opts.source || "dashboardTasks");
@@ -936,6 +1049,27 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
       status: additionalChargesMod.FOLLOW_UP_STATUS.RESOLVED,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+    await dismissTasksForFollowUp(db, {
+      followUpId: taskId,
+      tenantId: opts.tenantId,
+    });
+    if (charge.invoiceId) {
+      const issue = scope.classifyIssue({
+        type: TASK_TYPE.ADDITIONAL_CHARGE,
+        reason: charge.category || charge.status,
+      });
+      await stampInvoiceHoldDismissed(db, {
+        invoiceId: String(charge.invoiceId),
+        tenantId: opts.tenantId,
+        collectionPrefix: opts.collectionPrefix,
+        issue,
+      });
+      await dismissOpenTasksForHold(db, {
+        invoiceId: String(charge.invoiceId),
+        tenantId: opts.tenantId,
+        issue,
+      });
+    }
     return {ok: true};
   }
 
@@ -952,6 +1086,23 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     status: TASK_STATUS.DISMISSED,
     dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+  await resolveFollowUpDoc(db, additionalChargesMod, data.followUpId);
+  if (data.type === TASK_TYPE.ADDITIONAL_CHARGE && data.invoiceId) {
+    const collection = additionalChargesMod &&
+      additionalChargesMod.FOLLOW_UP_COLLECTION;
+    if (collection) {
+      const related = await db.collection(collection)
+          .where("invoiceId", "==", String(data.invoiceId))
+          .limit(20)
+          .get();
+      for (const doc of related.docs) {
+        const row = doc.data() || {};
+        if (!ownership.sameTenant(row.tenantId, opts.tenantId)) continue;
+        // eslint-disable-next-line no-await-in-loop
+        await resolveFollowUpDoc(db, additionalChargesMod, doc.id);
+      }
+    }
+  }
   const taskIssue = scope.classifyIssue(data);
   if (data.invoiceId && taskIssue) {
     const invoiceRef = db.collection(scope.collectionName({
@@ -976,6 +1127,14 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
         });
       }
     }
+  }
+  if (taskIssue && data.loadNumber) {
+    await stampHoldsForLoad(db, {
+      loadNumber: data.loadNumber,
+      tenantId: opts.tenantId,
+      collectionPrefix: opts.collectionPrefix,
+      issue: taskIssue,
+    });
   }
   return {ok: true};
 }
@@ -1174,6 +1333,28 @@ async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
     if (!ownership.isMissingCarrierRateHold(inv)) continue;
     if (scope.isIssueDismissed(inv, scope.ISSUE.MISSING_RATE)) continue;
     try {
+    // A done missing-rate task must not be reopened on the next refresh.
+    // eslint-disable-next-line no-await-in-loop
+    const prior = await db.collection(TASK_COLLECTION)
+        .where("invoiceId", "==", doc.id)
+        .limit(20)
+        .get();
+    const alreadyDismissed = prior.docs.some((taskDoc) => {
+      const row = taskDoc.data() || {};
+      return (row.status || "") === TASK_STATUS.DISMISSED &&
+        ownership.sameTenant(row.tenantId, tenantId) &&
+        ownership.isMissingRateType(row.type);
+    });
+    if (alreadyDismissed) {
+      // eslint-disable-next-line no-await-in-loop
+      await stampInvoiceHoldDismissed(db, {
+        invoiceId: doc.id,
+        tenantId,
+        collectionPrefix: opts.collectionPrefix,
+        issue: scope.ISSUE.MISSING_RATE,
+      });
+      continue;
+    }
     // eslint-disable-next-line no-await-in-loop
     const existing = await findOpenDuplicateTask(db, {
       tenantId,

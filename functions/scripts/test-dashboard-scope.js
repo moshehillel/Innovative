@@ -384,6 +384,47 @@ async function testDismiss() {
       real.store["invoices/inv-rate"].decisionStage,
       "needs_customer_rate_review");
   assert.strictEqual(real.store["dashboardTasks/rate-task"].status, "dismissed");
+
+  const charges = {
+    FOLLOW_UP_COLLECTION: "additionalCharges",
+    FOLLOW_UP_STATUS: {RESOLVED: "resolved"},
+  };
+  const chargeDb = mockDb({
+    "dashboardTasks/charge-task": {
+      tenantId: "default",
+      status: "open",
+      type: "additional_charge",
+      reason: "accessorial",
+      invoiceId: "inv-charge",
+      followUpId: "fu-1",
+      loadNumber: "265647",
+    },
+    "additionalCharges/fu-1": {
+      tenantId: "default",
+      resolved: false,
+      status: "pending_approval",
+      invoiceId: "inv-charge",
+    },
+    "dashboardTasks/linked": {
+      tenantId: "default",
+      status: "open",
+      type: "additional_charge",
+      followUpId: "fu-1",
+      invoiceId: "inv-charge",
+      loadNumber: "265647",
+    },
+  });
+  const closed = await tasks.dismissDashboardTask(chargeDb, charges, {
+    taskId: "fu-1",
+    source: "additionalCharges",
+    tenantId: "default",
+  });
+  assert.strictEqual(closed.ok, true);
+  assert.strictEqual(chargeDb.store["additionalCharges/fu-1"].resolved, true);
+  assert.strictEqual(
+      chargeDb.store["dashboardTasks/linked"].status, "dismissed");
+  assert.strictEqual(
+      chargeDb.store["dashboardTasks/charge-task"].status, "dismissed");
 }
 
 /**

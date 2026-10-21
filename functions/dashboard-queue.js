@@ -37,6 +37,68 @@ function holdIssueForInvoice(data) {
 }
 
 /**
+ * Drops rows the dispatcher already marked done.
+ * A dismissed task used to leave the invoice hold or a new copy on the list.
+ * @param {object} db Firestore.
+ * @param {object[]} rows Queue rows with issueType.
+ * @param {string} tenantId Tenant.
+ * @return {Promise<object[]>}
+ */
+async function omitRowsClosedByDismissedTask(db, rows, tenantId) {
+  const list = Array.isArray(rows) ? rows : [];
+  const invoiceIds = [...new Set(list.map((row) =>
+    String((row && row.invoiceId) || "").trim()).filter(Boolean))];
+  const loads = [...new Set(list.map((row) =>
+    String((row && row.loadNumber) || "").trim()).filter(Boolean))];
+  const closed = new Set();
+  const remember = (data) => {
+    if ((data.status || "") !== "dismissed") return;
+    if (!ownership.sameTenant(data.tenantId, tenantId)) return;
+    const issue = scope.classifyIssue(data);
+    const invoiceId = String(data.invoiceId || "").trim();
+    const load = String(data.loadNumber || "").trim();
+    if (invoiceId) closed.add(`${invoiceId}|${issue}`);
+    if (load) closed.add(`load:${load}|${issue}`);
+  };
+  const pull = async (field, values) => {
+    for (let i = 0; i < values.length; i += 10) {
+      const chunk = values.slice(i, i + 10);
+      if (!chunk.length) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const snap = await db.collection("dashboardTasks")
+          .where(field, "in", chunk)
+          .get();
+      snap.forEach((doc) => remember(doc.data() || {}));
+    }
+  };
+  try {
+    await pull("invoiceId", invoiceIds);
+    await pull("loadNumber", loads);
+    const numeric = loads.filter((load) => /^\d+$/.test(load)).map(Number);
+    await pull("loadNumber", numeric);
+  } catch (err) {
+    console.error("[dashboard-queue] dismissed rows:", err.message);
+    return list;
+  }
+  return list.filter((row) => {
+    const issue = row.issueType || scope.classifyIssue(row);
+    const invoiceId = String(row.invoiceId || "").trim();
+    const load = String(row.loadNumber || "").trim();
+    const closedRow = (invoiceId && closed.has(`${invoiceId}|${issue}`)) ||
+      (load && closed.has(`load:${load}|${issue}`));
+    if (!closedRow) return true;
+    if (row.source === "invoice") return false;
+    const type = String(row.type || "");
+    if (type === "missing_rate" || type === "rate_missing" ||
+        type === "missing_pod" || type === "signed_pod" ||
+        type === "pod_discrepancy" || type === "invoice_hold") {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
  * @param {object} doc Invoice snapshot.
  * @param {string} tenantId Tenant id.
  * @return {object|null}
@@ -159,7 +221,11 @@ async function listOperationalQueue(db, deps, opts) {
     }
   }
 
-  let merged = scope.mergeQueueItems(tasks.concat(invoiceRows))
+  const visibleTasks = await omitRowsClosedByDismissedTask(
+      db, tasks, tenantId);
+  const visibleHolds = await omitRowsClosedByDismissedTask(
+      db, invoiceRows, tenantId);
+  let merged = scope.mergeQueueItems(visibleTasks.concat(visibleHolds))
       .map((row) => ownership.applyOwnerDefaults(row));
   if (q && !loadSearch) {
     const needle = q.toLowerCase();
