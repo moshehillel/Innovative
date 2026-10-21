@@ -338,6 +338,21 @@ async function collectNotifPage(baseQuery, maxDocs) {
   return docs;
 }
 
+/**
+ * Load-number search matches the stored load, or a subject/title that
+ * still contains the number when older rows never saved loadNumber.
+ * @param {object} row Serialized notification.
+ * @param {string} q Search text, already known to be 5+ digits.
+ * @return {boolean}
+ */
+function notificationMatchesLoadQuery(row, q) {
+  const needle = String(q || "").trim();
+  if (!needle) return false;
+  if (String((row && row.loadNumber) || "") === needle) return true;
+  const text = `${(row && row.subject) || ""} ${(row && row.title) || ""}`;
+  return text.includes(needle);
+}
+
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
   const q = String(opts.q || "").trim();
@@ -432,6 +447,10 @@ async function listNotifications(db, opts) {
         visibleNotifications.push(row);
       });
     }
+    // A load-number search used to leave the current page in place and only
+    // append matches, so the emailed load never stood out. Keep matches only.
+    visibleNotifications = visibleNotifications.filter((n) =>
+      notificationMatchesLoadQuery(n, q));
   } else if (q) {
     const needle = q.toLowerCase();
     visibleNotifications = visibleNotifications.filter((n) => {
