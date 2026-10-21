@@ -28,6 +28,18 @@
     e: "E — Pay + bill (no customer email)",
   };
 
+  const OPS_PEOPLE = [
+    {key: "leo", name: "Leo", email: "leo@innovativecarriers.com"},
+    {key: "jak", name: "Jak", email: "jak@innovativecarriers.com"},
+    {key: "tina", name: "Tina", email: "tina@innovativecarriers.com"},
+    {key: "jason", name: "Jason", email: "jason@innovativecarriers.com"},
+    {key: "alex", name: "Alex", email: "alex@innovativecarriers.com"},
+    {key: "jay", name: "Jay", email: "jay@innovativecarriers.com"},
+    {key: "karen", name: "Karen", email: "karen@innovativecarriers.com"},
+    {key: "barry", name: "Barry", email: "barry@innovativecarriers.com"},
+    {key: "leah", name: "Leah", email: "leah@innovativecarriers.com"},
+  ];
+
   const els = {
     tmsBadge: document.getElementById("tmsBadge"),
     tenantLabel: document.getElementById("tenantLabel"),
@@ -93,6 +105,7 @@
   let dispatcherQuery = "";
   let chargePhase = null; // null | "dispute"
   let dispatcherKey = null;
+  let personKey = "";
   let taskOffset = 0;
   let taskHasMore = false;
   let taskLoadSeq = 0;
@@ -417,8 +430,18 @@
     return {label: "Review", cls: "type-badge-review"};
   }
 
+  function taskCanResolve(task) {
+    if (!task || !task.invoiceId) return false;
+    if (task.source === "invoice") return false;
+    if (task.type === "additional_charge" || task.source === "additionalCharges") {
+      return true;
+    }
+    return /charge|reweigh|accessorial|redeliver/i.test(
+        `${task.reason || ""} ${task.description || ""} ${task.title || ""}`);
+  }
+
   function renderChargeButtons(task) {
-    if (task.type !== "additional_charge" || !task.invoiceId) return "";
+    if (!taskCanResolve(task)) return "";
     return `<div class="charge-opt-grid">` +
       ["a", "b", "c", "d", "e"].map((opt) =>
         `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}" ` +
@@ -455,13 +478,11 @@
     const footer =
       renderChargeButtons(task) +
       `<div class="assign-row">` +
-      `<select class="input input-select assign-bucket" aria-label="Assign to">` +
-      `<option value="accounting">Accounting</option>` +
-      `<option value="sarah">Sarah</option>` +
-      `<option value="dispatch">Dispatcher</option>` +
+      `<select class="input input-select assign-person" aria-label="Assign to">` +
+      OPS_PEOPLE.map((p) =>
+        `<option value="${bodyEsc(p.key)}">${bodyEsc(p.name)}</option>`).join("") +
       `</select>` +
-      `<input class="input assign-who" type="text" placeholder="Dispatcher name or email" />` +
-      `<button type="button" class="btn btn-sm btn-primary assign-send">Assign and email</button>` +
+      `<button type="button" class="btn btn-sm btn-primary assign-send">Assign</button>` +
       `</div>` +
       (task.source === "invoice" ? "" :
         `<button type="button" class="btn btn-outline btn-sm drawer-dismiss">Done / Resolve</button>`);
@@ -551,27 +572,26 @@
     if (!foot || !drawerItem) return;
 
     foot.querySelector(".assign-send")?.addEventListener("click", async () => {
-      const bucket = foot.querySelector(".assign-bucket")?.value || "accounting";
-      const who = foot.querySelector(".assign-who")?.value.trim() || "";
-      const email = (who.match(/[^\s@]+@[^\s@]+\.[^\s@]+/) || [])[0] || "";
-      if (bucket === "dispatch" && !who) {
-        showError("Enter the dispatcher name or email.");
+      const key = foot.querySelector(".assign-person")?.value || "";
+      const person = OPS_PEOPLE.find((p) => p.key === key);
+      if (!person) {
+        showError("Pick a person.");
         return;
       }
       try {
         await postJson("/reassignDashboardWork", {
           taskId: drawerItem.id,
           source: drawerItem.source || "dashboardTasks",
-          bucket,
-          dispatcherEmail: email || (bucket === "dispatch" ? who : ""),
-          dispatcherName: email ? who.replace(email, "").trim() || who : who,
+          bucket: "dispatch",
+          dispatcherEmail: person.email,
+          dispatcherName: person.name,
           loadNumber: drawerItem.loadNumber,
           invoiceId: drawerItem.invoiceId,
           carrierName: drawerItem.carrierName,
           subject: drawerItem.subject || drawerItem.title,
           issue: drawerItem.issueType || drawerItem.type,
         });
-        showRunResult("Assigned. They were emailed.", false);
+        showRunResult(`Assigned to ${person.name}.`, false);
         closeDrawer();
         await loadTasks({reset: true});
       } catch (error) {
@@ -676,6 +696,59 @@
     });
   }
 
+  function addChargeLine(list, seed) {
+    const row = document.createElement("div");
+    row.className = "charge-line";
+    row.style.display = "grid";
+    row.style.gridTemplateColumns = "1fr 90px 110px";
+    row.style.gap = "6px";
+    row.style.marginBottom = "8px";
+    const carrier = seed && seed.carrierAmount ? Number(seed.carrierAmount) : "";
+    row.innerHTML =
+      `<input class="input charge-line-name" placeholder="Accessorial" value="${bodyEsc(seed && seed.name || "")}" />` +
+      `<input class="input charge-line-carrier" type="number" min="0" step="0.01" placeholder="Carrier $" value="${carrier === "" ? "" : bodyEsc(String(carrier))}" />` +
+      `<select class="input charge-line-mode"><option value="markup">% markup</option><option value="flat">Flat $</option></select>` +
+      `<input class="input charge-line-value" type="number" min="0" step="0.01" placeholder="20 or 75.00" />`;
+    row.style.gridTemplateColumns = "1fr 90px 110px 90px";
+    list.appendChild(row);
+  }
+
+  function readChargeLines(form) {
+    const lines = [];
+    form.querySelectorAll(".charge-line").forEach((row) => {
+      const name = row.querySelector(".charge-line-name").value.trim();
+      if (!name) return;
+      const carrierAmount = Number(row.querySelector(".charge-line-carrier").value);
+      const mode = row.querySelector(".charge-line-mode").value;
+      const val = Number(row.querySelector(".charge-line-value").value);
+      if (mode === "flat") {
+        if (!(val > 0)) return;
+        lines.push({
+          name, carrierAmount: carrierAmount || 0, pricingMode: "flat",
+          flatAmount: val, amount: val,
+        });
+        return;
+      }
+      if (!(carrierAmount > 0) || !(val >= 0)) return;
+      const amount = Math.round(carrierAmount * (1 + val / 100) * 100) / 100;
+      lines.push({
+        name, carrierAmount, pricingMode: "markup",
+        markupPct: val, amount,
+      });
+    });
+    return lines;
+  }
+
+  function chargeLinesForm(opt, allowEmpty) {
+    return `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
+      `<p>Percent markup on the carrier cost, or a flat customer amount. Add a line for an accessorial that was missed.</p>` +
+      `<div class="charge-line-list"></div>` +
+      `<button type="button" class="btn btn-sm btn-outline charge-add-line">+ Add accessorial</button>` +
+      `<div class="row-actions">` +
+      `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="${opt}" data-allow-empty="${allowEmpty ? "1" : "0"}">Confirm ${opt.toUpperCase()}</button>` +
+      `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
+  }
+
   function openChargeForm(btn) {
     const opt = btn.dataset.chargeOpt;
     const invoiceId = btn.dataset.invoice;
@@ -686,28 +759,15 @@
     if (!form) return;
     form.hidden = false;
     if (opt === "c" || opt === "d") {
-      form.innerHTML =
-        `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
-        `<div class="row-actions">` +
-        `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="${opt}">Confirm ${opt.toUpperCase()}</button>` +
-        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
-    } else if (opt === "a" || opt === "e") {
-      form.innerHTML =
-        `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
-        `<label>Customer charge amount ($)</label>` +
-        `<input type="number" min="0.01" step="0.01" class="charge-amount" />` +
-        `<div class="row-actions">` +
-        `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="${opt}">Confirm ${opt.toUpperCase()}</button>` +
-        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
+      form.innerHTML = chargeLinesForm(opt, true);
     } else {
-      form.innerHTML =
-        `<p><strong>${bodyEsc(CHARGE_LABELS.b)}</strong></p>` +
-        `<label>Customer bill lines (description | amount)</label>` +
-        `<textarea class="charge-lines" rows="3" placeholder="Liftgate|75"></textarea>` +
-        `<div class="row-actions">` +
-        `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="b">Confirm B</button>` +
-        `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
+      form.innerHTML = chargeLinesForm(opt, false);
     }
+    const list = form.querySelector(".charge-line-list");
+    addChargeLine(list, {});
+    form.querySelector(".charge-add-line").addEventListener("click", () => {
+      addChargeLine(list, {});
+    });
     form.querySelector(".charge-cancel").addEventListener("click", () => {
       form.hidden = true;
       form.innerHTML = "";
@@ -717,20 +777,14 @@
       setButtonBusy(confirmBtn, true, "Applying…");
       try {
         const payload = {invoiceId, option: opt, taskId, taskSource};
-        if (opt === "a" || opt === "e") {
-          payload.customerChargeAmount =
-            form.querySelector(".charge-amount").value;
+        const allowEmpty = confirmBtn.dataset.allowEmpty === "1";
+        const lines = readChargeLines(form);
+        if (!lines.length && !allowEmpty) {
+          showError("Enter a percent markup or a flat amount, or add an accessorial.");
+          setButtonBusy(confirmBtn, false);
+          return;
         }
-        if (opt === "b") {
-          const raw = form.querySelector(".charge-lines").value || "";
-          payload.customerBillLines = raw.split("\n").map((line) => {
-            const parts = line.split("|").map((s) => s.trim());
-            return {
-              description: parts[0] || "Accessorial",
-              amount: Number(parts[1]) || 0,
-            };
-          }).filter((l) => l.amount > 0);
-        }
+        payload.customerBillLines = lines;
         const result = await postJson("/dashboardAdditionalChargeDecision", payload);
         showRunResult(
             result.handedOffToDispatch ?
@@ -958,6 +1012,10 @@
           <td>${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">URGENT/OLD</span>' : ""}</td>
           <td title="${bodyEsc(receivedInfo(task).title)}">${bodyEsc(receivedInfo(task).text)}</td>
           <td class="row-actions">
+            ${taskCanResolve(task) ? `<span class="charge-opt-grid">` +
+              ["a", "b", "c", "d", "e"].map((opt) =>
+                `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}">${opt.toUpperCase()}</button>`).join("") +
+              `</span>` : ""}
             <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
             <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
           </td>
@@ -982,6 +1040,16 @@
       tr.querySelector(".task-open")?.addEventListener("click", (e) => {
         e.stopPropagation();
         openTaskDrawer(task);
+      });
+      tr.querySelectorAll(".charge-opt").forEach((btn) => {
+        btn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          btn.dataset.invoice = task.invoiceId || "";
+          btn.dataset.taskId = task.id;
+          btn.dataset.taskSource = task.source || "dashboardTasks";
+          openTaskDrawer(task);
+          openChargeForm(btn);
+        });
       });
       tr.querySelector(".task-dismiss")?.addEventListener("click", (e) => {
         e.stopPropagation();
@@ -1021,7 +1089,15 @@
         issue: issueFilter || "all",
         sort,
       });
-      if (dispatcherQuery) params.set("dispatcher", dispatcherQuery);
+      const q = String(els.workspaceSearch?.value || "").trim();
+      const loadSearch = /^\d{5,}$/.test(q);
+      if (!loadSearch) {
+        const key = personKey || dispatcherKey || "";
+        const person = OPS_PEOPLE.find((p) => p.key === key);
+        if (person) params.set("dispatcher", person.email);
+        else if (dispatcherQuery) params.set("dispatcher", dispatcherQuery);
+      }
+      if (q) params.set("q", q);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
       if (seq !== taskLoadSeq) return;
       openTaskCount = data.openCount || 0;
@@ -1309,8 +1385,10 @@
       updateNotifsLoadMore(true);
     }
     try {
+      const q = String(els.workspaceSearch?.value || "").trim();
       const data = await fetchJson(
-          `/getDashboardNotifications?limit=${TASK_PAGE}&offset=${notifOffset}`);
+          `/getDashboardNotifications?limit=${TASK_PAGE}&offset=${notifOffset}` +
+          (q ? `&q=${encodeURIComponent(q)}` : ""));
       const page = data.notifications || [];
       if (data.bucketCounts) bucketCounts = data.bucketCounts;
       notifHasMore = Boolean(data.hasMore);
@@ -1504,18 +1582,23 @@
   els.loadMoreNotifsBtn?.addEventListener("click", () => {
     if (notifHasMore) loadNotifications({reset: false});
   });
-  els.workspaceSearch?.addEventListener("input", () => {
-    if (activeTab === "tasks") {
-      withPreservedScroll(() => {
-        renderTasks(tasksCache.slice(), {preserveCache: true});
+  document.querySelectorAll("[data-person]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      personKey = btn.getAttribute("data-person") || "";
+      document.querySelectorAll("[data-person]").forEach((el) => {
+        el.classList.toggle("is-active", el === btn);
       });
-    } else if (activeTab === "invoices") {
-      paintInvoices(clientFilterSort(invoicesCache));
-    } else if (activeTab === "notifications") {
-      const keep = notifsCache.slice();
-      notifsCache = [];
-      renderNotifications(keep);
-    }
+      loadTasks({reset: true});
+    });
+  });
+  let searchTimer = null;
+  els.workspaceSearch?.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      if (activeTab === "tasks") loadTasks({reset: true});
+      else if (activeTab === "notifications") loadNotifications({reset: true});
+      else paintInvoices(clientFilterSort(invoicesCache));
+    }, 300);
   });
   els.workspaceSort?.addEventListener("change", () => {
     if (activeTab === "tasks") {

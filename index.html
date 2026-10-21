@@ -121,7 +121,7 @@
             <input id="dispatcherFilter" class="input input-search" type="search"
               placeholder="Dispatcher name or email" aria-label="Dispatcher" />
             <input id="workspaceSearch" class="input input-search" type="search"
-              placeholder="Search load, carrier, subject…" />
+              placeholder="Search any load number…" />
             <select id="workspaceSort" class="input input-select" aria-label="Sort">
               <option value="urgent">Urgent first</option>
               <option value="newest">Newest</option>
@@ -142,6 +142,18 @@
               <button type="button" class="subnav-btn" data-issue="missing_pod">Missing POD</button>
               <button type="button" class="subnav-btn" data-issue="missing_rate">Missing customer rate</button>
               <button type="button" class="subnav-btn" data-issue="miscellaneous">Miscellaneous</button>
+            </div>
+            <div class="subnav" id="peopleFilters" aria-label="Dispatcher">
+              <button type="button" class="subnav-btn is-active" data-person="">Everyone</button>
+              <button type="button" class="subnav-btn" data-person="leo">Leo</button>
+              <button type="button" class="subnav-btn" data-person="jak">Jak</button>
+              <button type="button" class="subnav-btn" data-person="tina">Tina</button>
+              <button type="button" class="subnav-btn" data-person="jason">Jason</button>
+              <button type="button" class="subnav-btn" data-person="alex">Alex</button>
+              <button type="button" class="subnav-btn" data-person="jay">Jay</button>
+              <button type="button" class="subnav-btn" data-person="karen">Karen</button>
+              <button type="button" class="subnav-btn" data-person="barry">Barry</button>
+              <button type="button" class="subnav-btn" data-person="leah">Leah</button>
             </div>
             <div class="panel-main panel-main-full">
               <div id="tasksContainer" class="table-wrap">
