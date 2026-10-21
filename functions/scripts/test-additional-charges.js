@@ -388,5 +388,29 @@ check("strip keeps redelivery", stripped.kept.length, 1);
 check("invoice minus original",
     ac.invoiceOverage(286.47, 194.70), 91.77);
 
+const page = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option B",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  accessorialOptions: [
+    {code: "RDV", name: "Redelivery Fee", category: "Destination"},
+    {code: "LFD", name: "Liftgate at Destination", category: "Destination"},
+  ],
+  carrierCharges: [{label: "Redelivery", amount: 75}],
+  fields: {invoiceId: "1", option: "b"},
+});
+check("resolution page uses the Primus list",
+    page.includes("Redelivery Fee") && page.includes("Select accessorial"),
+    true);
+check("resolution page can add another charge",
+    page.includes("add-bill-line"), true);
+const script = page.split("<script>")[1].split("</script>")[0];
+new Function(script);
+const coded = ac.normalizeCustomerBillLines([{
+  name: "Redelivery Fee", code: "rdv", carrierAmount: 75,
+  pricingMode: "markup", markupPct: 10,
+}]);
+check("accessorial code is kept", coded.lines[0].code, "RDV");
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

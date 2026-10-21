@@ -527,6 +527,13 @@ async function hydratePageBodies(db, additionalChargesMod, items, tenantId) {
       item.body = buildAdditionalChargeFallbackHtml(
           additionalChargesMod, follow);
     }
+    if (follow && Array.isArray(follow.charges) && follow.charges.length) {
+      item.charges = follow.charges.map((charge) => ({
+        label: charge.label || charge.name || charge.type || "",
+        amount: charge.amount != null ? Number(charge.amount) : null,
+        type: charge.type || null,
+      }));
+    }
   }
 }
 

@@ -1413,8 +1413,10 @@ function normalizeCustomerBillLines(lines) {
       return {ok: false, error: `${priced.error} (${name})`};
     }
     const carrier = Math.round(Number(line && line.carrierAmount) * 100) / 100;
+    const code = String((line && line.code) || "").trim().toUpperCase();
     out.push({
       name,
+      code: code || null,
       amount: priced.amount,
       carrierAmount: Number.isFinite(carrier) && carrier > 0 ? carrier : 0,
       pricingMode: priced.pricingMode,
@@ -1500,14 +1502,19 @@ function buildOptionBAccessorialConfirmPage(opts) {
   const seedJson = JSON.stringify(seedRows)
       .replace(/</g, "\\u003c")
       .replace(/-->/g, "--\\u003e");
+  const catalogJson = JSON.stringify(
+      Array.isArray(opts.accessorialOptions) ? opts.accessorialOptions : [])
+      .replace(/</g, "\\u003c")
+      .replace(/-->/g, "--\\u003e");
   const baseRateHtml = baseRate > 0 ?
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
     `<strong>Base customer rate (unchanged):</strong> ` +
     `${formatCustomerRate(baseRate)}</p>` :
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
     `The base customer freight rate will stay as-is in Primus. For each ` +
-    `accessorial, enter a percent markup or a flat customer charge. ` +
-    `Use Add accessorial for a charge that is not on the carrier bill.` +
+    `accessorial, pick it from the Primus list, then enter a percent ` +
+    `markup or a flat customer charge. Use Add accessorial for a charge ` +
+    `Jerry did not list.` +
     `</p>`;
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
@@ -1554,49 +1561,79 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `changed yet.</p>` +
     `<script>` +
     `const seedRows = ${seedJson};` +
+    `const catalog = ${catalogJson};` +
     `const container = document.getElementById("bill-lines");` +
     `function escAttr(v){return String(v ?? "").replace(/&/g,"&amp;")` +
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
+    `function normName(v){return String(v||"").toLowerCase()` +
+    `.replace(/[^a-z0-9]/g,"");}` +
     `function addRow(row={}){` +
     `const wrap=document.createElement("div");wrap.className="bill-row";` +
     `const carrier=Number(row.carrierAmount)||0;` +
-    `wrap.dataset.carrierAmount=String(carrier);` +
-    `const hint=carrier>0?"<div class=\\"bill-hint\\">Carrier cost $"+` +
-    `carrier.toFixed(2)+"</div>":` +
-    `"<div class=\\"bill-hint\\">No carrier cost — use a flat amount</div>";` +
-    `wrap.innerHTML="<div><input type=\\"text\\" class=\\"bill-name\\" ` +
-    `placeholder=\\"Accessorial name\\" value=\\""+escAttr(row.name||"")+` +
-    `"\\">"+hint+"</div><div><select class=\\"bill-mode\\">` +
+    `const sel=document.createElement("select");sel.className="bill-name";` +
+    `const blank=document.createElement("option");blank.value="";` +
+    `blank.textContent="Select accessorial";sel.appendChild(blank);` +
+    `const want=normName(row.name);const wantCode=String(row.code||"");` +
+    `let matched=false;` +
+    `for(const item of catalog){` +
+    `const opt=document.createElement("option");` +
+    `opt.value=item.code||"";opt.dataset.name=item.name||"";` +
+    `opt.textContent=(item.category?item.category+" — ":"")+item.name;` +
+    `if((wantCode&&item.code===wantCode)||` +
+    `(!wantCode&&want&&normName(item.name)===want)){` +
+    `opt.selected=true;matched=true;}` +
+    `sel.appendChild(opt);}` +
+    `if(want&&!matched){` +
+    `const opt=document.createElement("option");opt.value="";` +
+    `opt.dataset.name=row.name;opt.selected=true;` +
+    `opt.textContent=row.name+" (from the invoice)";` +
+    `sel.appendChild(opt);}` +
+    `const nameCell=document.createElement("div");nameCell.appendChild(sel);` +
+    `const carrierInput=document.createElement("input");` +
+    `carrierInput.className="bill-carrier";carrierInput.type="number";` +
+    `carrierInput.min="0";carrierInput.step="0.01";` +
+    `carrierInput.placeholder="Carrier $";` +
+    `if(carrier>0)carrierInput.value=carrier.toFixed(2);` +
+    `const hint=document.createElement("div");hint.className="bill-hint";` +
+    `hint.textContent="Carrier cost, then percent or flat customer charge";` +
+    `nameCell.appendChild(carrierInput);nameCell.appendChild(hint);` +
+    `const price=document.createElement("div");` +
+    `price.innerHTML="<select class=\\"bill-mode\\">` +
     `<option value=\\"markup\\">Percent markup</option>` +
-    `<option value=\\"flat\\">Flat amount</option></select>` +
-    `<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
-    `step=\\"0.01\\" placeholder=\\"20\\"></div>` +
-    `<button type=\\"button\\" class=\\"remove-btn\\" ` +
-    `title=\\"Remove\\">×</button>";` +
-    `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
-    `container.appendChild(wrap);}` +
+    `<option value=\\"flat\\">Flat amount</option></select>"+` +
+    `"<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
+    `step=\\"0.01\\" placeholder=\\"20\\">";` +
+    `const remove=document.createElement("button");` +
+    `remove.type="button";remove.className="remove-btn";` +
+    `remove.title="Remove";remove.textContent="×";` +
+    `remove.onclick=()=>{wrap.remove();};` +
+    `wrap.appendChild(nameCell);wrap.appendChild(price);` +
+    `wrap.appendChild(remove);container.appendChild(wrap);}` +
     `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);` +
     `document.getElementById("add-bill-line").onclick=` +
     `()=>addRow({name:"",carrierAmount:0});` +
     `document.getElementById("option-b-form").onsubmit=(e)=>{` +
     `const lines=[];` +
     `for(const row of container.querySelectorAll(".bill-row")){` +
-    `const name=row.querySelector(".bill-name").value.trim();` +
+    `const sel=row.querySelector(".bill-name");` +
+    `const opt=sel.options[sel.selectedIndex];` +
+    `const name=(opt&&opt.dataset.name||"").trim();` +
+    `const code=sel.value||"";` +
     `if(!name)continue;` +
-    `const carrierAmount=Number(row.dataset.carrierAmount)||0;` +
+    `const carrierAmount=Number(row.querySelector(".bill-carrier").value)||0;` +
     `const mode=row.querySelector(".bill-mode").value;` +
     `const val=Number(row.querySelector(".bill-value").value);` +
     `if(mode==="flat"){` +
     `if(!(val>0)){alert("Enter a flat customer charge for "+name);` +
     `e.preventDefault();return false;}` +
-    `lines.push({name,carrierAmount,pricingMode:"flat",flatAmount:val,` +
+    `lines.push({name,code,carrierAmount,pricingMode:"flat",flatAmount:val,` +
     `markupPct:null,amount:val});` +
     `}else{` +
     `if(!(carrierAmount>0)||!(val>=0)){` +
     `alert("Enter a markup percent for "+name);` +
     `e.preventDefault();return false;}` +
     `const amount=Math.round(carrierAmount*(1+val/100)*100)/100;` +
-    `lines.push({name,carrierAmount,pricingMode:"markup",markupPct:val,` +
+    `lines.push({name,code,carrierAmount,pricingMode:"markup",markupPct:val,` +
     `flatAmount:null,amount});}}` +
     `const allowEmpty=document.getElementById("allowEmptyLines");` +
     `if(!lines.length&&!(allowEmpty&&allowEmpty.value==="1")){` +

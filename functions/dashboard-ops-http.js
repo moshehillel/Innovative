@@ -33,6 +33,25 @@ function cors(req, res) {
  * @param {object} res Response.
  * @return {Promise<object>}
  */
+async function handleListAccessorials(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "GET") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    await deps.resolveDashboardTenant(req);
+    const catalog = require("./quote-accessorial-catalog");
+    const accessorials = await catalog.listPrimusAccessorialChoices();
+    return res.json({ok: true, accessorials});
+  } catch (error) {
+    console.error("getDashboardAccessorials error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not load the Primus accessorial list.",
+    });
+  }
+}
+
 async function handleListNotifications(req, res) {
   if (cors(req, res)) return;
   try {
@@ -534,6 +553,7 @@ function extractEmailAddress(from) {
 
 module.exports = {
   init,
+  handleListAccessorials,
   handleListNotifications,
   handleDismissNotification,
   handleFlagNotification,

@@ -3169,6 +3169,13 @@ async function handleAdditionalChargeAction(req, res) {
       }
       const currentRate = await resolveCurrentCustomerRate(
           invoice, bookingForRate);
+      let accessorialOptions = [];
+      try {
+        accessorialOptions = await require("./quote-accessorial-catalog")
+            .listPrimusAccessorialChoices();
+      } catch (_) {
+        accessorialOptions = [];
+      }
       const allowEmpty = option === "c" || option === "d";
       const notifyNote = option === "a" ?
         " The customer is emailed." :
@@ -3183,8 +3190,9 @@ async function handleAdditionalChargeAction(req, res) {
             description:
               `Load ${invoice.loadNumber || invoiceId}: ` +
               `${optionLabels[option]}. Each line can be a percent markup ` +
-              `on the carrier cost or a flat customer amount. Use Add ` +
-              `accessorial for a charge that is not on the bill.` +
+              `on the carrier cost or a flat customer amount. Pick each ` +
+              `accessorial from the Primus list. Use Add accessorial for ` +
+              `a charge Jerry did not list.` +
               notifyNote,
             confirmLabel: `Confirm option ${option.toUpperCase()}`,
             confirmColor: option === "d" ? "#dc2626" :
@@ -3195,6 +3203,7 @@ async function handleAdditionalChargeAction(req, res) {
             baseUrl: functionsBaseUrl(),
             baseCustomerRate: currentRate,
             allowEmpty,
+            accessorialOptions,
             carrierCharges: Array.isArray(charge.charges) ?
               charge.charges : [],
             fields: {
@@ -13394,6 +13403,7 @@ async function applyAdditionalChargeFromDashboard(opts) {
   if (lines.length) {
     body.customerBillLinesJson = JSON.stringify(lines.map((line) => ({
       name: line.description || line.name || "Accessorial",
+      code: line.code || null,
       amount: line.amount != null ? Number(line.amount) : null,
       carrierAmount: line.carrierAmount != null ?
         Number(line.carrierAmount) : null,
@@ -13463,6 +13473,8 @@ dashboardOpsHttp.init({
   getMailClient: (tenant) => mailProvider.getTenantMailClient(tenant),
 });
 
+exports.getDashboardAccessorials = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleListAccessorials);
 exports.getDashboardNotifications = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
 exports.getDashboardEmailAttachment = onRequest(

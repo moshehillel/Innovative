@@ -636,6 +636,61 @@ async function fetchPrimusAccessorialRows() {
   return normalizePrimusRows(rows);
 }
 
+/** @type {{at: number, live: boolean, rows: Array<object>|null}} */
+let choiceCache = {at: 0, live: false, rows: null};
+
+/**
+ * Primus accessorial names for resolution dropdowns.
+ * Falls back to the static catalog when Primus is unreachable.
+ * @return {Promise<Array<{code: string, name: string, category: string}>>}
+ */
+async function listPrimusAccessorialChoices() {
+  const now = Date.now();
+  const ttl = choiceCache.live ? (6 * 60 * 60 * 1000) : (10 * 60 * 1000);
+  if (choiceCache.rows && (now - choiceCache.at) < ttl) {
+    return choiceCache.rows;
+  }
+  let live = false;
+  let rows = [];
+  try {
+    rows = await fetchPrimusAccessorialRows();
+    live = rows.length > 0;
+  } catch (_) {
+    rows = [];
+  }
+  if (!rows.length) {
+    const catalog = buildStaticFallbackCatalog();
+    const flat = []
+        .concat(catalog.origin || [], catalog.destination || [],
+            catalog.other || []);
+    const seen = new Set();
+    for (const item of flat) {
+      const name = String((item && (item.name || item.label)) || "").trim();
+      const code = String((item && item.code) || "").trim().toUpperCase();
+      const key = (code || name).toLowerCase();
+      if (!name || seen.has(key)) continue;
+      seen.add(key);
+      rows.push({
+        code,
+        name,
+        category: item.category || "Other",
+      });
+    }
+  }
+  rows.sort((a, b) => {
+    const cat = String(a.category || "").localeCompare(String(b.category || ""));
+    if (cat) return cat;
+    return String(a.name || "").localeCompare(String(b.name || ""));
+  });
+  const choices = rows.map((row) => ({
+    code: row.code || "",
+    name: row.name,
+    category: row.category || "Other",
+  }));
+  choiceCache = {at: now, live, rows: choices};
+  return choices;
+}
+
 /**
  * Load catalog with Firestore cache (tenant quoteConfig/accessorialCatalog).
  * @param {object} tenant Tenant.
@@ -749,4 +804,5 @@ module.exports = {
   getQuoteAccessorialCatalog,
   normalizeRerunAccessorialCodes,
   fetchPrimusAccessorialRows,
+  listPrimusAccessorialChoices,
 };
