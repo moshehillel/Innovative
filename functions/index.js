@@ -6025,9 +6025,9 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "Fuel surcharge is not an extra charge.",
         "Line haul is never an extra charge. It is a breakdown of the " +
         "freight total.",
-        "The additional amount is the carrier invoice total minus the " +
-        "original amount on file. Do not report a line-haul line as the " +
-        "additional charge.",
+        "The difference is always the carrier invoice total minus the " +
+        "Primus amount on file. List any added lines you see, but never " +
+        "use a line amount as the difference.",
         "If the invoice lists an accessorial such as redelivery, name " +
         "that accessorial. Do not call it a reweigh unless the invoice " +
         "itself says reweigh or reclass.",
@@ -10914,16 +10914,8 @@ async function processGmailMessage(
           additionalCharges.stripFreightBreakdownCharges(
               normalizedChargeData.unrecognizedCharges);
         normalizedChargeData.unrecognizedCharges = strippedCharges.kept;
-        const invoiceGap = additionalCharges.invoiceOverage(
+        const invoiceGap = additionalCharges.reportedChargeDifference(
             aiResult.invoiceAmount, primusVendorCost);
-        if (!normalizedChargeData.unrecognizedCharges.length &&
-            invoiceGap != null && invoiceGap > 0.5) {
-          normalizedChargeData.unrecognizedCharges = [{
-            label: "Difference vs amount on file",
-            amount: invoiceGap,
-            type: "rate_difference",
-          }];
-        }
         const chargeCategory =
           additionalCharges.classifyAdditionalChargeReason({
             charges: normalizedChargeData.unrecognizedCharges,
@@ -10931,8 +10923,7 @@ async function processGmailMessage(
             freightMismatch,
             invoiceGap,
           });
-        const chargesTotal = additionalCharges.sumCharges(
-            normalizedChargeData.unrecognizedCharges);
+        const chargesTotal = invoiceGap;
 
         if (chargeCategory ===
             additionalCharges.CHARGE_CATEGORY.RATE_INCREASE) {

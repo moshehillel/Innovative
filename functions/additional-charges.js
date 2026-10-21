@@ -121,6 +121,19 @@ function invoiceOverage(invoiceAmount, primusAmount) {
   return Math.round((invoice - quoted) * 100) / 100;
 }
 
+/**
+ * The difference is always the carrier invoice minus Primus.
+ * Line amounts are listed separately and are not this number.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusAmount Primus carrier cost.
+ * @return {number|null}
+ */
+function reportedChargeDifference(invoiceAmount, primusAmount) {
+  const gap = invoiceOverage(invoiceAmount, primusAmount);
+  if (gap == null || !(gap > 0)) return null;
+  return gap;
+}
+
 /** Flat band for lumper base-freight pre-check vs Primus carrier cost. */
 const LUMPER_BASE_TOLERANCE = 5;
 
@@ -692,7 +705,7 @@ function chargesHtml(charges) {
         `<strong>${money(c && c.amount)}</strong></li>`)
       .join("");
   return rows ? `<ul style="margin:6px 0 6px 18px;padding:0">${rows}</ul>` :
-    "<p><em>No itemized charge rows — total difference only.</em></p>";
+    "<p><em>No added lines listed.</em></p>";
 }
 
 /**
@@ -841,7 +854,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Customer rate (Primus)", formatCustomerRate(customerRate)) +
     row("Carrier invoice", money(invoiceAmount)) +
     row("Amount on file (Primus)", money(primusAmount)) +
-    row("Additional charges", money(chargesTotal)) +
+    row("Difference (invoice minus Primus)", money(chargesTotal)) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
       row("W&I certificate", "Attached / referenced on invoice") : "") +
@@ -850,7 +863,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     accessorialConfirmHtml +
     mismatchHtml +
     rateHtml +
-    `<p><strong>Charges:</strong></p>` +
+    `<p><strong>Lines on the invoice (not the difference):</strong></p>` +
     chargesHtml(charges) +
     (Number(excludedInPrimusCount) > 0 ?
       `<p style="font-size:12px;color:#6b7280"><em>` +
@@ -1660,6 +1673,7 @@ module.exports = {
   isFreightBreakdownLabel,
   stripFreightBreakdownCharges,
   invoiceOverage,
+  reportedChargeDifference,
   displayChargeLabel,
   sumCharges,
   normalizeBreakdownText,

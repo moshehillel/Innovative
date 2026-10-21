@@ -387,6 +387,8 @@ const stripped = ac.stripFreightBreakdownCharges([
 check("strip keeps redelivery", stripped.kept.length, 1);
 check("invoice minus original",
     ac.invoiceOverage(286.47, 194.70), 91.77);
+check("difference is invoice minus Primus, not the line",
+    ac.reportedChargeDifference(286.47, 194.70), 91.77);
 
 const page = ac.buildOptionBAccessorialConfirmPage({
   title: "Confirm option B",
