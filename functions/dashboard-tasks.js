@@ -1286,10 +1286,14 @@ async function reassignDashboardWork(db, opts) {
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
   if (bucket === "dispatch") {
-    patch.dispatcherEmail = dispatcherEmail;
-    patch.dispatcherName = dispatcherName;
-    patch.dispatcherKey = dispatcherEmail ||
-      (dispatcherName ? dispatcherName.toLowerCase() : null);
+    const roster = ownership.OPS_DISPATCHERS.find((p) =>
+      p.email === dispatcherEmail ||
+      (dispatcherName && p.name.toLowerCase() === dispatcherName.toLowerCase()));
+    patch.dispatcherEmail = roster ? roster.email : dispatcherEmail;
+    patch.dispatcherName = roster ? roster.name : dispatcherName;
+    patch.dispatcherKey = roster ? roster.key :
+      (dispatcherEmail ||
+        (dispatcherName ? dispatcherName.toLowerCase() : null));
   }
   await ref.update(patch);
   const issue = scope.classifyIssue({...data, type: data.type});
@@ -1306,6 +1310,76 @@ async function reassignDashboardWork(db, opts) {
   };
 }
 
+async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
+  const raw = String(opts.q || "").trim();
+  const tenantId = String(opts.tenantId || "default");
+  if (!raw) return {tasks: []};
+  const values = [raw];
+  if (/^\d+$/.test(raw)) values.push(Number(raw));
+  const tasks = [];
+  const seen = new Set();
+  for (const value of values) {
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", value)
+        .limit(40)
+        .get();
+    snap.forEach((doc) => {
+      if (seen.has(doc.id)) return;
+      const data = doc.data() || {};
+      if ((data.status || "") !== TASK_STATUS.OPEN) return;
+      if (!ownership.sameTenant(data.tenantId, tenantId)) return;
+      if (data.type === TASK_TYPE.HUMAN_REVIEW) return;
+      seen.add(doc.id);
+      tasks.push(serializeTaskDoc(doc));
+    });
+  }
+  for (const value of values) {
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await db.collection(
+        additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .where("loadNumber", "==", value)
+        .limit(20)
+        .get();
+    snap.forEach((doc) => {
+      if (seen.has(doc.id)) return;
+      const d = doc.data() || {};
+      if (d.resolved === true) return;
+      if (!ownership.sameTenant(d.tenantId, tenantId)) return;
+      seen.add(doc.id);
+      const isDispute = d.status ===
+        additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
+        d.chargePhase === "dispute";
+      tasks.push({
+        id: doc.id,
+        source: "additionalCharges",
+        tenantId: d.tenantId || tenantId,
+        type: TASK_TYPE.ADDITIONAL_CHARGE,
+        title: `Additional charge — Load ${d.loadNumber || raw}`,
+        description: d.notes || null,
+        loadNumber: d.loadNumber || raw,
+        carrierName: d.carrierName || null,
+        invoiceId: d.invoiceId || null,
+        followUpId: doc.id,
+        reason: d.category || d.status || null,
+        status: "open",
+        chargesTotal: d.chargesTotal || null,
+        invoiceAmount: d.invoiceAmount || null,
+        to: d.emailTo || null,
+        cc: d.emailCc || null,
+        ownerBucket: d.ownerBucket || null,
+        dispatcherEmail: d.dispatcherEmail || null,
+        dispatcherName: d.dispatcherName || null,
+        dispatcherKey: d.dispatcherKey || null,
+        chargePhase: isDispute ? "dispute" : (d.chargePhase || null),
+        createdAt: d.createdAt && d.createdAt.toDate ?
+          d.createdAt.toDate().toISOString() : null,
+      });
+    });
+  }
+  return {tasks};
+}
+
 module.exports = {
   TASK_COLLECTION,
   TASK_TYPE,
@@ -1319,5 +1393,6 @@ module.exports = {
   missingRateTaskPayload,
   ensureMissingRateDispatchTasks,
   reassignDashboardWork,
+  searchOpenByLoadNumber,
   tenantCollection,
 };

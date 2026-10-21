@@ -357,5 +357,36 @@ const realMismatch = ac.validateLumperAmount({
 check("real mismatch => invalid", realMismatch.valid, false);
 check("real mismatch difference", Math.round(realMismatch.difference), 99);
 
+check("redelivery wins over a weight mismatch",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Redelivery", amount: 85}],
+      freightMismatch: {mismatch: true, dimMismatch: true},
+      hasCertificate: true,
+    }), ac.CHARGE_CATEGORY.ACCESSORIAL);
+
+check("line haul is not an extra charge",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Line Haul", amount: 19}],
+    }), ac.CHARGE_CATEGORY.RATE_INCREASE);
+
+check("small gap uses the accessorial amount",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Inside delivery", amount: 19}],
+      freightMismatch: {mismatch: true},
+      invoiceGap: 19,
+    }), ac.CHARGE_CATEGORY.ACCESSORIAL);
+
+const pct = ac.computeCustomerChargeAmount({
+  carrierAmount: 100, markupPct: 20,
+});
+check("20% of 100 is 120", pct.amount, 120);
+const stripped = ac.stripFreightBreakdownCharges([
+  {label: "Line Haul", amount: 19},
+  {label: "Redelivery", amount: 75},
+]);
+check("strip keeps redelivery", stripped.kept.length, 1);
+check("invoice minus original",
+    ac.invoiceOverage(286.47, 194.70), 91.77);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

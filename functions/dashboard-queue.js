@@ -100,17 +100,29 @@ async function listOperationalQueue(db, deps, opts) {
   const tenant = deps.tenant;
   const tenantId = tenant.tenantId;
   const sort = String(opts.sort || "").toLowerCase();
-  // Full open set (newest createdAt first, capped in the task query).
-  // Paging below applies Newest / Oldest / amount. Urgent-first here used
-  // to make Newest a reorder of the old urgent page.
-  const listed = await deps.dashboardTasks.listDashboardTasks(
-      db, deps.additionalCharges, {
-        tenantId,
-        collectionPrefix: tenant.collectionPrefix,
-        chargePhase: "all",
-        unpaged: true,
-        skipHydrate: true,
-      });
+  const q = String(opts.q || "").trim();
+  const loadSearch = /^\d{5,}$/.test(q);
+  const fetchLimit = loadSearch ? 40 :
+    (Number(opts.offset) > 0 ? 800 : 220);
+
+  let listed;
+  if (loadSearch &&
+      typeof deps.dashboardTasks.searchOpenByLoadNumber === "function") {
+    listed = await deps.dashboardTasks.searchOpenByLoadNumber(
+        db, deps.additionalCharges, {tenantId, q});
+    listed.disputeCount = (listed.tasks || []).filter((t) =>
+      t.chargePhase === "dispute").length;
+  } else {
+    listed = await deps.dashboardTasks.listDashboardTasks(
+        db, deps.additionalCharges, {
+          tenantId,
+          collectionPrefix: tenant.collectionPrefix,
+          chargePhase: "all",
+          unpaged: true,
+          skipHydrate: true,
+          fetchLimit,
+        });
+  }
   const tasks = (listed.tasks || []).map((task) => ({
     ...task,
     issueType: scope.classifyIssue(task),
@@ -119,10 +131,25 @@ async function listOperationalQueue(db, deps, opts) {
   const invoiceRows = [];
   if (typeof deps.tcol === "function") {
     try {
-      const snap = await deps.tcol(tenant, "invoices")
-          .where("decisionStage", "in", HOLD_STAGES)
-          .limit(2000)
-          .get();
+      let snap;
+      if (loadSearch) {
+        const values = [q, Number(q)];
+        const docs = [];
+        for (const value of values) {
+          // eslint-disable-next-line no-await-in-loop
+          const part = await deps.tcol(tenant, "invoices")
+              .where("loadNumber", "==", value)
+              .limit(15)
+              .get();
+          docs.push(...part.docs);
+        }
+        snap = {forEach: (fn) => docs.forEach(fn)};
+      } else {
+        snap = await deps.tcol(tenant, "invoices")
+            .where("decisionStage", "in", HOLD_STAGES)
+            .limit(fetchLimit)
+            .get();
+      }
       snap.forEach((doc) => {
         const row = invoiceHoldRow(doc, tenantId);
         if (row) invoiceRows.push(row);
@@ -134,6 +161,16 @@ async function listOperationalQueue(db, deps, opts) {
 
   let merged = scope.mergeQueueItems(tasks.concat(invoiceRows))
       .map((row) => ownership.applyOwnerDefaults(row));
+  if (q && !loadSearch) {
+    const needle = q.toLowerCase();
+    merged = merged.filter((row) => {
+      const hay = [
+        row.loadNumber, row.carrierName, row.title, row.reason,
+        row.proNumber, row.subject, row.description,
+      ].filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(needle);
+    });
+  }
   const issue = String(opts.issue || "all").toLowerCase();
   if (issue && issue !== "all") {
     merged = merged.filter((row) => row.issueType === issue);

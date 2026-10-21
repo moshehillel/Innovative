@@ -340,8 +340,9 @@ async function collectNotifPage(baseQuery, maxDocs) {
 
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
+  const q = String(opts.q || "").trim();
   const fetchLimit = Math.min(
-      Math.max(Number(opts.fetchLimit) || 2000, 50), 2000);
+      Math.max(Number(opts.fetchLimit) || 200, 50), 2000);
   const scope = require("./dashboard-scope");
   const notifName = scope.collectionName({
     collectionPrefix: opts.collectionPrefix,
@@ -409,8 +410,36 @@ async function listNotifications(db, opts) {
     await opts.backfillMail(notifications);
   }
 
-  const visibleNotifications =
+  let visibleNotifications =
     dedupe.collapseExactDuplicateItems(notifications);
+  if (/^\d{5,}$/.test(q)) {
+    const values = [q, Number(q)];
+    const seen = new Set(visibleNotifications.map((n) => n.id));
+    for (const value of values) {
+      // eslint-disable-next-line no-await-in-loop
+      const extra = await db.collection(notifName)
+          .where("loadNumber", "==", value)
+          .limit(30)
+          .get();
+      extra.forEach((doc) => {
+        if (seen.has(doc.id)) return;
+        const row = serializeNotif(doc);
+        if (row.status && row.status !== NOTIF_STATUS.OPEN &&
+            row.status !== "open") {
+          return;
+        }
+        seen.add(doc.id);
+        visibleNotifications.push(row);
+      });
+    }
+  } else if (q) {
+    const needle = q.toLowerCase();
+    visibleNotifications = visibleNotifications.filter((n) => {
+      const hay = [n.loadNumber, n.subject, n.title, n.reason, n.from, n.to]
+          .filter(Boolean).join(" ").toLowerCase();
+      return hay.includes(needle);
+    });
+  }
 
   const page = ownership.filterSortPaginate(visibleNotifications, {
     ownerBucket: opts.ownerBucket || null,

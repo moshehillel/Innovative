@@ -42,6 +42,8 @@ async function handleListNotifications(req, res) {
       collectionPrefix: tenant.collectionPrefix,
       limit: req.query.limit,
       offset: req.query.offset,
+      q: req.query.q || null,
+      fetchLimit: req.query.q ? 40 : 200,
       type: req.query.type || null,
       ownerBucket: req.query.ownerBucket || null,
       dispatcherKey: req.query.dispatcherKey || null,

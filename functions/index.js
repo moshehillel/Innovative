@@ -3161,123 +3161,84 @@ async function handleAdditionalChargeAction(req, res) {
     };
 
     if (req.method !== "POST") {
-      const confirmOpts = {
-        title: `Confirm option ${option.toUpperCase()}`,
-        description:
-          `Load ${invoice.loadNumber || invoiceId}: ` +
-          `${optionLabels[option]}. Nothing is sent until you click Confirm.`,
-        confirmLabel: `Confirm option ${option.toUpperCase()}`,
-        confirmColor: option === "d" ? "#dc2626" :
-          (option === "c" ? "#2563eb" :
-            (option === "e" ? "#7c3aed" : "#16a34a")),
-        actionPath: "additionalChargeAction",
-        fields: {
-          invoiceId: String(invoiceId),
-          option,
-          tenantId: tenantId || "",
-          exp: String(exp),
-          sig: String(sig),
-        },
-      };
-      if (option === "a" || option === "e") {
-        let bookingForRate = null;
-        try {
-          bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
-        } catch (_) {
-          // Best-effort default for the amount field.
-        }
-        const currentRate = await resolveCurrentCustomerRate(
-            invoice, bookingForRate);
-        const defaultCharge = Number(charge.amount) || 0;
-        const rateNote = currentRate > 0 ?
-          ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
-        const isE = option === "e";
-        confirmOpts.title = isE ? "Confirm option E" : "Confirm option A";
-        confirmOpts.description =
-          `Load ${invoice.loadNumber || invoiceId}: ` +
-          `${optionLabels[option]}. Enter how much to charge the customer ` +
-          `for this additional charge. The customer rate will be bumped by ` +
-          `that amount` +
-          (isE ?
-            `; no separate customer notification is sent - the charge is ` +
-            `included when the customer invoice goes out.` :
-            ` and the customer will be emailed.`) +
-          rateNote +
-          ` Nothing is sent until you click Confirm.`;
-        confirmOpts.confirmLabel = isE ?
-          "Confirm option E" : "Confirm option A";
-        confirmOpts.confirmColor = isE ? "#7c3aed" : "#16a34a";
-        confirmOpts.inputFields = [{
-          name: "customerChargeAmount",
-          label: "Amount to charge the customer ($)",
-          type: "number",
-          required: true,
-          min: "0.01",
-          step: "0.01",
-          placeholder: "0.00",
-          value: defaultCharge > 0 ? defaultCharge.toFixed(2) : "",
-        }];
-        return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
+      let bookingForRate = null;
+      try {
+        bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
+      } catch (_) {
+        // Best-effort default for the amount field.
       }
-      if (option === "b") {
-        let bookingForRate = null;
-        try {
-          bookingForRate = await fetchPrimusBooking(invoice.loadNumber);
-        } catch (_) {
-          // Best-effort default for the amount field.
-        }
-        const currentRate = await resolveCurrentCustomerRate(
-            invoice, bookingForRate);
-        return res.status(200).send(
-            additionalCharges.buildOptionBAccessorialConfirmPage({
-              title: "Confirm option B",
-              description:
-                `Load ${invoice.loadNumber || invoiceId}: ` +
-                `${optionLabels[option]}. Enter each accessorial and the ` +
-                `amount to bill the customer. The base customer rate stays ` +
-                `the same; each accessorial is added as a separate invoice ` +
-                `line. The dispatcher will get a ready customer-notification ` +
-                `template.`,
-              confirmLabel: "Confirm option B",
-              confirmColor: "#0d9488",
-              actionPath: "additionalChargeAction",
-              baseUrl: functionsBaseUrl(),
-              baseCustomerRate: currentRate,
-              carrierCharges: Array.isArray(charge.charges) ?
-                charge.charges : [],
-              fields: {
-                invoiceId: String(invoiceId),
-                option,
-                tenantId: tenantId || "",
-                exp: String(exp),
-                sig: String(sig),
-              },
-            }));
-      }
-      return res.status(200).send(buildEmailActionConfirmPage(confirmOpts));
+      const currentRate = await resolveCurrentCustomerRate(
+          invoice, bookingForRate);
+      const allowEmpty = option === "c" || option === "d";
+      const notifyNote = option === "a" ?
+        " The customer is emailed." :
+        (option === "e" ?
+          " No separate customer email. The charge is on the invoice." :
+          (option === "b" ?
+            " The dispatcher gets a customer-notification template." :
+            " Add an accessorial only if one belongs on this decision."));
+      return res.status(200).send(
+          additionalCharges.buildOptionBAccessorialConfirmPage({
+            title: `Confirm option ${option.toUpperCase()}`,
+            description:
+              `Load ${invoice.loadNumber || invoiceId}: ` +
+              `${optionLabels[option]}. Each line can be a percent markup ` +
+              `on the carrier cost or a flat customer amount. Use Add ` +
+              `accessorial for a charge that is not on the bill.` +
+              notifyNote,
+            confirmLabel: `Confirm option ${option.toUpperCase()}`,
+            confirmColor: option === "d" ? "#dc2626" :
+              (option === "c" ? "#2563eb" :
+                (option === "e" ? "#7c3aed" :
+                  (option === "b" ? "#0d9488" : "#16a34a"))),
+            actionPath: "additionalChargeAction",
+            baseUrl: functionsBaseUrl(),
+            baseCustomerRate: currentRate,
+            allowEmpty,
+            carrierCharges: Array.isArray(charge.charges) ?
+              charge.charges : [],
+            fields: {
+              invoiceId: String(invoiceId),
+              option,
+              tenantId: tenantId || "",
+              exp: String(exp),
+              sig: String(sig),
+            },
+          }));
     }
 
     const decision = option.toUpperCase();
     let optionBCustomerBillLines = null;
     let optionACustomerChargeAmount = null;
-    if (option === "a" || option === "e") {
-      const parsedAmount =
-        additionalCharges.parseCustomerChargeAmountFromRequest(req.body || {});
-      if (!parsedAmount.ok) {
-        return res.status(400).send(parsedAmount.error ||
-            `Option ${decision} requires a customer charge amount ` +
-            `greater than 0.`);
-      }
-      optionACustomerChargeAmount = parsedAmount.amount;
-    }
-    if (option === "b") {
-      const parsedLines = additionalCharges.parseCustomerBillLinesFromRequest(
+    const rawLines = req.body && req.body.customerBillLinesJson;
+    let parsedLines = null;
+    if (rawLines) {
+      parsedLines = additionalCharges.parseCustomerBillLinesFromRequest(
           req.body || {});
-      if (!parsedLines.ok) {
+      if (!parsedLines.ok && rawLines !== "[]") {
         return res.status(400).send(parsedLines.error ||
-            "Option B requires valid accessorial billing lines.");
+            "Enter a percent markup or a flat customer charge.");
       }
-      optionBCustomerBillLines = parsedLines.lines;
+      if (parsedLines.ok) optionBCustomerBillLines = parsedLines.lines;
+    }
+    if (option === "b" || option === "e" || option === "a") {
+      if (!optionBCustomerBillLines || !optionBCustomerBillLines.length) {
+        const parsedAmount = (option === "a" || option === "e") ?
+          additionalCharges.parseCustomerChargeAmountFromRequest(
+              req.body || {}) :
+          {ok: false};
+        if (parsedAmount.ok) {
+          optionACustomerChargeAmount = parsedAmount.amount;
+        } else {
+          return res.status(400).send(
+              (parsedLines && parsedLines.error) ||
+              "Enter at least one accessorial with a percent markup or " +
+              "a flat customer charge.");
+        }
+      } else if (option === "a" || option === "e") {
+        optionACustomerChargeAmount = additionalCharges.sumCustomerBillLines(
+            optionBCustomerBillLines);
+      }
     }
 
     const claim = await claimAdditionalChargeDecision(invoiceRef, decision);
@@ -3330,6 +3291,7 @@ async function handleAdditionalChargeAction(req, res) {
         "additionalCharge.decision": decision,
         "additionalCharge.approved": false,
         "additionalCharge.status": "disputed",
+        "additionalCharge.customerBillLines": optionBCustomerBillLines || [],
         "additionalCharge.decidedAt":
           admin.firestore.FieldValue.serverTimestamp(),
         "decisionStage": "additional_charge_disputed",
@@ -3387,6 +3349,10 @@ async function handleAdditionalChargeAction(req, res) {
       const billAmount = optionACustomerChargeAmount;
       approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
       approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
+      if (optionBCustomerBillLines && optionBCustomerBillLines.length) {
+        approvalUpdate["additionalCharge.customerBillLines"] =
+          optionBCustomerBillLines;
+      }
       if (baseRate > 0) {
         const bumpedRate =
           Math.round((baseRate + billAmount) * 100) / 100;
@@ -3402,7 +3368,8 @@ async function handleAdditionalChargeAction(req, res) {
           `recorded, but the current customer rate could not be resolved - ` +
           `please bump it manually before invoicing.`;
       }
-    } else if (billCustomer && chargesTotal > 0 && option === "b") {
+    } else if (option === "b" && optionBCustomerBillLines &&
+        optionBCustomerBillLines.length) {
       const baseRate = await resolveCurrentCustomerRate(invoice, booking);
       const billLines = optionBCustomerBillLines || [];
       const billExtra = additionalCharges.sumCustomerBillLines(billLines);
@@ -3416,6 +3383,12 @@ async function handleAdditionalChargeAction(req, res) {
         " Base customer rate unchanged.";
       rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
         ` ($${billExtra.toFixed(2)}).`;
+    }
+
+    if (option === "c" && optionBCustomerBillLines &&
+        optionBCustomerBillLines.length) {
+      approvalUpdate["additionalCharge.customerBillLines"] =
+        optionBCustomerBillLines;
     }
 
     await invoiceRef.update(approvalUpdate);
@@ -5446,11 +5419,19 @@ async function notifyLisaPodDiscrepancy(opts) {
   if (disc.missingCartons) flags.push("Missing cartons / shortage");
   const flagLabel = flags.length ? flags.join("; ") : "Discrepancy noted";
 
+  const shortOnly = disc.missingCartons && !disc.damageNoted;
   const html =
     `<p>Hi Lisa,</p>` +
     `<p>Jerry flagged load <strong>${escapeHtml(String(loadNumber || ""))}` +
     `</strong> because the POD shows <strong>${escapeHtml(flagLabel)}` +
-    `</strong> and needs your review before we treat delivery as clean.</p>` +
+    `</strong>.` +
+    (shortOnly ?
+      ` This is a delivered-short. The customer invoice still goes out. ` +
+      `Filing a claim is the customer's responsibility.` :
+      ` The customer invoice still goes out. A shortage does not hold ` +
+      `billing. Review damage with the customer if they want to file a ` +
+      `claim.`) +
+    `</p>` +
     (disc.details ?
       `<p style="margin:12px 0"><em>${escapeHtml(disc.details)}</em></p>` :
       "") +
@@ -5466,8 +5447,8 @@ async function notifyLisaPodDiscrepancy(opts) {
     `Missing cartons</td><td>${disc.missingCartons ? "Yes" : "No"}` +
     `</td></tr>` +
     `</table>` +
-    `<p>Please review the POD on the load and follow up with the customer ` +
-    `or carrier as needed.</p>`;
+    `<p>The customer was invoiced. Please keep the POD with the load in ` +
+    `case the customer files a claim.</p>`;
 
   const podFile = podStoragePath ? [{
     filename: podFilename || "pod.pdf",
@@ -6033,6 +6014,14 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "(YYYY-MM-DD). If the invoice shows terms like Net 30 but no " +
         "explicit due date, leave dueDate empty.",
         "Fuel surcharge is not an extra charge.",
+        "Line haul is never an extra charge. It is a breakdown of the " +
+        "freight total.",
+        "The additional amount is the carrier invoice total minus the " +
+        "original amount on file. Do not report a line-haul line as the " +
+        "additional charge.",
+        "If the invoice lists an accessorial such as redelivery, name " +
+        "that accessorial. Do not call it a reweigh unless the invoice " +
+        "itself says reweigh or reclass.",
         "Recognized extra charges are lumper and detention only.",
         "Detention = driver waiting time charge.",
         "If lumper exists, proof/receipt must be attached.",
@@ -10909,17 +10898,32 @@ async function processGmailMessage(
         }
         const freightMismatch = additionalCharges.detectFreightMismatch(
             aiResult.freightDetails, bookingForCharges);
+        const primusVendorCost = bookingForCharges &&
+          bookingForCharges.vendor &&
+          Number(bookingForCharges.vendor.cost) || null;
+        const strippedCharges =
+          additionalCharges.stripFreightBreakdownCharges(
+              normalizedChargeData.unrecognizedCharges);
+        normalizedChargeData.unrecognizedCharges = strippedCharges.kept;
+        const invoiceGap = additionalCharges.invoiceOverage(
+            aiResult.invoiceAmount, primusVendorCost);
+        if (!normalizedChargeData.unrecognizedCharges.length &&
+            invoiceGap != null && invoiceGap > 0.5) {
+          normalizedChargeData.unrecognizedCharges = [{
+            label: "Difference vs amount on file",
+            amount: invoiceGap,
+            type: "rate_difference",
+          }];
+        }
         const chargeCategory =
           additionalCharges.classifyAdditionalChargeReason({
             charges: normalizedChargeData.unrecognizedCharges,
             hasCertificate: !!aiResult.hasWeightInspectionCertificate,
             freightMismatch,
+            invoiceGap,
           });
         const chargesTotal = additionalCharges.sumCharges(
             normalizedChargeData.unrecognizedCharges);
-        const primusVendorCost = bookingForCharges &&
-          bookingForCharges.vendor &&
-          Number(bookingForCharges.vendor.cost) || null;
 
         if (chargeCategory ===
             additionalCharges.CHARGE_CATEGORY.RATE_INCREASE) {
@@ -13121,10 +13125,12 @@ exports.getDashboardTasks = onRequest(
     const tenant = await resolveDashboardTenant(req);
     const limit = Math.min(Number(req.query.limit || 50), 100);
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    const searchQ = String(req.query.q || "").trim();
     if (String(req.query.view || "") === "queue") {
-      if (!req.query.offset || Number(req.query.offset) === 0) {
+      if ((!req.query.offset || Number(req.query.offset) === 0) &&
+          !searchQ) {
         const primusUiBridgeLocal = require("./primus-ui-bridge");
-        await dashboardTasks.ensureMissingRateDispatchTasks(
+        dashboardTasks.ensureMissingRateDispatchTasks(
             db, tcol(tenant, "invoices"), {
               tenantId: tenant.tenantId,
               collectionPrefix: tenant.collectionPrefix,
@@ -13139,7 +13145,9 @@ exports.getDashboardTasks = onRequest(
                   name: found.displayName || found.userName || null,
                 };
               } : null,
-            });
+            }).catch((err) => {
+          console.error("[ensureMissingRateDispatchTasks]", err.message);
+        });
       }
       const queued = await dashboardQueue.listOperationalQueue(db, {
         tenant,
@@ -13149,6 +13157,7 @@ exports.getDashboardTasks = onRequest(
       }, {
         issue: req.query.issue || "all",
         dispatcher: req.query.dispatcher || "",
+        q: searchQ,
         limit,
         offset,
         sort: req.query.sort || "",
@@ -13171,7 +13180,7 @@ exports.getDashboardTasks = onRequest(
     }
     if (!req.query.chargePhase) {
       const primusUiBridgeLocal = require("./primus-ui-bridge");
-      await dashboardTasks.ensureMissingRateDispatchTasks(
+      dashboardTasks.ensureMissingRateDispatchTasks(
           db, tcol(tenant, "invoices"), {
             tenantId: tenant.tenantId,
             collectionPrefix: tenant.collectionPrefix,
@@ -13185,8 +13194,10 @@ exports.getDashboardTasks = onRequest(
                 email: found.email,
                 name: found.displayName || found.userName || null,
               };
-            } : null,
-          });
+              } : null,
+            }).catch((err) => {
+        console.error("[ensureMissingRateDispatchTasks]", err.message);
+      });
     }
     const result = await dashboardTasks.listDashboardTasks(
         db, additionalCharges, {
@@ -13378,17 +13389,23 @@ async function applyAdditionalChargeFromDashboard(opts) {
     exp: String(exp),
     sig,
   };
-  if (option === "a" || option === "e") {
-    body.customerChargeAmount = opts.customerChargeAmount;
-  }
-  if (option === "b") {
-    const lines = Array.isArray(opts.customerBillLines) ?
-      opts.customerBillLines : [];
-    // Form parser expects JSON string or structured fields.
+  const lines = Array.isArray(opts.customerBillLines) ?
+    opts.customerBillLines : [];
+  if (lines.length) {
     body.customerBillLinesJson = JSON.stringify(lines.map((line) => ({
-      name: line.description || line.name || "ACCESSORIAL",
-      amount: Number(line.amount) || 0,
+      name: line.description || line.name || "Accessorial",
+      amount: line.amount != null ? Number(line.amount) : null,
+      carrierAmount: line.carrierAmount != null ?
+        Number(line.carrierAmount) : null,
+      pricingMode: line.pricingMode || null,
+      markupPct: line.markupPct != null ? Number(line.markupPct) : null,
+      flatAmount: line.flatAmount != null ? Number(line.flatAmount) : null,
     })));
+  } else if (option === "c" || option === "d") {
+    body.customerBillLinesJson = "[]";
+  }
+  if ((option === "a" || option === "e") && !lines.length) {
+    body.customerChargeAmount = opts.customerChargeAmount;
   }
 
   let statusCode = 200;
@@ -15745,6 +15762,8 @@ async function reconcileUnrecognizedChargesWithPrimus(
     const TOTAL_TOLERANCE = 10;
     const totalMatches = vendorCost > 0 &&
       Math.abs(amount - vendorCost) <= TOTAL_TOLERANCE;
+    const overBy = vendorCost > 0 ?
+      Math.round((amount - vendorCost) * 100) / 100 : 0;
     // Invoice at/under Primus: AI-flagged line items are not overages.
     const invoiceAtOrUnderPrimus = vendorCost > 0 &&
       amount <= vendorCost + 0.01;
@@ -15754,10 +15773,28 @@ async function reconcileUnrecognizedChargesWithPrimus(
     const filtered = additionalCharges.filterChargesForApproval(
         charges, breakdown);
     const hadCharges = charges.length > 0;
+    // A few dollars over, with a named accessorial, is not a rounding match.
+    if (overBy > 0.5 && overBy <= TOTAL_TOLERANCE) {
+      const namedSmall = (filtered.ignorableSmall || []).filter((row) => {
+        const amt = Math.abs(Number(row && row.amount) || 0);
+        const label = String((row && (row.label || row.type)) || "");
+        return amt > 0.5 && Math.abs(amt - overBy) <= 1 &&
+          additionalCharges.isAccessorialLabel(label);
+      });
+      if (namedSmall.length) {
+        filtered.chargesForAction =
+          (filtered.chargesForAction || []).concat(namedSmall);
+        filtered.skipApproval = false;
+      }
+    }
     const allChargesReconciled = hadCharges && filtered.skipApproval;
-
+    const namedOverage = overBy > 0.5 &&
+      (filtered.chargesForAction || []).some((row) =>
+        additionalCharges.isAccessorialLabel(
+            String((row && (row.label || row.type)) || "")));
     return {
-      override: totalMatches || invoiceAtOrUnderPrimus || allChargesReconciled,
+      override: !namedOverage && (totalMatches ||
+        invoiceAtOrUnderPrimus || allChargesReconciled),
       vendorCost,
       breakdown,
       booking,

@@ -77,6 +77,50 @@ const RATE_MATCH_TOLERANCE = 10;
 /** Charges at or below this amount are ignored for approval/dispute. */
 const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
 
+/** A few dollars: match the gap to an accessorial instead of calling it a reweigh. */
+const SMALL_GAP_MAX = 25;
+
+/**
+ * Line haul and fuel are a breakdown of the freight total, never an extra.
+ * @param {string} label Charge label.
+ * @return {boolean}
+ */
+function isFreightBreakdownLabel(label) {
+  const text = String(label || "");
+  if (isAccessorialLabel(text)) return false;
+  return /line[\s-]*haul|\blinehaul\b|\bfuel\b|\bfsc\b/i.test(text);
+}
+
+/**
+ * Drops line-haul and fuel rows from an extra-charge list.
+ * @param {Array<object>} charges Charge rows.
+ * @return {{kept: Array<object>, dropped: Array<object>}}
+ */
+function stripFreightBreakdownCharges(charges) {
+  const kept = [];
+  const dropped = [];
+  for (const row of (Array.isArray(charges) ? charges : [])) {
+    if (isFreightBreakdownLabel(chargeLabel(row))) dropped.push(row);
+    else kept.push(row);
+  }
+  return {kept, dropped};
+}
+
+/**
+ * Carrier invoice total minus the original amount on file.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusAmount Primus carrier cost.
+ * @return {number|null}
+ */
+function invoiceOverage(invoiceAmount, primusAmount) {
+  const invoice = Number(String(invoiceAmount == null ? "" : invoiceAmount)
+      .replace(/[^0-9.-]/g, ""));
+  const quoted = Number(String(primusAmount == null ? "" : primusAmount)
+      .replace(/[^0-9.-]/g, ""));
+  if (!(invoice > 0) || !(quoted > 0)) return null;
+  return Math.round((invoice - quoted) * 100) / 100;
+}
+
 /** Flat band for lumper base-freight pre-check vs Primus carrier cost. */
 const LUMPER_BASE_TOLERANCE = 5;
 
@@ -566,17 +610,31 @@ function evaluateRequoteMatch(opts) {
  * @return {string} One of CHARGE_CATEGORY values.
  */
 function classifyAdditionalChargeReason(opts) {
-  const charges = Array.isArray(opts.charges) ? opts.charges : [];
+  const raw = Array.isArray(opts.charges) ? opts.charges : [];
+  const charges = raw.filter(
+      (c) => !isFreightBreakdownLabel(chargeLabel(c)));
   const wniByLabel = charges.some(
       (c) => isWeightInspectionLabel(chargeLabel(c)));
   const accessorialByLabel = charges.some(
       (c) => isAccessorialLabel(chargeLabel(c)));
   const mismatch = opts.freightMismatch && opts.freightMismatch.mismatch;
+  const gap = opts.invoiceGap != null ? Number(opts.invoiceGap) :
+    invoiceOverage(opts.invoiceAmount, opts.primusAmount);
 
-  // Itemized accessorials (school delivery, notify/detention, etc.) win
-  // over a stray W&I certificate flag or matching weight/class on the invoice.
-  if (accessorialByLabel && !wniByLabel && !mismatch) {
+  // A named accessorial (redelivery, liftgate, …) is the reason even when
+  // weight or dims also differ. Reweigh only when the invoice says so.
+  if (accessorialByLabel && !wniByLabel) {
     return CHARGE_CATEGORY.ACCESSORIAL;
+  }
+
+  // A few dollars off: use the accessorial line that matches the gap.
+  if (Number.isFinite(gap) && gap > 0.5 && gap <= SMALL_GAP_MAX) {
+    const near = charges.find((c) => {
+      const amt = Math.abs(Number(c && c.amount) || 0);
+      return amt > 0 && Math.abs(amt - gap) <= 1 &&
+        !isWeightInspectionLabel(chargeLabel(c));
+    });
+    if (near) return CHARGE_CATEGORY.ACCESSORIAL;
   }
 
   if (wniByLabel || opts.hasCertificate || mismatch) {
@@ -1296,24 +1354,79 @@ function customerBillLinesHtml(lines) {
  * @param {Array<object>} lines Raw line objects.
  * @return {object} Normalized lines payload.
  */
+function computeCustomerChargeAmount(row) {
+  const line = row || {};
+  const flatRaw = line.flatAmount;
+  const hasFlat = flatRaw != null && String(flatRaw).trim() !== "";
+  if (hasFlat || line.pricingMode === "flat") {
+    const flat = Math.round(Number(hasFlat ? flatRaw : line.amount) * 100) /
+      100;
+    if (!Number.isFinite(flat) || flat <= 0) {
+      return {ok: false, error: "Flat customer charge must be greater than 0."};
+    }
+    return {
+      ok: true, amount: flat, pricingMode: "flat",
+      flatAmount: flat, markupPct: null,
+    };
+  }
+  const pctRaw = line.markupPct;
+  const hasPct = pctRaw != null && String(pctRaw).trim() !== "";
+  if (hasPct || line.pricingMode === "markup") {
+    const pct = Number(hasPct ? pctRaw : line.markupPct);
+    const carrier = Math.round(Number(line.carrierAmount) * 100) / 100;
+    if (!Number.isFinite(pct) || pct < 0) {
+      return {ok: false, error: "Markup percent must be 0 or greater."};
+    }
+    if (!Number.isFinite(carrier) || carrier <= 0) {
+      return {
+        ok: false,
+        error: "Carrier cost is required when using a percent markup.",
+      };
+    }
+    const amount = Math.round(carrier * (1 + pct / 100) * 100) / 100;
+    return {
+      ok: true, amount, pricingMode: "markup",
+      markupPct: pct, flatAmount: null,
+    };
+  }
+  const amount = Math.round(Number(line.amount) * 100) / 100;
+  if (Number.isFinite(amount) && amount > 0) {
+    return {
+      ok: true, amount, pricingMode: "amount",
+      markupPct: null, flatAmount: amount,
+    };
+  }
+  return {
+    ok: false,
+    error: "Enter a percent markup or a flat customer charge.",
+  };
+}
+
 function normalizeCustomerBillLines(lines) {
   const out = [];
   for (const line of (Array.isArray(lines) ? lines : [])) {
-    const name = String(line && (line.name || line.label) || "").trim();
-    const amount = Math.round(Number(line && line.amount) * 100) / 100;
+    const name = String(
+        line && (line.name || line.label || line.description) || "").trim();
     if (!name) continue;
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return {
-        ok: false,
-        error: `Invalid amount for accessorial "${name}"`,
-      };
+    const priced = computeCustomerChargeAmount(line);
+    if (!priced.ok) {
+      return {ok: false, error: `${priced.error} (${name})`};
     }
-    out.push({name, amount});
+    const carrier = Math.round(Number(line && line.carrierAmount) * 100) / 100;
+    out.push({
+      name,
+      amount: priced.amount,
+      carrierAmount: Number.isFinite(carrier) && carrier > 0 ? carrier : 0,
+      pricingMode: priced.pricingMode,
+      markupPct: priced.markupPct,
+      flatAmount: priced.flatAmount,
+    });
   }
   if (!out.length) {
     return {
       ok: false,
-      error: "Enter at least one accessorial name and customer charge amount.",
+      error: "Enter at least one accessorial with a percent markup or " +
+        "flat customer charge.",
     };
   }
   return {ok: true, lines: out, total: sumCustomerBillLines(out)};
@@ -1392,13 +1505,15 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `<strong>Base customer rate (unchanged):</strong> ` +
     `${formatCustomerRate(baseRate)}</p>` :
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `The base customer freight rate will stay as-is in Primus. Enter each ` +
-    `accessorial and the amount to bill the customer below.</p>`;
+    `The base customer freight rate will stay as-is in Primus. For each ` +
+    `accessorial, enter a percent markup or a flat customer charge. ` +
+    `Use Add accessorial for a charge that is not on the carrier bill.` +
+    `</p>`;
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${esc(opts.title || "Confirm option B")}</title>` +
     `<style>` +
-    `.bill-row{display:grid;grid-template-columns:1fr 140px 32px;gap:8px;` +
+    `.bill-row{display:grid;grid-template-columns:1fr 160px 32px;gap:8px;` +
     `align-items:start;margin-bottom:10px}` +
     `.bill-row input{width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
     `border-radius:8px;font-size:16px;box-sizing:border-box}` +
@@ -1420,6 +1535,8 @@ function buildOptionBAccessorialConfirmPage(opts) {
     hidden +
     `<input type="hidden" name="customerBillLinesJson" ` +
     `id="customerBillLinesJson">` +
+    `<input type="hidden" id="allowEmptyLines" value="` +
+    `${opts.allowEmpty ? "1" : "0"}">` +
     `<p style="font-size:14px;font-weight:600;color:#374151;` +
     `margin-bottom:8px">` +
     `Accessorials to bill the customer</p>` +
@@ -1442,27 +1559,49 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
     `function addRow(row={}){` +
     `const wrap=document.createElement("div");wrap.className="bill-row";` +
-    `const hint=row.carrierAmount?` +
-    `"<div class=\\"bill-hint\\">Carrier billed ` +
-    `"+row.carrierAmount.toFixed(2)+"</div>":"";` +
+    `const carrier=Number(row.carrierAmount)||0;` +
+    `wrap.dataset.carrierAmount=String(carrier);` +
+    `const hint=carrier>0?"<div class=\\"bill-hint\\">Carrier cost $"+` +
+    `carrier.toFixed(2)+"</div>":` +
+    `"<div class=\\"bill-hint\\">No carrier cost — use a flat amount</div>";` +
     `wrap.innerHTML="<div><input type=\\"text\\" class=\\"bill-name\\" ` +
     `placeholder=\\"Accessorial name\\" value=\\""+escAttr(row.name||"")+` +
-    `"\\" required>"+hint+"</div><div><input type=\\"number\\" ` +
-    `class=\\"bill-amount\\" min=\\"0.01\\" step=\\"0.01\\" ` +
-    `placeholder=\\"0.00\\" value=\\""+escAttr(row.amount||"")+` +
-    `"\\" required></div><button type=\\"button\\" class=\\"remove-btn\\" ` +
+    `"\\">"+hint+"</div><div><select class=\\"bill-mode\\">` +
+    `<option value=\\"markup\\">Percent markup</option>` +
+    `<option value=\\"flat\\">Flat amount</option></select>` +
+    `<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
+    `step=\\"0.01\\" placeholder=\\"20\\"></div>` +
+    `<button type=\\"button\\" class=\\"remove-btn\\" ` +
     `title=\\"Remove\\">×</button>";` +
     `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
     `container.appendChild(wrap);}` +
-    `(seedRows.length?seedRows:[{name:"",amount:""}]).forEach(addRow);` +
-    `document.getElementById("add-bill-line").onclick=()=>addRow({});` +
-    `document.getElementById("option-b-form").onsubmit=()=>{` +
-    `const lines=[...container.querySelectorAll(".bill-row")].map((row)=>{` +
-    `return {name:row.querySelector(".bill-name").value.trim(),` +
-    `amount:Number(row.querySelector(".bill-amount").value)};` +
-    `}).filter((line)=>line.name&&line.amount>0);` +
-    `if(!lines.length){alert("Enter at least one accessorial and amount.");` +
-    `return false;}` +
+    `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);` +
+    `document.getElementById("add-bill-line").onclick=` +
+    `()=>addRow({name:"",carrierAmount:0});` +
+    `document.getElementById("option-b-form").onsubmit=(e)=>{` +
+    `const lines=[];` +
+    `for(const row of container.querySelectorAll(".bill-row")){` +
+    `const name=row.querySelector(".bill-name").value.trim();` +
+    `if(!name)continue;` +
+    `const carrierAmount=Number(row.dataset.carrierAmount)||0;` +
+    `const mode=row.querySelector(".bill-mode").value;` +
+    `const val=Number(row.querySelector(".bill-value").value);` +
+    `if(mode==="flat"){` +
+    `if(!(val>0)){alert("Enter a flat customer charge for "+name);` +
+    `e.preventDefault();return false;}` +
+    `lines.push({name,carrierAmount,pricingMode:"flat",flatAmount:val,` +
+    `markupPct:null,amount:val});` +
+    `}else{` +
+    `if(!(carrierAmount>0)||!(val>=0)){` +
+    `alert("Enter a markup percent for "+name);` +
+    `e.preventDefault();return false;}` +
+    `const amount=Math.round(carrierAmount*(1+val/100)*100)/100;` +
+    `lines.push({name,carrierAmount,pricingMode:"markup",markupPct:val,` +
+    `flatAmount:null,amount});}}` +
+    `const allowEmpty=document.getElementById("allowEmptyLines");` +
+    `if(!lines.length&&!(allowEmpty&&allowEmpty.value==="1")){` +
+    `alert("Enter a percent markup or a flat charge, or add an accessorial.");` +
+    `e.preventDefault();return false;}` +
     `document.getElementById("customerBillLinesJson").value=` +
     `JSON.stringify(lines);return true;};` +
     `</script></body></html>`;
@@ -1481,6 +1620,9 @@ module.exports = {
   formatCustomerRate,
   isWeightInspectionLabel,
   isAccessorialLabel,
+  isFreightBreakdownLabel,
+  stripFreightBreakdownCharges,
+  invoiceOverage,
   displayChargeLabel,
   sumCharges,
   normalizeBreakdownText,
@@ -1508,6 +1650,7 @@ module.exports = {
   customerBillLinesHtml,
   sumCustomerBillLines,
   normalizeCustomerBillLines,
+  computeCustomerChargeAmount,
   parseCustomerChargeAmountFromRequest,
   parseCustomerBillLinesFromRequest,
   seedCustomerBillLinesFromCharges,

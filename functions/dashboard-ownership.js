@@ -10,6 +10,57 @@ const OWNER_BUCKET = Object.freeze({
   DISPATCH: "dispatch",
 });
 
+/** People the work queue is divided by. Emails follow the company pattern. */
+const OPS_DISPATCHERS = Object.freeze([
+  {key: "leo", name: "Leo", email: "leo@innovativecarriers.com",
+    aliases: ["leo", "leom"]},
+  {key: "jak", name: "Jak", email: "jak@innovativecarriers.com",
+    aliases: ["jak", "jack"]},
+  {key: "tina", name: "Tina", email: "tina@innovativecarriers.com",
+    aliases: ["tina"]},
+  {key: "jason", name: "Jason", email: "jason@innovativecarriers.com",
+    aliases: ["jason", "jasons"]},
+  {key: "alex", name: "Alex", email: "alex@innovativecarriers.com",
+    aliases: ["alex"]},
+  {key: "jay", name: "Jay", email: "jay@innovativecarriers.com",
+    aliases: ["jay"]},
+  {key: "karen", name: "Karen", email: "karen@innovativecarriers.com",
+    aliases: ["karen"]},
+  {key: "barry", name: "Barry", email: "barry@innovativecarriers.com",
+    aliases: ["barry"]},
+  {key: "leah", name: "Leah", email: "leah@innovativecarriers.com",
+    aliases: ["leah"]},
+]);
+
+/**
+ * Match a To/Cc address to a named dispatcher.
+ * @param {string[]} addresses Normalized emails.
+ * @return {object|null}
+ */
+function matchRosterFromAddresses(addresses) {
+  const list = Array.isArray(addresses) ? addresses : [];
+  for (const addr of list) {
+    const local = String(addr || "").split("@")[0].replace(/[^a-z0-9]/g, "");
+    const hit = OPS_DISPATCHERS.find((person) => {
+      if (person.email === addr) return true;
+      return person.aliases.some((alias) => alias === local);
+    });
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
+ * Who the email was sent To, then Cc.
+ * @param {object} opts to, cc.
+ * @return {object|null}
+ */
+function rosterOwnerFromMail(opts) {
+  const toHit = matchRosterFromAddresses(splitEmails(opts && opts.to));
+  if (toHit) return toHit;
+  return matchRosterFromAddresses(splitEmails(opts && opts.cc));
+}
+
 /**
  * Empty tenant ids are the legacy default tenant. They are never "every tenant".
  * @param {string|null|undefined} value Stored or requested tenant id.
@@ -134,6 +185,17 @@ function classifyDashboardOwner(opts) {
     };
   }
 
+  const rosterHit = rosterOwnerFromMail(opts);
+  if (rosterHit) {
+    return {
+      ownerBucket: OWNER_BUCKET.DISPATCH,
+      awaitingReplyFrom: OWNER_BUCKET.DISPATCH,
+      dispatcherEmail: rosterHit.email,
+      dispatcherName: rosterHit.name,
+      dispatcherKey: rosterHit.key,
+    };
+  }
+
   const dispatcherEmail = normEmail(opts.dispatcherEmail);
   const dispatcherName = opts.dispatcherName ?
     String(opts.dispatcherName).trim() : null;
@@ -197,7 +259,15 @@ function classifyDashboardOwner(opts) {
  */
 function applyOwnerDefaults(item) {
   const out = {...item};
-  if (!out.ownerBucket) {
+  const named = OPS_DISPATCHERS.find((p) => p.key === out.dispatcherKey);
+  const rosterHit = named || rosterOwnerFromMail(out);
+  if (rosterHit) {
+    out.ownerBucket = OWNER_BUCKET.DISPATCH;
+    out.awaitingReplyFrom = out.awaitingReplyFrom || OWNER_BUCKET.DISPATCH;
+    out.dispatcherEmail = rosterHit.email;
+    out.dispatcherName = rosterHit.name;
+    out.dispatcherKey = rosterHit.key;
+  } else if (!out.ownerBucket) {
     const classified = classifyDashboardOwner(out);
     out.ownerBucket = classified.ownerBucket;
     out.awaitingReplyFrom = out.awaitingReplyFrom ||
@@ -280,6 +350,15 @@ function buildOwnerSummaries(items) {
     dispatch: {openCount: 0, urgentCount: 0},
   };
   const dispatchers = new Map();
+  for (const person of OPS_DISPATCHERS) {
+    dispatchers.set(person.key, {
+      key: person.key,
+      name: person.name,
+      email: person.email,
+      openCount: 0,
+      urgentCount: 0,
+    });
+  }
   for (const raw of items) {
     const item = applyOwnerDefaults(raw);
     const bucket = item.ownerBucket || OWNER_BUCKET.ACCOUNTING;
@@ -385,6 +464,7 @@ function filterSortPaginate(items, opts) {
 
 module.exports = {
   OWNER_BUCKET,
+  OPS_DISPATCHERS,
   URGENT_AGE_MS,
   canonicalTenantId,
   sameTenant,

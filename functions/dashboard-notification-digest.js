@@ -105,6 +105,11 @@ function digestRecipients(tenant, items) {
     if (isIntakeAddress(item.dispatcherEmail)) return;
     addEmail(item.dispatcherEmail, into, seen);
   });
+  if (!tenantId || tenantId === "default") {
+    ownership.OPS_DISPATCHERS.forEach((person) => {
+      addEmail(person.email, into, seen);
+    });
+  }
   return [...into].filter((email) => !isIntakeAddress(email));
 }
 
