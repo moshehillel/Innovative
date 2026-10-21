@@ -1020,25 +1020,123 @@ function buildDisputeEmailDraft(opts) {
  */
 function buildCustomerChargeNotificationEmail(opts) {
   const {customerName, loadNumber, charges, chargesTotal, category,
-    customerRate} = opts;
+    customerRate, customerBillLines} = opts;
+  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
+  const detail = billLines.length ?
+    (`<p>These additional charges will appear as their own lines on ` +
+      `your invoice, separate from the freight charge:</p>` +
+      customerBillLinesHtml(billLines) +
+      `<p>Additional total: <strong>` +
+      `${money(chargesTotal || sumCustomerBillLines(billLines))}</strong></p>`) :
+    (chargesHtml(charges) +
+      `<p>The additional amount of <strong>${money(chargesTotal)}</strong> ` +
+      `will be reflected on your invoice for this shipment.</p>`);
   const html =
     `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
     `<p>We were billed an additional charge by the carrier on your ` +
     `shipment (our reference <strong>${esc(String(loadNumber || ""))}` +
     `</strong>).</p>` +
     (customerRate != null && Number(customerRate) > 0 ?
-      `<p><strong>Your rate for this shipment:</strong> ` +
+      `<p><strong>Freight charge:</strong> ` +
       `${formatCustomerRate(customerRate)}</p>` : "") +
     `<p><strong>Reason:</strong> ${esc(categoryLabel(category))}</p>` +
-    chargesHtml(charges) +
-    `<p>The additional amount of <strong>${money(chargesTotal)}</strong> ` +
-    `will be reflected on your invoice for this shipment.</p>` +
+    detail +
     `<p>Please reach out if you have any questions.</p>`;
   return {
     subject: toOutboundEmailSafeSubject(
         `Additional charge on shipment ${loadNumber}`),
     html: toOutboundEmailSafeText(html),
   };
+}
+
+/**
+ * Option A bills each accessorial on its own customer-invoice line.
+ * The freight rate is left unchanged.
+ * @param {object} opts baseRate, billLines.
+ * @return {object}
+ */
+function planOptionACustomerBilling(opts) {
+  const rawBase = Number(opts && opts.baseRate);
+  const baseRate = Math.round(rawBase * 100) / 100;
+  const hasBase = Number.isFinite(baseRate) && baseRate > 0;
+  const billLines = Array.isArray(opts && opts.billLines) ? opts.billLines : [];
+  const total = Math.round(sumCustomerBillLines(billLines) * 100) / 100;
+  const invoiceLines = customerInvoiceChargeLines(
+      hasBase ? baseRate : 0, billLines);
+  let note = hasBase ?
+    `Base customer rate stays $${baseRate.toFixed(2)}.` :
+    "Base customer rate unchanged.";
+  if (billLines.length) {
+    note += ` Billing ${billLines.length} accessorial line(s)` +
+      ` ($${total.toFixed(2)}) as separate invoice lines.`;
+  }
+  return {
+    bumpFreight: false,
+    customerRate: hasBase ? baseRate : null,
+    customerBillLines: billLines,
+    customerBillAccessorialTotal: total,
+    customerChargeAmount: total,
+    invoiceLines,
+    note,
+  };
+}
+
+/**
+ * Freight stays the sell rate. Each accessorial is its own charge line.
+ * @param {number} customerRate Freight rate.
+ * @param {Array<object>} customerBillLines Accessorial lines.
+ * @return {Array<object>}
+ */
+function customerInvoiceChargeLines(customerRate, customerBillLines) {
+  const freight = Math.round(Number(customerRate || 0) * 100) / 100;
+  const lines = [{
+    kind: "freight",
+    description: "FREIGHT CHARGE",
+    rate: Number.isFinite(freight) ? freight : 0,
+  }];
+  (Array.isArray(customerBillLines) ? customerBillLines : []).forEach(
+      (line) => {
+        const amount = Math.round(Number(line && line.amount) * 100) / 100;
+        if (!Number.isFinite(amount) || amount <= 0) return;
+        const name = String(
+            (line && (line.name || line.label)) || "ACCESSORIAL")
+            .trim().toUpperCase();
+        lines.push({
+          kind: "accessorial",
+          description: name,
+          code: line && line.code ? String(line.code) : "",
+          rate: amount,
+        });
+      });
+  return lines;
+}
+
+/**
+ * Dashboard-ops mode parks internal mail. The customer additional-charge
+ * notice, customer bills, and a few ops digests still go out.
+ * @param {object} email Outbound email payload.
+ * @return {boolean}
+ */
+function mustDeliverDespiteDashboardPark(email) {
+  if (!email || typeof email !== "object") return false;
+  if (email.forceSend === true) return true;
+  const type = String(email.type || "");
+  return type === "dashboard_notification_digest" ||
+    type === "dashboard_assignment" ||
+    type === "additional_charge_customer_notice";
+}
+
+/**
+ * @param {object} opts decision, finalWorkflowStatus.
+ * @return {boolean}
+ */
+function shouldCloseAdditionalChargeTask(opts) {
+  const decision = String((opts && opts.decision) || "").toUpperCase();
+  const wf = String((opts && opts.finalWorkflowStatus) || "");
+  if (decision !== "A") return false;
+  return wf === "completed" ||
+    wf === "completed_no_customer_email" ||
+    wf === "completed_carrier_bill_only";
 }
 
 /**
@@ -1695,6 +1793,10 @@ module.exports = {
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
   buildCustomerChargeNotificationEmail,
+  planOptionACustomerBilling,
+  customerInvoiceChargeLines,
+  mustDeliverDespiteDashboardPark,
+  shouldCloseAdditionalChargeTask,
   buildDispatcherCustomerNotifyTemplate,
   buildDispatcherNotifyReminderEmail,
   buildOptionBAccessorialConfirmPage,

@@ -414,5 +414,155 @@ const coded = ac.normalizeCustomerBillLines([{
 }]);
 check("accessorial code is kept", coded.lines[0].code, "RDV");
 
-console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
-process.exit(failures ? 1 : 0);
+const optionALines = [
+  {name: "Residential Delivery", code: "RSD", amount: 55.9},
+  {name: "Liftgate at Destination", code: "LFD", amount: 54.6},
+];
+const optionAPlan = ac.planOptionACustomerBilling({
+  baseRate: 210.16,
+  billLines: optionALines,
+});
+check("option A does not bump freight", optionAPlan.bumpFreight, false);
+check("option A freight stays the base rate",
+    optionAPlan.customerRate, 210.16);
+check("option A accessorial total",
+    optionAPlan.customerBillAccessorialTotal, 110.5);
+check("option A invoice has freight plus each accessorial",
+    optionAPlan.invoiceLines.length, 3);
+check("freight line is not the combined total",
+    optionAPlan.invoiceLines[0].rate, 210.16);
+check("residential is its own line",
+    optionAPlan.invoiceLines[1].description, "RESIDENTIAL DELIVERY");
+check("residential amount stays on its line",
+    optionAPlan.invoiceLines[1].rate, 55.9);
+check("liftgate is its own line",
+    optionAPlan.invoiceLines[2].description, "LIFTGATE AT DESTINATION");
+check("liftgate amount stays on its line",
+    optionAPlan.invoiceLines[2].rate, 54.6);
+
+const notice = ac.buildCustomerChargeNotificationEmail({
+  customerName: "NJ Warehouse Express LLC",
+  loadNumber: "268358",
+  charges: [
+    {type: "ACC Residential delivery", amount: 43},
+    {type: "ACC Liftgate delivery", amount: 42},
+  ],
+  chargesTotal: 110.5,
+  category: ac.CHARGE_CATEGORY.ACCESSORIAL,
+  customerRate: 210.16,
+  customerBillLines: optionALines,
+});
+check("customer notice uses the existing subject",
+    notice.subject.indexOf("Additional charge on shipment 268358") >= 0,
+    true);
+check("customer notice lists residential",
+    notice.html.indexOf("Residential Delivery") >= 0, true);
+check("customer notice lists liftgate",
+    notice.html.indexOf("Liftgate at Destination") >= 0, true);
+check("customer notice keeps accessorials off the freight line",
+    notice.html.indexOf("separate from the freight") >= 0, true);
+check("customer additional-charge notice is delivered",
+    ac.mustDeliverDespiteDashboardPark({
+      type: "additional_charge_customer_notice",
+      to: "contact@nj3pllogistics.com",
+    }), true);
+check("internal approval mail can still stay on the dashboard",
+    ac.mustDeliverDespiteDashboardPark({
+      type: "additional_charge_approval",
+    }), false);
+check("option A completion closes the dashboard task",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "A",
+      finalWorkflowStatus: "completed",
+    }), true);
+check("option A still in progress stays open",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "A",
+      finalWorkflowStatus: "created",
+    }), false);
+check("a dispute is not closed by invoice completion",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "D",
+      finalWorkflowStatus: "completed",
+    }), false);
+
+/**
+ * @param {object} collections In-memory rows keyed by collection name.
+ * @return {object}
+ */
+function memoryDb(collections) {
+  return {
+    collection(name) {
+      const rows = collections[name] || [];
+      const filters = [];
+      const api = {
+        where(field, _op, value) {
+          filters.push({field, value});
+          return api;
+        },
+        limit() {
+          return api;
+        },
+        async get() {
+          const matched = rows.filter((row) =>
+            filters.every((filter) => row[filter.field] === filter.value));
+          return {
+            docs: matched.map((row) => ({
+              id: row.id,
+              data: () => row,
+              ref: {
+                update: async (patch) => Object.assign(row, patch),
+              },
+            })),
+          };
+        },
+      };
+      return api;
+    },
+  };
+}
+
+const dashboardTasks = require("../dashboard-tasks");
+const followUp = {
+  id: "follow-1",
+  invoiceId: "inv-1",
+  tenantId: "default",
+  status: "approved_billed",
+  resolved: false,
+};
+const disputeFollowUp = {
+  id: "follow-2",
+  invoiceId: "inv-1",
+  tenantId: "default",
+  status: "disputing",
+  resolved: false,
+};
+const task = {
+  id: "task-1",
+  invoiceId: "inv-1",
+  followUpId: "follow-1",
+  tenantId: "default",
+  type: "additional_charge",
+  status: "open",
+};
+const db = memoryDb({
+  additionalCharges: [followUp, disputeFollowUp],
+  dashboardTasks: [task],
+});
+
+dashboardTasks.closeAdditionalChargeWork(db, ac, {
+  invoiceId: "inv-1",
+  tenantId: "default",
+}).then((result) => {
+  check("close returns after option A", result.ok, true);
+  check("approved follow-up is resolved", followUp.resolved, true);
+  check("approved follow-up status is resolved",
+      followUp.status, ac.FOLLOW_UP_STATUS.RESOLVED);
+  check("dashboard task is dismissed", task.status, "dismissed");
+  check("dispute follow-up stays open", disputeFollowUp.resolved, false);
+  console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
+  process.exit(failures ? 1 : 0);
+}).catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

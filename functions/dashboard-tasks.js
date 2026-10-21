@@ -1498,6 +1498,72 @@ async function reassignDashboardWork(db, opts) {
   };
 }
 
+/**
+ * Closes the additional-charge dashboard task after option A invoicing
+ * finishes. Dispute follow-ups stay open.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object} opts invoiceId, tenantId.
+ * @return {Promise<object>}
+ */
+async function closeAdditionalChargeWork(db, additionalChargesMod, opts) {
+  const invoiceId = String((opts && opts.invoiceId) || "").trim();
+  if (!invoiceId || !additionalChargesMod) return {ok: false, closed: 0};
+  const collection = additionalChargesMod.FOLLOW_UP_COLLECTION;
+  const disputing = additionalChargesMod.FOLLOW_UP_STATUS &&
+    additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING;
+  const resolvedStatus = additionalChargesMod.FOLLOW_UP_STATUS &&
+    additionalChargesMod.FOLLOW_UP_STATUS.RESOLVED;
+  let closed = 0;
+  if (collection) {
+    const snap = await db.collection(collection)
+        .where("invoiceId", "==", invoiceId)
+        .limit(20)
+        .get();
+    for (const doc of snap.docs) {
+      const row = doc.data() || {};
+      if (row.resolved === true) continue;
+      if (disputing && row.status === disputing) continue;
+      if (opts.tenantId && row.tenantId &&
+          !ownership.sameTenant(row.tenantId, opts.tenantId)) {
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await doc.ref.update({
+        resolved: true,
+        status: resolvedStatus || "resolved",
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      // eslint-disable-next-line no-await-in-loop
+      await dismissTasksForFollowUp(db, {
+        followUpId: doc.id,
+        tenantId: opts.tenantId,
+      });
+      closed += 1;
+    }
+  }
+  const tasks = await db.collection(TASK_COLLECTION)
+      .where("invoiceId", "==", invoiceId)
+      .limit(20)
+      .get();
+  for (const doc of tasks.docs) {
+    const row = doc.data() || {};
+    if ((row.status || "") !== TASK_STATUS.OPEN) continue;
+    if (row.type !== TASK_TYPE.ADDITIONAL_CHARGE) continue;
+    if (opts.tenantId && row.tenantId &&
+        !ownership.sameTenant(row.tenantId, opts.tenantId)) {
+      continue;
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await doc.ref.update({
+      status: TASK_STATUS.DISMISSED,
+      dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    closed += 1;
+  }
+  return {ok: true, closed};
+}
+
 async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
   const raw = String(opts.q || "").trim();
   const tenantId = String(opts.tenantId || "default");
@@ -1581,6 +1647,7 @@ module.exports = {
   missingRateTaskPayload,
   ensureMissingRateDispatchTasks,
   reassignDashboardWork,
+  closeAdditionalChargeWork,
   searchOpenByLoadNumber,
   tenantCollection,
 };

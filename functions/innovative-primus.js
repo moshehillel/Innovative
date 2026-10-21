@@ -1185,11 +1185,26 @@ exports.processPrimusWorkflow = onRequest(
           additionalCharge.source === "unrecognized_charges") ?
           (Number(additionalCharge.amount) || 0) : 0;
         const additionalChargesMod = require("./additional-charges");
+        const decisionLetter = String(
+            (additionalCharge && additionalCharge.decision) || "",
+        ).toUpperCase();
+        // Option A and option B both itemize accessorials. Freight stays
+        // the base sell rate. Option A used to fold the charge into freight.
         const optionBCustomerBillLines = (additionalChargeApproved &&
           additionalCharge &&
-          String(additionalCharge.decision || "").toUpperCase() === "B" &&
+          (decisionLetter === "A" || decisionLetter === "B") &&
           Array.isArray(additionalCharge.customerBillLines)) ?
           additionalCharge.customerBillLines : [];
+        if (decisionLetter === "A" && optionBCustomerBillLines.length) {
+          const original = Number(additionalCharge.originalCustomerRate);
+          const current = Number(invoice.customerRate);
+          const extra = additionalChargesMod.sumCustomerBillLines(
+              optionBCustomerBillLines);
+          if (original > 0 && extra > 0 &&
+              Math.abs((current - original) - extra) < 0.05) {
+            invoice.customerRate = original;
+          }
+        }
         const customerBillAccessorialTotal = optionBCustomerBillLines.length ?
           additionalChargesMod.sumCustomerBillLines(optionBCustomerBillLines) :
           0;
@@ -3561,6 +3576,11 @@ exports.processPrimusWorkflow = onRequest(
             });
           }
 
+          const closeChargeTask = additionalChargesMod
+              .shouldCloseAdditionalChargeTask({
+                decision: additionalCharge && additionalCharge.decision,
+                finalWorkflowStatus: "completed",
+              });
           await invoiceDoc.ref.update({
             decisionStage: "completed",
             decisionReason: "Primus workflow completed successfully",
@@ -3572,8 +3592,26 @@ exports.processPrimusWorkflow = onRequest(
             customerInvoiceId: finalCustomerInvoiceId,
             issuedInvoiceNumber: issuedInvoiceNumber || null,
             processingLock: false,
+            ...(closeChargeTask ? {reviewStatus: "not_needed"} : {}),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
+          if (closeChargeTask) {
+            try {
+              const dashboardTasks = require("./dashboard-tasks");
+              await dashboardTasks.closeAdditionalChargeWork(
+                  db, additionalChargesMod, {
+                    invoiceId,
+                    tenantId: invoice.tenantId || "default",
+                  });
+            } catch (closeErr) {
+              await writeLog("warn", "workflow",
+                  "Additional-charge task close failed", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    error: closeErr.message,
+                  });
+            }
+          }
 
           await writeLog("info", "workflow", "Primus workflow completed", {
             invoiceId,

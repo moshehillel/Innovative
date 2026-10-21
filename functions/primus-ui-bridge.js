@@ -3509,37 +3509,24 @@ function buildActualCosts(vendor, bill, withIds = null) {
  */
 function buildCustomerCharges(
     customerRate, billToReference, customerBillLines) {
-  let description = "FREIGHT CHARGE";
+  const additionalCharges = require("./additional-charges");
+  const planned = additionalCharges.customerInvoiceChargeLines(
+      customerRate, customerBillLines);
   const ref = sanitizeBillToReferenceText(billToReference);
-  if (ref) {
-    description += ` - ${ref}`;
-  }
-  const lines = [{
-    id: 1,
-    code: "",
-    qty: 1,
-    description,
-    rate: roundMoney(customerRate),
-    total: roundMoney(customerRate).toFixed(2),
-    chargeType: "",
-  }];
-  (Array.isArray(customerBillLines) ? customerBillLines : []).forEach(
-      (line, idx) => {
-        const amount = roundMoney(line && line.amount);
-        if (!amount || amount <= 0) return;
-        const name = String(line && (line.name || line.label) || "ACCESSORIAL")
-            .trim().toUpperCase();
-        lines.push({
-          id: idx + 2,
-          code: "",
-          qty: 1,
-          description: name,
-          rate: amount,
-          total: amount.toFixed(2),
-          chargeType: "",
-        });
-      });
-  return lines;
+  return planned.map((line, idx) => {
+    let description = line.description;
+    if (idx === 0 && ref) description += ` - ${ref}`;
+    const rate = roundMoney(line.rate);
+    return {
+      id: idx + 1,
+      code: line.kind === "accessorial" ? (line.code || "") : "",
+      qty: 1,
+      description,
+      rate,
+      total: rate.toFixed(2),
+      chargeType: "",
+    };
+  });
 }
 
 /**

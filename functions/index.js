@@ -3326,8 +3326,8 @@ async function handleAdditionalChargeAction(req, res) {
     // Options a/b/c/e — the charge is approved for the carrier side.
     const billCustomer = option === "a" || option === "b" || option === "e";
 
-    // A/E: approver enters customer charge amount; bump sell rate
-    // by that amount.
+    // A: each accessorial is its own customer-invoice line. Freight stays.
+    // E: approver enters one amount and that amount bumps the sell rate.
     // B: approver itemizes accessorials on the confirm page.
     let rateBumpNote = "";
     const approvalUpdate = {
@@ -3352,8 +3352,40 @@ async function handleAdditionalChargeAction(req, res) {
       "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if ((option === "a" || option === "e") &&
-        optionACustomerChargeAmount > 0) {
+    if (option === "a") {
+      const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+      let billLines = Array.isArray(optionBCustomerBillLines) ?
+        optionBCustomerBillLines : [];
+      if (!billLines.length && optionACustomerChargeAmount > 0) {
+        const only = chargeRows.length === 1 ? chargeRows[0] : null;
+        billLines = [{
+          name: only ?
+            String(only.label || only.type || "Additional charge") :
+            "Additional charge",
+          code: only && only.code ? only.code : null,
+          amount: optionACustomerChargeAmount,
+        }];
+      }
+      if (billLines.length) {
+        const plan = additionalCharges.planOptionACustomerBilling({
+          baseRate,
+          billLines,
+        });
+        approvalUpdate["additionalCharge.customerChargeAmount"] =
+          plan.customerChargeAmount;
+        approvalUpdate["additionalCharge.customerBillLines"] =
+          plan.customerBillLines;
+        approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
+          plan.customerBillAccessorialTotal;
+        approvalUpdate["additionalCharge.originalCustomerRate"] =
+          plan.customerRate;
+        approvalUpdate["additionalCharge.rateBumpAmount"] = null;
+        approvalUpdate["additionalCharge.bumpedCustomerRate"] = null;
+        rateBumpNote = plan.note ? ` ${plan.note}` : "";
+        optionBCustomerBillLines = plan.customerBillLines;
+        optionACustomerChargeAmount = plan.customerChargeAmount;
+      }
+    } else if (option === "e" && optionACustomerChargeAmount > 0) {
       const baseRate = await resolveCurrentCustomerRate(invoice, booking);
       const billAmount = optionACustomerChargeAmount;
       approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
@@ -3422,20 +3454,30 @@ async function handleAdditionalChargeAction(req, res) {
           chargesTotal: optionACustomerChargeAmount != null ?
             optionACustomerChargeAmount : chargesTotal,
           category: charge.category,
-          customerRate: invoice.customerRate ||
+          customerRate: approvalUpdate[
+              "additionalCharge.originalCustomerRate"] ||
+            invoice.customerRate ||
             customerRateFromBooking(booking),
+          customerBillLines: approvalUpdate[
+              "additionalCharge.customerBillLines"] || [],
         });
-        await saveOutboundEmail(
+        const sent = await saveOutboundEmail(
             additionalCharges.applyAdditionalChargeEmailCc({
               type: "additional_charge_customer_notice",
               invoiceId: String(invoiceId),
+              loadNumber: invoice.loadNumber || null,
               forceRecipient: true,
+              forceSend: true,
               to: customerEmail,
               subject: note.subject,
               html: note.html,
               skipAgentGreeting: true,
             }));
-        extraNote += ` The customer was notified at ${customerEmail}.`;
+        if (sent && sent.ok && !sent.parked) {
+          extraNote += ` The customer was notified at ${customerEmail}.`;
+        } else {
+          extraNote += ` The customer notice to ${customerEmail} was not sent.`;
+        }
       } else {
         extraNote += " Could not resolve the customer email from Primus — " +
           "please notify the customer manually.";
@@ -6519,9 +6561,7 @@ async function saveOutboundEmail(email) {
     email.type === "dashboard_reply" ||
     email.type === "dashboard_assignment" ||
     email.type === "dashboard_notification_digest";
-  const forceSend = email.forceSend === true ||
-    email.type === "dashboard_notification_digest" ||
-    email.type === "dashboard_assignment";
+  const forceSend = additionalCharges.mustDeliverDespiteDashboardPark(email);
   const parkOpsOnDashboard = !forceSend &&
     dashboardOps.isDashboardOpsPrimary() &&
     !isCustomerBill && !isSystemErr && !isDashboardMeta;
@@ -6595,8 +6635,9 @@ async function saveOutboundEmail(email) {
     to: to,
     cc: cc || null,
     intendedTo: email.to || null,
-    sent: Boolean(sendResult && sendResult.ok),
+    sent: Boolean(sendResult && sendResult.ok && !sendResult.parked),
   }, null, tenant);
+  return sendResult;
 }
 
 /**
