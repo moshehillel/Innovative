@@ -4383,14 +4383,71 @@ function findMasterVendorByName(vendors, hint) {
 }
 
 /**
+ * Vendor named on the load (manage.php rate quote), not the underlying carrier.
+ * A Worldwide Express quote shows Carrier ESTES and Vendor Worldwide Express.
+ * REST booking.vendor.name is the carrier. vendorNameActual / vendorName is
+ * who the invoice should be billed to.
+ * @param {object|null} manageBooking bookingData from getBooking.
+ * @return {string}
+ */
+function manageLoadVendorName(manageBooking) {
+  if (!manageBooking || typeof manageBooking !== "object") return "";
+  const actual = String(manageBooking.vendorNameActual || "").trim();
+  const quoted = String(manageBooking.vendorName || "").trim();
+  return actual || quoted;
+}
+exports.manageLoadVendorName = manageLoadVendorName;
+
+/**
+ * Name to resolve in getVendors. The load vendor wins over the carrier.
+ * @param {object} opts loadVendorName, restVendorName, extractedCarrierName.
+ * @return {string}
+ */
+function billingVendorNameHint(opts) {
+  const src = opts || {};
+  const loadVendor = String(src.loadVendorName || "").trim();
+  const restVendor = String(src.restVendorName || "").trim();
+  const extracted = String(src.extractedCarrierName || "").trim();
+  return loadVendor || restVendor || extracted;
+}
+exports.billingVendorNameHint = billingVendorNameHint;
+
+/**
+ * Moves a cost line off the underlying carrier onto the load vendor.
+ * Leaves other vendors (insurance, port fees) on their own carrier.
+ * @param {object} line Actual, estimated, or billsInfo row.
+ * @param {string} underlyingCarrierName Carrier on the load (ESTES).
+ * @param {object} loadVendor Resolved master vendor {id, name}.
+ * @return {object}
+ */
+function applyLoadVendorToCostLine(line, underlyingCarrierName, loadVendor) {
+  const row = line || {};
+  const loadName = String(loadVendor && loadVendor.name || "").trim();
+  const loadId = loadVendor && loadVendor.id != null ?
+    String(loadVendor.id) : "";
+  const carrier = String(underlyingCarrierName || "").trim();
+  if (!loadName || !loadId || !carrier) return row;
+  if (loadName.toLowerCase() === carrier.toLowerCase()) return row;
+  const lineName = String(row.carrierName || "").trim();
+  if (!lineName || lineName.toLowerCase() !== carrier.toLowerCase()) {
+    return row;
+  }
+  return Object.assign({}, row, {
+    carrierId: loadId,
+    carrierName: loadName,
+  });
+}
+exports.applyLoadVendorToCostLine = applyLoadVendorToCostLine;
+
+/**
  * Resolves the Primus master vendor id (getVendors) for billing/QB sync.
  * Manual UI uses master ids (~82651 Estes); REST booking.vendor.id is a
  * different large assignment id Jerry must not send in billsInfo.carrierId.
  *
  * @param {object} bookingVendor booking.vendor from GET /book.
- * @param {string} [nameHint] Primus load vendor name (booking.vendor.name).
- *   Do not pass the carrier name from the invoice PDF — it may differ from
- *   the vendor assigned on the load and will break QuickBooks sync.
+ * @param {string} [nameHint] Load vendor (manage.php vendorName). Do not pass
+ *   the carrier from the invoice PDF. REST booking.vendor.name is the
+ *   underlying carrier when the load was rated through a 3PL.
  * @return {Promise<object>} vendor-shaped object with master id + name.
  */
 async function resolveMasterVendorForBilling(bookingVendor, nameHint) {
@@ -5908,10 +5965,38 @@ async function runPrimusUiBillingFlow(args) {
   if (!vendor.id) {
     return {ok: false, error: "Booking missing vendor.id"};
   }
-  const primusVendorName = String(vendor.name || "").trim();
+  const restVendorName = String(vendor.name || "").trim();
   const extractedCarrierName = String(args.carrierName || "").trim();
-  if (extractedCarrierName && primusVendorName &&
-      extractedCarrierName.toLowerCase() !== primusVendorName.toLowerCase() &&
+  let loadVendorName = "";
+  try {
+    const manageBooking = await fetchManageBooking(bookingId);
+    if (manageBooking.ok) {
+      loadVendorName = manageLoadVendorName(manageBooking.booking);
+    }
+  } catch (manageErr) {
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Could not read load vendor from manage.php — using booking vendor",
+          {loadNumber, bookingId, error: manageErr.message || String(manageErr)});
+    }
+  }
+  const billingNameHint = billingVendorNameHint({
+    loadVendorName,
+    restVendorName,
+    extractedCarrierName,
+  });
+  if (loadVendorName && restVendorName &&
+      loadVendorName.toLowerCase() !== restVendorName.toLowerCase() &&
+      writeLog) {
+    await writeLog("warn", "primus",
+        "Load vendor differs from carrier — billing the load vendor", {
+          loadNumber,
+          loadVendorName,
+          carrierName: restVendorName,
+          bookingVendorId: vendor.id,
+        });
+  } else if (extractedCarrierName && billingNameHint &&
+      extractedCarrierName.toLowerCase() !== billingNameHint.toLowerCase() &&
       writeLog) {
     await writeLog("warn", "primus",
         "Invoice carrier name differs from Primus load vendor — " +
@@ -5919,16 +6004,13 @@ async function runPrimusUiBillingFlow(args) {
         {
           loadNumber,
           extractedCarrierName,
-          primusVendorName,
+          primusVendorName: billingNameHint,
           bookingVendorId: vendor.id,
         });
   }
   try {
-    // Bill against the load vendor — not the PDF/email carrier name.
-    vendor = await resolveMasterVendorForBilling(
-        vendor,
-        primusVendorName || extractedCarrierName || "",
-    );
+    // Bill against the load vendor — not the carrier or the PDF name.
+    vendor = await resolveMasterVendorForBilling(vendor, billingNameHint);
   } catch (vendorErr) {
     return {
       ok: false,
@@ -6746,10 +6828,30 @@ async function writeCarrierInvoiceNumberToPrimus(args) {
 
   let vendor = booking.vendor || {};
   if (!vendor.id) return {ok: false, error: "Booking missing vendor.id"};
+  const underlyingCarrierName = String(vendor.name || "").trim();
+  let loadVendorName = "";
+  try {
+    const manageBooking = await fetchManageBooking(bookingId);
+    if (manageBooking.ok) {
+      loadVendorName = manageLoadVendorName(manageBooking.booking);
+    }
+  } catch (manageErr) {
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Could not read load vendor while writing carrier invoice #", {
+            loadNumber,
+            error: manageErr.message || String(manageErr),
+          });
+    }
+  }
   try {
     vendor = await resolveMasterVendorForBilling(
         vendor,
-        String(vendor.name || args.carrierName || ""),
+        billingVendorNameHint({
+          loadVendorName,
+          restVendorName: underlyingCarrierName,
+          extractedCarrierName: args.carrierName,
+        }),
     );
   } catch (vendorErr) {
     return {ok: false, error: vendorErr.message || "resolveMasterVendor failed"};
@@ -6790,37 +6892,41 @@ async function writeCarrierInvoiceNumberToPrimus(args) {
     billsInfo = [buildBillsInfo(vendor, bill, termsId)];
   } else {
     billsInfo = billsInfo.map((row) => {
-      const sameCarrier = String(row.carrierId) === String(vendor.id);
-      const missingNum = !String(row.vendorInvoiceNumber || "").trim();
+      const retargeted = applyLoadVendorToCostLine(
+          row, underlyingCarrierName, vendor);
+      const sameCarrier = String(retargeted.carrierId) === String(vendor.id);
+      const missingNum = !String(retargeted.vendorInvoiceNumber || "").trim();
       if (sameCarrier && missingNum) {
-        return Object.assign({}, row, {
+        return Object.assign({}, retargeted, {
           vendorInvoiceNumber,
-          PRO: proNumber || row.PRO || "",
+          PRO: proNumber || retargeted.PRO || "",
         });
       }
-      return row;
+      return retargeted;
     });
   }
 
   let carrierActualCosts;
   if (actualCosts.length) {
     carrierActualCosts = actualCosts.map((line) => {
-      const sameCarrier = String(line.carrierId) === String(vendor.id);
-      const vin = String(line.vendorInvoiceNumber || "").trim();
+      const retargeted = applyLoadVendorToCostLine(
+          line, underlyingCarrierName, vendor);
+      const sameCarrier = String(retargeted.carrierId) === String(vendor.id);
+      const vin = String(retargeted.vendorInvoiceNumber || "").trim();
       return {
-        id: String(line.id),
-        code: line.code || "",
-        description: line.description || "",
-        carrierId: String(line.carrierId || vendor.id),
-        carrierName: String(line.carrierName || vendor.name || ""),
-        qty: Number(line.qty || 1),
-        rate: roundMoney(line.rate),
-        total: roundMoney(line.total).toFixed(2),
+        id: String(retargeted.id),
+        code: retargeted.code || "",
+        description: retargeted.description || "",
+        carrierId: String(retargeted.carrierId || vendor.id),
+        carrierName: String(retargeted.carrierName || vendor.name || ""),
+        qty: Number(retargeted.qty || 1),
+        rate: roundMoney(retargeted.rate),
+        total: roundMoney(retargeted.total).toFixed(2),
         vendorInvoiceNumber: vin ||
           (sameCarrier ? vendorInvoiceNumber : ""),
-        terms: String(line.terms || ""),
-        PRO: String(line.PRO || proNumber || ""),
-        isAccessorial: !!line.isAccessorial,
+        terms: String(retargeted.terms || ""),
+        PRO: String(retargeted.PRO || proNumber || ""),
+        isAccessorial: !!retargeted.isAccessorial,
       };
     });
   } else {
@@ -6874,21 +6980,25 @@ async function writeCarrierInvoiceNumberToPrimus(args) {
     };
   }
 
-  const phase2Estimated = estimatedCosts.map((line) => ({
-    id: String(line.id),
-    code: line.code || "",
-    description: line.description || "",
-    carrierId: String(line.carrierId || ""),
-    carrierName: String(line.carrierName || ""),
-    editable: line.editable != null ? String(line.editable) : "0",
-    qty: Number(line.qty || 1),
-    rate: roundMoney(line.rate),
-    total: roundMoney(line.total).toFixed(2),
-    isAccessorial: !!line.isAccessorial,
-    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
-    terms: "",
-    PRO: "",
-  }));
+  const phase2Estimated = estimatedCosts.map((line) => {
+    const retargeted = applyLoadVendorToCostLine(
+        line, underlyingCarrierName, vendor);
+    return {
+      id: String(retargeted.id),
+      code: retargeted.code || "",
+      description: retargeted.description || "",
+      carrierId: String(retargeted.carrierId || ""),
+      carrierName: String(retargeted.carrierName || ""),
+      editable: retargeted.editable != null ? String(retargeted.editable) : "0",
+      qty: Number(retargeted.qty || 1),
+      rate: roundMoney(retargeted.rate),
+      total: roundMoney(retargeted.total).toFixed(2),
+      isAccessorial: !!retargeted.isAccessorial,
+      vendorInvoiceNumber: String(retargeted.vendorInvoiceNumber || ""),
+      terms: "",
+      PRO: "",
+    };
+  });
 
   const phase2Charges = charges.map((c) => ({
     id: String(c.id),
