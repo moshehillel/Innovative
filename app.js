@@ -696,35 +696,106 @@
     });
   }
 
-  function addChargeLine(list, seed) {
+  let accessorialChoices = null;
+
+  function normAccessorial(value) {
+    return String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+
+  async function loadAccessorialChoices() {
+    if (accessorialChoices) return accessorialChoices;
+    const data = await fetchJson("/getDashboardAccessorials");
+    accessorialChoices = Array.isArray(data.accessorials) ? data.accessorials : [];
+    return accessorialChoices;
+  }
+
+  function matchAccessorialChoice(name, choices) {
+    const want = normAccessorial(name);
+    if (!want) return null;
+    const exact = choices.find((item) =>
+      normAccessorial(item.name) === want || normAccessorial(item.code) === want);
+    if (exact) return exact;
+    if (want.length < 4) return null;
+    const loose = choices.filter((item) => {
+      const label = normAccessorial(item.name);
+      return label.includes(want) || want.includes(label);
+    });
+    return loose.length === 1 ? loose[0] : null;
+  }
+
+  function addChargeLine(list, seed, choices) {
     const row = document.createElement("div");
     row.className = "charge-line";
     row.style.display = "grid";
-    row.style.gridTemplateColumns = "1fr 90px 110px";
+    row.style.gridTemplateColumns = "1fr 90px 110px 90px";
     row.style.gap = "6px";
     row.style.marginBottom = "8px";
     const carrier = seed && seed.carrierAmount ? Number(seed.carrierAmount) : "";
-    row.innerHTML =
-      `<input class="input charge-line-name" placeholder="Accessorial" value="${bodyEsc(seed && seed.name || "")}" />` +
-      `<input class="input charge-line-carrier" type="number" min="0" step="0.01" placeholder="Carrier $" value="${carrier === "" ? "" : bodyEsc(String(carrier))}" />` +
-      `<select class="input charge-line-mode"><option value="markup">% markup</option><option value="flat">Flat $</option></select>` +
-      `<input class="input charge-line-value" type="number" min="0" step="0.01" placeholder="20 or 75.00" />`;
-    row.style.gridTemplateColumns = "1fr 90px 110px 90px";
+    const select = document.createElement("select");
+    select.className = "input charge-line-name";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "Select accessorial";
+    select.appendChild(blank);
+    const matched = matchAccessorialChoice(seed && seed.name, choices || []);
+    let selected = false;
+    (choices || []).forEach((item) => {
+      const opt = document.createElement("option");
+      opt.value = item.code || "";
+      opt.dataset.name = item.name || "";
+      opt.textContent = `${item.category ? item.category + " — " : ""}${item.name}`;
+      if (matched && item.code === matched.code && item.name === matched.name) {
+        opt.selected = true;
+        selected = true;
+      }
+      select.appendChild(opt);
+    });
+    if (seed && seed.name && !selected) {
+      const extra = document.createElement("option");
+      extra.value = "";
+      extra.dataset.name = seed.name;
+      extra.selected = true;
+      extra.textContent = `${seed.name} (from the invoice)`;
+      select.appendChild(extra);
+    }
+    const carrierInput = document.createElement("input");
+    carrierInput.className = "input charge-line-carrier";
+    carrierInput.type = "number";
+    carrierInput.min = "0";
+    carrierInput.step = "0.01";
+    carrierInput.placeholder = "Carrier $";
+    if (carrier !== "") carrierInput.value = String(carrier);
+    const mode = document.createElement("select");
+    mode.className = "input charge-line-mode";
+    mode.innerHTML = `<option value="markup">% markup</option><option value="flat">Flat $</option>`;
+    const value = document.createElement("input");
+    value.className = "input charge-line-value";
+    value.type = "number";
+    value.min = "0";
+    value.step = "0.01";
+    value.placeholder = "20 or 75.00";
+    row.appendChild(select);
+    row.appendChild(carrierInput);
+    row.appendChild(mode);
+    row.appendChild(value);
     list.appendChild(row);
   }
 
   function readChargeLines(form) {
     const lines = [];
     form.querySelectorAll(".charge-line").forEach((row) => {
-      const name = row.querySelector(".charge-line-name").value.trim();
+      const select = row.querySelector(".charge-line-name");
+      const opt = select && select.options[select.selectedIndex];
+      const name = opt && opt.dataset.name ? opt.dataset.name.trim() : "";
       if (!name) return;
+      const code = select.value || null;
       const carrierAmount = Number(row.querySelector(".charge-line-carrier").value);
       const mode = row.querySelector(".charge-line-mode").value;
       const val = Number(row.querySelector(".charge-line-value").value);
       if (mode === "flat") {
         if (!(val > 0)) return;
         lines.push({
-          name, carrierAmount: carrierAmount || 0, pricingMode: "flat",
+          name, code, carrierAmount: carrierAmount || 0, pricingMode: "flat",
           flatAmount: val, amount: val,
         });
         return;
@@ -732,7 +803,7 @@
       if (!(carrierAmount > 0) || !(val >= 0)) return;
       const amount = Math.round(carrierAmount * (1 + val / 100) * 100) / 100;
       lines.push({
-        name, carrierAmount, pricingMode: "markup",
+        name, code, carrierAmount, pricingMode: "markup",
         markupPct: val, amount,
       });
     });
@@ -741,7 +812,7 @@
 
   function chargeLinesForm(opt, allowEmpty) {
     return `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
-      `<p>Percent markup on the carrier cost, or a flat customer amount. Add a line for an accessorial that was missed.</p>` +
+      `<p>Pick each accessorial from the Primus list. Add accessorial for a charge Jerry did not list. Then enter a percent markup or a flat customer amount.</p>` +
       `<div class="charge-line-list"></div>` +
       `<button type="button" class="btn btn-sm btn-outline charge-add-line">+ Add accessorial</button>` +
       `<div class="row-actions">` +
@@ -749,7 +820,7 @@
       `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
   }
 
-  function openChargeForm(btn) {
+  async function openChargeForm(btn) {
     const opt = btn.dataset.chargeOpt;
     const invoiceId = btn.dataset.invoice;
     const taskId = btn.dataset.taskId;
@@ -764,9 +835,23 @@
       form.innerHTML = chargeLinesForm(opt, false);
     }
     const list = form.querySelector(".charge-line-list");
-    addChargeLine(list, {});
+    list.textContent = "Loading the Primus list…";
+    let choices = [];
+    try {
+      choices = await loadAccessorialChoices();
+    } catch (error) {
+      showError(error.message || "Could not load the Primus accessorial list.");
+    }
+    const listed = Array.isArray(drawerItem && drawerItem.charges) ?
+      drawerItem.charges : [];
+    list.textContent = "";
+    const seeds = listed.length ? listed.map((charge) => ({
+      name: charge.label || charge.name || charge.description || "",
+      carrierAmount: Number(charge.amount) || 0,
+    })) : [{}];
+    seeds.forEach((seed) => addChargeLine(list, seed, choices));
     form.querySelector(".charge-add-line").addEventListener("click", () => {
-      addChargeLine(list, {});
+      addChargeLine(list, {}, choices);
     });
     form.querySelector(".charge-cancel").addEventListener("click", () => {
       form.hidden = true;
