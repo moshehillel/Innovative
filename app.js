@@ -272,14 +272,11 @@
 
   function switchTab(tab) {
     activeTab = tab;
-    if (tab === "dispute") chargePhase = "dispute";
-    else if (tab === "tasks") chargePhase = null;
     els.tabBtns.forEach((btn) => {
       const on = btn.dataset.tab === tab;
       btn.classList.toggle("is-active", on);
       btn.setAttribute("aria-selected", on ? "true" : "false");
     });
-    const showTasks = tab === "tasks" || tab === "dispute";
     const panels = {
       tasks: els.tabPanelTasks,
       invoices: els.tabPanelInvoices,
@@ -288,32 +285,17 @@
     Object.keys(panels).forEach((key) => {
       const panel = panels[key];
       if (!panel) return;
-      const on = key === "tasks" ? showTasks : key === tab;
+      const on = key === tab;
       panel.hidden = !on;
       panel.classList.toggle("is-active", on);
     });
-    const issueNav = document.getElementById("issueFilters");
-    const peopleNav = document.getElementById("peopleFilters");
-    if (issueNav) issueNav.hidden = tab === "dispute";
-    if (peopleNav) peopleNav.hidden = tab === "dispute";
-    if (els.refreshTasksBtn) {
-      els.refreshTasksBtn.hidden = tab !== "tasks" && tab !== "dispute";
-    }
+    if (els.refreshTasksBtn) els.refreshTasksBtn.hidden = tab !== "tasks";
     if (els.refreshInvoicesBtn) els.refreshInvoicesBtn.hidden = tab !== "invoices";
     if (els.refreshNotifsBtn) els.refreshNotifsBtn.hidden = tab !== "notifications";
   }
 
   els.tabBtns.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const tab = btn.dataset.tab;
-      const prev = activeTab;
-      switchTab(tab);
-      if ((tab === "tasks" || tab === "dispute") && tab !== prev) {
-        loadTasks({reset: true});
-      } else if (tab === "notifications" && tab !== prev) {
-        loadNotifications({reset: true});
-      }
-    });
+    btn.addEventListener("click", () => switchTab(btn.dataset.tab));
   });
 
   /* —— Mail status —— */
@@ -1241,10 +1223,9 @@
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
         view: "queue",
-        issue: chargePhase === "dispute" ? "all" : (issueFilter || "all"),
+        issue: issueFilter || "all",
         sort,
       });
-      if (chargePhase === "dispute") params.set("chargePhase", "dispute");
       const q = String(els.workspaceSearch?.value || "").trim();
       const loadSearch = /^\d{5,}$/.test(q);
       if (!loadSearch) {
@@ -1256,14 +1237,8 @@
       if (q) params.set("q", q);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
       if (seq !== taskLoadSeq) return;
-      if (chargePhase === "dispute") {
-        disputeCount = data.disputeCount != null ?
-          data.disputeCount : (data.openCount || 0);
-      } else {
-        openTaskCount = data.openCount || 0;
-        disputeCount = data.disputeCount != null ?
-          data.disputeCount : disputeCount;
-      }
+      openTaskCount = data.openCount || 0;
+      disputeCount = data.disputeCount != null ? data.disputeCount : disputeCount;
       bucketCounts = data.bucketCounts || bucketCounts;
       dispatchers = data.dispatchers || [];
       renderFolderCounts();
@@ -1757,14 +1732,13 @@
   els.workspaceSearch?.addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
-      if (activeTab === "tasks" || activeTab === "dispute") {
-        loadTasks({reset: true});
-      } else if (activeTab === "notifications") loadNotifications({reset: true});
+      if (activeTab === "tasks") loadTasks({reset: true});
+      else if (activeTab === "notifications") loadNotifications({reset: true});
       else paintInvoices(clientFilterSort(invoicesCache));
     }, 300);
   });
   els.workspaceSort?.addEventListener("change", () => {
-    if (activeTab === "tasks" || activeTab === "dispute") {
+    if (activeTab === "tasks") {
       loadTasks({reset: true});
       return;
     }
