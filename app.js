@@ -272,11 +272,14 @@
 
   function switchTab(tab) {
     activeTab = tab;
+    if (tab === "dispute") chargePhase = "dispute";
+    else if (tab === "tasks") chargePhase = null;
     els.tabBtns.forEach((btn) => {
       const on = btn.dataset.tab === tab;
       btn.classList.toggle("is-active", on);
       btn.setAttribute("aria-selected", on ? "true" : "false");
     });
+    const showTasks = tab === "tasks" || tab === "dispute";
     const panels = {
       tasks: els.tabPanelTasks,
       invoices: els.tabPanelInvoices,
@@ -285,17 +288,32 @@
     Object.keys(panels).forEach((key) => {
       const panel = panels[key];
       if (!panel) return;
-      const on = key === tab;
+      const on = key === "tasks" ? showTasks : key === tab;
       panel.hidden = !on;
       panel.classList.toggle("is-active", on);
     });
-    if (els.refreshTasksBtn) els.refreshTasksBtn.hidden = tab !== "tasks";
+    const issueNav = document.getElementById("issueFilters");
+    const peopleNav = document.getElementById("peopleFilters");
+    if (issueNav) issueNav.hidden = tab === "dispute";
+    if (peopleNav) peopleNav.hidden = tab === "dispute";
+    if (els.refreshTasksBtn) {
+      els.refreshTasksBtn.hidden = tab !== "tasks" && tab !== "dispute";
+    }
     if (els.refreshInvoicesBtn) els.refreshInvoicesBtn.hidden = tab !== "invoices";
     if (els.refreshNotifsBtn) els.refreshNotifsBtn.hidden = tab !== "notifications";
   }
 
   els.tabBtns.forEach((btn) => {
-    btn.addEventListener("click", () => switchTab(btn.dataset.tab));
+    btn.addEventListener("click", () => {
+      const tab = btn.dataset.tab;
+      const prev = activeTab;
+      switchTab(tab);
+      if ((tab === "tasks" || tab === "dispute") && tab !== prev) {
+        loadTasks({reset: true});
+      } else if (tab === "notifications" && tab !== prev) {
+        loadNotifications({reset: true});
+      }
+    });
   });
 
   /* —— Mail status —— */
@@ -385,10 +403,59 @@
     els.drawer.setAttribute("aria-hidden", "false");
     const frame = els.drawerBody.querySelector(".notif-body-frame");
     if (frame && item) {
-      const html = emailBodyAsHtml(item.body || item.description || "");
-      if (html) frame.srcdoc = frameDoc(html);
+      const html = emailBodyAsHtml(item.body || "");
+      if (html) {
+        frame.srcdoc = frameDoc(html);
+      } else if (kind === "task" || kind === "notif") {
+        frame.srcdoc = frameDoc(
+            "<p style=\"color:#5c6b76\">Loading email…</p>");
+        loadRowDetail(item, kind).then(() => {
+          if (drawerItem !== item) return;
+          const loaded = emailBodyAsHtml(item.body || item.description || "");
+          frame.srcdoc = loaded ? frameDoc(loaded) : "";
+        });
+      } else {
+        const fallback = emailBodyAsHtml(item.description || "");
+        if (fallback) frame.srcdoc = frameDoc(fallback);
+      }
     }
     bindDrawerActions();
+  }
+
+  function loadRowDetail(item, kind) {
+    if (!item || item._detailLoaded) return Promise.resolve();
+    if (item._detailLoading) return item._detailLoading;
+    if (kind === "task" && (item.source === "invoice" ||
+        String(item.id || "").startsWith("invoice:"))) {
+      item._detailLoaded = true;
+      return Promise.resolve();
+    }
+    item._detailLoading = (async () => {
+      try {
+        if (kind === "notif") {
+          const data = await fetchJson(
+              `/getDashboardNotifications?detail=1&id=${encodeURIComponent(item.id)}`);
+          if (data && data.body) item.body = data.body;
+        } else {
+          const params = new URLSearchParams({
+            detail: "1",
+            id: item.id,
+            source: item.source || "dashboardTasks",
+          });
+          const data = await fetchJson(`/getDashboardTasks?${params}`);
+          if (data && data.body) item.body = data.body;
+          if (data && Array.isArray(data.charges) && data.charges.length) {
+            item.charges = data.charges;
+          }
+        }
+      } catch (error) {
+        console.error("row detail failed:", error);
+      } finally {
+        item._detailLoaded = true;
+        item._detailLoading = null;
+      }
+    })();
+    return item._detailLoading;
   }
 
   document.querySelectorAll("[data-drawer-close]").forEach((el) => {
@@ -836,6 +903,9 @@
     }
     const list = form.querySelector(".charge-line-list");
     list.textContent = "Loading the Primus list…";
+    if (drawerItem && !drawerItem._detailLoaded) {
+      await loadRowDetail(drawerItem, "task");
+    }
     let choices = [];
     try {
       choices = await loadAccessorialChoices();
@@ -1171,9 +1241,10 @@
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
         view: "queue",
-        issue: issueFilter || "all",
+        issue: chargePhase === "dispute" ? "all" : (issueFilter || "all"),
         sort,
       });
+      if (chargePhase === "dispute") params.set("chargePhase", "dispute");
       const q = String(els.workspaceSearch?.value || "").trim();
       const loadSearch = /^\d{5,}$/.test(q);
       if (!loadSearch) {
@@ -1185,8 +1256,14 @@
       if (q) params.set("q", q);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
       if (seq !== taskLoadSeq) return;
-      openTaskCount = data.openCount || 0;
-      disputeCount = data.disputeCount != null ? data.disputeCount : disputeCount;
+      if (chargePhase === "dispute") {
+        disputeCount = data.disputeCount != null ?
+          data.disputeCount : (data.openCount || 0);
+      } else {
+        openTaskCount = data.openCount || 0;
+        disputeCount = data.disputeCount != null ?
+          data.disputeCount : disputeCount;
+      }
       bucketCounts = data.bucketCounts || bucketCounts;
       dispatchers = data.dispatchers || [];
       renderFolderCounts();
@@ -1680,13 +1757,14 @@
   els.workspaceSearch?.addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
-      if (activeTab === "tasks") loadTasks({reset: true});
-      else if (activeTab === "notifications") loadNotifications({reset: true});
+      if (activeTab === "tasks" || activeTab === "dispute") {
+        loadTasks({reset: true});
+      } else if (activeTab === "notifications") loadNotifications({reset: true});
       else paintInvoices(clientFilterSort(invoicesCache));
     }, 300);
   });
   els.workspaceSort?.addEventListener("change", () => {
-    if (activeTab === "tasks") {
+    if (activeTab === "tasks" || activeTab === "dispute") {
       loadTasks({reset: true});
       return;
     }
