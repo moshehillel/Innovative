@@ -1168,23 +1168,21 @@
           ).join("") + `</span>` : `<span class="charge-opt-row"></span>`;
         rows += `<article class="work-row ${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
           <div class="work-line">
+            ${chargeBtns}
             <button type="button" class="work-summary" aria-expanded="false">
               <span class="work-load">${task.loadNumber ? bodyEsc(task.loadNumber) : "—"}</span>
               <span class="work-issue">${bodyEsc(issue)}</span>
               <span class="work-person">${bodyEsc(shortText(person, 22))}</span>
               <span class="work-status">${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">OLD</span>' : ""}</span>
             </button>
-            <div class="work-actions">
-              ${chargeBtns}
-              <span class="row-side-actions">
-                <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
-                <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
-                <select class="input input-select row-assign" aria-label="Assign">
-                  <option value="">Assign</option>
-                  ${assignOptions}
-                </select>
-              </span>
-            </div>
+            <span class="row-side-actions">
+              <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
+              <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
+              <select class="input input-select row-assign" aria-label="Assign">
+                <option value="">Assign</option>
+                ${assignOptions}
+              </select>
+            </span>
           </div>
           <div class="work-detail" hidden>
             <div><span>Carrier</span>${bodyEsc(task.carrierName || "—")}</div>

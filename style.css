@@ -421,7 +421,7 @@ body::before {
   align-items: center;
 }
 .work-head {
-  padding: 8px 428px 8px 14px;
+  padding: 8px 220px 8px 168px;
   font-size: 11px;
   font-weight: 700;
   letter-spacing: .04em;
@@ -438,11 +438,13 @@ body::before {
 .work-row.is-high-dollar { background: #fffaf0; }
 .work-line {
   display: flex;
-  flex-wrap: nowrap;
+  flex-flow: row nowrap;
   align-items: center;
-  gap: 12px;
-  min-height: 42px;
-  padding: 0 10px 0 4px;
+  gap: 8px;
+  min-height: 40px;
+  max-height: 44px;
+  padding: 0 8px;
+  overflow: hidden;
 }
 .work-summary {
   flex: 1 1 auto;
