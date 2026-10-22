@@ -433,7 +433,8 @@ const TASK_LIST_FIELDS = [
 
 /** Follow-up fields for list/merge. Excludes emailHtml. */
 const CHARGE_LIST_FIELDS = [
-  "tenantId", "status", "chargePhase", "notes", "emailSubject", "emailTo",
+  "tenantId", "status", "chargePhase", "decision", "notes",
+  "emailSubject", "emailTo",
   "emailCc", "loadNumber", "carrierName", "messageId", "invoiceId",
   "category", "chargesTotal", "invoiceAmount", "ownerBucket",
   "awaitingReplyFrom", "dispatcherEmail", "dispatcherName", "dispatcherKey",
@@ -698,7 +699,8 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     if (!ownership.sameTenant(d.tenantId, tenantId)) return;
     const isDispute = d.status ===
       additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
-      d.chargePhase === "dispute";
+      d.chargePhase === "dispute" ||
+      String(d.decision || "").toLowerCase() === "d";
     tasks.push({
       id: doc.id,
       source: "additionalCharges",
@@ -731,6 +733,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       dispatcherKey: d.dispatcherKey || null,
       chargePhase: isDispute ? "dispute" : (d.chargePhase || null),
       followUpStatus: d.status || null,
+      decision: d.decision || null,
       ownershipHistory: Array.isArray(d.ownershipHistory) ?
         d.ownershipHistory : [],
       ...mailFiles.serializeMailFields({
@@ -751,6 +754,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     const d = fuDoc.data() || {};
     if (!ownership.sameTenant(d.tenantId, tenantId)) continue;
     task.followUpStatus = d.status || task.followUpStatus || null;
+    if (d.decision) task.decision = d.decision;
     if (d.status === additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
         d.chargePhase === "dispute" || task.chargePhase === "dispute") {
       task.chargePhase = "dispute";
@@ -766,16 +770,16 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   const chargePhase = String(opts.chargePhase || "").toLowerCase();
   let working = visibleTasks;
   if (chargePhase === "dispute") {
-    working = visibleTasks.filter((t) => t.chargePhase === "dispute");
+    working = visibleTasks.filter((t) => scope.isOptionDDispute(t));
   } else if (chargePhase === "all") {
     working = visibleTasks;
   } else if (chargePhase === "open" || !chargePhase) {
-    // Default task folders hide items already in dispute.
-    working = visibleTasks.filter((t) => t.chargePhase !== "dispute");
+    // Work folders hide option D only. Other open tasks stay.
+    working = visibleTasks.filter((t) => !scope.isOptionDDispute(t));
   }
 
   const disputeCount = visibleTasks.filter((t) =>
-    t.chargePhase === "dispute").length;
+    scope.isOptionDDispute(t)).length;
 
   if (opts.unpaged) {
     return {
@@ -1642,7 +1646,8 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
       seen.add(doc.id);
       const isDispute = d.status ===
         additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
-        d.chargePhase === "dispute";
+        d.chargePhase === "dispute" ||
+        String(d.decision || "").toLowerCase() === "d";
       tasks.push({
         id: doc.id,
         source: "additionalCharges",
@@ -1665,6 +1670,8 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
         dispatcherName: d.dispatcherName || null,
         dispatcherKey: d.dispatcherKey || null,
         chargePhase: isDispute ? "dispute" : (d.chargePhase || null),
+        followUpStatus: d.status || null,
+        decision: d.decision || null,
         createdAt: d.createdAt && d.createdAt.toDate ?
           d.createdAt.toDate().toISOString() : null,
       });

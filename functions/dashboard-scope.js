@@ -183,6 +183,38 @@ function isIssueDismissed(row, issue) {
 }
 
 /**
+ * Additional-charge task or follow-up row.
+ * @param {object} row Queue row.
+ * @return {boolean}
+ */
+function isAdditionalChargeRow(row) {
+  const type = String((row && row.type) || "").toLowerCase();
+  const source = String((row && row.source) || "");
+  return type === "additional_charge" ||
+    source === "additionalCharges";
+}
+
+/**
+ * Option D only: additional charge decided as a dispute.
+ * Missing rate, missing POD, and every other type stay off
+ * this list even if they were stamped chargePhase dispute.
+ * @param {object} row Queue row.
+ * @return {boolean}
+ */
+function isOptionDDispute(row) {
+  if (!isAdditionalChargeRow(row)) return false;
+  const phase = String(row.chargePhase || "").toLowerCase();
+  const follow = String(row.followUpStatus || "").toLowerCase();
+  const decision = String(row.decision || "").toLowerCase();
+  const status = String(row.status || "").toLowerCase();
+  if (decision === "d") return true;
+  if (phase === "dispute") return true;
+  if (follow === "disputing" || follow === "disputed") return true;
+  if (status === "disputed" || status === "disputing") return true;
+  return false;
+}
+
+/**
  * @param {object} item Row.
  * @param {string} query Name, email, or dispatcher key. Blank matches all.
  * @return {boolean}
@@ -354,6 +386,8 @@ module.exports = {
   issueLabel,
   dismissedIssueList,
   isIssueDismissed,
+  isAdditionalChargeRow,
+  isOptionDDispute,
   dispatcherMatches,
   queueDedupeKey,
   mergeQueueItems,

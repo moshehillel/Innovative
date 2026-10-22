@@ -248,7 +248,7 @@ async function listOperationalQueue(db, deps, opts) {
     listedPromise = deps.dashboardTasks.searchOpenByLoadNumber(
         db, deps.additionalCharges, {tenantId, q}).then((listed) => {
       listed.disputeCount = (listed.tasks || []).filter((t) =>
-        t.chargePhase === "dispute").length;
+        scope.isOptionDDispute(t)).length;
       return listed;
     });
   } else {
@@ -285,12 +285,13 @@ async function listOperationalQueue(db, deps, opts) {
     });
   }
   const phase = String(opts.chargePhase || "").toLowerCase();
-  const disputeRows = merged.filter((row) => row.chargePhase === "dispute");
+  const disputeRows = merged.filter((row) =>
+    scope.isOptionDDispute(row));
   const disputeCount = disputeRows.length;
   if (phase === "dispute") {
     merged = disputeRows;
   } else {
-    merged = merged.filter((row) => row.chargePhase !== "dispute");
+    merged = merged.filter((row) => !scope.isOptionDDispute(row));
     const issue = String(opts.issue || "all").toLowerCase();
     if (issue && issue !== "all") {
       merged = merged.filter((row) => row.issueType === issue);
