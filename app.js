@@ -469,6 +469,21 @@
         .join("")}</dl>`;
   }
 
+  function isOptionDDispute(task) {
+    const type = String((task && task.type) || "").toLowerCase();
+    const source = String((task && task.source) || "");
+    if (type !== "additional_charge" && source !== "additionalCharges") {
+      return false;
+    }
+    const phase = String(task.chargePhase || "").toLowerCase();
+    const follow = String(task.followUpStatus || "").toLowerCase();
+    const decision = String(task.decision || "").toLowerCase();
+    const status = String(task.status || "").toLowerCase();
+    return decision === "d" || phase === "dispute" ||
+      follow === "disputing" || follow === "disputed" ||
+      status === "disputed" || status === "disputing";
+  }
+
   function taskTypeMeta(task) {
     const t = String(task.type || "");
     const reason = String(task.reason || "").toLowerCase();
@@ -1054,7 +1069,7 @@
     withPreservedScroll(() => {
       tasksCache = tasksCache.filter((t) => t.id !== task.id);
       openTaskCount = Math.max(0, openTaskCount - 1);
-      if (task.chargePhase === "dispute" || chargePhase === "dispute") {
+      if (isOptionDDispute(task)) {
         disputeCount = Math.max(0, disputeCount - 1);
       } else if (task.ownerBucket && bucketCounts[task.ownerBucket]) {
         const b = bucketCounts[task.ownerBucket];
@@ -1157,7 +1172,7 @@
         const high = Number(task.chargesTotal) >= HIGH_DOLLAR;
         const urgent = Boolean(task.isUrgentOld || task.ageLabel);
         const person = task.dispatcherName || task.dispatcherEmail || "—";
-        const statusLabel = task.chargePhase === "dispute" ?
+        const statusLabel = isOptionDDispute(task) ?
           "In dispute" : (task.issueLabel || task.ownerBucket || "Open");
         const issue = meta.label || task.issueLabel || "—";
         const logged = receivedInfo(task);
@@ -1304,7 +1319,12 @@
       bucketCounts = data.bucketCounts || bucketCounts;
       dispatchers = data.dispatchers || [];
       renderFolderCounts();
-      const page = data.tasks || [];
+      let page = data.tasks || [];
+      if (chargePhase === "dispute") {
+        page = page.filter(isOptionDDispute);
+      } else {
+        page = page.filter((task) => !isOptionDDispute(task));
+      }
       taskHasMore = Boolean(data.hasMore);
       taskOffset = data.nextOffset != null ? data.nextOffset : taskOffset + page.length;
       const scrollEl = getTasksScrollEl();
