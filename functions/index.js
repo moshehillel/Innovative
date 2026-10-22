@@ -13164,62 +13164,30 @@ exports.getDashboardTasks = onRequest(
   if (applyDashboardCors(req, res)) return;
   try {
     const tenant = await resolveDashboardTenant(req);
-    const limit = Math.min(Number(req.query.limit || 50), 100);
-    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
-    const searchQ = String(req.query.q || "").trim();
-    if (String(req.query.view || "") === "queue") {
-      if ((!req.query.offset || Number(req.query.offset) === 0) &&
-          !searchQ) {
-        const primusUiBridgeLocal = require("./primus-ui-bridge");
-        dashboardTasks.ensureMissingRateDispatchTasks(
-            db, tcol(tenant, "invoices"), {
-              tenantId: tenant.tenantId,
-              collectionPrefix: tenant.collectionPrefix,
-              resolveDispatcher: tenant.tms === "primus" ? async (inv) => {
-                const found = await primusUiBridgeLocal.resolveDispatcherEmail({
-                  loadNumber: inv && inv.loadNumber,
-                  fetchBooking: fetchPrimusBooking,
-                });
-                if (!found || !found.ok || !found.email) return null;
-                return {
-                  email: found.email,
-                  name: found.displayName || found.userName || null,
-                };
-              } : null,
-            }).catch((err) => {
-          console.error("[ensureMissingRateDispatchTasks]", err.message);
+    if (String(req.query.detail || "") === "1") {
+      const detail = await dashboardTasks.loadItemDetail(
+          db, additionalCharges, {
+            tenantId: tenant.tenantId,
+            id: req.query.id,
+            source: req.query.source || "dashboardTasks",
+          });
+      if (!detail.ok) {
+        return res.status(404).json({
+          ok: false,
+          error: detail.error || "Not found.",
         });
       }
-      const queued = await dashboardQueue.listOperationalQueue(db, {
-        tenant,
-        tcol,
-        dashboardTasks,
-        additionalCharges,
-      }, {
-        issue: req.query.issue || "all",
-        dispatcher: req.query.dispatcher || "",
-        q: searchQ,
-        limit,
-        offset,
-        sort: req.query.sort || "",
-        urgentFirst: req.query.urgentFirst !== "0",
-      });
       return res.json({
         ok: true,
         tenantId: tenant.tenantId,
-        tasks: queued.tasks,
-        openCount: queued.openCount,
-        filteredCount: queued.filteredCount,
-        hasMore: queued.hasMore,
-        nextOffset: queued.nextOffset,
-        offset: queued.offset,
-        limit: queued.limit,
-        bucketCounts: queued.bucketCounts,
-        dispatchers: queued.dispatchers,
-        disputeCount: queued.disputeCount || 0,
+        body: detail.body || null,
+        charges: detail.charges || [],
       });
     }
-    if (!req.query.chargePhase) {
+    const limit = Math.min(Number(req.query.limit || 50), 100);
+    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    const searchQ = String(req.query.q || "").trim();
+    const ensureMissingRates = () => {
       const primusUiBridgeLocal = require("./primus-ui-bridge");
       dashboardTasks.ensureMissingRateDispatchTasks(
           db, tcol(tenant, "invoices"), {
@@ -13235,9 +13203,43 @@ exports.getDashboardTasks = onRequest(
                 email: found.email,
                 name: found.displayName || found.userName || null,
               };
-              } : null,
-            }).catch((err) => {
+            } : null,
+          }).catch((err) => {
         console.error("[ensureMissingRateDispatchTasks]", err.message);
+      });
+    };
+    if (String(req.query.view || "") === "queue") {
+      const queued = await dashboardQueue.listOperationalQueue(db, {
+        tenant,
+        tcol,
+        dashboardTasks,
+        additionalCharges,
+      }, {
+        issue: req.query.issue || "all",
+        chargePhase: req.query.chargePhase || "",
+        dispatcher: req.query.dispatcher || "",
+        q: searchQ,
+        limit,
+        offset,
+        sort: req.query.sort || "",
+        urgentFirst: req.query.urgentFirst !== "0",
+      });
+      if ((!req.query.offset || Number(req.query.offset) === 0) && !searchQ) {
+        ensureMissingRates();
+      }
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        tasks: queued.tasks,
+        openCount: queued.openCount,
+        filteredCount: queued.filteredCount,
+        hasMore: queued.hasMore,
+        nextOffset: queued.nextOffset,
+        offset: queued.offset,
+        limit: queued.limit,
+        bucketCounts: queued.bucketCounts,
+        dispatchers: queued.dispatchers,
+        disputeCount: queued.disputeCount || 0,
       });
     }
     const result = await dashboardTasks.listDashboardTasks(
@@ -13254,6 +13256,7 @@ exports.getDashboardTasks = onRequest(
           backfillMail: (items) =>
             backfillDashboardMail(items, tenant, "task"),
         });
+    if (!req.query.chargePhase) ensureMissingRates();
     return res.json({
       ok: true,
       tenantId: tenant.tenantId,

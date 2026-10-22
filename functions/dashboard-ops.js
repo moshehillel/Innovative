@@ -30,6 +30,23 @@ const NOTIF_STATUS = Object.freeze({
   ACTED: "acted",
 });
 
+/** List fields. Email HTML is loaded when a notification is opened. */
+const NOTIF_LIST_FIELDS = [
+  "tenantId", "type", "status", "title", "subject", "from", "to", "cc",
+  "messageId", "invoiceId", "followUpId", "loadNumber", "proNumber",
+  "carrierName", "department", "reason", "emailType", "chargesTotal",
+  "emailSent", "ownerBucket", "awaitingReplyFrom", "dispatcherEmail",
+  "dispatcherName", "dispatcherKey", "ownershipHistory", "receivedAt",
+  "receivedAtSource", "emailReceivedAt", "attachments", "mailboxLookupAt",
+  "createdAt", "dismissedAt", "flaggedAt", "flagNote",
+];
+
+const FOLLOW_LIST_FIELDS = [
+  "tenantId", "emailSubject", "emailTo", "emailCc", "dispatcherEmail",
+  "dispatcherName", "ownerBucket", "receivedAt", "emailReceivedAt",
+  "receivedAtSource", "attachments",
+];
+
 /**
  * @return {boolean} True when dashboard is the primary ops surface.
  */
@@ -316,6 +333,106 @@ function enrichUnhandledNotifBody(n) {
 }
 
 /**
+ * Copies routing fields from follow-ups. Does not read email HTML.
+ * @param {object} db Firestore.
+ * @param {object[]} notifications Open notifications.
+ * @param {object|null} additionalChargesMod Follow-up module.
+ * @param {string} tenantId Tenant.
+ * @return {Promise<void>}
+ */
+async function enrichChargeNotificationFields(
+    db, notifications, additionalChargesMod, tenantId) {
+  if (!additionalChargesMod) return;
+  const need = (notifications || []).filter((n) =>
+    n && n.type === NOTIF_TYPE.ADDITIONAL_CHARGE && n.followUpId &&
+    (!n.subject || !n.to || !n.receivedAt || !n.dispatcherEmail ||
+      !Array.isArray(n.attachments)));
+  if (!need.length) return;
+  const ids = [...new Set(need.map((n) => n.followUpId))];
+  const map = new Map();
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += 10) chunks.push(ids.slice(i, i + 10));
+  try {
+    const concurrency = 8;
+    for (let i = 0; i < chunks.length; i += concurrency) {
+      const batch = chunks.slice(i, i + concurrency);
+      // eslint-disable-next-line no-await-in-loop
+      const snaps = await Promise.all(batch.map((chunk) =>
+        db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+            .where(admin.firestore.FieldPath.documentId(), "in", chunk)
+            .select(...FOLLOW_LIST_FIELDS)
+            .get()));
+      snaps.forEach((snap) => {
+        snap.forEach((doc) => map.set(doc.id, doc.data() || {}));
+      });
+    }
+  } catch (err) {
+    console.error("[listNotifications] charge enrich:", err.message);
+    return;
+  }
+  for (const n of need) {
+    const data = map.get(n.followUpId);
+    if (!data || !ownership.sameTenant(data.tenantId, n.tenantId || tenantId)) {
+      continue;
+    }
+    n.subject = n.subject || data.emailSubject || null;
+    n.to = n.to || data.emailTo || null;
+    n.cc = n.cc || data.emailCc || null;
+    n.dispatcherEmail = n.dispatcherEmail || data.dispatcherEmail || null;
+    n.dispatcherName = n.dispatcherName || data.dispatcherName || null;
+    n.ownerBucket = n.ownerBucket || data.ownerBucket || null;
+    if (!n.receivedAt) {
+      const iso = mailFiles.toIso(data.receivedAt || data.emailReceivedAt);
+      if (iso) {
+        n.receivedAt = iso;
+        n.receivedAtSource = data.receivedAtSource || "mailbox";
+      }
+    }
+    if (!Array.isArray(n.attachments) && Array.isArray(data.attachments)) {
+      n.attachments = mailFiles.publicAttachments(data.attachments);
+    }
+  }
+}
+
+/**
+ * Email HTML for one notification. Other tenants get not-found.
+ * @param {object} db Firestore.
+ * @param {object} opts id, tenantId, additionalChargesMod.
+ * @return {Promise<object>}
+ */
+async function loadNotificationDetail(db, opts) {
+  const id = String((opts && opts.id) || "").trim();
+  const tenantId = String((opts && opts.tenantId) || "default");
+  if (!id) return {ok: false, error: "Not found."};
+  const snap = await db.collection(NOTIF_COLLECTION).doc(id).get();
+  if (!snap.exists) return {ok: false, error: "Not found."};
+  const data = snap.data() || {};
+  if (!ownership.sameTenant(data.tenantId, tenantId)) {
+    return {ok: false, error: "Not found."};
+  }
+  const n = serializeNotif(snap);
+  if (n.type === NOTIF_TYPE.UNHANDLED_EMAIL) {
+    n.body = enrichUnhandledNotifBody(n);
+  } else if (n.type === NOTIF_TYPE.ADDITIONAL_CHARGE && !n.body &&
+      n.followUpId && opts.additionalChargesMod) {
+    const follow = await db
+        .collection(opts.additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .doc(n.followUpId)
+        .get();
+    if (follow.exists) {
+      const followData = follow.data() || {};
+      if (ownership.sameTenant(followData.tenantId, tenantId) &&
+          followData.emailHtml) {
+        n.body = String(followData.emailHtml);
+      }
+    }
+  }
+  let body = n.body != null ? String(n.body) : null;
+  if (body && body.length > 120000) body = body.slice(0, 120000);
+  return {ok: true, body};
+}
+
+/**
  * Lists open notifications for a tenant.
  * @param {object} db Firestore.
  * @param {object} opts tenantId, limit, type, additionalChargesMod?
@@ -365,13 +482,15 @@ async function listNotifications(db, opts) {
   let base = db.collection(notifName)
       .where("tenantId", "==", tenantId)
       .where("status", "==", NOTIF_STATUS.OPEN)
-      .orderBy("createdAt", "desc");
+      .orderBy("createdAt", "desc")
+      .select(...NOTIF_LIST_FIELDS);
   if (opts.type) {
     base = db.collection(notifName)
         .where("tenantId", "==", tenantId)
         .where("status", "==", NOTIF_STATUS.OPEN)
         .where("type", "==", String(opts.type))
-        .orderBy("createdAt", "desc");
+        .orderBy("createdAt", "desc")
+        .select(...NOTIF_LIST_FIELDS);
   }
   const docs = await collectNotifPage(base, fetchLimit);
   const notifications = docs.map(serializeNotif)
@@ -379,47 +498,15 @@ async function listNotifications(db, opts) {
       .filter((n) => scope.isOpenNotification(n));
 
   for (const n of notifications) {
-    if (n.type === NOTIF_TYPE.UNHANDLED_EMAIL) {
-      n.body = enrichUnhandledNotifBody(n);
-      if (n.reason && n.subject &&
-          !/^\[ACTION REQUIRED\]/i.test(String(n.subject))) {
-        n.subject = `[ACTION REQUIRED] ${n.reason} — ${n.subject}`;
-      }
-      continue;
+    if (n.type !== NOTIF_TYPE.UNHANDLED_EMAIL) continue;
+    if (n.reason && n.subject &&
+        !/^\[ACTION REQUIRED\]/i.test(String(n.subject))) {
+      n.subject = `[ACTION REQUIRED] ${n.reason} — ${n.subject}`;
     }
-    if (n.type !== NOTIF_TYPE.ADDITIONAL_CHARGE || n.body) continue;
-    if (!n.followUpId || !opts.additionalChargesMod) continue;
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      const fu = await db
-          .collection(opts.additionalChargesMod.FOLLOW_UP_COLLECTION)
-          .doc(n.followUpId).get();
-      if (!fu.exists) continue;
-      const d = fu.data() || {};
-      if (!ownership.sameTenant(d.tenantId, n.tenantId || tenantId)) continue;
-      if (d.emailHtml) {
-        n.body = String(d.emailHtml);
-        n.subject = n.subject || d.emailSubject || null;
-        n.to = n.to || d.emailTo || null;
-        n.cc = n.cc || d.emailCc || null;
-      }
-      n.dispatcherEmail = n.dispatcherEmail || d.dispatcherEmail || null;
-      n.dispatcherName = n.dispatcherName || d.dispatcherName || null;
-      n.ownerBucket = n.ownerBucket || d.ownerBucket || null;
-      if (!n.receivedAt) {
-        const iso = mailFiles.toIso(d.receivedAt || d.emailReceivedAt);
-        if (iso) {
-          n.receivedAt = iso;
-          n.receivedAtSource = d.receivedAtSource || "mailbox";
-        }
-      }
-      if (!Array.isArray(n.attachments) && Array.isArray(d.attachments)) {
-        n.attachments = mailFiles.publicAttachments(d.attachments);
-      }
-    } catch (err) {
-      console.error("[listNotifications] charge enrich:", err.message);
-    }
+    n.body = null;
   }
+  await enrichChargeNotificationFields(
+      db, notifications, opts.additionalChargesMod, tenantId);
 
   if (typeof opts.backfillMail === "function") {
     await opts.backfillMail(notifications);
@@ -434,6 +521,7 @@ async function listNotifications(db, opts) {
       // eslint-disable-next-line no-await-in-loop
       const extra = await db.collection(notifName)
           .where("loadNumber", "==", value)
+          .select(...NOTIF_LIST_FIELDS)
           .limit(30)
           .get();
       extra.forEach((doc) => {
@@ -467,6 +555,9 @@ async function listNotifications(db, opts) {
     limit: opts.limit || 50,
     maxLimit: opts.maxLimit,
     urgentFirst: opts.urgentFirst,
+  });
+  page.items.forEach((item) => {
+    if (item) item.body = null;
   });
 
   return {
@@ -590,6 +681,7 @@ module.exports = {
   isDashboardOpsPrimary,
   createNotification,
   listNotifications,
+  loadNotificationDetail,
   dismissNotification,
   flagNotification,
   markActed,

@@ -455,11 +455,37 @@ function capEmailBody(value) {
 }
 
 /**
+ * Loads selected fields for document ids. Does not read email HTML.
  * @param {object} db Firestore.
  * @param {string} collectionName Collection.
  * @param {string[]} ids Document ids.
+ * @param {string[]} fields Field mask.
  * @return {Promise<Map<string, object>>}
  */
+async function loadSelectedByIds(db, collectionName, ids, fields) {
+  const unique = [...new Set((ids || []).filter(Boolean))];
+  const map = new Map();
+  if (!unique.length) return map;
+  const chunks = [];
+  for (let i = 0; i < unique.length; i += 10) {
+    chunks.push(unique.slice(i, i + 10));
+  }
+  const concurrency = 8;
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    const batch = chunks.slice(i, i + concurrency);
+    // eslint-disable-next-line no-await-in-loop
+    const snaps = await Promise.all(batch.map((chunk) =>
+      db.collection(collectionName)
+          .where(admin.firestore.FieldPath.documentId(), "in", chunk)
+          .select(...fields)
+          .get()));
+    snaps.forEach((snap) => {
+      snap.forEach((doc) => map.set(doc.id, doc.data() || {}));
+    });
+  }
+  return map;
+}
+
 async function loadDocsById(db, collectionName, ids) {
   const unique = [...new Set((ids || []).filter(Boolean))];
   const snaps = [];
@@ -598,11 +624,18 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   const fetchLimit = Math.min(
       Math.max(Number(opts.fetchLimit) || 2000, 50), 2000);
 
-  const taskDocs = await loadScopedPages(db, TASK_COLLECTION, opts, (col) =>
-    col.where("tenantId", "==", tenantId)
-        .where("status", "==", TASK_STATUS.OPEN)
-        .orderBy("createdAt", "desc")
-        .select(...TASK_LIST_FIELDS), fetchLimit);
+  const [taskDocs, chargeDocs] = await Promise.all([
+    loadScopedPages(db, TASK_COLLECTION, opts, (col) =>
+      col.where("tenantId", "==", tenantId)
+          .where("status", "==", TASK_STATUS.OPEN)
+          .orderBy("createdAt", "desc")
+          .select(...TASK_LIST_FIELDS), fetchLimit),
+    loadScopedPages(
+        db, additionalChargesMod.FOLLOW_UP_COLLECTION, opts, (col) =>
+          col.where("resolved", "==", false)
+              .orderBy("createdAt", "desc")
+              .select(...CHARGE_LIST_FIELDS), fetchLimit),
+  ]);
   const taskSnap = {docs: taskDocs};
 
   // Drop legacy human_review rows — those belong in Notifications.
@@ -612,30 +645,28 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   const linkedFollowUpIds = new Set(
       tasks.map((t) => t.followUpId).filter(Boolean),
   );
-
-  const chargeDocs = await loadScopedPages(
-      db, additionalChargesMod.FOLLOW_UP_COLLECTION, opts, (col) =>
-        col.where("resolved", "==", false)
-            .orderBy("createdAt", "desc")
-            .select(...CHARGE_LIST_FIELDS), fetchLimit);
   const chargeSnap = {docs: chargeDocs};
+  const chargeById = new Map(chargeDocs.map((doc) => [doc.id, doc]));
+  const missingFollowIds = [];
+  for (const task of tasks) {
+    if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE || !task.followUpId) continue;
+    if (!chargeById.has(task.followUpId)) {
+      missingFollowIds.push(task.followUpId);
+    }
+  }
+  if (missingFollowIds.length) {
+    const extra = await loadSelectedByIds(
+        db, additionalChargesMod.FOLLOW_UP_COLLECTION, missingFollowIds,
+        CHARGE_LIST_FIELDS);
+    extra.forEach((data, id) => {
+      chargeById.set(id, {id, data: () => data});
+    });
+  }
 
   // Copy routing fields onto linked tasks. Email HTML stays off this path.
   for (const task of tasks) {
     if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE) continue;
-    let fuDoc = task.followUpId ?
-      chargeSnap.docs.find((x) => x.id === task.followUpId) : null;
-    if (task.followUpId && !fuDoc) {
-      // eslint-disable-next-line no-await-in-loop
-      const missed = await db
-          .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
-          .where(admin.firestore.FieldPath.documentId(), "==",
-              task.followUpId)
-          .select(...CHARGE_LIST_FIELDS)
-          .limit(1)
-          .get();
-      if (!missed.empty) fuDoc = missed.docs[0];
-    }
+    const fuDoc = task.followUpId ? chargeById.get(task.followUpId) : null;
     if (fuDoc) {
       const d = fuDoc.data() || {};
       if (!ownership.sameTenant(d.tenantId, tenantId)) continue;
@@ -715,7 +746,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   // Enrich linked tasks with follow-up dispute status.
   for (const task of tasks) {
     if (task.type !== TASK_TYPE.ADDITIONAL_CHARGE || !task.followUpId) continue;
-    const fuDoc = chargeSnap.docs.find((x) => x.id === task.followUpId);
+    const fuDoc = chargeById.get(task.followUpId);
     if (!fuDoc) continue;
     const d = fuDoc.data() || {};
     if (!ownership.sameTenant(d.tenantId, tenantId)) continue;
@@ -968,29 +999,36 @@ async function followUpIdsClosedByDismissedTask(db, followUpIds, tenantId) {
   const ids = [...new Set((followUpIds || []).map((id) =>
     String(id || "").trim()).filter(Boolean))];
   const closed = new Set();
-  for (let i = 0; i < ids.length; i += 10) {
-    const chunk = ids.slice(i, i + 10);
-    let snap;
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += 10) chunks.push(ids.slice(i, i + 10));
+  const concurrency = 8;
+  for (let i = 0; i < chunks.length; i += concurrency) {
+    const batch = chunks.slice(i, i + concurrency);
+    let snaps;
     try {
       // eslint-disable-next-line no-await-in-loop
-      snap = await db.collection(TASK_COLLECTION)
-          .where("followUpId", "in", chunk)
-          .get();
+      snaps = await Promise.all(batch.map((chunk) =>
+        db.collection(TASK_COLLECTION)
+            .where("followUpId", "in", chunk)
+            .select("status", "tenantId", "followUpId")
+            .get()));
     } catch (err) {
       console.error("[dashboard-tasks] dismissed follow-ups:", err.message);
       return closed;
     }
-    const open = new Set();
-    const done = new Set();
-    snap.forEach((doc) => {
-      const row = doc.data() || {};
-      if (!ownership.sameTenant(row.tenantId, tenantId)) return;
-      const id = String(row.followUpId || "");
-      if ((row.status || "") === TASK_STATUS.OPEN) open.add(id);
-      if ((row.status || "") === TASK_STATUS.DISMISSED) done.add(id);
-    });
-    done.forEach((id) => {
-      if (!open.has(id)) closed.add(id);
+    snaps.forEach((snap) => {
+      const open = new Set();
+      const done = new Set();
+      snap.forEach((doc) => {
+        const row = doc.data() || {};
+        if (!ownership.sameTenant(row.tenantId, tenantId)) return;
+        const id = String(row.followUpId || "");
+        if ((row.status || "") === TASK_STATUS.OPEN) open.add(id);
+        if ((row.status || "") === TASK_STATUS.DISMISSED) done.add(id);
+      });
+      done.forEach((id) => {
+        if (!open.has(id)) closed.add(id);
+      });
     });
   }
   return closed;
@@ -1344,6 +1382,7 @@ async function ensureMissingRateDispatchTasks(db, invoicesCol, opts) {
     // eslint-disable-next-line no-await-in-loop
     const prior = await db.collection(TASK_COLLECTION)
         .where("invoiceId", "==", doc.id)
+        .select("status", "tenantId", "type")
         .limit(20)
         .get();
     const alreadyDismissed = prior.docs.some((taskDoc) => {
@@ -1634,6 +1673,53 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
   return {tasks};
 }
 
+/**
+ * Email HTML and charge lines for one open row. Tenant-checked.
+ * The work list does not include this payload.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object} opts id, source, tenantId.
+ * @return {Promise<object>}
+ */
+async function loadItemDetail(db, additionalChargesMod, opts) {
+  const id = String((opts && opts.id) || "").trim();
+  const source = String((opts && opts.source) || "dashboardTasks");
+  const tenantId = String((opts && opts.tenantId) || "default");
+  if (!id) return {ok: false, error: "Not found."};
+  if (source === "invoice" || id.startsWith("invoice:")) {
+    return {ok: true, body: null, charges: []};
+  }
+  const item = {id, source, followUpId: null, type: null};
+  if (source === "additionalCharges") {
+    const snap = await db
+        .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .doc(id)
+        .get();
+    if (!snap.exists) return {ok: false, error: "Not found."};
+    const data = snap.data() || {};
+    if (!ownership.sameTenant(data.tenantId, tenantId)) {
+      return {ok: false, error: "Not found."};
+    }
+    item.followUpId = id;
+    item.type = TASK_TYPE.ADDITIONAL_CHARGE;
+  } else {
+    const snap = await db.collection(TASK_COLLECTION).doc(id).get();
+    if (!snap.exists) return {ok: false, error: "Not found."};
+    const data = snap.data() || {};
+    if (!ownership.sameTenant(data.tenantId, tenantId)) {
+      return {ok: false, error: "Not found."};
+    }
+    item.followUpId = data.followUpId || null;
+    item.type = data.type || null;
+  }
+  await hydratePageBodies(db, additionalChargesMod, [item], tenantId);
+  return {
+    ok: true,
+    body: item.body || null,
+    charges: Array.isArray(item.charges) ? item.charges : [],
+  };
+}
+
 module.exports = {
   TASK_COLLECTION,
   TASK_TYPE,
@@ -1641,6 +1727,7 @@ module.exports = {
   createDashboardTask,
   listDashboardTasks,
   hydratePageBodies,
+  loadItemDetail,
   dismissDashboardTask,
   handoffTaskToDispatch,
   markTaskInDispute,

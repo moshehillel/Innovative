@@ -14,6 +14,21 @@ const HOLD_STAGES = [
   "awaiting_pod",
 ];
 
+/** Invoice fields the work list needs. Skips extracted bodies and mail HTML. */
+const INVOICE_HOLD_FIELDS = [
+  "tenantId", "finalWorkflowStatus", "decisionStage", "decisionReason",
+  "dashboardDismissedIssues", "createdAt", "loadNumber", "proNumber",
+  "carrierName", "invoiceAmount", "dispatcherEmail", "dispatcherName",
+  "emailReceivedAt", "customerRate",
+];
+
+/** Task fields used to hide rows someone already marked done. No email HTML. */
+const DISMISS_LOOKUP_FIELDS = [
+  "status", "tenantId", "invoiceId", "loadNumber", "type", "emailType",
+  "reason", "decisionReason", "decisionStage", "displayStatus",
+  "finalWorkflowStatus", "title",
+];
+
 /**
  * Issue a live invoice hold would show, before dashboard dismissal.
  * @param {object} data Invoice fields.
@@ -61,21 +76,32 @@ async function omitRowsClosedByDismissedTask(db, rows, tenantId) {
     if (load) closed.add(`load:${load}|${issue}`);
   };
   const pull = async (field, values) => {
+    const chunks = [];
     for (let i = 0; i < values.length; i += 10) {
       const chunk = values.slice(i, i + 10);
-      if (!chunk.length) continue;
+      if (chunk.length) chunks.push(chunk);
+    }
+    const concurrency = 8;
+    for (let i = 0; i < chunks.length; i += concurrency) {
+      const batch = chunks.slice(i, i + concurrency);
       // eslint-disable-next-line no-await-in-loop
-      const snap = await db.collection("dashboardTasks")
-          .where(field, "in", chunk)
-          .get();
-      snap.forEach((doc) => remember(doc.data() || {}));
+      const snaps = await Promise.all(batch.map((chunk) =>
+        db.collection("dashboardTasks")
+            .where(field, "in", chunk)
+            .select(...DISMISS_LOOKUP_FIELDS)
+            .get()));
+      snaps.forEach((snap) => {
+        snap.forEach((doc) => remember(doc.data() || {}));
+      });
     }
   };
   try {
-    await pull("invoiceId", invoiceIds);
-    await pull("loadNumber", loads);
     const numeric = loads.filter((load) => /^\d+$/.test(load)).map(Number);
-    await pull("loadNumber", numeric);
+    await Promise.all([
+      pull("invoiceId", invoiceIds),
+      pull("loadNumber", loads),
+      pull("loadNumber", numeric),
+    ]);
   } catch (err) {
     console.error("[dashboard-queue] dismissed rows:", err.message);
     return list;
@@ -153,6 +179,52 @@ function invoiceHoldRow(doc, tenantId) {
 }
 
 /**
+ * Invoice holds for the work list. Field mask only — invoice docs are large.
+ * @param {object} deps tcol.
+ * @param {object} tenant Tenant.
+ * @param {string} tenantId Tenant id.
+ * @param {string} q Search text.
+ * @param {boolean} loadSearch True when q is a load number.
+ * @param {number} fetchLimit Cap.
+ * @return {Promise<object[]>}
+ */
+async function loadInvoiceHoldRows(
+    deps, tenant, tenantId, q, loadSearch, fetchLimit) {
+  if (typeof deps.tcol !== "function") return [];
+  const rows = [];
+  try {
+    let snap;
+    if (loadSearch) {
+      const values = [q, Number(q)];
+      const docs = [];
+      for (const value of values) {
+        // eslint-disable-next-line no-await-in-loop
+        const part = await deps.tcol(tenant, "invoices")
+            .where("loadNumber", "==", value)
+            .select(...INVOICE_HOLD_FIELDS)
+            .limit(15)
+            .get();
+        docs.push(...part.docs);
+      }
+      snap = {forEach: (fn) => docs.forEach(fn)};
+    } else {
+      snap = await deps.tcol(tenant, "invoices")
+          .where("decisionStage", "in", HOLD_STAGES)
+          .select(...INVOICE_HOLD_FIELDS)
+          .limit(fetchLimit)
+          .get();
+    }
+    snap.forEach((doc) => {
+      const row = invoiceHoldRow(doc, tenantId);
+      if (row) rows.push(row);
+    });
+  } catch (err) {
+    console.error("[dashboard-queue] invoice holds:", err.message);
+  }
+  return rows;
+}
+
+/**
  * @param {object} db Firestore.
  * @param {object} deps tenant, tcol, dashboardTasks, additionalCharges.
  * @param {object} opts issue, dispatcher, limit, offset.
@@ -167,15 +239,20 @@ async function listOperationalQueue(db, deps, opts) {
   const fetchLimit = loadSearch ? 40 :
     (Number(opts.offset) > 0 ? 800 : 220);
 
-  let listed;
+  const invoicePromise = loadInvoiceHoldRows(
+      deps, tenant, tenantId, q, loadSearch, fetchLimit);
+
+  let listedPromise;
   if (loadSearch &&
       typeof deps.dashboardTasks.searchOpenByLoadNumber === "function") {
-    listed = await deps.dashboardTasks.searchOpenByLoadNumber(
-        db, deps.additionalCharges, {tenantId, q});
-    listed.disputeCount = (listed.tasks || []).filter((t) =>
-      t.chargePhase === "dispute").length;
+    listedPromise = deps.dashboardTasks.searchOpenByLoadNumber(
+        db, deps.additionalCharges, {tenantId, q}).then((listed) => {
+      listed.disputeCount = (listed.tasks || []).filter((t) =>
+        t.chargePhase === "dispute").length;
+      return listed;
+    });
   } else {
-    listed = await deps.dashboardTasks.listDashboardTasks(
+    listedPromise = deps.dashboardTasks.listDashboardTasks(
         db, deps.additionalCharges, {
           tenantId,
           collectionPrefix: tenant.collectionPrefix,
@@ -185,47 +262,17 @@ async function listOperationalQueue(db, deps, opts) {
           fetchLimit,
         });
   }
+  const [listed, invoiceRows] = await Promise.all([
+    listedPromise, invoicePromise,
+  ]);
   const tasks = (listed.tasks || []).map((task) => ({
     ...task,
     issueType: scope.classifyIssue(task),
   }));
 
-  const invoiceRows = [];
-  if (typeof deps.tcol === "function") {
-    try {
-      let snap;
-      if (loadSearch) {
-        const values = [q, Number(q)];
-        const docs = [];
-        for (const value of values) {
-          // eslint-disable-next-line no-await-in-loop
-          const part = await deps.tcol(tenant, "invoices")
-              .where("loadNumber", "==", value)
-              .limit(15)
-              .get();
-          docs.push(...part.docs);
-        }
-        snap = {forEach: (fn) => docs.forEach(fn)};
-      } else {
-        snap = await deps.tcol(tenant, "invoices")
-            .where("decisionStage", "in", HOLD_STAGES)
-            .limit(fetchLimit)
-            .get();
-      }
-      snap.forEach((doc) => {
-        const row = invoiceHoldRow(doc, tenantId);
-        if (row) invoiceRows.push(row);
-      });
-    } catch (err) {
-      console.error("[dashboard-queue] invoice holds:", err.message);
-    }
-  }
-
-  const visibleTasks = await omitRowsClosedByDismissedTask(
-      db, tasks, tenantId);
-  const visibleHolds = await omitRowsClosedByDismissedTask(
-      db, invoiceRows, tenantId);
-  let merged = scope.mergeQueueItems(visibleTasks.concat(visibleHolds))
+  const visible = await omitRowsClosedByDismissedTask(
+      db, tasks.concat(invoiceRows), tenantId);
+  let merged = scope.mergeQueueItems(visible)
       .map((row) => ownership.applyOwnerDefaults(row));
   if (q && !loadSearch) {
     const needle = q.toLowerCase();
@@ -251,10 +298,10 @@ async function listOperationalQueue(db, deps, opts) {
     sort,
     urgentFirst: opts.urgentFirst !== false,
   });
-  if (typeof deps.dashboardTasks.hydratePageBodies === "function") {
-    await deps.dashboardTasks.hydratePageBodies(
-        db, deps.additionalCharges, page.items, tenant.tenantId);
-  }
+  // Email HTML is loaded when a row is opened, not with every page.
+  page.items.forEach((item) => {
+    if (item) item.body = null;
+  });
   return {
     tasks: page.items,
     openCount: page.openCount,
