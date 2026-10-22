@@ -414,6 +414,96 @@ body::before {
 .email-attachments .att-size {
   margin-left: 8px; color: var(--ic-text-faint); font-size: 12px; font-weight: 500;
 }
+.work-head, .work-summary {
+  display: grid;
+  grid-template-columns: 88px minmax(110px, 1.3fr) minmax(88px, 1fr) minmax(88px, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+.work-head {
+  padding: 8px 428px 8px 14px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--ic-text-faint);
+  background: #fafbfc;
+  border-bottom: 1px solid var(--ic-border);
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.work-row { border-bottom: 1px solid #eef1f4; background: #fff; }
+.work-row.is-urgent { box-shadow: inset 3px 0 0 var(--ic-urgent); }
+.work-row.is-high-dollar { background: #fffaf0; }
+.work-line {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 42px;
+  padding: 0 10px 0 4px;
+}
+.work-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  padding: 8px 8px;
+}
+.work-summary span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 13px;
+}
+.work-load { font-weight: 700; color: var(--ic-brand); }
+.work-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex: 0 0 auto;
+}
+.charge-opt-row, .row-side-actions {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 4px;
+}
+.charge-opt-row .charge-opt {
+  width: 32px;
+  min-width: 32px;
+  padding: 4px 0;
+  text-align: center;
+  justify-content: center;
+}
+.row-assign {
+  width: 92px;
+  min-width: 92px;
+  height: 30px;
+  padding: 2px 6px;
+  font-size: 12px;
+}
+.work-detail {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px 16px;
+  padding: 8px 16px 12px;
+  background: #f7fafa;
+  font-size: 13px;
+}
+.work-detail span {
+  display: block;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--ic-text-faint);
+}
 .charge-opt-grid { display: grid; gap: 6px; width: 100%; }
 .charge-opt {
   text-align: left; justify-content: flex-start;

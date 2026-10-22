@@ -1145,58 +1145,78 @@
       groups.get(key).push(t);
     });
 
+    const assignOptions = OPS_PEOPLE.map((p) =>
+      `<option value="${bodyEsc(p.key)}">${bodyEsc(p.name)}</option>`).join("");
     let rows = "";
     for (const [loadKey, group] of groups) {
       if (group.length > 1 && !String(loadKey).startsWith("id:")) {
-        rows += `<tr class="group-row"><td colspan="8">Load ${bodyEsc(loadKey)} · ${group.length} related tasks</td></tr>`;
+        rows += `<div class="group-row">Load ${bodyEsc(loadKey)} · ${group.length} related</div>`;
       }
       group.forEach((task) => {
         const meta = taskTypeMeta(task);
         const high = Number(task.chargesTotal) >= HIGH_DOLLAR;
         const urgent = Boolean(task.isUrgentOld || task.ageLabel);
-        const statusLabel = task.dispatcherName || task.dispatcherEmail ||
-          (task.chargePhase === "dispute" ? "dispute" : (task.issueLabel || task.ownerBucket || "—"));
-        rows += `<tr class="${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
-          <td><span class="type-badge ${meta.cls}">${bodyEsc(meta.label)}</span></td>
-          <td>${task.loadNumber ?
-            `<a class="load-link" href="#" data-load="${bodyEsc(task.loadNumber)}">${bodyEsc(task.loadNumber)}</a>` :
-            "—"}</td>
-          <td>${bodyEsc(shortText(task.carrierName, 28) || "—")}</td>
-          <td>${bodyEsc(formatMoney(task.chargesTotal))}</td>
-          <td>${bodyEsc(shortText(task.reason || task.description, 40) || "—")}</td>
-          <td>${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">URGENT/OLD</span>' : ""}</td>
-          <td title="${bodyEsc(receivedInfo(task).title)}">${bodyEsc(receivedInfo(task).text)}</td>
-          <td class="row-actions">
-            ${taskCanResolve(task) ? `<span class="charge-opt-grid">` +
-              ["a", "b", "c", "d", "e"].map((opt) =>
-                `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}">${opt.toUpperCase()}</button>`).join("") +
-              `</span>` : ""}
-            <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
-            <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
-          </td>
-        </tr>`;
+        const person = task.dispatcherName || task.dispatcherEmail || "—";
+        const statusLabel = task.chargePhase === "dispute" ?
+          "In dispute" : (task.issueLabel || task.ownerBucket || "Open");
+        const issue = meta.label || task.issueLabel || "—";
+        const logged = receivedInfo(task);
+        const chargeBtns = taskCanResolve(task) ?
+          `<span class="charge-opt-row">` +
+          ["a", "b", "c", "d", "e"].map((opt) =>
+            `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}">${opt.toUpperCase()}</button>`,
+          ).join("") + `</span>` : `<span class="charge-opt-row"></span>`;
+        rows += `<article class="work-row ${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
+          <div class="work-line">
+            <button type="button" class="work-summary" aria-expanded="false">
+              <span class="work-load">${task.loadNumber ? bodyEsc(task.loadNumber) : "—"}</span>
+              <span class="work-issue">${bodyEsc(issue)}</span>
+              <span class="work-person">${bodyEsc(shortText(person, 22))}</span>
+              <span class="work-status">${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">OLD</span>' : ""}</span>
+            </button>
+            <div class="work-actions">
+              ${chargeBtns}
+              <span class="row-side-actions">
+                <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
+                <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
+                <select class="input input-select row-assign" aria-label="Assign">
+                  <option value="">Assign</option>
+                  ${assignOptions}
+                </select>
+              </span>
+            </div>
+          </div>
+          <div class="work-detail" hidden>
+            <div><span>Carrier</span>${bodyEsc(task.carrierName || "—")}</div>
+            <div><span>Amount</span>${bodyEsc(formatMoney(task.chargesTotal || task.invoiceAmount))}</div>
+            <div><span>Reason</span>${bodyEsc(task.reason || task.description || "—")}</div>
+            <div><span>Logged</span>${bodyEsc(logged.text)}</div>
+          </div>
+        </article>`;
       });
     }
 
     els.tasksContainer.innerHTML =
-      `<table class="data-table"><thead><tr>
-        <th>Type</th><th>Load #</th><th>Carrier</th><th>Amount</th>
-        <th>Reason</th><th>Status</th><th>Logged</th><th></th>
-      </tr></thead><tbody>${rows}</tbody></table>`;
+      `<div class="work-head"><span>Load</span><span>Issue</span><span>Person</span><span>Status</span></div>` +
+      `<div class="work-list">${rows}</div>`;
 
     const byId = new Map(list.map((t) => [t.id, t]));
-    els.tasksContainer.querySelectorAll("tbody tr[data-task-id]").forEach((tr) => {
-      const task = byId.get(tr.dataset.taskId);
+    els.tasksContainer.querySelectorAll(".work-row[data-task-id]").forEach((row) => {
+      const task = byId.get(row.dataset.taskId);
       if (!task) return;
-      tr.addEventListener("click", (e) => {
-        if (e.target.closest("a,button")) return;
-        openTaskDrawer(task);
+      row.querySelector(".work-summary")?.addEventListener("click", () => {
+        const detail = row.querySelector(".work-detail");
+        const open = detail && detail.hidden;
+        if (detail) detail.hidden = !open;
+        row.classList.toggle("is-open", Boolean(open));
+        row.querySelector(".work-summary")?.setAttribute(
+            "aria-expanded", open ? "true" : "false");
       });
-      tr.querySelector(".task-open")?.addEventListener("click", (e) => {
+      row.querySelector(".task-open")?.addEventListener("click", (e) => {
         e.stopPropagation();
         openTaskDrawer(task);
       });
-      tr.querySelectorAll(".charge-opt").forEach((btn) => {
+      row.querySelectorAll(".charge-opt").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
           btn.dataset.invoice = task.invoiceId || "";
@@ -1206,14 +1226,33 @@
           openChargeForm(btn);
         });
       });
-      tr.querySelector(".task-dismiss")?.addEventListener("click", (e) => {
+      row.querySelector(".task-dismiss")?.addEventListener("click", (e) => {
         e.stopPropagation();
         dismissTaskOptimistic(task);
       });
-      tr.querySelector(".load-link")?.addEventListener("click", (e) => {
-        e.preventDefault();
+      row.querySelector(".row-assign")?.addEventListener("change", async (e) => {
         e.stopPropagation();
-        openTaskDrawer(task);
+        const person = OPS_PEOPLE.find((p) => p.key === e.target.value);
+        if (!person) return;
+        try {
+          await postJson("/reassignDashboardWork", {
+            taskId: task.id,
+            source: task.source || "dashboardTasks",
+            bucket: "dispatch",
+            dispatcherEmail: person.email,
+            dispatcherName: person.name,
+            loadNumber: task.loadNumber,
+            invoiceId: task.invoiceId,
+            carrierName: task.carrierName,
+            subject: task.subject || task.title,
+            issue: task.issueType || task.type,
+          });
+          const who = row.querySelector(".work-person");
+          if (who) who.textContent = person.name;
+          showRunResult(`Assigned to ${person.name}.`, false);
+        } catch (error) {
+          showError(error.message || "Could not assign.");
+        }
       });
     });
   }
