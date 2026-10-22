@@ -13578,6 +13578,7 @@ exports.getDashboardTasks = onRequest(
         additionalCharges,
       }, {
         issue: req.query.issue || "all",
+        chargePhase: req.query.chargePhase || "",
         dispatcher: req.query.dispatcher || "",
         q: searchQ,
         limit,

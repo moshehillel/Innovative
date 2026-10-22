@@ -284,12 +284,20 @@ async function listOperationalQueue(db, deps, opts) {
       return hay.includes(needle);
     });
   }
-  const issue = String(opts.issue || "all").toLowerCase();
-  if (issue && issue !== "all") {
-    merged = merged.filter((row) => row.issueType === issue);
+  const phase = String(opts.chargePhase || "").toLowerCase();
+  const disputeRows = merged.filter((row) => row.chargePhase === "dispute");
+  const disputeCount = disputeRows.length;
+  if (phase === "dispute") {
+    merged = disputeRows;
+  } else {
+    merged = merged.filter((row) => row.chargePhase !== "dispute");
+    const issue = String(opts.issue || "all").toLowerCase();
+    if (issue && issue !== "all") {
+      merged = merged.filter((row) => row.issueType === issue);
+    }
+    const dispatcher = opts.dispatcher || opts.dispatcherKey || "";
+    merged = merged.filter((row) => scope.dispatcherMatches(row, dispatcher));
   }
-  const dispatcher = opts.dispatcher || opts.dispatcherKey || "";
-  merged = merged.filter((row) => scope.dispatcherMatches(row, dispatcher));
 
   const page = ownership.filterSortPaginate(merged, {
     offset: opts.offset,
@@ -312,7 +320,7 @@ async function listOperationalQueue(db, deps, opts) {
     limit: page.limit,
     bucketCounts: page.bucketCounts,
     dispatchers: page.dispatchers,
-    disputeCount: listed.disputeCount || 0,
+    disputeCount,
   };
 }
 
