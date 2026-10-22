@@ -172,13 +172,15 @@ const reminder = ac.buildDispatcherNotifyReminderEmail({
   customerRate: 545,
   customerBillLines: [{name: "Reweigh Fee", amount: 120}],
 });
-check("dispatcher reminder has ready template",
-    reminder.html.includes("Ready-to-send customer email"), true);
-check("dispatcher reminder has updated rate",
-    reminder.html.includes("$665.00"), true);
+check("dispatcher reminder uses the customer notice",
+    reminder.html.includes("We wanted to make you aware") &&
+    reminder.html.includes("Hello Miworld"), true);
+check("dispatcher reminder totals the difference",
+    reminder.html.includes("Total Additional Charges") &&
+    reminder.html.includes("$120.00"), true);
 check("dispatcher reminder subject ASCII",
     !reminder.subject.includes("\u2014") &&
-    reminder.subject.includes(" - "), true);
+    reminder.subject.includes("264172"), true);
 const forward = ac.buildDispatcherCustomerNotifyTemplate({
   loadNumber: "264172",
   customerName: "Miworld",
@@ -189,9 +191,10 @@ const forward = ac.buildDispatcherCustomerNotifyTemplate({
   newCustomerRate: 665,
 });
 check("forward template mentions load",
-    forward.html.includes("264172"), true);
-check("forward template mentions new rate",
-    forward.html.includes("$665.00"), true);
+    forward.subject.includes("264172"), true);
+check("forward template totals the difference",
+    forward.html.includes("Total Additional Charges") &&
+    forward.html.includes("$120.00"), true);
 const dispute = ac.buildDisputeEmailDraft({
   loadNumber: "264172",
   carrierName: "Central Transport",
@@ -456,11 +459,36 @@ check("customer notice uses the existing subject",
     notice.subject.indexOf("Additional charge on shipment 268358") >= 0,
     true);
 check("customer notice lists residential",
-    notice.html.indexOf("Residential Delivery") >= 0, true);
+    notice.html.indexOf("Residential delivery") >= 0, true);
 check("customer notice lists liftgate",
-    notice.html.indexOf("Liftgate at Destination") >= 0, true);
-check("customer notice keeps accessorials off the freight line",
-    notice.html.indexOf("separate from the freight") >= 0, true);
+    notice.html.indexOf("Liftgate delivery") >= 0, true);
+check("customer notice states the difference total",
+    notice.html.indexOf("Total Additional Charges") >= 0 &&
+    notice.html.indexOf("$110.50") >= 0, true);
+const differenceNotice = ac.buildCustomerChargeNotificationEmail({
+  customerName: "Example Customer",
+  loadNumber: "265647",
+  charges: [
+    {label: "Line haul", amount: 19},
+    {label: "Redelivery Fee", amount: 72.77},
+    {label: "Fuel surcharge", amount: 40},
+  ],
+  chargesTotal: 91.77,
+});
+check("difference is invoice minus Primus, not line haul",
+    differenceNotice.html.indexOf("$91.77") >= 0 &&
+    differenceNotice.html.indexOf("Redelivery Fee") >= 0 &&
+    differenceNotice.html.indexOf("Line haul") < 0, true);
+check("option B completion closes the dashboard task",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "B",
+      finalWorkflowStatus: "completed",
+    }), true);
+check("option D does not close as a finished charge",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "D",
+      finalWorkflowStatus: "completed",
+    }), false);
 check("customer additional-charge notice is delivered",
     ac.mustDeliverDespiteDashboardPark({
       type: "additional_charge_customer_notice",

@@ -582,11 +582,242 @@ async function resolveInboundDrayageSignal(args) {
   return {isDrayage: false, carrierName, vendorType, containerNumber};
 }
 
+/** Invoice vs load Total Cost. Under $5 can proceed. $5 and over stops. */
+const DRAYAGE_AMOUNT_TOLERANCE = 5;
+
+/**
+ * Flattens Outlook HTML so container numbers and GTG are tokens.
+ * Mail clients leave literal `&nbsp;`, numeric entities, and tags in the
+ * plain-text part. Those must not keep a GTG reply off the invoice path.
+ * @param {string} value Raw subject or body.
+ * @return {string}
+ */
+function decodeDrayageMarkup(value) {
+  let text = String(value || "");
+  text = text.replace(/<[^>]+>/g, " ");
+  for (let i = 0; i < 3; i++) {
+    const next = text.replace(/&amp;/gi, "&");
+    if (next === text) break;
+    text = next;
+  }
+  text = text
+      .replace(/&nbsp;|&#0*160;|&#x0*a0;/gi, " ")
+      .replace(/&lt;/gi, "<")
+      .replace(/&gt;/gi, ">")
+      .replace(/&quot;|&#0*34;/gi, "\"")
+      .replace(/&#(\d+);/g, (_, digits) => {
+        const code = Number(digits);
+        if (code === 160 || code === 32) return " ";
+        if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) {
+          return " ";
+        }
+        return String.fromCodePoint(code);
+      })
+      .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+        const code = parseInt(hex, 16);
+        if (code === 0xa0 || code === 0x20) return " ";
+        if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff) {
+          return " ";
+        }
+        return String.fromCodePoint(code);
+      })
+      .replace(/[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g, " ")
+      .replace(/[\u200B\u200C\u200D\uFEFF]/g, "");
+  return text.replace(/[ \t\r\n\f\v]+/g, " ").trim();
+}
+
+/**
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {string}
+ */
+function drayageMatchText(subject, body) {
+  return decodeDrayageMarkup(`${subject || ""}\n${body || ""}`);
+}
+
+/**
+ * Leo's reply means the load charges are entered and Jerry may invoice.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {boolean}
+ */
+function isGtgConfirmation(subject, body) {
+  const text = drayageMatchText(subject, body);
+  return /\bGTG\b/i.test(text) || /\bgood to go\b/i.test(text);
+}
+
+/**
+ * Total Cost on the load rate quote. This is the figure in the
+ * booking's Total Cost box, stored as the vendor cost once the rate is saved.
+ * @param {object|null|undefined} booking Primus booking.
+ * @return {number|null}
+ */
+function readDrayageTotalCost(booking) {
+  if (!booking) return null;
+  const vendor = booking.vendor || {};
+  const raw = vendor.cost != null && String(vendor.cost).trim() !== "" ?
+    vendor.cost :
+    (booking.totalCost != null ? booking.totalCost : booking.total);
+  const amount = parseMoney(raw);
+  return amount != null && amount > 0 ? amount : null;
+}
+
+/**
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @param {number|null} totalCost Load Total Cost.
+ * @return {{ok: boolean, difference: number|null, invoiceAmount: number,
+ *   totalCost: number|null}}
+ */
+function drayageAmountsAcceptable(invoiceAmount, totalCost) {
+  const invoice = Number(invoiceAmount);
+  const total = totalCost == null ? null : Number(totalCost);
+  if (!(invoice > 0) || total == null || !(total > 0)) {
+    return {
+      ok: false,
+      difference: null,
+      invoiceAmount: invoice,
+      totalCost: total,
+    };
+  }
+  const difference = Math.round(Math.abs(invoice - total) * 100) / 100;
+  return {
+    ok: difference < DRAYAGE_AMOUNT_TOLERANCE,
+    difference,
+    invoiceAmount: invoice,
+    totalCost: total,
+  };
+}
+
+/**
+ * True when an actual-cost line already has a vendor bill number.
+ * vendorInvoiceNumber is the Primus Actual Cost Bill# column.
+ * Empty, null, and whitespace are unbilled. Numeric 0 is unbilled because
+ * the existing posting code reads it with `value || ""`. The string "0"
+ * is a bill number.
+ * @param {object|null|undefined} line Actual-cost or billsInfo row.
+ * @return {boolean}
+ */
+function actualCostHasVendorBillNumber(line) {
+  return !!String(line && line.vendorInvoiceNumber || "").trim();
+}
+
+/**
+ * Removes actual-cost lines that do not yet have a vendor bill number,
+ * then adds the drayage carrier bill. Lines that already have a bill
+ * number are left unchanged. The carrier bill is not added again when
+ * that invoice number is already on a line.
+ * @param {Array<object>} existingLines Actual cost lines.
+ * @param {object} feeLine New carrier-bill line.
+ * @return {{lines: Array<object>, added: boolean, removed: number}}
+ */
+function mergeDrayageActualCost(existingLines, feeLine) {
+  const source = Array.isArray(existingLines) ? existingLines : [];
+  const lines = [];
+  let removed = 0;
+  for (const line of source) {
+    if (!actualCostHasVendorBillNumber(line)) {
+      removed += 1;
+      continue;
+    }
+    lines.push(line);
+  }
+  const billNo = String(feeLine && feeLine.vendorInvoiceNumber || "").trim();
+  const already = billNo && lines.some((line) =>
+    String(line.vendorInvoiceNumber || "").trim() === billNo);
+  if (already) return {lines, added: false, removed};
+  lines.push(feeLine);
+  return {lines, added: true, removed};
+}
+
+/**
+ * Backup paperwork is uploaded as Carrier Bill. A POD is not.
+ * @param {object} file Attachment.
+ * @return {boolean}
+ */
+function isDrayagePodAttachment(file) {
+  if (!file) return false;
+  if (String(file.docType || "").toUpperCase() === "POD") return true;
+  const name = String(file.filename || file.name || "");
+  return /\bPOD\b|proof of delivery/i.test(name);
+}
+
+/**
+ * @param {object} row Tracking-search row.
+ * @param {string} container Container number.
+ * @return {boolean}
+ */
+function rowHasContainer(row, container) {
+  let blob = "";
+  try {
+    blob = JSON.stringify(row);
+  } catch (_) {
+    blob = "";
+  }
+  return new RegExp(`\\b${container}\\b`, "i").test(blob);
+}
+
+/**
+ * Picks the Primus load for a container search.
+ * Prefers a row that actually contains the container. A single search
+ * hit is accepted when Primus returned only that load.
+ * @param {Array<object>} rows getBookingsForTracking rows.
+ * @param {string} container Container number.
+ * @return {object}
+ */
+function pickContainerMatch(rows, container) {
+  const valid = [];
+  const seen = new Set();
+  for (const row of rows || []) {
+    const bol = loadResolution.normalizeLoadNumber(
+        row && (row.BOL || row.bol));
+    if (!loadResolution.isValidLoadNumber(bol) || seen.has(bol)) continue;
+    seen.add(bol);
+    valid.push({
+      loadNumber: bol,
+      row,
+      echoed: rowHasContainer(row, container),
+    });
+  }
+  const byCarrierRef = valid.filter((r) => {
+    const ref = String(r.row && r.row.carrierRef || "").trim().toUpperCase();
+    return ref && ref === String(container || "").trim().toUpperCase();
+  });
+  if (byCarrierRef.length === 1) {
+    return {
+      ok: true,
+      loadNumber: byCarrierRef[0].loadNumber,
+      row: byCarrierRef[0].row,
+      source: "carrier_ref",
+    };
+  }
+  const echoed = valid.filter((r) => r.echoed);
+  const pool = echoed.length ? echoed : (valid.length === 1 ? valid : []);
+  if (pool.length === 1) {
+    return {
+      ok: true,
+      loadNumber: pool[0].loadNumber,
+      row: pool[0].row,
+      source: pool[0].echoed ? "container_on_load" : "single_search_hit",
+    };
+  }
+  if (valid.length > 1) {
+    return {ok: false, ambiguous: true, count: valid.length};
+  }
+  return {ok: false, notFound: true};
+}
 module.exports = {
   DRAYAGE_FORWARD_EMAIL_DEFAULT,
   DRAYAGE_RETURN_EMAIL_DEFAULT,
   DRAYAGE_OPS_EMAIL_DEFAULT,
+  DRAYAGE_AMOUNT_TOLERANCE,
   LEO_REQUIRED_FIELDS,
+  isGtgConfirmation,
+  readDrayageTotalCost,
+  drayageAmountsAcceptable,
+  actualCostHasVendorBillNumber,
+  mergeDrayageActualCost,
+  isDrayagePodAttachment,
+  pickContainerMatch,
   normalizeContainerNumber,
   isPlausibleContainerNumber,
   sanitizeContainerNumber,

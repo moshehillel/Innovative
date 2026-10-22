@@ -1761,21 +1761,43 @@ exports.processPrimusWorkflow = onRequest(
         // restart the workflow.
         if (invoice.additionalCharge &&
             !invoice.additionalCharge.decision) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "additional_charge_gate",
-            stepStatus: "skipped",
-            reason: "Awaiting A/B/C/D additional-charge decision",
-          });
-          await invoiceDoc.ref.update({
-            processingLock: false,
-            finalWorkflowStatus: "additional_charge_pending_approval",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          return res.json({
-            ok: false,
-            error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
-          });
+          const freshSnap = await invoiceDoc.ref.get();
+          const fresh = freshSnap.exists ? (freshSnap.data() || {}) : {};
+          const freshCharge = fresh.additionalCharge || null;
+          if (freshCharge && freshCharge.decision) {
+            invoice.additionalCharge = freshCharge;
+            if (Array.isArray(fresh.unrecognizedCharges)) {
+              invoice.unrecognizedCharges = fresh.unrecognizedCharges;
+            }
+            if (Array.isArray(fresh.chargesNeedProof)) {
+              invoice.chargesNeedProof = fresh.chargesNeedProof;
+            }
+            if (fresh.customerRate != null) {
+              invoice.customerRate = fresh.customerRate;
+            }
+            await writeLog("info", "workflow",
+                "Additional-charge decision arrived during paperwork", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  decision: freshCharge.decision,
+                });
+          } else {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "additional_charge_gate",
+              stepStatus: "skipped",
+              reason: "Awaiting A/B/C/D additional-charge decision",
+            });
+            await invoiceDoc.ref.update({
+              processingLock: false,
+              finalWorkflowStatus: "additional_charge_pending_approval",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            return res.json({
+              ok: false,
+              error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
+            });
+          }
         }
 
         if (

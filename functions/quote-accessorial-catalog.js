@@ -628,6 +628,31 @@ function buildStaticFallbackCatalog() {
 }
 
 /**
+ * Accessorial dropdown rows without waiting on Primus.
+ * Uses the live cache when a previous request already filled it.
+ * @return {Array<{code: string, name: string, category: string}>}
+ */
+function staticAccessorialChoices() {
+  if (choiceCache.rows && choiceCache.rows.length) return choiceCache.rows;
+  const catalog = buildStaticFallbackCatalog();
+  const flat = []
+      .concat(catalog.origin || [], catalog.destination || [],
+          catalog.other || []);
+  const seen = new Set();
+  const rows = [];
+  for (const item of flat) {
+    const name = String((item && (item.name || item.label)) || "").trim();
+    const code = String((item && item.code) || "").trim().toUpperCase();
+    const key = (code || name).toLowerCase();
+    if (!name || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({code, name, category: item.category || "Other"});
+  }
+  rows.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+  return rows;
+}
+
+/**
  * Fetch Primus catalog (uncached).
  * @return {Promise<Array<object>>}
  */
@@ -801,6 +826,7 @@ module.exports = {
   normalizePrimusRows,
   buildDispatcherCatalog,
   buildStaticFallbackCatalog,
+  staticAccessorialChoices,
   getQuoteAccessorialCatalog,
   normalizeRerunAccessorialCodes,
   fetchPrimusAccessorialRows,

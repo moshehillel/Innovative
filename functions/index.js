@@ -3692,22 +3692,14 @@ async function handleAdditionalChargeAction(req, res) {
         resumeNote = " Billing could not be started. Jerry will retry.";
       }
     }
-    if (option === "a" || option === "c" || option === "e") {
+    if (option === "a" || option === "b" ||
+        option === "c" || option === "e") {
       await dashboardTasks.closeAdditionalChargeWork(
           db, additionalCharges, {
             invoiceId: String(invoiceId),
             tenantId: tenant.tenantId,
           }).catch((err) => {
         console.error("closeAdditionalChargeWork:", err.message);
-      });
-    } else if (option === "b" && !skipDispatcherNotify) {
-      await dashboardTasks.handoffTaskToDispatch(
-          db, additionalCharges, {
-            invoiceId: String(invoiceId),
-            tenantId: tenant.tenantId,
-            option,
-          }).catch((err) => {
-        console.error("handoffTaskToDispatch:", err.message);
       });
     }
 

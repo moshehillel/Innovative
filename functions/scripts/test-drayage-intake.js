@@ -136,6 +136,29 @@ runAsyncChecks().then(() => {
           .includes("accounting@innovativecarriers.com"),
       true);
 
+  check("GTG is recognized", dray.isGtgConfirmation("Load 1", "GTG"), true);
+  check("good to go is recognized",
+      dray.isGtgConfirmation("", "Good to go"), true);
+  check("a charge list is not GTG",
+      dray.isGtgConfirmation("", "Enter these charges"), false);
+  const merged = dray.mergeDrayageActualCost([
+    {description: "Port fee", vendorInvoiceNumber: "PF-9", amount: 75},
+    {description: "Open cost", vendorInvoiceNumber: "", amount: 10},
+    {description: "Zero bill", vendorInvoiceNumber: 0, amount: 5},
+    {description: "Text zero", vendorInvoiceNumber: "0", amount: 8},
+  ], {description: "Freight", vendorInvoiceNumber: "INV-44", amount: 400});
+  check("unbilled lines dropped", merged.removed, 2);
+  check("billed port fee kept",
+      merged.lines.some((line) => line.vendorInvoiceNumber === "PF-9"), true);
+  check("text zero bill kept",
+      merged.lines.some((line) => line.vendorInvoiceNumber === "0"), true);
+  check("carrier freight line added",
+      merged.lines.some((line) => line.vendorInvoiceNumber === "INV-44"), true);
+  check("five dollar gap stops",
+      dray.drayageAmountsAcceptable(1000, 1005).ok, false);
+  check("under five dollars can proceed",
+      dray.drayageAmountsAcceptable(1001, 1005).ok, true);
+
   if (failures) {
     console.error(`\n${failures} test(s) failed`);
     process.exit(1);

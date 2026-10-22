@@ -1018,35 +1018,70 @@ function buildDisputeEmailDraft(opts) {
  *   category.
  * @return {{subject: string, html: string}}
  */
-function buildCustomerChargeNotificationEmail(opts) {
-  const {customerName, loadNumber, charges, chargesTotal, category,
-    customerRate, customerBillLines} = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
-  const detail = billLines.length ?
-    (`<p>These additional charges will appear as their own lines on ` +
-      `your invoice, separate from the freight charge:</p>` +
-      customerBillLinesHtml(billLines) +
-      `<p>Additional total: <strong>` +
-      `${money(chargesTotal || sumCustomerBillLines(billLines))}</strong></p>`) :
-    (chargesHtml(charges) +
-      `<p>The additional amount of <strong>${money(chargesTotal)}</strong> ` +
-      `will be reflected on your invoice for this shipment.</p>`);
+function noticeChargeLines(charges) {
+  const split = stripFreightBreakdownCharges(charges);
+  return split.kept.filter((row) => chargeLabel(row));
+}
+
+function measurementLinesHtml(opts, lines) {
+  const blob = lines.map((row) => chargeLabel(row)).join(" ");
+  const measure = /reweigh|re-weigh|reclass|re-class|redim|re-dim|dimension/i
+      .test(blob);
+  if (!measure) return "";
+  const details = (opts.freightMismatch && opts.freightMismatch.details) ||
+    {};
+  const bits = [];
+  if (details.primusWeightLbs) {
+    bits.push(`Original weight: ${esc(String(details.primusWeightLbs))} lbs`);
+  }
+  if (details.invoiceWeightLbs) {
+    bits.push(`Updated weight: ${esc(String(details.invoiceWeightLbs))} lbs`);
+  }
+  if (opts.originalDims) {
+    bits.push(`Original dimensions: ${esc(String(opts.originalDims))}`);
+  }
+  if (opts.updatedDims) {
+    bits.push(`Updated dimensions: ${esc(String(opts.updatedDims))}`);
+  }
+  if (!bits.length) return "";
+  return bits.map((line) => `<div>${line}</div>`).join("");
+}
+
+/**
+ * Shared customer and dispatcher notice. Total is the invoice difference.
+ * @param {object} opts customerName, loadNumber, charges, chargesTotal.
+ * @return {{subject: string, html: string}}
+ */
+function buildAdditionalChargeNoticeEmail(opts) {
+  const customerName = opts.customerName;
+  const loadNumber = opts.loadNumber;
+  const lines = noticeChargeLines(opts.charges);
+  const listed = lines.length ? lines : [];
+  const lineHtml = listed.map((row) => {
+    const amt = Number(row && row.amount);
+    const amount = Number.isFinite(amt) ? `: ${money(amt)}` : "";
+    const label = esc(displayChargeLabel(chargeLabel(row)));
+    return `<div>${label}${amount}</div>`;
+  }).join("");
+  const total = opts.chargesTotal != null ? opts.chargesTotal :
+    sumCustomerBillLines(listed);
   const html =
     `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
-    `<p>We were billed an additional charge by the carrier on your ` +
-    `shipment (our reference <strong>${esc(String(loadNumber || ""))}` +
-    `</strong>).</p>` +
-    (customerRate != null && Number(customerRate) > 0 ?
-      `<p><strong>Freight charge:</strong> ` +
-      `${formatCustomerRate(customerRate)}</p>` : "") +
-    `<p><strong>Reason:</strong> ${esc(categoryLabel(category))}</p>` +
-    detail +
-    `<p>Please reach out if you have any questions.</p>`;
+    `<p>We wanted to make you aware that the carrier has applied an ` +
+    `additional charge to this shipment for the following:</p>` +
+    (lineHtml || `<div>Additional charge</div>`) +
+    measurementLinesHtml(opts, listed) +
+    `<p>Total Additional Charges: <strong>${money(total)}</strong></p>` +
+    `<p>If you have any questions, please feel free to reach out.</p>`;
   return {
     subject: toOutboundEmailSafeSubject(
         `Additional charge on shipment ${loadNumber}`),
     html: toOutboundEmailSafeText(html),
   };
+}
+
+function buildCustomerChargeNotificationEmail(opts) {
+  return buildAdditionalChargeNoticeEmail(opts);
 }
 
 /**
@@ -1133,7 +1168,10 @@ function mustDeliverDespiteDashboardPark(email) {
 function shouldCloseAdditionalChargeTask(opts) {
   const decision = String((opts && opts.decision) || "").toUpperCase();
   const wf = String((opts && opts.finalWorkflowStatus) || "");
-  if (decision !== "A") return false;
+  if (decision !== "A" && decision !== "B" &&
+      decision !== "C" && decision !== "E") {
+    return false;
+  }
   return wf === "completed" ||
     wf === "completed_no_customer_email" ||
     wf === "completed_carrier_bill_only";
@@ -1146,41 +1184,21 @@ function shouldCloseAdditionalChargeTask(opts) {
  * @return {{subject: string, html: string}}
  */
 function buildDispatcherCustomerNotifyTemplate(opts) {
-  const {
-    loadNumber, customerName, carrierName, chargesTotal,
-    customerRate, customerBillLines, newCustomerRate,
-  } = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
-  const baseRate = Number(customerRate) || 0;
-  const accessorialTotal = sumCustomerBillLines(billLines);
-  const updatedRate = Number(newCustomerRate) > 0 ?
-    Number(newCustomerRate) :
-    (baseRate > 0 ? baseRate + accessorialTotal : accessorialTotal);
-  const chargeDetail = billLines.length ?
-    customerBillLinesHtml(billLines) :
-    `<p>Additional charge total: <strong>${money(chargesTotal)}</strong></p>`;
-  const html =
-    `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
-    `<p>This note is about your shipment ` +
-    `<strong>${esc(String(loadNumber || ""))}</strong>` +
-    (carrierName ? ` with ${esc(carrierName)}` : "") + `.</p>` +
-    `<p>The carrier billed an additional charge on this load` +
-    (Number(chargesTotal) > 0 ?
-      ` of <strong>${money(chargesTotal)}</strong>` : "") +
-    `. Your updated customer rate for this shipment is ` +
-    `<strong>${money(updatedRate)}</strong>` +
-    (baseRate > 0 && billLines.length ?
-      ` (base freight ${formatCustomerRate(baseRate)} plus the ` +
-      `accessorial(s) below)` : "") +
-    `.</p>` +
-    chargeDetail +
-    `<p>Please let us know if you have any questions.</p>` +
-    `<p>Thank you,<br>Innovative Carriers</p>`;
-  return {
-    subject: toOutboundEmailSafeSubject(
-        `Updated rate on shipment ${loadNumber}`),
-    html: toOutboundEmailSafeText(html),
-  };
+  const carrier = Array.isArray(opts.charges) ? opts.charges : [];
+  const billed = Array.isArray(opts.customerBillLines) ?
+    opts.customerBillLines.map((line) => ({
+      label: line.name || line.label,
+      amount: line.amount,
+    })) : [];
+  return buildAdditionalChargeNoticeEmail({
+    customerName: opts.customerName,
+    loadNumber: opts.loadNumber,
+    charges: carrier.length ? carrier : billed,
+    chargesTotal: opts.chargesTotal,
+    freightMismatch: opts.freightMismatch,
+    originalDims: opts.originalDims,
+    updatedDims: opts.updatedDims,
+  });
 }
 
 /**
@@ -1191,63 +1209,7 @@ function buildDispatcherCustomerNotifyTemplate(opts) {
  * @return {{subject: string, html: string}}
  */
 function buildDispatcherNotifyReminderEmail(opts) {
-  const {
-    dispatcherName, loadNumber, carrierName, customerName,
-    charges, chargesTotal, customerRate, customerBillLines,
-  } = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
-  const baseRate = Number(customerRate) || 0;
-  const accessorialTotal = sumCustomerBillLines(billLines);
-  const newCustomerRate = baseRate > 0 ?
-    baseRate + accessorialTotal : accessorialTotal;
-  const billingBlock = billLines.length ?
-    ((baseRate > 0 ?
-      `<p><strong>Base customer rate (unchanged): ` +
-      `${formatCustomerRate(baseRate)}</strong></p>` : "") +
-      `<p><strong>Accessorials to bill the customer:</strong></p>` +
-      customerBillLinesHtml(billLines) +
-      `<p><strong>New customer total (base + accessorials): ` +
-      `${money(newCustomerRate)}</strong></p>` +
-      `<p><strong>Carrier additional charge:</strong> ` +
-      `${money(chargesTotal)}</p>`) :
-    (chargesHtml(charges) +
-      `<p>Total additional: <strong>${money(chargesTotal)}</strong></p>` +
-      (baseRate > 0 ?
-        `<p><strong>Current customer rate:</strong> ` +
-        `${formatCustomerRate(baseRate)}</p>` : ""));
-  const forward = buildDispatcherCustomerNotifyTemplate({
-    loadNumber,
-    customerName,
-    carrierName,
-    chargesTotal,
-    customerRate: baseRate,
-    customerBillLines: billLines,
-    newCustomerRate,
-  });
-  const html =
-    `<p>Hi${dispatcherName ? ` ${esc(dispatcherName)}` : ""},</p>` +
-    `<p>An additional carrier charge on load ` +
-    `<strong>${esc(String(loadNumber || ""))}</strong> ` +
-    `(${esc(carrierName || "carrier")}) was approved to be billed to the ` +
-    `customer. <strong>Please notify the customer</strong>` +
-    `${customerName ? ` (${esc(customerName)})` : ""} ` +
-    `about the updated rate.</p>` +
-    billingBlock +
-    `<hr style="border:none;border-top:1px solid #e5e7eb;margin:18px 0">` +
-    `<p><strong>Ready-to-send customer email</strong> - copy or forward ` +
-    `this to the customer:</p>` +
-    `<p style="font-size:13px;color:#6b7280"><strong>Subject:</strong> ` +
-    `${esc(forward.subject)}</p>` +
-    `<div style="border:1px solid #bfdbfe;border-radius:8px;padding:16px;` +
-    `background:#eff6ff;font-size:14px">${forward.html}</div>` +
-    `<p style="font-size:12px;color:#6b7280;margin-top:14px">This item ` +
-    `stays on your task list (Additional Charges Follow-Up) until the ` +
-    `customer is notified.</p>`;
-  return {
-    subject: toOutboundEmailSafeSubject(
-        `Task - notify customer of additional charge on Load ${loadNumber}`),
-    html: toOutboundEmailSafeText(html),
-  };
+  return buildDispatcherCustomerNotifyTemplate(opts);
 }
 
 /**
