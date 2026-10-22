@@ -181,6 +181,20 @@ check("dispatcher reminder totals the difference",
 check("dispatcher reminder subject ASCII",
     !reminder.subject.includes("\u2014") &&
     reminder.subject.includes("264172"), true);
+const sameNotice = ac.buildCustomerChargeNotificationEmail({
+  customerName: "Miworld",
+  loadNumber: "264172",
+  charges: [{label: "Reweigh Fee", amount: 120}],
+  chargesTotal: 120,
+});
+check("dispatcher template matches the customer notice",
+    reminder.subject === sameNotice.subject &&
+    reminder.html === sameNotice.html, true);
+check("dispatcher customer template is delivered",
+    ac.mustDeliverDespiteDashboardPark({
+      type: "additional_charge_dispatcher_task",
+      to: "tina@innovativecarriers.com",
+    }), true);
 const forward = ac.buildDispatcherCustomerNotifyTemplate({
   loadNumber: "264172",
   customerName: "Miworld",

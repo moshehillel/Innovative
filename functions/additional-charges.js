@@ -1148,7 +1148,8 @@ function customerInvoiceChargeLines(customerRate, customerBillLines) {
 
 /**
  * Dashboard-ops mode parks internal mail. The customer additional-charge
- * notice, customer bills, and a few ops digests still go out.
+ * notice, the dispatcher copy of that notice, customer bills, and a few
+ * ops digests still go out.
  * @param {object} email Outbound email payload.
  * @return {boolean}
  */
@@ -1158,7 +1159,8 @@ function mustDeliverDespiteDashboardPark(email) {
   const type = String(email.type || "");
   return type === "dashboard_notification_digest" ||
     type === "dashboard_assignment" ||
-    type === "additional_charge_customer_notice";
+    type === "additional_charge_customer_notice" ||
+    type === "additional_charge_dispatcher_task";
 }
 
 /**

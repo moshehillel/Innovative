@@ -3610,6 +3610,8 @@ async function handleAdditionalChargeAction(req, res) {
         const reminderPayload = {
           type: "additional_charge_dispatcher_task",
           invoiceId: String(invoiceId),
+          loadNumber: invoice.loadNumber || null,
+          forceSend: true,
           subject: reminder.subject,
           html: reminder.html,
           skipAgentGreeting: true,
@@ -3622,14 +3624,26 @@ async function handleAdditionalChargeAction(req, res) {
         if (dispatcher.ok && dispatcher.email) {
           reminderPayload.forceRecipient = true;
           reminderPayload.to = dispatcher.email;
-          extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
-            `to notify the customer.`;
-        } else {
-          extraNote += " Could not resolve the dispatcher email — the " +
-            "reminder went to the ops mailbox instead.";
         }
-        await saveOutboundEmail(additionalCharges.applyDispatcherEmailCc(
-            additionalCharges.applyAdditionalChargeEmailCc(reminderPayload)));
+        const sentDispatcher = await saveOutboundEmail(
+            additionalCharges.applyDispatcherEmailCc(
+                additionalCharges.applyAdditionalChargeEmailCc(
+                    reminderPayload)));
+        const dispatcherSent = sentDispatcher &&
+          sentDispatcher.ok && !sentDispatcher.parked;
+        if (dispatcher.ok && dispatcher.email && dispatcherSent) {
+          extraNote += ` The dispatcher (${dispatcher.email}) was ` +
+            `emailed the customer template.`;
+        } else if (dispatcher.ok && dispatcher.email) {
+          extraNote += ` The dispatcher template to ` +
+            `${dispatcher.email} was not sent.`;
+        } else if (dispatcherSent) {
+          extraNote += " Could not resolve the dispatcher email. " +
+            "The template went to the ops mailbox instead.";
+        } else {
+          extraNote += " Could not resolve the dispatcher email, " +
+            "and the template was not sent.";
+        }
       }
 
       await additionalCharges.updateFollowUp(db, {
