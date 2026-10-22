@@ -438,6 +438,7 @@ body::before {
 .work-row.is-high-dollar { background: #fffaf0; }
 .work-line {
   display: flex;
+  flex-wrap: nowrap;
   align-items: center;
   gap: 12px;
   min-height: 42px;
