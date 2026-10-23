@@ -499,6 +499,8 @@ body::before {
   background: #f7fafa;
   font-size: 13px;
 }
+.work-detail .dispute-notes { grid-column: 1 / -1; white-space: pre-wrap; }
+.dispute-notes-box { white-space: pre-wrap; }
 .work-detail span {
   display: block;
   font-size: 10px;

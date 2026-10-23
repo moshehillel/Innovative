@@ -592,6 +592,8 @@
         ["Dispatcher", bodyEsc(task.dispatcherName || task.dispatcherEmail || "—")],
       ]) +
       `<div class="why-box"><strong>Why it needs attention:</strong> ${bodyEsc(why)}</div>` +
+      (task.disputeNotes ?
+        `<div class="why-box dispute-notes-box"><strong>Notes on what to dispute:</strong> ${bodyEsc(task.disputeNotes)}</div>` : "") +
       (task.isUrgentOld || task.ageLabel ?
         `<p><span class="age-badge">URGENT/OLD</span></p>` : "") +
       `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>` +
@@ -988,10 +990,15 @@
   }
 
   function chargeLinesForm(opt, allowEmpty) {
+    const notes = opt === "d" ?
+      `<label>Notes on what to dispute</label>` +
+      `<textarea class="charge-dispute-notes" rows="3" ` +
+      `placeholder="What should be disputed?"></textarea>` : "";
     return `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
       `<p>Pick each accessorial from the Primus list. Add accessorial for a charge Jerry did not list. Then enter a percent markup or a flat customer amount.</p>` +
       `<div class="charge-line-list"></div>` +
       `<button type="button" class="btn btn-sm btn-outline charge-add-line">+ Add accessorial</button>` +
+      notes +
       `<div class="row-actions">` +
       `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="${opt}" data-allow-empty="${allowEmpty ? "1" : "0"}">Confirm ${opt.toUpperCase()}</button>` +
       `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
@@ -1089,6 +1096,10 @@
           return;
         }
         payload.customerBillLines = lines;
+        if (opt === "d") {
+          const notesEl = form.querySelector(".charge-dispute-notes");
+          payload.disputeNotes = notesEl ? notesEl.value : "";
+        }
         }
         const result = await postJson("/dashboardAdditionalChargeDecision", payload);
         if (result.alreadyApplied) {
@@ -1319,6 +1330,8 @@
           "In dispute" : (task.issueLabel || task.ownerBucket || "Open");
         const issue = meta.label || task.issueLabel || "—";
         const logged = receivedInfo(task);
+        const disputeNotesHtml = task.disputeNotes ?
+          `<div class="dispute-notes"><span>Notes on what to dispute</span>${bodyEsc(task.disputeNotes)}</div>` : "";
         const chargeBtns = taskCanResolve(task) ?
           `<span class="charge-opt-row">` +
           CHARGE_OPTS.map((opt) =>
@@ -1347,6 +1360,7 @@
             <div><span>Amount</span>${bodyEsc(formatMoney(task.chargesTotal || task.invoiceAmount))}</div>
             <div><span>Reason</span>${bodyEsc(task.reason || task.description || "—")}</div>
             <div><span>Logged</span>${bodyEsc(logged.text)}</div>
+            ${disputeNotesHtml}
           </div>
         </article>`;
       });
