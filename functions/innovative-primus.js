@@ -1188,11 +1188,12 @@ exports.processPrimusWorkflow = onRequest(
         const decisionLetter = String(
             (additionalCharge && additionalCharge.decision) || "",
         ).toUpperCase();
-        // Option A and option B both itemize accessorials. Freight stays
-        // the base sell rate. Option A used to fold the charge into freight.
+        // A, B, and F itemize accessorials. The freight rate stays the
+        // base sell rate. F is one accessorial named Freight.
+        const billsAccessorials = decisionLetter === "A" ||
+          decisionLetter === "B" || decisionLetter === "F";
         const optionBCustomerBillLines = (additionalChargeApproved &&
-          additionalCharge &&
-          (decisionLetter === "A" || decisionLetter === "B") &&
+          additionalCharge && billsAccessorials &&
           Array.isArray(additionalCharge.customerBillLines)) ?
           additionalCharge.customerBillLines : [];
         if (decisionLetter === "A" && optionBCustomerBillLines.length) {

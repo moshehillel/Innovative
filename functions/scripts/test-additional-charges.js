@@ -93,7 +93,7 @@ const noMatch = ac.evaluateRequoteMatch({
 });
 check("rate mismatch over $10", noMatch.matched, false);
 
-// 3. Approval email contains all five buttons (signed confirm links)
+// 3. Approval email contains every decision button (signed confirm links)
 const email = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
   invoiceId: "inv123",
@@ -123,7 +123,7 @@ check("email shows quote number",
 check("email shows customer rate", email.html.includes("$545.00"), true);
 check("email shows customer rate label",
     email.html.includes("Customer rate (Primus)"), true);
-for (const opt of ["a", "b", "c", "d", "e"]) {
+for (const opt of ["a", "b", "c", "d", "e", "f"]) {
   check(`button ${opt} has action`,
       email.html.includes("additionalChargeAction") &&
       email.html.includes(`invoiceId=inv123`) &&
@@ -457,6 +457,96 @@ check("liftgate is its own line",
 check("liftgate amount stays on its line",
     optionAPlan.invoiceLines[2].rate, 54.6);
 
+const pctOfInvoice = ac.computeOptionFCustomerRate({
+  mode: "percent", percent: 10, invoiceAmount: 350,
+});
+check("option F 10 percent of a 350 invoice is 35",
+    pctOfInvoice.ok && pctOfInvoice.amount === 35, true);
+check("option F percent is not a markup on the invoice",
+    pctOfInvoice.amount !== 385, true);
+const flatRate = ac.computeOptionFCustomerRate({
+  mode: "flat", flatAmount: "40",
+});
+check("option F flat amount is the customer rate",
+    flatRate.ok && flatRate.amount === 40, true);
+const badPct = ac.computeOptionFCustomerRate({
+  mode: "percent", percent: 10, invoiceAmount: 0,
+});
+check("option F percent needs the invoice total", badPct.ok, false);
+const freightPick = ac.freightAccessorialFromCatalog([
+  {code: "fsc", name: "Fuel Surcharge"},
+  {code: "frg", name: "Freight"},
+]);
+check("option F uses the Freight catalog code", freightPick.code, "FRG");
+check("option F accessorial name is Freight", freightPick.name, "Freight");
+const noFreight = ac.freightAccessorialFromCatalog([
+  {code: "FSC", name: "Fuel Surcharge"},
+]);
+check("option F still names Freight when the catalog has none",
+    noFreight.name, "Freight");
+check("option F sends no code when Freight is not in the catalog",
+    noFreight.code, null);
+const optionFPlan = ac.planOptionFCustomerBilling({
+  baseRate: 210.16,
+  amount: pctOfInvoice.amount,
+  mode: "percent",
+  percent: 10,
+  code: freightPick.code,
+});
+check("option F does not bump freight", optionFPlan.bumpFreight, false);
+check("option F leaves the freight rate alone",
+    optionFPlan.customerRate, 210.16);
+check("option F bills one line", optionFPlan.customerBillLines.length, 1);
+check("option F line name is Freight",
+    optionFPlan.customerBillLines[0].name, "Freight");
+check("option F line amount is the customer rate",
+    optionFPlan.customerBillLines[0].amount, 35);
+check("option F keeps the catalog code",
+    optionFPlan.customerBillLines[0].code, "FRG");
+check("option F invoice is freight plus one Freight accessorial",
+    optionFPlan.invoiceLines.length, 2);
+check("option F freight line stays the base rate",
+    optionFPlan.invoiceLines[0].description === "FREIGHT CHARGE" &&
+    optionFPlan.invoiceLines[0].rate === 210.16, true);
+check("option F writes Freight as an accessorial",
+    optionFPlan.invoiceLines[1].kind === "accessorial" &&
+    optionFPlan.invoiceLines[1].description === "FREIGHT" &&
+    optionFPlan.invoiceLines[1].code === "FRG" &&
+    optionFPlan.invoiceLines[1].rate === 35, true);
+const parsedFPct = ac.parseOptionFFromRequest({
+  fMode: "percent", fValue: "10",
+}, 350);
+check("option F form percent uses the invoice total",
+    parsedFPct.ok && parsedFPct.amount === 35, true);
+const parsedFFlat = ac.parseOptionFFromRequest({
+  fMode: "flat", fFlatAmount: "12.50",
+}, 350);
+check("option F form flat is the typed amount",
+    parsedFFlat.ok && parsedFFlat.amount === 12.5, true);
+const fPage = ac.buildOptionFConfirmPage({
+  title: "F - customer rate as Freight",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  invoiceAmount: 350,
+  loadNumber: "264172",
+  fields: {invoiceId: "1", option: "f"},
+});
+check("option F confirm title",
+    fPage.includes("F - customer rate as Freight"), true);
+check("option F confirm offers flat or percent",
+    fPage.includes("Flat dollar amount") &&
+    fPage.includes("Percent of the invoice total"), true);
+check("option F confirm shows the invoice total",
+    fPage.includes("$350.00"), true);
+check("option F confirm does not itemize carrier accessorials",
+    fPage.includes("Add accessorial"), false);
+new Function(fPage.split("<script>")[1].split("</script>")[0]);
+check("option F completion closes the dashboard task",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "F",
+      finalWorkflowStatus: "completed",
+    }), true);
+
 const notice = ac.buildCustomerChargeNotificationEmail({
   customerName: "NJ Warehouse Express LLC",
   loadNumber: "268358",
@@ -563,6 +653,38 @@ function memoryDb(collections) {
     },
   };
 }
+
+check("open charge has no saved decision",
+    ac.savedAdditionalChargeDecision({amount: 10}), null);
+check("blank decision is still open",
+    ac.savedAdditionalChargeDecision({decision: "  "}), null);
+check("saved decision blocks a second click",
+    ac.savedAdditionalChargeDecision({decision: "b"}), "B");
+check("saved F decision blocks a second click",
+    ac.savedAdditionalChargeDecision({decision: "f"}), "F");
+
+const confirmPage = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option B",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  fields: {invoiceId: "1", option: "b"},
+});
+check("confirm page ignores a second submit",
+    confirmPage.includes('form.dataset.submitted==="1"'), true);
+check("confirm page locks the button after submit",
+    confirmPage.includes('form.dataset.submitted="1"'), true);
+const optionFPage = ac.buildOptionFConfirmPage({
+  title: "F - customer rate as Freight",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  invoiceAmount: 350,
+  loadNumber: "267957",
+  fields: {invoiceId: "1", option: "f"},
+});
+check("option F page ignores a second submit",
+    optionFPage.includes('form.dataset.submitted==="1"'), true);
+check("option F page locks the button after submit",
+    optionFPage.includes('submitBtn.disabled=true'), true);
 
 const dashboardTasks = require("../dashboard-tasks");
 const followUp = {

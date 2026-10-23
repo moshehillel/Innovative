@@ -3055,8 +3055,10 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
     const invoice = snap.data();
     const charge = invoice.additionalCharge;
     if (!charge) return {ok: false, reason: "no_charge"};
-    if (charge.decision) {
-      return {ok: false, reason: "already", decision: charge.decision};
+    const saved =
+      additionalCharges.savedAdditionalChargeDecision(charge);
+    if (saved) {
+      return {ok: false, reason: "already", decision: saved};
     }
     tx.update(invoiceRef, {
       "additionalCharge.decision": decision,
@@ -3069,8 +3071,34 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
 }
 
 /**
- * Handles the A/B/C/D/E decision buttons from the additional-charge approval
- * email:
+ * Primus catalog row named Freight, when that accessorial exists.
+ * @return {Promise<{name: string, code: string|null}>}
+ */
+async function freightAccessorialForOptionF() {
+  let choices = [];
+  try {
+    const catalog = require("./quote-accessorial-catalog");
+    if (typeof catalog.listPrimusAccessorialChoices === "function") {
+      choices = await catalog.listPrimusAccessorialChoices();
+    }
+  } catch (err) {
+    console.error("freight catalog:", err.message);
+    choices = [];
+  }
+  if (!Array.isArray(choices) || !choices.length) {
+    try {
+      choices = require("./quote-accessorial-catalog")
+          .staticAccessorialChoices();
+    } catch (_) {
+      choices = [];
+    }
+  }
+  return additionalCharges.freightAccessorialFromCatalog(choices);
+}
+
+/**
+ * Handles the A/B/C/D/E/F decision buttons from the additional-charge
+ * approval email:
  *   a — pay carrier + bill customer (enter customer charge amount;
  *       auto-email the customer contact).
  *   b — pay carrier + bill customer (enter accessorial amounts / updated
@@ -3079,6 +3107,8 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
  *   d — not approved; dispute draft generated for manual submission.
  *   e - pay carrier + bill customer (enter amount; bump rate; no separate
  *       customer notification - charge rides on the customer invoice).
+ *   f - pay carrier + bill a flat amount or a percent of the invoice
+ *       total as one Freight accessorial. No separate customer email.
  */
 exports.additionalChargeAction = onRequest(
     {invoker: "public", timeoutSeconds: 540, memory: "512MiB"},
@@ -3133,9 +3163,10 @@ async function handleAdditionalChargeAction(req, res) {
     const exp = (req.body && req.body.exp) || req.query.exp;
     const sig = (req.body && req.body.sig) || req.query.sig;
 
-    if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+    if (!invoiceId ||
+        !["a", "b", "c", "d", "e", "f"].includes(option)) {
       return res.status(400).send(
-          "Missing invoiceId or a valid option (a|b|c|d|e).");
+          "Missing invoiceId or a valid option (a|b|c|d|e|f).");
     }
 
     const tokenOk = emailActionTokens.verify({
@@ -3165,22 +3196,30 @@ async function handleAdditionalChargeAction(req, res) {
           "This invoice has no additional charge awaiting a decision.");
     }
 
-    const htmlPage = (title, color, message) => res.status(200).send(
-        `<!doctype html><html><head><meta charset="utf-8">` +
-        `<meta name="viewport" content="width=device-width,` +
-        `initial-scale=1"><title>${title}</title></head>` +
-        `<body style="font-family:Arial,sans-serif;text-align:center;` +
-        `padding:48px;color:#111827">` +
-        `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
-        `<p style="font-size:16px;color:#374151">${message}</p>` +
-        `<p style="font-size:13px;color:#9ca3af">Load ` +
-        `${escapeHtml(String(invoice.loadNumber || invoiceId))}</p>` +
-        `</body></html>`);
+    const htmlPage = (title, color, message, marker) => {
+      const stamp = marker ? `<!--${marker}-->` : "";
+      return res.status(200).send(
+          `<!doctype html><html><head><meta charset="utf-8">` +
+          `<meta name="viewport" content="width=device-width,` +
+          `initial-scale=1"><title>${title}</title></head>` +
+          `<body style="font-family:Arial,sans-serif;text-align:center;` +
+          `padding:48px;color:#111827">` +
+          `<h1 style="color:${color};margin-bottom:12px">${title}</h1>` +
+          `<p style="font-size:16px;color:#374151">${message}</p>` +
+          `<p style="font-size:13px;color:#9ca3af">Load ` +
+          `${escapeHtml(String(invoice.loadNumber || invoiceId))}</p>` +
+          `${stamp}</body></html>`);
+    };
 
-    if (charge.decision) {
-      return htmlPage("Already decided", "#6b7280",
-          `This charge was already handled (option ` +
-          `${escapeHtml(String(charge.decision).toUpperCase())}).`);
+    const savedDecision =
+      additionalCharges.savedAdditionalChargeDecision(charge);
+    if (savedDecision) {
+      return htmlPage(
+          "Already decided",
+          "#6b7280",
+          "This charge was already handled (option " +
+          `${escapeHtml(savedDecision)}).`,
+          `already-applied:${savedDecision}`);
     }
 
     const optionLabels = {
@@ -3191,6 +3230,8 @@ async function handleAdditionalChargeAction(req, res) {
       d: "D - Not approved (dispute with carrier)",
       e: "E - Pay carrier + bill customer (enter amount; apply rate; " +
         "no separate customer notification)",
+      f: "F - customer rate as Freight (flat amount or percent of " +
+        "the invoice; no separate customer email)",
     };
 
     if (req.method !== "POST") {
@@ -3203,6 +3244,24 @@ async function handleAdditionalChargeAction(req, res) {
             .staticAccessorialChoices();
       } catch (_) {
         accessorialOptions = [];
+      }
+      if (option === "f") {
+        return res.status(200).send(
+            additionalCharges.buildOptionFConfirmPage({
+              title: "F - customer rate as Freight",
+              invoiceAmount: Number(invoice.invoiceAmount) || 0,
+              loadNumber: invoice.loadNumber || invoiceId,
+              confirmLabel: "Confirm option F",
+              actionPath: "additionalChargeAction",
+              baseUrl: functionsBaseUrl(),
+              fields: {
+                invoiceId: String(invoiceId),
+                option,
+                tenantId: tenantId || "",
+                exp: String(exp),
+                sig: String(sig),
+              },
+            }));
       }
       const allowEmpty = option === "c" || option === "d";
       const notifyNote = option === "a" ?
@@ -3258,7 +3317,17 @@ async function handleAdditionalChargeAction(req, res) {
       }
       if (parsedLines.ok) optionBCustomerBillLines = parsedLines.lines;
     }
-    if (option === "b" || option === "e" || option === "a") {
+    let optionFRate = null;
+    if (option === "f") {
+      const parsedF = additionalCharges.parseOptionFFromRequest(
+          req.body || {}, invoice.invoiceAmount);
+      if (!parsedF.ok) {
+        return res.status(400).send(parsedF.error ||
+            "Enter a flat amount or a percent of the invoice.");
+      }
+      optionFRate = parsedF;
+      optionBCustomerBillLines = null;
+    } else if (option === "b" || option === "e" || option === "a") {
       if (!optionBCustomerBillLines || !optionBCustomerBillLines.length) {
         const parsedAmount = (option === "a" || option === "e") ?
           additionalCharges.parseCustomerChargeAmountFromRequest(
@@ -3281,9 +3350,13 @@ async function handleAdditionalChargeAction(req, res) {
     const claim = await claimAdditionalChargeDecision(invoiceRef, decision);
     if (!claim.ok) {
       if (claim.reason === "already") {
-        return htmlPage("Already decided", "#6b7280",
-            `This charge was already handled (option ` +
-            `${escapeHtml(String(claim.decision).toUpperCase())}).`);
+        const saved = String(claim.decision || "").toUpperCase();
+        return htmlPage(
+            "Already decided",
+            "#6b7280",
+            "This charge was already handled (option " +
+            `${escapeHtml(saved)}).`,
+            `already-applied:${saved}`);
       }
       return res.status(400).send("Could not process this decision.");
     }
@@ -3357,8 +3430,9 @@ async function handleAdditionalChargeAction(req, res) {
           "for manual submission to the carrier.");
     }
 
-    // Options a/b/c/e — the charge is approved for the carrier side.
-    const billCustomer = option === "a" || option === "b" || option === "e";
+    // Options a/b/c/e/f — the charge is approved for the carrier side.
+    const billCustomer = option === "a" || option === "b" ||
+      option === "e" || option === "f";
 
     // A: each accessorial is its own customer-invoice line. Freight stays.
     // E: approver enters one amount and that amount bumps the sell rate.
@@ -3370,7 +3444,7 @@ async function handleAdditionalChargeAction(req, res) {
       "additionalCharge.billCustomer": billCustomer,
       "additionalCharge.notifyCustomer": option === "a" ? "auto" :
         (option === "b" ? "dispatcher" :
-          (option === "e" ? "none" : null)),
+          ((option === "e" || option === "f") ? "none" : null)),
       "additionalCharge.status": "approved",
       "additionalCharge.decidedAt":
         admin.firestore.FieldValue.serverTimestamp(),
@@ -3458,6 +3532,34 @@ async function handleAdditionalChargeAction(req, res) {
         " Base customer rate unchanged.";
       rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
         ` ($${billExtra.toFixed(2)}).`;
+    } else if (option === "f" && optionFRate && optionFRate.amount > 0) {
+      const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+      const freight = await freightAccessorialForOptionF();
+      const plan = additionalCharges.planOptionFCustomerBilling({
+        baseRate,
+        amount: optionFRate.amount,
+        mode: optionFRate.mode,
+        percent: optionFRate.percent,
+        code: freight.code,
+      });
+      approvalUpdate["additionalCharge.customerChargeAmount"] =
+        plan.customerChargeAmount;
+      approvalUpdate["additionalCharge.customerBillLines"] =
+        plan.customerBillLines;
+      approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
+        plan.customerBillAccessorialTotal;
+      approvalUpdate["additionalCharge.originalCustomerRate"] =
+        plan.customerRate;
+      approvalUpdate["additionalCharge.rateBumpAmount"] = null;
+      approvalUpdate["additionalCharge.bumpedCustomerRate"] = null;
+      approvalUpdate["additionalCharge.customerRateMode"] =
+        optionFRate.mode;
+      if (optionFRate.percent != null) {
+        approvalUpdate["additionalCharge.customerRatePercent"] =
+          optionFRate.percent;
+      }
+      rateBumpNote = plan.note ? ` ${plan.note}` : "";
+      optionBCustomerBillLines = plan.customerBillLines;
     }
 
     if (option === "c" && optionBCustomerBillLines &&
@@ -3542,6 +3644,15 @@ async function handleAdditionalChargeAction(req, res) {
       // the additional charge is included on the customer invoice.
       extraNote += " No separate customer notification sent; charge will " +
         "be included on the customer invoice.";
+      await additionalCharges.updateFollowUp(db, {
+        invoiceId: String(invoiceId),
+        status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
+        decision,
+        notes: extraNote.trim(),
+      });
+    } else if (option === "f") {
+      extraNote += " No separate customer notification sent. The " +
+        "customer rate is one Freight accessorial on the invoice.";
       await additionalCharges.updateFollowUp(db, {
         invoiceId: String(invoiceId),
         status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
@@ -3707,7 +3818,7 @@ async function handleAdditionalChargeAction(req, res) {
       }
     }
     if (option === "a" || option === "b" ||
-        option === "c" || option === "e") {
+        option === "c" || option === "e" || option === "f") {
       await dashboardTasks.closeAdditionalChargeWork(
           db, additionalCharges, {
             invoiceId: String(invoiceId),
@@ -3732,6 +3843,7 @@ async function handleAdditionalChargeAction(req, res) {
         "Approved — dispatcher will notify the customer",
       c: "Approved — carrier only",
       e: "Approved — customer billed via invoice (no separate notification)",
+      f: "Approved - customer rate entered as Freight",
     };
     const messages = {
       a: "The carrier bill will be paid in full and the charge billed " +
@@ -3749,6 +3861,9 @@ async function handleAdditionalChargeAction(req, res) {
       e: "The carrier bill will be paid in full and the charge billed " +
         "to the customer on the invoice (no separate notification)." +
         extraNote,
+      f: "The carrier bill will be paid in full. The customer is " +
+        "billed the entered rate as one Primus accessorial named " +
+        "Freight. No separate customer email was sent." + extraNote,
     };
     return htmlPage(titles[option], "#16a34a",
         messages[option] + resumeNote);
@@ -13820,6 +13935,12 @@ async function applyAdditionalChargeFromDashboard(opts) {
   if ((option === "a" || option === "e") && !lines.length) {
     body.customerChargeAmount = opts.customerChargeAmount;
   }
+  if (option === "f") {
+    if (opts.fMode) body.fMode = opts.fMode;
+    if (opts.fValue != null) body.fValue = opts.fValue;
+    if (opts.fFlatAmount != null) body.fFlatAmount = opts.fFlatAmount;
+    if (opts.fPercent != null) body.fPercent = opts.fPercent;
+  }
 
   let statusCode = 200;
   let sentBody = "";
@@ -13845,6 +13966,15 @@ async function applyAdditionalChargeFromDashboard(opts) {
   };
 
   await handleAdditionalChargeAction(fakeReq, fakeRes);
+  const applied = sentBody.match(/already-applied:([A-Z])/);
+  if (applied) {
+    return {
+      ok: true,
+      alreadyApplied: true,
+      decision: applied[1],
+      message: "This charge was already decided.",
+    };
+  }
   if (statusCode >= 400) {
     const plain = sentBody.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
     return {

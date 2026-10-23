@@ -198,7 +198,7 @@ async function handleFlagNotification(req, res) {
 }
 
 /**
- * POST additional-charge decision A–E from the dashboard.
+ * POST additional-charge decision A-F from the dashboard.
  * Signs an email-action token and reuses additionalChargeAction.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -214,10 +214,11 @@ async function handleAdditionalChargeDecision(req, res) {
     const body = req.body || {};
     const invoiceId = String(body.invoiceId || "").trim();
     const option = String(body.option || "").toLowerCase();
-    if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+    if (!invoiceId ||
+        !["a", "b", "c", "d", "e", "f"].includes(option)) {
       return res.status(400).json({
         ok: false,
-        error: "invoiceId and option (a|b|c|d|e) are required.",
+        error: "invoiceId and option (a|b|c|d|e|f) are required.",
       });
     }
 
@@ -234,9 +235,25 @@ async function handleAdditionalChargeDecision(req, res) {
       option,
       customerChargeAmount: body.customerChargeAmount,
       customerBillLines: body.customerBillLines,
+      fMode: body.fMode,
+      fValue: body.fValue,
+      fFlatAmount: body.fFlatAmount,
+      fPercent: body.fPercent,
     });
     if (!result.ok) {
       return res.status(result.status || 400).json(result);
+    }
+    if (result.alreadyApplied) {
+      return res.json({
+        ok: true,
+        accepted: false,
+        alreadyApplied: true,
+        option: String(result.decision || option).toUpperCase(),
+        handedOffToDispatch: false,
+        markedInDispute: false,
+        message: result.message ||
+          "This charge was already decided.",
+      });
     }
 
     if (body.notificationId) {

@@ -9,7 +9,7 @@
  *      from what is on the Primus booking. For W&I we re-rate via Primus
  *      GET /rate with the invoice's updated weight/class and compare the
  *      returned total to the carrier invoice (default $10 tolerance).
- *   C. Approval email offers FIVE decisions:
+ *   C. Approval email offers these decisions:
  *        A — pay carrier + bill customer; auto-email the customer contact.
  *        B — pay carrier + bill customer; dispatcher notifies the customer
  *            (system reminds the dispatcher / adds to their task list).
@@ -18,6 +18,9 @@
  *            submission (LTL portals) or email (TL).
  *        E — pay carrier + bill customer; enter amount and bump rate; no
  *            separate customer notification (invoice carries the charge).
+ *        F — pay carrier + bill a flat amount or a percent of the carrier
+ *            invoice total as one Primus accessorial named Freight. No
+ *            separate customer email.
  *   D. Every case is tracked on an Additional Charges Follow-Up list until
  *      resolved.
  *
@@ -883,6 +886,9 @@ function buildAdditionalChargeApprovalEmail(opts) {
     btn("e", "#7c3aed",
         "E - Approve: pay carrier + bill customer " +
         "(enter amount; apply rate; no separate customer notification)") +
+    btn("f", "#c2410c",
+        "F - Customer rate as Freight " +
+        "(flat amount or percent of the invoice; no separate email)") +
     `<p style="font-size:12px;color:#6b7280">A: enter how much to charge the ` +
     `customer on the confirm page; the customer rate is bumped by that ` +
     `amount and the customer is emailed. B: the base customer rate stays ` +
@@ -892,7 +898,11 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `and the customer rate stays the same (no itemization needed). D: Jerry ` +
     `will draft the wording for manual submission. E: like A (enter amount ` +
     `and bump the customer rate) but no separate customer notification - ` +
-    `the charge is included when the customer invoice is sent.` +
+    `the charge is included when the customer invoice is sent. ` +
+    `F: enter a flat dollar amount, or a percent of the carrier invoice ` +
+    `total (a $350 invoice at 10% is $35.00). That amount is the customer ` +
+    `rate and is entered in Primus as one accessorial named Freight. The ` +
+    `carrier is paid the invoice. No separate customer email.` +
     `</p>`;
 
   return {
@@ -1171,7 +1181,7 @@ function shouldCloseAdditionalChargeTask(opts) {
   const decision = String((opts && opts.decision) || "").toUpperCase();
   const wf = String((opts && opts.finalWorkflowStatus) || "");
   if (decision !== "A" && decision !== "B" &&
-      decision !== "C" && decision !== "E") {
+      decision !== "C" && decision !== "E" && decision !== "F") {
     return false;
   }
   return wf === "completed" ||
@@ -1530,6 +1540,140 @@ function parseCustomerChargeAmountFromRequest(body) {
  * @param {object} body POST body from the confirm form.
  * @return {object} Parsed customer bill lines payload.
  */
+/**
+ * Rounds a dollar amount to cents.
+ * @param {number} amount Raw amount.
+ * @return {number}
+ */
+function roundOptionFMoney(amount) {
+  return Math.round(Number(amount) * 100) / 100;
+}
+
+/**
+ * Option F customer rate. Flat is the typed dollar amount. Percent is
+ * that percent of the carrier invoice total, not a markup on one line.
+ * @param {object} opts mode, flatAmount, percent, invoiceAmount.
+ * @return {object}
+ */
+function computeOptionFCustomerRate(opts) {
+  const mode = String((opts && opts.mode) || "").toLowerCase();
+  if (mode === "flat") {
+    const flat = roundOptionFMoney(opts.flatAmount);
+    if (!Number.isFinite(flat) || flat <= 0) {
+      return {ok: false, error: "Enter a flat amount greater than 0."};
+    }
+    return {ok: true, mode: "flat", amount: flat, percent: null};
+  }
+  if (mode === "percent" || mode === "percentage") {
+    const pct = Number(opts.percent);
+    const invoice = roundOptionFMoney(opts.invoiceAmount);
+    if (!Number.isFinite(pct) || pct <= 0) {
+      return {ok: false, error: "Enter a percent greater than 0."};
+    }
+    if (!Number.isFinite(invoice) || invoice <= 0) {
+      return {
+        ok: false,
+        error: "Carrier invoice total is required for a percent.",
+      };
+    }
+    const amount = roundOptionFMoney(invoice * (pct / 100));
+    if (!(amount > 0)) {
+      return {ok: false, error: "That percent is less than one cent."};
+    }
+    return {
+      ok: true,
+      mode: "percent",
+      amount,
+      percent: pct,
+      invoiceAmount: invoice,
+    };
+  }
+  return {
+    ok: false,
+    error: "Choose a flat amount or a percent of the invoice.",
+  };
+}
+
+/**
+ * Catalog row whose name is Freight, if the list has one.
+ * @param {Array<object>} choices Primus or static accessorial rows.
+ * @return {{name: string, code: string|null}}
+ */
+function freightAccessorialFromCatalog(choices) {
+  const rows = Array.isArray(choices) ? choices : [];
+  let hit = null;
+  for (const row of rows) {
+    const name = String((row && (row.name || row.label)) || "").trim();
+    if (name.toLowerCase() === "freight") {
+      hit = row;
+      break;
+    }
+  }
+  const rawCode = hit && hit.code ? String(hit.code).trim() : "";
+  return {name: "Freight", code: rawCode ? rawCode.toUpperCase() : null};
+}
+
+/**
+ * One Freight accessorial. The base freight rate is not bumped.
+ * @param {object} opts baseRate, amount, mode, percent, code.
+ * @return {object}
+ */
+function planOptionFCustomerBilling(opts) {
+  const baseRaw = Number(opts && opts.baseRate);
+  const baseRate = roundOptionFMoney(baseRaw);
+  const hasBase = Number.isFinite(baseRate) && baseRate > 0;
+  const amount = roundOptionFMoney(opts && opts.amount);
+  const code = opts && opts.code ?
+    String(opts.code).trim().toUpperCase() : "";
+  const mode = opts && opts.mode === "percent" ? "percent" : "flat";
+  const billLines = [{
+    name: "Freight",
+    code: code || null,
+    amount,
+    pricingMode: mode,
+    flatAmount: mode === "flat" ? amount : null,
+    markupPct: mode === "percent" ? Number(opts.percent) : null,
+  }];
+  const invoiceLines = customerInvoiceChargeLines(
+      hasBase ? baseRate : 0, billLines);
+  let note = `Customer rate $${amount.toFixed(2)} entered as ` +
+    "accessorial Freight.";
+  note += hasBase ?
+    ` Base freight stays $${baseRate.toFixed(2)}.` :
+    " Base freight rate unchanged.";
+  return {
+    bumpFreight: false,
+    customerRate: hasBase ? baseRate : null,
+    customerBillLines: billLines,
+    customerBillAccessorialTotal: amount,
+    customerChargeAmount: amount,
+    invoiceLines,
+    note,
+  };
+}
+
+/**
+ * Reads option F from the confirm form. Percent uses invoiceAmount.
+ * @param {object} body POST body.
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @return {object}
+ */
+function parseOptionFFromRequest(body, invoiceAmount) {
+  const src = body || {};
+  const mode = String(src.fMode || src.pricingMode || "").toLowerCase();
+  const shared = src.fValue != null ? src.fValue : null;
+  const flatRaw = src.fFlatAmount != null ? src.fFlatAmount :
+    (src.flatAmount != null ? src.flatAmount : shared);
+  const pctRaw = src.fPercent != null ? src.fPercent :
+    (src.percent != null ? src.percent : shared);
+  return computeOptionFCustomerRate({
+    mode: mode === "percentage" ? "percent" : mode,
+    flatAmount: flatRaw,
+    percent: pctRaw,
+    invoiceAmount,
+  });
+}
+
 function parseCustomerBillLinesFromRequest(body) {
   const raw = body && body.customerBillLinesJson;
   if (!raw) {
@@ -1556,6 +1700,18 @@ function seedCustomerBillLinesFromCharges(charges) {
   }));
   if (rows.length) return rows;
   return [{name: "", amount: "", carrierAmount: 0}];
+}
+
+/**
+ * Letter already saved on this additional charge, if any.
+ * A second A–F action must no-op when this is set.
+ * @param {object|null} charge additionalCharge object.
+ * @return {string|null} Uppercase letter, or null when still open.
+ */
+function savedAdditionalChargeDecision(charge) {
+  const decision = String((charge && charge.decision) || "").trim();
+  if (!decision) return null;
+  return decision.toUpperCase();
 }
 
 /**
@@ -1687,7 +1843,9 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);` +
     `document.getElementById("add-bill-line").onclick=` +
     `()=>addRow({name:"",carrierAmount:0});` +
-    `document.getElementById("option-b-form").onsubmit=(e)=>{` +
+    `const form=document.getElementById("option-b-form");` +
+    `form.onsubmit=(e)=>{` +
+    `if(form.dataset.submitted==="1"){e.preventDefault();return false;}` +
     `const lines=[];` +
     `for(const row of container.querySelectorAll(".bill-row")){` +
     `const sel=row.querySelector(".bill-name");` +
@@ -1715,7 +1873,102 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `alert("Enter a percent markup or a flat charge, or add an accessorial.");` +
     `e.preventDefault();return false;}` +
     `document.getElementById("customerBillLinesJson").value=` +
-    `JSON.stringify(lines);return true;};` +
+    `JSON.stringify(lines);` +
+    `form.dataset.submitted="1";` +
+    `const submitBtn=form.querySelector("button[type=submit]");` +
+    `if(submitBtn){submitBtn.disabled=true;` +
+    `submitBtn.textContent="Submitting...";}` +
+    `return true;};` +
+    `</script></body></html>`;
+}
+
+/**
+ * Option F confirm page. One flat amount or a percent of the invoice.
+ * @param {object} opts form options.
+ * @return {string} HTML page.
+ */
+function buildOptionFConfirmPage(opts) {
+  const fields = opts.fields || {};
+  const formAction = `${opts.baseUrl}/${opts.actionPath}`;
+  const hidden = Object.entries(fields)
+      .map(([name, value]) =>
+        `<input type="hidden" name="${esc(name)}" ` +
+        `value="${esc(String(value ?? ""))}">`)
+      .join("");
+  const invoice = roundOptionFMoney(opts.invoiceAmount);
+  const hasInvoice = Number.isFinite(invoice) && invoice > 0;
+  const invoiceText = hasInvoice ? money(invoice) : "unavailable";
+  const invoiceJs = hasInvoice ? String(invoice) : "0";
+  const title = opts.title || "F - customer rate as Freight";
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${esc(title)}</title></head>` +
+    `<body style="font-family:Arial,sans-serif;max-width:560px;` +
+    `margin:48px auto;padding:0 16px;color:#111827">` +
+    `<h1 style="font-size:22px;margin-bottom:12px">${esc(title)}</h1>` +
+    `<p style="font-size:16px;color:#374151;line-height:1.5">` +
+    `Load ${esc(String(opts.loadNumber || ""))}: enter one customer ` +
+    `rate. A flat amount is billed as entered. A percent is that ` +
+    `percent of the carrier invoice total (${esc(invoiceText)}). ` +
+    `Example: a $350 invoice at 10% is $35.00. Jerry enters that ` +
+    `amount in Primus as one accessorial named Freight, pays the ` +
+    `carrier invoice, and does not send a separate customer email.` +
+    `</p>` +
+    `<form method="POST" action="${esc(formAction)}" id="option-f-form" ` +
+    `style="margin-top:16px">` +
+    hidden +
+    `<p style="margin:12px 0"><label>` +
+    `<input type="radio" name="fMode" value="flat" checked> ` +
+    `Flat dollar amount</label></p>` +
+    `<p style="margin:12px 0"><label>` +
+    `<input type="radio" name="fMode" value="percent"> ` +
+    `Percent of the invoice total</label></p>` +
+    `<p><input type="number" name="fValue" id="fValue" min="0" ` +
+    `step="0.01" required placeholder="35.00 or 10" ` +
+    `style="width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
+    `border-radius:8px;font-size:16px;box-sizing:border-box"></p>` +
+    `<p id="f-preview" style="font-size:14px;color:#374151"></p>` +
+    `<button type="submit" style="background:#c2410c;color:#fff;` +
+    `border:none;padding:12px 20px;border-radius:8px;font-size:16px;` +
+    `font-weight:600;cursor:pointer">` +
+    `${esc(opts.confirmLabel || "Confirm option F")}</button>` +
+    `</form>` +
+    `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
+    `If you did not request this, close this page - nothing has been ` +
+    `changed yet.</p>` +
+    `<script>` +
+    `const invoiceAmount=${invoiceJs};` +
+    `const preview=document.getElementById("f-preview");` +
+    `const input=document.getElementById("fValue");` +
+    `function mode(){const el=document.querySelector(` +
+    `"input[name=fMode]:checked");return el?el.value:"flat";}` +
+    `function show(){const val=Number(input.value);` +
+    `if(!(val>0)){preview.textContent="";return;}` +
+    `if(mode()==="percent"){` +
+    `if(!(invoiceAmount>0)){preview.textContent=` +
+    `"Invoice total is missing, so a percent cannot be calculated.";` +
+    `return;}` +
+    `const amount=Math.round(invoiceAmount*(val/100)*100)/100;` +
+    `preview.textContent="Customer rate: $"+amount.toFixed(2)+` +
+    `" ("+val+"% of $"+invoiceAmount.toFixed(2)+")";` +
+    `}else{preview.textContent="Customer rate: $"+val.toFixed(2);}}` +
+    `input.addEventListener("input",show);` +
+    `document.querySelectorAll("input[name=fMode]").forEach((el)=>` +
+    `el.addEventListener("change",show));` +
+    `const form=document.getElementById("option-f-form");` +
+    `form.onsubmit=(e)=>{` +
+    `if(form.dataset.submitted==="1"){e.preventDefault();return false;}` +
+    `const val=Number(input.value);` +
+    `if(!(val>0)){alert("Enter an amount greater than 0.");` +
+    `e.preventDefault();return false;}` +
+    `if(mode()==="percent"&&!(invoiceAmount>0)){` +
+    `alert("The carrier invoice total is missing.");` +
+    `e.preventDefault();return false;}` +
+    `form.dataset.submitted="1";` +
+    `const submitBtn=form.querySelector("button[type=submit]");` +
+    `if(submitBtn){submitBtn.disabled=true;` +
+    `submitBtn.textContent="Submitting...";}` +
+    `return true;};` +
     `</script></body></html>`;
 }
 
@@ -1763,7 +2016,13 @@ module.exports = {
   shouldCloseAdditionalChargeTask,
   buildDispatcherCustomerNotifyTemplate,
   buildDispatcherNotifyReminderEmail,
+  savedAdditionalChargeDecision,
   buildOptionBAccessorialConfirmPage,
+  buildOptionFConfirmPage,
+  computeOptionFCustomerRate,
+  freightAccessorialFromCatalog,
+  planOptionFCustomerBilling,
+  parseOptionFFromRequest,
   customerBillLinesHtml,
   sumCustomerBillLines,
   normalizeCustomerBillLines,
