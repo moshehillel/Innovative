@@ -3485,6 +3485,7 @@ exports.processPrimusWorkflow = onRequest(
 
           let primusEmailFailed = false;
           let primusEmailFailureReason = "";
+          let customerInvoiceEmailRecord = null;
 
           if (primusEmailBlockers.length) {
             primusEmailFailed = true;
@@ -3504,6 +3505,13 @@ exports.processPrimusWorkflow = onRequest(
                 };
               }
             }
+            const invoiceUnchanged = !!(invoiceGenerationResult &&
+              invoiceGenerationResult.reused);
+            const guardTotal = invoiceGenerationResult &&
+              invoiceGenerationResult.invoiceTotal != null ?
+              invoiceGenerationResult.invoiceTotal :
+              (Number(customerRate) +
+                Number(customerBillAccessorialTotal || 0));
             const primusEmailResult = await emailBOLDocs({
               booking: bookingForEmail,
               loadNumber: invoice.loadNumber,
@@ -3512,10 +3520,53 @@ exports.processPrimusWorkflow = onRequest(
               customerInvoiceId: finalCustomerInvoiceId,
               invoiceNumber: issuedInvoiceNumber || "0",
               chargesTotal: customerRate,
+              customerRate,
+              customerInvoiceTotal: guardTotal,
+              customerBillLines: optionBCustomerBillLines,
+              invoiceUnchanged,
+              firestoreInvoiceId: invoiceId,
               podPdf: podPdfForEmail,
               extraDriveFileIds: extraDriveIds,
             });
-            if (primusEmailResult.ok) {
+            if (primusEmailResult.ok && primusEmailResult.skipped) {
+              customerInvoiceEmailRecord = {
+                sent: false,
+                skipped: true,
+                reason: primusEmailResult.reason ||
+                  "customer_invoice_unchanged",
+                customerInvoiceId: finalCustomerInvoiceId ?
+                  String(finalCustomerInvoiceId) : null,
+                invoiceNumber: issuedInvoiceNumber || null,
+              };
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "final_email_sent",
+                stepStatus: "skipped",
+                reason: customerInvoiceEmailRecord.reason,
+                output: {
+                  to: customerEmail,
+                  customerInvoiceId: finalCustomerInvoiceId,
+                  invoiceNumber: issuedInvoiceNumber || null,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "Customer invoice email skipped — already sent unchanged", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    to: customerEmail,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    invoiceNumber: issuedInvoiceNumber,
+                    reason: customerInvoiceEmailRecord.reason,
+                  });
+            } else if (primusEmailResult.ok) {
+              customerInvoiceEmailRecord = {
+                sent: true,
+                skipped: false,
+                reason: null,
+                customerInvoiceId: finalCustomerInvoiceId ?
+                  String(finalCustomerInvoiceId) : null,
+                invoiceNumber: issuedInvoiceNumber || null,
+              };
               await logWorkflowStep({
                 invoiceId,
                 stepName: "final_email_sent",
@@ -3606,7 +3657,11 @@ exports.processPrimusWorkflow = onRequest(
               });
           await invoiceDoc.ref.update({
             decisionStage: "completed",
-            decisionReason: "Primus workflow completed successfully",
+            decisionReason: customerInvoiceEmailRecord &&
+              customerInvoiceEmailRecord.skipped ?
+              "Customer invoice already sent and unchanged" :
+              "Primus workflow completed successfully",
+            customerInvoiceEmail: customerInvoiceEmailRecord || null,
             customerName: customerName,
             customerRate: customerRate,
             profit: profit,

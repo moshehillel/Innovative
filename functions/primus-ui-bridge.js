@@ -40,6 +40,8 @@ const {
 } = require("./email-outbound-safe");
 const workflowErrors = require("./workflow-error-messages");
 const drayageIntake = require("./drayage-intake");
+const customerInvoiceSendGuard = require(
+    "./customer-invoice-send-guard");
 
 const admin = require("firebase-admin");
 
@@ -2193,8 +2195,71 @@ async function emailBOLDocs(args) {
     }
   }
 
+  let sendClaim = null;
+  if (!args.forceResend) {
+    try {
+      const decision =
+        await customerInvoiceSendGuard.evaluateCustomerInvoiceResend(
+            firestore(), {
+              loadNumber,
+              customerInvoiceId,
+              invoiceNumber,
+              invoiceTotal: args.customerInvoiceTotal,
+              customerRate: args.customerRate != null ?
+                args.customerRate : args.chargesTotal,
+              customerBillLines: args.customerBillLines,
+              invoiceUnchanged: args.invoiceUnchanged === true,
+              firestoreInvoiceId: args.firestoreInvoiceId || null,
+              to: customerEmail,
+            });
+      if (decision.skip) {
+        if (writeLog) {
+          await writeLog("info", "primus",
+              "Customer invoice email skipped — already sent unchanged", {
+                loadNumber,
+                customerInvoiceId: String(customerInvoiceId),
+                invoiceNumber,
+                reason: decision.reason,
+                priorInvoiceId: decision.priorInvoiceId || null,
+              });
+        }
+        return {
+          ok: true,
+          skipped: true,
+          reason: decision.reason,
+          to: customerEmail,
+          driveFileIds: [],
+          attachments: null,
+        };
+      }
+      sendClaim = decision.claim || null;
+    } catch (guardErr) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "Customer invoice resend check failed — email will send", {
+              loadNumber,
+              error: guardErr && guardErr.message,
+            });
+      }
+    }
+  }
+
   const result = await managePhpPost(params);
   const success = isEmailBOLDocsSuccess(result.json);
+  if (sendClaim) {
+    try {
+      await customerInvoiceSendGuard.finishCustomerInvoiceSend(
+          sendClaim, success ? "sent" : "failed");
+    } catch (markErr) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "Could not record customer invoice send", {
+              loadNumber,
+              error: markErr && markErr.message,
+            });
+      }
+    }
+  }
   const attachments = {
     invoiceSelected: true,
     bolSelected: !args.invoiceOnly,

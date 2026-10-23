@@ -4859,6 +4859,10 @@ async function handleDrayageGtgReturn(args) {
     customerInvoiceId: entered.customerInvoiceId,
     invoiceNumber: entered.invoiceNumber || "0",
     chargesTotal: entered.chargesTotal != null ? entered.chargesTotal : 0,
+    customerRate: entered.chargesTotal,
+    customerInvoiceTotal: entered.chargesTotal,
+    invoiceUnchanged: entered.alreadyIssued === true &&
+      !Number(entered.removedUnbilledActualCosts || 0),
     invoiceOnly: true,
   });
   if (!mailed.ok) {
@@ -4867,7 +4871,9 @@ async function handleDrayageGtgReturn(args) {
         "drayage_gtg_email_failed");
   }
 
-  await writeLog("info", "mail", "Drayage GTG invoiced", {
+  await writeLog("info", "mail", mailed.skipped ?
+    "Drayage invoice already sent — unchanged, not resent" :
+    "Drayage GTG invoiced", {
     messageId,
     loadNumber,
     invoiceNumber,
