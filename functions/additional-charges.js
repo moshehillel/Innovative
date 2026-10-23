@@ -914,11 +914,24 @@ function buildAdditionalChargeApprovalEmail(opts) {
 }
 
 /**
+ * Trims option D notes. Empty is allowed.
+ * @param {*} value Raw notes from the confirm form.
+ * @return {string}
+ */
+function normalizeDisputeNotes(value) {
+  return String(value == null ? "" : value)
+      .replace(/\r\n/g, "\n")
+      .trim()
+      .slice(0, 4000);
+}
+
+/**
  * Builds a carrier dispute draft for manual submission. Most LTL carriers
  * take disputes on their website portal, so this is copy/paste wording; TL
  * disputes go to the carrier email on file.
  * @param {object} opts loadNumber, carrierName, proNumber, invoiceNumber,
- *   invoiceAmount, expectedAmount, charges, category, freightMismatch.
+ *   invoiceAmount, expectedAmount, charges, category, freightMismatch,
+ *   disputeNotes.
  * @return {{subject: string, html: string}}
  */
 function buildDisputeEmailDraft(opts) {
@@ -927,6 +940,7 @@ function buildDisputeEmailDraft(opts) {
     invoiceAmount, expectedAmount, charges, category, freightMismatch,
     customerRate, hasCertificate,
   } = opts;
+  const disputeNotes = normalizeDisputeNotes(opts.disputeNotes);
 
   const effectiveCategory = resolveEffectiveChargeCategory({
     charges,
@@ -986,6 +1000,9 @@ function buildDisputeEmailDraft(opts) {
         `${money(c && c.amount)}`)
       .join("<br>");
 
+  const notesBlock = disputeNotes ?
+    `Notes on what to dispute:<br>` +
+    `${esc(disputeNotes).replace(/\n/g, "<br>")}<br><br>` : "";
   const disputeText =
     `To: ${carrierName || "Carrier"} — Billing / Disputes<br><br>` +
     `RE: Invoice ${invoiceNumber || "—"}` +
@@ -996,6 +1013,7 @@ function buildDisputeEmailDraft(opts) {
     `${money(expectedAmount)} (difference ${money(Math.abs(diff))}).<br><br>` +
     `${basis}<br><br>` +
     (chargeLines ? `Disputed charge(s):<br>${chargeLines}<br><br>` : "") +
+    notesBlock +
     `Please review and issue a corrected invoice. Payment for the ` +
     `undisputed portion is being processed per our standard terms.<br><br>` +
     `Thank you,<br>Innovative Carriers — Accounting`;
@@ -1408,6 +1426,9 @@ async function updateFollowUp(db, opts) {
     update.decisionAt = admin.firestore.FieldValue.serverTimestamp();
   }
   if (opts.notes) update.notes = opts.notes;
+  if (opts.disputeNotes != null) {
+    update.disputeNotes = normalizeDisputeNotes(opts.disputeNotes);
+  }
   await ref.update(update);
 }
 
@@ -1737,6 +1758,15 @@ function buildOptionBAccessorialConfirmPage(opts) {
       Array.isArray(opts.accessorialOptions) ? opts.accessorialOptions : [])
       .replace(/</g, "\\u003c")
       .replace(/-->/g, "--\\u003e");
+  const notesHtml = opts.showDisputeNotes ?
+    `<label for="disputeNotes" style="display:block;font-size:14px;` +
+    `font-weight:600;color:#374151;margin:16px 0 8px">` +
+    `Notes on what to dispute</label>` +
+    `<textarea name="disputeNotes" id="disputeNotes" rows="4" ` +
+    `placeholder="What should be disputed?" ` +
+    `style="width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
+    `border-radius:8px;font-size:16px;box-sizing:border-box;` +
+    `font-family:Arial,sans-serif"></textarea>` : "";
   const baseRateHtml = baseRate > 0 ?
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
     `<strong>Base customer rate (unchanged):</strong> ` +
@@ -1781,6 +1811,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `<div id="bill-lines"></div>` +
     `<button type="button" class="add-btn" id="add-bill-line">` +
     `+ Add accessorial</button>` +
+    notesHtml +
     `<div style="margin-top:20px">` +
     `<button type="submit" style="background:${btnColor};color:#fff;` +
     `border:none;padding:12px 20px;border-radius:8px;font-size:16px;` +
@@ -2009,6 +2040,7 @@ module.exports = {
   pickCarrierInvoiceAttachment,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
+  normalizeDisputeNotes,
   buildCustomerChargeNotificationEmail,
   planOptionACustomerBilling,
   customerInvoiceChargeLines,

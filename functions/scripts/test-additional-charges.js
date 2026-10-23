@@ -253,6 +253,32 @@ check("accessorial dispute names school delivery",
     accessorialDispute.html.includes("School delivery fee"), true);
 check("accessorial dispute uses unauthorized wording",
     accessorialDispute.html.includes("not authorized"), true);
+check("plain dispute draft has no notes label",
+    dispute.html.includes("Notes on what to dispute"), false);
+const notedDispute = ac.buildDisputeEmailDraft({
+  loadNumber: "264172",
+  carrierName: "Central Transport",
+  invoiceNumber: "CT-9",
+  invoiceAmount: 550,
+  expectedAmount: 430,
+  charges: [],
+  category: ac.CHARGE_CATEGORY.RATE_INCREASE,
+  disputeNotes: "  Detention was not authorized.\nDo not pay it.  ",
+});
+check("dispute draft includes typed notes",
+    notedDispute.html.includes("Detention was not authorized."), true);
+check("dispute draft keeps the notes line break",
+    notedDispute.html.includes("Do not pay it."), true);
+check("dispute draft labels the notes",
+    notedDispute.html.includes("Notes on what to dispute"), true);
+check("dispute notes are escaped",
+    ac.buildDisputeEmailDraft({
+      loadNumber: "1",
+      invoiceAmount: 10,
+      expectedAmount: 5,
+      charges: [],
+      disputeNotes: "<script>alert(1)</script>",
+    }).html.includes("<script>alert"), false);
 
 // 5. Small-charge filter and Primus partition
 const breakdown = [
@@ -673,6 +699,22 @@ check("confirm page ignores a second submit",
     confirmPage.includes('form.dataset.submitted==="1"'), true);
 check("confirm page locks the button after submit",
     confirmPage.includes('form.dataset.submitted="1"'), true);
+check("option B confirm has no dispute notes box",
+    confirmPage.includes('name="disputeNotes"'), false);
+const disputeConfirm = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option D",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  allowEmpty: true,
+  showDisputeNotes: true,
+  fields: {invoiceId: "1", option: "d"},
+});
+check("option D confirm has dispute notes",
+    disputeConfirm.includes("Notes on what to dispute") &&
+    disputeConfirm.includes('name="disputeNotes"'), true);
+check("option D notes are not required",
+    disputeConfirm.includes("required"), false);
+new Function(disputeConfirm.split("<script>")[1].split("</script>")[0]);
 const optionFPage = ac.buildOptionFConfirmPage({
   title: "F - customer rate as Freight",
   baseUrl: "https://example.test",

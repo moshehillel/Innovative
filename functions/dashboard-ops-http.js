@@ -239,6 +239,7 @@ async function handleAdditionalChargeDecision(req, res) {
       fValue: body.fValue,
       fFlatAmount: body.fFlatAmount,
       fPercent: body.fPercent,
+      disputeNotes: body.disputeNotes,
     });
     if (!result.ok) {
       return res.status(result.status || 400).json(result);
@@ -285,6 +286,7 @@ async function handleAdditionalChargeDecision(req, res) {
             followUpId: body.followUpId || null,
             invoiceId,
             tenantId: tenant.tenantId,
+            disputeNotes: body.disputeNotes,
           }).catch((err) => {
         console.error("markTaskInDispute:", err.message);
       });

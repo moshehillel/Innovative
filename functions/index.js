@@ -3290,6 +3290,7 @@ async function handleAdditionalChargeAction(req, res) {
             baseUrl: functionsBaseUrl(),
             baseCustomerRate: currentRate,
             allowEmpty,
+            showDisputeNotes: option === "d",
             accessorialOptions,
             carrierCharges: Array.isArray(charge.charges) ?
               charge.charges : [],
@@ -3376,6 +3377,12 @@ async function handleAdditionalChargeAction(req, res) {
 
     if (option === "d") {
       // Not approved — generate the dispute draft for manual submission.
+      const disputeNotes = additionalCharges.normalizeDisputeNotes(
+          req.body && req.body.disputeNotes);
+      const followNotes = disputeNotes ?
+        ("Dispute draft emailed for manual submission. " +
+          "Notes on what to dispute: " + disputeNotes) :
+        "Dispute draft emailed for manual submission";
       const dispute = additionalCharges.buildDisputeEmailDraft({
         loadNumber: invoice.loadNumber,
         carrierName: invoice.carrierName,
@@ -3390,6 +3397,7 @@ async function handleAdditionalChargeAction(req, res) {
         hasCertificate: charge.hasCertificate,
         customerRate: invoice.customerRate ||
           customerRateFromBooking(booking),
+        disputeNotes,
       });
       await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
         type: "carrier_dispute_draft",
@@ -3402,6 +3410,7 @@ async function handleAdditionalChargeAction(req, res) {
         "additionalCharge.approved": false,
         "additionalCharge.status": "disputed",
         "additionalCharge.customerBillLines": optionBCustomerBillLines || [],
+        "additionalCharge.disputeNotes": disputeNotes,
         "additionalCharge.decidedAt":
           admin.firestore.FieldValue.serverTimestamp(),
         "decisionStage": "additional_charge_disputed",
@@ -3413,7 +3422,8 @@ async function handleAdditionalChargeAction(req, res) {
         invoiceId: String(invoiceId),
         status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
         decision,
-        notes: "Dispute draft emailed for manual submission",
+        notes: followNotes,
+        disputeNotes,
       });
       await writeLog("info", "workflow",
           "Additional charge NOT approved — dispute draft generated", {
@@ -3422,6 +3432,7 @@ async function handleAdditionalChargeAction(req, res) {
       await dashboardTasks.markTaskInDispute(db, additionalCharges, {
         invoiceId: String(invoiceId),
         tenantId: tenant.tenantId,
+        disputeNotes,
       }).catch((err) => {
         console.error("markTaskInDispute:", err.message);
       });
@@ -13940,6 +13951,10 @@ async function applyAdditionalChargeFromDashboard(opts) {
     if (opts.fValue != null) body.fValue = opts.fValue;
     if (opts.fFlatAmount != null) body.fFlatAmount = opts.fFlatAmount;
     if (opts.fPercent != null) body.fPercent = opts.fPercent;
+  }
+  if (option === "d") {
+    body.disputeNotes = additionalCharges.normalizeDisputeNotes(
+        opts.disputeNotes);
   }
 
   let statusCode = 200;

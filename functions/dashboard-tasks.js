@@ -312,6 +312,7 @@ function serializeTaskDoc(doc) {
       dispatcherKey: d.dispatcherKey || null,
       chargePhase: d.chargePhase || null,
       followUpStatus: d.followUpStatus || null,
+      disputeNotes: d.disputeNotes || null,
       ownershipHistory: Array.isArray(d.ownershipHistory) ?
         d.ownershipHistory : [],
       ...mailFiles.serializeMailFields(d),
@@ -426,14 +427,15 @@ const TASK_LIST_FIELDS = [
   "loadNumber", "proNumber", "carrierName", "messageId", "invoiceId",
   "followUpId", "department", "reason", "status", "chargesTotal",
   "ownerBucket", "awaitingReplyFrom", "dispatcherEmail", "dispatcherName",
-  "dispatcherKey", "chargePhase", "followUpStatus", "ownershipHistory",
+  "dispatcherKey", "chargePhase", "followUpStatus", "disputeNotes",
+  "ownershipHistory",
   "receivedAt", "receivedAtSource", "emailReceivedAt", "attachments",
   "mailboxLookupAt", "createdAt", "dismissedAt",
 ];
 
 /** Follow-up fields for list/merge. Excludes emailHtml. */
 const CHARGE_LIST_FIELDS = [
-  "tenantId", "status", "chargePhase", "decision", "notes",
+  "tenantId", "status", "chargePhase", "decision", "notes", "disputeNotes",
   "emailSubject", "emailTo",
   "emailCc", "loadNumber", "carrierName", "messageId", "invoiceId",
   "category", "chargesTotal", "invoiceAmount", "ownerBucket",
@@ -734,6 +736,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
       chargePhase: isDispute ? "dispute" : (d.chargePhase || null),
       followUpStatus: d.status || null,
       decision: d.decision || null,
+      disputeNotes: d.disputeNotes || null,
       ownershipHistory: Array.isArray(d.ownershipHistory) ?
         d.ownershipHistory : [],
       ...mailFiles.serializeMailFields({
@@ -755,6 +758,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     if (!ownership.sameTenant(d.tenantId, tenantId)) continue;
     task.followUpStatus = d.status || task.followUpStatus || null;
     if (d.decision) task.decision = d.decision;
+    if (d.disputeNotes) task.disputeNotes = d.disputeNotes;
     if (d.status === additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING ||
         d.chargePhase === "dispute" || task.chargePhase === "dispute") {
       task.chargePhase = "dispute";
@@ -1204,6 +1208,8 @@ async function markTaskInDispute(db, additionalChargesMod, opts) {
     ownerBucket: ownership.OWNER_BUCKET.ACCOUNTING,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   };
+  const disputeNotes = String(opts.disputeNotes || "").trim();
+  if (disputeNotes) patch.disputeNotes = disputeNotes.slice(0, 4000);
 
   if (opts.taskId && opts.source !== "additionalCharges") {
     const ref = db.collection(TASK_COLLECTION).doc(String(opts.taskId));
@@ -1223,12 +1229,14 @@ async function markTaskInDispute(db, additionalChargesMod, opts) {
     const snap = await ref.get();
     if (snap.exists &&
         ownership.sameTenant((snap.data() || {}).tenantId, opts.tenantId)) {
-      await ref.update({
+      const followPatch = {
         status: additionalChargesMod.FOLLOW_UP_STATUS.DISPUTING,
         chargePhase: "dispute",
         resolved: false,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+      };
+      if (disputeNotes) followPatch.disputeNotes = disputeNotes;
+      await ref.update(followPatch);
       updates.push("followUp");
     }
   }
@@ -1672,6 +1680,7 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
         chargePhase: isDispute ? "dispute" : (d.chargePhase || null),
         followUpStatus: d.status || null,
         decision: d.decision || null,
+        disputeNotes: d.disputeNotes || null,
         createdAt: d.createdAt && d.createdAt.toDate ?
           d.createdAt.toDate().toISOString() : null,
       });
