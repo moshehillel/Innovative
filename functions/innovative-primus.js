@@ -1185,11 +1185,27 @@ exports.processPrimusWorkflow = onRequest(
           additionalCharge.source === "unrecognized_charges") ?
           (Number(additionalCharge.amount) || 0) : 0;
         const additionalChargesMod = require("./additional-charges");
+        const decisionLetter = String(
+            (additionalCharge && additionalCharge.decision) || "",
+        ).toUpperCase();
+        // A, B, and F itemize accessorials. The freight rate stays the
+        // base sell rate. F is one accessorial named Freight.
+        const billsAccessorials = decisionLetter === "A" ||
+          decisionLetter === "B" || decisionLetter === "F";
         const optionBCustomerBillLines = (additionalChargeApproved &&
-          additionalCharge &&
-          String(additionalCharge.decision || "").toUpperCase() === "B" &&
+          additionalCharge && billsAccessorials &&
           Array.isArray(additionalCharge.customerBillLines)) ?
           additionalCharge.customerBillLines : [];
+        if (decisionLetter === "A" && optionBCustomerBillLines.length) {
+          const original = Number(additionalCharge.originalCustomerRate);
+          const current = Number(invoice.customerRate);
+          const extra = additionalChargesMod.sumCustomerBillLines(
+              optionBCustomerBillLines);
+          if (original > 0 && extra > 0 &&
+              Math.abs((current - original) - extra) < 0.05) {
+            invoice.customerRate = original;
+          }
+        }
         const customerBillAccessorialTotal = optionBCustomerBillLines.length ?
           additionalChargesMod.sumCustomerBillLines(optionBCustomerBillLines) :
           0;
@@ -1746,21 +1762,43 @@ exports.processPrimusWorkflow = onRequest(
         // restart the workflow.
         if (invoice.additionalCharge &&
             !invoice.additionalCharge.decision) {
-          await logWorkflowStep({
-            invoiceId,
-            stepName: "additional_charge_gate",
-            stepStatus: "skipped",
-            reason: "Awaiting A/B/C/D additional-charge decision",
-          });
-          await invoiceDoc.ref.update({
-            processingLock: false,
-            finalWorkflowStatus: "additional_charge_pending_approval",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          return res.json({
-            ok: false,
-            error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
-          });
+          const freshSnap = await invoiceDoc.ref.get();
+          const fresh = freshSnap.exists ? (freshSnap.data() || {}) : {};
+          const freshCharge = fresh.additionalCharge || null;
+          if (freshCharge && freshCharge.decision) {
+            invoice.additionalCharge = freshCharge;
+            if (Array.isArray(fresh.unrecognizedCharges)) {
+              invoice.unrecognizedCharges = fresh.unrecognizedCharges;
+            }
+            if (Array.isArray(fresh.chargesNeedProof)) {
+              invoice.chargesNeedProof = fresh.chargesNeedProof;
+            }
+            if (fresh.customerRate != null) {
+              invoice.customerRate = fresh.customerRate;
+            }
+            await writeLog("info", "workflow",
+                "Additional-charge decision arrived during paperwork", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  decision: freshCharge.decision,
+                });
+          } else {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "additional_charge_gate",
+              stepStatus: "skipped",
+              reason: "Awaiting A/B/C/D additional-charge decision",
+            });
+            await invoiceDoc.ref.update({
+              processingLock: false,
+              finalWorkflowStatus: "additional_charge_pending_approval",
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            return res.json({
+              ok: false,
+              error: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
+            });
+          }
         }
 
         if (
@@ -2102,7 +2140,8 @@ exports.processPrimusWorkflow = onRequest(
             additionalChargesMod.buildAdditionalChargeApprovalEmail({
               baseUrl: `https://${req.get("host")}`,
               invoiceId,
-              tenantId: (req.body && req.body.tenantId) || null,
+              tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
               loadNumber: invoice.loadNumber,
               carrierName: invoice.carrierName,
               customerName: invoice.customerName || null,
@@ -2141,7 +2180,8 @@ exports.processPrimusWorkflow = onRequest(
                 carrierName: invoice.carrierName,
                 customerName: invoice.customerName || null,
                 invoiceId,
-                tenantId: (req.body && req.body.tenantId) || null,
+                tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                 category: additionalChargesMod.CHARGE_CATEGORY.ACCESSORIAL,
                 charges: actionCharges,
                 chargesTotal: proofTotal,
@@ -2489,7 +2529,8 @@ exports.processPrimusWorkflow = onRequest(
                   req,
                   code: "MISSING_CUSTOMER",
                   invoiceId,
-                  tenantId: (req.body && req.body.tenantId) || null,
+                  tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                   loadNumber: invoice.loadNumber,
                   context: {
                     loadNumber: invoice.loadNumber,
@@ -2654,7 +2695,8 @@ exports.processPrimusWorkflow = onRequest(
                   req,
                   code: "MISSING_RATE",
                   invoiceId,
-                  tenantId: (req.body && req.body.tenantId) || null,
+                  tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                   loadNumber: invoice.loadNumber,
                   context: {
                     loadNumber: invoice.loadNumber,
@@ -2760,7 +2802,8 @@ exports.processPrimusWorkflow = onRequest(
                   req,
                   code: isLowMargin ? "LOW_MARGIN" : "MISSING_RATE",
                   invoiceId,
-                  tenantId: (req.body && req.body.tenantId) || null,
+                  tenantId: (invoice && invoice.tenantId) ||
+                  (req.body && req.body.tenantId) || "default",
                   loadNumber: invoice.loadNumber,
                   context: {
                     loadNumber: invoice.loadNumber,
@@ -3442,6 +3485,7 @@ exports.processPrimusWorkflow = onRequest(
 
           let primusEmailFailed = false;
           let primusEmailFailureReason = "";
+          let customerInvoiceEmailRecord = null;
 
           if (primusEmailBlockers.length) {
             primusEmailFailed = true;
@@ -3461,6 +3505,15 @@ exports.processPrimusWorkflow = onRequest(
                 };
               }
             }
+            const reusedIssued = !!(invoiceGenerationResult &&
+              invoiceGenerationResult.reused);
+            const invoiceUnchanged = reusedIssued &&
+              optionBCustomerBillLines.length === 0;
+            const guardTotal = invoiceGenerationResult &&
+              invoiceGenerationResult.invoiceTotal != null ?
+              invoiceGenerationResult.invoiceTotal :
+              (Number(customerRate) +
+                Number(customerBillAccessorialTotal || 0));
             const primusEmailResult = await emailBOLDocs({
               booking: bookingForEmail,
               loadNumber: invoice.loadNumber,
@@ -3469,10 +3522,53 @@ exports.processPrimusWorkflow = onRequest(
               customerInvoiceId: finalCustomerInvoiceId,
               invoiceNumber: issuedInvoiceNumber || "0",
               chargesTotal: customerRate,
+              customerRate,
+              customerInvoiceTotal: guardTotal,
+              customerBillLines: optionBCustomerBillLines,
+              invoiceUnchanged,
+              firestoreInvoiceId: invoiceId,
               podPdf: podPdfForEmail,
               extraDriveFileIds: extraDriveIds,
             });
-            if (primusEmailResult.ok) {
+            if (primusEmailResult.ok && primusEmailResult.skipped) {
+              customerInvoiceEmailRecord = {
+                sent: false,
+                skipped: true,
+                reason: primusEmailResult.reason ||
+                  "customer_invoice_unchanged",
+                customerInvoiceId: finalCustomerInvoiceId ?
+                  String(finalCustomerInvoiceId) : null,
+                invoiceNumber: issuedInvoiceNumber || null,
+              };
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "final_email_sent",
+                stepStatus: "skipped",
+                reason: customerInvoiceEmailRecord.reason,
+                output: {
+                  to: customerEmail,
+                  customerInvoiceId: finalCustomerInvoiceId,
+                  invoiceNumber: issuedInvoiceNumber || null,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "Customer invoice email skipped — already sent unchanged", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    to: customerEmail,
+                    customerInvoiceId: finalCustomerInvoiceId,
+                    invoiceNumber: issuedInvoiceNumber,
+                    reason: customerInvoiceEmailRecord.reason,
+                  });
+            } else if (primusEmailResult.ok) {
+              customerInvoiceEmailRecord = {
+                sent: true,
+                skipped: false,
+                reason: null,
+                customerInvoiceId: finalCustomerInvoiceId ?
+                  String(finalCustomerInvoiceId) : null,
+                invoiceNumber: issuedInvoiceNumber || null,
+              };
               await logWorkflowStep({
                 invoiceId,
                 stepName: "final_email_sent",
@@ -3491,6 +3587,7 @@ exports.processPrimusWorkflow = onRequest(
                   "Customer documents emailed via Primus emailBOLDocs", {
                     invoiceId,
                     flowId,
+                    loadNumber: invoice.loadNumber || null,
                     to: customerEmail,
                     customerInvoiceId: finalCustomerInvoiceId,
                     invoiceNumber: issuedInvoiceNumber,
@@ -3556,9 +3653,18 @@ exports.processPrimusWorkflow = onRequest(
             });
           }
 
+          const closeChargeTask = additionalChargesMod
+              .shouldCloseAdditionalChargeTask({
+                decision: additionalCharge && additionalCharge.decision,
+                finalWorkflowStatus: "completed",
+              });
           await invoiceDoc.ref.update({
             decisionStage: "completed",
-            decisionReason: "Primus workflow completed successfully",
+            decisionReason: customerInvoiceEmailRecord &&
+              customerInvoiceEmailRecord.skipped ?
+              "Customer invoice already sent and unchanged" :
+              "Primus workflow completed successfully",
+            customerInvoiceEmail: customerInvoiceEmailRecord || null,
             customerName: customerName,
             customerRate: customerRate,
             profit: profit,
@@ -3567,8 +3673,26 @@ exports.processPrimusWorkflow = onRequest(
             customerInvoiceId: finalCustomerInvoiceId,
             issuedInvoiceNumber: issuedInvoiceNumber || null,
             processingLock: false,
+            ...(closeChargeTask ? {reviewStatus: "not_needed"} : {}),
             updatedAt: admin.firestore.FieldValue.serverTimestamp(),
           });
+          if (closeChargeTask) {
+            try {
+              const dashboardTasks = require("./dashboard-tasks");
+              await dashboardTasks.closeAdditionalChargeWork(
+                  db, additionalChargesMod, {
+                    invoiceId,
+                    tenantId: invoice.tenantId || "default",
+                  });
+            } catch (closeErr) {
+              await writeLog("warn", "workflow",
+                  "Additional-charge task close failed", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    error: closeErr.message,
+                  });
+            }
+          }
 
           await writeLog("info", "workflow", "Primus workflow completed", {
             invoiceId,

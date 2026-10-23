@@ -93,7 +93,7 @@ const noMatch = ac.evaluateRequoteMatch({
 });
 check("rate mismatch over $10", noMatch.matched, false);
 
-// 3. Approval email contains all five buttons (signed confirm links)
+// 3. Approval email contains every decision button (signed confirm links)
 const email = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
   invoiceId: "inv123",
@@ -123,7 +123,7 @@ check("email shows quote number",
 check("email shows customer rate", email.html.includes("$545.00"), true);
 check("email shows customer rate label",
     email.html.includes("Customer rate (Primus)"), true);
-for (const opt of ["a", "b", "c", "d", "e"]) {
+for (const opt of ["a", "b", "c", "d", "e", "f"]) {
   check(`button ${opt} has action`,
       email.html.includes("additionalChargeAction") &&
       email.html.includes(`invoiceId=inv123`) &&
@@ -172,13 +172,29 @@ const reminder = ac.buildDispatcherNotifyReminderEmail({
   customerRate: 545,
   customerBillLines: [{name: "Reweigh Fee", amount: 120}],
 });
-check("dispatcher reminder has ready template",
-    reminder.html.includes("Ready-to-send customer email"), true);
-check("dispatcher reminder has updated rate",
-    reminder.html.includes("$665.00"), true);
+check("dispatcher reminder uses the customer notice",
+    reminder.html.includes("We wanted to make you aware") &&
+    reminder.html.includes("Hello Miworld"), true);
+check("dispatcher reminder totals the difference",
+    reminder.html.includes("Total Additional Charges") &&
+    reminder.html.includes("$120.00"), true);
 check("dispatcher reminder subject ASCII",
     !reminder.subject.includes("\u2014") &&
-    reminder.subject.includes(" - "), true);
+    reminder.subject.includes("264172"), true);
+const sameNotice = ac.buildCustomerChargeNotificationEmail({
+  customerName: "Miworld",
+  loadNumber: "264172",
+  charges: [{label: "Reweigh Fee", amount: 120}],
+  chargesTotal: 120,
+});
+check("dispatcher template matches the customer notice",
+    reminder.subject === sameNotice.subject &&
+    reminder.html === sameNotice.html, true);
+check("dispatcher customer template is delivered",
+    ac.mustDeliverDespiteDashboardPark({
+      type: "additional_charge_dispatcher_task",
+      to: "tina@innovativecarriers.com",
+    }), true);
 const forward = ac.buildDispatcherCustomerNotifyTemplate({
   loadNumber: "264172",
   customerName: "Miworld",
@@ -189,9 +205,10 @@ const forward = ac.buildDispatcherCustomerNotifyTemplate({
   newCustomerRate: 665,
 });
 check("forward template mentions load",
-    forward.html.includes("264172"), true);
-check("forward template mentions new rate",
-    forward.html.includes("$665.00"), true);
+    forward.subject.includes("264172"), true);
+check("forward template totals the difference",
+    forward.html.includes("Total Additional Charges") &&
+    forward.html.includes("$120.00"), true);
 const dispute = ac.buildDisputeEmailDraft({
   loadNumber: "264172",
   carrierName: "Central Transport",
@@ -236,6 +253,32 @@ check("accessorial dispute names school delivery",
     accessorialDispute.html.includes("School delivery fee"), true);
 check("accessorial dispute uses unauthorized wording",
     accessorialDispute.html.includes("not authorized"), true);
+check("plain dispute draft has no notes label",
+    dispute.html.includes("Notes on what to dispute"), false);
+const notedDispute = ac.buildDisputeEmailDraft({
+  loadNumber: "264172",
+  carrierName: "Central Transport",
+  invoiceNumber: "CT-9",
+  invoiceAmount: 550,
+  expectedAmount: 430,
+  charges: [],
+  category: ac.CHARGE_CATEGORY.RATE_INCREASE,
+  disputeNotes: "  Detention was not authorized.\nDo not pay it.  ",
+});
+check("dispute draft includes typed notes",
+    notedDispute.html.includes("Detention was not authorized."), true);
+check("dispute draft keeps the notes line break",
+    notedDispute.html.includes("Do not pay it."), true);
+check("dispute draft labels the notes",
+    notedDispute.html.includes("Notes on what to dispute"), true);
+check("dispute notes are escaped",
+    ac.buildDisputeEmailDraft({
+      loadNumber: "1",
+      invoiceAmount: 10,
+      expectedAmount: 5,
+      charges: [],
+      disputeNotes: "<script>alert(1)</script>",
+    }).html.includes("<script>alert"), false);
 
 // 5. Small-charge filter and Primus partition
 const breakdown = [
@@ -357,5 +400,375 @@ const realMismatch = ac.validateLumperAmount({
 check("real mismatch => invalid", realMismatch.valid, false);
 check("real mismatch difference", Math.round(realMismatch.difference), 99);
 
-console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
-process.exit(failures ? 1 : 0);
+check("redelivery wins over a weight mismatch",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Redelivery", amount: 85}],
+      freightMismatch: {mismatch: true, dimMismatch: true},
+      hasCertificate: true,
+    }), ac.CHARGE_CATEGORY.ACCESSORIAL);
+
+check("line haul is not an extra charge",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Line Haul", amount: 19}],
+    }), ac.CHARGE_CATEGORY.RATE_INCREASE);
+
+check("small gap uses the accessorial amount",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Inside delivery", amount: 19}],
+      freightMismatch: {mismatch: true},
+      invoiceGap: 19,
+    }), ac.CHARGE_CATEGORY.ACCESSORIAL);
+
+const pct = ac.computeCustomerChargeAmount({
+  carrierAmount: 100, markupPct: 20,
+});
+check("20% of 100 is 120", pct.amount, 120);
+const stripped = ac.stripFreightBreakdownCharges([
+  {label: "Line Haul", amount: 19},
+  {label: "Redelivery", amount: 75},
+]);
+check("strip keeps redelivery", stripped.kept.length, 1);
+check("invoice minus original",
+    ac.invoiceOverage(286.47, 194.70), 91.77);
+check("difference is invoice minus Primus, not the line",
+    ac.reportedChargeDifference(286.47, 194.70), 91.77);
+
+const page = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option B",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  accessorialOptions: [
+    {code: "RDV", name: "Redelivery Fee", category: "Destination"},
+    {code: "LFD", name: "Liftgate at Destination", category: "Destination"},
+  ],
+  carrierCharges: [{label: "Redelivery", amount: 75}],
+  fields: {invoiceId: "1", option: "b"},
+});
+check("resolution page uses the Primus list",
+    page.includes("Redelivery Fee") && page.includes("Select accessorial"),
+    true);
+check("resolution page can add another charge",
+    page.includes("add-bill-line"), true);
+const script = page.split("<script>")[1].split("</script>")[0];
+new Function(script);
+const coded = ac.normalizeCustomerBillLines([{
+  name: "Redelivery Fee", code: "rdv", carrierAmount: 75,
+  pricingMode: "markup", markupPct: 10,
+}]);
+check("accessorial code is kept", coded.lines[0].code, "RDV");
+
+const optionALines = [
+  {name: "Residential Delivery", code: "RSD", amount: 55.9},
+  {name: "Liftgate at Destination", code: "LFD", amount: 54.6},
+];
+const optionAPlan = ac.planOptionACustomerBilling({
+  baseRate: 210.16,
+  billLines: optionALines,
+});
+check("option A does not bump freight", optionAPlan.bumpFreight, false);
+check("option A freight stays the base rate",
+    optionAPlan.customerRate, 210.16);
+check("option A accessorial total",
+    optionAPlan.customerBillAccessorialTotal, 110.5);
+check("option A invoice has freight plus each accessorial",
+    optionAPlan.invoiceLines.length, 3);
+check("freight line is not the combined total",
+    optionAPlan.invoiceLines[0].rate, 210.16);
+check("residential is its own line",
+    optionAPlan.invoiceLines[1].description, "RESIDENTIAL DELIVERY");
+check("residential amount stays on its line",
+    optionAPlan.invoiceLines[1].rate, 55.9);
+check("liftgate is its own line",
+    optionAPlan.invoiceLines[2].description, "LIFTGATE AT DESTINATION");
+check("liftgate amount stays on its line",
+    optionAPlan.invoiceLines[2].rate, 54.6);
+
+const pctOfInvoice = ac.computeOptionFCustomerRate({
+  mode: "percent", percent: 10, invoiceAmount: 350,
+});
+check("option F 10 percent of a 350 invoice is 35",
+    pctOfInvoice.ok && pctOfInvoice.amount === 35, true);
+check("option F percent is not a markup on the invoice",
+    pctOfInvoice.amount !== 385, true);
+const flatRate = ac.computeOptionFCustomerRate({
+  mode: "flat", flatAmount: "40",
+});
+check("option F flat amount is the customer rate",
+    flatRate.ok && flatRate.amount === 40, true);
+const badPct = ac.computeOptionFCustomerRate({
+  mode: "percent", percent: 10, invoiceAmount: 0,
+});
+check("option F percent needs the invoice total", badPct.ok, false);
+const freightPick = ac.freightAccessorialFromCatalog([
+  {code: "fsc", name: "Fuel Surcharge"},
+  {code: "frg", name: "Freight"},
+]);
+check("option F uses the Freight catalog code", freightPick.code, "FRG");
+check("option F accessorial name is Freight", freightPick.name, "Freight");
+const noFreight = ac.freightAccessorialFromCatalog([
+  {code: "FSC", name: "Fuel Surcharge"},
+]);
+check("option F still names Freight when the catalog has none",
+    noFreight.name, "Freight");
+check("option F sends no code when Freight is not in the catalog",
+    noFreight.code, null);
+const optionFPlan = ac.planOptionFCustomerBilling({
+  baseRate: 210.16,
+  amount: pctOfInvoice.amount,
+  mode: "percent",
+  percent: 10,
+  code: freightPick.code,
+});
+check("option F does not bump freight", optionFPlan.bumpFreight, false);
+check("option F leaves the freight rate alone",
+    optionFPlan.customerRate, 210.16);
+check("option F bills one line", optionFPlan.customerBillLines.length, 1);
+check("option F line name is Freight",
+    optionFPlan.customerBillLines[0].name, "Freight");
+check("option F line amount is the customer rate",
+    optionFPlan.customerBillLines[0].amount, 35);
+check("option F keeps the catalog code",
+    optionFPlan.customerBillLines[0].code, "FRG");
+check("option F invoice is freight plus one Freight accessorial",
+    optionFPlan.invoiceLines.length, 2);
+check("option F freight line stays the base rate",
+    optionFPlan.invoiceLines[0].description === "FREIGHT CHARGE" &&
+    optionFPlan.invoiceLines[0].rate === 210.16, true);
+check("option F writes Freight as an accessorial",
+    optionFPlan.invoiceLines[1].kind === "accessorial" &&
+    optionFPlan.invoiceLines[1].description === "FREIGHT" &&
+    optionFPlan.invoiceLines[1].code === "FRG" &&
+    optionFPlan.invoiceLines[1].rate === 35, true);
+const parsedFPct = ac.parseOptionFFromRequest({
+  fMode: "percent", fValue: "10",
+}, 350);
+check("option F form percent uses the invoice total",
+    parsedFPct.ok && parsedFPct.amount === 35, true);
+const parsedFFlat = ac.parseOptionFFromRequest({
+  fMode: "flat", fFlatAmount: "12.50",
+}, 350);
+check("option F form flat is the typed amount",
+    parsedFFlat.ok && parsedFFlat.amount === 12.5, true);
+const fPage = ac.buildOptionFConfirmPage({
+  title: "F - customer rate as Freight",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  invoiceAmount: 350,
+  loadNumber: "264172",
+  fields: {invoiceId: "1", option: "f"},
+});
+check("option F confirm title",
+    fPage.includes("F - customer rate as Freight"), true);
+check("option F confirm offers flat or percent",
+    fPage.includes("Flat dollar amount") &&
+    fPage.includes("Percent of the invoice total"), true);
+check("option F confirm shows the invoice total",
+    fPage.includes("$350.00"), true);
+check("option F confirm does not itemize carrier accessorials",
+    fPage.includes("Add accessorial"), false);
+new Function(fPage.split("<script>")[1].split("</script>")[0]);
+check("option F completion closes the dashboard task",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "F",
+      finalWorkflowStatus: "completed",
+    }), true);
+
+const notice = ac.buildCustomerChargeNotificationEmail({
+  customerName: "NJ Warehouse Express LLC",
+  loadNumber: "268358",
+  charges: [
+    {type: "ACC Residential delivery", amount: 43},
+    {type: "ACC Liftgate delivery", amount: 42},
+  ],
+  chargesTotal: 110.5,
+  category: ac.CHARGE_CATEGORY.ACCESSORIAL,
+  customerRate: 210.16,
+  customerBillLines: optionALines,
+});
+check("customer notice uses the existing subject",
+    notice.subject.indexOf("Additional charge on shipment 268358") >= 0,
+    true);
+check("customer notice lists residential",
+    notice.html.indexOf("Residential delivery") >= 0, true);
+check("customer notice lists liftgate",
+    notice.html.indexOf("Liftgate delivery") >= 0, true);
+check("customer notice states the difference total",
+    notice.html.indexOf("Total Additional Charges") >= 0 &&
+    notice.html.indexOf("$110.50") >= 0, true);
+const differenceNotice = ac.buildCustomerChargeNotificationEmail({
+  customerName: "Example Customer",
+  loadNumber: "265647",
+  charges: [
+    {label: "Line haul", amount: 19},
+    {label: "Redelivery Fee", amount: 72.77},
+    {label: "Fuel surcharge", amount: 40},
+  ],
+  chargesTotal: 91.77,
+});
+check("difference is invoice minus Primus, not line haul",
+    differenceNotice.html.indexOf("$91.77") >= 0 &&
+    differenceNotice.html.indexOf("Redelivery Fee") >= 0 &&
+    differenceNotice.html.indexOf("Line haul") < 0, true);
+check("option B completion closes the dashboard task",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "B",
+      finalWorkflowStatus: "completed",
+    }), true);
+check("option D does not close as a finished charge",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "D",
+      finalWorkflowStatus: "completed",
+    }), false);
+check("customer additional-charge notice is delivered",
+    ac.mustDeliverDespiteDashboardPark({
+      type: "additional_charge_customer_notice",
+      to: "contact@nj3pllogistics.com",
+    }), true);
+check("internal approval mail can still stay on the dashboard",
+    ac.mustDeliverDespiteDashboardPark({
+      type: "additional_charge_approval",
+    }), false);
+check("option A completion closes the dashboard task",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "A",
+      finalWorkflowStatus: "completed",
+    }), true);
+check("option A still in progress stays open",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "A",
+      finalWorkflowStatus: "created",
+    }), false);
+check("a dispute is not closed by invoice completion",
+    ac.shouldCloseAdditionalChargeTask({
+      decision: "D",
+      finalWorkflowStatus: "completed",
+    }), false);
+
+/**
+ * @param {object} collections In-memory rows keyed by collection name.
+ * @return {object}
+ */
+function memoryDb(collections) {
+  return {
+    collection(name) {
+      const rows = collections[name] || [];
+      const filters = [];
+      const api = {
+        where(field, _op, value) {
+          filters.push({field, value});
+          return api;
+        },
+        limit() {
+          return api;
+        },
+        async get() {
+          const matched = rows.filter((row) =>
+            filters.every((filter) => row[filter.field] === filter.value));
+          return {
+            docs: matched.map((row) => ({
+              id: row.id,
+              data: () => row,
+              ref: {
+                update: async (patch) => Object.assign(row, patch),
+              },
+            })),
+          };
+        },
+      };
+      return api;
+    },
+  };
+}
+
+check("open charge has no saved decision",
+    ac.savedAdditionalChargeDecision({amount: 10}), null);
+check("blank decision is still open",
+    ac.savedAdditionalChargeDecision({decision: "  "}), null);
+check("saved decision blocks a second click",
+    ac.savedAdditionalChargeDecision({decision: "b"}), "B");
+check("saved F decision blocks a second click",
+    ac.savedAdditionalChargeDecision({decision: "f"}), "F");
+
+const confirmPage = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option B",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  fields: {invoiceId: "1", option: "b"},
+});
+check("confirm page ignores a second submit",
+    confirmPage.includes('form.dataset.submitted==="1"'), true);
+check("confirm page locks the button after submit",
+    confirmPage.includes('form.dataset.submitted="1"'), true);
+check("option B confirm has no dispute notes box",
+    confirmPage.includes('name="disputeNotes"'), false);
+const disputeConfirm = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option D",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  allowEmpty: true,
+  showDisputeNotes: true,
+  fields: {invoiceId: "1", option: "d"},
+});
+check("option D confirm has dispute notes",
+    disputeConfirm.includes("Notes on what to dispute") &&
+    disputeConfirm.includes('name="disputeNotes"'), true);
+check("option D notes are not required",
+    disputeConfirm.includes("required"), false);
+new Function(disputeConfirm.split("<script>")[1].split("</script>")[0]);
+const optionFPage = ac.buildOptionFConfirmPage({
+  title: "F - customer rate as Freight",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  invoiceAmount: 350,
+  loadNumber: "267957",
+  fields: {invoiceId: "1", option: "f"},
+});
+check("option F page ignores a second submit",
+    optionFPage.includes('form.dataset.submitted==="1"'), true);
+check("option F page locks the button after submit",
+    optionFPage.includes('submitBtn.disabled=true'), true);
+
+const dashboardTasks = require("../dashboard-tasks");
+const followUp = {
+  id: "follow-1",
+  invoiceId: "inv-1",
+  tenantId: "default",
+  status: "approved_billed",
+  resolved: false,
+};
+const disputeFollowUp = {
+  id: "follow-2",
+  invoiceId: "inv-1",
+  tenantId: "default",
+  status: "disputing",
+  resolved: false,
+};
+const task = {
+  id: "task-1",
+  invoiceId: "inv-1",
+  followUpId: "follow-1",
+  tenantId: "default",
+  type: "additional_charge",
+  status: "open",
+};
+const db = memoryDb({
+  additionalCharges: [followUp, disputeFollowUp],
+  dashboardTasks: [task],
+});
+
+dashboardTasks.closeAdditionalChargeWork(db, ac, {
+  invoiceId: "inv-1",
+  tenantId: "default",
+}).then((result) => {
+  check("close returns after option A", result.ok, true);
+  check("approved follow-up is resolved", followUp.resolved, true);
+  check("approved follow-up status is resolved",
+      followUp.status, ac.FOLLOW_UP_STATUS.RESOLVED);
+  check("dashboard task is dismissed", task.status, "dismissed");
+  check("dispute follow-up stays open", disputeFollowUp.resolved, false);
+  console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
+  process.exit(failures ? 1 : 0);
+}).catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

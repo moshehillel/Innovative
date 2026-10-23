@@ -9,7 +9,7 @@
  *      from what is on the Primus booking. For W&I we re-rate via Primus
  *      GET /rate with the invoice's updated weight/class and compare the
  *      returned total to the carrier invoice (default $10 tolerance).
- *   C. Approval email offers FIVE decisions:
+ *   C. Approval email offers these decisions:
  *        A — pay carrier + bill customer; auto-email the customer contact.
  *        B — pay carrier + bill customer; dispatcher notifies the customer
  *            (system reminds the dispatcher / adds to their task list).
@@ -18,6 +18,9 @@
  *            submission (LTL portals) or email (TL).
  *        E — pay carrier + bill customer; enter amount and bump rate; no
  *            separate customer notification (invoice carries the charge).
+ *        F — pay carrier + bill a flat amount or a percent of the carrier
+ *            invoice total as one Primus accessorial named Freight. No
+ *            separate customer email.
  *   D. Every case is tracked on an Additional Charges Follow-Up list until
  *      resolved.
  *
@@ -76,6 +79,63 @@ const RATE_MATCH_TOLERANCE = 10;
 
 /** Charges at or below this amount are ignored for approval/dispute. */
 const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
+
+/** A few dollars: match the gap to an accessorial instead of calling it a reweigh. */
+const SMALL_GAP_MAX = 25;
+
+/**
+ * Line haul and fuel are a breakdown of the freight total, never an extra.
+ * @param {string} label Charge label.
+ * @return {boolean}
+ */
+function isFreightBreakdownLabel(label) {
+  const text = String(label || "");
+  if (isAccessorialLabel(text)) return false;
+  return /line[\s-]*haul|\blinehaul\b|\bfuel\b|\bfsc\b/i.test(text);
+}
+
+/**
+ * Drops line-haul and fuel rows from an extra-charge list.
+ * @param {Array<object>} charges Charge rows.
+ * @return {{kept: Array<object>, dropped: Array<object>}}
+ */
+function stripFreightBreakdownCharges(charges) {
+  const kept = [];
+  const dropped = [];
+  for (const row of (Array.isArray(charges) ? charges : [])) {
+    if (isFreightBreakdownLabel(chargeLabel(row))) dropped.push(row);
+    else kept.push(row);
+  }
+  return {kept, dropped};
+}
+
+/**
+ * Carrier invoice total minus the original amount on file.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusAmount Primus carrier cost.
+ * @return {number|null}
+ */
+function invoiceOverage(invoiceAmount, primusAmount) {
+  const invoice = Number(String(invoiceAmount == null ? "" : invoiceAmount)
+      .replace(/[^0-9.-]/g, ""));
+  const quoted = Number(String(primusAmount == null ? "" : primusAmount)
+      .replace(/[^0-9.-]/g, ""));
+  if (!(invoice > 0) || !(quoted > 0)) return null;
+  return Math.round((invoice - quoted) * 100) / 100;
+}
+
+/**
+ * The difference is always the carrier invoice minus Primus.
+ * Line amounts are listed separately and are not this number.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusAmount Primus carrier cost.
+ * @return {number|null}
+ */
+function reportedChargeDifference(invoiceAmount, primusAmount) {
+  const gap = invoiceOverage(invoiceAmount, primusAmount);
+  if (gap == null || !(gap > 0)) return null;
+  return gap;
+}
 
 /** Flat band for lumper base-freight pre-check vs Primus carrier cost. */
 const LUMPER_BASE_TOLERANCE = 5;
@@ -566,17 +626,31 @@ function evaluateRequoteMatch(opts) {
  * @return {string} One of CHARGE_CATEGORY values.
  */
 function classifyAdditionalChargeReason(opts) {
-  const charges = Array.isArray(opts.charges) ? opts.charges : [];
+  const raw = Array.isArray(opts.charges) ? opts.charges : [];
+  const charges = raw.filter(
+      (c) => !isFreightBreakdownLabel(chargeLabel(c)));
   const wniByLabel = charges.some(
       (c) => isWeightInspectionLabel(chargeLabel(c)));
   const accessorialByLabel = charges.some(
       (c) => isAccessorialLabel(chargeLabel(c)));
   const mismatch = opts.freightMismatch && opts.freightMismatch.mismatch;
+  const gap = opts.invoiceGap != null ? Number(opts.invoiceGap) :
+    invoiceOverage(opts.invoiceAmount, opts.primusAmount);
 
-  // Itemized accessorials (school delivery, notify/detention, etc.) win
-  // over a stray W&I certificate flag or matching weight/class on the invoice.
-  if (accessorialByLabel && !wniByLabel && !mismatch) {
+  // A named accessorial (redelivery, liftgate, …) is the reason even when
+  // weight or dims also differ. Reweigh only when the invoice says so.
+  if (accessorialByLabel && !wniByLabel) {
     return CHARGE_CATEGORY.ACCESSORIAL;
+  }
+
+  // A few dollars off: use the accessorial line that matches the gap.
+  if (Number.isFinite(gap) && gap > 0.5 && gap <= SMALL_GAP_MAX) {
+    const near = charges.find((c) => {
+      const amt = Math.abs(Number(c && c.amount) || 0);
+      return amt > 0 && Math.abs(amt - gap) <= 1 &&
+        !isWeightInspectionLabel(chargeLabel(c));
+    });
+    if (near) return CHARGE_CATEGORY.ACCESSORIAL;
   }
 
   if (wniByLabel || opts.hasCertificate || mismatch) {
@@ -634,7 +708,7 @@ function chargesHtml(charges) {
         `<strong>${money(c && c.amount)}</strong></li>`)
       .join("");
   return rows ? `<ul style="margin:6px 0 6px 18px;padding:0">${rows}</ul>` :
-    "<p><em>No itemized charge rows — total difference only.</em></p>";
+    "<p><em>No added lines listed.</em></p>";
 }
 
 /**
@@ -783,7 +857,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Customer rate (Primus)", formatCustomerRate(customerRate)) +
     row("Carrier invoice", money(invoiceAmount)) +
     row("Amount on file (Primus)", money(primusAmount)) +
-    row("Additional charges", money(chargesTotal)) +
+    row("Difference (invoice minus Primus)", money(chargesTotal)) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
       row("W&I certificate", "Attached / referenced on invoice") : "") +
@@ -792,7 +866,7 @@ function buildAdditionalChargeApprovalEmail(opts) {
     accessorialConfirmHtml +
     mismatchHtml +
     rateHtml +
-    `<p><strong>Charges:</strong></p>` +
+    `<p><strong>Lines on the invoice (not the difference):</strong></p>` +
     chargesHtml(charges) +
     (Number(excludedInPrimusCount) > 0 ?
       `<p style="font-size:12px;color:#6b7280"><em>` +
@@ -812,6 +886,9 @@ function buildAdditionalChargeApprovalEmail(opts) {
     btn("e", "#7c3aed",
         "E - Approve: pay carrier + bill customer " +
         "(enter amount; apply rate; no separate customer notification)") +
+    btn("f", "#c2410c",
+        "F - Customer rate as Freight " +
+        "(flat amount or percent of the invoice; no separate email)") +
     `<p style="font-size:12px;color:#6b7280">A: enter how much to charge the ` +
     `customer on the confirm page; the customer rate is bumped by that ` +
     `amount and the customer is emailed. B: the base customer rate stays ` +
@@ -821,7 +898,11 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `and the customer rate stays the same (no itemization needed). D: Jerry ` +
     `will draft the wording for manual submission. E: like A (enter amount ` +
     `and bump the customer rate) but no separate customer notification - ` +
-    `the charge is included when the customer invoice is sent.` +
+    `the charge is included when the customer invoice is sent. ` +
+    `F: enter a flat dollar amount, or a percent of the carrier invoice ` +
+    `total (a $350 invoice at 10% is $35.00). That amount is the customer ` +
+    `rate and is entered in Primus as one accessorial named Freight. The ` +
+    `carrier is paid the invoice. No separate customer email.` +
     `</p>`;
 
   return {
@@ -833,11 +914,24 @@ function buildAdditionalChargeApprovalEmail(opts) {
 }
 
 /**
+ * Trims option D notes. Empty is allowed.
+ * @param {*} value Raw notes from the confirm form.
+ * @return {string}
+ */
+function normalizeDisputeNotes(value) {
+  return String(value == null ? "" : value)
+      .replace(/\r\n/g, "\n")
+      .trim()
+      .slice(0, 4000);
+}
+
+/**
  * Builds a carrier dispute draft for manual submission. Most LTL carriers
  * take disputes on their website portal, so this is copy/paste wording; TL
  * disputes go to the carrier email on file.
  * @param {object} opts loadNumber, carrierName, proNumber, invoiceNumber,
- *   invoiceAmount, expectedAmount, charges, category, freightMismatch.
+ *   invoiceAmount, expectedAmount, charges, category, freightMismatch,
+ *   disputeNotes.
  * @return {{subject: string, html: string}}
  */
 function buildDisputeEmailDraft(opts) {
@@ -846,6 +940,7 @@ function buildDisputeEmailDraft(opts) {
     invoiceAmount, expectedAmount, charges, category, freightMismatch,
     customerRate, hasCertificate,
   } = opts;
+  const disputeNotes = normalizeDisputeNotes(opts.disputeNotes);
 
   const effectiveCategory = resolveEffectiveChargeCategory({
     charges,
@@ -905,6 +1000,9 @@ function buildDisputeEmailDraft(opts) {
         `${money(c && c.amount)}`)
       .join("<br>");
 
+  const notesBlock = disputeNotes ?
+    `Notes on what to dispute:<br>` +
+    `${esc(disputeNotes).replace(/\n/g, "<br>")}<br><br>` : "";
   const disputeText =
     `To: ${carrierName || "Carrier"} — Billing / Disputes<br><br>` +
     `RE: Invoice ${invoiceNumber || "—"}` +
@@ -915,6 +1013,7 @@ function buildDisputeEmailDraft(opts) {
     `${money(expectedAmount)} (difference ${money(Math.abs(diff))}).<br><br>` +
     `${basis}<br><br>` +
     (chargeLines ? `Disputed charge(s):<br>${chargeLines}<br><br>` : "") +
+    notesBlock +
     `Please review and issue a corrected invoice. Payment for the ` +
     `undisputed portion is being processed per our standard terms.<br><br>` +
     `Thank you,<br>Innovative Carriers — Accounting`;
@@ -947,27 +1046,165 @@ function buildDisputeEmailDraft(opts) {
  *   category.
  * @return {{subject: string, html: string}}
  */
-function buildCustomerChargeNotificationEmail(opts) {
-  const {customerName, loadNumber, charges, chargesTotal, category,
-    customerRate} = opts;
+function noticeChargeLines(charges) {
+  const split = stripFreightBreakdownCharges(charges);
+  return split.kept.filter((row) => chargeLabel(row));
+}
+
+function measurementLinesHtml(opts, lines) {
+  const blob = lines.map((row) => chargeLabel(row)).join(" ");
+  const measure = /reweigh|re-weigh|reclass|re-class|redim|re-dim|dimension/i
+      .test(blob);
+  if (!measure) return "";
+  const details = (opts.freightMismatch && opts.freightMismatch.details) ||
+    {};
+  const bits = [];
+  if (details.primusWeightLbs) {
+    bits.push(`Original weight: ${esc(String(details.primusWeightLbs))} lbs`);
+  }
+  if (details.invoiceWeightLbs) {
+    bits.push(`Updated weight: ${esc(String(details.invoiceWeightLbs))} lbs`);
+  }
+  if (opts.originalDims) {
+    bits.push(`Original dimensions: ${esc(String(opts.originalDims))}`);
+  }
+  if (opts.updatedDims) {
+    bits.push(`Updated dimensions: ${esc(String(opts.updatedDims))}`);
+  }
+  if (!bits.length) return "";
+  return bits.map((line) => `<div>${line}</div>`).join("");
+}
+
+/**
+ * Shared customer and dispatcher notice. Total is the invoice difference.
+ * @param {object} opts customerName, loadNumber, charges, chargesTotal.
+ * @return {{subject: string, html: string}}
+ */
+function buildAdditionalChargeNoticeEmail(opts) {
+  const customerName = opts.customerName;
+  const loadNumber = opts.loadNumber;
+  const lines = noticeChargeLines(opts.charges);
+  const listed = lines.length ? lines : [];
+  const lineHtml = listed.map((row) => {
+    const amt = Number(row && row.amount);
+    const amount = Number.isFinite(amt) ? `: ${money(amt)}` : "";
+    const label = esc(displayChargeLabel(chargeLabel(row)));
+    return `<div>${label}${amount}</div>`;
+  }).join("");
+  const total = opts.chargesTotal != null ? opts.chargesTotal :
+    sumCustomerBillLines(listed);
   const html =
     `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
-    `<p>We were billed an additional charge by the carrier on your ` +
-    `shipment (our reference <strong>${esc(String(loadNumber || ""))}` +
-    `</strong>).</p>` +
-    (customerRate != null && Number(customerRate) > 0 ?
-      `<p><strong>Your rate for this shipment:</strong> ` +
-      `${formatCustomerRate(customerRate)}</p>` : "") +
-    `<p><strong>Reason:</strong> ${esc(categoryLabel(category))}</p>` +
-    chargesHtml(charges) +
-    `<p>The additional amount of <strong>${money(chargesTotal)}</strong> ` +
-    `will be reflected on your invoice for this shipment.</p>` +
-    `<p>Please reach out if you have any questions.</p>`;
+    `<p>We wanted to make you aware that the carrier has applied an ` +
+    `additional charge to this shipment for the following:</p>` +
+    (lineHtml || `<div>Additional charge</div>`) +
+    measurementLinesHtml(opts, listed) +
+    `<p>Total Additional Charges: <strong>${money(total)}</strong></p>` +
+    `<p>If you have any questions, please feel free to reach out.</p>`;
   return {
     subject: toOutboundEmailSafeSubject(
         `Additional charge on shipment ${loadNumber}`),
     html: toOutboundEmailSafeText(html),
   };
+}
+
+function buildCustomerChargeNotificationEmail(opts) {
+  return buildAdditionalChargeNoticeEmail(opts);
+}
+
+/**
+ * Option A bills each accessorial on its own customer-invoice line.
+ * The freight rate is left unchanged.
+ * @param {object} opts baseRate, billLines.
+ * @return {object}
+ */
+function planOptionACustomerBilling(opts) {
+  const rawBase = Number(opts && opts.baseRate);
+  const baseRate = Math.round(rawBase * 100) / 100;
+  const hasBase = Number.isFinite(baseRate) && baseRate > 0;
+  const billLines = Array.isArray(opts && opts.billLines) ? opts.billLines : [];
+  const total = Math.round(sumCustomerBillLines(billLines) * 100) / 100;
+  const invoiceLines = customerInvoiceChargeLines(
+      hasBase ? baseRate : 0, billLines);
+  let note = hasBase ?
+    `Base customer rate stays $${baseRate.toFixed(2)}.` :
+    "Base customer rate unchanged.";
+  if (billLines.length) {
+    note += ` Billing ${billLines.length} accessorial line(s)` +
+      ` ($${total.toFixed(2)}) as separate invoice lines.`;
+  }
+  return {
+    bumpFreight: false,
+    customerRate: hasBase ? baseRate : null,
+    customerBillLines: billLines,
+    customerBillAccessorialTotal: total,
+    customerChargeAmount: total,
+    invoiceLines,
+    note,
+  };
+}
+
+/**
+ * Freight stays the sell rate. Each accessorial is its own charge line.
+ * @param {number} customerRate Freight rate.
+ * @param {Array<object>} customerBillLines Accessorial lines.
+ * @return {Array<object>}
+ */
+function customerInvoiceChargeLines(customerRate, customerBillLines) {
+  const freight = Math.round(Number(customerRate || 0) * 100) / 100;
+  const lines = [{
+    kind: "freight",
+    description: "FREIGHT CHARGE",
+    rate: Number.isFinite(freight) ? freight : 0,
+  }];
+  (Array.isArray(customerBillLines) ? customerBillLines : []).forEach(
+      (line) => {
+        const amount = Math.round(Number(line && line.amount) * 100) / 100;
+        if (!Number.isFinite(amount) || amount <= 0) return;
+        const name = String(
+            (line && (line.name || line.label)) || "ACCESSORIAL")
+            .trim().toUpperCase();
+        lines.push({
+          kind: "accessorial",
+          description: name,
+          code: line && line.code ? String(line.code) : "",
+          rate: amount,
+        });
+      });
+  return lines;
+}
+
+/**
+ * Dashboard-ops mode parks internal mail. The customer additional-charge
+ * notice, the dispatcher copy of that notice, customer bills, and a few
+ * ops digests still go out.
+ * @param {object} email Outbound email payload.
+ * @return {boolean}
+ */
+function mustDeliverDespiteDashboardPark(email) {
+  if (!email || typeof email !== "object") return false;
+  if (email.forceSend === true) return true;
+  const type = String(email.type || "");
+  return type === "dashboard_notification_digest" ||
+    type === "dashboard_assignment" ||
+    type === "additional_charge_customer_notice" ||
+    type === "additional_charge_dispatcher_task";
+}
+
+/**
+ * @param {object} opts decision, finalWorkflowStatus.
+ * @return {boolean}
+ */
+function shouldCloseAdditionalChargeTask(opts) {
+  const decision = String((opts && opts.decision) || "").toUpperCase();
+  const wf = String((opts && opts.finalWorkflowStatus) || "");
+  if (decision !== "A" && decision !== "B" &&
+      decision !== "C" && decision !== "E" && decision !== "F") {
+    return false;
+  }
+  return wf === "completed" ||
+    wf === "completed_no_customer_email" ||
+    wf === "completed_carrier_bill_only";
 }
 
 /**
@@ -977,41 +1214,21 @@ function buildCustomerChargeNotificationEmail(opts) {
  * @return {{subject: string, html: string}}
  */
 function buildDispatcherCustomerNotifyTemplate(opts) {
-  const {
-    loadNumber, customerName, carrierName, chargesTotal,
-    customerRate, customerBillLines, newCustomerRate,
-  } = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
-  const baseRate = Number(customerRate) || 0;
-  const accessorialTotal = sumCustomerBillLines(billLines);
-  const updatedRate = Number(newCustomerRate) > 0 ?
-    Number(newCustomerRate) :
-    (baseRate > 0 ? baseRate + accessorialTotal : accessorialTotal);
-  const chargeDetail = billLines.length ?
-    customerBillLinesHtml(billLines) :
-    `<p>Additional charge total: <strong>${money(chargesTotal)}</strong></p>`;
-  const html =
-    `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
-    `<p>This note is about your shipment ` +
-    `<strong>${esc(String(loadNumber || ""))}</strong>` +
-    (carrierName ? ` with ${esc(carrierName)}` : "") + `.</p>` +
-    `<p>The carrier billed an additional charge on this load` +
-    (Number(chargesTotal) > 0 ?
-      ` of <strong>${money(chargesTotal)}</strong>` : "") +
-    `. Your updated customer rate for this shipment is ` +
-    `<strong>${money(updatedRate)}</strong>` +
-    (baseRate > 0 && billLines.length ?
-      ` (base freight ${formatCustomerRate(baseRate)} plus the ` +
-      `accessorial(s) below)` : "") +
-    `.</p>` +
-    chargeDetail +
-    `<p>Please let us know if you have any questions.</p>` +
-    `<p>Thank you,<br>Innovative Carriers</p>`;
-  return {
-    subject: toOutboundEmailSafeSubject(
-        `Updated rate on shipment ${loadNumber}`),
-    html: toOutboundEmailSafeText(html),
-  };
+  const carrier = Array.isArray(opts.charges) ? opts.charges : [];
+  const billed = Array.isArray(opts.customerBillLines) ?
+    opts.customerBillLines.map((line) => ({
+      label: line.name || line.label,
+      amount: line.amount,
+    })) : [];
+  return buildAdditionalChargeNoticeEmail({
+    customerName: opts.customerName,
+    loadNumber: opts.loadNumber,
+    charges: carrier.length ? carrier : billed,
+    chargesTotal: opts.chargesTotal,
+    freightMismatch: opts.freightMismatch,
+    originalDims: opts.originalDims,
+    updatedDims: opts.updatedDims,
+  });
 }
 
 /**
@@ -1022,110 +1239,162 @@ function buildDispatcherCustomerNotifyTemplate(opts) {
  * @return {{subject: string, html: string}}
  */
 function buildDispatcherNotifyReminderEmail(opts) {
-  const {
-    dispatcherName, loadNumber, carrierName, customerName,
-    charges, chargesTotal, customerRate, customerBillLines,
-  } = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
-  const baseRate = Number(customerRate) || 0;
-  const accessorialTotal = sumCustomerBillLines(billLines);
-  const newCustomerRate = baseRate > 0 ?
-    baseRate + accessorialTotal : accessorialTotal;
-  const billingBlock = billLines.length ?
-    ((baseRate > 0 ?
-      `<p><strong>Base customer rate (unchanged): ` +
-      `${formatCustomerRate(baseRate)}</strong></p>` : "") +
-      `<p><strong>Accessorials to bill the customer:</strong></p>` +
-      customerBillLinesHtml(billLines) +
-      `<p><strong>New customer total (base + accessorials): ` +
-      `${money(newCustomerRate)}</strong></p>` +
-      `<p><strong>Carrier additional charge:</strong> ` +
-      `${money(chargesTotal)}</p>`) :
-    (chargesHtml(charges) +
-      `<p>Total additional: <strong>${money(chargesTotal)}</strong></p>` +
-      (baseRate > 0 ?
-        `<p><strong>Current customer rate:</strong> ` +
-        `${formatCustomerRate(baseRate)}</p>` : ""));
-  const forward = buildDispatcherCustomerNotifyTemplate({
+  return buildDispatcherCustomerNotifyTemplate(opts);
+}
+
+/**
+ * Finds an unresolved follow-up for the same load, amount, and reason.
+ * @param {object} db Firestore.
+ * @param {object} data Incoming follow-up fields.
+ * @return {Promise<string|null>}
+ */
+async function findUnresolvedDuplicateFollowUp(db, data) {
+  const dedupe = require("./dashboard-dedupe");
+  const loadNumber = String(data.loadNumber || "").trim();
+  if (!loadNumber) return null;
+  const snap = await db.collection(FOLLOW_UP_COLLECTION)
+      .where("loadNumber", "==", loadNumber)
+      .limit(200)
+      .get();
+  const incoming = {
+    type: "additional_charge",
     loadNumber,
-    customerName,
-    carrierName,
-    chargesTotal,
-    customerRate: baseRate,
-    customerBillLines: billLines,
-    newCustomerRate,
-  });
-  const html =
-    `<p>Hi${dispatcherName ? ` ${esc(dispatcherName)}` : ""},</p>` +
-    `<p>An additional carrier charge on load ` +
-    `<strong>${esc(String(loadNumber || ""))}</strong> ` +
-    `(${esc(carrierName || "carrier")}) was approved to be billed to the ` +
-    `customer. <strong>Please notify the customer</strong>` +
-    `${customerName ? ` (${esc(customerName)})` : ""} ` +
-    `about the updated rate.</p>` +
-    billingBlock +
-    `<hr style="border:none;border-top:1px solid #e5e7eb;margin:18px 0">` +
-    `<p><strong>Ready-to-send customer email</strong> - copy or forward ` +
-    `this to the customer:</p>` +
-    `<p style="font-size:13px;color:#6b7280"><strong>Subject:</strong> ` +
-    `${esc(forward.subject)}</p>` +
-    `<div style="border:1px solid #bfdbfe;border-radius:8px;padding:16px;` +
-    `background:#eff6ff;font-size:14px">${forward.html}</div>` +
-    `<p style="font-size:12px;color:#6b7280;margin-top:14px">This item ` +
-    `stays on your task list (Additional Charges Follow-Up) until the ` +
-    `customer is notified.</p>`;
-  return {
-    subject: toOutboundEmailSafeSubject(
-        `Task - notify customer of additional charge on Load ${loadNumber}`),
-    html: toOutboundEmailSafeText(html),
+    reason: data.category || null,
+    chargesTotal: data.chargesTotal,
   };
+  let best = null;
+  const ownership = require("./dashboard-ownership");
+  for (const doc of snap.docs) {
+    const row = doc.data() || {};
+    if (row.resolved === true) continue;
+    if (!ownership.sameTenant(row.tenantId, data.tenantId || "default")) {
+      continue;
+    }
+    const candidate = {
+      type: "additional_charge",
+      loadNumber: row.loadNumber,
+      reason: row.category || null,
+      chargesTotal: row.chargesTotal,
+      chargePhase: row.chargePhase || null,
+      followUpStatus: row.status || null,
+      createdAt: row.createdAt && row.createdAt.toDate ?
+        row.createdAt.toDate().toISOString() : null,
+      receivedAt: row.receivedAt && row.receivedAt.toDate ?
+        row.receivedAt.toDate().toISOString() : null,
+    };
+    if (!dedupe.sameExactCharge(incoming, candidate)) continue;
+    if (!best ||
+        dedupe.compareDuplicatePreference(candidate, best.item) > 0) {
+      best = {id: doc.id, item: candidate};
+    }
+  }
+  return best ? best.id : null;
 }
 
 /**
  * Creates a follow-up entry so the charge is tracked until resolved.
+ * Reuses an unresolved follow-up for the same charge.
  * @param {object} db Firestore instance.
  * @param {object} data loadNumber, carrierName, customerName, invoiceId,
  *   category, charges, chargesTotal, invoiceAmount, status, notes.
  * @return {Promise<string>} Follow-up doc id.
  */
 async function createFollowUp(db, data) {
-  const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
-    loadNumber: data.loadNumber || null,
-    carrierName: data.carrierName || null,
-    customerName: data.customerName || null,
-    invoiceId: data.invoiceId || null,
-    tenantId: data.tenantId || null,
-    category: data.category || null,
-    charges: Array.isArray(data.charges) ? data.charges : [],
-    chargesTotal: Number(data.chargesTotal) || 0,
-    invoiceAmount: Number(data.invoiceAmount) || 0,
-    status: data.status || FOLLOW_UP_STATUS.PENDING_APPROVAL,
-    decision: null,
-    decisionAt: null,
-    notes: data.notes || null,
-    resolved: false,
-    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  const MAX_BODY = 120000;
+  let emailHtml = data.emailHtml != null ? String(data.emailHtml) : null;
+  if (emailHtml && emailHtml.length > MAX_BODY) {
+    emailHtml = emailHtml.slice(0, MAX_BODY);
+  }
+  const ownership = require("./dashboard-ownership");
+  const owner = ownership.ownershipFieldsForCreate({
+    to: data.emailTo,
+    cc: data.emailCc,
+    type: "additional_charge",
+    dispatcherEmail: data.dispatcherEmail,
+    dispatcherName: data.dispatcherName,
+    ownerBucket: data.ownerBucket,
   });
-
+  let docId = null;
   try {
-    const dashboardTasks = require("./dashboard-tasks");
-    await dashboardTasks.createDashboardTask(db, {
-      tenantId: data.tenantId || "default",
-      type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
-      title: `Additional charge - Load ${data.loadNumber || "-"}`,
-      description: data.notes || null,
+    docId = await findUnresolvedDuplicateFollowUp(db, data);
+  } catch (dedupeErr) {
+    console.error("[createFollowUp] dedupe lookup failed:", dedupeErr.message);
+  }
+  if (docId) {
+    console.log("[createFollowUp] exact duplicate open charge — reused",
+        docId, data.loadNumber || "", data.chargesTotal, data.category || "");
+    if (data.status === FOLLOW_UP_STATUS.DISPUTING) {
+      await db.collection(FOLLOW_UP_COLLECTION).doc(docId).update({
+        status: FOLLOW_UP_STATUS.DISPUTING,
+        chargePhase: "dispute",
+        resolved: false,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    }
+  } else {
+    const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
       loadNumber: data.loadNumber || null,
       carrierName: data.carrierName || null,
+      customerName: data.customerName || null,
       invoiceId: data.invoiceId || null,
-      followUpId: doc.id,
-      reason: data.category || data.status || null,
+      tenantId: data.tenantId || "default",
+      category: data.category || null,
+      charges: Array.isArray(data.charges) ? data.charges : [],
+      chargesTotal: Number(data.chargesTotal) || 0,
+      invoiceAmount: Number(data.invoiceAmount) || 0,
+      status: data.status || FOLLOW_UP_STATUS.PENDING_APPROVAL,
+      decision: null,
+      decisionAt: null,
+      notes: data.notes || null,
+      emailHtml,
+      emailSubject: data.emailSubject || null,
+      emailTo: data.emailTo || null,
+      emailCc: data.emailCc || null,
+      ...owner,
+      ...require("./dashboard-email-files").fieldsForCreate({
+        receivedAt: data.receivedAt || data.emailReceivedAt || null,
+        receivedAtSource: data.receivedAtSource || "mailbox",
+        attachments: data.attachments,
+      }),
+      resolved: false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-  } catch (taskErr) {
-    console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+    docId = doc.id;
   }
 
-  return doc.id;
+  if (data.skipDashboardTask !== true) {
+    try {
+      const dashboardTasks = require("./dashboard-tasks");
+      await dashboardTasks.createDashboardTask(db, {
+        tenantId: data.tenantId || "default",
+        type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+        title: `Additional charge - Load ${data.loadNumber || "-"}`,
+        description: data.notes || null,
+        body: emailHtml,
+        subject: data.emailSubject || null,
+        to: data.emailTo || null,
+        cc: data.emailCc || null,
+        loadNumber: data.loadNumber || null,
+        carrierName: data.carrierName || null,
+        invoiceId: data.invoiceId || null,
+        followUpId: docId,
+        messageId: data.messageId || null,
+        reason: data.category || data.status || null,
+        chargesTotal: data.chargesTotal || null,
+        dispatcherEmail: owner.dispatcherEmail,
+        dispatcherName: owner.dispatcherName,
+        ownerBucket: owner.ownerBucket,
+        receivedAt: data.receivedAt || data.emailReceivedAt || null,
+        receivedAtSource: data.receivedAtSource || "mailbox",
+        attachments: data.attachments,
+      });
+    } catch (taskErr) {
+      console.error("[createFollowUp] dashboard task failed:", taskErr.message);
+    }
+  }
+
+  return docId;
 }
 
 /**
@@ -1157,6 +1426,9 @@ async function updateFollowUp(db, opts) {
     update.decisionAt = admin.firestore.FieldValue.serverTimestamp();
   }
   if (opts.notes) update.notes = opts.notes;
+  if (opts.disputeNotes != null) {
+    update.disputeNotes = normalizeDisputeNotes(opts.disputeNotes);
+  }
   await ref.update(update);
 }
 
@@ -1188,24 +1460,81 @@ function customerBillLinesHtml(lines) {
  * @param {Array<object>} lines Raw line objects.
  * @return {object} Normalized lines payload.
  */
+function computeCustomerChargeAmount(row) {
+  const line = row || {};
+  const flatRaw = line.flatAmount;
+  const hasFlat = flatRaw != null && String(flatRaw).trim() !== "";
+  if (hasFlat || line.pricingMode === "flat") {
+    const flat = Math.round(Number(hasFlat ? flatRaw : line.amount) * 100) /
+      100;
+    if (!Number.isFinite(flat) || flat <= 0) {
+      return {ok: false, error: "Flat customer charge must be greater than 0."};
+    }
+    return {
+      ok: true, amount: flat, pricingMode: "flat",
+      flatAmount: flat, markupPct: null,
+    };
+  }
+  const pctRaw = line.markupPct;
+  const hasPct = pctRaw != null && String(pctRaw).trim() !== "";
+  if (hasPct || line.pricingMode === "markup") {
+    const pct = Number(hasPct ? pctRaw : line.markupPct);
+    const carrier = Math.round(Number(line.carrierAmount) * 100) / 100;
+    if (!Number.isFinite(pct) || pct < 0) {
+      return {ok: false, error: "Markup percent must be 0 or greater."};
+    }
+    if (!Number.isFinite(carrier) || carrier <= 0) {
+      return {
+        ok: false,
+        error: "Carrier cost is required when using a percent markup.",
+      };
+    }
+    const amount = Math.round(carrier * (1 + pct / 100) * 100) / 100;
+    return {
+      ok: true, amount, pricingMode: "markup",
+      markupPct: pct, flatAmount: null,
+    };
+  }
+  const amount = Math.round(Number(line.amount) * 100) / 100;
+  if (Number.isFinite(amount) && amount > 0) {
+    return {
+      ok: true, amount, pricingMode: "amount",
+      markupPct: null, flatAmount: amount,
+    };
+  }
+  return {
+    ok: false,
+    error: "Enter a percent markup or a flat customer charge.",
+  };
+}
+
 function normalizeCustomerBillLines(lines) {
   const out = [];
   for (const line of (Array.isArray(lines) ? lines : [])) {
-    const name = String(line && (line.name || line.label) || "").trim();
-    const amount = Math.round(Number(line && line.amount) * 100) / 100;
+    const name = String(
+        line && (line.name || line.label || line.description) || "").trim();
     if (!name) continue;
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return {
-        ok: false,
-        error: `Invalid amount for accessorial "${name}"`,
-      };
+    const priced = computeCustomerChargeAmount(line);
+    if (!priced.ok) {
+      return {ok: false, error: `${priced.error} (${name})`};
     }
-    out.push({name, amount});
+    const carrier = Math.round(Number(line && line.carrierAmount) * 100) / 100;
+    const code = String((line && line.code) || "").trim().toUpperCase();
+    out.push({
+      name,
+      code: code || null,
+      amount: priced.amount,
+      carrierAmount: Number.isFinite(carrier) && carrier > 0 ? carrier : 0,
+      pricingMode: priced.pricingMode,
+      markupPct: priced.markupPct,
+      flatAmount: priced.flatAmount,
+    });
   }
   if (!out.length) {
     return {
       ok: false,
-      error: "Enter at least one accessorial name and customer charge amount.",
+      error: "Enter at least one accessorial with a percent markup or " +
+        "flat customer charge.",
     };
   }
   return {ok: true, lines: out, total: sumCustomerBillLines(out)};
@@ -1232,6 +1561,140 @@ function parseCustomerChargeAmountFromRequest(body) {
  * @param {object} body POST body from the confirm form.
  * @return {object} Parsed customer bill lines payload.
  */
+/**
+ * Rounds a dollar amount to cents.
+ * @param {number} amount Raw amount.
+ * @return {number}
+ */
+function roundOptionFMoney(amount) {
+  return Math.round(Number(amount) * 100) / 100;
+}
+
+/**
+ * Option F customer rate. Flat is the typed dollar amount. Percent is
+ * that percent of the carrier invoice total, not a markup on one line.
+ * @param {object} opts mode, flatAmount, percent, invoiceAmount.
+ * @return {object}
+ */
+function computeOptionFCustomerRate(opts) {
+  const mode = String((opts && opts.mode) || "").toLowerCase();
+  if (mode === "flat") {
+    const flat = roundOptionFMoney(opts.flatAmount);
+    if (!Number.isFinite(flat) || flat <= 0) {
+      return {ok: false, error: "Enter a flat amount greater than 0."};
+    }
+    return {ok: true, mode: "flat", amount: flat, percent: null};
+  }
+  if (mode === "percent" || mode === "percentage") {
+    const pct = Number(opts.percent);
+    const invoice = roundOptionFMoney(opts.invoiceAmount);
+    if (!Number.isFinite(pct) || pct <= 0) {
+      return {ok: false, error: "Enter a percent greater than 0."};
+    }
+    if (!Number.isFinite(invoice) || invoice <= 0) {
+      return {
+        ok: false,
+        error: "Carrier invoice total is required for a percent.",
+      };
+    }
+    const amount = roundOptionFMoney(invoice * (pct / 100));
+    if (!(amount > 0)) {
+      return {ok: false, error: "That percent is less than one cent."};
+    }
+    return {
+      ok: true,
+      mode: "percent",
+      amount,
+      percent: pct,
+      invoiceAmount: invoice,
+    };
+  }
+  return {
+    ok: false,
+    error: "Choose a flat amount or a percent of the invoice.",
+  };
+}
+
+/**
+ * Catalog row whose name is Freight, if the list has one.
+ * @param {Array<object>} choices Primus or static accessorial rows.
+ * @return {{name: string, code: string|null}}
+ */
+function freightAccessorialFromCatalog(choices) {
+  const rows = Array.isArray(choices) ? choices : [];
+  let hit = null;
+  for (const row of rows) {
+    const name = String((row && (row.name || row.label)) || "").trim();
+    if (name.toLowerCase() === "freight") {
+      hit = row;
+      break;
+    }
+  }
+  const rawCode = hit && hit.code ? String(hit.code).trim() : "";
+  return {name: "Freight", code: rawCode ? rawCode.toUpperCase() : null};
+}
+
+/**
+ * One Freight accessorial. The base freight rate is not bumped.
+ * @param {object} opts baseRate, amount, mode, percent, code.
+ * @return {object}
+ */
+function planOptionFCustomerBilling(opts) {
+  const baseRaw = Number(opts && opts.baseRate);
+  const baseRate = roundOptionFMoney(baseRaw);
+  const hasBase = Number.isFinite(baseRate) && baseRate > 0;
+  const amount = roundOptionFMoney(opts && opts.amount);
+  const code = opts && opts.code ?
+    String(opts.code).trim().toUpperCase() : "";
+  const mode = opts && opts.mode === "percent" ? "percent" : "flat";
+  const billLines = [{
+    name: "Freight",
+    code: code || null,
+    amount,
+    pricingMode: mode,
+    flatAmount: mode === "flat" ? amount : null,
+    markupPct: mode === "percent" ? Number(opts.percent) : null,
+  }];
+  const invoiceLines = customerInvoiceChargeLines(
+      hasBase ? baseRate : 0, billLines);
+  let note = `Customer rate $${amount.toFixed(2)} entered as ` +
+    "accessorial Freight.";
+  note += hasBase ?
+    ` Base freight stays $${baseRate.toFixed(2)}.` :
+    " Base freight rate unchanged.";
+  return {
+    bumpFreight: false,
+    customerRate: hasBase ? baseRate : null,
+    customerBillLines: billLines,
+    customerBillAccessorialTotal: amount,
+    customerChargeAmount: amount,
+    invoiceLines,
+    note,
+  };
+}
+
+/**
+ * Reads option F from the confirm form. Percent uses invoiceAmount.
+ * @param {object} body POST body.
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @return {object}
+ */
+function parseOptionFFromRequest(body, invoiceAmount) {
+  const src = body || {};
+  const mode = String(src.fMode || src.pricingMode || "").toLowerCase();
+  const shared = src.fValue != null ? src.fValue : null;
+  const flatRaw = src.fFlatAmount != null ? src.fFlatAmount :
+    (src.flatAmount != null ? src.flatAmount : shared);
+  const pctRaw = src.fPercent != null ? src.fPercent :
+    (src.percent != null ? src.percent : shared);
+  return computeOptionFCustomerRate({
+    mode: mode === "percentage" ? "percent" : mode,
+    flatAmount: flatRaw,
+    percent: pctRaw,
+    invoiceAmount,
+  });
+}
+
 function parseCustomerBillLinesFromRequest(body) {
   const raw = body && body.customerBillLinesJson;
   if (!raw) {
@@ -1261,6 +1724,18 @@ function seedCustomerBillLinesFromCharges(charges) {
 }
 
 /**
+ * Letter already saved on this additional charge, if any.
+ * A second A–F action must no-op when this is set.
+ * @param {object|null} charge additionalCharge object.
+ * @return {string|null} Uppercase letter, or null when still open.
+ */
+function savedAdditionalChargeDecision(charge) {
+  const decision = String((charge && charge.decision) || "").trim();
+  if (!decision) return null;
+  return decision.toUpperCase();
+}
+
+/**
  * Option B confirm page — itemized customer accessorial billing.
  * @param {object} opts form options.
  * @return {string} HTML page.
@@ -1279,18 +1754,34 @@ function buildOptionBAccessorialConfirmPage(opts) {
   const seedJson = JSON.stringify(seedRows)
       .replace(/</g, "\\u003c")
       .replace(/-->/g, "--\\u003e");
+  const catalogJson = JSON.stringify(
+      Array.isArray(opts.accessorialOptions) ? opts.accessorialOptions : [])
+      .replace(/</g, "\\u003c")
+      .replace(/-->/g, "--\\u003e");
+  const notesHtml = opts.showDisputeNotes ?
+    `<label for="disputeNotes" style="display:block;font-size:14px;` +
+    `font-weight:600;color:#374151;margin:16px 0 8px">` +
+    `Notes on what to dispute</label>` +
+    `<textarea name="disputeNotes" id="disputeNotes" rows="4" ` +
+    `placeholder="What should be disputed?" ` +
+    `style="width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
+    `border-radius:8px;font-size:16px;box-sizing:border-box;` +
+    `font-family:Arial,sans-serif"></textarea>` : "";
   const baseRateHtml = baseRate > 0 ?
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
     `<strong>Base customer rate (unchanged):</strong> ` +
     `${formatCustomerRate(baseRate)}</p>` :
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `The base customer freight rate will stay as-is in Primus. Enter each ` +
-    `accessorial and the amount to bill the customer below.</p>`;
+    `The base customer freight rate will stay as-is in Primus. For each ` +
+    `accessorial, pick it from the Primus list, then enter a percent ` +
+    `markup or a flat customer charge. Use Add accessorial for a charge ` +
+    `Jerry did not list.` +
+    `</p>`;
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${esc(opts.title || "Confirm option B")}</title>` +
     `<style>` +
-    `.bill-row{display:grid;grid-template-columns:1fr 140px 32px;gap:8px;` +
+    `.bill-row{display:grid;grid-template-columns:1fr 160px 32px;gap:8px;` +
     `align-items:start;margin-bottom:10px}` +
     `.bill-row input{width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
     `border-radius:8px;font-size:16px;box-sizing:border-box}` +
@@ -1312,12 +1803,15 @@ function buildOptionBAccessorialConfirmPage(opts) {
     hidden +
     `<input type="hidden" name="customerBillLinesJson" ` +
     `id="customerBillLinesJson">` +
+    `<input type="hidden" id="allowEmptyLines" value="` +
+    `${opts.allowEmpty ? "1" : "0"}">` +
     `<p style="font-size:14px;font-weight:600;color:#374151;` +
     `margin-bottom:8px">` +
     `Accessorials to bill the customer</p>` +
     `<div id="bill-lines"></div>` +
     `<button type="button" class="add-btn" id="add-bill-line">` +
     `+ Add accessorial</button>` +
+    notesHtml +
     `<div style="margin-top:20px">` +
     `<button type="submit" style="background:${btnColor};color:#fff;` +
     `border:none;padding:12px 20px;border-radius:8px;font-size:16px;` +
@@ -1329,34 +1823,183 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `changed yet.</p>` +
     `<script>` +
     `const seedRows = ${seedJson};` +
+    `const catalog = ${catalogJson};` +
     `const container = document.getElementById("bill-lines");` +
     `function escAttr(v){return String(v ?? "").replace(/&/g,"&amp;")` +
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
+    `function normName(v){return String(v||"").toLowerCase()` +
+    `.replace(/[^a-z0-9]/g,"");}` +
     `function addRow(row={}){` +
     `const wrap=document.createElement("div");wrap.className="bill-row";` +
-    `const hint=row.carrierAmount?` +
-    `"<div class=\\"bill-hint\\">Carrier billed ` +
-    `"+row.carrierAmount.toFixed(2)+"</div>":"";` +
-    `wrap.innerHTML="<div><input type=\\"text\\" class=\\"bill-name\\" ` +
-    `placeholder=\\"Accessorial name\\" value=\\""+escAttr(row.name||"")+` +
-    `"\\" required>"+hint+"</div><div><input type=\\"number\\" ` +
-    `class=\\"bill-amount\\" min=\\"0.01\\" step=\\"0.01\\" ` +
-    `placeholder=\\"0.00\\" value=\\""+escAttr(row.amount||"")+` +
-    `"\\" required></div><button type=\\"button\\" class=\\"remove-btn\\" ` +
-    `title=\\"Remove\\">×</button>";` +
-    `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
-    `container.appendChild(wrap);}` +
-    `(seedRows.length?seedRows:[{name:"",amount:""}]).forEach(addRow);` +
-    `document.getElementById("add-bill-line").onclick=()=>addRow({});` +
-    `document.getElementById("option-b-form").onsubmit=()=>{` +
-    `const lines=[...container.querySelectorAll(".bill-row")].map((row)=>{` +
-    `return {name:row.querySelector(".bill-name").value.trim(),` +
-    `amount:Number(row.querySelector(".bill-amount").value)};` +
-    `}).filter((line)=>line.name&&line.amount>0);` +
-    `if(!lines.length){alert("Enter at least one accessorial and amount.");` +
-    `return false;}` +
+    `const carrier=Number(row.carrierAmount)||0;` +
+    `const sel=document.createElement("select");sel.className="bill-name";` +
+    `const blank=document.createElement("option");blank.value="";` +
+    `blank.textContent="Select accessorial";sel.appendChild(blank);` +
+    `const want=normName(row.name);const wantCode=String(row.code||"");` +
+    `let matched=false;` +
+    `for(const item of catalog){` +
+    `const opt=document.createElement("option");` +
+    `opt.value=item.code||"";opt.dataset.name=item.name||"";` +
+    `opt.textContent=(item.category?item.category+" — ":"")+item.name;` +
+    `if((wantCode&&item.code===wantCode)||` +
+    `(!wantCode&&want&&normName(item.name)===want)){` +
+    `opt.selected=true;matched=true;}` +
+    `sel.appendChild(opt);}` +
+    `if(want&&!matched){` +
+    `const opt=document.createElement("option");opt.value="";` +
+    `opt.dataset.name=row.name;opt.selected=true;` +
+    `opt.textContent=row.name+" (from the invoice)";` +
+    `sel.appendChild(opt);}` +
+    `const nameCell=document.createElement("div");nameCell.appendChild(sel);` +
+    `const carrierInput=document.createElement("input");` +
+    `carrierInput.className="bill-carrier";carrierInput.type="number";` +
+    `carrierInput.min="0";carrierInput.step="0.01";` +
+    `carrierInput.placeholder="Carrier $";` +
+    `if(carrier>0)carrierInput.value=carrier.toFixed(2);` +
+    `const hint=document.createElement("div");hint.className="bill-hint";` +
+    `hint.textContent="Carrier cost, then percent or flat customer charge";` +
+    `nameCell.appendChild(carrierInput);nameCell.appendChild(hint);` +
+    `const price=document.createElement("div");` +
+    `price.innerHTML="<select class=\\"bill-mode\\">` +
+    `<option value=\\"markup\\">Percent markup</option>` +
+    `<option value=\\"flat\\">Flat amount</option></select>"+` +
+    `"<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
+    `step=\\"0.01\\" placeholder=\\"20\\">";` +
+    `const remove=document.createElement("button");` +
+    `remove.type="button";remove.className="remove-btn";` +
+    `remove.title="Remove";remove.textContent="×";` +
+    `remove.onclick=()=>{wrap.remove();};` +
+    `wrap.appendChild(nameCell);wrap.appendChild(price);` +
+    `wrap.appendChild(remove);container.appendChild(wrap);}` +
+    `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);` +
+    `document.getElementById("add-bill-line").onclick=` +
+    `()=>addRow({name:"",carrierAmount:0});` +
+    `const form=document.getElementById("option-b-form");` +
+    `form.onsubmit=(e)=>{` +
+    `if(form.dataset.submitted==="1"){e.preventDefault();return false;}` +
+    `const lines=[];` +
+    `for(const row of container.querySelectorAll(".bill-row")){` +
+    `const sel=row.querySelector(".bill-name");` +
+    `const opt=sel.options[sel.selectedIndex];` +
+    `const name=(opt&&opt.dataset.name||"").trim();` +
+    `const code=sel.value||"";` +
+    `if(!name)continue;` +
+    `const carrierAmount=Number(row.querySelector(".bill-carrier").value)||0;` +
+    `const mode=row.querySelector(".bill-mode").value;` +
+    `const val=Number(row.querySelector(".bill-value").value);` +
+    `if(mode==="flat"){` +
+    `if(!(val>0)){alert("Enter a flat customer charge for "+name);` +
+    `e.preventDefault();return false;}` +
+    `lines.push({name,code,carrierAmount,pricingMode:"flat",flatAmount:val,` +
+    `markupPct:null,amount:val});` +
+    `}else{` +
+    `if(!(carrierAmount>0)||!(val>=0)){` +
+    `alert("Enter a markup percent for "+name);` +
+    `e.preventDefault();return false;}` +
+    `const amount=Math.round(carrierAmount*(1+val/100)*100)/100;` +
+    `lines.push({name,code,carrierAmount,pricingMode:"markup",markupPct:val,` +
+    `flatAmount:null,amount});}}` +
+    `const allowEmpty=document.getElementById("allowEmptyLines");` +
+    `if(!lines.length&&!(allowEmpty&&allowEmpty.value==="1")){` +
+    `alert("Enter a percent markup or a flat charge, or add an accessorial.");` +
+    `e.preventDefault();return false;}` +
     `document.getElementById("customerBillLinesJson").value=` +
-    `JSON.stringify(lines);return true;};` +
+    `JSON.stringify(lines);` +
+    `form.dataset.submitted="1";` +
+    `const submitBtn=form.querySelector("button[type=submit]");` +
+    `if(submitBtn){submitBtn.disabled=true;` +
+    `submitBtn.textContent="Submitting...";}` +
+    `return true;};` +
+    `</script></body></html>`;
+}
+
+/**
+ * Option F confirm page. One flat amount or a percent of the invoice.
+ * @param {object} opts form options.
+ * @return {string} HTML page.
+ */
+function buildOptionFConfirmPage(opts) {
+  const fields = opts.fields || {};
+  const formAction = `${opts.baseUrl}/${opts.actionPath}`;
+  const hidden = Object.entries(fields)
+      .map(([name, value]) =>
+        `<input type="hidden" name="${esc(name)}" ` +
+        `value="${esc(String(value ?? ""))}">`)
+      .join("");
+  const invoice = roundOptionFMoney(opts.invoiceAmount);
+  const hasInvoice = Number.isFinite(invoice) && invoice > 0;
+  const invoiceText = hasInvoice ? money(invoice) : "unavailable";
+  const invoiceJs = hasInvoice ? String(invoice) : "0";
+  const title = opts.title || "F - customer rate as Freight";
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${esc(title)}</title></head>` +
+    `<body style="font-family:Arial,sans-serif;max-width:560px;` +
+    `margin:48px auto;padding:0 16px;color:#111827">` +
+    `<h1 style="font-size:22px;margin-bottom:12px">${esc(title)}</h1>` +
+    `<p style="font-size:16px;color:#374151;line-height:1.5">` +
+    `Load ${esc(String(opts.loadNumber || ""))}: enter one customer ` +
+    `rate. A flat amount is billed as entered. A percent is that ` +
+    `percent of the carrier invoice total (${esc(invoiceText)}). ` +
+    `Example: a $350 invoice at 10% is $35.00. Jerry enters that ` +
+    `amount in Primus as one accessorial named Freight, pays the ` +
+    `carrier invoice, and does not send a separate customer email.` +
+    `</p>` +
+    `<form method="POST" action="${esc(formAction)}" id="option-f-form" ` +
+    `style="margin-top:16px">` +
+    hidden +
+    `<p style="margin:12px 0"><label>` +
+    `<input type="radio" name="fMode" value="flat" checked> ` +
+    `Flat dollar amount</label></p>` +
+    `<p style="margin:12px 0"><label>` +
+    `<input type="radio" name="fMode" value="percent"> ` +
+    `Percent of the invoice total</label></p>` +
+    `<p><input type="number" name="fValue" id="fValue" min="0" ` +
+    `step="0.01" required placeholder="35.00 or 10" ` +
+    `style="width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
+    `border-radius:8px;font-size:16px;box-sizing:border-box"></p>` +
+    `<p id="f-preview" style="font-size:14px;color:#374151"></p>` +
+    `<button type="submit" style="background:#c2410c;color:#fff;` +
+    `border:none;padding:12px 20px;border-radius:8px;font-size:16px;` +
+    `font-weight:600;cursor:pointer">` +
+    `${esc(opts.confirmLabel || "Confirm option F")}</button>` +
+    `</form>` +
+    `<p style="font-size:13px;color:#9ca3af;margin-top:20px">` +
+    `If you did not request this, close this page - nothing has been ` +
+    `changed yet.</p>` +
+    `<script>` +
+    `const invoiceAmount=${invoiceJs};` +
+    `const preview=document.getElementById("f-preview");` +
+    `const input=document.getElementById("fValue");` +
+    `function mode(){const el=document.querySelector(` +
+    `"input[name=fMode]:checked");return el?el.value:"flat";}` +
+    `function show(){const val=Number(input.value);` +
+    `if(!(val>0)){preview.textContent="";return;}` +
+    `if(mode()==="percent"){` +
+    `if(!(invoiceAmount>0)){preview.textContent=` +
+    `"Invoice total is missing, so a percent cannot be calculated.";` +
+    `return;}` +
+    `const amount=Math.round(invoiceAmount*(val/100)*100)/100;` +
+    `preview.textContent="Customer rate: $"+amount.toFixed(2)+` +
+    `" ("+val+"% of $"+invoiceAmount.toFixed(2)+")";` +
+    `}else{preview.textContent="Customer rate: $"+val.toFixed(2);}}` +
+    `input.addEventListener("input",show);` +
+    `document.querySelectorAll("input[name=fMode]").forEach((el)=>` +
+    `el.addEventListener("change",show));` +
+    `const form=document.getElementById("option-f-form");` +
+    `form.onsubmit=(e)=>{` +
+    `if(form.dataset.submitted==="1"){e.preventDefault();return false;}` +
+    `const val=Number(input.value);` +
+    `if(!(val>0)){alert("Enter an amount greater than 0.");` +
+    `e.preventDefault();return false;}` +
+    `if(mode()==="percent"&&!(invoiceAmount>0)){` +
+    `alert("The carrier invoice total is missing.");` +
+    `e.preventDefault();return false;}` +
+    `form.dataset.submitted="1";` +
+    `const submitBtn=form.querySelector("button[type=submit]");` +
+    `if(submitBtn){submitBtn.disabled=true;` +
+    `submitBtn.textContent="Submitting...";}` +
+    `return true;};` +
     `</script></body></html>`;
 }
 
@@ -1373,6 +2016,10 @@ module.exports = {
   formatCustomerRate,
   isWeightInspectionLabel,
   isAccessorialLabel,
+  isFreightBreakdownLabel,
+  stripFreightBreakdownCharges,
+  invoiceOverage,
+  reportedChargeDifference,
   displayChargeLabel,
   sumCharges,
   normalizeBreakdownText,
@@ -1393,13 +2040,25 @@ module.exports = {
   pickCarrierInvoiceAttachment,
   buildAdditionalChargeApprovalEmail,
   buildDisputeEmailDraft,
+  normalizeDisputeNotes,
   buildCustomerChargeNotificationEmail,
+  planOptionACustomerBilling,
+  customerInvoiceChargeLines,
+  mustDeliverDespiteDashboardPark,
+  shouldCloseAdditionalChargeTask,
   buildDispatcherCustomerNotifyTemplate,
   buildDispatcherNotifyReminderEmail,
+  savedAdditionalChargeDecision,
   buildOptionBAccessorialConfirmPage,
+  buildOptionFConfirmPage,
+  computeOptionFCustomerRate,
+  freightAccessorialFromCatalog,
+  planOptionFCustomerBilling,
+  parseOptionFFromRequest,
   customerBillLinesHtml,
   sumCustomerBillLines,
   normalizeCustomerBillLines,
+  computeCustomerChargeAmount,
   parseCustomerChargeAmountFromRequest,
   parseCustomerBillLinesFromRequest,
   seedCustomerBillLinesFromCharges,
