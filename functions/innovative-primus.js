@@ -3505,8 +3505,10 @@ exports.processPrimusWorkflow = onRequest(
                 };
               }
             }
-            const invoiceUnchanged = !!(invoiceGenerationResult &&
+            const reusedIssued = !!(invoiceGenerationResult &&
               invoiceGenerationResult.reused);
+            const invoiceUnchanged = reusedIssued &&
+              optionBCustomerBillLines.length === 0;
             const guardTotal = invoiceGenerationResult &&
               invoiceGenerationResult.invoiceTotal != null ?
               invoiceGenerationResult.invoiceTotal :
@@ -3585,6 +3587,7 @@ exports.processPrimusWorkflow = onRequest(
                   "Customer documents emailed via Primus emailBOLDocs", {
                     invoiceId,
                     flowId,
+                    loadNumber: invoice.loadNumber || null,
                     to: customerEmail,
                     customerInvoiceId: finalCustomerInvoiceId,
                     invoiceNumber: issuedInvoiceNumber,
