@@ -26,7 +26,10 @@
     c: "C — Pay carrier only",
     d: "D — Dispute / not approved",
     e: "E — Pay + bill (no customer email)",
+    f: "F — customer rate as Freight",
   };
+
+  const CHARGE_OPTS = ["a", "b", "c", "d", "e", "f"];
 
   const OPS_PEOPLE = [
     {key: "leo", name: "Leo", email: "leo@innovativecarriers.com"},
@@ -143,6 +146,43 @@
       btn.disabled = false;
       btn.textContent = btn.dataset.idleText || idleText || btn.textContent;
     }
+  }
+
+  function chargeHosts(taskId) {
+    const hosts = [];
+    const id = String(taskId || "");
+    if (!id) return hosts;
+    document.querySelectorAll(".work-row[data-task-id]").forEach((row) => {
+      if (row.dataset.taskId === id) hosts.push(row);
+    });
+    if (els.drawerFooter && drawerItem && drawerItem.id === id) {
+      hosts.push(els.drawerFooter);
+    }
+    return hosts;
+  }
+
+  function freezeChargeButtons(taskId) {
+    chargeHosts(taskId).forEach((host) => {
+      host.dataset.chargeFrozen = "1";
+      host.querySelectorAll(".charge-opt").forEach((btn) => {
+        btn.disabled = true;
+      });
+    });
+  }
+
+  function unfreezeChargeButtons(taskId) {
+    chargeHosts(taskId).forEach((host) => {
+      delete host.dataset.chargeFrozen;
+      host.querySelectorAll(".charge-opt").forEach((btn) => {
+        btn.disabled = false;
+      });
+    });
+  }
+
+  function releaseChargeAttempt(taskId, confirmBtn, form) {
+    if (form) delete form.dataset.submitting;
+    setButtonBusy(confirmBtn, false);
+    unfreezeChargeButtons(taskId);
   }
 
   function setRangeButtonsDisabled(disabled) {
@@ -525,7 +565,7 @@
   function renderChargeButtons(task) {
     if (!taskCanResolve(task)) return "";
     return `<div class="charge-opt-grid">` +
-      ["a", "b", "c", "d", "e"].map((opt) =>
+      CHARGE_OPTS.map((opt) =>
         `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}" ` +
         `data-invoice="${bodyEsc(task.invoiceId)}" data-task-id="${bodyEsc(task.id)}" ` +
         `data-task-source="${bodyEsc(task.source || "dashboardTasks")}">` +
@@ -652,6 +692,7 @@
     const foot = els.drawerFooter;
     const body = els.drawerBody;
     if (!foot || !drawerItem) return;
+    delete foot.dataset.chargeFrozen;
 
     foot.querySelector(".assign-send")?.addEventListener("click", async () => {
       const key = foot.querySelector(".assign-person")?.value || "";
@@ -688,7 +729,11 @@
     });
 
     foot.querySelectorAll(".charge-opt").forEach((btn) => {
-      btn.addEventListener("click", () => openChargeForm(btn));
+      btn.addEventListener("click", () => {
+        if (btn.disabled || foot.dataset.chargeFrozen === "1") return;
+        freezeChargeButtons(drawerItem && drawerItem.id);
+        openChargeForm(btn);
+      });
     });
 
     foot.querySelector(".notif-dismiss")?.addEventListener("click", () => {
@@ -892,6 +937,56 @@
     return lines;
   }
 
+  function chargeFreightForm(invoiceAmount) {
+    const invoice = Number(invoiceAmount);
+    const known = Number.isFinite(invoice) && invoice > 0;
+    const shown = known ? formatMoney(invoice) : "the carrier invoice on file";
+    return `<p><strong>${bodyEsc(CHARGE_LABELS.f)}</strong></p>` +
+      `<p>Enter one customer rate. Flat uses the dollar amount you type. ` +
+      `Percent is that percent of the carrier invoice (${bodyEsc(shown)}). ` +
+      `A $350 invoice at 10% bills $35.00. That amount is entered in Primus ` +
+      `as one accessorial named Freight. The carrier is paid the invoice. ` +
+      `No separate customer email.</p>` +
+      `<label class="charge-f-choice"><input type="radio" name="fMode" value="flat" checked> Flat dollar amount</label>` +
+      `<label class="charge-f-choice"><input type="radio" name="fMode" value="percent"> Percent of the invoice total</label>` +
+      `<input class="input charge-f-value" type="number" min="0" step="0.01" placeholder="35.00 or 10">` +
+      `<p class="charge-f-preview"></p>` +
+      `<div class="row-actions">` +
+      `<button type="button" class="btn btn-sm btn-primary charge-confirm" data-opt="f">Confirm F</button>` +
+      `<button type="button" class="btn btn-outline btn-sm charge-cancel">Cancel</button></div>`;
+  }
+
+  function bindFreightPreview(form, invoiceAmount) {
+    const invoice = Number(invoiceAmount);
+    const preview = form.querySelector(".charge-f-preview");
+    const input = form.querySelector(".charge-f-value");
+    const show = () => {
+      const mode = form.querySelector("input[name='fMode']:checked");
+      const val = Number(input && input.value);
+      if (!(val > 0)) {
+        if (preview) preview.textContent = "";
+        return;
+      }
+      if (mode && mode.value === "percent") {
+        if (!(invoice > 0)) {
+          preview.textContent =
+            "Percent uses the carrier invoice total on file.";
+          return;
+        }
+        const amount = Math.round(invoice * (val / 100) * 100) / 100;
+        preview.textContent =
+          `Customer rate: ${formatMoney(amount)} ` +
+          `(${val}% of ${formatMoney(invoice)})`;
+        return;
+      }
+      preview.textContent = `Customer rate: ${formatMoney(val)}`;
+    };
+    input.addEventListener("input", show);
+    form.querySelectorAll("input[name='fMode']").forEach((el) => {
+      el.addEventListener("change", show);
+    });
+  }
+
   function chargeLinesForm(opt, allowEmpty) {
     return `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
       `<p>Pick each accessorial from the Primus list. Add accessorial for a charge Jerry did not list. Then enter a percent markup or a flat customer amount.</p>` +
@@ -909,18 +1004,32 @@
     const taskSource = btn.dataset.taskSource;
     const form = els.drawerFooter.querySelector(`[data-charge-form="${taskId}"]`) ||
       els.drawerBody.querySelector(`[data-charge-form="${taskId}"]`);
-    if (!form) return;
+    if (!form) {
+      unfreezeChargeButtons(taskId);
+      return;
+    }
     form.hidden = false;
-    if (opt === "c" || opt === "d") {
+    const invoiceAmount = drawerItem && drawerItem.invoiceAmount;
+    if (opt === "f") {
+      form.innerHTML = chargeFreightForm(invoiceAmount);
+      bindFreightPreview(form, invoiceAmount);
+    } else if (opt === "c" || opt === "d") {
       form.innerHTML = chargeLinesForm(opt, true);
     } else {
       form.innerHTML = chargeLinesForm(opt, false);
     }
+    form.querySelector(".charge-cancel").addEventListener("click", () => {
+      form.hidden = true;
+      form.innerHTML = "";
+      unfreezeChargeButtons(taskId);
+    });
+    if (opt !== "f") {
     const list = form.querySelector(".charge-line-list");
     list.textContent = "Loading the Primus list…";
     if (drawerItem && !drawerItem._detailLoaded) {
       await loadRowDetail(drawerItem, "task");
     }
+    if (form.hidden || !form.querySelector(".charge-confirm")) return;
     let choices = [];
     try {
       choices = await loadAccessorialChoices();
@@ -938,24 +1047,56 @@
     form.querySelector(".charge-add-line").addEventListener("click", () => {
       addChargeLine(list, {}, choices);
     });
-    form.querySelector(".charge-cancel").addEventListener("click", () => {
-      form.hidden = true;
-      form.innerHTML = "";
-    });
-    form.querySelector(".charge-confirm").addEventListener("click", async () => {
-      const confirmBtn = form.querySelector(".charge-confirm");
+    }
+    const confirmBtn = form.querySelector(".charge-confirm");
+    confirmBtn.addEventListener("click", async () => {
+      if (form.dataset.submitting === "1") return;
+      form.dataset.submitting = "1";
       setButtonBusy(confirmBtn, true, "Applying…");
       try {
         const payload = {invoiceId, option: opt, taskId, taskSource};
+        if (opt === "f") {
+          const modeEl = form.querySelector("input[name='fMode']:checked");
+          const fMode = modeEl ? modeEl.value : "";
+          const val = Number(form.querySelector(".charge-f-value").value);
+          if (fMode === "flat") {
+            if (!(val > 0)) {
+              showError("Enter a flat amount greater than 0.");
+              releaseChargeAttempt(taskId, confirmBtn, form);
+              return;
+            }
+            payload.fMode = "flat";
+            payload.fFlatAmount = val;
+          } else if (fMode === "percent") {
+            if (!(val > 0)) {
+              showError("Enter a percent greater than 0.");
+              releaseChargeAttempt(taskId, confirmBtn, form);
+              return;
+            }
+            payload.fMode = "percent";
+            payload.fPercent = val;
+          } else {
+            showError("Choose a flat amount or a percent of the invoice.");
+            releaseChargeAttempt(taskId, confirmBtn, form);
+            return;
+          }
+        } else {
         const allowEmpty = confirmBtn.dataset.allowEmpty === "1";
         const lines = readChargeLines(form);
         if (!lines.length && !allowEmpty) {
           showError("Enter a percent markup or a flat amount, or add an accessorial.");
-          setButtonBusy(confirmBtn, false);
+          releaseChargeAttempt(taskId, confirmBtn, form);
           return;
         }
         payload.customerBillLines = lines;
+        }
         const result = await postJson("/dashboardAdditionalChargeDecision", payload);
+        if (result.alreadyApplied) {
+          showRunResult(
+              result.message || "This charge was already decided.",
+              false);
+          return;
+        }
         showRunResult(
             result.handedOffToDispatch ?
               `Option B applied — moved to Dispatch Tasks.` :
@@ -976,8 +1117,10 @@
         }
         loadNotifications({reset: true});
       } catch (error) {
-        showError(error.message || "Could not apply decision.");
-        setButtonBusy(confirmBtn, false);
+        const message = error.message || "Could not apply decision.";
+        showError(message);
+        if (/already (handled|decided|applied)/i.test(message)) return;
+        releaseChargeAttempt(taskId, confirmBtn, form);
       }
     });
   }
@@ -1178,7 +1321,7 @@
         const logged = receivedInfo(task);
         const chargeBtns = taskCanResolve(task) ?
           `<span class="charge-opt-row">` +
-          ["a", "b", "c", "d", "e"].map((opt) =>
+          CHARGE_OPTS.map((opt) =>
             `<button type="button" class="btn btn-sm charge-opt" data-charge-opt="${opt}">${opt.toUpperCase()}</button>`,
           ).join("") + `</span>` : `<span class="charge-opt-row"></span>`;
         rows += `<article class="work-row ${urgent ? "is-urgent" : ""} ${high ? "is-high-dollar" : ""}" data-task-id="${bodyEsc(task.id)}">
@@ -1232,10 +1375,16 @@
       row.querySelectorAll(".charge-opt").forEach((btn) => {
         btn.addEventListener("click", (e) => {
           e.stopPropagation();
+          if (btn.disabled || row.dataset.chargeFrozen === "1") return;
+          row.dataset.chargeFrozen = "1";
+          row.querySelectorAll(".charge-opt").forEach((other) => {
+            other.disabled = true;
+          });
           btn.dataset.invoice = task.invoiceId || "";
           btn.dataset.taskId = task.id;
           btn.dataset.taskSource = task.source || "dashboardTasks";
           openTaskDrawer(task);
+          freezeChargeButtons(task.id);
           openChargeForm(btn);
         });
       });
