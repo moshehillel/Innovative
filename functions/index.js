@@ -35,6 +35,9 @@ const fedexFreightPod = require("./fedex-freight-pod");
 const xpoImaging = require("./xpo-imaging");
 const loadResolution = require("./invoice-load-resolution");
 const apexCapitalIntake = require("./apex-capital-intake");
+const invoiceZipAttachments = require("./invoice-zip-attachments");
+const invoiceBatchClassification =
+  require("./invoice-batch-classification");
 const dailyActivityReport = require("./daily-activity-report");
 const podRequestIntake = require("./pod-request-intake");
 const podSendDedup = require("./pod-send-dedup");
@@ -9562,6 +9565,27 @@ async function processGmailMessage(
               error: expandErr.message,
             });
       }
+      try {
+        const beforeZipCount = attachments.length;
+        attachments = await invoiceZipAttachments.expandZipAttachments(
+            gmail, messageId, attachments, resolveAttachmentBuffer);
+        const fromZip = attachments.filter((a) => a && a.fromZip);
+        if (fromZip.length > 0) {
+          await writeLog("info", "mail",
+              "Extracted invoice file(s) from ZIP attachment(s)", {
+                messageId,
+                beforeCount: beforeZipCount,
+                afterCount: attachments.length,
+                extracted: fromZip.map((a) => a.filename),
+              });
+        }
+      } catch (zipErr) {
+        await writeLog("warn", "mail",
+            "ZIP attachment expand failed; continuing", {
+              messageId,
+              error: zipErr.message,
+            });
+      }
 
       if (attachments.length === 0) {
         try {
@@ -10255,14 +10279,19 @@ async function processGmailMessage(
             fileSize: fileBuffer.length,
           });
           const isPdfMime = isPdfAttachment(attachment, fileBuffer);
+          const isZip = invoiceZipAttachments.isZipAttachment(
+              attachment, fileBuffer);
+          const zipDone = Boolean(attachment.zipExpanded);
           if (isPdfMime && isPdfTooSmallForIntake(attachment, fileBuffer)) {
           // Small PDF — likely a real document but too short to be an invoice
             skippedDocTypes.push("small PDF");
-          } else if (!isPdfMime && fileBuffer.length >= 10000) {
+          } else if (!isPdfMime && !isZip && fileBuffer.length >= 10000) {
           // Substantive non-PDF (Excel, Word, image, etc.)
             const ext = String(attachment.filename || "")
                 .split(".").pop().toUpperCase();
             skippedDocTypes.push(ext || attachment.mimeType || "non-PDF file");
+          } else if (isZip && !zipDone) {
+            skippedDocTypes.push("ZIP");
           }
           continue;
         }
@@ -10801,10 +10830,18 @@ async function processGmailMessage(
           input: {attachmentCount: pdfAttachments.length},
         });
 
-        aiResult = await classifyInvoiceData(
-            pdfAttachments,
-            lastKnownLoadNumber,
-        );
+        aiResult = await invoiceBatchClassification
+            .classifyCarrierInvoiceAttachments({
+              pdfAttachments,
+              lastKnownLoadNumber,
+              messageId,
+              classifyCombined: (atts, last) =>
+                classifyInvoiceData(atts, last),
+              classifyOne: (pdf, last) =>
+                classifyInvoiceData([pdf], last),
+              log: (level, message, details) =>
+                writeLog(level, "ai", message, details),
+            });
 
         await logWorkflowStep({
           gmailMessageId: messageId,

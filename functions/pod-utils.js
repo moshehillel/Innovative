@@ -977,6 +977,81 @@ function buildPodClassifierRules(options = {}) {
   return rules;
 }
 
+/**
+ * Normalizes attachment filenames for comparison.
+ * Central Transport pads names with spaces.
+ * @param {string} filename Raw filename.
+ * @return {string}
+ */
+function normalizeAttachmentFilenameKey(filename) {
+  return String(filename || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "");
+}
+
+/**
+ * @param {string} a First filename.
+ * @param {string} b Second filename.
+ * @return {boolean}
+ */
+function attachmentFilenamesMatch(a, b) {
+  if (!a || !b) return false;
+  return normalizeAttachmentFilenameKey(a) ===
+    normalizeAttachmentFilenameKey(b);
+}
+
+/**
+ * Invoice PDFs, excluding POD-only files.
+ * @param {Array<object>|null|undefined} attachments Attachment list.
+ * @return {Array<object>}
+ */
+function listInvoicePdfAttachments(attachments) {
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.filter((a) => {
+    if (!a || !a.filename) return false;
+    if (String(a.docType || "").toUpperCase() === "POD") return false;
+    return /\.pdf$/i.test(String(a.filename)) ||
+      /pdf/i.test(String(a.mimeType || ""));
+  });
+}
+
+/**
+ * True when each invoice PDF must be classified on its own.
+ * One combined call on a Central Transport batch (two or more
+ * multi-page bills) is truncated or returns only a thinking block,
+ * so later invoices are never read. A single multi-invoice PDF
+ * (FedEx) stays one call.
+ * @param {Array<object>|null|undefined} attachments Attachment list.
+ * @return {boolean}
+ */
+function shouldClassifyEachInvoicePdf(attachments) {
+  return listInvoicePdfAttachments(attachments).length >= 2;
+}
+
+/**
+ * Invoice PDF attachments not claimed by any classifier item.
+ * @param {Array<object>} invoiceItems Classifier invoice items.
+ * @param {Array<object>} attachments Stored attachment metadata.
+ * @return {Array<object>}
+ */
+function listUncoveredInvoiceAttachments(invoiceItems, attachments) {
+  const pdfs = listInvoicePdfAttachments(attachments);
+  const claimed = new Set();
+  for (const item of (Array.isArray(invoiceItems) ? invoiceItems : [])) {
+    const name = item && item.attachmentFilename;
+    if (!name) continue;
+    claimed.add(normalizeAttachmentFilenameKey(name));
+    for (const pdf of pdfs) {
+      if (attachmentFilenamesMatch(pdf.filename, name)) {
+        claimed.add(normalizeAttachmentFilenameKey(pdf.filename));
+      }
+    }
+  }
+  return pdfs.filter((pdf) =>
+    !claimed.has(normalizeAttachmentFilenameKey(pdf.filename)));
+}
+
 module.exports = {
   POD_PACKAGE_SOURCES,
   POD_DOCUMENT_SHAPE,
@@ -1008,4 +1083,9 @@ module.exports = {
   detectPodDiscrepanciesInText,
   scanPodBufferForDiscrepancies,
   mergePodDiscrepancies,
+  normalizeAttachmentFilenameKey,
+  attachmentFilenamesMatch,
+  listInvoicePdfAttachments,
+  shouldClassifyEachInvoicePdf,
+  listUncoveredInvoiceAttachments,
 };
