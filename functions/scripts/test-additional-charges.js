@@ -451,6 +451,203 @@ check("resolution page can add another charge",
     page.includes("add-bill-line"), true);
 const script = page.split("<script>")[1].split("</script>")[0];
 new Function(script);
+
+/**
+ * Runs the confirm-page script against a small stand-in for the browser.
+ * @param {string} html Confirm page HTML.
+ * @return {object}
+ */
+function mountConfirmPage(html) {
+  const pageScript = html.split("<script>")[1].split("</script>")[0];
+  const byId = new Map();
+  const matches = (node, sel) => {
+    if (sel.startsWith(".")) {
+      return String(node.className || "").split(/\s+/).includes(sel.slice(1));
+    }
+    const attr = sel.match(/^(\w+)\[(\w+)=["']?([^"'\]]+)["']?\]$/);
+    if (attr) {
+      return node.tag === attr[1] && String(node[attr[2]] || "") === attr[3];
+    }
+    return node.tag === sel;
+  };
+  const queryAll = (node, sel) => {
+    const out = [];
+    const walk = (current) => {
+      for (const child of current.children || []) {
+        if (matches(child, sel)) out.push(child);
+        walk(child);
+      }
+    };
+    walk(node);
+    return out;
+  };
+  const make = (tag) => {
+    const node = {
+      tag,
+      className: "",
+      children: [],
+      textContent: "",
+      type: "",
+      placeholder: "",
+      id: "",
+      title: "",
+      disabled: false,
+      readOnly: false,
+      dataset: {},
+      parent: null,
+      _value: "",
+      _options: [],
+      _selected: 0,
+      _selectedFlag: false,
+      appendChild(child) {
+        this.children.push(child);
+        child.parent = this;
+        if (this.tag === "select" && child.tag === "option") {
+          this._options.push(child);
+          child._select = this;
+          if (child.selected) {
+            this._selected = this._options.length - 1;
+          }
+        }
+        return child;
+      },
+      querySelector(sel) {
+        return queryAll(this, sel)[0] || null;
+      },
+      querySelectorAll(sel) {
+        return queryAll(this, sel);
+      },
+      remove() {
+        if (!this.parent) return;
+        this.parent.children = this.parent.children.filter((c) => c !== this);
+      },
+    };
+    Object.defineProperty(node, "options", {
+      get() {
+        return this._options;
+      },
+    });
+    Object.defineProperty(node, "selectedIndex", {
+      get() {
+        return this._selected;
+      },
+      set(index) {
+        this._selected = index;
+      },
+    });
+    Object.defineProperty(node, "selected", {
+      get() {
+        return this._selectedFlag;
+      },
+      set(flag) {
+        this._selectedFlag = !!flag;
+        if (flag && this._select) {
+          this._select._selected = this._select._options.indexOf(this);
+        }
+      },
+    });
+    Object.defineProperty(node, "value", {
+      get() {
+        if (this.tag === "select") {
+          const opt = this._options[this._selected];
+          return opt ? opt.value : "";
+        }
+        return this._value;
+      },
+      set(next) {
+        this._value = String(next);
+        if (this.tag !== "select") return;
+        const idx = this._options.findIndex((opt) => opt.value === this._value);
+        if (idx >= 0) this._selected = idx;
+      },
+    });
+    return node;
+  };
+  const document = {
+    createElement: make,
+    getElementById(id) {
+      return byId.get(id) || null;
+    },
+  };
+  const form = make("form");
+  form.id = "option-b-form";
+  form.dataset = {};
+  const lines = make("div");
+  lines.id = "bill-lines";
+  const addBtn = make("button");
+  addBtn.id = "add-bill-line";
+  addBtn.type = "button";
+  const allowEmpty = make("input");
+  allowEmpty.id = "allowEmptyLines";
+  allowEmpty.value = "0";
+  const jsonField = make("input");
+  jsonField.id = "customerBillLinesJson";
+  const submitBtn = make("button");
+  submitBtn.type = "submit";
+  form.appendChild(lines);
+  form.appendChild(allowEmpty);
+  form.appendChild(jsonField);
+  form.appendChild(submitBtn);
+  byId.set(form.id, form);
+  byId.set(lines.id, lines);
+  byId.set(addBtn.id, addBtn);
+  byId.set(allowEmpty.id, allowEmpty);
+  byId.set(jsonField.id, jsonField);
+  const alerts = [];
+  const fn = new Function("document", "alert", pageScript);
+  fn(document, (msg) => alerts.push(String(msg)));
+  return {form, container: lines, addBtn, alerts, jsonField};
+}
+
+const pctPage = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option B",
+  baseUrl: "https://example.test",
+  actionPath: "additionalChargeAction",
+  accessorialOptions: [
+    {code: "RDV", name: "Redelivery", category: "Destination"},
+  ],
+  carrierCharges: [{label: "Redelivery", amount: 125}],
+  fields: {invoiceId: "1", option: "b"},
+});
+const defaulted = mountConfirmPage(pctPage);
+const defaultRow = defaulted.container.querySelector(".bill-row");
+const defaultPct = defaultRow.querySelector(".bill-value");
+check("confirm page defaults the percent to 30", defaultPct.value, "30");
+check("confirm percent stays editable",
+    defaultPct.disabled === true || defaultPct.readOnly === true, false);
+defaulted.form.onsubmit({preventDefault() {}});
+const defaultLines = JSON.parse(defaulted.jsonField.value);
+check("default 30 percent of 125 bills 162.50",
+    defaultLines[0].markupPct === 30 && defaultLines[0].amount === 162.5,
+    true);
+const edited = mountConfirmPage(pctPage);
+const editedRow = edited.container.querySelector(".bill-row");
+const editedPct = editedRow.querySelector(".bill-value");
+const editedMode = editedRow.querySelector(".bill-mode");
+editedPct.value = "15";
+editedPct.oninput();
+editedMode.value = "flat";
+editedMode.onchange();
+check("flat mode does not turn 30 into the customer dollars",
+    editedPct.value, "");
+editedMode.value = "markup";
+editedMode.onchange();
+check("switching back shows the typed percent", editedPct.value, "15");
+edited.addBtn.onclick();
+const added = edited.container.querySelectorAll(".bill-row");
+const addedRow = added[added.length - 1];
+const addedPct = addedRow.querySelector(".bill-value");
+check("new accessorial row starts at 30 percent", addedPct.value, "30");
+addedRow.querySelector(".bill-name").value = "RDV";
+addedRow.querySelector(".bill-carrier").value = "10";
+edited.form.onsubmit({preventDefault() {}});
+const editedLines = JSON.parse(edited.jsonField.value);
+check("confirm page accepts a percent other than 30",
+    editedLines.some((line) =>
+      line.markupPct === 15 && line.amount === 143.75) &&
+    editedLines.some((line) =>
+      line.markupPct === 30 && line.amount === 13),
+    true);
 const coded = ac.normalizeCustomerBillLines([{
   name: "Redelivery Fee", code: "rdv", carrierAmount: 75,
   pricingMode: "markup", markupPct: 10,
@@ -566,6 +763,9 @@ check("option F confirm shows the invoice total",
     fPage.includes("$350.00"), true);
 check("option F confirm does not itemize carrier accessorials",
     fPage.includes("Add accessorial"), false);
+check("option F invoice percent is not defaulted to 30",
+    fPage.includes("const defaultPct=") ||
+    fPage.includes("value=\"30\""), false);
 new Function(fPage.split("<script>")[1].split("</script>")[0]);
 check("option F completion closes the dashboard task",
     ac.shouldCloseAdditionalChargeTask({
@@ -588,13 +788,61 @@ const notice = ac.buildCustomerChargeNotificationEmail({
 check("customer notice uses the existing subject",
     notice.subject.indexOf("Additional charge on shipment 268358") >= 0,
     true);
-check("customer notice lists residential",
-    notice.html.indexOf("Residential delivery") >= 0, true);
-check("customer notice lists liftgate",
-    notice.html.indexOf("Liftgate delivery") >= 0, true);
-check("customer notice states the difference total",
+check("customer notice lists the billed residential amount",
+    notice.html.indexOf("Residential Delivery: $55.90") >= 0, true);
+check("customer notice lists the billed liftgate amount",
+    notice.html.indexOf("Liftgate at Destination: $54.60") >= 0, true);
+check("customer notice totals the customer lines",
     notice.html.indexOf("Total Additional Charges") >= 0 &&
-    notice.html.indexOf("$110.50") >= 0, true);
+    notice.html.indexOf("$110.50") >= 0 &&
+    notice.html.indexOf("$43.00") < 0 &&
+    notice.html.indexOf("$42.00") < 0, true);
+const dispatcherBill = ac.buildDispatcherNotifyReminderEmail({
+  dispatcherName: "Tina",
+  loadNumber: "267289",
+  customerName: "Classic Eyewear Cases inc DBA Optipak",
+  charges: [
+    {label: "Line haul", amount: 133.74},
+    {label: "REDELIVERY", amount: 125},
+    {label: "Fuel surcharge", amount: 20},
+  ],
+  chargesTotal: 125,
+  customerRate: 239,
+  customerBillLines: [{
+    name: "Redelivery",
+    amount: 162.5,
+    carrierAmount: 125,
+    pricingMode: "markup",
+    markupPct: 30,
+  }],
+});
+check("dispatcher line is the customer amount",
+    dispatcherBill.html.indexOf("Redelivery: $162.50") >= 0, true);
+check("dispatcher total is the customer amount",
+    dispatcherBill.html.indexOf("<strong>$162.50</strong>") >= 0, true);
+check("dispatcher notice skips the carrier cost",
+    dispatcherBill.html.indexOf("$125.00") >= 0, false);
+check("dispatcher notice skips line haul and fuel",
+    dispatcherBill.html.indexOf("Line haul") >= 0 ||
+    dispatcherBill.html.indexOf("Fuel") >= 0, false);
+const flatAndMarkup = ac.buildDispatcherCustomerNotifyTemplate({
+  loadNumber: "1",
+  customerName: "Acme",
+  charges: [{label: "Detention", amount: 50}],
+  chargesTotal: 50,
+  customerBillLines: [
+    {name: "Detention", amount: 80, pricingMode: "flat", flatAmount: 80},
+    {name: "Liftgate", amount: 65, pricingMode: "markup", markupPct: 30},
+  ],
+});
+check("flat line shows the flat customer amount",
+    flatAndMarkup.html.indexOf("Detention: $80.00") >= 0, true);
+check("markup line shows the marked-up amount",
+    flatAndMarkup.html.indexOf("Liftgate: $65.00") >= 0, true);
+check("notice total is the sum of customer lines",
+    flatAndMarkup.html.indexOf("<strong>$145.00</strong>") >= 0, true);
+check("notice total is not the carrier difference",
+    flatAndMarkup.html.indexOf("$50.00") >= 0, false);
 const differenceNotice = ac.buildCustomerChargeNotificationEmail({
   customerName: "Example Customer",
   loadNumber: "265647",

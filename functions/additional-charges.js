@@ -80,6 +80,9 @@ const RATE_MATCH_TOLERANCE = 10;
 /** Charges at or below this amount are ignored for approval/dispute. */
 const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
 
+/** Starting percent markup on a resolution line. The person can change it. */
+const DEFAULT_CUSTOMER_MARKUP_PCT = 30;
+
 /** A few dollars: match the gap to an accessorial instead of calling it a reweigh. */
 const SMALL_GAP_MAX = 25;
 
@@ -1051,6 +1054,24 @@ function noticeChargeLines(charges) {
   return split.kept.filter((row) => chargeLabel(row));
 }
 
+/**
+ * Customer amounts for the notice. Each amount is the billed charge
+ * (carrier plus markup, or the flat amount). Line haul and fuel are omitted.
+ * @param {Array<object>} lines customerBillLines.
+ * @return {Array<object>}
+ */
+function customerNoticeChargeLines(lines) {
+  const rows = [];
+  for (const line of (Array.isArray(lines) ? lines : [])) {
+    const label = String((line && (line.name || line.label)) || "").trim();
+    const amount = Math.round(Number(line && line.amount) * 100) / 100;
+    if (!label || !Number.isFinite(amount) || !(amount > 0)) continue;
+    if (isFreightBreakdownLabel(label)) continue;
+    rows.push({label, amount});
+  }
+  return rows;
+}
+
 function measurementLinesHtml(opts, lines) {
   const blob = lines.map((row) => chargeLabel(row)).join(" ");
   const measure = /reweigh|re-weigh|reclass|re-class|redim|re-dim|dimension/i
@@ -1076,23 +1097,29 @@ function measurementLinesHtml(opts, lines) {
 }
 
 /**
- * Shared customer and dispatcher notice. Total is the invoice difference.
- * @param {object} opts customerName, loadNumber, charges, chargesTotal.
+ * Shared customer and dispatcher notice. Customer bill lines win:
+ * each line and the total are what the customer is charged. The
+ * invoice-minus-Primus difference is used only when no customer
+ * lines were entered.
+ * @param {object} opts customerName, loadNumber, charges, chargesTotal,
+ *   customerBillLines.
  * @return {{subject: string, html: string}}
  */
 function buildAdditionalChargeNoticeEmail(opts) {
   const customerName = opts.customerName;
   const loadNumber = opts.loadNumber;
-  const lines = noticeChargeLines(opts.charges);
-  const listed = lines.length ? lines : [];
+  const billed = customerNoticeChargeLines(opts.customerBillLines);
+  const useCustomer = billed.length > 0;
+  const listed = useCustomer ? billed : noticeChargeLines(opts.charges);
   const lineHtml = listed.map((row) => {
     const amt = Number(row && row.amount);
     const amount = Number.isFinite(amt) ? `: ${money(amt)}` : "";
     const label = esc(displayChargeLabel(chargeLabel(row)));
     return `<div>${label}${amount}</div>`;
   }).join("");
-  const total = opts.chargesTotal != null ? opts.chargesTotal :
-    sumCustomerBillLines(listed);
+  const lineTotal = Math.round(sumCustomerBillLines(listed) * 100) / 100;
+  const total = useCustomer ? lineTotal :
+    (opts.chargesTotal != null ? opts.chargesTotal : lineTotal);
   const html =
     `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
     `<p>We wanted to make you aware that the carrier has applied an ` +
@@ -1214,16 +1241,11 @@ function shouldCloseAdditionalChargeTask(opts) {
  * @return {{subject: string, html: string}}
  */
 function buildDispatcherCustomerNotifyTemplate(opts) {
-  const carrier = Array.isArray(opts.charges) ? opts.charges : [];
-  const billed = Array.isArray(opts.customerBillLines) ?
-    opts.customerBillLines.map((line) => ({
-      label: line.name || line.label,
-      amount: line.amount,
-    })) : [];
   return buildAdditionalChargeNoticeEmail({
     customerName: opts.customerName,
     loadNumber: opts.loadNumber,
-    charges: carrier.length ? carrier : billed,
+    charges: opts.charges,
+    customerBillLines: opts.customerBillLines,
     chargesTotal: opts.chargesTotal,
     freightMismatch: opts.freightMismatch,
     originalDims: opts.originalDims,
@@ -1824,6 +1846,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `<script>` +
     `const seedRows = ${seedJson};` +
     `const catalog = ${catalogJson};` +
+    `const defaultPct=${DEFAULT_CUSTOMER_MARKUP_PCT};` +
     `const container = document.getElementById("bill-lines");` +
     `function escAttr(v){return String(v ?? "").replace(/&/g,"&amp;")` +
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
@@ -1860,11 +1883,34 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `hint.textContent="Carrier cost, then percent or flat customer charge";` +
     `nameCell.appendChild(carrierInput);nameCell.appendChild(hint);` +
     `const price=document.createElement("div");` +
-    `price.innerHTML="<select class=\\"bill-mode\\">` +
-    `<option value=\\"markup\\">Percent markup</option>` +
-    `<option value=\\"flat\\">Flat amount</option></select>"+` +
-    `"<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
-    `step=\\"0.01\\" placeholder=\\"20\\">";` +
+    `const mode=document.createElement("select");` +
+    `mode.className="bill-mode";` +
+    `const markupOpt=document.createElement("option");` +
+    `markupOpt.value="markup";` +
+    `markupOpt.textContent="Percent markup";` +
+    `const flatOpt=document.createElement("option");` +
+    `flatOpt.value="flat";flatOpt.textContent="Flat amount";` +
+    `mode.appendChild(markupOpt);mode.appendChild(flatOpt);` +
+    `const valInput=document.createElement("input");` +
+    `valInput.className="bill-value";valInput.type="number";` +
+    `valInput.min="0";valInput.step="0.01";` +
+    `valInput.placeholder=String(defaultPct);` +
+    `valInput.value=String(defaultPct);` +
+    `let keptPct=String(defaultPct);` +
+    `mode.onchange=()=>{` +
+    `if(mode.value==="flat"){` +
+    `const typed=String(valInput.value||"").trim();` +
+    `if(typed!=="")keptPct=typed;` +
+    `valInput.value="";valInput.placeholder="Flat $";` +
+    `}else{` +
+    `valInput.value=keptPct||String(defaultPct);` +
+    `valInput.placeholder=String(defaultPct);}` +
+    `};` +
+    `valInput.oninput=()=>{` +
+    `if(mode.value==="flat")return;` +
+    `const typed=String(valInput.value||"").trim();` +
+    `if(typed!=="")keptPct=typed;};` +
+    `price.appendChild(mode);price.appendChild(valInput);` +
     `const remove=document.createElement("button");` +
     `remove.type="button";remove.className="remove-btn";` +
     `remove.title="Remove";remove.textContent="×";` +
@@ -2014,6 +2060,7 @@ module.exports = {
   applyAdditionalChargeEmailCc,
   applyDispatcherEmailCc,
   formatCustomerRate,
+  DEFAULT_CUSTOMER_MARKUP_PCT,
   isWeightInspectionLabel,
   isAccessorialLabel,
   isFreightBreakdownLabel,
