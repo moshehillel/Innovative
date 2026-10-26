@@ -902,7 +902,26 @@
     value.type = "number";
     value.min = "0";
     value.step = "0.01";
-    value.placeholder = "20 or 75.00";
+    value.placeholder = "30";
+    value.value = "30";
+    value.dataset.keptPct = "30";
+    mode.addEventListener("change", () => {
+      if (mode.value === "flat") {
+        const typed = value.value.trim();
+        if (typed !== "") value.dataset.keptPct = typed;
+        value.value = "";
+        value.placeholder = "Flat $";
+        return;
+      }
+      const kept = (value.dataset.keptPct || "").trim();
+      value.value = kept || "30";
+      value.placeholder = "30";
+    });
+    value.addEventListener("input", () => {
+      if (mode.value === "flat") return;
+      const typed = value.value.trim();
+      if (typed !== "") value.dataset.keptPct = typed;
+    });
     row.appendChild(select);
     row.appendChild(carrierInput);
     row.appendChild(mode);
