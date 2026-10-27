@@ -1292,7 +1292,7 @@
         return hay.includes(q);
       });
     }
-    const sort = els.workspaceSort?.value || "urgent";
+    const sort = els.workspaceSort?.value || "newest";
     list.sort((a, b) => {
       if (sort === "urgent") {
         if (Boolean(a.isUrgentOld) !== Boolean(b.isUrgentOld)) {
@@ -1470,7 +1470,7 @@
       updateTasksLoadMore(true);
     }
     try {
-      const sort = els.workspaceSort?.value || "urgent";
+      const sort = els.workspaceSort?.value || "newest";
       const params = new URLSearchParams({
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
