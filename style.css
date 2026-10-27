@@ -263,6 +263,15 @@ body::before {
 }
 .panel-main-full { border-radius: 0 0 12px 12px; border-top: 0; }
 .panel-empty { margin: 0; padding: 36px 20px; text-align: center; color: var(--ic-text-muted); }
+.ops-hint {
+  margin: 0;
+  padding: 10px 16px;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ic-text-muted);
+  background: #f7fafa;
+  border-bottom: 1px solid var(--ic-border);
+}
 
 .folder-rail {
   width: 220px; flex: 0 0 220px;

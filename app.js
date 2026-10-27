@@ -106,7 +106,7 @@
   let ownerBucket = "accounting";
   let issueFilter = "all";
   let dispatcherQuery = "";
-  let chargePhase = null; // null | "dispute"
+  let chargePhase = null; // null | "dispute" | "missing_pod"
   let dispatcherKey = null;
   let personKey = "";
   let taskOffset = 0;
@@ -114,6 +114,7 @@
   let taskLoadSeq = 0;
   let tasksCache = [];
   let disputeCount = 0;
+  let missingPodCount = 0;
   let bucketCounts = {accounting: {}, sarah: {}, dispatch: {}};
   let dispatchers = [];
   let notifOffset = 0;
@@ -313,13 +314,15 @@
   function switchTab(tab) {
     activeTab = tab;
     if (tab === "dispute") chargePhase = "dispute";
+    else if (tab === "missing_pod") chargePhase = "missing_pod";
     else if (tab === "tasks") chargePhase = null;
     els.tabBtns.forEach((btn) => {
       const on = btn.dataset.tab === tab;
       btn.classList.toggle("is-active", on);
       btn.setAttribute("aria-selected", on ? "true" : "false");
     });
-    const showTasks = tab === "tasks" || tab === "dispute";
+    const showTasks = tab === "tasks" || tab === "dispute" ||
+      tab === "missing_pod";
     const panels = {
       tasks: els.tabPanelTasks,
       invoices: els.tabPanelInvoices,
@@ -334,10 +337,15 @@
     });
     const issueNav = document.getElementById("issueFilters");
     const peopleNav = document.getElementById("peopleFilters");
-    if (issueNav) issueNav.hidden = tab === "dispute";
+    if (issueNav) {
+      issueNav.hidden = tab === "dispute" || tab === "missing_pod";
+    }
     if (peopleNav) peopleNav.hidden = tab === "dispute";
+    const podHint = document.getElementById("missingPodHint");
+    if (podHint) podHint.hidden = tab !== "missing_pod";
     if (els.refreshTasksBtn) {
-      els.refreshTasksBtn.hidden = tab !== "tasks" && tab !== "dispute";
+      els.refreshTasksBtn.hidden = tab !== "tasks" && tab !== "dispute" &&
+        tab !== "missing_pod";
     }
     if (els.refreshInvoicesBtn) els.refreshInvoicesBtn.hidden = tab !== "invoices";
     if (els.refreshNotifsBtn) els.refreshNotifsBtn.hidden = tab !== "notifications";
@@ -348,7 +356,8 @@
       const tab = btn.dataset.tab;
       const prev = activeTab;
       switchTab(tab);
-      if ((tab === "tasks" || tab === "dispute") && tab !== prev) {
+      if ((tab === "tasks" || tab === "dispute" || tab === "missing_pod") &&
+          tab !== prev) {
         loadTasks({reset: true});
       } else if (tab === "notifications" && tab !== prev) {
         loadNotifications({reset: true});
@@ -546,10 +555,35 @@
         reason === "missing_rate") {
       return {label: "Missing rate", cls: "type-badge-review"};
     }
+    if (t === "missing_pod" || isMissingPodItem(task)) {
+      return {label: "Missing POD", cls: "type-badge-pod"};
+    }
     if (/missing/i.test(reason)) {
       return {label: "Missing Information", cls: "type-badge-review"};
     }
     return {label: "Review", cls: "type-badge-review"};
+  }
+
+  function isMissingPodItem(task) {
+    if (!task || isOptionDDispute(task)) return false;
+    const status = String(task.status || "open").toLowerCase();
+    if (status && status !== "open") return false;
+    const type = String(task.type || task.emailType || "").toLowerCase();
+    if (type === "signed_pod" || type === "pod_discrepancy") return false;
+    if (type === "additional_charge") return false;
+    if (type === "missing_rate" || type === "rate_missing") return false;
+    if (type === "human_review" || type === "unhandled_email") return false;
+    const issue = String(task.issueType || "").toLowerCase();
+    const stage = String(task.decisionStage || task.reason || "").toLowerCase();
+    const missing = type === "missing_pod" || issue === "missing_pod" ||
+      /missing_pod|needs_pod|awaiting_pod/.test(stage);
+    if (!missing) return false;
+    if (type === "missing_pod" || type === "invoice_hold") return true;
+    if (/missing_pod|needs_pod|awaiting_pod/.test(
+        String(task.decisionStage || ""))) {
+      return true;
+    }
+    return !type && issue === "missing_pod";
   }
 
   function taskCanResolve(task) {
@@ -608,6 +642,8 @@
       `</select>` +
       `<button type="button" class="btn btn-sm btn-primary assign-send">Assign</button>` +
       `</div>` +
+      (isMissingPodItem(task) ?
+        `<button type="button" class="btn btn-primary btn-sm drawer-pod-done">POD done</button>` : "") +
       (task.source === "invoice" ? "" :
         `<button type="button" class="btn btn-outline btn-sm drawer-dismiss">Done / Resolve</button>`);
     openDrawer("task", task, task.title || meta.label, meta.label, body, footer);
@@ -722,6 +758,12 @@
       } catch (error) {
         showError(error.message);
       }
+    });
+
+    foot.querySelectorAll(".drawer-pod-done").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        finishMissingPod(drawerItem, {closeDrawerFirst: true, button: btn});
+      });
     });
 
     foot.querySelectorAll(".drawer-dismiss").forEach((btn) => {
@@ -1188,6 +1230,8 @@
     });
     const disputeBadge = document.getElementById("disputeCountBadge");
     if (disputeBadge) disputeBadge.textContent = String(disputeCount || 0);
+    const podBadge = document.getElementById("missingPodCountBadge");
+    if (podBadge) podBadge.textContent = String(missingPodCount || 0);
     if (!els.dispatcherFolders) return;
     els.dispatcherFolders.innerHTML = (dispatchers || []).map((d) =>
       `<button type="button" class="folder-child" data-key="${bodyEsc(d.key)}">` +
@@ -1271,6 +1315,33 @@
     });
   }
 
+  async function finishMissingPod(task, opts) {
+    if (!task || !task.id) return;
+    const button = opts && opts.button;
+    if (button) button.disabled = true;
+    try {
+      await postJson("/finishMissingPodWorkflow", {
+        taskId: task.id,
+        source: task.source || "dashboardTasks",
+        invoiceId: task.invoiceId || null,
+        loadNumber: task.loadNumber || null,
+      });
+      if (opts && opts.closeDrawerFirst) closeDrawer();
+      tasksCache = tasksCache.filter((t) => t.id !== task.id);
+      missingPodCount = Math.max(0, missingPodCount - 1);
+      if (chargePhase !== "missing_pod" && chargePhase !== "dispute") {
+        openTaskCount = Math.max(0, openTaskCount - 1);
+      }
+      renderFolderCounts();
+      renderTasks(tasksCache.slice(), {append: false, preserveCache: true});
+      showRunResult("POD workflow finished. Removed from the dashboard.", false);
+      await loadTasks({reset: true});
+    } catch (error) {
+      if (button) button.disabled = false;
+      showError(error.message || "Could not finish the POD workflow.");
+    }
+  }
+
   function itemAmount(item) {
     const raw = item && (item.chargesTotal != null ?
       item.chargesTotal : item.invoiceAmount);
@@ -1321,8 +1392,10 @@
       els.taskCountBadge.textContent = String(openTaskCount);
     }
     if (!list.length) {
+      const empty = chargePhase === "missing_pod" ?
+        "No open missing POD items." : "No open work for this filter.";
       els.tasksContainer.innerHTML =
-        '<p class="panel-empty">No open work for this filter.</p>';
+        `<p class="panel-empty">${empty}</p>`;
       return;
     }
 
@@ -1366,6 +1439,8 @@
               <span class="work-status">${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">OLD</span>' : ""}</span>
             </button>
             <span class="row-side-actions">
+              ${isMissingPodItem(task) ?
+                `<button type="button" class="btn btn-sm btn-primary task-pod-done">POD done</button>` : ""}
               <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
               <button type="button" class="btn btn-sm btn-ghost task-dismiss">Done</button>
               <select class="input input-select row-assign" aria-label="Assign">
@@ -1421,6 +1496,11 @@
           openChargeForm(btn);
         });
       });
+      row.querySelector(".task-pod-done")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const button = e.currentTarget;
+        finishMissingPod(task, {button});
+      });
       row.querySelector(".task-dismiss")?.addEventListener("click", (e) => {
         e.stopPropagation();
         dismissTaskOptimistic(task);
@@ -1475,10 +1555,14 @@
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
         view: "queue",
-        issue: chargePhase === "dispute" ? "all" : (issueFilter || "all"),
+        issue: (chargePhase === "dispute" || chargePhase === "missing_pod") ?
+          "all" : (issueFilter || "all"),
         sort,
       });
       if (chargePhase === "dispute") params.set("chargePhase", "dispute");
+      else if (chargePhase === "missing_pod") {
+        params.set("chargePhase", "missing_pod");
+      }
       const q = String(els.workspaceSearch?.value || "").trim();
       const loadSearch = /^\d{5,}$/.test(q);
       if (!loadSearch) {
@@ -1490,13 +1574,25 @@
       if (q) params.set("q", q);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
       if (seq !== taskLoadSeq) return;
+      if (data.disputeCount != null && chargePhase !== "dispute") {
+        disputeCount = data.disputeCount;
+      }
+      if (data.missingPodCount != null && chargePhase !== "missing_pod") {
+        missingPodCount = data.missingPodCount;
+      }
       if (chargePhase === "dispute") {
         disputeCount = data.disputeCount != null ?
           data.disputeCount : (data.openCount || 0);
+      } else if (chargePhase === "missing_pod") {
+        missingPodCount = data.missingPodCount != null ?
+          data.missingPodCount : (data.openCount || 0);
       } else {
         openTaskCount = data.openCount || 0;
         disputeCount = data.disputeCount != null ?
           data.disputeCount : disputeCount;
+        if (data.missingPodCount != null) {
+          missingPodCount = data.missingPodCount;
+        }
       }
       bucketCounts = data.bucketCounts || bucketCounts;
       dispatchers = data.dispatchers || [];
@@ -1504,6 +1600,8 @@
       let page = data.tasks || [];
       if (chargePhase === "dispute") {
         page = page.filter(isOptionDDispute);
+      } else if (chargePhase === "missing_pod") {
+        page = page.filter(isMissingPodItem);
       } else {
         page = page.filter((task) => !isOptionDDispute(task));
       }
@@ -1996,14 +2094,16 @@
   els.workspaceSearch?.addEventListener("input", () => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => {
-      if (activeTab === "tasks" || activeTab === "dispute") {
+      if (activeTab === "tasks" || activeTab === "dispute" ||
+          activeTab === "missing_pod") {
         loadTasks({reset: true});
       } else if (activeTab === "notifications") loadNotifications({reset: true});
       else paintInvoices(clientFilterSort(invoicesCache));
     }, 300);
   });
   els.workspaceSort?.addEventListener("change", () => {
-    if (activeTab === "tasks" || activeTab === "dispute") {
+    if (activeTab === "tasks" || activeTab === "dispute" ||
+        activeTab === "missing_pod") {
       loadTasks({reset: true});
       return;
     }
