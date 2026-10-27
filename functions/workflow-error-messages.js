@@ -12,6 +12,9 @@ const ACTION = {
   RESUME: "resume",
 };
 
+/** Lisa receives ShipPrimus bill-to stops a person must fix, then resume. */
+const BILLTO_BOOKING_FIX_EMAIL = "lisa@innovativecarriers.com";
+
 /** Resume steps that should run mark-delivered → invoice → customer email. */
 const BILLING_PIPELINE_RESUME_STEPS = new Set([
   "mark_delivered",
@@ -148,6 +151,40 @@ function looksLikeSystemError(message, step) {
     /typeerror|referenceerror|manage\.php|session|not configured|env /
         .test(m) ||
     /timeout|econnreset|fetch failed|status 5\d\d/.test(m);
+}
+
+/**
+ * True when billing stopped because ShipPrimus has no bill-to location.
+ * A person must pick the customer location, then resume. Not a crash.
+ * @param {object} [context] Alert context.
+ * @return {boolean}
+ */
+function isBilltoLocationMiss(context) {
+  const ctx = context || {};
+  const source = String(ctx.billtoSource || "").toLowerCase();
+  if (source === "manage_location_not_found") return true;
+  const step = String(ctx.step || "").toLowerCase();
+  if (step === "resolvebillto") return true;
+  const m = String(ctx.errorMessage || "").toLowerCase();
+  if (!m) return false;
+  if (/could not resolve billtoid/.test(m)) return true;
+  if (/could not (map|resolve) bill-to/.test(m)) return true;
+  if (/manage\.php bill-to/.test(m)) return true;
+  if (/bill-to/.test(m) && /shipping location/.test(m)) return true;
+  return false;
+}
+
+/**
+ * True for the Lisa email when Jerry stops on a ShipPrimus bill-to miss.
+ * @param {string} code Catalog code.
+ * @param {object} [context] Alert context.
+ * @return {boolean}
+ */
+function isBilltoBookingFixAlert(code, context) {
+  if (String(code || "").toUpperCase() !== "UI_BILLING_FAILED") {
+    return false;
+  }
+  return isBilltoLocationMiss(context);
 }
 
 /**
@@ -360,6 +397,26 @@ function buildWorkflowAlertEmail(opts) {
       break;
 
     case "UI_BILLING_FAILED":
+      if (isBilltoLocationMiss(ctx)) {
+        const who = (customer && customer !== "—") ?
+          esc(customer) : "the bill-to customer";
+        subject = `Action needed — Bill-to missing on Load ${loadNumber}`;
+        title = "ShipPrimus billing needs attention";
+        summary = "Jerry stopped billing this load because the bill-to " +
+          "customer location was not found in ShipPrimus.";
+        explanation = `Jerry searched ShipPrimus customer locations for ` +
+          `${who} and did not find a match, so billing stopped. ` +
+          "On the load in ShipPrimus, select the real customer " +
+          "location as the bill-to. If the draft invoice Bill To is " +
+          "blank, select that same customer location on the draft " +
+          "invoice. Then resume so Jerry can finish billing.";
+        if (ctx.draftInvoiceId) {
+          explanation += ` Draft invoice ${esc(ctx.draftInvoiceId)} ` +
+            "has no Bill To stored.";
+        }
+        action = ACTION.RESUME;
+        break;
+      }
       if (looksLikeSystemError(ctx.errorMessage, ctx.step)) {
         subject = `System issue — ShipPrimus billing automation — Load ` +
         `${loadNumber}`;
@@ -530,6 +587,9 @@ function buildWorkflowAlertEmail(opts) {
   if (ctx.invoiceDocId) {
     extraRows.push(["Primus invoice ID", String(ctx.invoiceDocId)]);
   }
+  if (ctx.draftInvoiceId) {
+    extraRows.push(["Draft invoice", String(ctx.draftInvoiceId)]);
+  }
 
   const marginBlock = code === "LOW_MARGIN" && ctx.carrierCost != null ?
     `<table style="border-collapse:collapse;font-size:15px;margin:12px 0">` +
@@ -593,6 +653,8 @@ function isSystemAlertCode(code, context) {
     case "STUCK_FLOW":
       return true;
     case "UI_BILLING_FAILED":
+      if (isBilltoLocationMiss(ctx)) return false;
+      return looksLikeSystemError(ctx.errorMessage, ctx.step);
     case "MARK_DELIVERED_FAILED":
       return looksLikeSystemError(ctx.errorMessage, ctx.step);
     default:
@@ -784,6 +846,9 @@ module.exports = {
   buildWorkflowAlertEmail,
   buildWorkflowActionButton,
   looksLikeSystemError,
+  isBilltoLocationMiss,
+  isBilltoBookingFixAlert,
+  BILLTO_BOOKING_FIX_EMAIL,
   isSystemAlertCode,
   isSystemUiBillingStep,
   isTransientNetworkError,

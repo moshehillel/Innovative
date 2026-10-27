@@ -5112,7 +5112,14 @@ async function runPrimusUiBillingFlow(args) {
           });
     }
   } else if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: "Could not resolve billtoId from booking",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName,
+      draftInvoiceId: existingDraftId || null,
+    };
   } else if (writeLog) {
     await writeLog("info", "primus",
         "No draft invoice found — saveInvoice will create one", {
@@ -5125,7 +5132,14 @@ async function runPrimusUiBillingFlow(args) {
   }
 
   if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: "Could not resolve billtoId from booking",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName,
+      draftInvoiceId: existingDraftId || null,
+    };
   }
 
   const billDate = args.billDate || new Date();
