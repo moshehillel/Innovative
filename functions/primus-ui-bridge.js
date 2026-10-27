@@ -2209,6 +2209,9 @@ async function emailBOLDocs(args) {
                 args.customerRate : args.chargesTotal,
               customerBillLines: args.customerBillLines,
               invoiceUnchanged: args.invoiceUnchanged === true,
+              alreadyIssued: args.alreadyIssued === true,
+              issuedNow: args.issuedNow === true,
+              customerTotalChanged: args.customerTotalChanged === true,
               firestoreInvoiceId: args.firestoreInvoiceId || null,
               to: customerEmail,
             });

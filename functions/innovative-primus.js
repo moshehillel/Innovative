@@ -550,15 +550,25 @@ async function sendWorkflowAlert(opts) {
     invoiceId,
     tenantId,
   });
-  await saveOutboundEmail({
-    type: type || String(code).toLowerCase(),
+  const billtoFix = workflowErrors.isBilltoBookingFixAlert(
+      code, alertContext);
+  const outbound = {
+    type: billtoFix ? "billto_booking_fix" :
+      (type || String(code).toLowerCase()),
     invoiceId,
     subject: alert.subject,
     html: alert.html,
     alertCode: code,
     alertContext,
-    systemError: workflowErrors.isSystemAlertCode(code, alertContext),
-  });
+    systemError: billtoFix ? false :
+      workflowErrors.isSystemAlertCode(code, alertContext),
+  };
+  if (billtoFix) {
+    outbound.to = workflowErrors.BILLTO_BOOKING_FIX_EMAIL;
+    outbound.forceRecipient = true;
+    outbound.forceSend = true;
+  }
+  await saveOutboundEmail(outbound);
 
   if (workflowErrors.isCannotEmailHoldAlert(code) && invoiceId && db) {
     try {
@@ -3118,6 +3128,9 @@ exports.processPrimusWorkflow = onRequest(
                       customerName,
                       errorMessage: uiResult.error || "Unknown error",
                       step: uiResult.step || null,
+                      billtoSource: uiResult.billtoSource || null,
+                      billtoPartyName: uiResult.billtoPartyName || null,
+                      draftInvoiceId: uiResult.draftInvoiceId || null,
                     },
                   });
 

@@ -5,6 +5,7 @@ const {BigQuery} = require("@google-cloud/bigquery");
 
 const COLLECTION = "customerInvoiceEmailSends";
 const SKIP_REASON = "customer_invoice_unchanged";
+const ALREADY_ISSUED_REASON = "customer_invoice_already_issued";
 const SENDING_WINDOW_MS = 10 * 60 * 1000;
 const EMAIL_LOG_MESSAGE =
   "Customer documents emailed via Primus emailBOLDocs";
@@ -101,6 +102,17 @@ function totalsDiffer(prior, current) {
 }
 
 /**
+ * True when this pass is an invoice that was already on the load.
+ * A changed customer total is the one case that may still be emailed.
+ * @param {object} current Snapshot of the invoice about to send.
+ * @return {boolean}
+ */
+function alreadyIssuedUnchanged(current) {
+  if (!current || current.customerTotalChanged === true) return false;
+  return current.alreadyIssued === true;
+}
+
+/**
  * @param {object} current Snapshot of the invoice about to send.
  * @param {Array<object>} priors Earlier successful sends.
  * @return {object} skip, reason, and the matching prior send.
@@ -111,17 +123,24 @@ function decideCustomerInvoiceSend(current, priors) {
     return {skip: false, reason: null, prior: null};
   }
   const prior = list.find((row) => sameIssuedInvoice(row, current));
-  if (!prior) return {skip: false, reason: null, prior: null};
-  if (totalsDiffer(prior, current)) {
-    return {skip: false, reason: null, prior: null};
+  if (prior) {
+    if (totalsDiffer(prior, current)) {
+      return {skip: false, reason: null, prior: null};
+    }
+    // Unknown prior total plus new accessorials can still be sent once.
+    if (!current.invoiceUnchanged &&
+        prior.totalCents == null &&
+        hasAccessorialLines(current.linesKey)) {
+      return {skip: false, reason: null, prior: null};
+    }
+    return {skip: true, reason: SKIP_REASON, prior};
   }
-  // Unknown prior total plus new accessorials can still be sent once.
-  if (!current.invoiceUnchanged &&
-      prior.totalCents == null &&
-      hasAccessorialLines(current.linesKey)) {
-    return {skip: false, reason: null, prior: null};
+  // No Jerry send log. An invoice already on the load still must not
+  // be emailed again just because a statement listed that load.
+  if (alreadyIssuedUnchanged(current)) {
+    return {skip: true, reason: ALREADY_ISSUED_REASON, prior: null};
   }
-  return {skip: true, reason: SKIP_REASON, prior};
+  return {skip: false, reason: null, prior: null};
 }
 
 /**
@@ -487,8 +506,10 @@ async function outboundCustomerInvoicePriors(db, args, invoices) {
  * Decides whether emailBOLDocs may send this customer invoice.
  * Already emailed means the emailBOLDocs success log, a saved customer
  * invoice email, or a workflow that already finished that email.
- * customerInvoiceStatus and Primus status.sent are not read.
- * A new invoice may send once. A changed customer total may send once.
+ * An invoice already issued on the load is not emailed again even when
+ * none of those records exist. customerInvoiceStatus and Primus
+ * status.sent are not read. A new invoice may send once. A changed
+ * customer total may send once.
  * @param {FirebaseFirestore.Firestore} db Firestore.
  * @param {object} args Send context.
  * @return {Promise<object>}
@@ -505,6 +526,9 @@ async function evaluateCustomerInvoiceResend(db, args) {
       moneyCents(args.invoiceTotal) : accessorialCents(rate, lines),
     linesKey: customerInvoiceLinesKey(rate, lines),
     invoiceUnchanged: args.invoiceUnchanged === true,
+    alreadyIssued: args.alreadyIssued === true ||
+      (args.invoiceUnchanged === true && args.issuedNow !== true),
+    customerTotalChanged: args.customerTotalChanged === true,
     loadNumber: args.loadNumber || null,
     sourceInvoiceId: args.firestoreInvoiceId || null,
     to: args.to || null,
@@ -619,6 +643,7 @@ async function finishCustomerInvoiceSend(claim, status) {
 
 module.exports = {
   SKIP_REASON,
+  ALREADY_ISSUED_REASON,
   moneyCents,
   normalizeInvoiceNumber,
   customerInvoiceLinesKey,

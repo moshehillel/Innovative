@@ -67,11 +67,24 @@ check("unchanged issued invoice already emailed is skipped", () => {
       decision.prior.sourceInvoiceId, "kQbNFIXTBJaZVJheHCfH");
 });
 
-check("issued invoice with no prior email is sent", () => {
+check("already issued invoice with no send log is skipped", () => {
+  const decision = guard.decideCustomerInvoiceSend({
+    customerInvoiceId: "3012168",
+    invoiceNumber: "17188",
+    invoiceUnchanged: true,
+    alreadyIssued: true,
+  }, []);
+  assert.strictEqual(decision.skip, true);
+  assert.strictEqual(
+      decision.reason, guard.ALREADY_ISSUED_REASON);
+});
+
+check("new invoice that was just issued is sent", () => {
   const decision = guard.decideCustomerInvoiceSend({
     customerInvoiceId: "3618447",
     invoiceNumber: "30489",
-    invoiceUnchanged: true,
+    invoiceUnchanged: false,
+    alreadyIssued: false,
   }, []);
   assert.strictEqual(decision.skip, false);
 });
@@ -382,6 +395,7 @@ async function checkSentFlagIgnored() {
     customerRate: 945,
     customerBillLines: [],
     invoiceUnchanged: true,
+    issuedNow: true,
     firestoreInvoiceId: "new-doc",
   });
   guard._setEmailLogRows(null);
@@ -389,6 +403,58 @@ async function checkSentFlagIgnored() {
   assert.ok(decision.claim);
   passed++;
   console.log("ok", "a sent status flag alone does not count as emailed");
+}
+
+/**
+ * @return {Promise<void>}
+ */
+async function checkAlreadyIssuedNoLog() {
+  guard._setEmailLogRows([]);
+  const db = fakeDb([], null);
+  const decision = await guard.evaluateCustomerInvoiceResend(db, {
+    loadNumber: "253716",
+    customerInvoiceId: 3012168,
+    invoiceNumber: "17188",
+    invoiceTotal: 580,
+    customerRate: 580,
+    customerBillLines: [],
+    invoiceUnchanged: true,
+    alreadyIssued: true,
+    firestoreInvoiceId: "QSn0BieEOLWOYFw19B1k",
+  });
+  guard._setEmailLogRows(null);
+  assert.strictEqual(decision.skip, true);
+  assert.strictEqual(
+      decision.reason, "customer_invoice_already_issued");
+  assert.strictEqual(decision.claim, null);
+  assert.strictEqual(db.store.send.status, "sent");
+  passed++;
+  console.log("ok", "253716 already issued with no send log is skipped");
+}
+
+/**
+ * @return {Promise<void>}
+ */
+async function checkChargeOnOldInvoice() {
+  guard._setEmailLogRows([]);
+  const db = fakeDb([], null);
+  const decision = await guard.evaluateCustomerInvoiceResend(db, {
+    loadNumber: "253716",
+    customerInvoiceId: 3012168,
+    invoiceNumber: "17188",
+    invoiceTotal: 655,
+    customerRate: 580,
+    customerBillLines: [{name: "Liftgate", amount: 75}],
+    invoiceUnchanged: false,
+    alreadyIssued: true,
+    customerTotalChanged: true,
+    firestoreInvoiceId: "new-doc",
+  });
+  guard._setEmailLogRows(null);
+  assert.strictEqual(decision.skip, false);
+  assert.ok(decision.claim);
+  passed++;
+  console.log("ok", "additional charge on an old invoice can send once");
 }
 
 /**
@@ -468,6 +534,8 @@ checkReplay()
     .then(checkChangedBill)
     .then(checkStatementLog)
     .then(checkSentFlagIgnored)
+    .then(checkAlreadyIssuedNoLog)
+    .then(checkChargeOnOldInvoice)
     .then(checkWorkflowEmailStep)
     .then(checkOutboundMail)
     .then(() => {
