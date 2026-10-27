@@ -6624,21 +6624,27 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
     messages: [{role: "user", content: contentBlocks}],
   });
 
+  const noteRead = (response, parsed) =>
+    invoiceBatchClassification.annotateInvoiceRead(
+        parsed, response);
+
   let response = await callClassifier(12288);
   try {
-    return parseClassificationResponse(response.content);
+    return noteRead(
+        response, parseClassificationResponse(response.content));
   } catch (parseErr) {
     const truncated = response.stop_reason === "max_tokens";
     if (!truncated) throw parseErr;
-    // One retry with a higher ceiling when the first answer was cut off.
+    // Full-file retry only when nothing could be parsed.
     response = await callClassifier(16384);
-    return parseClassificationResponse(response.content);
+    return noteRead(
+        response, parseClassificationResponse(response.content));
   }
 }
 
 /**
- * Re-classifies page chunks of a multi-load statement PDF to recover
- * loads the first full-PDF pass missed.
+ * Re-reads page chunks of one multi-invoice PDF and adds bills the
+ * first pass did not already save.
  * @param {Array<object>} pdfAttachments Saved PDF attachments.
  * @param {Array<object>} invoiceItems Items from the first classification.
  * @param {object} gap analyzeStatementExtractionGap result.
@@ -6656,47 +6662,29 @@ async function supplementStatementInvoiceExtraction(
     await getPdfPageCount(primaryAtt.buffer);
   if (pageCount < 3) return invoiceItems;
 
-  const existingLoads = new Set(
-      invoiceItems.map((i) => String(i.loadNumber || "").trim())
-          .filter(Boolean));
-  const merged = invoiceItems.slice();
-  const chunkSize = 12;
-
-  for (let start = 2; start <= pageCount; start += chunkSize - 1) {
-    const end = Math.min(start + chunkSize - 1, pageCount);
-    const pages = [];
-    for (let p = start; p <= end; p++) pages.push(p);
-    const chunkBuf = await slicePdfByPages(primaryAtt.buffer, pages);
-    if (!chunkBuf) continue;
-
-    const chunkAtt = {
-      filename:
-        `${primaryAtt.filename || "statement.pdf"}-p${start}-${end}.pdf`,
-      mimeType: "application/pdf",
-      buffer: chunkBuf,
-      docType: "INVOICE",
-    };
-    try {
-      const chunkResult = await classifyInvoiceData(
-          [chunkAtt], lastKnownLoadNumber);
-      const chunkItems = normalizeClassificationToInvoices(chunkResult);
-      for (const item of chunkItems) {
-        const ln = String(item.loadNumber || "").trim();
-        if (!ln || existingLoads.has(ln)) continue;
-        existingLoads.add(ln);
-        item.attachmentFilename = primaryAtt.filename;
-        merged.push(item);
-      }
-    } catch (chunkErr) {
-      await writeLog("warn", "ai",
-          "Statement chunk classification failed", {
-            pages: `${start}-${end}`,
-            error: chunkErr.message,
-          });
-    }
+  const out = await invoiceBatchClassification
+      .supplementInvoicePdfByPageChunks({
+        pdf: primaryAtt,
+        invoiceItems,
+        pageCount,
+        messageId: null,
+        slicePdf: slicePdfByPages,
+        classifyChunk: async (chunkAtt) => {
+          const chunkResult = await classifyInvoiceData(
+              [chunkAtt], lastKnownLoadNumber);
+          return normalizeClassificationToInvoices(chunkResult);
+        },
+        log: (level, message, details) =>
+          writeLog(level, "ai", message, details),
+      });
+  if (out.skipped.length > 0) {
+    await writeLog("warn", "ai",
+        "Skipped chunk bills with no load or invoice number", {
+          filename: primaryAtt.filename,
+          skipped: out.skipped.length,
+        });
   }
-
-  return merged;
+  return out.items;
 }
 
 /**
@@ -6712,9 +6700,8 @@ async function recoverStatementInvoiceItems(opts) {
     invoiceItems,
     lastKnownLoadNumber,
   } = opts;
-  if (!statementInvoiceBundle.looksLikeNumberedStatementSubject(subject)) {
-    return {invoiceItems, gap: null};
-  }
+  const numbered =
+    statementInvoiceBundle.looksLikeNumberedStatementSubject(subject);
 
   const primaryPdf = pdfAttachments.find((a) => a.docType !== "POD") ||
     pdfAttachments[0];
@@ -6722,10 +6709,13 @@ async function recoverStatementInvoiceItems(opts) {
   let pageCount = 0;
   if (primaryPdf && primaryPdf.buffer) {
     pageCount = await getPdfPageCount(primaryPdf.buffer);
-    const pageTexts = await extractPdfPageTexts(primaryPdf.buffer);
-    if (pageTexts && pageTexts[0]) {
-      indexLoadNumbers = statementInvoiceBundle.parseStatementIndexLoadNumbers(
-          pageTexts[0]);
+    if (numbered) {
+      const pageTexts = await extractPdfPageTexts(primaryPdf.buffer);
+      if (pageTexts && pageTexts[0]) {
+        indexLoadNumbers =
+          statementInvoiceBundle.parseStatementIndexLoadNumbers(
+              pageTexts[0]);
+      }
     }
   }
 
@@ -6734,11 +6724,30 @@ async function recoverStatementInvoiceItems(opts) {
     extractedLoadNumbers: invoiceItems.map((i) => i && i.loadNumber),
     pageCount,
   });
-  if (!gap.underExtracted) {
-    return {invoiceItems, gap};
+  const decision = invoiceBatchClassification.assessInvoiceRead({
+    stopReason: opts.stopReason,
+    cutOff: !!opts.cutOff,
+    endedEarly: !!opts.endedEarly,
+    invoiceCount: invoiceItems.length,
+    pageCount,
+  });
+  // Numbered statements still use the index. Any other multi-invoice
+  // PDF continues when the first read was partial and the batch reader
+  // did not already finish the page chunks.
+  const shouldChunk = numbered ?
+    !!gap.underExtracted :
+    (!opts.chunkSupplementDone && !!decision.partial);
+  if (!shouldChunk) {
+    return {invoiceItems, gap: numbered ? gap : null};
+  }
+  if (!numbered) {
+    gap = Object.assign({}, gap, {underExtracted: true});
   }
 
-  await writeLog("warn", "ai", "Statement PDF under-extraction detected", {
+  const logLabel = numbered ?
+    "Statement PDF under-extraction detected" :
+    "Multi-invoice PDF read looks partial";
+  await writeLog("warn", "ai", logLabel, {
     messageId,
     subject,
     expectedCount: gap.expectedCount,
@@ -6746,6 +6755,7 @@ async function recoverStatementInvoiceItems(opts) {
     missingLoads: gap.missingLoads,
     indexLoadCount: gap.indexLoads.length,
     pageCount: gap.pageCount,
+    reasons: decision.reasons,
   });
 
   const recovered = await supplementStatementInvoiceExtraction(
@@ -6755,7 +6765,7 @@ async function recoverStatementInvoiceItems(opts) {
     extractedLoadNumbers: recovered.map((i) => i && i.loadNumber),
     pageCount,
   });
-  if (gap.underExtracted && gap.missingLoads.length > 0) {
+  if (numbered && gap.underExtracted && gap.missingLoads.length > 0) {
     await writeLog("warn", "ai",
         "Statement still missing loads after chunk supplement", {
           messageId,
@@ -6763,6 +6773,9 @@ async function recoverStatementInvoiceItems(opts) {
           extractedCount: gap.extractedCount,
           expectedCount: gap.expectedCount,
         });
+  }
+  if (!numbered) {
+    return {invoiceItems: recovered, gap: null};
   }
   return {invoiceItems: recovered, gap};
 }
@@ -10835,6 +10848,7 @@ async function processGmailMessage(
               pdfAttachments,
               lastKnownLoadNumber,
               messageId,
+              subject,
               classifyCombined: (atts, last) =>
                 classifyInvoiceData(atts, last),
               classifyOne: (pdf, last) =>
@@ -10905,6 +10919,10 @@ async function processGmailMessage(
           pdfAttachments,
           invoiceItems,
           lastKnownLoadNumber,
+          stopReason: aiResult.stopReason,
+          cutOff: !!aiResult.cutOff,
+          endedEarly: !!aiResult.endedEarly,
+          chunkSupplementDone: !!aiResult.chunkSupplementDone,
         });
         invoiceItems = recovered.invoiceItems;
         statementExtractionGap = recovered.gap;
