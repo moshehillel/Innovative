@@ -6,6 +6,7 @@
 
 const scope = require("./dashboard-scope");
 const ownership = require("./dashboard-ownership");
+const podDash = require("./missing-pod-dashboard");
 
 const HOLD_STAGES = [
   "needs_customer_rate_review",
@@ -236,8 +237,10 @@ async function listOperationalQueue(db, deps, opts) {
   const sort = String(opts.sort || "").toLowerCase();
   const q = String(opts.q || "").trim();
   const loadSearch = /^\d{5,}$/.test(q);
+  const requestedScan = Number(opts.scanLimit) || 0;
   const fetchLimit = loadSearch ? 40 :
-    (Number(opts.offset) > 0 ? 800 : 220);
+    (requestedScan > 0 ? Math.min(requestedScan, 800) :
+      (Number(opts.offset) > 0 ? 800 : 220));
 
   const invoicePromise = loadInvoiceHoldRows(
       deps, tenant, tenantId, q, loadSearch, fetchLimit);
@@ -288,8 +291,14 @@ async function listOperationalQueue(db, deps, opts) {
   const disputeRows = merged.filter((row) =>
     scope.isOptionDDispute(row));
   const disputeCount = disputeRows.length;
+  const missingPodRows = merged.filter((row) =>
+    podDash.isMissingPodDashboardItem(row));
+  const missingPodCount = missingPodRows.length;
   if (phase === "dispute") {
     merged = disputeRows;
+  } else if (phase === "missing_pod") {
+    merged = missingPodRows.filter((row) =>
+      scope.dispatcherMatches(row, opts.dispatcher || opts.dispatcherKey));
   } else {
     merged = merged.filter((row) => !scope.isOptionDDispute(row));
     const issue = String(opts.issue || "all").toLowerCase();
@@ -322,6 +331,7 @@ async function listOperationalQueue(db, deps, opts) {
     bucketCounts: page.bucketCounts,
     dispatchers: page.dispatchers,
     disputeCount,
+    missingPodCount,
   };
 }
 

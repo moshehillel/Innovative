@@ -13777,6 +13777,7 @@ exports.getDashboardTasks = onRequest(
         bucketCounts: queued.bucketCounts,
         dispatchers: queued.dispatchers,
         disputeCount: queued.disputeCount || 0,
+        missingPodCount: queued.missingPodCount || 0,
       });
     }
     const result = await dashboardTasks.listDashboardTasks(
@@ -13929,6 +13930,93 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
       ok: false,
       error: "Failed to dismiss task.",
       details: error.message,
+    });
+  }
+});
+
+/**
+ * Resumes a missing-POD invoice the same way a POD arrival does.
+ * @param {object} tenant Tenant.
+ * @param {string} invoiceId Invoice id.
+ * @param {string} resumeFrom Pause step.
+ * @return {Promise<object>}
+ */
+async function resumeDashboardPodWorkflow(
+    tenant, invoiceId, resumeFrom) {
+  const step = resumeFrom || "pod_extraction";
+  const ref = tcol(tenant, "invoices").doc(String(invoiceId));
+  await ref.update({
+    workflowPausedAtStep: null,
+    workflowPausedAt: null,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  await writeLog("info", "workflow",
+      "Dashboard POD done resuming workflow", {
+        invoiceId: String(invoiceId),
+        tenantId: tenant && tenant.tenantId,
+        resumeFrom: step,
+      });
+  const url = workflowUrlForTenant(tenant);
+  if (!url) {
+    return {ok: false, status: 0, payload: {error: "NO_WORKFLOW"}};
+  }
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({
+      invoiceId: String(invoiceId),
+      tenantId: tenant.tenantId,
+      resumeFrom: step,
+    }),
+  });
+  const payload = await resp.json().catch(() => ({}));
+  return {
+    ok: resp.ok && payload.ok !== false,
+    status: resp.status,
+    payload,
+  };
+}
+
+exports.finishMissingPodWorkflow = onRequest({
+  invoker: "public",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+}, async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({
+      ok: false,
+      error: "Method not allowed.",
+    });
+  }
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const body = req.body || {};
+    const result = await missingPodDashboard.finishFromDashboard({
+      tenant,
+      tenantId: tenant.tenantId,
+      taskId: body.taskId,
+      source: body.source,
+      invoiceId: body.invoiceId,
+      loadNumber: body.loadNumber,
+    });
+    if (!result.ok) {
+      return res.status(422).json({
+        ok: false,
+        error: result.error ||
+          "Could not finish the POD workflow.",
+      });
+    }
+    return res.json({ok: true, tenantId: tenant.tenantId});
+  } catch (error) {
+    console.error("finishMissingPodWorkflow error:", error);
+    const status = error.statusCode === 403 ? 403 : 500;
+    return res.status(status).json({
+      ok: false,
+      error: status === 403 ?
+        error.message :
+        "Could not finish the POD workflow.",
+      details: status === 403 ? undefined : error.message,
     });
   }
 });
@@ -16907,6 +16995,7 @@ async function resumeMissingPodWorkflow(invoiceId, resumeFrom) {
 }
 
 const missingPodDaily = require("./missing-pod-daily");
+const missingPodDashboard = require("./missing-pod-dashboard");
 missingPodDaily.init({
   FieldPath: admin.firestore.FieldPath,
   FieldValue: admin.firestore.FieldValue,
@@ -16915,6 +17004,59 @@ missingPodDaily.init({
   fetchPrimusBooking,
   checkBookingHasPod: (args) => primusUiBridge.checkBookingHasPod(args),
   resumeWorkflow: resumeMissingPodWorkflow,
+  writeLog,
+});
+
+/**
+ * Open missing-POD dashboard rows for the Innovative tenant.
+ * @return {Promise<object[]>}
+ */
+async function listOpenMissingPodDashboardItems() {
+  const items = [];
+  let offset = 0;
+  for (let page = 0; page < 8; page++) {
+    // eslint-disable-next-line no-await-in-loop
+    const queued = await dashboardQueue.listOperationalQueue(db, {
+      tenant: DEFAULT_TENANT,
+      tcol,
+      dashboardTasks,
+      additionalCharges,
+    }, {
+      chargePhase: "missing_pod",
+      limit: 100,
+      offset,
+      scanLimit: 800,
+    });
+    const tasks = queued.tasks || [];
+    items.push(...tasks);
+    if (!queued.hasMore) break;
+    offset = queued.nextOffset || (offset + tasks.length);
+  }
+  return items;
+}
+
+missingPodDashboard.init({
+  db,
+  FieldValue: admin.firestore.FieldValue,
+  tenant: DEFAULT_TENANT,
+  loadInvoice: async (tenant, invoiceId) => {
+    const snap = await tcol(tenant || DEFAULT_TENANT, "invoices")
+        .doc(String(invoiceId)).get();
+    if (!snap.exists) return null;
+    return {id: snap.id, ...(snap.data() || {})};
+  },
+  loadTask: async (taskId) => {
+    const snap = await db.collection("dashboardTasks")
+        .doc(String(taskId)).get();
+    if (!snap.exists) return null;
+    return snap.data() || null;
+  },
+  resumeWorkflow: (tenant, invoiceId, resumeFrom) =>
+    resumeDashboardPodWorkflow(
+        tenant || DEFAULT_TENANT, invoiceId, resumeFrom),
+  lookupPrimusPod: (loadNumber) =>
+    missingPodDaily.lookupPrimusPod(loadNumber),
+  listOpenMissingPodItems: listOpenMissingPodDashboardItems,
   writeLog,
 });
 
@@ -16970,6 +17112,37 @@ exports.checkMissingPodDaily = onSchedule({
     console.error("checkMissingPodDaily error:", error.message);
     await writeLog("error", "workflow",
         "Daily missing-POD check failed", {
+          error: error.message,
+        });
+    throw error;
+  }
+});
+
+/**
+ * Monday and Thursday 8:00 AM America/Cayman.
+ * Open missing-POD dashboard rows only. If Primus already has a POD,
+ * finish that workflow and drop the row. Does not email the customer.
+ */
+exports.checkMissingPodOnDashboard = onSchedule({
+  schedule: "0 8 * * 1,4",
+  timeZone: "America/Cayman",
+  timeoutSeconds: 540,
+  memory: "1GiB",
+  retryCount: 0,
+}, async () => {
+  try {
+    const result = await missingPodDashboard.runTwiceWeeklyCheck();
+    console.log("checkMissingPodOnDashboard:", JSON.stringify({
+      checked: result.checked,
+      completed: result.completed,
+      skipped: result.skipped,
+      failed: result.failed,
+    }));
+  } catch (error) {
+    console.error(
+        "checkMissingPodOnDashboard error:", error.message);
+    await writeLog("error", "workflow",
+        "Missing POD dashboard check failed", {
           error: error.message,
         });
     throw error;

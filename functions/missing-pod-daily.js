@@ -501,4 +501,5 @@ exports.resumeStepFor = resumeStepFor;
 exports.classifyResumeResult = classifyResumeResult;
 exports.isCheckFailure = isCheckFailure;
 exports.evaluateHold = evaluateHold;
+exports.lookupPrimusPod = lookupPrimusPod;
 exports.runMissingPodDailyCheck = runMissingPodDailyCheck;
