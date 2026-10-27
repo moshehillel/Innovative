@@ -1,9 +1,9 @@
 /**
  * Classifies carrier-invoice PDFs.
  * Two or more files are each read on their own, and a file that comes
- * back empty is retried once. One PDF that holds many invoices is
- * re-read in overlapping page chunks when the first answer is partial,
- * whether or not the email is a numbered statement.
+ * back empty is retried once. One PDF with more than 2 pages is always
+ * re-read in overlapping page chunks. A counted list that is still
+ * short after those chunks is held for manual review.
  */
 "use strict";
 
@@ -103,6 +103,139 @@ function assessInvoiceRead(ctx) {
   if (truncated && count >= 1) partial = true;
   if (reasons.includes("fewer_than_pages") && count >= 1) partial = true;
   return {partial, reasons, expectedCount: expected};
+}
+
+/**
+ * A PDF with more pages than this can hold more than one invoice.
+ * One- and two-page bills can finish after one complete read.
+ */
+const MULTI_INVOICE_PAGE_MIN = 2;
+
+/**
+ * Reads a stated invoice count such as "10 invoices".
+ * @param {string} text Cover or packet text.
+ * @return {number} 0 when no count is stated.
+ */
+function parseStatedInvoiceCount(text) {
+  const src = String(text || "");
+  let best = 0;
+  const re = /\b(\d{1,3})\s+invoices?\b/gi;
+  let match;
+  while ((match = re.exec(src))) {
+    const n = Number(match[1]);
+    if (n > best && n < 500) best = n;
+  }
+  return best;
+}
+
+/**
+ * Statement-cover load list, when the page is actually a list.
+ * @param {string} text Cover text.
+ * @return {string[]}
+ */
+function indexLoadsFromCover(text) {
+  const src = String(text || "");
+  const loads = statementInvoiceBundle
+      .parseStatementIndexLoadNumbers(src);
+  if (loads.length < 2) return [];
+  const stated = parseStatedInvoiceCount(src);
+  if (!/\bstatement\b/i.test(src) && stated < 2) return [];
+  return loads;
+}
+
+/**
+ * @param {string[]|null} texts Page texts.
+ * @return {{statedInvoiceCount: number, indexLoadNumbers: string[]}}
+ */
+function countedListFromPageTexts(texts) {
+  const pages = Array.isArray(texts) ? texts : [];
+  const cover = pages.slice(0, 2).join("\n");
+  return {
+    statedInvoiceCount: parseStatedInvoiceCount(cover),
+    indexLoadNumbers: indexLoadsFromCover(cover),
+  };
+}
+
+/**
+ * After page chunks, a counted list that is still short is not complete.
+ * Counted lists are a statement cover, a stated "N invoices", or a
+ * page count that still implies more bills than were captured.
+ * Invoices already read are kept. The remainder is for review.
+ * @param {object} ctx pageCount, capturedCount, loads, stated count.
+ * @return {object|null}
+ */
+function assessInvoiceShortfall(ctx) {
+  const captured = Number(ctx.capturedCount) || 0;
+  const pageCount = Number(ctx.pageCount) || 0;
+  const indexLoads = Array.isArray(ctx.indexLoadNumbers) ?
+    ctx.indexLoadNumbers : [];
+  const stated = Number(ctx.statedInvoiceCount) || 0;
+  const extracted = (Array.isArray(ctx.extractedLoadNumbers) ?
+    ctx.extractedLoadNumbers : [])
+      .map((load) => String(load || "").trim())
+      .filter(Boolean);
+  const got = new Set(extracted);
+  const missingLoads = indexLoads.filter((load) => !got.has(load));
+  let expected = 0;
+  let source = "";
+  if (indexLoads.length >= 2 || stated > 1) {
+    expected = Math.max(indexLoads.length, stated);
+    source = indexLoads.length >= 2 ?
+      "statement_cover" : "stated_count";
+  } else if (pageCount > MULTI_INVOICE_PAGE_MIN) {
+    const implied = statementInvoiceBundle
+        .estimateStatementInvoiceCount({pageCount});
+    if (implied >= 2 && captured < implied) {
+      expected = implied;
+      source = "page_count";
+    }
+  }
+  const short = source === "statement_cover" ?
+    (missingLoads.length > 0 || captured < expected) :
+    (source !== "" && captured < expected);
+  if (!short || expected < 1) return null;
+  let reason = "";
+  if (source === "statement_cover") {
+    reason = "Statement cover lists " + expected +
+      " invoice(s); captured " + captured +
+      " after page chunks";
+  } else if (source === "stated_count") {
+    reason = "Packet says " + expected +
+      " invoices; captured " + captured +
+      " after page chunks";
+  } else {
+    reason = "Page count " + pageCount +
+      " still implies about " + expected +
+      " invoices; captured " + captured +
+      " after page chunks";
+  }
+  return {
+    needsReview: true,
+    underExtracted: true,
+    expectedCount: expected,
+    extractedCount: captured,
+    indexLoads,
+    missingLoads: source === "statement_cover" ? missingLoads : [],
+    pageCount,
+    source,
+    reason,
+  };
+}
+
+/**
+ * @param {object} pdf PDF attachment.
+ * @param {Function|undefined} readPageTexts Page-text reader.
+ * @return {Promise<string[]>}
+ */
+async function loadPageTexts(pdf, readPageTexts) {
+  const read = readPageTexts || podUtils.extractPdfPageTexts;
+  if (!pdf || !pdf.buffer || !read) return [];
+  try {
+    const got = await read(pdf.buffer);
+    return Array.isArray(got) ? got : [];
+  } catch (_) {
+    return [];
+  }
 }
 
 /**
@@ -331,7 +464,9 @@ async function supplementInvoicePdfByPageChunks(opts) {
 }
 
 /**
- * Continues a single PDF when the first read looks partial.
+ * Continues one PDF in overlapping page chunks.
+ * More than 2 pages always continues. A shorter PDF continues only
+ * when the first answer was cut off or otherwise partial.
  * @param {object} opts pdf, items, rawResult, classifyChunk.
  * @return {Promise<object>}
  */
@@ -353,18 +488,32 @@ async function continuePartialInvoicePdf(opts) {
     invoiceCount: items.length,
     pageCount,
   });
-  if (!decision.partial || items.length === 0 || pageCount < 2) {
-    return {items, didChunk: false, decision, skipped: [], chunkErrors: 0};
+  const multiPage = pageCount > MULTI_INVOICE_PAGE_MIN;
+  const forceChunk = !!opts.forceMultiPageChunk &&
+    multiPage && items.length > 0;
+  const partialChunk = !!decision.partial &&
+    items.length > 0 && pageCount >= 2;
+  if (!forceChunk && !partialChunk) {
+    return {
+      items,
+      didChunk: false,
+      decision,
+      skipped: [],
+      chunkErrors: 0,
+      shortfall: null,
+    };
   }
-  await log("warn",
-      "Partial multi-invoice PDF — reading remaining page chunks", {
-        messageId: opts.messageId || null,
-        filename: pdf && pdf.filename,
-        reasons: decision.reasons,
-        extractedCount: items.length,
-        expectedCount: decision.expectedCount,
-        pageCount,
-      });
+  const logLabel = forceChunk && !decision.partial ?
+    "Multi-page invoice PDF — reading every page chunk" :
+    "Partial multi-invoice PDF — reading remaining page chunks";
+  await log("warn", logLabel, {
+    messageId: opts.messageId || null,
+    filename: pdf && pdf.filename,
+    reasons: decision.reasons,
+    extractedCount: items.length,
+    expectedCount: decision.expectedCount,
+    pageCount,
+  });
   const supplemented = await supplementInvoicePdfByPageChunks({
     pdf,
     invoiceItems: items,
@@ -382,21 +531,46 @@ async function continuePartialInvoicePdf(opts) {
           count: supplemented.skipped.length,
         });
   }
+  let shortfall = null;
+  if (forceChunk) {
+    const texts = await loadPageTexts(pdf, opts.readPageTexts);
+    const counted = countedListFromPageTexts(texts);
+    shortfall = assessInvoiceShortfall({
+      pageCount,
+      capturedCount: supplemented.items.length,
+      extractedLoadNumbers: supplemented.items.map(
+          (item) => item && item.loadNumber),
+      statedInvoiceCount: counted.statedInvoiceCount,
+      indexLoadNumbers: counted.indexLoadNumbers,
+    });
+    if (shortfall) {
+      await log("warn",
+          "Multi-invoice PDF still short — hold for review", {
+            messageId: opts.messageId || null,
+            filename: pdf && pdf.filename,
+            reason: shortfall.reason,
+            expectedCount: shortfall.expectedCount,
+            extractedCount: shortfall.extractedCount,
+            pageCount,
+          });
+    }
+  }
   return {
     items: supplemented.items,
     didChunk: true,
     decision,
     skipped: supplemented.skipped,
     chunkErrors: supplemented.chunkErrors,
+    shortfall,
   };
 }
 
 /**
  * Classifies invoice PDFs. Two or more files are read one at a time.
  * Any file still missing from the result is retried once.
- * A single multi-invoice PDF that comes back partial is continued
- * in page chunks. Numbered statement packets stay on the statement
- * recovery path so that index is still applied.
+ * A single PDF with more than 2 pages is always continued in page
+ * chunks. A counted list that is still short is returned for review.
+ * Numbered statement packets stay on the statement recovery path.
  * @param {object} opts pdfAttachments, classifyCombined, classifyOne, log.
  * @return {Promise<object>}
  */
@@ -414,13 +588,14 @@ async function classifyCarrierInvoiceAttachments(opts) {
   const separate = podUtils.shouldClassifyEachInvoicePdf(invoicePdfs);
   let merged = [];
   let chunkSupplementDone = false;
+  let invoiceShortfall = null;
   let readPartial = false;
   let stopReason = "";
   let cutOff = false;
   let endedEarly = false;
   let partialReasons = [];
 
-  const noteDecision = (raw, decision, didChunk) => {
+  const noteDecision = (raw, decision, didChunk, shortfall) => {
     if (decision && decision.partial) {
       readPartial = true;
       partialReasons = decision.reasons || partialReasons;
@@ -429,9 +604,14 @@ async function classifyCarrierInvoiceAttachments(opts) {
     if (raw && raw.cutOff) cutOff = true;
     if (raw && raw.endedEarly) endedEarly = true;
     if (didChunk) chunkSupplementDone = true;
+    if (shortfall && shortfall.underExtracted) {
+      invoiceShortfall = shortfall;
+    }
   };
 
-  const continueOne = async (pdf, raw, items) => {
+  const singlePacket = !separate && invoicePdfs.length === 1;
+
+  const continueOne = async (pdf, raw, items, forceMultiPage) => {
     if (numbered) return items;
     const continued = await continuePartialInvoicePdf({
       pdf,
@@ -442,16 +622,22 @@ async function classifyCarrierInvoiceAttachments(opts) {
       getPageCount: opts.getPageCount,
       slicePdf: opts.slicePdf,
       pageCount: opts.pageCount,
+      readPageTexts: opts.readPageTexts,
+      forceMultiPageChunk: !!forceMultiPage,
       classifyChunk: (chunkAtt) => classifyOne(chunkAtt, lastKnown),
     });
-    noteDecision(raw, continued.decision, continued.didChunk);
+    noteDecision(
+        raw,
+        continued.decision,
+        continued.didChunk,
+        continued.shortfall);
     return continued.items;
   };
 
   const readOne = async (pdf) => {
     const raw = await classifyOne(pdf, lastKnown);
     const items = stampFilename(itemsFromResult(raw), pdf.filename);
-    return continueOne(pdf, raw, items);
+    return continueOne(pdf, raw, items, singlePacket);
   };
 
   if (!separate) {
@@ -459,7 +645,8 @@ async function classifyCarrierInvoiceAttachments(opts) {
     merged = itemsFromResult(combined);
     if (invoicePdfs.length === 1) {
       merged = stampFilename(merged, invoicePdfs[0].filename);
-      merged = await continueOne(invoicePdfs[0], combined, merged);
+      merged = await continueOne(
+          invoicePdfs[0], combined, merged, true);
     } else if (combined && combined.readPartial) {
       readPartial = true;
       stopReason = combined.stopReason || "";
@@ -531,15 +718,18 @@ async function classifyCarrierInvoiceAttachments(opts) {
     endedEarly,
     partialReasons,
     chunkSupplementDone,
+    invoiceShortfall,
   };
 }
 
 module.exports = {
   classifyCarrierInvoiceAttachments,
   assessInvoiceRead,
+  assessInvoiceShortfall,
   annotateInvoiceRead,
   jsonTextIsComplete,
   mergeUnseenInvoiceItems,
   supplementInvoicePdfByPageChunks,
   continuePartialInvoicePdf,
+  parseStatedInvoiceCount,
 };

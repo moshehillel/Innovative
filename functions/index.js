@@ -6731,14 +6731,30 @@ async function recoverStatementInvoiceItems(opts) {
     invoiceCount: invoiceItems.length,
     pageCount,
   });
-  // Numbered statements still use the index. Any other multi-invoice
-  // PDF continues when the first read was partial and the batch reader
-  // did not already finish the page chunks.
+  // Numbered statements still use the index. Any other multi-page
+  // PDF is already re-read in page chunks. A counted list that is
+  // still short is held for review instead of marked complete.
   const shouldChunk = numbered ?
     !!gap.underExtracted :
     (!opts.chunkSupplementDone && !!decision.partial);
+  const heldShort = !numbered && opts.invoiceShortfall &&
+    opts.invoiceShortfall.underExtracted ?
+    opts.invoiceShortfall : null;
   if (!shouldChunk) {
-    return {invoiceItems, gap: numbered ? gap : null};
+    if (heldShort) {
+      await writeLog("warn", "ai",
+          "Multi-invoice PDF still short after page chunks", {
+            messageId,
+            reason: heldShort.reason || "",
+            expectedCount: heldShort.expectedCount,
+            extractedCount: heldShort.extractedCount,
+            pageCount: heldShort.pageCount || pageCount,
+          });
+    }
+    return {
+      invoiceItems,
+      gap: heldShort || (numbered ? gap : null),
+    };
   }
   if (!numbered) {
     gap = Object.assign({}, gap, {underExtracted: true});
@@ -6775,7 +6791,28 @@ async function recoverStatementInvoiceItems(opts) {
         });
   }
   if (!numbered) {
-    return {invoiceItems: recovered, gap: null};
+    let held = heldShort;
+    if (!held) {
+      held = invoiceBatchClassification.assessInvoiceShortfall({
+        pageCount,
+        capturedCount: recovered.length,
+        extractedLoadNumbers: recovered.map(
+            (item) => item && item.loadNumber),
+        statedInvoiceCount: 0,
+        indexLoadNumbers,
+      });
+    }
+    if (held) {
+      await writeLog("warn", "ai",
+          "Multi-invoice PDF still short after page chunks", {
+            messageId,
+            reason: held.reason || "",
+            expectedCount: held.expectedCount,
+            extractedCount: held.extractedCount,
+            pageCount: held.pageCount || pageCount,
+          });
+    }
+    return {invoiceItems: recovered, gap: held};
   }
   return {invoiceItems: recovered, gap};
 }
@@ -6800,9 +6837,10 @@ async function handleStatementUnderExtractionAlert(args) {
     missingList.join(", ") :
     `expected ~${gap.expectedCount}, extracted ${gap.extractedCount}`;
 
-  const reason =
+  const heldReason = gap && gap.reason ? String(gap.reason) : "";
+  const reason = heldReason ||
     "Statement PDF missing freight invoices — manual review required";
-  const notes =
+  let notes =
     `Hi, I'm ${AI_AGENT_NAME}, your AI assistant.\n\n` +
     `I received a numbered carrier statement packet ` +
     `(subject: ${subject || "—"}) that contains multiple freight ` +
@@ -6817,6 +6855,25 @@ async function handleStatementUnderExtractionAlert(args) {
     `I processed the invoice(s) I could identify. Please review the ` +
     `attached PDF and enter any missing loads manually, or reprocess ` +
     `after correcting.\n\nThank you,\n${AI_AGENT_NAME}`;
+  if (heldReason) {
+    notes = "Hi, I'm " + AI_AGENT_NAME + ", your AI assistant.\n\n" +
+      "I read a multi-invoice PDF (subject: " +
+      (subject || "-") + ").\n\n" +
+      heldReason + "\n\n" +
+      "I kept the " + String(gap.extractedCount) +
+      " invoice(s) already read. " +
+      "The remainder is held for manual review.\n\n" +
+      "Thank you,\n" + AI_AGENT_NAME;
+  }
+
+  const extractedData = {
+    "Subject": subject || "—",
+    "Expected invoices": String(gap.expectedCount || "—"),
+    "Extracted invoices": String(gap.extractedCount || "—"),
+    "Missing load numbers": missingLabel,
+    "PDF pages": gap.pageCount ? String(gap.pageCount) : "—",
+  };
+  if (heldReason) extractedData.Why = heldReason;
 
   await forwardToHumanReview(
       gmail, messageId, subject, from, reason, notes,
@@ -6824,13 +6881,7 @@ async function handleStatementUnderExtractionAlert(args) {
         department: "operations",
         emailBody,
         emailHtml: emailHtml || null,
-        extractedData: {
-          "Subject": subject || "—",
-          "Expected invoices": String(gap.expectedCount || "—"),
-          "Extracted invoices": String(gap.extractedCount || "—"),
-          "Missing load numbers": missingLabel,
-          "PDF pages": gap.pageCount ? String(gap.pageCount) : "—",
-        },
+        extractedData,
       },
   );
 
@@ -6842,6 +6893,7 @@ async function handleStatementUnderExtractionAlert(args) {
         extractedCount: gap.extractedCount,
         missingLoads: missingList,
         pageCount: gap.pageCount,
+        reason: heldReason || "",
       });
 }
 
@@ -10923,6 +10975,7 @@ async function processGmailMessage(
           cutOff: !!aiResult.cutOff,
           endedEarly: !!aiResult.endedEarly,
           chunkSupplementDone: !!aiResult.chunkSupplementDone,
+          invoiceShortfall: aiResult.invoiceShortfall || null,
         });
         invoiceItems = recovered.invoiceItems;
         statementExtractionGap = recovered.gap;

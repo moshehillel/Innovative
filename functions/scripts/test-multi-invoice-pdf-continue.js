@@ -60,6 +60,7 @@ function packet() {
     pdfAttachments: [packet()],
     messageId: "ct-one-pdf",
     getPageCount: async () => 30,
+    readPageTexts: async () => [""],
     slicePdf: async () => Buffer.from("chunk"),
     classifyCombined: async () => {
       seen.push("combined");
@@ -136,7 +137,7 @@ function packet() {
   const one = await batch.classifyCarrierInvoiceAttachments({
     subject,
     pdfAttachments: [packet()],
-    getPageCount: async () => 4,
+    getPageCount: async () => 2,
     slicePdf: async () => Buffer.from("nope"),
     classifyCombined: async () => ({
       invoices: [bill("265111")],
@@ -148,16 +149,18 @@ function packet() {
       return {invoices: [bill("265111")]};
     },
   });
-  check("a finished single invoice does not request chunks",
+  check("a one- or two-page invoice can finish without chunks",
       quiet.length === 0 &&
       one.invoices.length === 1 &&
-      one.chunkSupplementDone === false);
+      one.chunkSupplementDone === false &&
+      !one.invoiceShortfall);
 
   const longQuiet = [];
-  await batch.classifyCarrierInvoiceAttachments({
+  const longRead = await batch.classifyCarrierInvoiceAttachments({
     subject,
     pdfAttachments: [packet()],
     getPageCount: async () => 12,
+    readPageTexts: async () => [""],
     slicePdf: async () => Buffer.from("nope"),
     classifyCombined: async () => ({
       invoices: [bill("265222")],
@@ -169,14 +172,21 @@ function packet() {
       return {invoices: []};
     },
   });
-  check("one finished invoice on a long PDF is not chunked",
-      longQuiet.length === 0);
+  check("one finished invoice on a long PDF is still chunked",
+      longQuiet.length > 0 &&
+      longRead.invoices.length === 1 &&
+      longRead.invoices[0].loadNumber === "265222");
+  check("page count that still implies more bills is held",
+      longRead.invoiceShortfall &&
+      longRead.invoiceShortfall.needsReview === true &&
+      longRead.invoiceShortfall.source === "page_count");
 
   const shortList = [];
   const shortRead = await batch.classifyCarrierInvoiceAttachments({
     subject,
     pdfAttachments: [packet()],
     getPageCount: async () => 30,
+    readPageTexts: async () => [""],
     slicePdf: async () => Buffer.from("chunk"),
     classifyCombined: async () => ({
       invoices: [bill("265301"), bill("265302"), bill("265303")],
@@ -191,6 +201,99 @@ function packet() {
   check("fewer invoices than pages still requests the rest",
       shortList.length > 0 &&
       shortRead.invoices.some((i) => i.loadNumber === "265310"));
+
+  const notPartial = batch.assessInvoiceRead({
+    stopReason: "end_turn",
+    cutOff: false,
+    endedEarly: false,
+    invoiceCount: 2,
+    pageCount: 5,
+  });
+  check("two finished invoices on 5 pages are not judged partial",
+      notPartial.partial === false && notPartial.reasons.length === 0);
+
+  const twoOfTenSeen = [];
+  const twoOfTen = await batch.classifyCarrierInvoiceAttachments({
+    subject,
+    pdfAttachments: [packet()],
+    getPageCount: async () => 5,
+    readPageTexts: async () => ["Carrier packet 10 invoices"],
+    slicePdf: async () => Buffer.from("chunk"),
+    classifyCombined: async () => ({
+      invoices: [bill("270001"), bill("270002")],
+      stopReason: "end_turn",
+      cutOff: false,
+      endedEarly: false,
+    }),
+    classifyOne: async (pdf) => {
+      twoOfTenSeen.push(pdf.filename);
+      if (pdf.filename.indexOf("-p2-5") === -1) {
+        throw new Error("unexpected chunk " + pdf.filename);
+      }
+      return {
+        invoices: [
+          bill("270001"),
+          bill("270009", {invoiceNumber: "INV-270002"}),
+          bill("270003"),
+        ],
+      };
+    },
+  });
+  const twoLoads = twoOfTen.invoices.map(
+      (item) => String(item.loadNumber || ""));
+  const twoCount = (load) =>
+    twoLoads.filter((loadNo) => loadNo === load).length;
+  check("2 of 10 still runs the chunk pass when not cut off",
+      twoOfTenSeen.indexOf("ct-packet.pdf-p2-5.pdf") !== -1 &&
+      twoOfTen.chunkSupplementDone === true);
+  check("chunk pass does not save a bill that was already read",
+      twoCount("270001") === 1 && twoCount("270009") === 0);
+  check("chunk pass keeps a new invoice and the first two",
+      twoCount("270002") === 1 && twoCount("270003") === 1 &&
+      twoOfTen.invoices.length === 3);
+  check("short of the stated 10 is held for review",
+      twoOfTen.invoiceShortfall &&
+      twoOfTen.invoiceShortfall.needsReview === true &&
+      twoOfTen.invoiceShortfall.expectedCount === 10 &&
+      twoOfTen.invoiceShortfall.extractedCount === 3 &&
+      twoOfTen.invoiceShortfall.source === "stated_count" &&
+      /10/.test(twoOfTen.invoiceShortfall.reason) &&
+      /3/.test(twoOfTen.invoiceShortfall.reason));
+  check("review note records why the count is short",
+      bundle.buildStatementGapSummarySuffix(twoOfTen.invoiceShortfall) ===
+      twoOfTen.invoiceShortfall.reason);
+
+  const failedKeep = await batch.classifyCarrierInvoiceAttachments({
+    subject,
+    pdfAttachments: [packet()],
+    getPageCount: async () => 20,
+    readPageTexts: async () => ["Statement cover 10 invoices"],
+    slicePdf: async () => Buffer.from("chunk"),
+    classifyCombined: async () => ({
+      invoices: [bill("271001"), bill("271002")],
+      stopReason: "end_turn",
+      cutOff: false,
+    }),
+    classifyOne: async (pdf) => {
+      if (pdf.filename.indexOf("-p2-13") !== -1) {
+        throw new Error("chunk failed");
+      }
+      if (pdf.filename.indexOf("-p13-20") !== -1) {
+        return {invoices: [bill("271003")]};
+      }
+      throw new Error("unexpected chunk " + pdf.filename);
+    },
+  });
+  const failedLoads = failedKeep.invoices.map(
+      (item) => String(item.loadNumber || ""));
+  check("a failed chunk keeps invoices and later chunks",
+      failedLoads.indexOf("271001") !== -1 &&
+      failedLoads.indexOf("271002") !== -1 &&
+      failedLoads.indexOf("271003") !== -1);
+  check("still short of 10 after a failed chunk is held",
+      failedKeep.invoiceShortfall &&
+      failedKeep.invoiceShortfall.needsReview === true &&
+      failedKeep.invoices.length === 3);
 
   if (failures) {
     console.error("\n" + failures + " failure(s)");
