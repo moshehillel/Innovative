@@ -695,6 +695,45 @@ async function markActed(db, opts) {
   return {ok: true};
 }
 
+const NOTICE_ISSUE = Object.freeze({
+  POD: "pod",
+  RATE: "rate",
+  PROFIT: "profit",
+  GTG: "gtg",
+  LOAD_NUMBER: "load_number",
+  CHARGE_APPROVAL: "charge_approval",
+  DISPUTE: "dispute",
+});
+
+/**
+ * Subject, title, and reason with dashes folded to a hyphen.
+ * Email HTML is left out so a mention in the body cannot match.
+ * @param {object} row Notification or task.
+ * @return {string}
+ */
+function noticePlainText(row) {
+  return [
+    row && row.subject,
+    row && row.reason,
+    row && row.title,
+    row && row.decisionReason,
+    row && row.emailType,
+    row && row.type,
+  ].filter((part) => part != null && String(part) !== "")
+      .join("\n")
+      .replace(/[\u2014\u2013\u2012\u2212]/g, "-")
+      .toLowerCase();
+}
+
+/**
+ * @param {object} row Notification.
+ * @return {boolean}
+ */
+function isOpenNotice(row) {
+  const status = String((row && row.status) || "open").toLowerCase();
+  return status === NOTIF_STATUS.OPEN;
+}
+
 /**
  * Open "Action needed - No POD" or "POD needed" notice, including
  * "Reminder: POD needed". Dashes may be an em dash or a hyphen.
@@ -703,15 +742,146 @@ async function markActed(db, opts) {
  * @return {boolean}
  */
 function isClearablePodNotification(row) {
-  if (!row) return false;
-  const status = String(row.status || "open").toLowerCase();
-  if (status !== NOTIF_STATUS.OPEN) return false;
-  const text = [row.subject, row.reason, row.title]
-      .filter((part) => part != null && String(part) !== "")
-      .join("\n")
-      .replace(/[\u2014\u2013\u2012\u2212]/g, "-");
+  if (!row || !isOpenNotice(row)) return false;
+  const text = noticePlainText(row);
   if (/action needed\s*-\s*no pod\b/i.test(text)) return true;
   return /\bpod needed\b/i.test(text);
+}
+
+/**
+ * One problem per notice. A different problem on the same load
+ * gets a different key and is left open.
+ * @param {object} row Notification or task.
+ * @return {string|null}
+ */
+function noticeIssueKey(row) {
+  if (!row) return null;
+  const type = String(row.type || "").toLowerCase();
+  const emailType = String(row.emailType || "").toLowerCase();
+  const text = noticePlainText(row);
+  const phase = String(row.chargePhase || "").toLowerCase();
+  const follow = String(row.followUpStatus || "").toLowerCase();
+  const decision = String(row.decision || "").toLowerCase();
+  const dispute = emailType === "carrier_dispute_draft" ||
+    /dispute draft/.test(text) ||
+    phase === "dispute" ||
+    follow === "disputing" ||
+    follow === "disputed" ||
+    decision === "d";
+  if (emailType.indexOf("drayage_gtg") === 0 || /gtg stopped/.test(text)) {
+    return NOTICE_ISSUE.GTG;
+  }
+  if (emailType === "missing_load_number" ||
+      /enter load\s*(#|number)\b/.test(text)) {
+    return NOTICE_ISSUE.LOAD_NUMBER;
+  }
+  if (dispute && (type === "additional_charge" ||
+      emailType === "carrier_dispute_draft" ||
+      /dispute draft/.test(text))) {
+    return NOTICE_ISSUE.DISPUTE;
+  }
+  if (emailType === "additional_charge_approval" ||
+      type === "additional_charge" ||
+      /approval needed\s*-\s*additional charge/.test(text)) {
+    return NOTICE_ISSUE.CHARGE_APPROVAL;
+  }
+  if (type === "missing_pod" ||
+      /action needed\s*-\s*no pod\b/.test(text) ||
+      /\bpod needed\b/.test(text)) {
+    return NOTICE_ISSUE.POD;
+  }
+  if (type === "low_margin" ||
+      type === "low_profit" ||
+      emailType === "low_profit_dispatcher" ||
+      emailType === "low_margin" ||
+      /low\/negative profit|low margin|customer rate too low/.test(text) ||
+      /rate too low/.test(text)) {
+    return NOTICE_ISSUE.PROFIT;
+  }
+  const reason = String(row.reason || row.decisionReason || "");
+  if (type === "missing_rate" ||
+      type === "rate_missing" ||
+      emailType === "rate_missing" ||
+      reason.toUpperCase() === "MISSING_RATE" ||
+      /no customer rate|missing customer rate|missing carrier rate/
+          .test(text)) {
+    return NOTICE_ISSUE.RATE;
+  }
+  return null;
+}
+
+/**
+ * Which notice the set-rate form finished. Missing rate and low
+ * margin are different problems.
+ * @param {object} inv Invoice fields before the rate is saved.
+ * @return {string|null}
+ */
+function noticeIssueForRateSave(inv) {
+  if (!inv) return null;
+  const rate = Number(inv.customerRate);
+  const missing = !Number.isFinite(rate) || rate <= 0;
+  const blob = [inv.decisionReason, inv.decisionStage, inv.reason]
+      .filter((part) => part != null && String(part) !== "")
+      .join(" ")
+      .toLowerCase();
+  const low = /too low|low margin|low_margin|negative profit|low profit/
+      .test(blob);
+  const rateText = /missing customer rate|missing_rate|no customer rate/
+      .test(blob);
+  if (missing || (rateText && !low)) return NOTICE_ISSUE.RATE;
+  if (low) return NOTICE_ISSUE.PROFIT;
+  return null;
+}
+
+/**
+ * @param {object} data Notice fields.
+ * @param {string} loadNumber Requested load.
+ * @return {boolean}
+ */
+function sameNoticeLoad(data, loadNumber) {
+  const want = String(loadNumber || "").trim();
+  const got = String(data && data.loadNumber == null ?
+    "" : data.loadNumber).trim();
+  return Boolean(want) && want === got;
+}
+
+/**
+ * @param {object} data Notice fields.
+ * @param {object} request issue, loadNumber, invoiceId, messageId,
+ *   followUpId.
+ * @return {boolean}
+ */
+function notificationMatchesCompletedIssue(data, request) {
+  if (!isOpenNotice(data)) return false;
+  if (noticeIssueKey(data) !== request.issue) return false;
+  const issue = request.issue;
+  if (issue === NOTICE_ISSUE.LOAD_NUMBER) {
+    const mid = String(request.messageId || "").trim();
+    if (!mid) return false;
+    if (String(data.messageId || "") === mid) return true;
+    if (mid.length < 8) return false;
+    const blob = [data.subject, data.title, data.body]
+        .filter((part) => part != null && String(part) !== "")
+        .join("\n");
+    return blob.includes(mid);
+  }
+  if (issue === NOTICE_ISSUE.CHARGE_APPROVAL ||
+      issue === NOTICE_ISSUE.DISPUTE) {
+    const wantFollow = String(request.followUpId || "").trim();
+    const gotFollow = String(data.followUpId || "").trim();
+    if (wantFollow && gotFollow && wantFollow !== gotFollow) return false;
+    const wantInvoice = String(request.invoiceId || "").trim();
+    const gotInvoice = String(data.invoiceId || "").trim();
+    if (wantInvoice && gotInvoice && wantInvoice !== gotInvoice) {
+      return false;
+    }
+    if (wantFollow && gotFollow === wantFollow) return true;
+    if (wantInvoice && gotInvoice === wantInvoice) return true;
+  }
+  const wantInvoice = String(request.invoiceId || "").trim();
+  const gotInvoice = String(data.invoiceId || "").trim();
+  if (wantInvoice && gotInvoice === wantInvoice) return true;
+  return sameNoticeLoad(data, request.loadNumber);
 }
 
 /**
@@ -782,6 +952,73 @@ async function dismissOpenPodNotifications(db, opts) {
 }
 
 /**
+ * Dismisses open notices for one completed problem on a load.
+ * A different problem on that load stays open.
+ * @param {object} db Firestore.
+ * @param {object} opts issue, tenantId, loadNumber, invoiceId,
+ *   messageId, followUpId.
+ * @return {Promise<object>}
+ */
+async function dismissOpenIssueNotifications(db, opts) {
+  const request = opts || {};
+  const issue = String(request.issue || "").trim();
+  if (!db || !issue) return {ok: true, dismissed: 0, ids: []};
+  const tenantId = request.tenantId || "default";
+  const loadNumber = String(request.loadNumber || "").trim();
+  const invoiceId = String(request.invoiceId || "").trim();
+  const messageId = String(request.messageId || "").trim();
+  const followUpId = String(request.followUpId || "").trim();
+  const lookups = [];
+  if (invoiceId) lookups.push(["invoiceId", invoiceId]);
+  if (loadNumber) {
+    lookups.push(["loadNumber", loadNumber]);
+    if (/^\d+$/.test(loadNumber)) {
+      lookups.push(["loadNumber", Number(loadNumber)]);
+    }
+  }
+  if (messageId) lookups.push(["messageId", messageId]);
+  if (followUpId) lookups.push(["followUpId", followUpId]);
+  if (issue === NOTICE_ISSUE.LOAD_NUMBER) {
+    lookups.push(["emailType", "missing_load_number"]);
+  }
+  if (!lookups.length) return {ok: true, dismissed: 0, ids: []};
+  const seen = new Set();
+  const ids = [];
+  const match = {
+    issue,
+    loadNumber,
+    invoiceId,
+    messageId,
+    followUpId,
+  };
+  for (const pair of lookups) {
+    let docs = [];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      docs = await loadNotifDocs(db, pair[0], pair[1]);
+    } catch (err) {
+      console.error("[dismissOpenIssueNotifications]",
+          err && err.message);
+      continue;
+    }
+    for (const doc of docs) {
+      if (!doc || seen.has(doc.id)) continue;
+      seen.add(doc.id);
+      const data = doc.data() || {};
+      if (!ownership.sameTenant(data.tenantId, tenantId)) continue;
+      if (!notificationMatchesCompletedIssue(data, match)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const result = await dismissNotification(db, {
+        id: doc.id,
+        tenantId: data.tenantId || tenantId,
+      });
+      if (result && result.ok) ids.push(doc.id);
+    }
+  }
+  return {ok: true, dismissed: ids.length, ids};
+}
+
+/**
  * Finds open unhandled/charge notifications for an invoice or message.
  * @param {object} db Firestore.
  * @param {object} opts tenantId, invoiceId?, messageId?, type?
@@ -813,8 +1050,12 @@ module.exports = {
   uniqueNotificationsById,
   loadNotificationDetail,
   dismissNotification,
+  NOTICE_ISSUE,
   isClearablePodNotification,
+  noticeIssueKey,
+  noticeIssueForRateSave,
   dismissOpenPodNotifications,
+  dismissOpenIssueNotifications,
   flagNotification,
   markActed,
   findOpenByRef,

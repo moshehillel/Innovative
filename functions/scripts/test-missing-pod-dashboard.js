@@ -252,7 +252,7 @@ async function testFinishAndSchedule() {
       (invoices[id] ? {...invoices[id]} : null),
     resumeWorkflow: async (_tenant, id) => {
       resumes.push(id);
-      if (id === "inv-pod") {
+      if (id === "inv-pod" || id === "inv-btn") {
         invoices[id].decisionStage = "completed";
         invoices[id].finalWorkflowStatus = "completed";
         return {
@@ -389,6 +389,39 @@ async function testFinishAndSchedule() {
       db.store["dashboardTasks/still-1"].status, "open");
   check("failed button does not email the customer", emails.length, 0);
   check("failed button does not clear notices",
+      cleared.some((row) => String(row.loadNumber) === "300"), false);
+
+  invoices["inv-btn"] = {
+    id: "inv-btn",
+    decisionStage: "missing_pod",
+    finalWorkflowStatus: "waiting_manual",
+    loadNumber: "440",
+    workflowPausedAtStep: "pod_extraction",
+  };
+  db.store["dashboardTasks/btn-1"] = {
+    tenantId: "default",
+    status: "open",
+    type: "missing_pod",
+    reason: "missing_pod",
+    decisionStage: "missing_pod",
+    invoiceId: "inv-btn",
+    loadNumber: "440",
+  };
+  const button = await pod.finishFromDashboard({
+    tenant: {tenantId: "default"},
+    tenantId: "default",
+    taskId: "btn-1",
+    source: "dashboardTasks",
+    invoiceId: "inv-btn",
+    loadNumber: "440",
+    type: "missing_pod",
+    issueType: "missing_pod",
+    decisionStage: "missing_pod",
+  });
+  check("POD done button finishes the hold", button.ok, true);
+  check("POD done button clears that load's notices",
+      cleared.some((row) => String(row.loadNumber) === "440"), true);
+  check("POD done button does not clear the skipped load",
       cleared.some((row) => String(row.loadNumber) === "300"), false);
 }
 

@@ -6,8 +6,9 @@
  * Done only hides a row. POD done resumes the invoice the same way a POD
  * arrival does, and drops the row only after that hold is actually gone.
  * The twice-weekly job does that only when Primus already has a POD file.
- * It does not email the customer. A finished hold clears open No-POD
- * and POD-needed notices. A hold that is still missing stays up.
+ * It does not email the customer. POD done and a finished hold clear
+ * open No-POD and POD-needed notices. A hold that is still missing
+ * stays up.
  */
 
 const scope = require("./dashboard-scope");
@@ -289,7 +290,8 @@ async function finishFromDashboard(opts) {
       loadNumber: row.loadNumber,
       closedBy: "pod_done",
     });
-    return {ok: true, removed: true, reason: gate.reason};
+    return finishedPodHold(
+        row, before, request.tenantId, gate.reason);
   }
   if (typeof deps.resumeWorkflow !== "function") {
     return {
@@ -328,7 +330,26 @@ async function finishFromDashboard(opts) {
     loadNumber: row.loadNumber || (after && after.loadNumber),
     closedBy: "pod_done",
   });
-  return {ok: true, removed: true, reason: "workflow_finished"};
+  return finishedPodHold(
+      row, after || before, request.tenantId, "workflow_finished");
+}
+
+/**
+ * @param {object} item Dashboard row.
+ * @param {object|null} invoice Invoice fields.
+ * @param {string} tenantId Tenant id.
+ * @param {string} reason Finish reason.
+ * @return {Promise<object>}
+ */
+async function finishedPodHold(item, invoice, tenantId, reason) {
+  const notificationsDismissed = await clearPodNotices(
+      item, invoice, tenantId);
+  return {
+    ok: true,
+    removed: true,
+    reason,
+    notificationsDismissed,
+  };
 }
 
 /**
@@ -416,9 +437,8 @@ async function runTwiceWeeklyCheck(options) {
         if (finished.ok) {
           summary.completed += 1;
           summary.completedInvoiceIds.push(invoiceId);
-          // eslint-disable-next-line no-await-in-loop
           summary.notificationsDismissed +=
-            await clearPodNotices(item, invoice, tenantId);
+            Number(finished.notificationsDismissed) || 0;
           // eslint-disable-next-line no-await-in-loop
           await logCheck(item, gate.reason, "completed");
         } else {
@@ -472,9 +492,8 @@ async function runTwiceWeeklyCheck(options) {
     if (finished.ok) {
       summary.completed += 1;
       summary.completedInvoiceIds.push(invoiceId);
-      // eslint-disable-next-line no-await-in-loop
       summary.notificationsDismissed +=
-        await clearPodNotices(item, invoice, tenantId);
+        Number(finished.notificationsDismissed) || 0;
       // eslint-disable-next-line no-await-in-loop
       await logCheck(item, finished.reason || "pod_on_primus", "completed");
     } else {

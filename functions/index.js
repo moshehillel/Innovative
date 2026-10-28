@@ -2929,6 +2929,11 @@ exports.enterInvoiceLoadNumber = onRequest(async (req, res) => {
     const prior = intake && intake.manualLoadNumber ?
       String(intake.manualLoadNumber) : null;
     if (prior === normalizedLoad && intake.status === "processed") {
+      await dismissCompletedWorkNotice({
+        tenantId: tenant.tenantId,
+        messageId: String(messageId),
+        issue: dashboardOps.NOTICE_ISSUE.LOAD_NUMBER,
+      });
       return res.status(200).send(
           `<!doctype html><html><body style="font-family:Arial,sans-serif;` +
           `text-align:center;padding:48px"><h1 style="color:#16a34a">` +
@@ -2955,6 +2960,11 @@ exports.enterInvoiceLoadNumber = onRequest(async (req, res) => {
     await reprocessGmailMessageForTenant(
         tenant, String(messageId), inboxFlowId);
 
+    await dismissCompletedWorkNotice({
+      tenantId: tenant.tenantId,
+      messageId: String(messageId),
+      issue: dashboardOps.NOTICE_ISSUE.LOAD_NUMBER,
+    });
     return res.status(200).send(
         `<!doctype html><html><body style="font-family:Arial,sans-serif;` +
         `text-align:center;padding:48px"><h1 style="color:#16a34a">` +
@@ -3174,6 +3184,22 @@ async function attachShipmentBol(booking, loadNumber) {
   }
 }
 
+/**
+ * Drops the open notice for work a person just finished.
+ * A failure here must not undo the completed work.
+ * @param {object} opts issue, tenantId, loadNumber, invoiceId,
+ *   messageId, followUpId.
+ * @return {Promise<void>}
+ */
+async function dismissCompletedWorkNotice(opts) {
+  try {
+    await dashboardOps.dismissOpenIssueNotifications(db, opts || {});
+  } catch (err) {
+    console.error("[dismissCompletedWorkNotice]",
+        err && err.message);
+  }
+}
+
 async function handleAdditionalChargeAction(req, res) {
   try {
     const invoiceId = (req.body && req.body.invoiceId) || req.query.invoiceId;
@@ -3236,6 +3262,12 @@ async function handleAdditionalChargeAction(req, res) {
     const savedDecision =
       additionalCharges.savedAdditionalChargeDecision(charge);
     if (savedDecision) {
+      await dismissCompletedWorkNotice({
+        tenantId: tenant.tenantId,
+        loadNumber: invoice.loadNumber || null,
+        invoiceId: String(invoiceId),
+        issue: dashboardOps.NOTICE_ISSUE.CHARGE_APPROVAL,
+      });
       return htmlPage(
           "Already decided",
           "#6b7280",
@@ -3374,6 +3406,12 @@ async function handleAdditionalChargeAction(req, res) {
     if (!claim.ok) {
       if (claim.reason === "already") {
         const saved = String(claim.decision || "").toUpperCase();
+        await dismissCompletedWorkNotice({
+          tenantId: tenant.tenantId,
+          loadNumber: invoice.loadNumber || null,
+          invoiceId: String(invoiceId),
+          issue: dashboardOps.NOTICE_ISSUE.CHARGE_APPROVAL,
+        });
         return htmlPage(
             "Already decided",
             "#6b7280",
@@ -3457,6 +3495,12 @@ async function handleAdditionalChargeAction(req, res) {
         disputeNotes,
       }).catch((err) => {
         console.error("markTaskInDispute:", err.message);
+      });
+      await dismissCompletedWorkNotice({
+        tenantId: tenant.tenantId,
+        loadNumber: invoice.loadNumber || null,
+        invoiceId: String(invoiceId),
+        issue: dashboardOps.NOTICE_ISSUE.CHARGE_APPROVAL,
       });
       return htmlPage("Dispute draft created", "#dc2626",
           "The charge was not approved. Jerry emailed a dispute draft " +
@@ -3898,6 +3942,12 @@ async function handleAdditionalChargeAction(req, res) {
         "billed the entered rate as one Primus accessorial named " +
         "Freight. No separate customer email was sent." + extraNote,
     };
+    await dismissCompletedWorkNotice({
+      tenantId: tenant.tenantId,
+      loadNumber: invoice.loadNumber || null,
+      invoiceId: String(invoiceId),
+      issue: dashboardOps.NOTICE_ISSUE.CHARGE_APPROVAL,
+    });
     return htmlPage(titles[option], "#16a34a",
         messages[option] + resumeNote);
   } catch (error) {
@@ -5002,6 +5052,7 @@ async function handleMissingLoadNumberForLisa(args) {
     type: "missing_load_number",
     forceRecipient: true,
     to: lisaEmail,
+    messageId,
     subject: `Enter load # — ${aiResult.carrierName || "carrier invoice"}`,
     html:
       `<p>Jerry received a carrier invoice but could not match it to a ` +
@@ -13234,6 +13285,16 @@ exports.setCustomerRate = onRequest(async (req, res) => {
     customerRate,
     customerName,
   });
+
+  const rateNotice = dashboardOps.noticeIssueForRateSave(inv);
+  if (rateNotice) {
+    await dismissCompletedWorkNotice({
+      tenantId: tenant.tenantId,
+      loadNumber: inv.loadNumber || null,
+      invoiceId: String(invoiceId),
+      issue: rateNotice,
+    });
+  }
 
   // Resume the invoice's OWN tenant workflow (TAI or Primus), never a
   // hardcoded Primus default.

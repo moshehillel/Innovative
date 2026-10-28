@@ -764,7 +764,181 @@ async function testListReadsEveryOpenNotification() {
   assert.ok(late.notifications.length > 0);
 }
 
+async function testCompletedWorkClearsMatchingNotice() {
+  const ops = require("../dashboard-ops");
+  const tasks = require("../dashboard-tasks");
+  assert.strictEqual(ops.noticeIssueKey({
+    status: "open",
+    subject: "Action needed \u2014 No POD for Load 200",
+  }), "pod");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Reminder: POD needed \u2014 Load 200",
+  }), "pod");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Action needed \u2014 No customer rate for Load 200",
+  }), "rate");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Action needed \u2014 Low margin for Load 200",
+  }), "profit");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Action needed \u2014 low/negative profit on Load 200",
+    emailType: "low_profit_dispatcher",
+  }), "profit");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Drayage GTG stopped \u2014 load 200",
+    emailType: "drayage_gtg_stopped",
+  }), "gtg");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Enter load number",
+  }), "load_number");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Approval needed \u2014 additional charge on Load 200",
+    type: "additional_charge",
+  }), "charge_approval");
+  assert.strictEqual(ops.noticeIssueKey({
+    subject: "Dispute draft - carrier invoice on Load 200",
+    emailType: "carrier_dispute_draft",
+  }), "dispute");
+  assert.strictEqual(ops.noticeIssueForRateSave({
+    customerRate: 0,
+    decisionReason: "Missing customer rate",
+  }), "rate");
+  assert.strictEqual(ops.noticeIssueForRateSave({
+    customerRate: 40,
+    decisionReason: "Customer rate too low",
+  }), "profit");
+
+  const db = mockDb({
+    "dashboardNotifications/pod": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      subject: "Action needed \u2014 No POD for Load 200",
+    },
+    "dashboardNotifications/remind": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      subject: "Reminder: POD needed - Load 200",
+    },
+    "dashboardNotifications/rate": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      subject: "Action needed \u2014 No customer rate for Load 200",
+    },
+    "dashboardNotifications/profit": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      subject: "Action needed \u2014 low/negative profit on Load 200",
+      emailType: "low_profit_dispatcher",
+    },
+    "dashboardNotifications/margin": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      subject: "Action needed \u2014 Low margin for Load 200",
+    },
+    "dashboardNotifications/gtg": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      subject: "Drayage GTG stopped \u2014 load 200",
+      emailType: "drayage_gtg_stopped",
+    },
+    "dashboardNotifications/loadn": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      messageId: "msg-keep",
+      subject: "Enter load number",
+    },
+    "dashboardNotifications/charge": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1", followUpId: "fu-1",
+      type: "additional_charge",
+      subject: "Approval needed - additional charge on Load 200",
+    },
+    "dashboardNotifications/otherCharge": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-2", followUpId: "fu-2",
+      type: "additional_charge",
+      subject: "Approval needed - additional charge on Load 200",
+    },
+    "dashboardNotifications/dispute": {
+      tenantId: "default", status: "open", loadNumber: "200",
+      invoiceId: "inv-1",
+      emailType: "carrier_dispute_draft",
+      subject: "Dispute draft - carrier invoice on Load 200",
+    },
+    "dashboardTasks/rate-task": {
+      tenantId: "default", status: "open", type: "missing_rate",
+      reason: "MISSING_RATE", invoiceId: "inv-1", loadNumber: "200",
+    },
+    "invoices/inv-1": {
+      tenantId: "default",
+      decisionStage: "needs_customer_rate_review",
+      decisionReason: "MISSING_RATE",
+      loadNumber: "200",
+    },
+  });
+  const done = await tasks.dismissDashboardTask(db, {}, {
+    taskId: "rate-task",
+    source: "dashboardTasks",
+    tenantId: "default",
+  });
+  assert.strictEqual(done.ok, true);
+  assert.strictEqual(db.store["dashboardNotifications/rate"].status,
+      "dismissed");
+  assert.strictEqual(db.store["dashboardNotifications/pod"].status, "open");
+  assert.strictEqual(db.store["dashboardNotifications/profit"].status, "open");
+  assert.strictEqual(db.store["dashboardNotifications/margin"].status, "open");
+  assert.strictEqual(db.store["dashboardNotifications/gtg"].status, "open");
+  assert.strictEqual(db.store["dashboardNotifications/charge"].status, "open");
+  assert.strictEqual(db.store["dashboardNotifications/dispute"].status,
+      "open");
+
+  const charge = await ops.dismissOpenIssueNotifications(db, {
+    tenantId: "default",
+    loadNumber: "200",
+    invoiceId: "inv-1",
+    followUpId: "fu-1",
+    issue: "charge_approval",
+  });
+  assert.deepStrictEqual(charge.ids, ["charge"]);
+  assert.strictEqual(db.store["dashboardNotifications/otherCharge"].status,
+      "open");
+  assert.strictEqual(db.store["dashboardNotifications/dispute"].status,
+      "open");
+  assert.strictEqual(db.store["dashboardNotifications/pod"].status, "open");
+
+  const profit = await ops.dismissOpenIssueNotifications(db, {
+    tenantId: "default",
+    loadNumber: "200",
+    invoiceId: "inv-1",
+    issue: "profit",
+  });
+  assert.deepStrictEqual(profit.ids.slice().sort(), ["margin", "profit"]);
+  assert.strictEqual(db.store["dashboardNotifications/gtg"].status, "open");
+  assert.strictEqual(db.store["dashboardNotifications/remind"].status, "open");
+
+  const entered = await ops.dismissOpenIssueNotifications(db, {
+    tenantId: "default",
+    messageId: "msg-other",
+    issue: "load_number",
+  });
+  assert.deepStrictEqual(entered.ids, []);
+  assert.strictEqual(db.store["dashboardNotifications/loadn"].status, "open");
+  db.store["dashboardNotifications/entered"] = {
+    tenantId: "default", status: "open",
+    emailType: "missing_load_number",
+    subject: "Enter load # - carrier",
+    body: "https://example/enterInvoiceLoadNumber?invoiceId=msg-entered-9",
+  };
+  const byBody = await ops.dismissOpenIssueNotifications(db, {
+    tenantId: "default",
+    messageId: "msg-entered-9",
+    issue: "load_number",
+  });
+  assert.deepStrictEqual(byBody.ids, ["entered"]);
+  assert.strictEqual(db.store["dashboardNotifications/loadn"].status, "open");
+}
+
 testDismiss()
+    .then(() => testCompletedWorkClearsMatchingNotice())
     .then(() => testListReadsEveryOpenNotification())
     .then(() => testDigestSendsOnce())
     .then(() => {
