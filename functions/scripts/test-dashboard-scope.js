@@ -147,6 +147,51 @@ assert.strictEqual(digestMod.isJerrySystemNotification({
 assert.strictEqual(digestMod.isJerrySystemNotification({
   subject: "Review POD",
 }), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Action needed — low/negative profit on Load 268833",
+  emailType: "low_profit_dispatcher",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "Drayage GTG stopped — load 206473",
+  emailType: "drayage_gtg_stopped",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "[ACTION REQUIRED] Invoice amount does not match the shipment rate",
+  emailType: "human_review",
+}), false);
+assert.strictEqual(digestMod.isJerrySystemNotification({
+  subject: "[ACTION REQUIRED] Email received with no attachments",
+  emailType: "human_review",
+}), false);
+
+const ops = require("../dashboard-ops");
+assert.strictEqual(ops.notificationMatchesLoadQuery({
+  loadNumber: null,
+  subject: "Action needed — low/negative profit on Load 268833",
+}, "268833"), true);
+assert.strictEqual(ops.notificationMatchesLoadQuery({
+  loadNumber: null,
+  subject: "Drayage GTG stopped — load 206473",
+}, "206473"), true);
+assert.strictEqual(ops.notificationMatchesLoadQuery({
+  loadNumber: null,
+  subject: "Re: Invoice - Load V796457 - Ref 269483",
+}, "269483"), true);
+assert.strictEqual(ops.notificationMatchesLoadQuery({
+  loadNumber: "111111",
+  subject: "Action needed — low/negative profit on Load 268833",
+}, "111111"), true);
+assert.strictEqual(ops.notificationMatchesLoadQuery({
+  subject: "Action needed — low/negative profit on Load 268833",
+}, "269999"), false);
+const doubled = ops.uniqueNotificationsById([
+  {id: "same", subject: "No customer rate for Load 269237"},
+  {id: "same", subject: "No customer rate for Load 269237"},
+  {id: "other", subject: "No customer rate for Load 269237"},
+]);
+assert.strictEqual(doubled.length, 2);
+assert.strictEqual(doubled[0].id, "same");
+assert.strictEqual(doubled[1].id, "other");
 assert.strictEqual(digestMod.isInboundDigestEmail({
   subject: "Re: Jerry — 111 unfinished notification(s) — Oct 15, 2026",
 }), true);
@@ -171,13 +216,13 @@ assert.ok(other.includes("disp@aa.example"));
 const queue = require("../dashboard-queue");
 const september = {
   id: "sep",
-  receivedAt: "2026-09-01T12:00:00.000Z",
+  receivedAt: new Date(Date.now() - 40 * 24 * 60 * 60 * 1000).toISOString(),
   ownerBucket: "dispatch",
   chargesTotal: 175,
 };
 const october = {
   id: "oct",
-  receivedAt: "2026-10-12T12:00:00.000Z",
+  receivedAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
   ownerBucket: "dispatch",
   chargesTotal: 40,
 };
@@ -477,7 +522,11 @@ async function testDigestSendsOnce() {
   const db = claimDb();
   digestMod.init({
     db,
-    listNotifications: async () => ({
+    listNotifications: async (_db, opts) => {
+      assert.ok(Number(opts.fetchLimit) >= 2000);
+      assert.ok(Number(opts.limit) >= 2000);
+      assert.strictEqual(opts.sort, "newest");
+      return {
       notifications: [
         {
           status: "open",
@@ -497,7 +546,8 @@ async function testDigestSendsOnce() {
           dispatcherEmail: "accounting@innovativecarriers.com",
         },
       ],
-    }),
+      };
+    },
     saveOutboundEmail: async (email) => {
       sent.push(email);
     },

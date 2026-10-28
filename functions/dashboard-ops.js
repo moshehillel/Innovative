@@ -456,8 +456,8 @@ async function collectNotifPage(baseQuery, maxDocs) {
 }
 
 /**
- * Load-number search matches the stored load, or a subject/title that
- * still contains the number when older rows never saved loadNumber.
+ * Load-number search matches the stored load, or subject, title, or
+ * reason text when older rows never saved loadNumber.
  * @param {object} row Serialized notification.
  * @param {string} q Search text, already known to be 5+ digits.
  * @return {boolean}
@@ -466,15 +466,47 @@ function notificationMatchesLoadQuery(row, q) {
   const needle = String(q || "").trim();
   if (!needle) return false;
   if (String((row && row.loadNumber) || "") === needle) return true;
-  const text = `${(row && row.subject) || ""} ${(row && row.title) || ""}`;
+  const text = [
+    row && row.subject,
+    row && row.title,
+    row && row.reason,
+  ].filter(Boolean).join(" ");
   return text.includes(needle);
 }
 
+/**
+ * One row per notification document. A load-number lookup must not
+ * append a doc the open-status query already returned.
+ * @param {object[]} items Serialized notifications.
+ * @return {object[]}
+ */
+function uniqueNotificationsById(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items || []) {
+    const id = item && item.id ? String(item.id) : "";
+    if (id) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+    }
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * Lists open notifications for a tenant.
+ * @param {object} db Firestore.
+ * @param {object} opts tenantId, limit, fetchLimit, sort, q.
+ * @return {Promise<object>}
+ */
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
   const q = String(opts.q || "").trim();
+  // Same window as the morning digest. A 200-row cap dropped open mail
+  // once the queue grew past it, including rows that email had listed.
   const fetchLimit = Math.min(
-      Math.max(Number(opts.fetchLimit) || 200, 50), 2000);
+      Math.max(Number(opts.fetchLimit) || 2000, 50), 2000);
   const scope = require("./dashboard-scope");
   const notifName = scope.collectionName({
     collectionPrefix: opts.collectionPrefix,
@@ -547,6 +579,7 @@ async function listNotifications(db, opts) {
       return hay.includes(needle);
     });
   }
+  visibleNotifications = uniqueNotificationsById(visibleNotifications);
 
   const page = ownership.filterSortPaginate(visibleNotifications, {
     ownerBucket: opts.ownerBucket || null,
@@ -554,6 +587,7 @@ async function listNotifications(db, opts) {
     offset: opts.offset,
     limit: opts.limit || 50,
     maxLimit: opts.maxLimit,
+    sort: opts.sort || null,
     urgentFirst: opts.urgentFirst,
   });
   page.items.forEach((item) => {
@@ -681,6 +715,8 @@ module.exports = {
   isDashboardOpsPrimary,
   createNotification,
   listNotifications,
+  notificationMatchesLoadQuery,
+  uniqueNotificationsById,
   loadNotificationDetail,
   dismissNotification,
   flagNotification,

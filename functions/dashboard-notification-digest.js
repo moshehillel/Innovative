@@ -305,7 +305,9 @@ async function runDailyNotificationDigest(opts) {
         collectionPrefix: tenant.collectionPrefix,
         limit: 2000,
         maxLimit: 2000,
+        fetchLimit: 2000,
         offset: 0,
+        sort: "newest",
         urgentFirst: false,
       });
       const open = (listed.notifications || [])
