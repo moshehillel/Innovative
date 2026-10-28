@@ -1884,10 +1884,16 @@
       updateNotifsLoadMore(true);
     }
     try {
+      const sort = els.workspaceSort?.value || "newest";
+      const params = new URLSearchParams({
+        limit: String(TASK_PAGE),
+        offset: String(notifOffset),
+        sort,
+      });
+      if (sort !== "urgent") params.set("urgentFirst", "0");
       const q = String(els.workspaceSearch?.value || "").trim();
-      const data = await fetchJson(
-          `/getDashboardNotifications?limit=${TASK_PAGE}&offset=${notifOffset}` +
-          (q ? `&q=${encodeURIComponent(q)}` : ""));
+      if (q) params.set("q", q);
+      const data = await fetchJson(`/getDashboardNotifications?${params}`);
       const page = data.notifications || [];
       if (data.bucketCounts) bucketCounts = data.bucketCounts;
       notifHasMore = Boolean(data.hasMore);
