@@ -192,6 +192,16 @@ const doubled = ops.uniqueNotificationsById([
 assert.strictEqual(doubled.length, 2);
 assert.strictEqual(doubled[0].id, "same");
 assert.strictEqual(doubled[1].id, "other");
+const listedHtml = digestMod.digestHtml([
+  {subject: "First open", loadNumber: "1"},
+  {subject: "Middle open", loadNumber: "2"},
+  {subject: "Last open row", loadNumber: "3"},
+], "Oct 28, 2026");
+assert.ok(listedHtml.includes("Last open row"));
+assert.ok(listedHtml.includes("First open"));
+assert.ok(/3 unfinished notification/.test(listedHtml));
+assert.ok(/jerry dashboard/i.test(listedHtml));
+assert.ok(/unfinished notification/i.test(listedHtml));
 assert.strictEqual(digestMod.isInboundDigestEmail({
   subject: "Re: Jerry — 111 unfinished notification(s) — Oct 15, 2026",
 }), true);
@@ -523,8 +533,9 @@ async function testDigestSendsOnce() {
   digestMod.init({
     db,
     listNotifications: async (_db, opts) => {
-      assert.ok(Number(opts.fetchLimit) >= 2000);
-      assert.ok(Number(opts.limit) >= 2000);
+      assert.strictEqual(opts.all, true);
+      assert.strictEqual(opts.fetchLimit, undefined);
+      assert.strictEqual(opts.limit, undefined);
       assert.strictEqual(opts.sort, "newest");
       return {
       notifications: [
@@ -576,6 +587,11 @@ async function testDigestSendsOnce() {
   assert.ok(/sarah@innovativecarriers.com/i.test(sent[0].to));
   assert.ok(/pat@innovativecarriers.com/i.test(sent[0].to));
   assert.strictEqual(sent[0].cc, null);
+  assert.ok(/Approval needed/.test(sent[0].html));
+  assert.ok(/No POD/.test(sent[0].html));
+  assert.ok(!/inbox digest/i.test(sent[0].html));
+  assert.ok(/unfinished notification/i.test(sent[0].html));
+  assert.ok(/jerry dashboard/i.test(sent[0].html));
   const claim = db.docs["settings/dashboardNotificationDigest_default"];
   claim.status = "error";
   const retry = await digestMod.runDailyNotificationDigest({
@@ -586,7 +602,170 @@ async function testDigestSendsOnce() {
   assert.strictEqual(sent.length, 1);
 }
 
+/**
+ * Firestore stand-in that pages an in-memory notification list.
+ * @param {object[]} rows id + data.
+ * @return {object}
+ */
+function fakeNotifDb(rows) {
+  function make(list, start, lim) {
+    return {
+      where(field, op, value) {
+        if (op !== "==") throw new Error(op);
+        return make(list.filter((row) => row.data[field] === value), 0, null);
+      },
+      orderBy(field, dir) {
+        const sorted = list.slice().sort((a, b) => {
+          const av = a.data[field];
+          const bv = b.data[field];
+          const an = av instanceof Date ? av.getTime() : 0;
+          const bn = bv instanceof Date ? bv.getTime() : 0;
+          if (an === bn) return 0;
+          return dir === "desc" ? bn - an : an - bn;
+        });
+        return make(sorted, 0, null);
+      },
+      select() {
+        return this;
+      },
+      limit(n) {
+        return make(list, 0, n);
+      },
+      startAfter(doc) {
+        const idx = list.findIndex((row) => row.id === doc.id);
+        return make(list, idx + 1, lim);
+      },
+      async get() {
+        const from = start || 0;
+        const end = lim == null ? list.length : from + lim;
+        const slice = list.slice(from, end);
+        const docs = slice.map((row) => ({
+          id: row.id,
+          data() {
+            return row.data;
+          },
+        }));
+        return {
+          empty: docs.length === 0,
+          size: docs.length,
+          docs,
+          forEach(fn) {
+            docs.forEach(fn);
+          },
+        };
+      },
+    };
+  }
+  return {
+    collection() {
+      return make(rows, 0, null);
+    },
+  };
+}
+
+async function testListReadsEveryOpenNotification() {
+  const rows = [];
+  const base = Date.UTC(2024, 0, 1);
+  for (let i = 0; i < 2500; i++) {
+    rows.push({
+      id: `n${i}`,
+      data: {
+        tenantId: "default",
+        status: "open",
+        type: "ops_email",
+        subject: i === 0 ? "Rate note for Load 555555" : `Notice ${i}`,
+        ownerBucket: "accounting",
+        createdAt: new Date(base + i * 1000),
+      },
+    });
+  }
+  rows.push({
+    id: "copy",
+    data: {
+      tenantId: "default",
+      status: "open",
+      type: "ops_email",
+      subject: "Separate copy",
+      loadNumber: "555555",
+      ownerBucket: "accounting",
+      createdAt: new Date(base + 100 * 1000),
+    },
+  });
+  rows.push({
+    id: "copy",
+    data: {
+      tenantId: "default",
+      status: "open",
+      type: "ops_email",
+      subject: "Separate copy",
+      loadNumber: "555555",
+      ownerBucket: "accounting",
+      createdAt: new Date(base + 100 * 1000),
+    },
+  });
+  rows.push({
+    id: "closed",
+    data: {
+      tenantId: "default",
+      status: "dismissed",
+      type: "ops_email",
+      subject: "Closed 555555",
+      loadNumber: "555555",
+      ownerBucket: "accounting",
+      createdAt: new Date(base + 50 * 1000),
+    },
+  });
+  rows.push({
+    id: "other-tenant",
+    data: {
+      tenantId: "aa",
+      status: "open",
+      type: "ops_email",
+      subject: "Other tenant 555555",
+      loadNumber: "555555",
+      ownerBucket: "accounting",
+      createdAt: new Date(base + 60 * 1000),
+    },
+  });
+  const db = fakeNotifDb(rows);
+  const all = await ops.listNotifications(db, {
+    tenantId: "default",
+    all: true,
+    fetchLimit: 2000,
+    sort: "newest",
+    urgentFirst: false,
+  });
+  assert.strictEqual(all.notifications.length, 2501);
+  assert.strictEqual(all.hasMore, false);
+  assert.strictEqual(all.notifications[0].id, "n2499");
+  const ids = all.notifications.map((row) => row.id);
+  assert.ok(ids.includes("n0"));
+  assert.strictEqual(ids.filter((id) => id === "copy").length, 1);
+  assert.ok(!ids.includes("closed"));
+  assert.ok(!ids.includes("other-tenant"));
+  const found = await ops.listNotifications(db, {
+    tenantId: "default",
+    q: "555555",
+    limit: 50,
+    sort: "newest",
+    urgentFirst: false,
+  });
+  const foundIds = found.notifications.map((row) => row.id).sort();
+  assert.deepStrictEqual(foundIds, ["copy", "n0"]);
+  const late = await ops.listNotifications(db, {
+    tenantId: "default",
+    limit: 50,
+    maxLimit: 50,
+    offset: 2500,
+    sort: "newest",
+    urgentFirst: false,
+  });
+  assert.ok(late.notifications.some((row) => row.id === "n0"));
+  assert.ok(late.notifications.length > 0);
+}
+
 testDismiss()
+    .then(() => testListReadsEveryOpenNotification())
     .then(() => testDigestSendsOnce())
     .then(() => {
       console.log("ok");

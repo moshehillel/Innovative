@@ -433,24 +433,29 @@ async function loadNotificationDetail(db, opts) {
 }
 
 /**
- * Lists open notifications for a tenant.
- * @param {object} db Firestore.
- * @param {object} opts tenantId, limit, type, additionalChargesMod?
- * @return {Promise<object>}
+ * Reads a query in chunks of 200 until no rows remain.
+ * Pass maxDocs only to stop early. The dashboard does not.
+ * @param {object} baseQuery Firestore query, newest first.
+ * @param {number} [maxDocs] Optional stop.
+ * @return {Promise<object[]>}
  */
 async function collectNotifPage(baseQuery, maxDocs) {
   const pageSize = 200;
   const docs = [];
   let last = null;
-  while (docs.length < maxDocs) {
-    let query = baseQuery.limit(Math.min(pageSize, maxDocs - docs.length));
+  const cap = Number(maxDocs);
+  const bounded = Number.isFinite(cap) && cap > 0;
+  while (!bounded || docs.length < cap) {
+    const room = bounded ?
+      Math.min(pageSize, cap - docs.length) : pageSize;
+    let query = baseQuery.limit(room);
     if (last) query = query.startAfter(last);
     // eslint-disable-next-line no-await-in-loop
     const snap = await query.get();
     if (snap.empty) break;
     docs.push(...snap.docs);
     last = snap.docs[snap.docs.length - 1];
-    if (snap.size < pageSize) break;
+    if (snap.size < room) break;
   }
   return docs;
 }
@@ -496,17 +501,17 @@ function uniqueNotificationsById(items) {
 
 /**
  * Lists open notifications for a tenant.
+ * Reads every open row. opts.all returns that full set in one page.
  * @param {object} db Firestore.
- * @param {object} opts tenantId, limit, fetchLimit, sort, q.
+ * @param {object} opts tenantId, limit, all, sort, q.
  * @return {Promise<object>}
  */
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
   const q = String(opts.q || "").trim();
-  // Same window as the morning digest. A 200-row cap dropped open mail
-  // once the queue grew past it, including rows that email had listed.
-  const fetchLimit = Math.min(
-      Math.max(Number(opts.fetchLimit) || 2000, 50), 2000);
+  // Newest first, in chunks, until the open set is empty. A 200-row
+  // page and a 2,000-row window both hid open mail once the queue
+  // grew past them.
   const scope = require("./dashboard-scope");
   const notifName = scope.collectionName({
     collectionPrefix: opts.collectionPrefix,
@@ -524,7 +529,7 @@ async function listNotifications(db, opts) {
         .orderBy("createdAt", "desc")
         .select(...NOTIF_LIST_FIELDS);
   }
-  const docs = await collectNotifPage(base, fetchLimit);
+  const docs = await collectNotifPage(base);
   const notifications = docs.map(serializeNotif)
       .filter((n) => ownership.sameTenant(n.tenantId, tenantId))
       .filter((n) => scope.isOpenNotification(n));
@@ -551,18 +556,18 @@ async function listNotifications(db, opts) {
     const seen = new Set(visibleNotifications.map((n) => n.id));
     for (const value of values) {
       // eslint-disable-next-line no-await-in-loop
-      const extra = await db.collection(notifName)
-          .where("loadNumber", "==", value)
-          .select(...NOTIF_LIST_FIELDS)
-          .limit(30)
-          .get();
-      extra.forEach((doc) => {
+      const extraDocs = await collectNotifPage(
+          db.collection(notifName)
+              .where("loadNumber", "==", value)
+              .select(...NOTIF_LIST_FIELDS));
+      extraDocs.forEach((doc) => {
         if (seen.has(doc.id)) return;
         const row = serializeNotif(doc);
         if (row.status && row.status !== NOTIF_STATUS.OPEN &&
             row.status !== "open") {
           return;
         }
+        if (!ownership.sameTenant(row.tenantId, tenantId)) return;
         seen.add(doc.id);
         visibleNotifications.push(row);
       });
@@ -581,12 +586,15 @@ async function listNotifications(db, opts) {
   }
   visibleNotifications = uniqueNotificationsById(visibleNotifications);
 
+  const returnAll = opts.all === true;
+  const fullCount = Math.max(visibleNotifications.length, 1);
   const page = ownership.filterSortPaginate(visibleNotifications, {
     ownerBucket: opts.ownerBucket || null,
     dispatcherKey: opts.dispatcherKey || null,
-    offset: opts.offset,
-    limit: opts.limit || 50,
-    maxLimit: opts.maxLimit,
+    offset: returnAll ? 0 : opts.offset,
+    limit: returnAll ? fullCount : (opts.limit || 50),
+    maxLimit: returnAll ? fullCount : opts.maxLimit,
+    hardCap: returnAll ? fullCount : null,
     sort: opts.sort || null,
     urgentFirst: opts.urgentFirst,
   });

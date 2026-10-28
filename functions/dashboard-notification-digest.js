@@ -206,8 +206,12 @@ function digestHtml(items, dateLabel) {
       `<td style="padding:6px 8px;border:1px solid #e5e7eb">${age}</td>` +
       `</tr>`;
   }).join("");
-  return `<p>These dashboard notifications are still open as of ` +
-    `${escapeHtml(dateLabel)} (Eastern). They are on the Jerry dashboard.</p>` +
+  const count = items.length;
+  const countLabel = `${count} unfinished notification(s)`;
+  return `<p>${countLabel} are still open as of ` +
+    `${escapeHtml(dateLabel)} (Eastern). ` +
+    `All ${count} are listed below, and each one is on the ` +
+    `Jerry dashboard.</p>` +
     `<table style="border-collapse:collapse;font-size:13px">` +
     `<thead><tr>` +
     `<th style="text-align:left;padding:6px 8px;border:1px solid #e5e7eb">Load</th>` +
@@ -215,7 +219,8 @@ function digestHtml(items, dateLabel) {
     `<th style="text-align:left;padding:6px 8px;border:1px solid #e5e7eb">Waiting on</th>` +
     `<th style="text-align:left;padding:6px 8px;border:1px solid #e5e7eb">Age</th>` +
     `</tr></thead><tbody>${rows}</tbody></table>` +
-    `<p style="color:#6b7280;font-size:12px">${items.length} unfinished notification(s).</p>`;
+    `<p style="color:#6b7280;font-size:12px">${countLabel}. ` +
+    `This email lists every one of them.</p>`;
 }
 
 /**
@@ -303,10 +308,7 @@ async function runDailyNotificationDigest(opts) {
       const listed = await deps.listNotifications(deps.db, {
         tenantId: tenant.tenantId,
         collectionPrefix: tenant.collectionPrefix,
-        limit: 2000,
-        maxLimit: 2000,
-        fetchLimit: 2000,
-        offset: 0,
+        all: true,
         sort: "newest",
         urgentFirst: false,
       });

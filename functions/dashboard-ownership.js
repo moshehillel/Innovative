@@ -413,7 +413,8 @@ function filterSortPaginate(items, opts) {
   const dispatcherKey = opts.dispatcherKey ?
     String(opts.dispatcherKey).toLowerCase() : null;
   const offset = Math.max(0, Number(opts.offset) || 0);
-  const cap = Math.min(Math.max(Number(opts.maxLimit) || 100, 1), 5000);
+  const ceiling = Number(opts.hardCap) > 0 ? Number(opts.hardCap) : 5000;
+  const cap = Math.min(Math.max(Number(opts.maxLimit) || 100, 1), ceiling);
   const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), cap);
   const sort = String(opts.sort || "").toLowerCase();
   // Newest / oldest / amount must page in that order. Urgent-first would

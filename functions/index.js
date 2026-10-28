@@ -14226,7 +14226,8 @@ dashboardOpsHttp.init({
 exports.getDashboardAccessorials = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListAccessorials);
 exports.getDashboardNotifications = onRequest(
-    {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
+    {invoker: "public", timeoutSeconds: 180, memory: "512MiB"},
+    dashboardOpsHttp.handleListNotifications);
 exports.getDashboardEmailAttachment = onRequest(
     {invoker: "public", timeoutSeconds: 120, memory: "512MiB"},
     dashboardOpsHttp.handleDownloadEmailAttachment);
