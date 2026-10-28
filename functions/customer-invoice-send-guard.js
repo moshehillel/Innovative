@@ -6,6 +6,7 @@ const {BigQuery} = require("@google-cloud/bigquery");
 const COLLECTION = "customerInvoiceEmailSends";
 const SKIP_REASON = "customer_invoice_unchanged";
 const ALREADY_ISSUED_REASON = "customer_invoice_already_issued";
+const PRIMUS_ALREADY_SENT_REASON = "primus_invoice_already_sent";
 const SENDING_WINDOW_MS = 10 * 60 * 1000;
 const EMAIL_LOG_MESSAGE =
   "Customer documents emailed via Primus emailBOLDocs";
@@ -122,6 +123,11 @@ function decideCustomerInvoiceSend(current, priors) {
   if (!current || !current.customerInvoiceId) {
     return {skip: false, reason: null, prior: null};
   }
+  // Primus status.sent true blocks the email, including a new charge.
+  // False or a missing flag is not permission to send.
+  if (current.primusInvoiceSent === true) {
+    return {skip: true, reason: PRIMUS_ALREADY_SENT_REASON, prior: null};
+  }
   const prior = list.find((row) => sameIssuedInvoice(row, current));
   if (prior) {
     if (totalsDiffer(prior, current)) {
@@ -209,7 +215,8 @@ function snapshotFromCompletedInvoice(id, data) {
 
 /**
  * True when this workflow already emailed the customer documents.
- * customerInvoiceStatus and Primus status.sent are ignored.
+ * A sent flag stored on the Firestore invoice is ignored. Primus
+ * status.sent is passed in separately as primusInvoiceSent.
  * @param {object} data Invoice document.
  * @param {boolean} emailStep final_email_sent success exists.
  * @return {boolean}
@@ -507,9 +514,11 @@ async function outboundCustomerInvoicePriors(db, args, invoices) {
  * Already emailed means the emailBOLDocs success log, a saved customer
  * invoice email, or a workflow that already finished that email.
  * An invoice already issued on the load is not emailed again even when
- * none of those records exist. customerInvoiceStatus and Primus
- * status.sent are not read. A new invoice may send once. A changed
- * customer total may send once.
+ * none of those records exist. Primus status.sent true is an extra
+ * block and stops the email even when the customer total changed.
+ * False or a missing flag does not allow a send by itself. A new
+ * invoice may send once. A changed customer total may send once
+ * when Primus does not already mark that invoice sent.
  * @param {FirebaseFirestore.Firestore} db Firestore.
  * @param {object} args Send context.
  * @return {Promise<object>}
@@ -529,6 +538,7 @@ async function evaluateCustomerInvoiceResend(db, args) {
     alreadyIssued: args.alreadyIssued === true ||
       (args.invoiceUnchanged === true && args.issuedNow !== true),
     customerTotalChanged: args.customerTotalChanged === true,
+    primusInvoiceSent: args.primusInvoiceSent === true,
     loadNumber: args.loadNumber || null,
     sourceInvoiceId: args.firestoreInvoiceId || null,
     to: args.to || null,
@@ -641,9 +651,39 @@ async function finishCustomerInvoiceSend(claim, status) {
   }, {merge: true});
 }
 
+/**
+ * True only when the matched Primus customer invoice has status.sent
+ * set to boolean true. A false or missing flag does not mean unsent.
+ * @param {Array<object>} invoices REST invoices for the load.
+ * @param {string|number} customerInvoiceId Invoice id to email.
+ * @param {string|number} invoiceNumber Printed invoice number.
+ * @return {boolean}
+ */
+function readPrimusSentFlag(invoices, customerInvoiceId, invoiceNumber) {
+  const rows = Array.isArray(invoices) ? invoices : [];
+  const id = String(customerInvoiceId || "");
+  const num = String(invoiceNumber == null ? "" : invoiceNumber).trim();
+  let match = null;
+  if (id) {
+    match = rows.find((inv) => {
+      if (!inv) return false;
+      const invId = inv.invoiceId != null ? inv.invoiceId : inv.id;
+      return String(invId || "") === id;
+    }) || null;
+  }
+  if (!match && num && num !== "0") {
+    match = rows.find((inv) =>
+      inv && String(inv.invoiceNumber || "") === num) || null;
+  }
+  if (!match || !match.status) return false;
+  return match.status.sent === true;
+}
+
 module.exports = {
   SKIP_REASON,
   ALREADY_ISSUED_REASON,
+  PRIMUS_ALREADY_SENT_REASON,
+  readPrimusSentFlag,
   moneyCents,
   normalizeInvoiceNumber,
   customerInvoiceLinesKey,

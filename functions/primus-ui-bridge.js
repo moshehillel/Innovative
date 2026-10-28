@@ -2195,8 +2195,18 @@ async function emailBOLDocs(args) {
     }
   }
 
+  let primusInvoiceSent = false;
+  try {
+    const restInvoices = await fetchRestInvoicesByLoad(loadNumber);
+    primusInvoiceSent = customerInvoiceSendGuard.readPrimusSentFlag(
+        restInvoices, customerInvoiceId, invoiceNumber);
+  } catch (_) {
+    primusInvoiceSent = false;
+  }
+
   let sendClaim = null;
-  if (!args.forceResend) {
+  // forceResend skips Jerry's own records. Primus sent=true still blocks.
+  if (!args.forceResend || primusInvoiceSent) {
     try {
       const decision =
         await customerInvoiceSendGuard.evaluateCustomerInvoiceResend(
@@ -2212,24 +2222,30 @@ async function emailBOLDocs(args) {
               alreadyIssued: args.alreadyIssued === true,
               issuedNow: args.issuedNow === true,
               customerTotalChanged: args.customerTotalChanged === true,
+              primusInvoiceSent,
               firestoreInvoiceId: args.firestoreInvoiceId || null,
               to: customerEmail,
             });
-      if (decision.skip) {
+      if (decision.skip || primusInvoiceSent) {
+        const sentReason =
+          customerInvoiceSendGuard.PRIMUS_ALREADY_SENT_REASON;
+        const reason = decision.skip ? decision.reason : sentReason;
+        const skipLog = reason === sentReason ?
+          "Customer invoice email skipped — Primus marked sent" :
+          "Customer invoice email skipped — already sent unchanged";
         if (writeLog) {
-          await writeLog("info", "primus",
-              "Customer invoice email skipped — already sent unchanged", {
-                loadNumber,
-                customerInvoiceId: String(customerInvoiceId),
-                invoiceNumber,
-                reason: decision.reason,
-                priorInvoiceId: decision.priorInvoiceId || null,
-              });
+          await writeLog("info", "primus", skipLog, {
+            loadNumber,
+            customerInvoiceId: String(customerInvoiceId),
+            invoiceNumber,
+            reason,
+            priorInvoiceId: decision.priorInvoiceId || null,
+          });
         }
         return {
           ok: true,
           skipped: true,
-          reason: decision.reason,
+          reason,
           to: customerEmail,
           driveFileIds: [],
           attachments: null,
@@ -2237,6 +2253,23 @@ async function emailBOLDocs(args) {
       }
       sendClaim = decision.claim || null;
     } catch (guardErr) {
+      if (primusInvoiceSent) {
+        if (writeLog) {
+          await writeLog("warn", "primus",
+              "Primus marked sent — email blocked after guard error", {
+                loadNumber,
+                error: guardErr && guardErr.message,
+              });
+        }
+        return {
+          ok: true,
+          skipped: true,
+          reason: customerInvoiceSendGuard.PRIMUS_ALREADY_SENT_REASON,
+          to: customerEmail,
+          driveFileIds: [],
+          attachments: null,
+        };
+      }
       if (writeLog) {
         await writeLog("warn", "primus",
             "Customer invoice resend check failed — email will send", {

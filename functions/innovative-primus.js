@@ -3695,8 +3695,11 @@ exports.processPrimusWorkflow = onRequest(
                   invoiceNumber: issuedInvoiceNumber || null,
                 },
               });
-              await writeLog("info", "workflow",
-                  "Customer invoice email skipped — already sent unchanged", {
+              const skipLog = customerInvoiceEmailRecord.reason ===
+                "primus_invoice_already_sent" ?
+                "Customer invoice email skipped — Primus marked sent" :
+                "Customer invoice email skipped — already sent unchanged";
+              await writeLog("info", "workflow", skipLog, {
                     invoiceId,
                     loadNumber: invoice.loadNumber,
                     to: customerEmail,

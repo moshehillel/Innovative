@@ -142,6 +142,58 @@ check("placeholder invoice number does not block a match", () => {
   assert.strictEqual(decision.skip, true);
 });
 
+check("Primus sent=true blocks a changed customer total", () => {
+  const decision = guard.decideCustomerInvoiceSend({
+    customerInvoiceId: "3618447",
+    invoiceNumber: "30489",
+    totalCents: 102000,
+    linesKey: withLiftgate,
+    invoiceUnchanged: false,
+    customerTotalChanged: true,
+    primusInvoiceSent: true,
+  }, []);
+  assert.strictEqual(decision.skip, true);
+  assert.strictEqual(decision.reason, guard.PRIMUS_ALREADY_SENT_REASON);
+});
+
+check("Primus sent=false does not allow or block a first send", () => {
+  const decision = guard.decideCustomerInvoiceSend({
+    customerInvoiceId: "3618447",
+    invoiceNumber: "30489",
+    totalCents: 94500,
+    linesKey: freightOnly,
+    primusInvoiceSent: false,
+  }, []);
+  assert.strictEqual(decision.skip, false);
+});
+
+check("Primus sent flag matches the invoice, not another on the load",
+    () => {
+      const rows = [
+        {
+          invoiceId: "111",
+          invoiceNumber: "100",
+          status: {sent: true, generated: true},
+        },
+        {
+          invoiceId: "3618447",
+          invoiceNumber: "30489",
+          status: {sent: false, generated: true},
+        },
+      ];
+      assert.strictEqual(
+          guard.readPrimusSentFlag(rows, "3618447", "30489"), false);
+      assert.strictEqual(
+          guard.readPrimusSentFlag(rows, "111", "100"), true);
+      assert.strictEqual(
+          guard.readPrimusSentFlag(rows, "manage-id", "30489"), false);
+      rows[1].status.sent = true;
+      assert.strictEqual(
+          guard.readPrimusSentFlag(rows, "manage-id", "30489"), true);
+      assert.strictEqual(
+          guard.readPrimusSentFlag([], "3618447", "30489"), false);
+    });
+
 check("higher total on a reused invoice is sent", () => {
   const decision = guard.decideCustomerInvoiceSend({
     customerInvoiceId: "3618447",
@@ -502,6 +554,47 @@ async function checkWorkflowEmailStep() {
 /**
  * @return {Promise<void>}
  */
+async function checkPrimusSentEvaluate() {
+  guard._setEmailLogRows([]);
+  const blockedDb = fakeDb([], null);
+  const blocked = await guard.evaluateCustomerInvoiceResend(blockedDb, {
+    loadNumber: "267957",
+    customerInvoiceId: 3618447,
+    invoiceNumber: "30489",
+    invoiceTotal: 1020,
+    customerRate: 945,
+    customerBillLines: [{name: "Liftgate", amount: 75}],
+    invoiceUnchanged: false,
+    customerTotalChanged: true,
+    primusInvoiceSent: true,
+    firestoreInvoiceId: "new-doc",
+  });
+  assert.strictEqual(blocked.skip, true);
+  assert.strictEqual(blocked.reason, "primus_invoice_already_sent");
+  assert.strictEqual(blocked.claim, null);
+  const freshDb = fakeDb([], null);
+  const fresh = await guard.evaluateCustomerInvoiceResend(freshDb, {
+    loadNumber: "268900",
+    customerInvoiceId: "555",
+    invoiceNumber: "40001",
+    invoiceTotal: 100,
+    customerRate: 100,
+    customerBillLines: [],
+    invoiceUnchanged: false,
+    issuedNow: true,
+    primusInvoiceSent: false,
+    firestoreInvoiceId: "fresh-doc",
+  });
+  guard._setEmailLogRows(null);
+  assert.strictEqual(fresh.skip, false);
+  assert.ok(fresh.claim);
+  passed++;
+  console.log("ok", "evaluate skips only when Primus sent is true");
+}
+
+/**
+ * @return {Promise<void>}
+ */
 async function checkOutboundMail() {
   guard._setEmailLogRows([]);
   const db = fakeDb([], null, {
@@ -537,6 +630,7 @@ checkReplay()
     .then(checkAlreadyIssuedNoLog)
     .then(checkChargeOnOldInvoice)
     .then(checkWorkflowEmailStep)
+    .then(checkPrimusSentEvaluate)
     .then(checkOutboundMail)
     .then(() => {
       console.log(passed + " passed");
