@@ -145,6 +145,7 @@ async function runScenario() {
   const lookups = [];
   const resumes = [];
   const logs = [];
+  const cleared = [];
   const settings = {cursorId: null};
   daily.init({
     FieldPath: {documentId: () => "__name__"},
@@ -175,6 +176,10 @@ async function runScenario() {
     },
     writeLog: async (level, category, message, details) => {
       logs.push({level, category, message, details});
+    },
+    dismissOpenPodNotifications: async (opts) => {
+      cleared.push(opts);
+      return {ok: true, dismissed: 1, ids: ["n"]};
     },
   });
 
@@ -208,8 +213,17 @@ async function runScenario() {
   check("summary was logged",
       logs.some((row) => row.message === "Daily missing-POD check finished"),
       true);
+  check("POD found clears notices for those loads",
+      cleared.map((row) => String(row.loadNumber)).sort(),
+      ["200", "500"]);
+  check("still-missing load does not clear notices",
+      cleared.some((row) => String(row.loadNumber) === "100"),
+      false);
+  check("daily check reports the cleared count",
+      result.notificationsDismissed, 2);
 
   resumes.length = 0;
+  const clearedBeforeDry = cleared.length;
   const dry = await daily.runMissingPodDailyCheck({
     dryRun: true,
     pageSize: 10,
@@ -218,6 +232,10 @@ async function runScenario() {
   });
   check("dry run does not resume", resumes.length, 0);
   check("dry run still counts pod-found as resumed", dry.resumed, 2);
+  check("dry run does not clear notices",
+      cleared.length, clearedBeforeDry);
+  check("dry run reports no cleared notices",
+      dry.notificationsDismissed, 0);
 
   const lookupFailed = await daily.evaluateHold({
     decisionStage: "missing_pod",
@@ -228,7 +246,164 @@ async function runScenario() {
   check("booking miss is a failed check", lookupFailed.bucket, "failed");
 }
 
-runScenario().then(() => {
+function noticeDb(rows) {
+  const store = {};
+  rows.forEach((row) => {
+    store[row.id] = {...row};
+  });
+  return {
+    store,
+    collection() {
+      return {
+        where(field, _op, value) {
+          const api = {
+            limit() {
+              return api;
+            },
+            async get() {
+              const docs = Object.keys(store)
+                  .filter((id) => store[id][field] === value)
+                  .map((id) => ({
+                    id,
+                    data() {
+                      return store[id];
+                    },
+                  }));
+              return {docs};
+            },
+          };
+          return api;
+        },
+        doc(id) {
+          return {
+            async get() {
+              if (!store[id]) return {exists: false, data: () => ({})};
+              return {exists: true, data: () => store[id]};
+            },
+            async update(patch) {
+              Object.assign(store[id], patch);
+            },
+          };
+        },
+      };
+    },
+  };
+}
+
+async function testNoticeClear() {
+  const ops = require("../dashboard-ops");
+  const fs = require("fs");
+  const path = require("path");
+  check("action needed no POD is clearable",
+      ops.isClearablePodNotification({
+        status: "open",
+        subject: "Action needed \u2014 No POD for Load 200",
+      }), true);
+  check("reminder POD needed is clearable",
+      ops.isClearablePodNotification({
+        status: "open",
+        subject: "Reminder: POD needed \u2014 Load 200",
+      }), true);
+  check("plain POD needed is clearable",
+      ops.isClearablePodNotification({
+        status: "open",
+        reason: "POD needed \u2014 Load 200",
+      }), true);
+  check("customer rate is not a POD notice",
+      ops.isClearablePodNotification({
+        status: "open",
+        subject: "Action needed \u2014 No customer rate for Load 200",
+      }), false);
+  check("low margin is not a POD notice",
+      ops.isClearablePodNotification({
+        status: "open",
+        subject: "Action needed \u2014 Low margin for Load 200",
+      }), false);
+  check("GTG stop is not a POD notice",
+      ops.isClearablePodNotification({
+        status: "open",
+        subject: "Drayage GTG stopped \u2014 load 200",
+      }), false);
+  check("enter load number is not a POD notice",
+      ops.isClearablePodNotification({
+        status: "open",
+        subject: "Enter load number",
+      }), false);
+  check("done notice is not cleared again",
+      ops.isClearablePodNotification({
+        status: "dismissed",
+        subject: "Action needed - No POD for Load 200",
+      }), false);
+
+  const db = noticeDb([
+    {id: "pod", invoiceId: "inv-1", loadNumber: null, status: "open",
+      tenantId: "default",
+      subject: "Action needed \u2014 No POD for Load 200"},
+    {id: "rem", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default",
+      subject: "Reminder: POD needed - Load 200 / PRO 9"},
+    {id: "ask", invoiceId: "inv-1", loadNumber: 200, status: "open",
+      tenantId: "default",
+      subject: "POD needed - Load 200"},
+    {id: "rate", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default",
+      subject: "Action needed \u2014 No customer rate for Load 200"},
+    {id: "low", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default",
+      subject: "Action needed \u2014 Low margin for Load 200"},
+    {id: "gtg", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default",
+      subject: "Drayage GTG stopped \u2014 load 200"},
+    {id: "load", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default", subject: "Enter load number"},
+    {id: "chg", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default",
+      subject: "Additional charge \u2014 Load 200"},
+    {id: "esc", invoiceId: "inv-1", loadNumber: "200", status: "open",
+      tenantId: "default",
+      subject: "Escalation \u2014 no POD after 3 carrier reminders"},
+    {id: "done", invoiceId: "inv-1", loadNumber: "200",
+      status: "dismissed", tenantId: "default",
+      subject: "Action needed - No POD for Load 200"},
+    {id: "flag", invoiceId: "inv-1", loadNumber: "200",
+      status: "flagged", tenantId: "default",
+      subject: "POD needed - Load 200"},
+    {id: "other", invoiceId: "inv-9", loadNumber: "999", status: "open",
+      tenantId: "default", subject: "POD needed - Load 999"},
+  ]);
+  const result = await ops.dismissOpenPodNotifications(db, {
+    loadNumber: "200",
+    invoiceId: "inv-1",
+    tenantId: "default",
+  });
+  check("clears the three POD notices",
+      result.ids.slice().sort(), ["ask", "pod", "rem"]);
+  check("rate notice stays open", db.store.rate.status, "open");
+  check("low margin notice stays open", db.store.low.status, "open");
+  check("GTG notice stays open", db.store.gtg.status, "open");
+  check("load-number notice stays open", db.store.load.status, "open");
+  check("charge notice stays open", db.store.chg.status, "open");
+  check("escalation notice stays open", db.store.esc.status, "open");
+  check("already done notice stays dismissed",
+      db.store.done.status, "dismissed");
+  check("flagged notice stays flagged", db.store.flag.status, "flagged");
+  check("another load stays open", db.store.other.status, "open");
+  check("cleared notices use the Done status",
+      db.store.pod.status, "dismissed");
+
+  const src = fs.readFileSync(
+      path.join(__dirname, "../index.js"), "utf8");
+  const start = src.indexOf("async function runPodFollowUpChecks");
+  const end = src.indexOf("let retryPendingTransientWorkflowsImpl");
+  const fn = src.slice(start, end);
+  const podAt = fn.indexOf("if (hasPod)");
+  const dismissAt = fn.indexOf("dismissOpenPodNotifications");
+  const remindAt = fn.indexOf("Send next carrier reminder");
+  check("chase clears notices after the POD is found",
+      dismissAt > podAt && dismissAt < remindAt, true);
+}
+
+runScenario().then(() => testNoticeClear()).then(() => {
   if (failures) {
     console.error(`${failures} failed`);
     process.exit(1);

@@ -7,6 +7,7 @@
  * POD exists. Truckload missing-POD is a separate carrier chase and is not
  * queried here. When Primus now has a usable POD, this hands the invoice back
  * to processPrimusWorkflow the same way Resume Workflow does.
+ * A resumed hold clears open No-POD and POD-needed notices.
  */
 
 const CHECK_CONCURRENCY = 4;
@@ -334,6 +335,30 @@ async function stampCheck(doc, result) {
 }
 
 /**
+ * Clears open No-POD notices after billing actually resumed.
+ * @param {object} row Per-invoice outcome.
+ * @return {Promise<number>} Notices dismissed.
+ */
+async function clearPodNotices(row) {
+  if (typeof deps.dismissOpenPodNotifications !== "function") return 0;
+  if (!row) return 0;
+  if (!row.loadNumber && !row.invoiceId) return 0;
+  try {
+    const result = await deps.dismissOpenPodNotifications({
+      loadNumber: row.loadNumber,
+      invoiceId: row.invoiceId,
+      tenantId: "default",
+    });
+    const count = Number(result && result.dismissed) || 0;
+    row.notificationsDismissed = count;
+    return count;
+  } catch (err) {
+    row.dismissError = (err && err.message) || "dismiss_failed";
+    return 0;
+  }
+}
+
+/**
  * @param {object} row Per-invoice outcome.
  * @return {Promise<void>}
  */
@@ -457,8 +482,16 @@ async function runMissingPodDailyCheck(options) {
     deferred: 0,
     truncated: collected.nextCursor != null,
     resumedInvoiceIds: [],
+    notificationsDismissed: 0,
   };
   for (const row of rows) {
+    const resumed = row.bucket === "resumed";
+    const alreadyDone = row.resume === true &&
+      row.bucket === "skipped" &&
+      row.reason === "already_completed";
+    if (!dryRun && (resumed || alreadyDone)) {
+      summary.notificationsDismissed += await clearPodNotices(row);
+    }
     if (row.bucket === "stillMissing") summary.stillMissing++;
     else if (row.bucket === "resumed") {
       summary.resumed++;
@@ -483,6 +516,7 @@ async function runMissingPodDailyCheck(options) {
             failed: summary.failed,
             deferred: summary.deferred,
             truncated: summary.truncated,
+            notificationsDismissed: summary.notificationsDismissed,
             dryRun,
             resumedInvoiceIds: summary.resumedInvoiceIds,
           });

@@ -696,6 +696,92 @@ async function markActed(db, opts) {
 }
 
 /**
+ * Open "Action needed - No POD" or "POD needed" notice, including
+ * "Reminder: POD needed". Dashes may be an em dash or a hyphen.
+ * Rate, profit, GTG, charge, dispute, and load-number mail do not match.
+ * @param {object} row Notification fields.
+ * @return {boolean}
+ */
+function isClearablePodNotification(row) {
+  if (!row) return false;
+  const status = String(row.status || "open").toLowerCase();
+  if (status !== NOTIF_STATUS.OPEN) return false;
+  const text = [row.subject, row.reason, row.title]
+      .filter((part) => part != null && String(part) !== "")
+      .join("\n")
+      .replace(/[\u2014\u2013\u2012\u2212]/g, "-");
+  if (/action needed\s*-\s*no pod\b/i.test(text)) return true;
+  return /\bpod needed\b/i.test(text);
+}
+
+/**
+ * @param {object} db Firestore.
+ * @param {string} field Field name.
+ * @param {string|number} value Field value.
+ * @return {Promise<object[]>}
+ */
+async function loadNotifDocs(db, field, value) {
+  const snap = await db.collection(NOTIF_COLLECTION)
+      .where(field, "==", value)
+      .limit(40)
+      .get();
+  return snap.docs || [];
+}
+
+/**
+ * Dismisses open No-POD / POD-needed notices for one load.
+ * Uses the same status the Done button sets. Other alerts stay open.
+ * Call this only after a check has confirmed the POD is present.
+ * @param {object} db Firestore.
+ * @param {object} opts loadNumber, invoiceId, tenantId.
+ * @return {Promise<object>}
+ */
+async function dismissOpenPodNotifications(db, opts) {
+  const request = opts || {};
+  const loadNumber = String(request.loadNumber || "").trim();
+  const invoiceId = String(request.invoiceId || "").trim();
+  if (!db || (!loadNumber && !invoiceId)) {
+    return {ok: true, dismissed: 0, ids: []};
+  }
+  const tenantId = request.tenantId || "default";
+  const lookups = [];
+  if (invoiceId) lookups.push(["invoiceId", invoiceId]);
+  if (loadNumber) {
+    lookups.push(["loadNumber", loadNumber]);
+    if (/^\d+$/.test(loadNumber)) {
+      lookups.push(["loadNumber", Number(loadNumber)]);
+    }
+  }
+  const seen = new Set();
+  const ids = [];
+  for (const pair of lookups) {
+    let docs = [];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      docs = await loadNotifDocs(db, pair[0], pair[1]);
+    } catch (err) {
+      console.error("[dismissOpenPodNotifications]",
+          err && err.message);
+      continue;
+    }
+    for (const doc of docs) {
+      if (!doc || seen.has(doc.id)) continue;
+      seen.add(doc.id);
+      const data = doc.data() || {};
+      if (!ownership.sameTenant(data.tenantId, tenantId)) continue;
+      if (!isClearablePodNotification(data)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const result = await dismissNotification(db, {
+        id: doc.id,
+        tenantId: data.tenantId || tenantId,
+      });
+      if (result && result.ok) ids.push(doc.id);
+    }
+  }
+  return {ok: true, dismissed: ids.length, ids};
+}
+
+/**
  * Finds open unhandled/charge notifications for an invoice or message.
  * @param {object} db Firestore.
  * @param {object} opts tenantId, invoiceId?, messageId?, type?
@@ -727,6 +813,8 @@ module.exports = {
   uniqueNotificationsById,
   loadNotificationDetail,
   dismissNotification,
+  isClearablePodNotification,
+  dismissOpenPodNotifications,
   flagNotification,
   markActed,
   findOpenByRef,

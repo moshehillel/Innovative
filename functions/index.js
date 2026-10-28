@@ -2335,6 +2335,7 @@ async function runPodFollowUpChecks() {
   const reminded = [];
   const escalated = [];
   const resolved = [];
+  let noticesCleared = 0;
   const now = new Date();
   const MAX_REMINDERS = 3;
   const REMIND_INTERVAL_BD = 3;
@@ -2375,6 +2376,18 @@ async function runPodFollowUpChecks() {
           admin.firestore.FieldValue.serverTimestamp(),
         "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
       });
+      try {
+        const cleared =
+          await dashboardOps.dismissOpenPodNotifications(db, {
+            loadNumber: inv.loadNumber || null,
+            invoiceId: doc.id,
+            tenantId: inv.tenantId || "default",
+          });
+        noticesCleared += (cleared && cleared.dismissed) || 0;
+      } catch (dismissErr) {
+        console.error("pod follow-up dismiss:",
+            dismissErr && dismissErr.message);
+      }
       resolved.push(doc.id);
       continue;
     }
@@ -2489,7 +2502,13 @@ async function runPodFollowUpChecks() {
     reminded.push(doc.id);
   }
 
-  return {checked: snap.size, reminded, escalated, resolved};
+  return {
+    checked: snap.size,
+    reminded,
+    escalated,
+    resolved,
+    noticesCleared,
+  };
 }
 
 /**
@@ -17104,6 +17123,8 @@ missingPodDaily.init({
   fetchPrimusBooking,
   checkBookingHasPod: (args) => primusUiBridge.checkBookingHasPod(args),
   resumeWorkflow: resumeMissingPodWorkflow,
+  dismissOpenPodNotifications: (opts) =>
+    dashboardOps.dismissOpenPodNotifications(db, opts),
   writeLog,
 });
 
@@ -17157,6 +17178,8 @@ missingPodDashboard.init({
   lookupPrimusPod: (loadNumber) =>
     missingPodDaily.lookupPrimusPod(loadNumber),
   listOpenMissingPodItems: listOpenMissingPodDashboardItems,
+  dismissOpenPodNotifications: (opts) =>
+    dashboardOps.dismissOpenPodNotifications(db, opts),
   writeLog,
 });
 
@@ -17207,6 +17230,8 @@ exports.checkMissingPodDaily = onSchedule({
       failed: result.failed,
       deferred: result.deferred,
       truncated: result.truncated,
+      notificationsDismissed:
+        result.notificationsDismissed || 0,
     }));
   } catch (error) {
     console.error("checkMissingPodDaily error:", error.message);
@@ -17237,6 +17262,8 @@ exports.checkMissingPodOnDashboard = onSchedule({
       completed: result.completed,
       skipped: result.skipped,
       failed: result.failed,
+      notificationsDismissed:
+        result.notificationsDismissed || 0,
     }));
   } catch (error) {
     console.error(

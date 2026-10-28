@@ -243,6 +243,7 @@ async function testFinishAndSchedule() {
   const lookups = [];
   const resumes = [];
   const emails = [];
+  const cleared = [];
   pod.init({
     db,
     FieldValue: {serverTimestamp: () => "ts"},
@@ -311,6 +312,10 @@ async function testFinishAndSchedule() {
     saveOutboundEmail: async () => {
       emails.push("customer");
     },
+    dismissOpenPodNotifications: async (opts) => {
+      cleared.push(opts);
+      return {ok: true, dismissed: 1, ids: ["n"]};
+    },
   });
 
   const blocked = await pod.finishFromDashboard({
@@ -356,6 +361,14 @@ async function testFinishAndSchedule() {
   check("missing rate task was not closed",
       db.store["dashboardTasks/rate-task"].status, "open");
   check("job does not email the customer", emails.length, 0);
+  check("found POD clears notices for that load",
+      cleared.map((row) => String(row.loadNumber)), ["100"]);
+  check("found POD clears notices for that invoice",
+      cleared.map((row) => row.invoiceId), ["inv-pod"]);
+  check("no-POD load does not clear notices",
+      cleared.some((row) => String(row.loadNumber) === "300"), false);
+  check("rate row does not clear notices",
+      cleared.some((row) => String(row.loadNumber) === "200"), false);
 
   resumes.length = 0;
   const failed = await pod.finishFromDashboard({
@@ -375,6 +388,8 @@ async function testFinishAndSchedule() {
   check("failed button leaves the row",
       db.store["dashboardTasks/still-1"].status, "open");
   check("failed button does not email the customer", emails.length, 0);
+  check("failed button does not clear notices",
+      cleared.some((row) => String(row.loadNumber) === "300"), false);
 }
 
 async function main() {
