@@ -12486,6 +12486,40 @@ const MIME_FILENAME_RE = new RegExp(
 );
 
 /**
+ * Content-Type name= when Content-Disposition has no filename.
+ * Must not treat the "name" inside "filename" as this parameter.
+ */
+const MIME_TYPE_NAME_RE = new RegExp(
+    "(?:^|[;\\s])name\\*\\s*=\\s*UTF-8''([^;\\r\\n]+)|" +
+    "(?:^|[;\\s])name\\s*=\\s*\"([^\"]+)\"|" +
+    "(?:^|[;\\s])name\\s*=\\s*([^\"\\s;\\r\\n]+)",
+    "i",
+);
+
+/**
+ * Filename from Content-Disposition filename= or Content-Type name=.
+ * Outlook stores some invoice PDFs as application/octet-stream with
+ * only a name= parameter, so filename= alone misses them.
+ * @param {string} headers MIME header block.
+ * @return {string}
+ */
+function mimePartFilename(headers) {
+  const block = String(headers || "");
+  const named = block.match(MIME_FILENAME_RE);
+  let raw = named && (named[1] || named[2]);
+  if (!raw) {
+    const typeName = block.match(MIME_TYPE_NAME_RE);
+    raw = typeName && (typeName[1] || typeName[2] || typeName[3]);
+  }
+  const text = String(raw || "").trim();
+  try {
+    return decodeURIComponent(text);
+  } catch (_) {
+    return text;
+  }
+}
+
+/**
  * Extracts PDF files buried inside a raw MIME / .eml buffer.
  * Needed for Outlook "FW:" emails where Gmail leaves the original message
  * as an unexpanded message/rfc822 blob instead of listing nested parts.
@@ -12519,10 +12553,7 @@ function extractPdfAttachmentsFromMime(mimeBuffer) {
 
       const typeMatch = headers.match(/Content-Type:\s*([^\s;]+)/i);
       const mimeType = typeMatch ? typeMatch[1].toLowerCase() : "";
-      const nameMatch = headers.match(MIME_FILENAME_RE);
-      const filename = decodeURIComponent(
-          String((nameMatch && (nameMatch[1] || nameMatch[2])) || "").trim(),
-      );
+      const filename = mimePartFilename(headers);
       const isBase64 = /Content-Transfer-Encoding:\s*base64/i.test(headers);
 
       if (mimeType.includes("message/rfc822") ||
@@ -12582,11 +12613,8 @@ function extractPdfAttachmentsFromMime(mimeBuffer) {
           Buffer.from(body.replace(/\s+/g, ""), "base64") :
           Buffer.from(body, "binary");
         if (isPdfMagicBytes(pdfBuf)) {
-          const nameMatch = headers.match(MIME_FILENAME_RE);
           found.push({
-            filename: decodeURIComponent(
-                String((nameMatch && (nameMatch[1] || nameMatch[2])) ||
-                  "attachment.pdf").trim()) || "attachment.pdf",
+            filename: mimePartFilename(headers) || "attachment.pdf",
             mimeType: "application/pdf",
             buffer: pdfBuf,
             fromNestedMime: true,
