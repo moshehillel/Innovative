@@ -219,10 +219,37 @@ input, select, textarea {
   overflow: hidden;
   box-shadow: var(--ic-shadow-lg);
 }
-.login-visual { min-height: 100%; background: #0a3d3d; }
-.login-visual img {
-  display: block; width: 100%; height: 100%; min-height: 560px;
-  object-fit: cover; object-position: center 46%;
+.login-visual {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 28px;
+  background:
+    radial-gradient(ellipse 78% 62% at 50% 46%, rgba(46, 176, 170, 0.4), rgba(13, 110, 110, 0) 70%),
+    linear-gradient(165deg, #12807c 0%, #0a3d3d 58%, #072828 100%);
+}
+.login-mark {
+  width: min(228px, 84%);
+  height: auto;
+  display: block;
+  overflow: visible;
+  filter: drop-shadow(0 14px 28px rgba(0, 0, 0, 0.22));
+}
+.login-mark .star-b,
+.login-mark .star-c,
+.login-mark .star-d,
+.login-mark .star-e {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: login-star-twinkle 3.8s ease-in-out infinite;
+}
+.login-mark .star-c { animation-delay: 0.7s; }
+.login-mark .star-d { animation-delay: 1.35s; }
+.login-mark .star-e { animation-delay: 1.9s; }
+@keyframes login-star-twinkle {
+  0%, 100% { opacity: 0.62; }
+  50% { opacity: 1; }
 }
 .login-panel { padding: 48px 40px 40px; }
 .login-brand { text-align: center; margin-bottom: 28px; }
@@ -319,6 +346,10 @@ input, select, textarea {
 }
 @media (prefers-reduced-motion: reduce) {
   .login-highway-overlay { display: none !important; }
+  .login-mark .star-b,
+  .login-mark .star-c,
+  .login-mark .star-d,
+  .login-mark .star-e { animation: none; opacity: 1; }
 }
 
 /* ——— Thinking / skeleton loaders ——— */
@@ -1081,7 +1112,8 @@ body.page-admin #panel-rules {
 @media (max-width: 760px) {
   .login-page { padding: 24px 16px; }
   .login { grid-template-columns: 1fr; min-height: 0; width: 100%; }
-  .login-visual img { min-height: 180px; max-height: 220px; }
+  .login-visual { min-height: 180px; max-height: 220px; padding: 16px; }
+  .login-mark { width: 128px; }
   .rules-hero { grid-template-columns: 1fr; }
 }
 .panel-toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }

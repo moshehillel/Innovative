@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css?v=20261012b">
+  <link rel="stylesheet" href="style.css?v=20261029a">
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
 </head>
@@ -15,7 +15,30 @@
   <section id="login-screen" class="login-page hidden">
     <div class="login">
       <div class="login-visual" aria-hidden="true">
-        <img src="images/quote-login-driver.jpg?v=20261011g" alt="">
+        <svg class="login-mark" viewBox="0 0 240 270" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="login-star-glow" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#4ad4cd" stop-opacity="0.5"/>
+              <stop offset="72%" stop-color="#0d6e6e" stop-opacity="0"/>
+            </radialGradient>
+            <linearGradient id="login-star-main" x1="52" y1="82" x2="164" y2="194" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#f7fffe"/>
+              <stop offset="52%" stop-color="#d4f3f1"/>
+              <stop offset="100%" stop-color="#7ed4cf"/>
+            </linearGradient>
+            <linearGradient id="login-star-mid" x1="152" y1="50" x2="200" y2="98" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stop-color="#ffffff"/>
+              <stop offset="100%" stop-color="#b7ebe7"/>
+            </linearGradient>
+          </defs>
+          <circle cx="118" cy="138" r="96" fill="url(#login-star-glow)"/>
+          <path class="login-constellation" d="M108 138 L176 74 M108 138 L68 70 M108 138 L162 204" stroke="#b7ebe7" stroke-opacity="0.42" stroke-width="1.2" stroke-linecap="round"/>
+          <path class="star-a" fill="url(#login-star-main)" d="M108 82 C110.8 118.4 127.6 135.2 164 138 C127.6 140.8 110.8 157.6 108 194 C105.2 157.6 88.4 140.8 52 138 C88.4 135.2 105.2 118.4 108 82Z"/>
+          <path class="star-b" fill="url(#login-star-mid)" d="M176 50 C177.2 65.6 184.4 72.8 200 74 C184.4 75.2 177.2 82.4 176 98 C174.8 82.4 167.6 75.2 152 74 C167.6 72.8 174.8 65.6 176 50Z"/>
+          <path class="star-c" fill="#e9fbf9" d="M162 189 C162.8 198.8 167.3 203.3 177 204 C167.3 204.8 162.8 209.3 162 219 C161.3 209.3 156.8 204.8 147 204 C156.8 203.3 161.3 198.8 162 189Z"/>
+          <path class="star-d" fill="#f4fffe" d="M68 60 C68.5 66.5 71.5 69.5 78 70 C71.5 70.5 68.5 73.5 68 80 C67.5 73.5 64.5 70.5 58 70 C64.5 69.5 67.5 66.5 68 60Z"/>
+          <path class="star-e" fill="#c6f1ee" d="M58 189 C58.4 193.6 60.5 195.7 65 196 C60.5 196.4 58.4 198.5 58 203 C57.7 198.5 55.6 196.4 51 196 C55.6 195.7 57.7 193.6 58 189Z"/>
+        </svg>
       </div>
       <div class="login-panel">
       <div class="login-brand">
