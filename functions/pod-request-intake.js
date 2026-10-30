@@ -366,7 +366,34 @@ function isPodRequestEmail(
   const classification = emailClassification ||
     (intent ? {intent} : null);
   if (aiRejectsPodRequest(classification)) return false;
-  return asking;
+  if (asking) return true;
+  // Read like a person: a delivery document is named and the sender is a
+  // real person, but the phrasing is not a textbook "please send the POD".
+  // Do not drop it on a missing verb — treat it as a request so a human
+  // (Lisa) reviews it. isAmbiguousPodMention keeps this out of auto-send.
+  return isAmbiguousPodMention(subject, body, emailClassification, from);
+}
+
+/**
+ * True when the email names a delivery document and is not a citation,
+ * but there is no clear ask verb. The classifier neither confirmed nor
+ * rejected a POD request. These must be escalated to a person, never
+ * auto-fulfilled with a generic Primus POD.
+ * @param {string} subject Subject.
+ * @param {string} body Body.
+ * @param {object} [emailClassification] Classifier result.
+ * @param {string} [from] From header.
+ * @return {boolean}
+ */
+function isAmbiguousPodMention(subject, body, emailClassification, from) {
+  if (looksLikePodRequest(subject, body)) return false;
+  if (isDocumentCitationWithoutAsk(subject, body)) return false;
+  if (senderIsSystemMailbox(from)) return false;
+  const classification = emailClassification || null;
+  if (classification && classification.intent === "pod_request") return false;
+  if (aiRejectsPodRequest(classification)) return false;
+  const hay = podRequestText(subject, body);
+  return DOCUMENT_MENTION.test(hay);
 }
 
 module.exports = {
@@ -387,4 +414,5 @@ module.exports = {
   parseEmailAddressFromHeader,
   senderIsSystemMailbox,
   isPodRequestEmail,
+  isAmbiguousPodMention,
 };

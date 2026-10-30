@@ -8024,15 +8024,27 @@ async function notifyLisaSignedPodRequest(opts) {
   } = opts || {};
   const lisa = process.env.LOW_PROFIT_CC_EMAIL || podFollowup.LISA_EMAIL;
   const fiveBelow = escalateReason === "five_below_stamp";
-  const whyHtml = fiveBelow ?
-    `This load delivers to <strong>Five Below</strong>, which requires a ` +
-    `<strong>stamped POD</strong>. Jerry did not auto-send a generic ` +
-    `Primus POD — please obtain the stamped POD and ` +
-    `<strong>reply to the customer</strong>.` :
-    `A customer requested a <strong>specific type of POD</strong> ` +
-    `(e.g. stamped, signed, notarized). Jerry did not auto-send the ` +
-    `Primus POD — please obtain the requested document and ` +
-    `<strong>reply to the customer</strong>.`;
+  const ambiguous = escalateReason === "ambiguous_pod_request";
+  let whyHtml;
+  if (fiveBelow) {
+    whyHtml =
+      `This load delivers to <strong>Five Below</strong>, which requires a ` +
+      `<strong>stamped POD</strong>. Jerry did not auto-send a generic ` +
+      `Primus POD — please obtain the stamped POD and ` +
+      `<strong>reply to the customer</strong>.`;
+  } else if (ambiguous) {
+    whyHtml =
+      `This email <strong>mentions a delivery document</strong> but the ` +
+      `request is not clearly worded, so Jerry was not confident enough ` +
+      `to auto-send a POD. Please read it and ` +
+      `<strong>reply to the customer</strong> if they want the POD.`;
+  } else {
+    whyHtml =
+      `A customer requested a <strong>specific type of POD</strong> ` +
+      `(e.g. stamped, signed, notarized). Jerry did not auto-send the ` +
+      `Primus POD — please obtain the requested document and ` +
+      `<strong>reply to the customer</strong>.`;
+  }
   const html =
     `<p>Hi Lisa,</p>` +
     `<p>${whyHtml} Load ` +
@@ -8216,6 +8228,31 @@ async function handlePodRequestEmail(opts) {
   const requesterEmail = podRequestIntake.parseEmailAddressFromHeader(from);
   const wantsSpecialPod = podRequestIntake.looksLikeSpecialPodRequest(
       subject, emailBody);
+
+  // Ambiguous mention (a delivery doc is named but the ask is not explicit,
+  // and the classifier neither confirmed nor rejected). Read it like a
+  // person: send it to Lisa instead of auto-sending a generic POD on a guess.
+  if (!wantsSpecialPod &&
+      podRequestIntake.isAmbiguousPodMention(
+          subject, emailBody, emailClassification, from)) {
+    await notifyLisaSignedPodRequest({
+      messageId,
+      subject,
+      from,
+      loadNumber,
+      proNumber,
+      requesterEmail,
+      emailBody,
+      tenant,
+      escalateReason: "ambiguous_pod_request",
+    });
+    return {
+      handled: true,
+      status: "pod_request_escalated_ambiguous",
+      loadNumber,
+      escalatedToLisa: true,
+    };
+  }
 
   if (requesterEmail && podSendDedup.isBlockedPodRecipient(requesterEmail)) {
     await notifyLisaPodRequestBlockedRecipient({

@@ -298,6 +298,46 @@ check("unishippers noreply is not an auto-send recipient",
         "noreply.myunishippers@unishippers.com",
     ));
 
+// Read like a person: a bare delivery-doc mention from a real sender, with
+// no textbook ask and no AI verdict, is ambiguous — handle it, but escalate
+// to Lisa rather than auto-send a generic POD on a guess.
+check("bare POD mention from a person is an ambiguous mention",
+    pri.isAmbiguousPodMention(
+        "266012", "POD", null, "Dana Reed <dana@acmefoods.com>"));
+check("ambiguous mention is treated as a POD request (so it is handled)",
+    pri.isPodRequestEmail(
+        "266012", "POD", "unknown",
+        {intent: "unknown", reasoning: "Classifier unsure"},
+        "Dana Reed <dana@acmefoods.com>"));
+check("clear ask is not 'ambiguous' (goes down the normal request path)",
+    !pri.isAmbiguousPodMention(
+        "Load 266012", "Please send the POD",
+        null, "Dana Reed <dana@acmefoods.com>"));
+check("a citation is not an ambiguous mention",
+    !pri.isAmbiguousPodMention(
+        "Dispute", "Load 266012 was billed according to the POD.",
+        null, "Dana Reed <dana@acmefoods.com>"));
+check("system mailbox bare mention is not ambiguous",
+    !pri.isAmbiguousPodMention(
+        "266012", "POD", null,
+        "noreply.myunishippers@unishippers.com"));
+check("AI-rejected mention is not ambiguous",
+    !pri.isAmbiguousPodMention(
+        "266012", "POD",
+        {intent: "unknown", confidence: "high",
+          reasoning: "Scheduling reply about delivery appointment, " +
+            "not a POD request"},
+        "Dana Reed <dana@acmefoods.com>"));
+check("AI-confirmed request is not 'ambiguous'",
+    !pri.isAmbiguousPodMention(
+        "266012", "POD",
+        {intent: "pod_request", reasoning: "Asks for POD"},
+        "Dana Reed <dana@acmefoods.com>"));
+check("a no-document email is not an ambiguous mention",
+    !pri.isAmbiguousPodMention(
+        "Hello", "Can you call me back about the appointment?",
+        null, "Dana Reed <dana@acmefoods.com>"));
+
 // Encoding: em dash / smart quotes must never become â€
 const mojibakeSubject = toOutboundEmailSafeSubject(
     "Proof of Delivery — Load #265902");

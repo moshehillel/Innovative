@@ -263,6 +263,109 @@ check("OCR split reads load, PRO, and amount off the scan",
       item.loadNumber === "267027" && item.proNumber === "10480252" &&
       item.invoiceAmount === 353.75));
 
+function estesInvoice(pro, amount) {
+  return [
+    "ESTES EXPRESS LINES",
+    "INVOICE NUMBER",
+    `PRO NUMBER ${pro}`,
+    `ESTES REV. ${amount}`,
+  ].join("\n");
+}
+
+const estesPacket = split.splitMultiBillPacket([
+  estesInvoice("295-5096609", "414.50"),
+  estesInvoice("295-5096603", "347.00"),
+  "ESTES EXPRESS LINES\nPRO NUMBER\nsee remittance copy",
+]);
+check("Estes dashed PRO and ESTES REV open a bill",
+    estesPacket.items.length === 2 &&
+    estesPacket.items[0].proNumber === "2955096609" &&
+    estesPacket.items[0].invoiceAmount === 414.5);
+check("an Estes page that still cannot be read is named, not dropped",
+    estesPacket.gap.underExtracted === true &&
+    estesPacket.gap.unclaimedBills.some((bill) => bill.page === 3));
+
+const humanWording = split.splitMultiBillPacket([
+  [
+    "CARRIER FREIGHT BILL",
+    "Waybill: 178-0980346",
+    "Amount due $250.00",
+  ].join("\n"),
+  [
+    "INVOICE",
+    "Freight bill no 55443322",
+    "Balance due 88.10",
+  ].join("\n"),
+  [
+    "INVOICE",
+    "PRO # 295-4881139",
+    "Invoice total: 1,220.55",
+  ].join("\n"),
+]);
+check("a waybill and amount due are read as a bill",
+    humanWording.items.some((item) =>
+      item.proNumber === "1780980346" && item.invoiceAmount === 250));
+check("freight bill number and balance due are read as a bill",
+    humanWording.items.some((item) =>
+      item.proNumber === "55443322" && item.invoiceAmount === 88.1));
+check("invoice total with a dashed PRO is read as a bill",
+    humanWording.items.some((item) =>
+      item.proNumber === "2954881139" && item.invoiceAmount === 1220.55));
+
+const oddWords = split.splitMultiBillPacket([
+  [
+    "SHIPMENT PAPER",
+    "Tracking ref 441-2299001",
+    "Carrier wants 612.40",
+  ].join("\n"),
+  [
+    "INVOICE",
+    "Ref 10480001",
+    "Line haul 100.00",
+    "Fuel 25.50",
+    "Final figure 125.50",
+  ].join("\n"),
+]);
+check("unfamiliar wording still opens the bill",
+    oddWords.items.some((item) =>
+      item.proNumber === "4412299001" && item.invoiceAmount === 612.4));
+check("the last dollar figure is the total, not a line item",
+    oddWords.items.some((item) =>
+      item.proNumber === "10480001" && item.invoiceAmount === 125.5));
+
+// Page type by shape and meaning, not a fixed header vocabulary.
+check("proof of delivery with a signature block reads as a POD",
+    split.supportKind(
+        "PROOF OF DELIVERY\nReceived in good order\nConsignee signature",
+    ) === "pod");
+check("delivery receipt reads as a POD",
+    split.supportKind("DELIVERY RECEIPT\nReceived by: J. Doe") === "pod");
+check("straight bill of lading reads as a BOL",
+    split.supportKind("STRAIGHT BILL OF LADING\nShipper / Consignee") ===
+    "bol");
+check("load confirmation reads as a rate confirmation",
+    split.supportKind("LOAD CONFIRMATION\nAgreed rate 500.00") ===
+    "rate_confirmation");
+check("carrier confirmation reads as a rate confirmation",
+    split.supportKind("CARRIER CONFIRMATION\nRate 500.00") ===
+    "rate_confirmation");
+check("a bill that also prints 'bill of lading number' is NOT a support page",
+    split.pageHasBillSignal(
+        "INVOICE\nBill of Lading Number 12345\nPRO 295-5096609\n" +
+        "Please pay 414.50") === true &&
+    split.supportKind(
+        "INVOICE\nBill of Lading Number 12345\nPRO 295-5096609\n" +
+        "Please pay 414.50") == null);
+check("Estes 'ORIGINAL FREIGHT BILL' is an invoice title without the word " +
+    "invoice",
+    split.hasInvoiceTitle(
+        "ESTES EXPRESS\nORIGINAL FREIGHT BILL\nPRO 295-5096609\n" +
+        "ESTES REV. 414.50") === true);
+check("a pure POD page is not treated as an invoice title",
+    split.hasInvoiceTitle(
+        "PROOF OF DELIVERY\nReceived by J. Doe\nConsignee signature",
+    ) === false);
+
 /**
  * @param {number} pages Page count.
  * @return {Promise<Buffer>}

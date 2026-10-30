@@ -187,6 +187,7 @@ function normalizeExtractedQuote(extracted, opts) {
   applySubjectLineZips(next, opts);
   applyEmailPalletBlocks(next, opts);
   correctCartonVsPalletFreight(next, opts && opts.body);
+  applyDestinationPalletCounts(next, opts && opts.body);
   applyMixedPalletDimLines(next, opts && opts.body);
   applyPerPalletWeightTable(next, opts && opts.body);
   applyStandaloneStackedPalletSpec(next, opts && opts.body);
@@ -980,6 +981,71 @@ function extractCompactPalletBlocks(body) {
 }
 
 /**
+ * Per-stop pallet counts from a numbered destination list.
+ * Newest copy wins: forwarded threads put the update above the original.
+ * "1. MGE3 - … 30549-2010 - Jefferson, GA" / "o 3 pallets - 55 boxes".
+ * @param {string} body Email body.
+ * @return {Map<string, {pallets: number, boxes: number}>} ZIP → counts.
+ */
+function extractDestinationPalletUpdates(body) {
+  const text = normalizeDirtyFreightText(body);
+  const headerRe =
+    /(?:^|\n)[ \t]*\d+\.[ \t]+([^\n]*?\d{5}(?:-\d{4})?[^\n]*)/g;
+  const byZip = new Map();
+  let m;
+  while ((m = headerRe.exec(text)) !== null) {
+    const header = m[1];
+    const zipMatch = header.match(/(\d{5})(?:-\d{4})?/);
+    if (!zipMatch) continue;
+    const zip = zipMatch[1];
+    const after = text.slice(m.index + m[0].length);
+    const nextLine = after.match(
+        /^\s*\n[ \t]*(?:[o•\u2022*\-][ \t]+)?(\d{1,3})[ \t]+pallets?[ \t]*-[ \t]*(\d{1,4})[ \t]+box(?:es)?\b/i);
+    if (!nextLine) continue;
+    const pallets = Number(nextLine[1]);
+    const boxes = Number(nextLine[2]);
+    if (!(pallets >= 1) || pallets > 200) continue;
+    if (!byZip.has(zip)) byZip.set(zip, {pallets, boxes});
+  }
+  return byZip;
+}
+
+/**
+ * Apply the latest per-destination "N pallets - M boxes" line.
+ * Overrides a 1-pallet AI row when the stop lists its own count.
+ * @param {object} extracted Parsed quote.
+ * @param {string} body Email body.
+ * @return {object}
+ */
+function applyDestinationPalletCounts(extracted, body) {
+  if (!extracted || !Array.isArray(extracted.lanes)) return extracted;
+  const byZip = extractDestinationPalletUpdates(body);
+  if (byZip.size < 2) return extracted;
+  let applied = 0;
+  for (const lane of extracted.lanes) {
+    if (!lane || typeof lane !== "object") continue;
+    const hit = byZip.get(laneConsigneeZip5(lane));
+    if (!hit) continue;
+    const rows = Array.isArray(lane.freightInfo) ? lane.freightInfo : [];
+    const qty = freightInfoQty(rows);
+    if (qty === hit.pallets) continue;
+    if (rows.length > 1 && qty > 1) continue;
+    const base = rows[0] && typeof rows[0] === "object" ? {...rows[0]} : {};
+    lane.freightInfo = [freightDims.normalizePalletDims({
+      ...base,
+      qty: hit.pallets,
+      dimType: base.dimType || "PLT",
+      weightType: base.weightType || "each",
+    })];
+    applied++;
+  }
+  if (applied > 0) {
+    pushExtractWarning(extracted, "destination pallet counts");
+  }
+  return extracted;
+}
+
+/**
  * "2 pallets" / "2 plt" / "2 skids" — number before the word.
  * Does not treat "Pallet 1" as qty 1.
  * Returns null for alternate quantity RFQs ("also quote 2 skids") so
@@ -990,6 +1056,10 @@ function extractCompactPalletBlocks(body) {
 function parseInformalPalletCount(text) {
   const blob = String(text || "");
   if (freightRules.isAlternateQuantityQuote(blob)) return null;
+  // A multi-stop list ("3 pallets - 55 boxes" under each ZIP) is not one
+  // shipment qty. The max in the thread ("11 pallets") must not stamp
+  // every lane.
+  if (extractDestinationPalletUpdates(blob).size >= 2) return null;
   // Same-line only — never span newlines. Otherwise WEIGHT- 139\nPallets- 1
   // (and zip codes above a "pallet:" line) become fake pallet counts.
   const re = /\b(\d{1,3})[^\S\r\n]+(?:pallets?|plts?|skids?)\b/gi;
@@ -1450,11 +1520,13 @@ function parseLabeledFreightTotals(body) {
         new RegExp("Pallet\\s+Counts?\\s*" + DIRTY_LABEL_SEP +
           "?\\s*(\\d+)", "i"));
   }
-  // "Pallets- 1" / "Pallet: 2" — not "1 pallet – 48x40x15" dims.
+  // "Pallets- 1" / "Pallet: 2" — not "1 pallet – 48x40x15" dims
+  // and not "3 pallets - 55 boxes" (the number after the dash is cartons).
   if (palletCount == null) {
     palletCount = matchLabeledNumber(text,
         new RegExp("\\bPallets?\\s*" + DIRTY_LABEL_SEP +
-          "\\s*(\\d+)(?!\\d)(?!\\s*" + DIRTY_DIM_SEP + ")", "i"));
+          "\\s*(\\d+)(?!\\d)(?!\\s*(?:box(?:es)?|cartons?|" +
+          DIRTY_CTN_UNIT + "|" + DIRTY_DIM_SEP + "))", "i"));
   }
   if (palletCount == null) {
     const blocks = extractCompactPalletBlocks(text);
@@ -4108,6 +4180,14 @@ function looksLikeQuoteRequest(subject, body) {
     "rate quote", "quote request", "freight quote", "shipping rate",
     "let us know the shipping rate", "get a freight quote",
     "\\bquote\\b", "rfq",
+    // Natural human phrasings of the same ask — not a fixed vocabulary.
+    "how much (?:to|would it)", "what(?:'s| is| would)? (?:the|it) cost",
+    "cost to (?:ship|move|haul|transport)",
+    "price to (?:ship|move|haul|transport)",
+    "pricing to (?:ship|move|haul|transport)",
+    "can you (?:quote|rate|price)", "need a rate", "get a rate",
+    "\\bltl rate\\b", "ftl rate", "rate to (?:ship|move|haul)",
+    "ship(?:ping)? cost", "freight cost", "freight charge",
   ].join("|"));
   if (quotePhrases.test(text)) {
     return true;

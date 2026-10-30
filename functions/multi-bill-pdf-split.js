@@ -79,11 +79,41 @@ function isStatementCoverPage(text) {
  * @param {string} text Page text.
  * @return {string|null} bol, pod, rate_confirmation, or null.
  */
+/**
+ * A page that carries a shipment number and an amount due reads as a
+ * freight bill, whatever header words it uses. Used so a support page
+ * never swallows a real bill.
+ * @param {string} text Page text.
+ * @return {boolean}
+ */
+function pageHasBillSignal(text) {
+  const src = String(text || "");
+  return !!matchCarrierPro(src) && matchBillAmount(src) != null;
+}
+
 function supportKind(text) {
   const t = String(text || "").toUpperCase();
-  if (/\bRATE\s+CONFIRMATION\b/.test(t)) return "rate_confirmation";
-  if (/\bBILL\s+OF\s+LADING\b/.test(t)) return "bol";
-  if (/\bDELIVERY\s+RECEIPT\b/.test(t)) return "pod";
+  // A rate/load/carrier confirmation is never a bill we pay — always support.
+  if (/\bRATE\s+CONFIRMATION\b/.test(t) ||
+      /\bLOAD\s+CONFIRMATION\b/.test(t) ||
+      /\bCARRIER\s+CONFIRMATION\b/.test(t) ||
+      /\bRATE\s*CON\b/.test(t)) {
+    return "rate_confirmation";
+  }
+  // When the page also reads as a freight bill (shipment # + amount due),
+  // it IS the bill — do not downgrade it to a support page and drop it.
+  if (pageHasBillSignal(text)) return null;
+  if (/\bDELIVERY\s+RECEIPT\b/.test(t) ||
+      /\bPROOF\s+OF\s+DELIVERY\b/.test(t) ||
+      /\bRECEIVED\s+(?:BY|IN\s+GOOD\s+(?:ORDER|CONDITION))\b/.test(t) ||
+      /\bCONSIGNEE\s+SIGNATURE\b/.test(t)) {
+    return "pod";
+  }
+  if (/\bBILL\s+OF\s+LADING\b/.test(t) ||
+      /\bSTRAIGHT\s+BILL\b/.test(t) ||
+      /\bUNIFORM\s+BILL\b/.test(t)) {
+    return "bol";
+  }
   return null;
 }
 
@@ -99,40 +129,110 @@ function hasInvoiceTitle(text) {
   t = t.replace(/\b(?:PLEASE\s+)?SEND\s+(?:YOUR\s+|THE\s+)?INVOICE\b/gi, "");
   t = t.replace(/\bINVOICE\s+AND\s+POD\b/gi, "");
   t = t.replace(/\bINVOICE\s*(?:NUMBER|NO\.?|#)/gi, "");
-  return /\bINVOICE\b/i.test(t);
+  // "INVOICE" is the common header, but carriers also title a bill
+  // "FREIGHT BILL" / "ORIGINAL FREIGHT BILL" with no word "invoice".
+  return /\bINVOICE\b/i.test(t) || /\bFREIGHT\s+BILL\b/i.test(t);
 }
 
 /**
- * @param {string} text Page text.
- * @return {object}
+ * Currency figures on the page, in reading order. A weight or a date
+ * is not currency: currency has cents.
+ * @param {string} src Page text.
+ * @return {number[]}
  */
+function moneyAmounts(src) {
+  const out = [];
+  const re = /\$?\d{1,3}(?:,\d{3})*\.\d{2}\b/g;
+  let match = re.exec(src);
+  while (match) {
+    const n = parseAmount(match[0]);
+    if (n != null && n > 0) out.push(n);
+    match = re.exec(src);
+  }
+  return out;
+}
+
+/**
+ * Shipment numbers on the page. A dashed carrier PRO wins. Otherwise the
+ * last long number, which is where the PRO sits after a PO or account.
+ * Six-digit loads, zips, and dates are not shipment numbers.
+ * @param {string} src Page text.
+ * @return {string[]}
+ */
+function shipmentNumbers(src) {
+  const dashed = [];
+  const dashRe = /\b(\d{3}-\d{6,8})\b/g;
+  let dash = dashRe.exec(src);
+  while (dash) {
+    const n = normRef(dash[1]);
+    if (n && dashed.indexOf(n) < 0) dashed.push(n);
+    dash = dashRe.exec(src);
+  }
+  if (dashed.length) return dashed;
+  const solids = [];
+  const solidRe = /\b(\d{7,12})\b/g;
+  let solid = solidRe.exec(src);
+  while (solid) {
+    if (solids.indexOf(solid[1]) < 0) solids.push(solid[1]);
+    solid = solidRe.exec(src);
+  }
+  return solids;
+}
+
+/**
+ * The shipment number. No label list: the shape of the number is enough.
+ * @param {string} src Page text.
+ * @return {string}
+ */
+function matchCarrierPro(src) {
+  const nums = shipmentNumbers(src);
+  if (!nums.length) return "";
+  return nums[nums.length - 1];
+}
+
+/**
+ * The amount due. No label list: on a freight bill the total is the
+ * last dollar figure.
+ * @param {string} src Page text.
+ * @return {number|null}
+ */
+function matchBillAmount(src) {
+  const amounts = moneyAmounts(src);
+  if (!amounts.length) return null;
+  return amounts[amounts.length - 1];
+}
+
+/**
+ * A carrier page the splitter still could not open. These must be named
+ * in the packet gap so an unread bill cannot disappear with no alert.
+ * @param {string} text Page text.
+ * @return {boolean}
+ */
+function looksLikeSkippedCarrierPage(text) {
+  if (isStatementCoverPage(text) || supportKind(text)) return false;
+  if (isLooseFreightInvoicePage(text)) return false;
+  const src = String(text || "");
+  if (moneyAmounts(src).length || shipmentNumbers(src).length) return true;
+  return /\bPRO\b/i.test(src);
+}
+
 function extractBillIdentity(text) {
   const src = String(text || "");
-  const proM = src.match(
-      /\bPRO\s*(?:NUMBER|#|NO\.?)?\s*:?\s*(\d{6,12})\b/i);
+  const proFromPage = matchCarrierPro(src);
   const loadM = src.match(
       /\bB\/L\s*(?:NUMBER|#)\s*:?\s*(\d{5,9})\b/i) ||
     src.match(/\bBOL\s*#?\s*:?\s*(\d{5,9})\b/i) ||
     src.match(/\bLOAD\s*#?\s*:?\s*(\d{5,9})\b/i);
   const invM = src.match(
       /\bINVOICE\s*(?:NUMBER|#|NO\.?)?\s*:?\s*(\d{4,12})\b/i);
-  let pro = proM ? (normRef(proM[1]) || proM[1]) : "";
+  let pro = proFromPage;
   let load = loadM ? loadM[1] : "";
   const columnar = columnarBill(src);
   if (!load && columnar) load = columnar.loadNumber;
   if (!pro && columnar) pro = columnar.proNumber;
   let invoiceNumber = invM ? (normRef(invM[1]) || invM[1]) : "";
   if (!invoiceNumber && pro) invoiceNumber = pro;
-  const pay = src.match(new RegExp(
-      "PLEASE\\s+PAY\\s+THIS\\s+AMOUNT[^0-9]{0,24}" +
-      "(\\d{1,3}(?:,\\d{3})*\\.\\d{2})", "i"));
-  const tot = src.match(
-      /\bTOTAL\s+CHARGES\b[^0-9]{0,24}(\d{1,3}(?:,\d{3})*\.\d{2})/i);
-  const inlinePay = src.match(new RegExp(
-      "PLEASE\\s+PAY[^\\d]{0,20}(\\d{1,3}(?:,\\d{3})*\\.\\d{2})", "i"));
-  const amount = parseAmount(
-      (pay && pay[1]) || (inlinePay && inlinePay[1]) ||
-      (tot && tot[1]) || "");
+  const amount = matchBillAmount(src);
   return {
     invoiceNumber,
     proNumber: pro,
@@ -213,8 +313,7 @@ function isLooseFreightInvoicePage(text) {
   if (isStrictFreightInvoicePage(text)) return true;
   if (looksLikeColumnInvoicePage(text)) return true;
   const id = extractBillIdentity(text);
-  const hasPay = /\bPLEASE\s+PAY\s+THIS\s+AMOUNT\b/i.test(text) ||
-    /\bTOTAL\s+CHARGES\b/i.test(text);
+  const hasPay = matchBillAmount(text) != null;
   return hasPay && !!(id.proNumber || id.loadNumber);
 }
 
@@ -260,7 +359,8 @@ function collectPageBillRefs(text) {
   const src = String(text || "");
   const refs = [];
   const re = new RegExp(
-      "\\b(?:INVOICE|PRO)\\s*(?:NUMBER|#|NO\\.?)?\\s*:?\\s*(\\d{6,12})\\b",
+      "\\b(?:INVOICE|PRO)\\s*(?:NUMBER|#|NO\\.?)?\\s*:?\\s*" +
+      "(\\d{3}-\\d{6,8}|\\d{6,12})\\b",
       "gi");
   let match = re.exec(src);
   while (match) {
@@ -433,7 +533,8 @@ function findUnclaimedBills(texts, groups) {
   const seen = new Set();
   const push = (bill) => {
     const key = normRef(bill.invoiceNumber) || normRef(bill.proNumber) ||
-      normRef(bill.loadNumber);
+      normRef(bill.loadNumber) ||
+      (bill.page ? `page:${bill.page}` : "");
     if (!key || seen.has(key)) return;
     if (groups.some((g) => sameBill(g, bill))) return;
     seen.add(key);
@@ -459,6 +560,15 @@ function findUnclaimedBills(texts, groups) {
         if (group && sameBill(group, bill)) return;
         push(bill);
       });
+      if (looksLikeSkippedCarrierPage(text)) {
+        push({
+          page: pageNo,
+          invoiceNumber: "",
+          proNumber: "",
+          loadNumber: "",
+          amount: null,
+        });
+      }
       return;
     }
     collectPageBillRefs(text).forEach((ref) => {
@@ -470,6 +580,15 @@ function findUnclaimedBills(texts, groups) {
         amount: null,
       });
     });
+    if (looksLikeSkippedCarrierPage(text)) {
+      push({
+        page: pageNo,
+        invoiceNumber: "",
+        proNumber: "",
+        loadNumber: "",
+        amount: null,
+      });
+    }
   });
   return out;
 }
@@ -849,6 +968,9 @@ async function splitSinglePdfInvoiceItems(opts) {
 module.exports = {
   normRef,
   sameBill,
+  supportKind,
+  pageHasBillSignal,
+  hasInvoiceTitle,
   isStatementCoverPage,
   parseStatementCoverBills,
   isStrictFreightInvoicePage,
