@@ -1982,6 +1982,56 @@ check("payment alert language detects Zelle",
     adm.hasPaymentAlertLanguage(
         "hi", "Quickpay/Zelle accounting@innovativecarriers.com"));
 
+// Read an NOA by MEANING, without the literal "NOA" / "notice of assignment"
+// tokens and without a known factor domain — like a person would.
+check("NOA by meaning: purchased the accounts receivable",
+    adm.looksLikeNoaEmailContent(
+        "Important account update",
+        "We have purchased the accounts receivable of ABC Trucking LLC. " +
+        "Please make all checks payable to Acme Financial Group.",
+        "ap@someunknownfactor.co"));
+check("NOA by meaning: account assigned, remit to us",
+    adm.looksLikeNoaEmailContent(
+        "Account change",
+        "The account of Delta Carriers has been assigned to us. " +
+        "All future payments are to be sent to the address below.",
+        "billing@newfunder.io"));
+check("NOA by meaning: we are the factoring company for",
+    adm.looksLikeNoaEmailContent(
+        "Payment instructions",
+        "We are the factoring company for Smith Transport. " +
+        "Make all payments payable to us going forward.",
+        "info@random-capital.com"));
+check("a real freight invoice is NOT read as NOA (bill wins)",
+    !adm.looksLikeNoaEmailContent(
+        "Invoice #6672 Load 267545 for US Carrier Inc",
+        "Attached is the freight invoice for load 267545.",
+        "ap@unknownfactor.co"));
+check("surety-domain sender reads as a factor",
+    adm.senderDomainLooksLikeFactor("Remit <ap@example-surety.com>"));
+
+// AI understood a Notice of Assignment — honor it even with unfamiliar
+// wording, but only when no freight bill is present (bill always wins).
+check("AI noa intent + no attachments → NOA-only ignore",
+    adm.shouldIgnoreNoaOnlyPackage(
+        "Payment direction update",
+        "Please update your records with our new remit details.",
+        [], 0, "ap@brandnewfactor.co",
+        {intent: "noa", reasoning: "Assignment / remit notice"}));
+check("AI noa intent does NOT ignore when a freight invoice PDF is present",
+    !adm.shouldIgnoreNoaOnlyPackage(
+        "Invoice 981 PO 265543",
+        "Freight bill attached.",
+        [{filename: "invoice_981.pdf", mimeType: "application/pdf"}],
+        1, "ap@brandnewfactor.co",
+        {intent: "noa", reasoning: "has NOA cover but also a bill"}));
+check("AI noa intent does NOT ignore when invoice content is in the subject",
+    !adm.shouldIgnoreNoaOnlyPackage(
+        "Invoice #981 Your PO # 265543",
+        "See attached.",
+        [], 0, "ap@brandnewfactor.co",
+        {intent: "noa", reasoning: "subject is a factored invoice"}));
+
 if (failures) {
   console.error(`\n${failures} test(s) failed`);
   process.exit(1);

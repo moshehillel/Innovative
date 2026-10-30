@@ -1174,7 +1174,8 @@ function senderDomainLooksLikeFactor(from) {
   const at = addr.lastIndexOf("@");
   if (at < 0) return false;
   const domain = addr.slice(at + 1).toLowerCase();
-  return /(?:financ|factor|funding)/.test(domain);
+  // financ* covers finance/financial/financing; add factor/funding/surety.
+  return /(?:financ|factor|funding|surety)/.test(domain);
 }
 
 /**
@@ -1743,6 +1744,29 @@ function looksLikeNoaEmailContent(subject, body, from) {
   if (remitDirectedRe.test(content)) {
     return true;
   }
+
+  // Read an NOA by MEANING, not just the literal words "NOA" / "notice of
+  // assignment" / a known factor domain. A person recognizes these as an
+  // assignment/factoring notice redirecting where to pay — so should Jerry.
+  const meaningPatterns = [
+    // "we have purchased / factored the accounts receivable / invoices"
+    /\b(?:purchased|bought|factored|acquired)\b[\s\S]{0,60}\b(?:accounts?\s+receivable|invoices?|receivables?|account)\b/,
+    // "assignment of accounts receivable" / "account has been assigned to"
+    /\bassignment\s+of\s+(?:accounts?\s+receivable|receivables?|your\s+account)\b/,
+    /\b(?:account|invoices?|receivables?)\s+(?:has|have)\s+been\s+assigned\s+to\b/,
+    // "we are the factor / factoring company for X"
+    /\bwe\s+are\s+the\s+(?:factor|factoring\s+company)\b/,
+    /\bfactoring\s+company\s+for\b/,
+    // "make all checks/payments payable to" / "payable to <factor>"
+    /\bmake\s+(?:all\s+)?(?:checks?|payments?|remittances?)\s+payable\s+to\b/,
+    /\b(?:all\s+)?(?:checks?|payments?)\s+(?:are\s+to\s+be\s+|should\s+be\s+|must\s+be\s+)?made\s+payable\s+to\b/,
+    // "all (future) payments are to be made/sent/remitted/directed"
+    /\ball\s+(?:future\s+)?payments?\s+(?:are\s+to\s+be|should\s+be|must\s+be)\b/,
+  ];
+  if (meaningPatterns.some((re) => re.test(content))) {
+    return true;
+  }
+
   const fromL = String(from || "").toLowerCase();
   const factorDomains = [
     "factorview.com",
@@ -1840,10 +1864,11 @@ function rtsNoaAttachmentsLookNoaOnly(attachments) {
  * @param {Array<object>} attachments Attachment metadata.
  * @param {number} [invoicePdfCount] Invoice PDFs after doc classification.
  * @param {string} [from] From header (optional).
+ * @param {object} [emailClassification] AI classifier result (optional).
  * @return {boolean}
  */
 function shouldIgnoreNoaOnlyPackage(
-    subject, body, attachments, invoicePdfCount, from) {
+    subject, body, attachments, invoicePdfCount, from, emailClassification) {
   const list = Array.isArray(attachments) ? attachments : [];
   if (Number(invoicePdfCount) > 0) return false;
   if (looksLikeInvoiceEmailContent(subject, body)) return false;
@@ -1857,6 +1882,12 @@ function shouldIgnoreNoaOnlyPackage(
   if (looksLikeNoaEmailContent(subject, body, from) &&
       Number(invoicePdfCount) === 0 &&
       list.length > 0) {
+    return true;
+  }
+  // AI understood it as a Notice of Assignment (like a person reading it).
+  // Honor that even when the wording/sender is unfamiliar — but only after
+  // the invoice guards above, so a real freight bill is never dropped.
+  if (emailClassification && emailClassification.intent === "noa") {
     return true;
   }
   return false;
@@ -2148,6 +2179,7 @@ module.exports = {
   shouldHandleCarrierStatementFollowUp,
   looksLikeInvoiceEmailContent,
   looksLikeNoaEmailContent,
+  senderDomainLooksLikeFactor,
   isNoticeOfAssignmentEmail,
   isRtsNoaEmail,
   attachmentFilenameLooksLikeInvoice,
