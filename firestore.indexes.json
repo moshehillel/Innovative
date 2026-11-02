@@ -32,6 +32,25 @@
         {"fieldPath": "resolved", "order": "ASCENDING"},
         {"fieldPath": "createdAt", "order": "DESCENDING"}
       ]
+    },
+    {
+      "collectionGroup": "dashboardNotifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "tenantId", "order": "ASCENDING"},
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "createdAt", "order": "DESCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "dashboardNotifications",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "tenantId", "order": "ASCENDING"},
+        {"fieldPath": "status", "order": "ASCENDING"},
+        {"fieldPath": "type", "order": "ASCENDING"},
+        {"fieldPath": "createdAt", "order": "DESCENDING"}
+      ]
     }
   ],
   "fieldOverrides": []
