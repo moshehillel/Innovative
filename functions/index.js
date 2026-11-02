@@ -2286,7 +2286,28 @@ async function runPodFollowUpChecks() {
     reminded.push(doc.id);
   }
 
-  return {checked: snap.size, reminded, escalated, resolved};
+  let childrensApparelPodWaits = {
+    checked: 0, resumed: [], waiting: [], skipped: [],
+  };
+  try {
+    const childrensApparel = require("./childrens-apparel-invoice");
+    childrensApparelPodWaits = await childrensApparel.resumePodWaits({
+      db,
+      fetchBooking: fetchPrimusBooking,
+      checkPod: primusUiBridge && primusUiBridge.checkBookingHasPod,
+      kickWorkflow: kickPrimusWorkflow,
+    });
+  } catch (caPodErr) {
+    console.error("childrens apparel pod wait:", caPodErr.message);
+  }
+
+  return {
+    checked: snap.size,
+    reminded,
+    escalated,
+    resolved,
+    childrensApparelPodWaits,
+  };
 }
 
 /**

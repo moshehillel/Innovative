@@ -16,6 +16,7 @@ const {onRequest} = require("firebase-functions/v2/https");
 const admin = require("firebase-admin");
 const loadResolution = require("./invoice-load-resolution");
 const intakeAmountMismatchGate = require("./intake-amount-mismatch-gate");
+const childrensApparel = require("./childrens-apparel-invoice");
 const workflowErrors = require("./workflow-error-messages");
 const mailIntakeQueue = require("./mail-intake-queue");
 const {findInvoiceAttachment} = require("./pod-utils");
@@ -2167,6 +2168,25 @@ exports.processPrimusWorkflow = onRequest(
                 },
               });
 
+              const apparelPodName =
+                childrensApparel.billToCustomerName(bookingForMode) ||
+                invoice.customerName || "";
+              if (childrensApparel.isChildrensApparelCustomer(
+                  apparelPodName)) {
+                await invoiceDoc.ref.update({
+                  childrensApparelPodWait: true,
+                  customerName: apparelPodName,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                await writeLog("info", "workflow",
+                    "Children's Apparel held for POD — " +
+                    "later check will rate and invoice", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      customerName: apparelPodName,
+                    });
+              }
+
               await pauseWorkflow(
                   invoiceDoc.ref,
                   "pod_extraction",
@@ -2426,7 +2446,26 @@ exports.processPrimusWorkflow = onRequest(
                 invoice.loadNumber,
                 baseAmount,
             );
-            amountValidation = amountValidationResult;
+            const apparelCustomerName =
+              childrensApparel.billToCustomerName(bookingForMode) ||
+              invoice.customerName || "";
+            amountValidation = childrensApparel.acceptCostMatch(
+                apparelCustomerName,
+                amountValidationResult,
+            );
+            if (amountValidation &&
+                amountValidation.childrensApparelCostMatch) {
+              await writeLog("info", "workflow",
+                  "Children's Apparel cost match within $25", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerName: apparelCustomerName,
+                    submittedAmount: amountValidation.submittedAmount,
+                    expectedCost: amountValidation.primusQuotedAmount ||
+                      amountValidation.amount,
+                    difference: amountValidation.difference,
+                  });
+            }
 
             await logWorkflowStep({
               invoiceId,
@@ -3250,6 +3289,60 @@ exports.processPrimusWorkflow = onRequest(
                     customerRate: manualRate,
                     customerName: customerRateResult.customerName,
                   });
+            }
+
+            if (!customerRateResult.ok) {
+              const apparelName = customerNameForCheck ||
+                manualCustomerName ||
+                childrensApparel.billToCustomerName(bookingForMode) ||
+                invoice.customerName || "";
+              const expectedCost = amountValidation &&
+                (amountValidation.primusQuotedAmount != null ?
+                  amountValidation.primusQuotedAmount :
+                  amountValidation.amount);
+              const hasPodForApparel = Boolean(
+                  (extractedPodOnlyFile && extractedPodOnlyFile.storagePath) ||
+                (invoice.podOnlyFile && invoice.podOnlyFile.storagePath) ||
+                invoice.podOnPrimusAlready ||
+                primusSteps.podUploaded);
+              const matchedCarrierCost = amountValidation &&
+                amountValidation.enteredAmount != null ?
+                amountValidation.enteredAmount :
+                (amountValidation &&
+                  amountValidation.submittedAmount != null ?
+                  amountValidation.submittedAmount :
+                  invoice.invoiceAmount);
+              const apparelRate = childrensApparel.autoCustomerRate({
+                customerName: apparelName,
+                carrierCost: matchedCarrierCost,
+                expectedCost,
+                hasPod: hasPodForApparel,
+              });
+              if (apparelRate) {
+                customerRateResult = {
+                  ok: true,
+                  customerName: apparelRate.customerName,
+                  customerRate: apparelRate.customerRate,
+                  rateSource: apparelRate.rateSource,
+                };
+                await invoiceDoc.ref.update({
+                  customerRate: apparelRate.customerRate,
+                  customerRateSource: apparelRate.rateSource,
+                  customerName: apparelRate.customerName,
+                  updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                });
+                invoice.customerRate = apparelRate.customerRate;
+                await writeLog("info", "workflow",
+                    "Children's Apparel rate entered from carrier cost", {
+                      invoiceId,
+                      loadNumber: invoice.loadNumber,
+                      customerName: apparelRate.customerName,
+                      carrierCost: matchedCarrierCost,
+                      expectedCost,
+                      customerRate: apparelRate.customerRate,
+                      hasPod: hasPodForApparel,
+                    });
+              }
             }
 
             if (!customerRateResult.ok) {
