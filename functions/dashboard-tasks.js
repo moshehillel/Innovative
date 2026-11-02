@@ -21,14 +21,269 @@ const TASK_STATUS = Object.freeze({
   DISMISSED: "dismissed",
 });
 
+const AMOUNT_TOLERANCE_CENTS = 1;
+
+/**
+ * @param {*} value Dollar amount.
+ * @return {number|null} Integer cents, or null when unknown.
+ */
+function amountCents(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n * 100);
+}
+
+/**
+ * @param {*} value Label text.
+ * @return {string}
+ */
+function normText(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+/**
+ * Stable identity for the charge lines on one work item.
+ * @param {Array<object>|null} charges Charge rows.
+ * @return {string}
+ */
+function chargeLineSignature(charges) {
+  if (!Array.isArray(charges) || !charges.length) return "";
+  const parts = [];
+  charges.forEach((line) => {
+    if (!line || typeof line !== "object") return;
+    const label = normText(
+        line.label || line.name || line.type || line.description);
+    const cents = amountCents(
+        line.amount != null ? line.amount : line.charge);
+    if (!label && cents == null) return;
+    parts.push(`${label}:${cents == null ? "" : cents}`);
+  });
+  parts.sort();
+  return parts.join("|");
+}
+
+/**
+ * @param {object} item Task or follow-up shaped fields.
+ * @return {object}
+ */
+function workIdentity(item) {
+  const row = item || {};
+  return {
+    type: normText(row.type),
+    loadNumber: String(row.loadNumber || "").trim(),
+    reason: normText(row.reason || row.category),
+    cents: amountCents(row.chargesTotal),
+    signature: row.chargeSignature || chargeLineSignature(row.charges) || "",
+    followUpId: String(row.followUpId || "").trim(),
+    messageId: String(row.messageId || "").trim(),
+  };
+}
+
+/**
+ * True when two rows are the same work item.
+ * Same follow-up or email collapses even when the amount was not stored.
+ * Same load + kind + charge lines (or amount) collapses retry copies.
+ * A different amount, charge line set, or email stays visible.
+ * @param {object} a Item.
+ * @param {object} b Item.
+ * @return {boolean}
+ */
+function isSameWorkItem(a, b) {
+  const left = workIdentity(a);
+  const right = workIdentity(b);
+  if (!left.type || left.type !== right.type) return false;
+  if (left.followUpId && right.followUpId &&
+      left.followUpId === right.followUpId) {
+    return true;
+  }
+  if (left.messageId && right.messageId) {
+    return left.messageId === right.messageId;
+  }
+  if (!left.loadNumber || left.loadNumber !== right.loadNumber) return false;
+  if (!left.reason || left.reason !== right.reason) return false;
+  // Same lines collapse even when a retry forgot to store the total.
+  if (left.signature && right.signature &&
+      left.signature === right.signature) {
+    return true;
+  }
+  // Same dollar amount is the same charge. A different total stays.
+  // Line wording can drift across retries ("Over Dim" vs "OVER DIM"),
+  // so a signature mismatch does not keep a second row.
+  if (left.cents == null || right.cents == null) return false;
+  return Math.abs(left.cents - right.cents) <= AMOUNT_TOLERANCE_CENTS;
+}
+
+/**
+ * @param {object} item Row.
+ * @return {number}
+ */
+function recencyMs(item) {
+  const ms = item && item.createdAt ? Date.parse(item.createdAt) : 0;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+/**
+ * Positive when `a` should be kept instead of `b`.
+ * An in-dispute copy wins, otherwise the newest row.
+ * @param {object} a Item.
+ * @param {object} b Item.
+ * @return {number}
+ */
+function compareDuplicatePreference(a, b) {
+  const aDispute = isOptionDDispute(a) ? 1 : 0;
+  const bDispute = isOptionDDispute(b) ? 1 : 0;
+  if (aDispute !== bDispute) return aDispute - bDispute;
+  const recency = recencyMs(a) - recencyMs(b);
+  if (recency !== 0) return recency;
+  const aAmt = a && a.chargesTotal != null ? 1 : 0;
+  const bAmt = b && b.chargesTotal != null ? 1 : 0;
+  return aAmt - bAmt;
+}
+
+/**
+ * Collapses retry copies of the same work item.
+ * @param {object[]} items Rows.
+ * @return {object[]}
+ */
+function collapseDuplicateTasks(items) {
+  const list = Array.isArray(items) ? items : [];
+  if (list.length < 2) return list.slice();
+  const parent = list.map((_, i) => i);
+  /**
+   * @param {number} i Index.
+   * @return {number}
+   */
+  const find = (i) => {
+    let x = i;
+    while (parent[x] !== x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+  /**
+   * @param {number} a Index.
+   * @param {number} b Index.
+   * @return {void}
+   */
+  const union = (a, b) => {
+    const pa = find(a);
+    const pb = find(b);
+    if (pa !== pb) parent[pb] = pa;
+  };
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      if (isSameWorkItem(list[i], list[j])) union(i, j);
+    }
+  }
+  const groups = new Map();
+  const order = [];
+  list.forEach((item, i) => {
+    const root = find(i);
+    if (!groups.has(root)) {
+      groups.set(root, []);
+      order.push(root);
+    }
+    groups.get(root).push(item);
+  });
+  return order.map((root) => {
+    const group = groups.get(root);
+    return group.reduce((best, item) =>
+      compareDuplicatePreference(item, best) > 0 ? item : best);
+  });
+}
+
+/**
+ * @param {object} db Firestore.
+ * @param {object} data Incoming task fields.
+ * @return {Promise<object|null>} Open duplicate doc, if any.
+ */
+async function findOpenDuplicateTask(db, data) {
+  const tenantId = String((data && data.tenantId) || "default");
+  const loadNumber = String((data && data.loadNumber) || "").trim();
+  const messageId = String((data && data.messageId) || "").trim();
+  const followUpId = String((data && data.followUpId) || "").trim();
+  let snap = null;
+  if (loadNumber) {
+    snap = await db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", loadNumber)
+        .limit(200)
+        .get();
+  } else if (messageId) {
+    snap = await db.collection(TASK_COLLECTION)
+        .where("messageId", "==", messageId)
+        .limit(20)
+        .get();
+  } else if (followUpId) {
+    snap = await db.collection(TASK_COLLECTION)
+        .where("followUpId", "==", followUpId)
+        .limit(20)
+        .get();
+  }
+  if (!snap) return null;
+  let found = null;
+  snap.forEach((doc) => {
+    if (found) return;
+    const row = doc.data() || {};
+    if ((row.status || "") !== TASK_STATUS.OPEN) return;
+    if (String(row.tenantId || "default") !== tenantId) return;
+    if (!isSameWorkItem(data, row)) return;
+    found = {id: doc.id, ref: doc.ref, data: row};
+  });
+  return found;
+}
+
 /**
  * Creates an open dashboard task (fire-and-forget safe).
+ * Reuses an open task when this is the same work item.
  * @param {object} db Firestore instance.
  * @param {object} data Task fields.
  * @return {Promise<string|null>} Doc id or null on failure.
  */
 async function createDashboardTask(db, data) {
   try {
+    const signature = data.chargeSignature ||
+      chargeLineSignature(data.charges);
+    const incoming = Object.assign({}, data, {
+      chargeSignature: signature || null,
+    });
+    try {
+      const existing = await findOpenDuplicateTask(db, incoming);
+      if (existing) {
+        const patch = {};
+        if (data.chargesTotal != null &&
+            existing.data.chargesTotal == null) {
+          patch.chargesTotal = Number(data.chargesTotal);
+        }
+        if (signature && !existing.data.chargeSignature) {
+          patch.chargeSignature = signature;
+        }
+        if (data.followUpId && !existing.data.followUpId) {
+          patch.followUpId = data.followUpId;
+        }
+        if (data.messageId && !existing.data.messageId) {
+          patch.messageId = data.messageId;
+        }
+        if (data.invoiceId && !existing.data.invoiceId) {
+          patch.invoiceId = data.invoiceId;
+        }
+        if (data.description && !existing.data.description) {
+          patch.description = data.description;
+        }
+        if (Object.keys(patch).length) {
+          await existing.ref.update(patch);
+        }
+        console.log(
+            "[createDashboardTask] reused open task",
+            existing.id,
+            data.loadNumber || "",
+            data.reason || data.type || "");
+        return existing.id;
+      }
+    } catch (dedupeErr) {
+      console.error("[createDashboardTask] dedupe lookup failed:",
+          dedupeErr.message);
+    }
     const doc = await db.collection(TASK_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || TASK_TYPE.HUMAN_REVIEW,
@@ -42,6 +297,9 @@ async function createDashboardTask(db, data) {
       followUpId: data.followUpId || null,
       department: data.department || null,
       reason: data.reason || null,
+      chargesTotal: data.chargesTotal != null ?
+        Number(data.chargesTotal) : null,
+      chargeSignature: signature || null,
       status: TASK_STATUS.OPEN,
       chargePhase: data.chargePhase || null,
       followUpStatus: data.followUpStatus || null,
@@ -78,6 +336,8 @@ function serializeTaskDoc(doc) {
     followUpId: d.followUpId || null,
     department: d.department || null,
     reason: d.reason || null,
+    chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
+    chargeSignature: d.chargeSignature || null,
     status: d.status || null,
     chargePhase: d.chargePhase || null,
     followUpStatus: d.followUpStatus || null,
@@ -172,7 +432,8 @@ function chargeTaskFromFollowUp(id, data, tenantId) {
     department: null,
     reason: data.category || data.status || null,
     status: dispute ? "disputing" : "open",
-    chargesTotal: data.chargesTotal || null,
+    chargesTotal: data.chargesTotal != null ? data.chargesTotal : null,
+    chargeSignature: chargeLineSignature(data.charges) || null,
     invoiceAmount: data.invoiceAmount || null,
     chargePhase: dispute ? "dispute" : null,
     followUpStatus: data.status || null,
@@ -272,7 +533,14 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   tasks.forEach((task) => {
     if (!task.followUpId) return;
     const data = followById.get(task.followUpId);
-    if (data) applyFollowUpDispute(task, data);
+    if (!data) return;
+    applyFollowUpDispute(task, data);
+    if (task.chargesTotal == null && data.chargesTotal != null) {
+      task.chargesTotal = data.chargesTotal;
+    }
+    if (!task.reason && data.category) task.reason = data.category;
+    const signature = chargeLineSignature(data.charges);
+    if (signature && !task.chargeSignature) task.chargeSignature = signature;
   });
 
   const linkedFollowUpIds = new Set(
@@ -283,13 +551,14 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     tasks.push(chargeTaskFromFollowUp(id, data, tenantId));
   });
 
-  tasks.sort((a, b) => {
+  const visible = collapseDuplicateTasks(tasks);
+  visible.sort((a, b) => {
     const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
     const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
     return tb - ta;
   });
 
-  return partitionByChargePhase(tasks, {
+  return partitionByChargePhase(visible, {
     chargePhase: opts.chargePhase,
     limit,
     offset,
@@ -345,6 +614,166 @@ async function markTasksInDispute(db, opts) {
  * @param {object} opts taskId, source, tenantId.
  * @return {Promise<object>} {ok: boolean, error?: string}
  */
+/**
+ * Loads charge totals for tasks that were saved before amounts were stored.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod Follow-up module.
+ * @param {object[]} docs Task snapshots.
+ * @return {Promise<Map<string, object>>}
+ */
+async function loadFollowUpSeeds(db, additionalChargesMod, docs) {
+  const seeds = new Map();
+  if (!additionalChargesMod || typeof db.getAll !== "function") return seeds;
+  const ids = [];
+  docs.forEach((doc) => {
+    const row = doc.data ? doc.data() : doc;
+    const id = String((row && row.followUpId) || "").trim();
+    if (!id || seeds.has(id)) return;
+    if (row.chargesTotal != null &&
+        (row.chargeSignature || chargeLineSignature(row.charges))) {
+      return;
+    }
+    ids.push(id);
+  });
+  if (!ids.length) return seeds;
+  const refs = ids.slice(0, 100).map((id) =>
+    db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION).doc(id));
+  const snaps = await db.getAll(...refs);
+  snaps.forEach((snap) => {
+    if (!snap.exists) return;
+    seeds.set(snap.id, snap.data() || {});
+  });
+  return seeds;
+}
+
+/**
+ * @param {object} row Task fields.
+ * @param {object|null} follow Follow-up fields.
+ * @return {object}
+ */
+function taskWithFollowUpAmount(row, follow) {
+  const data = follow || {};
+  return {
+    type: row.type || null,
+    loadNumber: row.loadNumber || data.loadNumber || null,
+    reason: row.reason || data.category || null,
+    chargesTotal: row.chargesTotal != null ?
+      row.chargesTotal : data.chargesTotal,
+    charges: data.charges || null,
+    chargeSignature: row.chargeSignature || null,
+    followUpId: row.followUpId || null,
+    messageId: row.messageId || null,
+    tenantId: row.tenantId || data.tenantId || null,
+    chargePhase: row.chargePhase || null,
+    followUpStatus: row.followUpStatus || data.status || null,
+    decision: row.decision || data.decision || null,
+    status: row.status || data.status || null,
+  };
+}
+
+/**
+ * Dismisses other open tasks that are the same work item.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod Follow-up module.
+ * @param {object} seed Task identity.
+ * @return {Promise<number>}
+ */
+async function dismissDuplicateOpenTasks(db, additionalChargesMod, seed) {
+  const loadNumber = String((seed && seed.loadNumber) || "").trim();
+  const messageId = String((seed && seed.messageId) || "").trim();
+  const followUpId = String((seed && seed.followUpId) || "").trim();
+  let snap = null;
+  if (loadNumber) {
+    snap = await db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", loadNumber)
+        .limit(200)
+        .get();
+  } else if (messageId) {
+    snap = await db.collection(TASK_COLLECTION)
+        .where("messageId", "==", messageId)
+        .limit(20)
+        .get();
+  } else if (followUpId) {
+    snap = await db.collection(TASK_COLLECTION)
+        .where("followUpId", "==", followUpId)
+        .limit(20)
+        .get();
+  }
+  if (!snap) return 0;
+  const openDocs = [];
+  snap.forEach((doc) => {
+    const row = doc.data() || {};
+    if (row.status === TASK_STATUS.DISMISSED) return;
+    if (seed.tenantId && row.tenantId && row.tenantId !== seed.tenantId) {
+      return;
+    }
+    openDocs.push(doc);
+  });
+  const follows = await loadFollowUpSeeds(
+      db, additionalChargesMod, openDocs);
+  const writes = [];
+  openDocs.forEach((doc) => {
+    const row = doc.data() || {};
+    const follow = follows.get(row.followUpId) || null;
+    const candidate = taskWithFollowUpAmount(row, follow);
+    if (!isSameWorkItem(seed, candidate)) return;
+    writes.push(doc.ref.update({
+      status: TASK_STATUS.DISMISSED,
+      dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }));
+  });
+  await Promise.all(writes);
+  return writes.length;
+}
+
+/**
+ * Resolves unresolved follow-ups that are the same charge.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod Follow-up module.
+ * @param {object} seed Charge identity.
+ * @return {Promise<number>}
+ */
+async function resolveDuplicateFollowUps(db, additionalChargesMod, seed) {
+  const loadNumber = String((seed && seed.loadNumber) || "").trim();
+  if (!loadNumber || !additionalChargesMod) return 0;
+  const snap = await db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+      .where("loadNumber", "==", loadNumber)
+      .limit(200)
+      .get();
+  const writes = [];
+  snap.forEach((doc) => {
+    const row = doc.data() || {};
+    if (row.resolved === true) return;
+    if (seed.tenantId && row.tenantId && row.tenantId !== seed.tenantId) {
+      return;
+    }
+    const candidate = {
+      type: TASK_TYPE.ADDITIONAL_CHARGE,
+      loadNumber: row.loadNumber,
+      reason: row.category,
+      chargesTotal: row.chargesTotal,
+      charges: row.charges,
+      followUpId: doc.id,
+    };
+    if (!isSameWorkItem(seed, candidate)) return;
+    writes.push(doc.ref.update({
+      resolved: true,
+      status: additionalChargesMod.FOLLOW_UP_STATUS.RESOLVED,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }));
+  });
+  await Promise.all(writes);
+  return writes.length;
+}
+
+/**
+ * Dismisses a dashboard task or resolves an additional-charge follow-up.
+ * Also clears open retry copies of that same work item.
+ * @param {object} db Firestore instance.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object} opts taskId, source, tenantId.
+ * @return {Promise<object>} {ok: boolean, error?: string}
+ */
 async function dismissDashboardTask(db, additionalChargesMod, opts) {
   const taskId = String(opts.taskId || "").trim();
   const source = String(opts.source || "dashboardTasks");
@@ -359,11 +788,26 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     if (!snap.exists) {
       return {ok: false, error: "Task not found."};
     }
+    const row = snap.data() || {};
+    if (opts.tenantId && row.tenantId && row.tenantId !== opts.tenantId) {
+      return {ok: false, error: "Task not found."};
+    }
     await ref.update({
       resolved: true,
       status: additionalChargesMod.FOLLOW_UP_STATUS.RESOLVED,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+    const seed = {
+      type: TASK_TYPE.ADDITIONAL_CHARGE,
+      tenantId: row.tenantId || opts.tenantId || null,
+      loadNumber: row.loadNumber || null,
+      reason: row.category || null,
+      chargesTotal: row.chargesTotal,
+      charges: row.charges,
+      followUpId: taskId,
+    };
+    await resolveDuplicateFollowUps(db, additionalChargesMod, seed);
+    await dismissDuplicateOpenTasks(db, additionalChargesMod, seed);
     return {ok: true};
   }
 
@@ -381,6 +825,19 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     status: TASK_STATUS.DISMISSED,
     dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+  let seed = taskWithFollowUpAmount(data, null);
+  if (data.type === TASK_TYPE.ADDITIONAL_CHARGE && data.followUpId &&
+      additionalChargesMod) {
+    const followSnap = await db
+        .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .doc(String(data.followUpId))
+        .get();
+    const follow = followSnap.exists ? (followSnap.data() || {}) : null;
+    seed = taskWithFollowUpAmount(data, follow);
+    seed.type = TASK_TYPE.ADDITIONAL_CHARGE;
+    await resolveDuplicateFollowUps(db, additionalChargesMod, seed);
+  }
+  await dismissDuplicateOpenTasks(db, additionalChargesMod, seed);
   return {ok: true};
 }
 
@@ -393,6 +850,9 @@ module.exports = {
   dismissDashboardTask,
   markTasksInDispute,
   isOptionDDispute,
+  isSameWorkItem,
+  collapseDuplicateTasks,
+  chargeLineSignature,
   partitionByChargePhase,
   applyFollowUpDispute,
   chargeTaskFromFollowUp,

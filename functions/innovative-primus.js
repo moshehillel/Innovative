@@ -2721,9 +2721,7 @@ exports.processPrimusWorkflow = onRequest(
               } catch (_) {
                 // Non-fatal — approval email still goes out.
               }
-              await saveOutboundEmail(approvalPayload);
-
-              await additionalChargesMod.createFollowUp(db, {
+              const followUp = await additionalChargesMod.createFollowUp(db, {
                 loadNumber: invoice.loadNumber,
                 carrierName: invoice.carrierName,
                 customerName: invoice.customerName || null,
@@ -2735,6 +2733,9 @@ exports.processPrimusWorkflow = onRequest(
                 invoiceAmount: invoice.invoiceAmount,
                 status: additionalChargesMod.FOLLOW_UP_STATUS.PENDING_APPROVAL,
               });
+              if (!(followUp && followUp.reused)) {
+                await saveOutboundEmail(approvalPayload);
+              }
 
               return res.json({
                 ok: false,

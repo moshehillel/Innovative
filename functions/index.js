@@ -5828,7 +5828,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     }
   }
 
-  const followUpId = await additionalCharges.createFollowUp(db, {
+  const followUp = await additionalCharges.createFollowUp(db, {
     loadNumber: aiResult.loadNumber,
     carrierName: aiResult.carrierName,
     customerName: customerName || null,
@@ -5840,6 +5840,17 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     invoiceAmount: aiResult.invoiceAmount,
     status: additionalCharges.FOLLOW_UP_STATUS.PENDING_APPROVAL,
   });
+  const followUpId = followUp && followUp.id ? followUp.id : followUp;
+  if (followUp && followUp.reused) {
+    await writeLog("info", "email",
+        "Additional-charge approval already open — skipped duplicate", {
+          invoiceId,
+          followUpId,
+          loadNumber: aiResult.loadNumber,
+          category: pending.category,
+        });
+    return;
+  }
 
   let certificateStatus = null;
   if (pending.category ===
@@ -6018,6 +6029,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     followUpId,
     loadNumber: aiResult.loadNumber || null,
     carrierName: aiResult.carrierName || null,
+    reason: pending.category || null,
     emailType: "additional_charge_approval",
     chargesTotal: pending.chargesTotal,
     chargeOptions: ["a", "b", "c", "d", "e"],
@@ -12257,13 +12269,7 @@ async function processGmailMessage(
             hasCertificate: !!aiResult.hasWeightInspectionCertificate,
             customerRate: customerRateFromBooking(bookingForCharges),
           });
-          await saveOutboundEmail(
-              additionalCharges.applyAdditionalChargeEmailCc({
-                type: "carrier_dispute_draft",
-                subject: dispute.subject,
-                html: dispute.html,
-              }));
-          await additionalCharges.createFollowUp(db, {
+          const disputeFollowUp = await additionalCharges.createFollowUp(db, {
             loadNumber: aiResult.loadNumber,
             carrierName: aiResult.carrierName,
             tenantId: tenant.tenantId,
@@ -12274,6 +12280,14 @@ async function processGmailMessage(
             status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
             notes: "Dispute draft emailed for manual submission",
           });
+          if (!(disputeFollowUp && disputeFollowUp.reused)) {
+            await saveOutboundEmail(
+                additionalCharges.applyAdditionalChargeEmailCc({
+                  type: "carrier_dispute_draft",
+                  subject: dispute.subject,
+                  html: dispute.html,
+                }));
+          }
           await writeLog("warn", "ai",
               "Unexplained rate increase — dispute draft generated", {
                 messageId,

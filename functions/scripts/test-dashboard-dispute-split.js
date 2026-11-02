@@ -202,6 +202,99 @@ async function main() {
       dispute.tasks.every(dashboardTasks.isOptionDDispute) &&
       work.tasks.every((task) => !dashboardTasks.isOptionDDispute(task)));
 
+  const stamp = (iso) => ({toDate: () => new Date(iso)});
+  const dupTask = (id, followUpId, total, iso) => ({
+    id,
+    data: {
+      tenantId: "default",
+      type: "additional_charge",
+      status: "open",
+      loadNumber: "265879",
+      reason: "weight_inspection",
+      chargesTotal: total,
+      followUpId,
+      createdAt: stamp(iso),
+    },
+  });
+  const dupFollow = (id, total, iso) => ({
+    id,
+    data: {
+      tenantId: "default",
+      status: "pending_approval",
+      resolved: false,
+      loadNumber: "265879",
+      category: "weight_inspection",
+      chargesTotal: total,
+      createdAt: stamp(iso),
+    },
+  });
+  const dupDb = mockDb(
+      [
+        dupTask("new-824", "fu-new", 824.71, "2026-11-02T17:20:12.406Z"),
+        dupTask("old-824", "fu-old", 824.71, "2026-11-02T17:10:08.285Z"),
+        dupTask("amt-440", "fu-440", 440, "2026-11-01T18:20:15.775Z"),
+        {
+          id: "lumper",
+          data: {
+            tenantId: "default",
+            type: "additional_charge",
+            status: "open",
+            loadNumber: "265879",
+            reason: "accessorial",
+            chargesTotal: 824.71,
+            followUpId: "fu-lumper",
+            createdAt: stamp("2026-11-02T12:00:00.000Z"),
+          },
+        },
+      ],
+      [
+        dupFollow("fu-new", 824.71, "2026-11-02T17:20:12.273Z"),
+        dupFollow("fu-old", 824.71, "2026-11-02T17:10:08.218Z"),
+        dupFollow("fu-440", 440, "2026-11-01T18:20:15.775Z"),
+        dupFollow("fu-lumper", 824.71, "2026-11-02T12:00:00.000Z"),
+      ],
+  );
+  const collapsed = await dashboardTasks.listDashboardTasks(dupDb, chargesMod, {
+    tenantId: "default",
+    limit: 20,
+    chargePhase: "all",
+  });
+  const collapsedIds = collapsed.tasks.map((task) => task.id).sort();
+  check("same load and amount collapses to the newest row",
+      collapsedIds.includes("new-824") && !collapsedIds.includes("old-824"),
+      collapsedIds.join());
+  check("different amount and different charge kind stay",
+      collapsedIds.includes("amt-440") && collapsedIds.includes("lumper") &&
+      collapsed.tasks.length === 3,
+      collapsedIds.join());
+  check("same message id is one human-review task",
+      dashboardTasks.collapseDuplicateTasks([
+        {
+          id: "mail-a",
+          type: "human_review",
+          messageId: "m1",
+          loadNumber: "1",
+          reason: "review",
+          createdAt: "2026-11-02T10:00:00.000Z",
+        },
+        {
+          id: "mail-b",
+          type: "human_review",
+          messageId: "m1",
+          loadNumber: "1",
+          reason: "review",
+          createdAt: "2026-11-02T11:00:00.000Z",
+        },
+        {
+          id: "mail-c",
+          type: "human_review",
+          messageId: "m2",
+          loadNumber: "1",
+          reason: "review",
+          createdAt: "2026-11-02T12:00:00.000Z",
+        },
+      ]).map((task) => task.id).sort().join() === "mail-b,mail-c");
+
   if (failures) process.exit(1);
 }
 

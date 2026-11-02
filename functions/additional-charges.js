@@ -1927,13 +1927,98 @@ function buildDispatcherNotifyReminderEmail(opts) {
 }
 
 /**
+ * Finds an unresolved follow-up for the same load and charge.
+ * @param {object} db Firestore instance.
+ * @param {object} data Follow-up fields.
+ * @return {Promise<object|null>}
+ */
+async function findReusableFollowUp(db, data) {
+  const loadNumber = String((data && data.loadNumber) || "").trim();
+  const category = String((data && data.category) || "").trim();
+  if (!loadNumber || !category) return null;
+  const snap = await db.collection(FOLLOW_UP_COLLECTION)
+      .where("loadNumber", "==", loadNumber)
+      .limit(200)
+      .get();
+  const dashboardTasks = require("./dashboard-tasks");
+  const incoming = {
+    type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+    loadNumber,
+    reason: category,
+    chargesTotal: data.chargesTotal,
+    charges: data.charges,
+    followUpId: null,
+    messageId: null,
+  };
+  let found = null;
+  snap.forEach((doc) => {
+    if (found) return;
+    const row = doc.data() || {};
+    if (row.resolved === true) return;
+    if (data.tenantId && row.tenantId && row.tenantId !== data.tenantId) {
+      return;
+    }
+    const candidate = {
+      type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+      loadNumber: row.loadNumber,
+      reason: row.category,
+      chargesTotal: row.chargesTotal,
+      charges: row.charges,
+      followUpId: doc.id,
+    };
+    if (!dashboardTasks.isSameWorkItem(incoming, candidate)) return;
+    found = {id: doc.id, ref: doc.ref, data: row};
+  });
+  return found;
+}
+
+/**
  * Creates a follow-up entry so the charge is tracked until resolved.
+ * Reuses an unresolved follow-up when this is the same charge.
  * @param {object} db Firestore instance.
  * @param {object} data loadNumber, carrierName, customerName, invoiceId,
  *   category, charges, chargesTotal, invoiceAmount, status, notes.
- * @return {Promise<string>} Follow-up doc id.
+ * @return {Promise<{id: string, reused: boolean}>} Follow-up doc id.
  */
 async function createFollowUp(db, data) {
+  const dashboardTasks = require("./dashboard-tasks");
+  try {
+    const existing = await findReusableFollowUp(db, data);
+    if (existing) {
+      const dispute = data.status === FOLLOW_UP_STATUS.DISPUTING ||
+        String(data.decision || "").toLowerCase() === "d";
+      await dashboardTasks.createDashboardTask(db, {
+        tenantId: data.tenantId || "default",
+        type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
+        title: dispute ?
+          `Charge in dispute - Load ${data.loadNumber || "-"}` :
+          `Additional charge - Load ${data.loadNumber || "-"}`,
+        description: data.notes || existing.data.notes || null,
+        loadNumber: data.loadNumber || null,
+        carrierName: data.carrierName || existing.data.carrierName || null,
+        invoiceId: existing.data.invoiceId || data.invoiceId || null,
+        followUpId: existing.id,
+        reason: data.category || data.status || null,
+        chargesTotal: existing.data.chargesTotal != null ?
+          existing.data.chargesTotal : data.chargesTotal,
+        charges: existing.data.charges || data.charges,
+        chargePhase: dispute ? "dispute" : null,
+        followUpStatus: existing.data.status || data.status || null,
+        decision: existing.data.decision || data.decision || null,
+        disputeNotes: dispute ?
+          (data.disputeNotes || data.notes || null) : null,
+      });
+      console.log(
+          "[createFollowUp] reused open follow-up",
+          existing.id,
+          data.loadNumber || "",
+          data.category || "");
+      return {id: existing.id, reused: true};
+    }
+  } catch (reuseErr) {
+    console.error("[createFollowUp] reuse lookup failed:", reuseErr.message);
+  }
+
   const doc = await db.collection(FOLLOW_UP_COLLECTION).add({
     loadNumber: data.loadNumber || null,
     carrierName: data.carrierName || null,
@@ -1954,7 +2039,6 @@ async function createFollowUp(db, data) {
   });
 
   try {
-    const dashboardTasks = require("./dashboard-tasks");
     const dispute = data.status === FOLLOW_UP_STATUS.DISPUTING ||
       String(data.decision || "").toLowerCase() === "d";
     await dashboardTasks.createDashboardTask(db, {
@@ -1969,6 +2053,8 @@ async function createFollowUp(db, data) {
       invoiceId: data.invoiceId || null,
       followUpId: doc.id,
       reason: data.category || data.status || null,
+      chargesTotal: data.chargesTotal,
+      charges: data.charges,
       chargePhase: dispute ? "dispute" : null,
       followUpStatus: data.status || null,
       decision: data.decision || null,
@@ -1978,7 +2064,7 @@ async function createFollowUp(db, data) {
     console.error("[createFollowUp] dashboard task failed:", taskErr.message);
   }
 
-  return doc.id;
+  return {id: doc.id, reused: false};
 }
 
 /**

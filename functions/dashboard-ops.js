@@ -83,13 +83,63 @@ function serializeNotif(doc) {
 }
 
 /**
+ * @param {object} db Firestore.
+ * @param {object} data Notification fields.
+ * @return {Promise<string|null>} Existing open id, if this is a retry.
+ */
+async function findOpenDuplicateNotification(db, data) {
+  const tenantId = String((data && data.tenantId) || "default");
+  const followUpId = String((data && data.followUpId) || "").trim();
+  const messageId = String((data && data.messageId) || "").trim();
+  const type = String((data && data.type) || "").trim();
+  let snap = null;
+  if (followUpId) {
+    snap = await db.collection(NOTIF_COLLECTION)
+        .where("followUpId", "==", followUpId)
+        .limit(10)
+        .get();
+  } else if (messageId) {
+    snap = await db.collection(NOTIF_COLLECTION)
+        .where("messageId", "==", messageId)
+        .limit(10)
+        .get();
+  }
+  if (!snap) return null;
+  let found = null;
+  snap.forEach((doc) => {
+    if (found) return;
+    const row = doc.data() || {};
+    if (row.status !== NOTIF_STATUS.OPEN) return;
+    if (String(row.tenantId || "default") !== tenantId) return;
+    if (type && row.type && row.type !== type) return;
+    found = doc.id;
+  });
+  return found;
+}
+
+/**
  * Creates an open dashboard notification.
+ * Reuses an open row for the same follow-up or email.
  * @param {object} db Firestore.
  * @param {object} data Fields.
  * @return {Promise<string|null>}
  */
 async function createNotification(db, data) {
   try {
+    try {
+      const existingId = await findOpenDuplicateNotification(db, data);
+      if (existingId) {
+        console.log(
+            "[dashboard-ops] reused open notification",
+            existingId,
+            data.loadNumber || "",
+            data.type || "");
+        return existingId;
+      }
+    } catch (dedupeErr) {
+      console.error("[dashboard-ops] notification dedupe failed:",
+          dedupeErr.message);
+    }
     const ref = await db.collection(NOTIF_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || NOTIF_TYPE.OPS_EMAIL,
