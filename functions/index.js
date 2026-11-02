@@ -14442,12 +14442,20 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
         db, additionalCharges, {
           tenantId: tenant.tenantId,
           limit,
+          offset: req.query.offset,
+          chargePhase: req.query.chargePhase || null,
         });
     return res.json({
       ok: true,
       tenantId: tenant.tenantId,
       tasks: result.tasks,
       openCount: result.openCount,
+      disputeCount: result.disputeCount || 0,
+      filteredCount: result.filteredCount,
+      hasMore: result.hasMore,
+      nextOffset: result.nextOffset,
+      offset: result.offset,
+      limit: result.limit,
     });
   } catch (error) {
     console.error("getDashboardTasks error:", error);

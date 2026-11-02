@@ -1955,16 +1955,24 @@ async function createFollowUp(db, data) {
 
   try {
     const dashboardTasks = require("./dashboard-tasks");
+    const dispute = data.status === FOLLOW_UP_STATUS.DISPUTING ||
+      String(data.decision || "").toLowerCase() === "d";
     await dashboardTasks.createDashboardTask(db, {
       tenantId: data.tenantId || "default",
       type: dashboardTasks.TASK_TYPE.ADDITIONAL_CHARGE,
-      title: `Additional charge - Load ${data.loadNumber || "-"}`,
+      title: dispute ?
+        `Charge in dispute - Load ${data.loadNumber || "-"}` :
+        `Additional charge - Load ${data.loadNumber || "-"}`,
       description: data.notes || null,
       loadNumber: data.loadNumber || null,
       carrierName: data.carrierName || null,
       invoiceId: data.invoiceId || null,
       followUpId: doc.id,
       reason: data.category || data.status || null,
+      chargePhase: dispute ? "dispute" : null,
+      followUpStatus: data.status || null,
+      decision: data.decision || null,
+      disputeNotes: dispute ? (data.disputeNotes || data.notes || null) : null,
     });
   } catch (taskErr) {
     console.error("[createFollowUp] dashboard task failed:", taskErr.message);
@@ -2002,7 +2010,26 @@ async function updateFollowUp(db, opts) {
     update.decisionAt = admin.firestore.FieldValue.serverTimestamp();
   }
   if (opts.notes) update.notes = opts.notes;
+  if (opts.disputeNotes) update.disputeNotes = opts.disputeNotes;
   await ref.update(update);
+  const decision = String(opts.decision || "").toLowerCase();
+  const disputing = opts.status === FOLLOW_UP_STATUS.DISPUTING ||
+    decision === "d";
+  if (!disputing) return;
+  try {
+    const dashboardTasks = require("./dashboard-tasks");
+    const saved = (await ref.get()).data() || {};
+    await dashboardTasks.markTasksInDispute(db, {
+      tenantId: saved.tenantId || opts.tenantId || null,
+      followUpId: ref.id,
+      invoiceId: saved.invoiceId || opts.invoiceId || null,
+      decision: opts.decision || saved.decision || "D",
+      disputeNotes: opts.disputeNotes || saved.disputeNotes ||
+        opts.notes || null,
+    });
+  } catch (taskErr) {
+    console.error("[updateFollowUp] dispute task failed:", taskErr.message);
+  }
 }
 
 /**
