@@ -3,9 +3,11 @@
  * reviewers, plus unhandled-email actions (reply / delete / flag).
  *
  * Env:
- *   DASHBOARD_OPS_PRIMARY=true — park unhandled / ops alerts in the
- *     dashboard instead of (or in addition to) emailing humans. When set,
- *     forwardToHumanReview skips SMTP send after writing a notification.
+ *   DASHBOARD_OPS_PRIMARY — default OFF (emails must go out). Set true only
+ *     with explicit Moshe approval. When true, park unhandled / ops alerts
+ *     on the dashboard instead of emailing; forwardToHumanReview skips SMTP
+ *     after writing a notification. Never flip this on in a deploy without
+ *     that approval.
  */
 
 "use strict";
