@@ -1679,6 +1679,53 @@ check("weight word total → labeled lbs",
 check("weight word total → numeric not string",
     typeof weightWordTotal.lanes[0].freightInfo[0].weight, "number");
 
+check("pallets-dash-boxes is not the pallet count",
+    intake.parseLabeledFreightTotals("o 3 pallets - 55 boxes").palletCount,
+    3);
+check("Pallets- 1 still labeled",
+    intake.parseLabeledFreightTotals("Pallets- 1").palletCount, 1);
+
+const d2129Body = [
+  "1. MGE3 - 808 Hog Mountain Road 30549-2010 - Jefferson, GA",
+  "o 3 pallets - 55 boxes",
+  "2. STL4 - 3050 GATEWAY COMMERCE CENTER DR S 62025-2815 - Edwardsville, IL",
+  "o 3 pallets - 57 boxes",
+  "3. HOU8 - 2303 Hurricane Lane 77545-1129 - FRESNO, TX",
+  "o 3 pallets - 60 boxes",
+  "4. BOS7 - 1180 Innovation Way 02720-4766 - Fall River, MA",
+  "o 4 pallets - 93 boxes",
+  "5. SMF6 - 4930 ALLBAUGH DR 95837-9109 - SACRAMENTO, CA",
+  "o 3 pallets - 58 boxes",
+  "",
+  "1. MGE3 - 808 Hog Mountain Road 30549-2010 - Jefferson, GA",
+  "o 2 pallets - 55 boxes",
+  "Total pallets estimate: 11 pallets",
+  "Pallet size: 48-40-72",
+  "Weight per pallet: ~502 lbs",
+].join("\n");
+const d2129 = intake.normalizeExtractedQuote({
+  lanes: [
+    ["Jefferson", "GA", "30549"],
+    ["Edwardsville", "IL", "62025"],
+    ["FRESNO", "TX", "77545"],
+    ["Fall River", "MA", "02720"],
+    ["SACRAMENTO", "CA", "95837"],
+  ].map(([city, state, zip]) => ({
+    consignee: {city, state, zipCode: zip},
+    freightInfo: [{
+      qty: 1, weight: 502, weightType: "each",
+      length: 40, width: 48, height: 72, dimType: "PLT",
+    }],
+  })),
+}, {subject: "FW: LTL Multiple Destination Shipments Quote", body: d2129Body});
+check("D2129 uses updated pallet counts not 1",
+    d2129.lanes.map((l) => l.freightInfo[0].qty),
+    [3, 3, 3, 4, 3]);
+check("D2129 keeps per-pallet weight",
+    d2129.lanes[0].freightInfo[0].weight, 502);
+check("D2129 weight stays each",
+    d2129.lanes[3].freightInfo[0].weightType, "each");
+
 // maybeRepairFreightExtract: max one attempt (early return, no model call).
 const repairOnceEx = {
   _freightRepairAttempted: true,

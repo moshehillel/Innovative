@@ -163,7 +163,7 @@ function buildEmailActionProcessingPage(opts) {
 }
 
 /**
- * Option B confirm page — accessorials with % markup or flat customer charge.
+ * Option B/E confirm page — Primus typeahead + % markup or flat charge.
  * @param {object} opts Form options.
  * @return {string}
  */
@@ -178,6 +178,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
         `value="${esc(String(value ?? ""))}">`)
       .join("");
   const baseRate = Number(opts.baseCustomerRate) || 0;
+  const bumpRate = !!opts.bumpCustomerRate;
   const charges = Array.isArray(opts.carrierCharges) ? opts.carrierCharges : [];
   const seedRows = charges.map((charge) => ({
     name: String((charge && (charge.label || charge.name || charge.type)) ||
@@ -191,13 +192,33 @@ function buildOptionBAccessorialConfirmPage(opts) {
   const seedJson = JSON.stringify(seedRows)
       .replace(/</g, "\\u003c")
       .replace(/-->/g, "--\\u003e");
-  const baseRateHtml = baseRate > 0 ?
-    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `<strong>Base customer rate (unchanged):</strong> ` +
-    `$${baseRate.toFixed(2)}</p>` :
-    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `The base customer freight rate will stay as-is. For each ` +
-    `accessorial, enter a percent markup or a flat customer charge.</p>`;
+  const catalogJson = JSON.stringify(
+      Array.isArray(opts.accessorialOptions) ? opts.accessorialOptions : [])
+      .replace(/</g, "\\u003c")
+      .replace(/-->/g, "--\\u003e");
+  const accessorialsUrlJson = JSON.stringify(
+      opts.accessorialsUrl ? String(opts.accessorialsUrl) : "");
+  const pickHint =
+    `Type to find each accessorial in the Primus list, then select it. ` +
+    `Add accessorial for a charge Jerry did not list. Then enter a ` +
+    `percent markup (default 30%) or a flat customer amount.`;
+  const baseRateHtml = bumpRate ?
+    (baseRate > 0 ?
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `<strong>Current customer rate:</strong> $${baseRate.toFixed(2)}. ` +
+      `Confirming bumps it by the accessorial total below.</p>` +
+      `<p style="font-size:14px;color:#374151;margin:0 0 12px">` +
+      `${pickHint}</p>` :
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `${pickHint} The total bumps the customer rate.</p>`) :
+    (baseRate > 0 ?
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `<strong>Base customer rate (unchanged):</strong> ` +
+      `$${baseRate.toFixed(2)}</p>` +
+      `<p style="font-size:14px;color:#374151;margin:0 0 12px">` +
+      `${pickHint}</p>` :
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `The base customer freight rate will stay as-is. ${pickHint}</p>`);
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${esc(opts.title || "Confirm option B")}</title>` +
@@ -209,6 +230,16 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `.bill-row input,.bill-row select{width:100%;padding:10px 12px;` +
     `border:1px solid #d1d5db;border-radius:8px;font-size:16px;` +
     `box-sizing:border-box;background:#fff}` +
+    `.bill-picker{position:relative}` +
+    `.bill-menu{display:none;position:absolute;z-index:20;left:0;right:0;` +
+    `top:calc(100% + 2px);max-height:220px;overflow:auto;background:#fff;` +
+    `border:1px solid #d1d5db;border-radius:8px;` +
+    `box-shadow:0 8px 20px rgba(15,23,42,.12)}` +
+    `.bill-menu.open{display:block}` +
+    `.bill-menu-item{display:block;width:100%;text-align:left;border:0;` +
+    `background:#fff;padding:8px 10px;font-size:14px;cursor:pointer}` +
+    `.bill-menu-item:hover{background:#f3f4f6}` +
+    `.bill-menu-empty{padding:8px 10px;font-size:12px;color:#6b7280}` +
     `.bill-meta{font-size:13px;color:#374151;margin:0 0 8px}` +
     `.bill-meta strong{color:#111827}` +
     `.bill-price{display:grid;grid-template-columns:140px 1fr;gap:8px;` +
@@ -251,10 +282,36 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `changed yet.</p>` +
     `<script>` +
     `const seedRows = ${seedJson};` +
+    `let catalog = ${catalogJson};` +
+    `const accessorialsUrl = ${accessorialsUrlJson};` +
     `const container = document.getElementById("bill-lines");` +
     `function escAttr(v){return String(v ?? "").replace(/&/g,"&amp;")` +
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
     `function money(n){return "$"+(Number(n)||0).toFixed(2);}` +
+    `function normName(v){return String(v||"").toLowerCase()` +
+    `.replace(/[^a-z0-9]/g,"");}` +
+    `function filterCatalog(q){` +
+    `const list=Array.isArray(catalog)?catalog:[];` +
+    `const want=normName(q);` +
+    `if(!want)return list.slice(0,50);` +
+    `return list.filter((item)=>{` +
+    `const name=normName(item.name);` +
+    `const code=normName(item.code);` +
+    `const cat=normName(item.category);` +
+    `return name.includes(want)||code.includes(want)||cat.includes(want)||` +
+    `want.includes(name);}).slice(0,50);}` +
+    `function matchCatalog(name,code){` +
+    `const want=normName(name);const wantCode=String(code||"");` +
+    `const list=Array.isArray(catalog)?catalog:[];` +
+    `for(const item of list){` +
+    `if((wantCode&&item.code===wantCode)||` +
+    `(want&&(normName(item.name)===want||normName(item.code)===want)))` +
+    `return item;}` +
+    `if(want.length<4)return null;` +
+    `const loose=list.filter((item)=>{` +
+    `const label=normName(item.name);` +
+    `return label.includes(want)||want.includes(label);});` +
+    `return loose.length===1?loose[0]:null;}` +
     `function refreshPreview(wrap){` +
     `const carrier=Number(wrap.dataset.carrierAmount)||0;` +
     `const mode=wrap.querySelector(".bill-mode").value;` +
@@ -277,19 +334,70 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `const mode=row.pricingMode==="flat"?"flat":"markup";` +
     `const seedVal=mode==="flat"?` +
     `(row.flatAmount!=null?row.flatAmount:row.amount||""):` +
-    `(row.markupPct!=null?row.markupPct:"");` +
-    `wrap.innerHTML="<div class=\\"bill-row-top\\"><div>"+` +
-    `"<label class=\\"field-label\\">Accessorial name</label>"+` +
-    `"<input type=\\"text\\" class=\\"bill-name\\" ` +
-    `placeholder=\\"e.g. Liftgate\\" value=\\""+escAttr(row.name||"")+` +
-    `"\\" required></div>"+` +
-    `"<button type=\\"button\\" class=\\"remove-btn\\" ` +
-    `title=\\"Remove\\">×</button></div>"+` +
-    `"<p class=\\"bill-meta\\"><strong>Carrier cost:</strong> "+` +
-    `(carrier>0?money(carrier):"Not set — use flat charge or edit")+` +
-    `"</p>"+` +
-    `"<div class=\\"bill-price\\"><div>"+` +
-    `"<label class=\\"field-label\\">Charge type</label>"+` +
+    `(row.markupPct!=null?row.markupPct:30);` +
+    `const top=document.createElement("div");top.className="bill-row-top";` +
+    `const nameCell=document.createElement("div");` +
+    `const label=document.createElement("label");` +
+    `label.className="field-label";` +
+    `label.textContent="Primus accessorial";` +
+    `const picker=document.createElement("div");picker.className="bill-picker";` +
+    `const search=document.createElement("input");` +
+    `search.type="search";search.className="bill-name-search";` +
+    `search.autocomplete="off";` +
+    `search.placeholder="Type to find Primus accessorial";` +
+    `const nameHidden=document.createElement("input");` +
+    `nameHidden.type="hidden";nameHidden.className="bill-name";` +
+    `const codeHidden=document.createElement("input");` +
+    `codeHidden.type="hidden";codeHidden.className="bill-code";` +
+    `const menu=document.createElement("div");menu.className="bill-menu";` +
+    `const matched=matchCatalog(row.name,row.code);` +
+    `if(matched){` +
+    `nameHidden.value=matched.name||"";` +
+    `codeHidden.value=matched.code||"";` +
+    `search.value=matched.name||"";` +
+    `}else if(row.name){` +
+    `search.value=String(row.name);` +
+    `search.placeholder="Pick Primus name (Jerry listed: "+row.name+")";}` +
+    `function setChoice(item){` +
+    `nameHidden.value=item.name||"";codeHidden.value=item.code||"";` +
+    `search.value=item.name||"";menu.className="bill-menu";` +
+    `while(menu.firstChild)menu.removeChild(menu.firstChild);}` +
+    `function renderMenu(){` +
+    `while(menu.firstChild)menu.removeChild(menu.firstChild);` +
+    `const items=filterCatalog(search.value);` +
+    `if(!items.length){` +
+    `const empty=document.createElement("div");` +
+    `empty.className="bill-menu-empty";` +
+    `empty.textContent="No Primus match — keep typing";` +
+    `menu.appendChild(empty);menu.className="bill-menu open";return;}` +
+    `items.forEach((item)=>{` +
+    `const btn=document.createElement("button");btn.type="button";` +
+    `btn.className="bill-menu-item";` +
+    `btn.textContent=(item.category?item.category+" — ":"")+item.name;` +
+    `btn.onmousedown=(ev)=>{if(ev&&ev.preventDefault)ev.preventDefault();` +
+    `setChoice(item);};` +
+    `menu.appendChild(btn);});` +
+    `menu.className="bill-menu open";}` +
+    `search.onfocus=()=>renderMenu();` +
+    `search.oninput=()=>{` +
+    `if(String(search.value||"").trim()!==` +
+    `String(nameHidden.value||"").trim()){` +
+    `nameHidden.value="";codeHidden.value="";}` +
+    `renderMenu();};` +
+    `search.onblur=()=>{setTimeout(()=>{menu.className="bill-menu";},150);};` +
+    `picker.appendChild(search);picker.appendChild(nameHidden);` +
+    `picker.appendChild(codeHidden);picker.appendChild(menu);` +
+    `nameCell.appendChild(label);nameCell.appendChild(picker);` +
+    `const remove=document.createElement("button");` +
+    `remove.type="button";remove.className="remove-btn";` +
+    `remove.title="Remove";remove.textContent="×";` +
+    `remove.onclick=()=>{wrap.remove();};` +
+    `top.appendChild(nameCell);top.appendChild(remove);` +
+    `const meta=document.createElement("p");meta.className="bill-meta";` +
+    `meta.innerHTML="<strong>Carrier cost:</strong> "+` +
+    `(carrier>0?money(carrier):"Not set — use flat charge or edit");` +
+    `const price=document.createElement("div");price.className="bill-price";` +
+    `price.innerHTML="<div><label class=\\"field-label\\">Charge type</label>"+` +
     `"<select class=\\"bill-mode\\"><option value=\\"markup\\""+` +
     `(mode==="markup"?" selected":"")+` +
     `">Percent markup</option><option value=\\"flat\\""+` +
@@ -298,35 +406,68 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `"<label class=\\"field-label bill-value-label\\">"+` +
     `(mode==="flat"?"Flat amount ($)":"Markup (%)")+"</label>"+` +
     `"<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
-    `step=\\"0.01\\" placeholder=\\""+(mode==="flat"?"250.00":"20")+` +
+    `step=\\"0.01\\" placeholder=\\""+(mode==="flat"?"250.00":"30")+` +
     `"\\" value=\\""+escAttr(seedVal===0||seedVal?String(seedVal):"")+` +
-    `"\\" required></div></div>"+` +
-    `"<div class=\\"bill-preview\\"></div>";` +
+    `"\\" required></div>";` +
+    `const preview=document.createElement("div");` +
+    `preview.className="bill-preview";` +
+    `wrap.appendChild(top);wrap.appendChild(meta);` +
+    `wrap.appendChild(price);wrap.appendChild(preview);` +
     `const syncLabel=()=>{` +
     `const m=wrap.querySelector(".bill-mode").value;` +
     `wrap.querySelector(".bill-value-label").textContent=` +
     `m==="flat"?"Flat amount ($)":"Markup (%)";` +
     `wrap.querySelector(".bill-value").placeholder=` +
-    `m==="flat"?"250.00":"20";refreshPreview(wrap);};` +
+    `m==="flat"?"250.00":"30";refreshPreview(wrap);};` +
     `wrap.querySelector(".bill-mode").onchange=syncLabel;` +
     `wrap.querySelector(".bill-value").oninput=()=>refreshPreview(wrap);` +
-    `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
     `container.appendChild(wrap);refreshPreview(wrap);}` +
-    `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);` +
+    `function renderSeedRows(){` +
+    `container.innerHTML="";` +
+    `(seedRows.length?seedRows:[{name:"",carrierAmount:0}]).forEach(addRow);}` +
+    `renderSeedRows();` +
     `document.getElementById("add-bill-line").onclick=` +
     `()=>addRow({name:"",carrierAmount:0});` +
+    `if(accessorialsUrl){` +
+    `fetch(accessorialsUrl,{credentials:"omit"}).then((r)=>r.json())` +
+    `.then((data)=>{` +
+    `if(!data||!Array.isArray(data.accessorials)||!data.accessorials.length)` +
+    `return;` +
+    `catalog=data.accessorials;` +
+    `const hadRows=container.querySelectorAll(".bill-row").length;` +
+    `if(hadRows){` +
+    `const existing=[];` +
+    `container.querySelectorAll(".bill-row").forEach((row)=>{` +
+    `existing.push({` +
+    `name:row.querySelector(".bill-name").value||` +
+    `row.querySelector(".bill-name-search").value||"",` +
+    `code:row.querySelector(".bill-code").value||"",` +
+    `carrierAmount:Number(row.dataset.carrierAmount)||0,` +
+    `pricingMode:row.querySelector(".bill-mode").value,` +
+    `markupPct:row.querySelector(".bill-mode").value==="markup"?` +
+    `row.querySelector(".bill-value").value:null,` +
+    `flatAmount:row.querySelector(".bill-mode").value==="flat"?` +
+    `row.querySelector(".bill-value").value:null});});` +
+    `container.innerHTML="";` +
+    `existing.forEach(addRow);}` +
+    `}).catch(()=>{});}` +
     `document.getElementById("option-b-form").onsubmit=(e)=>{` +
     `const lines=[];` +
     `for(const row of container.querySelectorAll(".bill-row")){` +
-    `const name=row.querySelector(".bill-name").value.trim();` +
-    `if(!name)continue;` +
+    `const name=(row.querySelector(".bill-name").value||"").trim();` +
+    `const code=row.querySelector(".bill-code").value||"";` +
+    `const typed=(row.querySelector(".bill-name-search").value||"").trim();` +
+    `if(!name){` +
+    `if(typed){alert("Pick \\""+typed+"\\" from the Primus list "+` +
+    `"(type to filter, then select).");e.preventDefault();return false;}` +
+    `continue;}` +
     `const carrierAmount=Number(row.dataset.carrierAmount)||0;` +
     `const mode=row.querySelector(".bill-mode").value;` +
     `const val=Number(row.querySelector(".bill-value").value);` +
     `if(mode==="flat"){` +
     `if(!(val>0)){alert("Enter a flat customer charge for "+name);` +
     `e.preventDefault();return false;}` +
-    `lines.push({name,carrierAmount,pricingMode:"flat",flatAmount:val,` +
+    `lines.push({name,code,carrierAmount,pricingMode:"flat",flatAmount:val,` +
     `markupPct:null,amount:val});` +
     `}else{` +
     `if(!(carrierAmount>0)){alert(name+": carrier cost required for ` +
@@ -334,7 +475,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `if(!Number.isFinite(val)||val<0){alert("Enter a markup % for "+name);` +
     `e.preventDefault();return false;}` +
     `const amount=Math.round(carrierAmount*(1+val/100)*100)/100;` +
-    `lines.push({name,carrierAmount,pricingMode:"markup",markupPct:val,` +
+    `lines.push({name,code,carrierAmount,pricingMode:"markup",markupPct:val,` +
     `flatAmount:null,amount});}}` +
     `if(!lines.length){alert("Enter at least one accessorial with a ` +
     `percent markup or flat charge.");e.preventDefault();return false;}` +
@@ -369,11 +510,118 @@ function simpleResultPage(title, color, message, loadNumber) {
     `</body></html>`;
 }
 
+/**
+ * Option F confirm page — flat amount or percent of the carrier invoice.
+ * The result replaces the customer rate and is billed as accessorial Freight.
+ * @param {object} opts Form options.
+ * @return {string}
+ */
+function buildOptionFConfirmPage(opts) {
+  const fields = opts.fields || {};
+  const btnColor = opts.confirmColor || "#c2410c";
+  const formAction = `${functionsBaseUrl()}/${opts.actionPath}`;
+  const esc = escapeHtml;
+  const hidden = Object.entries(fields)
+      .map(([name, value]) =>
+        `<input type="hidden" name="${esc(name)}" ` +
+        `value="${esc(String(value ?? ""))}">`)
+      .join("");
+  const invoiceAmount = Number(opts.invoiceAmount) || 0;
+  const invoiceLabel = invoiceAmount > 0 ?
+    `$${invoiceAmount.toFixed(2)}` : "unavailable";
+  return `<!doctype html><html><head><meta charset="utf-8">` +
+    `<meta name="viewport" content="width=device-width,initial-scale=1">` +
+    `<title>${esc(opts.title || "Confirm option F")}</title>` +
+    `<style>` +
+    `input[type=number],select{width:100%;padding:10px 12px;` +
+    `border:1px solid #d1d5db;border-radius:8px;font-size:16px;` +
+    `box-sizing:border-box;background:#fff}` +
+    `.field-label{font-size:12px;color:#6b7280;margin:0 0 4px;display:block}` +
+    `.mode{display:flex;gap:16px;margin:8px 0 14px;font-size:15px}` +
+    `.preview{font-size:15px;color:#9a3412;font-weight:600;margin:12px 0}` +
+    `@keyframes spin{to{transform:rotate(360deg)}}` +
+    `</style></head>` +
+    `<body style="font-family:Arial,sans-serif;max-width:640px;` +
+    `margin:48px auto;padding:0 16px;color:#111827">` +
+    `<h1 style="font-size:22px;margin-bottom:12px">` +
+    `${esc(opts.title || "Confirm option F")}</h1>` +
+    `<p style="font-size:16px;color:#374151;line-height:1.5">` +
+    `${opts.description || ""}</p>` +
+    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+    `<strong>Carrier invoice total:</strong> ${esc(invoiceLabel)}</p>` +
+    `<form method="POST" action="${esc(formAction)}" id="option-f-form" ` +
+    `style="margin-top:16px">` +
+    hidden +
+    `<span class="field-label">How to set the customer rate</span>` +
+    `<div class="mode">` +
+    `<label><input type="radio" name="rateMode" value="flat" checked> ` +
+    `Flat amount ($)</label>` +
+    `<label><input type="radio" name="rateMode" value="percent"` +
+    (invoiceAmount > 0 ? "" : " disabled") +
+    `> Percent of invoice (%)</label>` +
+    `</div>` +
+    `<label class="field-label" for="rateInput" id="rate-input-label">` +
+    `Flat amount ($)</label>` +
+    `<input id="rateInput" name="rateInput" type="number" required ` +
+    `min="0.01" step="0.01" placeholder="0.00">` +
+    `<p class="preview" id="rate-preview"></p>` +
+    `<p style="font-size:13px;color:#6b7280">This amount replaces the ` +
+    `customer rate and is entered in Primus as an accessorial named ` +
+    `<strong>Freight</strong>. Nothing is sent until you click Confirm.</p>` +
+    `<button type="submit" style="margin-top:16px;background:${btnColor};` +
+    `color:#fff;border:0;padding:12px 18px;border-radius:8px;` +
+    `font-size:16px;font-weight:600;cursor:pointer">` +
+    `${esc(opts.confirmLabel || "Confirm option F")}</button>` +
+    `</form>` +
+    `<script>` +
+    `(function(){` +
+    `var invoice=${invoiceAmount > 0 ? invoiceAmount.toFixed(2) : "0"};` +
+    `var form=document.getElementById("option-f-form");` +
+    `var input=document.getElementById("rateInput");` +
+    `var label=document.getElementById("rate-input-label");` +
+    `var preview=document.getElementById("rate-preview");` +
+    `function mode(){` +
+    `var picked=form.querySelector('input[name="rateMode"]:checked');` +
+    `return picked?picked.value:"flat";}` +
+    `function refresh(){` +
+    `var pct=mode()==="percent";` +
+    `label.textContent=pct?"Percent of invoice (%)":"Flat amount ($)";` +
+    `input.placeholder=pct?"0.00":"0.00";` +
+    `input.step=pct?"0.01":"0.01";` +
+    `var n=Number(input.value);` +
+    `var amount=0;` +
+    `if(Number.isFinite(n)&&n>0){` +
+    `amount=pct?Math.round(invoice*(n/100)*100)/100:Math.round(n*100)/100;}` +
+    `preview.textContent=amount>0?` +
+    `("Customer rate entered in Primus as Freight: $"+amount.toFixed(2)):"";` +
+    `}` +
+    `form.addEventListener("change",refresh);` +
+    `input.addEventListener("input",refresh);` +
+    `form.addEventListener("submit",function(e){` +
+    `var n=Number(input.value);` +
+    `if(!Number.isFinite(n)||n<=0){` +
+    `alert(mode()==="percent"?` +
+    `"Enter a percent greater than 0.":"Enter a flat amount greater than 0.");` +
+    `e.preventDefault();return false;}` +
+    `if(mode()==="percent"&&(!(invoice>0)||n>500)){` +
+    `alert(invoice>0?"Percent must be 500 or less.":` +
+    `"Invoice total is missing. Use a flat amount.");` +
+    `e.preventDefault();return false;}` +
+    `var btn=form.querySelector('button[type="submit"]');` +
+    `if(btn&&!btn.disabled){btn.disabled=true;` +
+    `btn.textContent="Processing...";}` +
+    `return true;});` +
+    `refresh();` +
+    `})();` +
+    `</script></body></html>`;
+}
+
 module.exports = {
   escapeHtml,
   functionsBaseUrl,
   buildEmailActionConfirmPage,
   buildEmailActionProcessingPage,
   buildOptionBAccessorialConfirmPage,
+  buildOptionFConfirmPage,
   simpleResultPage,
 };

@@ -26,6 +26,31 @@ function cors(req, res) {
 }
 
 /**
+ * GET Primus accessorial choices for A/E typeaheads.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<object>}
+ */
+async function handleListAccessorials(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "GET") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    await deps.resolveDashboardTenant(req);
+    const catalog = require("./quote-accessorial-catalog");
+    const accessorials = await catalog.listPrimusAccessorialChoices();
+    return res.json({ok: true, accessorials});
+  } catch (error) {
+    console.error("getDashboardAccessorials error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not load the Primus accessorial list.",
+    });
+  }
+}
+
+/**
  * GET open notifications.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -148,7 +173,7 @@ async function handleFlagNotification(req, res) {
 }
 
 /**
- * POST additional-charge decision A–E from the dashboard.
+ * POST additional-charge decision A–F from the dashboard.
  * Signs an email-action token and reuses additionalChargeAction.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -164,10 +189,10 @@ async function handleAdditionalChargeDecision(req, res) {
     const body = req.body || {};
     const invoiceId = String(body.invoiceId || "").trim();
     const option = String(body.option || "").toLowerCase();
-    if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+    if (!invoiceId || !["a", "b", "c", "d", "e", "f"].includes(option)) {
       return res.status(400).json({
         ok: false,
-        error: "invoiceId and option (a|b|c|d|e) are required.",
+        error: "invoiceId and option (a|b|c|d|e|f) are required.",
       });
     }
 
@@ -184,6 +209,9 @@ async function handleAdditionalChargeDecision(req, res) {
       option,
       customerChargeAmount: body.customerChargeAmount,
       customerBillLines: body.customerBillLines,
+      rateMode: body.rateMode || body.optionFRateMode,
+      rateInput: body.rateInput != null ?
+        body.rateInput : body.optionFRateInput,
     });
     if (!result.ok) {
       return res.status(result.status || 400).json(result);
@@ -356,6 +384,7 @@ function extractEmailAddress(from) {
 
 module.exports = {
   init,
+  handleListAccessorials,
   handleListNotifications,
   handleDismissNotification,
   handleFlagNotification,

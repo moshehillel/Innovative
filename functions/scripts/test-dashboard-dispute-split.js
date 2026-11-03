@@ -43,7 +43,8 @@ function mockDb(tasks, charges) {
 
   return {
     collection(name) {
-      const rows = name === "dashboardTasks" ? tasks : charges;
+      const rows = name === "dashboardTasks" ? tasks :
+        (name === "dashboardNotifications" ? [] : charges);
       const filters = [];
       const query = {
         where(field, _op, value) {
@@ -294,6 +295,48 @@ async function main() {
           createdAt: "2026-11-02T12:00:00.000Z",
         },
       ]).map((task) => task.id).sort().join() === "mail-b,mail-c");
+
+  check("dispatcherMatches finds Leo by email",
+      dashboardTasks.dispatcherMatches({
+        dispatcherEmail: "leo@innovativecarriers.com",
+        dispatcherKey: "leo",
+        dispatcherName: "Leo",
+      }, "leo@innovativecarriers.com") === true);
+  check("dispatcherMatches finds Leo by key",
+      dashboardTasks.dispatcherMatches({
+        dispatcherEmail: "leo@innovativecarriers.com",
+        dispatcherKey: "leo",
+      }, "leo") === true);
+  check("dispatcherMatches rejects other dispatcher",
+      dashboardTasks.dispatcherMatches({
+        dispatcherEmail: "jak@innovativecarriers.com",
+        dispatcherKey: "jak",
+      }, "leo") === false);
+  check("dispatcherMatches blank query keeps all",
+      dashboardTasks.dispatcherMatches({dispatcherKey: "leo"}, "") === true);
+
+  const leoOnly = dashboardTasks.partitionByChargePhase([
+    {
+      id: "leo-1",
+      type: "additional_charge",
+      dispatcherKey: "leo",
+      dispatcherEmail: "leo@innovativecarriers.com",
+    },
+    {
+      id: "jak-1",
+      type: "additional_charge",
+      dispatcherKey: "jak",
+      dispatcherEmail: "jak@innovativecarriers.com",
+    },
+    {
+      id: "none-1",
+      type: "human_review",
+    },
+  ], {chargePhase: "", dispatcher: "leo", limit: 20, offset: 0});
+  check("partition filters to selected dispatcher only",
+      leoOnly.tasks.length === 1 && leoOnly.tasks[0].id === "leo-1" &&
+      leoOnly.filteredCount === 1,
+      leoOnly.tasks.map((t) => t.id).join());
 
   if (failures) process.exit(1);
 }

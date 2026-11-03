@@ -75,11 +75,44 @@ function serializeNotif(doc) {
     chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
     chargeOptions: Array.isArray(d.chargeOptions) ? d.chargeOptions : null,
     emailSent: d.emailSent === true,
+    ownerBucket: d.ownerBucket || null,
+    awaitingReplyFrom: d.awaitingReplyFrom || null,
+    dispatcherEmail: d.dispatcherEmail || null,
+    dispatcherName: d.dispatcherName || null,
+    dispatcherKey: d.dispatcherKey || null,
+    receivedAt: tsIso(d.receivedAt) || tsIso(d.emailReceivedAt) || null,
     createdAt: tsIso(d.createdAt),
     dismissedAt: tsIso(d.dismissedAt),
     flaggedAt: tsIso(d.flaggedAt),
     flagNote: d.flagNote || null,
   };
+}
+
+/**
+ * Reads a query in chunks of 200 until no rows remain.
+ * @param {object} baseQuery Firestore query, newest first.
+ * @param {number} [maxDocs] Optional stop.
+ * @return {Promise<object[]>}
+ */
+async function collectNotifPage(baseQuery, maxDocs) {
+  const pageSize = 200;
+  const docs = [];
+  let last = null;
+  const cap = Number(maxDocs);
+  const bounded = Number.isFinite(cap) && cap > 0;
+  while (!bounded || docs.length < cap) {
+    const room = bounded ?
+      Math.min(pageSize, cap - docs.length) : pageSize;
+    let query = baseQuery.limit(room);
+    if (last) query = query.startAfter(last);
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await query.get();
+    if (snap.empty) break;
+    docs.push(...snap.docs);
+    last = snap.docs[snap.docs.length - 1];
+    if (snap.size < room) break;
+  }
+  return docs;
 }
 
 /**
@@ -178,28 +211,29 @@ async function createNotification(db, data) {
 
 /**
  * Lists open notifications for a tenant.
+ * opts.all returns every open row (daily unfinished digest).
  * @param {object} db Firestore.
- * @param {object} opts tenantId, limit, type.
+ * @param {object} opts tenantId, limit, type, all.
  * @return {Promise<object>}
  */
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
-  const limit = Math.min(Number(opts.limit) || 50, 100);
-  let query = db.collection(NOTIF_COLLECTION)
+  const returnAll = opts && opts.all === true;
+  let base = db.collection(NOTIF_COLLECTION)
       .where("tenantId", "==", tenantId)
       .where("status", "==", NOTIF_STATUS.OPEN)
-      .orderBy("createdAt", "desc")
-      .limit(limit);
+      .orderBy("createdAt", "desc");
   if (opts.type) {
-    query = db.collection(NOTIF_COLLECTION)
+    base = db.collection(NOTIF_COLLECTION)
         .where("tenantId", "==", tenantId)
         .where("status", "==", NOTIF_STATUS.OPEN)
         .where("type", "==", String(opts.type))
-        .orderBy("createdAt", "desc")
-        .limit(limit);
+        .orderBy("createdAt", "desc");
   }
-  const snap = await query.get();
-  const notifications = snap.docs.map(serializeNotif);
+  const docs = returnAll ?
+    await collectNotifPage(base) :
+    await collectNotifPage(base, Math.min(Number(opts.limit) || 50, 100));
+  const notifications = docs.map(serializeNotif);
   return {notifications, openCount: notifications.length};
 }
 

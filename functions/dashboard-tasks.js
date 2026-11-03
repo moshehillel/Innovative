@@ -6,6 +6,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const ownership = require("./dashboard-ownership");
 
 const TASK_COLLECTION = "dashboardTasks";
 
@@ -270,6 +271,16 @@ async function createDashboardTask(db, data) {
         if (data.description && !existing.data.description) {
           patch.description = data.description;
         }
+        if (!existing.data.dispatcherKey && !existing.data.dispatcherEmail) {
+          const owner = ownership.ownershipFieldsForCreate(data);
+          if (owner.dispatcherKey || owner.dispatcherEmail) {
+            patch.ownerBucket = owner.ownerBucket;
+            patch.awaitingReplyFrom = owner.awaitingReplyFrom;
+            patch.dispatcherEmail = owner.dispatcherEmail;
+            patch.dispatcherName = owner.dispatcherName;
+            patch.dispatcherKey = owner.dispatcherKey;
+          }
+        }
         if (Object.keys(patch).length) {
           await existing.ref.update(patch);
         }
@@ -284,11 +295,15 @@ async function createDashboardTask(db, data) {
       console.error("[createDashboardTask] dedupe lookup failed:",
           dedupeErr.message);
     }
+    const owner = ownership.ownershipFieldsForCreate(data);
     const doc = await db.collection(TASK_COLLECTION).add({
       tenantId: data.tenantId || "default",
       type: data.type || TASK_TYPE.HUMAN_REVIEW,
       title: data.title || "Action required",
       description: data.description || null,
+      from: data.from || null,
+      to: data.to || null,
+      cc: data.cc || null,
       loadNumber: data.loadNumber || null,
       proNumber: data.proNumber || null,
       carrierName: data.carrierName || null,
@@ -300,6 +315,7 @@ async function createDashboardTask(db, data) {
       chargesTotal: data.chargesTotal != null ?
         Number(data.chargesTotal) : null,
       chargeSignature: signature || null,
+      ...owner,
       status: TASK_STATUS.OPEN,
       chargePhase: data.chargePhase || null,
       followUpStatus: data.followUpStatus || null,
@@ -321,13 +337,16 @@ async function createDashboardTask(db, data) {
  */
 function serializeTaskDoc(doc) {
   const d = doc.data() || {};
-  return {
+  return ownership.applyOwnerDefaults({
     id: doc.id,
     source: "dashboardTasks",
     tenantId: d.tenantId || null,
     type: d.type || null,
     title: d.title || null,
     description: d.description || null,
+    from: d.from || null,
+    to: d.to || null,
+    cc: d.cc || null,
     loadNumber: d.loadNumber || null,
     proNumber: d.proNumber || null,
     carrierName: d.carrierName || null,
@@ -339,6 +358,11 @@ function serializeTaskDoc(doc) {
     chargesTotal: d.chargesTotal != null ? d.chargesTotal : null,
     chargeSignature: d.chargeSignature || null,
     status: d.status || null,
+    ownerBucket: d.ownerBucket || null,
+    awaitingReplyFrom: d.awaitingReplyFrom || null,
+    dispatcherEmail: d.dispatcherEmail || null,
+    dispatcherName: d.dispatcherName || null,
+    dispatcherKey: d.dispatcherKey || null,
     chargePhase: d.chargePhase || null,
     followUpStatus: d.followUpStatus || null,
     decision: d.decision || null,
@@ -347,7 +371,36 @@ function serializeTaskDoc(doc) {
       d.createdAt.toDate().toISOString() : null,
     dismissedAt: d.dismissedAt && d.dismissedAt.toDate ?
       d.dismissedAt.toDate().toISOString() : null,
-  };
+  });
+}
+
+/**
+ * Match a dispatcher filter (key, email, or name). Blank matches all.
+ * @param {object} item Task row.
+ * @param {string} query Filter text.
+ * @return {boolean}
+ */
+function dispatcherMatches(item, query) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return true;
+  const roster = ownership.OPS_DISPATCHERS.find((person) =>
+    person.key === q || person.email === q ||
+    person.name.toLowerCase() === q);
+  const needles = roster ?
+    [roster.key, roster.email, roster.name.toLowerCase()] : [q];
+  const fields = [
+    item && item.dispatcherKey,
+    item && item.dispatcherEmail,
+    item && item.dispatcherName,
+    item && item.to,
+    item && item.cc,
+  ];
+  return fields.some((value) => {
+    const text = String(value || "").trim().toLowerCase();
+    if (!text) return false;
+    return needles.some((needle) =>
+      text === needle || text.includes(needle));
+  });
 }
 
 /**
@@ -414,7 +467,14 @@ function chargeTaskFromFollowUp(id, data, tenantId) {
   const dispute = followUpIsDispute(data);
   const created = data.createdAt && data.createdAt.toDate ?
     data.createdAt.toDate().toISOString() : null;
-  return applyFollowUpDispute({
+  const owner = ownership.ownershipFieldsForCreate({
+    type: TASK_TYPE.ADDITIONAL_CHARGE,
+    to: data.to || null,
+    cc: data.cc || null,
+    dispatcherEmail: data.dispatcherEmail || null,
+    dispatcherName: data.dispatcherName || null,
+  });
+  return applyFollowUpDispute(ownership.applyOwnerDefaults({
     id,
     source: "additionalCharges",
     tenantId: data.tenantId || tenantId,
@@ -423,6 +483,8 @@ function chargeTaskFromFollowUp(id, data, tenantId) {
       `Charge in dispute — Load ${data.loadNumber || "—"}` :
       `Additional charge — Load ${data.loadNumber || "—"}`,
     description: data.notes || null,
+    to: data.to || null,
+    cc: data.cc || null,
     loadNumber: data.loadNumber || null,
     proNumber: null,
     carrierName: data.carrierName || null,
@@ -435,23 +497,29 @@ function chargeTaskFromFollowUp(id, data, tenantId) {
     chargesTotal: data.chargesTotal != null ? data.chargesTotal : null,
     chargeSignature: chargeLineSignature(data.charges) || null,
     invoiceAmount: data.invoiceAmount || null,
+    ownerBucket: data.ownerBucket || owner.ownerBucket,
+    dispatcherEmail: data.dispatcherEmail || owner.dispatcherEmail,
+    dispatcherName: data.dispatcherName || owner.dispatcherName,
+    dispatcherKey: data.dispatcherKey || owner.dispatcherKey,
     chargePhase: dispute ? "dispute" : null,
     followUpStatus: data.status || null,
     decision: data.decision || null,
     disputeNotes: data.disputeNotes || null,
     createdAt: created,
     dismissedAt: null,
-  }, data);
+  }), data);
 }
 
 /**
  * Work excludes option D. In Dispute is only those rows.
  * @param {object[]} tasks Merged rows, newest first.
- * @param {object} opts chargePhase, limit, offset.
+ * @param {object} opts chargePhase, dispatcher, limit, offset.
  * @return {object}
  */
 function partitionByChargePhase(tasks, opts) {
   const phase = String((opts && opts.chargePhase) || "").toLowerCase();
+  const dispatcher = String(
+      (opts && (opts.dispatcher || opts.dispatcherKey)) || "").trim();
   const limit = Math.min(Math.max(Number(opts && opts.limit) || 50, 1), 100);
   const offset = Math.max(0, Number(opts && opts.offset) || 0);
   const rows = Array.isArray(tasks) ? tasks : [];
@@ -460,6 +528,9 @@ function partitionByChargePhase(tasks, opts) {
   if (phase === "dispute") working = disputes;
   else if (phase !== "all") {
     working = rows.filter((task) => !isOptionDDispute(task));
+  }
+  if (dispatcher) {
+    working = working.filter((task) => dispatcherMatches(task, dispatcher));
   }
   const page = working.slice(offset, offset + limit);
   return {
@@ -541,6 +612,21 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     if (!task.reason && data.category) task.reason = data.category;
     const signature = chargeLineSignature(data.charges);
     if (signature && !task.chargeSignature) task.chargeSignature = signature;
+    if (!task.dispatcherKey && !task.dispatcherEmail) {
+      const enriched = ownership.applyOwnerDefaults({
+        ...task,
+        to: task.to || data.to || null,
+        cc: task.cc || data.cc || null,
+        dispatcherEmail: data.dispatcherEmail || null,
+        dispatcherName: data.dispatcherName || null,
+      });
+      task.to = enriched.to;
+      task.cc = enriched.cc;
+      task.ownerBucket = enriched.ownerBucket;
+      task.dispatcherEmail = enriched.dispatcherEmail;
+      task.dispatcherName = enriched.dispatcherName;
+      task.dispatcherKey = enriched.dispatcherKey;
+    }
   });
 
   const linkedFollowUpIds = new Set(
@@ -551,6 +637,8 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     tasks.push(chargeTaskFromFollowUp(id, data, tenantId));
   });
 
+  await enrichTasksFromNotifications(db, tasks, tenantId);
+
   const visible = collapseDuplicateTasks(tasks);
   visible.sort((a, b) => {
     const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
@@ -560,8 +648,66 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
 
   return partitionByChargePhase(visible, {
     chargePhase: opts.chargePhase,
+    dispatcher: opts.dispatcher || opts.dispatcherKey || "",
     limit,
     offset,
+  });
+}
+
+/**
+ * Older tasks lack dispatcher fields. Open notifications still store To/Cc
+ * from the approval email, so reuse those to assign roster owners at list time.
+ * @param {object} db Firestore.
+ * @param {object[]} tasks Task rows.
+ * @param {string} tenantId Tenant.
+ * @return {Promise<void>}
+ */
+async function enrichTasksFromNotifications(db, tasks, tenantId) {
+  const need = (tasks || []).filter((task) =>
+    task && !task.dispatcherKey && !task.dispatcherEmail);
+  if (!need.length) return;
+  let snap;
+  try {
+    snap = await db.collection("dashboardNotifications")
+        .where("tenantId", "==", tenantId)
+        .where("status", "==", "open")
+        .orderBy("createdAt", "desc")
+        .limit(200)
+        .get();
+  } catch (err) {
+    console.error("[enrichTasksFromNotifications]", err.message);
+    return;
+  }
+  if (!snap || snap.empty) return;
+  const byFollowUp = new Map();
+  const byMessage = new Map();
+  const byLoad = new Map();
+  snap.docs.forEach((doc) => {
+    const d = doc.data() || {};
+    const row = {to: d.to || null, cc: d.cc || null};
+    if (d.followUpId) byFollowUp.set(String(d.followUpId), row);
+    if (d.messageId) byMessage.set(String(d.messageId), row);
+    if (d.loadNumber && !byLoad.has(String(d.loadNumber))) {
+      byLoad.set(String(d.loadNumber), row);
+    }
+  });
+  need.forEach((task) => {
+    const hit = (task.followUpId && byFollowUp.get(String(task.followUpId))) ||
+      (task.messageId && byMessage.get(String(task.messageId))) ||
+      (task.loadNumber && byLoad.get(String(task.loadNumber))) ||
+      null;
+    if (!hit) return;
+    const enriched = ownership.applyOwnerDefaults({
+      ...task,
+      to: task.to || hit.to,
+      cc: task.cc || hit.cc,
+    });
+    task.to = enriched.to;
+    task.cc = enriched.cc;
+    task.ownerBucket = enriched.ownerBucket;
+    task.dispatcherEmail = enriched.dispatcherEmail;
+    task.dispatcherName = enriched.dispatcherName;
+    task.dispatcherKey = enriched.dispatcherKey;
   });
 }
 
@@ -856,4 +1002,5 @@ module.exports = {
   partitionByChargePhase,
   applyFollowUpDispute,
   chargeTaskFromFollowUp,
+  dispatcherMatches,
 };

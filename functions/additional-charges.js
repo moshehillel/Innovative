@@ -14,7 +14,7 @@
  *      the carrier invoice. The inspection certificate is uploaded to
  *      Primus only when it has no prices, so it can be sent to the
  *      customer.
- *   C. Approval email offers FIVE decisions:
+ *   C. Approval email offers SIX decisions:
  *        A — pay carrier + bill customer; auto-email the customer contact.
  *        B — pay carrier + bill customer; dispatcher notifies the customer
  *            (system reminds the dispatcher / adds to their task list).
@@ -23,6 +23,9 @@
  *            submission (LTL portals) or email (TL).
  *        E — pay carrier + bill customer; enter amount and bump rate; no
  *            separate customer notification (invoice carries the charge).
+ *        F — replace the customer rate with a flat amount or a percent of
+ *            the carrier invoice total. That amount is entered in Primus
+ *            as an accessorial named Freight. No separate customer email.
  *   D. Every case is tracked on an Additional Charges Follow-Up list until
  *      resolved.
  *
@@ -47,7 +50,10 @@ const {
 const FOLLOW_UP_COLLECTION = "additionalCharges";
 
 const LISA_EMAIL = process.env.LOW_PROFIT_CC_EMAIL ||
-  "Lisa@innovativecarriers.com";
+    "Lisa@innovativecarriers.com";
+
+/** Primus customer-charge accessorial written by option F. */
+const FREIGHT_ACCESSORIAL_NAME = "Freight";
 
 /** Follow-up lifecycle statuses. */
 const FOLLOW_UP_STATUS = Object.freeze({
@@ -89,6 +95,12 @@ const MIN_IGNORABLE_CHARGE_AMOUNT = 5;
 
 /** Flat band for lumper base-freight pre-check vs Primus carrier cost. */
 const LUMPER_BASE_TOLERANCE = 5;
+
+/**
+ * A few dollars: match the gap to an accessorial instead of calling it a
+ * reweigh when weight/class also differ.
+ */
+const SMALL_GAP_MAX = 25;
 
 /**
  * Coerce money-like values ("$503.11", "1,250.00") to a finite number.
@@ -280,6 +292,66 @@ function formatCustomerRate(amount) {
 }
 
 /**
+ * Option F: customer rate is a flat amount, or a percent of the carrier
+ * invoice total. That amount is the full customer rate (not a bump).
+ * @param {object} opts mode flat|percent, input, invoiceAmount.
+ * @return {object} {ok, amount?, mode?, input?, invoiceAmount?, error?}
+ */
+function computeFreightCustomerRate(opts) {
+  const row = opts || {};
+  const mode = String(row.mode || "").trim().toLowerCase();
+  const input = Math.round(Number(row.input) * 100) / 100;
+  const invoiceAmount = coerceMoneyNumber(row.invoiceAmount);
+  if (mode !== "flat" && mode !== "percent") {
+    return {
+      ok: false,
+      error: "Choose a flat amount or a percent of the invoice.",
+    };
+  }
+  if (!Number.isFinite(input) || input <= 0) {
+    return {
+      ok: false,
+      error: mode === "percent" ?
+        "Enter a percent greater than 0." :
+        "Enter a flat amount greater than 0.",
+    };
+  }
+  if (mode === "percent") {
+    if (!(invoiceAmount > 0)) {
+      return {
+        ok: false,
+        error: "Invoice total is missing, so a percent cannot be " +
+          "calculated. Enter a flat amount instead.",
+      };
+    }
+    if (input > 500) {
+      return {ok: false, error: "Percent must be 500 or less."};
+    }
+    const amount = Math.round(invoiceAmount * (input / 100) * 100) / 100;
+    if (!(amount > 0)) {
+      return {
+        ok: false,
+        error: "Calculated customer rate must be greater than 0.",
+      };
+    }
+    return {
+      ok: true,
+      mode: "percent",
+      input,
+      amount,
+      invoiceAmount,
+    };
+  }
+  return {
+    ok: true,
+    mode: "flat",
+    input,
+    amount: input,
+    invoiceAmount: invoiceAmount > 0 ? invoiceAmount : null,
+  };
+}
+
+/**
  * @param {object} charge Charge row {label|type, amount}.
  * @return {string}
  */
@@ -432,6 +504,58 @@ function rehomeNotifyDetentionToUnrecognized(recognized, unrecognized) {
  */
 function isAccessorialLabel(label) {
   return ACCESSORIAL_LABEL_PATTERN.test(String(label || ""));
+}
+
+/**
+ * Line haul, fuel, and base freight are a breakdown of the freight total —
+ * never an additional / accessorial charge.
+ * @param {string} label Charge label.
+ * @return {boolean}
+ */
+function isFreightBreakdownLabel(label) {
+  const text = String(label || "");
+  if (isAccessorialLabel(text)) return false;
+  return /line[\s-]*haul|\blinehaul\b|\bfuel(?:\s*surcharge)?\b|\bfsc\b|base[\s-]*freight|\btotal\s*freight\b/i
+      .test(text);
+}
+
+/**
+ * Drops line-haul / fuel / base-freight rows from an extra-charge list.
+ * @param {Array<object>} charges Charge rows.
+ * @return {{kept: Array<object>, dropped: Array<object>}}
+ */
+function stripFreightBreakdownCharges(charges) {
+  const kept = [];
+  const dropped = [];
+  for (const row of (Array.isArray(charges) ? charges : [])) {
+    if (isFreightBreakdownLabel(chargeLabel(row))) dropped.push(row);
+    else kept.push(row);
+  }
+  return {kept, dropped};
+}
+
+/**
+ * Carrier invoice total minus the Primus amount on file.
+ * Primary overage for additional-charge math — always compute this first.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusAmount Primus carrier cost.
+ * @return {number|null}
+ */
+function invoiceOverage(invoiceAmount, primusAmount) {
+  return computeAddedCharge(invoiceAmount, primusAmount);
+}
+
+/**
+ * Reported additional-charge amount: always invoice − Primus when positive.
+ * Line-item amounts are for identification only; they are not this number.
+ * @param {number|string} invoiceAmount Carrier invoice total.
+ * @param {number|string} primusAmount Primus carrier cost.
+ * @return {number|null}
+ */
+function reportedChargeDifference(invoiceAmount, primusAmount) {
+  const gap = invoiceOverage(invoiceAmount, primusAmount);
+  if (gap == null || !(gap > 0)) return null;
+  return gap;
 }
 
 /**
@@ -596,8 +720,10 @@ function partitionChargesByPrimus(charges, breakdown) {
  *   chargesForAction, skipApproval.
  */
 function filterChargesForApproval(charges, breakdown, minAmount) {
+  // Line haul / fuel / base freight are never approval extras.
+  const stripped = stripFreightBreakdownCharges(charges).kept;
   const {ignorable, remaining} = filterIgnorableSmallCharges(
-      charges, minAmount);
+      stripped, minAmount);
   const {alreadyInPrimus, notInPrimus} = partitionChargesByPrimus(
       remaining, breakdown);
   return {
@@ -905,17 +1031,33 @@ function evaluateRequoteMatch(opts) {
  * @return {string} One of CHARGE_CATEGORY values.
  */
 function classifyAdditionalChargeReason(opts) {
-  const charges = Array.isArray(opts.charges) ? opts.charges : [];
+  const raw = Array.isArray(opts.charges) ? opts.charges : [];
+  // Line haul / fuel / base freight are freight breakdown, not extras.
+  const charges = raw.filter(
+      (c) => !isFreightBreakdownLabel(chargeLabel(c)));
   const wniByLabel = charges.some(
       (c) => isWeightInspectionLabel(chargeLabel(c)));
   const accessorialByLabel = charges.some(
       (c) => isAccessorialLabel(chargeLabel(c)));
   const mismatch = opts.freightMismatch && opts.freightMismatch.mismatch;
+  const gap = opts.invoiceGap != null ? Number(opts.invoiceGap) :
+    invoiceOverage(opts.invoiceAmount, opts.primusAmount);
 
   // Itemized accessorials (school delivery, notify/detention, etc.) win
   // over a stray W&I certificate flag or matching weight/class on the invoice.
   if (accessorialByLabel && !wniByLabel && !mismatch) {
     return CHARGE_CATEGORY.ACCESSORIAL;
+  }
+
+  // A few dollars off: prefer the accessorial that matches invoice − Primus
+  // over treating a coincident weight/class change as the reason.
+  if (Number.isFinite(gap) && gap > 0.5 && gap <= SMALL_GAP_MAX) {
+    const near = charges.find((c) => {
+      const amt = Math.abs(Number(c && c.amount) || 0);
+      return amt > 0 && Math.abs(amt - gap) <= 1 &&
+        !isWeightInspectionLabel(chargeLabel(c));
+    });
+    if (near) return CHARGE_CATEGORY.ACCESSORIAL;
   }
 
   if (wniByLabel || opts.hasCertificate || mismatch) {
@@ -983,7 +1125,7 @@ function displayChargeLabelForRow(charge) {
  * @return {string} HTML list of charges.
  */
 function chargesHtml(charges) {
-  const rows = (Array.isArray(charges) ? charges : [])
+  const rows = stripFreightBreakdownCharges(charges).kept
       .map((c) =>
         `<li>${esc(displayChargeLabelForRow(c))}: ` +
         `<strong>${money(c && c.amount)}</strong></li>`)
@@ -1123,6 +1265,7 @@ function listAdditionalChargeApprovalAttachments(attachments, hints) {
 /**
  * Additional charge when the carrier voids the quote and sends a new
  * invoice: invoice total minus the Primus quoted carrier total.
+ * Same formula as invoiceOverage / reportedChargeDifference.
  * @param {number|string} invoiceAmount Carrier invoice total.
  * @param {number|string} primusQuotedTotal Primus vendor.cost.
  * @return {number|null} Dollars, or null when either side is missing.
@@ -1432,14 +1575,18 @@ function buildAdditionalChargeApprovalEmail(opts) {
       opts.weightRebill.addedCharge :
       computeAddedCharge(invoiceAmount, primusAmount)) :
     null;
-  // Accessorial emails historically showed only the sum of line items
-  // pending A/B/C/D/E. Ops read that next to invoice + amount on file and
-  // expected invoice − Primus. Show both so the math reconciles.
-  const invoiceOverage = !weightInspection ?
+  // Always anchor on invoice − Primus. Line items identify the reason;
+  // they are not the additional-charge amount.
+  const invoiceOverageAmt = !weightInspection ?
     computeAddedCharge(invoiceAmount, primusAmount) : null;
+  const listedTotal = sumCharges(
+      stripFreightBreakdownCharges(charges).kept);
   const pendingTotal = Number(chargesTotal) || 0;
-  const overageDiffersFromPending = invoiceOverage != null &&
-    Math.abs(invoiceOverage - pendingTotal) > 0.05;
+  const presentedAdditional = invoiceOverageAmt != null ?
+    invoiceOverageAmt :
+    pendingTotal;
+  const overageDiffersFromPending = invoiceOverageAmt != null &&
+    Math.abs(invoiceOverageAmt - listedTotal) > 0.05;
 
   const emailTokens = require("./email-action-tokens");
   const actionUrl = typeof actionUrlFn === "function" ?
@@ -1549,9 +1696,9 @@ function buildAdditionalChargeApprovalEmail(opts) {
   const overageNoteParts = [];
   if (overageDiffersFromPending) {
     overageNoteParts.push(
-        `Invoice is ${money(invoiceOverage)} over amount on file, but ` +
-        `only ${money(pendingTotal)} are the accessorial line(s) needing ` +
-        `your decision below.`);
+        `Additional charge is ${money(invoiceOverageAmt)} ` +
+        `(invoice total minus amount on file). Identified accessorial ` +
+        `line(s) below total ${money(listedTotal)}.`);
     const ignoredBrief = formatChargeBrief(ignoredSmall);
     if (ignoredBrief) {
       overageNoteParts.push(
@@ -1568,7 +1715,8 @@ function buildAdditionalChargeApprovalEmail(opts) {
           `were excluded.`);
     }
     overageNoteParts.push(
-        `Any leftover is usually freight variance vs the Primus quote.`);
+        `Any leftover is usually freight variance vs the Primus quote. ` +
+        `Line haul / base freight lines are never additional charges.`);
   }
   const overageNoteHtml = overageNoteParts.length ?
     `<p style="background:#fef3c7;border:1px solid #fcd34d;` +
@@ -1576,12 +1724,9 @@ function buildAdditionalChargeApprovalEmail(opts) {
     `<strong>Why the totals differ:</strong> ` +
     `${esc(overageNoteParts.join(" "))}</p>` : "";
 
-  const additionalChargeRowLabel = weightInspection ?
-    "Additional charge" :
-    (overageDiffersFromPending ?
-      "Charges needing decision" : "Additional charges");
+  const additionalChargeRowLabel = "Additional charge";
   const additionalChargeRowValue = weightInspection && addedCharge != null ?
-    money(addedCharge) : money(chargesTotal);
+    money(addedCharge) : money(presentedAdditional);
 
   const html =
     `<p>A carrier invoice came in <strong>higher than the quoted ` +
@@ -1594,8 +1739,8 @@ function buildAdditionalChargeApprovalEmail(opts) {
     row("Customer rate (Primus)", formatCustomerRate(customerRate)) +
     row("Carrier invoice", money(invoiceAmount)) +
     row("Amount on file (Primus)", money(primusAmount)) +
-    (invoiceOverage != null ?
-      row("Invoice over amount on file", money(invoiceOverage)) : "") +
+    (invoiceOverageAmt != null ?
+      row("Invoice over amount on file", money(invoiceOverageAmt)) : "") +
     row(additionalChargeRowLabel, additionalChargeRowValue) +
     row("Reason (detected)", esc(categoryLabel(category))) +
     (hasCertificate ?
@@ -1626,17 +1771,26 @@ function buildAdditionalChargeApprovalEmail(opts) {
         "D - Not approved: dispute with carrier") +
     btn("e", "#7c3aed",
         "E - Approve: pay carrier + bill customer " +
-        "(enter amount; apply rate; no separate customer notification)") +
+        "(percent markup or flat per accessorial; apply rate; " +
+        "no separate customer notification)") +
+    btn("f", "#c2410c",
+        "F - Set customer rate: flat amount or percent of the invoice " +
+        "(Primus accessorial Freight)") +
     `<p style="font-size:12px;color:#6b7280">A: enter how much to charge the ` +
     `customer on the confirm page; the customer rate is bumped by that ` +
     `amount and the customer is emailed. B: the base customer rate stays ` +
-    `the same - enter each accessorial and the amount to bill the customer ` +
-    `on separate lines; the dispatcher gets a ready customer-notification ` +
+    `the same - enter each accessorial with a percent markup or flat ` +
+    `amount; the dispatcher gets a ready customer-notification ` +
     `template. C: the carrier bill is entered at the full carrier amount ` +
     `and the customer rate stays the same (no itemization needed). D: Jerry ` +
-    `will draft the wording for manual submission. E: like A (enter amount ` +
-    `and bump the customer rate) but no separate customer notification - ` +
-    `the charge is included when the customer invoice is sent.` +
+    `will draft the wording for manual submission. E: like B (percent ` +
+    `markup or flat per accessorial) but the customer rate is bumped by ` +
+    `the total and no separate customer notification is sent - the charge ` +
+    `is included when the customer invoice is sent. F: enter a ` +
+    `flat dollar amount or a percent of the carrier invoice total. That ` +
+    `calculated amount replaces the customer rate and is entered in Primus ` +
+    `as an accessorial named Freight. No separate customer notification ` +
+    `is sent.` +
     `</p>`;
 
   return {
@@ -2007,6 +2161,12 @@ async function createFollowUp(db, data) {
         decision: existing.data.decision || data.decision || null,
         disputeNotes: dispute ?
           (data.disputeNotes || data.notes || null) : null,
+        to: data.to || existing.data.to || null,
+        cc: data.cc || existing.data.cc || null,
+        dispatcherEmail: data.dispatcherEmail ||
+          existing.data.dispatcherEmail || null,
+        dispatcherName: data.dispatcherName ||
+          existing.data.dispatcherName || null,
       });
       console.log(
           "[createFollowUp] reused open follow-up",
@@ -2033,6 +2193,10 @@ async function createFollowUp(db, data) {
     decision: null,
     decisionAt: null,
     notes: data.notes || null,
+    to: data.to || null,
+    cc: data.cc || null,
+    dispatcherEmail: data.dispatcherEmail || null,
+    dispatcherName: data.dispatcherName || null,
     resolved: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -2059,6 +2223,10 @@ async function createFollowUp(db, data) {
       followUpStatus: data.status || null,
       decision: data.decision || null,
       disputeNotes: dispute ? (data.disputeNotes || data.notes || null) : null,
+      to: data.to || null,
+      cc: data.cc || null,
+      dispatcherEmail: data.dispatcherEmail || null,
+      dispatcherName: data.dispatcherName || null,
     });
   } catch (taskErr) {
     console.error("[createFollowUp] dashboard task failed:", taskErr.message);
@@ -2306,7 +2474,7 @@ function parseCustomerBillLinesFromRequest(body) {
  * @return {Array<object>}
  */
 function seedCustomerBillLinesFromCharges(charges) {
-  const rows = (Array.isArray(charges) ? charges : []).map((charge) => ({
+  const rows = stripFreightBreakdownCharges(charges).kept.map((charge) => ({
     name: displayChargeLabel(chargeLabel(charge)),
     amount: "",
     carrierAmount: Number(charge && charge.amount) || 0,
@@ -2330,17 +2498,27 @@ function buildOptionBAccessorialConfirmPage(opts) {
         `value="${esc(String(value ?? ""))}">`)
       .join("");
   const baseRate = Number(opts.baseCustomerRate) || 0;
+  const bumpRate = !!opts.bumpCustomerRate;
   const seedRows = seedCustomerBillLinesFromCharges(opts.carrierCharges);
   const seedJson = JSON.stringify(seedRows)
       .replace(/</g, "\\u003c")
       .replace(/-->/g, "--\\u003e");
-  const baseRateHtml = baseRate > 0 ?
-    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `<strong>Base customer rate (unchanged):</strong> ` +
-    `${formatCustomerRate(baseRate)}</p>` :
-    `<p style="font-size:14px;color:#374151;margin:12px 0">` +
-    `The base customer freight rate will stay as-is in Primus. For each ` +
-    `accessorial, enter a percent markup or a flat customer charge.</p>`;
+  const baseRateHtml = bumpRate ?
+    (baseRate > 0 ?
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `<strong>Current customer rate:</strong> ` +
+      `${formatCustomerRate(baseRate)}. Confirming bumps it by the ` +
+      `accessorial total below.</p>` :
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `For each accessorial, enter a percent markup or a flat customer ` +
+      `charge. The total bumps the customer rate in Primus.</p>`) :
+    (baseRate > 0 ?
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `<strong>Base customer rate (unchanged):</strong> ` +
+      `${formatCustomerRate(baseRate)}</p>` :
+      `<p style="font-size:14px;color:#374151;margin:12px 0">` +
+      `The base customer freight rate will stay as-is in Primus. For each ` +
+      `accessorial, enter a percent markup or a flat customer charge.</p>`);
   return `<!doctype html><html><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">` +
     `<title>${esc(opts.title || "Confirm option B")}</title>` +
@@ -2421,7 +2599,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `const mode=row.pricingMode==="flat"?"flat":"markup";` +
     `const seedVal=mode==="flat"?` +
     `(row.flatAmount!=null?row.flatAmount:row.amount||""):` +
-    `(row.markupPct!=null?row.markupPct:"");` +
+    `(row.markupPct!=null?row.markupPct:30);` +
     `wrap.innerHTML="<div class=\\"bill-row-top\\"><div>"+` +
     `"<label class=\\"field-label\\">Accessorial name</label>"+` +
     `"<input type=\\"text\\" class=\\"bill-name\\" ` +
@@ -2442,7 +2620,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `"<label class=\\"field-label bill-value-label\\">"+` +
     `(mode==="flat"?"Flat amount ($)":"Markup (%)")+"</label>"+` +
     `"<input type=\\"number\\" class=\\"bill-value\\" min=\\"0\\" ` +
-    `step=\\"0.01\\" placeholder=\\""+(mode==="flat"?"250.00":"20")+` +
+    `step=\\"0.01\\" placeholder=\\""+(mode==="flat"?"250.00":"30")+` +
     `"\\" value=\\""+escAttr(seedVal===0||seedVal?String(seedVal):"")+` +
     `"\\" required></div></div>"+` +
     `"<div class=\\"bill-preview\\"></div>";` +
@@ -2451,7 +2629,7 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `wrap.querySelector(".bill-value-label").textContent=` +
     `m==="flat"?"Flat amount ($)":"Markup (%)";` +
     `wrap.querySelector(".bill-value").placeholder=` +
-    `m==="flat"?"250.00":"20";refreshPreview(wrap);};` +
+    `m==="flat"?"250.00":"30";refreshPreview(wrap);};` +
     `wrap.querySelector(".bill-mode").onchange=syncLabel;` +
     `wrap.querySelector(".bill-value").oninput=()=>refreshPreview(wrap);` +
     `wrap.querySelector(".remove-btn").onclick=()=>{wrap.remove();};` +
@@ -2502,6 +2680,8 @@ module.exports = {
   RATE_MATCH_TOLERANCE,
   MIN_IGNORABLE_CHARGE_AMOUNT,
   LISA_EMAIL,
+  FREIGHT_ACCESSORIAL_NAME,
+  computeFreightCustomerRate,
   coerceMoneyNumber,
   primusAmountMatchTolerance,
   evaluatePrimusAmountMatch,
@@ -2512,6 +2692,10 @@ module.exports = {
   formatCustomerRate,
   isWeightInspectionLabel,
   isAccessorialLabel,
+  isFreightBreakdownLabel,
+  stripFreightBreakdownCharges,
+  invoiceOverage,
+  reportedChargeDifference,
   displayChargeLabel,
   displayChargeLabelForRow,
   parseNotifyDetentionStorage,

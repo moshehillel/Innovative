@@ -19,6 +19,8 @@
  *   PRIMUS_UI_FILETYPE_QUOTE_APPROVAL — override Quote Approval type id
  *   PRIMUS_UI_FILETYPE_INSPECTION_CERT — override inspection certificate
  *     type id (customer-visible; used for price-free W&I certificates)
+ *   PRIMUS_UI_FILETYPE_COI — override Certificate of Insurance type id
+ *     (customer-visible; attached on invoice email when present on load)
  *   PRIMUS_UI_QUOTE_APPROVAL_TYPE_NAME — match name in getFileTypes
  *   PRIMUS_UI_UPLOAD_FILE_FIELD — multipart file field name (default file)
  *   PRIMUS_UI_SESSION_TTL_HOURS — PHPSESSID cache lifetime (default 24)
@@ -810,22 +812,80 @@ async function resolveUploadFileTypes() {
   const inspectionCert = envInspection ?
     {
       id: String(envInspection),
+      ids: [String(envInspection)],
       name: "Inspection certificate (env)",
       external: "1",
     } :
     matchInspectionCertFileType(types);
 
-  return {carrierBill: carrier, pod, quoteApproval, inspectionCert};
+  const envCoi = process.env.PRIMUS_UI_FILETYPE_COI;
+  const coi = envCoi ?
+    {
+      id: String(envCoi),
+      ids: [String(envCoi)],
+      name: "Certificate of Insurance (env)",
+      external: "1",
+    } :
+    matchCoiFileType(types);
+
+  return {carrierBill: carrier, pod, quoteApproval, inspectionCert, coi};
+}
+
+/**
+ * Customer-visible Certificate of Insurance file type(s). Primus may expose
+ * more than one COI id; collect all so invoice email can attach any of them.
+ * @param {Array<object>} types File type rows.
+ * @return {{id: string, ids: string[], name: string, external: string}|null}
+ */
+function matchCoiFileType(types) {
+  const hits = [];
+  for (const t of (Array.isArray(types) ? types : [])) {
+    const name = String(
+        t.name || t.description || t.typeName || t.fileTypeName || "",
+    ).trim();
+    const code = String(t.code || "").trim().toUpperCase();
+    const id = t.id != null ? t.id :
+      (t.fileTypeId != null ? t.fileTypeId : t.type);
+    if (id == null) continue;
+    const lower = name.toLowerCase();
+    const isCoi = code === "COI" ||
+      lower.includes("certificate of insurance");
+    if (!isCoi) continue;
+    hits.push({
+      id: String(id),
+      name: name || "Certificate of Insurance",
+      external: String(t.external != null ? t.external : ""),
+    });
+  }
+  if (!hits.length) return null;
+  const preferred = hits.find((h) => h.external === "1") || hits[0];
+  return {
+    id: preferred.id,
+    ids: [...new Set(hits.map((h) => h.id))],
+    name: preferred.name,
+    external: preferred.external,
+  };
 }
 
 /**
  * Customer-visible weight & inspection certificate file type, when Primus
- * has one. Prefers external=1 so the document can be sent to the customer.
+ * has one. Prefers code WI / Reweigh/Reclass, then external=1 name matches.
  * @param {Array<object>} types File type rows.
- * @return {{id: string, name: string, external: string}|null}
+ * @return {{id: string, ids: string[], name: string, external: string}|null}
  */
 function matchInspectionCertFileType(types) {
+  const byCode = matchFileTypeByCode(types, "WI");
+  if (byCode) {
+    return {
+      id: byCode.id,
+      ids: [byCode.id],
+      name: byCode.name,
+      external: byCode.external,
+    };
+  }
   const patterns = [
+    "reweigh/reclass certificate",
+    "reweigh/reclass",
     "weight & inspection",
     "weight and inspection",
     "inspection certificate",
@@ -850,7 +910,14 @@ function matchInspectionCertFileType(types) {
       external: String(t.external != null ? t.external : ""),
     });
   }
-  return hits.find((h) => h.external === "1") || hits[0] || null;
+  const preferred = hits.find((h) => h.external === "1") || hits[0];
+  if (!preferred) return null;
+  return {
+    id: preferred.id,
+    ids: [...new Set(hits.map((h) => h.id))],
+    name: preferred.name,
+    external: preferred.external,
+  };
 }
 exports.resolveUploadFileTypes = resolveUploadFileTypes;
 
@@ -899,6 +966,81 @@ function listQuoteApprovalDriveFileIds(docData, quoteApprovalFileTypeId) {
       const isType = wantType && ft === wantType;
       const nameLooks = /QUOTE\s*APPROVAL|APPROVED\s*QUOTE|QUOTE\s*APPROV/
           .test(name);
+      if (isType || nameLooks) ids.push(driveId);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * Normalize one-or-many Primus fileType ids to a string set.
+ * @param {string|number|Array<string|number>|null|undefined} fileTypeIds
+ * @return {Set<string>}
+ */
+function fileTypeIdSet(fileTypeIds) {
+  const list = Array.isArray(fileTypeIds) ? fileTypeIds : [fileTypeIds];
+  return new Set(list.filter((x) => x != null && x !== "")
+      .map((x) => String(x)));
+}
+
+/**
+ * Insurance Certificate of Insurance (COI) drive file ids on a booking.
+ * Matches Primus COI file type(s) and/or COI-looking filenames.
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string|number|Array<string|number>|null} [coiFileTypeIds]
+ * @param {string|number|null} [excludeFileTypeId] Carrier-bill type.
+ * @return {string[]}
+ */
+function listInsuranceCoiDriveFileIds(
+    docData, coiFileTypeIds, excludeFileTypeId) {
+  const ids = [];
+  const want = fileTypeIdSet(coiFileTypeIds);
+  const excludeTypeId = excludeFileTypeId != null ?
+    String(excludeFileTypeId) : null;
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      const driveId = readDriveFileId(f);
+      if (!driveId) continue;
+      const ft = readFileTypeId(f);
+      if (excludeTypeId && ft === excludeTypeId) continue;
+      const name = String(
+          f.name || f.fileName || f.description || f.fileDescription || "",
+      );
+      const isType = want.size > 0 && ft && want.has(ft);
+      const nameLooks = /\bCOI\b|CERTIFICATE\s+OF\s+INSURANCE/i.test(name);
+      if (isType || nameLooks) ids.push(driveId);
+    }
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * Reweigh/reclass (W&I) inspection certificate drive file ids.
+ * Price-free certs are uploaded as this type; priced certs are withheld.
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string|number|Array<string|number>|null} [inspectionCertFileTypeIds]
+ * @param {string|number|null} [excludeFileTypeId] Carrier-bill type.
+ * @return {string[]}
+ */
+function listInspectionCertDriveFileIds(
+    docData, inspectionCertFileTypeIds, excludeFileTypeId) {
+  const ids = [];
+  const want = fileTypeIdSet(inspectionCertFileTypeIds);
+  const excludeTypeId = excludeFileTypeId != null ?
+    String(excludeFileTypeId) : null;
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      const driveId = readDriveFileId(f);
+      if (!driveId) continue;
+      const ft = readFileTypeId(f);
+      if (excludeTypeId && ft === excludeTypeId) continue;
+      const name = String(
+          f.name || f.fileName || f.description || f.fileDescription || "",
+      ).toUpperCase();
+      const isType = want.size > 0 && ft && want.has(ft);
+      const nameLooks =
+        /REWEIGH\s*\/?\s*RECLASS|WEIGHT\s*(?:&|AND)\s*INSPECTION|W\s*&\s*I\b/
+            .test(name);
       if (isType || nameLooks) ids.push(driveId);
     }
   }
@@ -1866,6 +2008,17 @@ async function resolvePodDriveIdsForEmail(args) {
   const quoteApprovalTypeId = uploadFileTypes.quoteApproval &&
       uploadFileTypes.quoteApproval.id ?
     uploadFileTypes.quoteApproval.id : null;
+  const coiTypeIds = uploadFileTypes.coi &&
+      Array.isArray(uploadFileTypes.coi.ids) && uploadFileTypes.coi.ids.length ?
+    uploadFileTypes.coi.ids :
+    (uploadFileTypes.coi && uploadFileTypes.coi.id ?
+      [uploadFileTypes.coi.id] : []);
+  const inspectionCertTypeIds = uploadFileTypes.inspectionCert &&
+      Array.isArray(uploadFileTypes.inspectionCert.ids) &&
+      uploadFileTypes.inspectionCert.ids.length ?
+    uploadFileTypes.inspectionCert.ids :
+    (uploadFileTypes.inspectionCert && uploadFileTypes.inspectionCert.id ?
+      [uploadFileTypes.inspectionCert.id] : []);
   const bookingId = resolveManageBookingId(booking);
   if (!bookingId) {
     return {ok: false, error: "Could not resolve manage.php bookingId"};
@@ -1943,6 +2096,33 @@ async function resolvePodDriveIdsForEmail(args) {
     }
   }
 
+  // Insurance COI: attach when already on the Primus load (customer-visible).
+  let coiDriveIds = docData ?
+    listInsuranceCoiDriveFileIds(docData, coiTypeIds, carrierBillTypeId) : [];
+  if (coiDriveIds.length && writeLog) {
+    await writeLog("info", "primus",
+        "Invoice email — including Certificate of Insurance attachment(s)", {
+          loadNumber,
+          bookingId,
+          coiDriveIds,
+          coiTypeIds,
+        });
+  }
+
+  // W&I / reweigh-reclass: only price-free certs are uploaded to this type.
+  let inspectionCertDriveIds = docData ?
+    listInspectionCertDriveFileIds(
+        docData, inspectionCertTypeIds, carrierBillTypeId) : [];
+  if (inspectionCertDriveIds.length && writeLog) {
+    await writeLog("info", "primus",
+        "Invoice email — including inspection certificate attachment(s)", {
+          loadNumber,
+          bookingId,
+          inspectionCertDriveIds,
+          inspectionCertTypeIds,
+        });
+  }
+
   // FINAL FIREWALL: whatever ended up in the list (including caller-supplied
   // extraDriveFileIds and freshly uploaded ids), drop anything that Primus
   // reports as the carrier-bill file type. The carrier cost must NEVER be
@@ -1951,22 +2131,21 @@ async function resolvePodDriveIdsForEmail(args) {
   const carrierBillDriveIds = new Set(
       listFileTypeDriveIds(docData, carrierBillTypeId));
   const blocked = [];
-  const safePodIds = [];
-  for (const id of podDriveIds) {
-    if (carrierBillDriveIds.has(String(id))) {
-      blocked.push(String(id));
-    } else {
-      safePodIds.push(id);
+  const filterSafe = (sourceIds) => {
+    const safe = [];
+    for (const id of sourceIds) {
+      if (carrierBillDriveIds.has(String(id))) {
+        blocked.push(String(id));
+      } else {
+        safe.push(id);
+      }
     }
-  }
-  const safeQuoteIds = [];
-  for (const id of quoteApprovalDriveIds) {
-    if (carrierBillDriveIds.has(String(id))) {
-      blocked.push(String(id));
-    } else {
-      safeQuoteIds.push(id);
-    }
-  }
+    return safe;
+  };
+  const safePodIds = filterSafe(podDriveIds);
+  const safeQuoteIds = filterSafe(quoteApprovalDriveIds);
+  const safeCoiIds = filterSafe(coiDriveIds);
+  const safeInspectionIds = filterSafe(inspectionCertDriveIds);
   if (blocked.length && writeLog) {
     await writeLog("error", "primus",
         "BLOCKED carrier-bill document from customer email attachments", {
@@ -1980,7 +2159,14 @@ async function resolvePodDriveIdsForEmail(args) {
   return {
     podDriveIds: safePodIds,
     quoteApprovalDriveIds: safeQuoteIds,
-    driveFileIds: [...new Set([...safePodIds, ...safeQuoteIds])],
+    coiDriveIds: safeCoiIds,
+    inspectionCertDriveIds: safeInspectionIds,
+    driveFileIds: [...new Set([
+      ...safePodIds,
+      ...safeQuoteIds,
+      ...safeCoiIds,
+      ...safeInspectionIds,
+    ])],
     blockedDriveFileIds: blocked,
     miworld,
     customerName,
@@ -2042,6 +2228,8 @@ async function emailBOLDocs(args) {
   const {
     podDriveIds,
     quoteApprovalDriveIds,
+    coiDriveIds,
+    inspectionCertDriveIds,
     driveFileIds: resolvedDriveIds,
     blockedDriveFileIds,
     miworld,
@@ -2070,6 +2258,8 @@ async function emailBOLDocs(args) {
         bolSelected: true,
         podDriveIdsSelected: [],
         quoteApprovalDriveIdsSelected: quoteApprovalDriveIds || [],
+        coiDriveIdsSelected: coiDriveIds || [],
+        inspectionCertDriveIdsSelected: inspectionCertDriveIds || [],
         miworld: !!miworld,
         customerName: resolvedCustomerName || null,
         blockedCarrierBillDriveIds: blockedDriveFileIds || [],
@@ -2137,6 +2327,9 @@ async function emailBOLDocs(args) {
     bolSelected: !args.invoiceOnly,
     podDriveIdsSelected: args.invoiceOnly ? [] : (podDriveIds || []),
     quoteApprovalDriveIdsSelected: quoteApprovalDriveIds || [],
+    coiDriveIdsSelected: args.invoiceOnly ? [] : (coiDriveIds || []),
+    inspectionCertDriveIdsSelected: args.invoiceOnly ?
+      [] : (inspectionCertDriveIds || []),
     miworld: !!miworld,
     customerName: resolvedCustomerName || null,
     blockedCarrierBillDriveIds: blockedDriveFileIds || [],
@@ -3642,10 +3835,30 @@ function buildActualCosts(vendor, bill, withIds = null) {
  * @param {number} customerRate Base freight customer rate.
  * @param {string} [billToReference] Bill-to Reference# (e.g. Unit #256255).
  * @param {Array<object>} [customerBillLines] Option B accessorial lines.
+ * @param {object} [opts] Optional billing shape.
+ * @param {boolean} [opts.freightAccessorialOnly] Option F: one accessorial
+ *   line named Freight (or freightAccessorialName) at customerRate.
+ * @param {string} [opts.freightAccessorialName] Accessorial description.
  * @return {Array<object>}
  */
 function buildCustomerCharges(
-    customerRate, billToReference, customerBillLines) {
+    customerRate, billToReference, customerBillLines, opts) {
+  const freightOnly = !!(opts && opts.freightAccessorialOnly);
+  if (freightOnly) {
+    const amount = roundMoney(customerRate);
+    const name = String(
+        (opts && opts.freightAccessorialName) || "Freight",
+    ).trim() || "Freight";
+    return [{
+      id: 1,
+      code: "",
+      qty: 1,
+      description: name,
+      rate: amount,
+      total: amount.toFixed(2),
+      chargeType: "",
+    }];
+  }
   let description = "FREIGHT CHARGE";
   const ref = sanitizeBillToReferenceText(billToReference);
   if (ref) {
@@ -3682,9 +3895,13 @@ function buildCustomerCharges(
 /**
  * @param {number} customerRate Base freight rate.
  * @param {Array<object>} [customerBillLines] Option B accessorial lines.
+ * @param {object} [opts] Optional billing shape (freightAccessorialOnly).
  * @return {number}
  */
-function customerChargesTotal(customerRate, customerBillLines) {
+function customerChargesTotal(customerRate, customerBillLines, opts) {
+  if (opts && opts.freightAccessorialOnly) {
+    return roundMoney(customerRate || 0);
+  }
   const base = roundMoney(customerRate || 0);
   const extra = (Array.isArray(customerBillLines) ? customerBillLines : [])
       .reduce((sum, line) => sum + roundMoney(line && line.amount), 0);
@@ -6144,8 +6361,13 @@ async function runPrimusUiBillingFlow(args) {
   const customerRate = roundMoney(args.customerRate || 0);
   const customerBillLines = Array.isArray(args.customerBillLines) ?
     args.customerBillLines : [];
-  const customerTotal = customerChargesTotal(customerRate, customerBillLines);
-  if (!carrierTotal || !customerRate) {
+  const chargeOpts = args.freightAccessorialOnly ? {
+    freightAccessorialOnly: true,
+    freightAccessorialName: args.freightAccessorialName || "Freight",
+  } : null;
+  const customerTotal = customerChargesTotal(
+      customerRate, customerBillLines, chargeOpts);
+  if (!carrierTotal || !(customerTotal > 0)) {
     return {ok: false, error: "Missing carrier or customer rate"};
   }
 
@@ -6233,7 +6455,8 @@ async function runPrimusUiBillingFlow(args) {
     action: "saveInvoice",
     billsInfo,
     charges: buildCustomerCharges(
-        customerRate, args.billToReferenceNumber, customerBillLines),
+        customerRate, args.billToReferenceNumber, customerBillLines,
+        chargeOpts),
     actualCosts: actualCostsFirst,
     estimatedCosts,
     chargesTotal: customerTotal,
@@ -6282,21 +6505,38 @@ async function runPrimusUiBillingFlow(args) {
   const storedCharges = extractChargesFromStore(storeData);
   const phase2Charges = (storedCharges ||
     buildCustomerCharges(
-        customerRate, args.billToReferenceNumber, customerBillLines))
+        customerRate, args.billToReferenceNumber, customerBillLines,
+        chargeOpts))
       .map((c) => ({
         id: String(c.id != null ? c.id : 1),
         code: c.code || "",
-        description: c.description || "FREIGHT CHARGE",
+        description: c.description ||
+          (chargeOpts ? "Freight" : "FREIGHT CHARGE"),
         qty: Number(c.qty || 1),
         rate: roundMoney(c.rate),
         total: roundMoney(c.total).toFixed(2),
       }));
-  if (args.billToReferenceNumber &&
+  if (args.billToReferenceNumber && !chargeOpts &&
       !invoiceChargesIncludeReference(
           phase2Charges, args.billToReferenceNumber)) {
     const withRef = buildCustomerCharges(
-        customerRate, args.billToReferenceNumber, customerBillLines);
+        customerRate, args.billToReferenceNumber, customerBillLines,
+        chargeOpts);
     phase2Charges.splice(0, phase2Charges.length, ...withRef.map((c) => ({
+      id: String(c.id),
+      code: c.code || "",
+      description: c.description,
+      qty: Number(c.qty || 1),
+      rate: roundMoney(c.rate),
+      total: roundMoney(c.total).toFixed(2),
+    })));
+  }
+  // Option F: Primus may echo a draft FREIGHT CHARGE — replace with Freight.
+  if (chargeOpts && chargeOpts.freightAccessorialOnly) {
+    const withFreight = buildCustomerCharges(
+        customerRate, args.billToReferenceNumber, customerBillLines,
+        chargeOpts);
+    phase2Charges.splice(0, phase2Charges.length, ...withFreight.map((c) => ({
       id: String(c.id),
       code: c.code || "",
       description: c.description,
@@ -7623,6 +7863,10 @@ exports._internal = {
   listPodDriveFileIds,
   listCustomerDriveFileIds,
   listQuoteApprovalDriveFileIds,
+  listInsuranceCoiDriveFileIds,
+  listInspectionCertDriveFileIds,
+  matchCoiFileType,
+  matchInspectionCertFileType,
   isMiworldCustomer,
   customerNameFromBooking,
   fetchUiFileTypes,
@@ -7633,6 +7877,8 @@ exports._internal = {
   resolveExistingDraftInvoiceId,
   buildBillsInfo,
   buildActualCosts,
+  buildCustomerCharges,
+  customerChargesTotal,
   resolveBookingQuoteIds,
   resolveManageBookingId,
   resolveVendorBillRefs,

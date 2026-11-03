@@ -17,6 +17,7 @@ const admin = require("firebase-admin");
 const crypto = require("crypto");
 const emailActionTokens = require("./email-action-tokens");
 const pages = require("./pages");
+const accessorialCatalog = require("./accessorial-catalog-static");
 const {
   tenantFromRequest,
   tcol,
@@ -44,8 +45,10 @@ const OPTION_LABELS = {
     "dispatcher notifies customer)",
   c: "C - Pay carrier only (customer rate unchanged)",
   d: "D - Not approved (dispute with carrier)",
-  e: "E - Pay carrier + bill customer (enter amount; apply rate; " +
-    "no separate customer notification)",
+  e: "E - Pay carrier + bill customer (percent markup or flat per " +
+    "accessorial; apply rate; no separate customer notification)",
+  f: "F - Set the customer rate from a flat amount or a percent of the " +
+    "invoice (Primus accessorial Freight)",
 };
 
 /**
@@ -104,7 +107,7 @@ function workerAuthOk(req) {
 /**
  * Atomically claims an additional-charge decision.
  * @param {object} invoiceRef Firestore ref.
- * @param {string} decision A-E.
+ * @param {string} decision A-F.
  * @return {Promise<object>}
  */
 async function claimAdditionalChargeDecision(invoiceRef, decision) {
@@ -131,6 +134,59 @@ async function claimAdditionalChargeDecision(invoiceRef, decision) {
  * @param {object} body POST body.
  * @return {object}
  */
+/**
+ * Option F: flat dollars, or a percent of the carrier invoice total.
+ * @param {object} body POST body.
+ * @param {number} invoiceAmount Carrier invoice total.
+ * @return {object}
+ */
+function parseFreightCustomerRateFromRequest(body, invoiceAmount) {
+  const mode = String((body && body.rateMode) || "").trim().toLowerCase();
+  const input = Math.round(Number(body && body.rateInput) * 100) / 100;
+  const invoice = Math.round(Number(invoiceAmount) * 100) / 100;
+  if (mode !== "flat" && mode !== "percent") {
+    return {
+      ok: false,
+      error: "Choose a flat amount or a percent of the invoice.",
+    };
+  }
+  if (!Number.isFinite(input) || input <= 0) {
+    return {
+      ok: false,
+      error: mode === "percent" ?
+        "Enter a percent greater than 0." :
+        "Enter a flat amount greater than 0.",
+    };
+  }
+  if (mode === "percent") {
+    if (!Number.isFinite(invoice) || invoice <= 0) {
+      return {
+        ok: false,
+        error: "Invoice total is missing, so a percent cannot be " +
+          "calculated. Enter a flat amount instead.",
+      };
+    }
+    if (input > 500) {
+      return {ok: false, error: "Percent must be 500 or less."};
+    }
+    const amount = Math.round(invoice * (input / 100) * 100) / 100;
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return {
+        ok: false,
+        error: "Calculated customer rate must be greater than 0.",
+      };
+    }
+    return {ok: true, mode, input, amount, invoiceAmount: invoice};
+  }
+  return {
+    ok: true,
+    mode: "flat",
+    input,
+    amount: input,
+    invoiceAmount: Number.isFinite(invoice) && invoice > 0 ? invoice : null,
+  };
+}
+
 function parseCustomerChargeAmountFromRequest(body) {
   const raw = body && (body.customerChargeAmount != null ?
     body.customerChargeAmount : body.customer_charge_amount);
@@ -232,8 +288,10 @@ function parseCustomerBillLinesFromRequest(body) {
       if (!priced.ok) {
         return {ok: false, error: `${priced.error} (${name})`};
       }
+      const code = String((row && row.code) || "").trim();
       lines.push({
         name,
+        code: code || null,
         amount: priced.amount,
         carrierAmount: Number.isFinite(carrierAmount) && carrierAmount > 0 ?
           carrierAmount : 0,
@@ -268,9 +326,9 @@ async function handleAdditionalChargeGet(req, res) {
   const exp = req.query.exp;
   const sig = req.query.sig;
 
-  if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+  if (!invoiceId || !["a", "b", "c", "d", "e", "f"].includes(option)) {
     return res.status(400).send(
-        "Missing invoiceId or a valid option (a|b|c|d|e).");
+        "Missing invoiceId or a valid option (a|b|c|d|e|f).");
   }
 
   const tokenOk = emailActionTokens.verify({
@@ -329,26 +387,21 @@ async function handleAdditionalChargeGet(req, res) {
   }
 
   const loadLabel = invoice.loadNumber || invoiceId;
-  if (option === "a" || option === "e") {
-    const currentRate = Number(invoice.customerRate) || 0;
+  const currentRate = Number(invoice.customerRate) || 0;
+  if (option === "a") {
     const defaultCharge = Number(charge.amount) || 0;
     const rateNote = currentRate > 0 ?
       ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
-    const isE = option === "e";
     return res.status(200).send(pages.buildEmailActionConfirmPage({
-      title: isE ? "Confirm option E" : "Confirm option A",
+      title: "Confirm option A",
       description:
-        `Load ${loadLabel}: ${OPTION_LABELS[option]}. Enter how much to ` +
+        `Load ${loadLabel}: ${OPTION_LABELS.a}. Enter how much to ` +
         `charge the customer for this additional charge. The customer rate ` +
-        `will be bumped by that amount` +
-        (isE ?
-          `; no separate customer notification is sent - the charge is ` +
-          `included when the customer invoice goes out.` :
-          ` and the customer will be emailed.`) +
+        `will be bumped by that amount and the customer will be emailed.` +
         rateNote +
         ` Nothing is sent until you click Confirm.`,
-      confirmLabel: isE ? "Confirm option E" : "Confirm option A",
-      confirmColor: isE ? "#7c3aed" : "#16a34a",
+      confirmLabel: "Confirm option A",
+      confirmColor: "#16a34a",
       actionPath: "additionalChargeAction",
       fields,
       inputFields: [{
@@ -364,23 +417,55 @@ async function handleAdditionalChargeGet(req, res) {
     }));
   }
 
-  // option b
-  const currentRate = Number(invoice.customerRate) || 0;
+  if (option === "f") {
+    const rateNote = currentRate > 0 ?
+      ` Current customer rate on file: $${currentRate.toFixed(2)}.` : "";
+    return res.status(200).send(pages.buildOptionFConfirmPage({
+      title: "Confirm option F",
+      description:
+        `Load ${loadLabel}: ${OPTION_LABELS.f}. Enter a flat dollar ` +
+        `amount, or a percent of the carrier invoice total. The calculated ` +
+        `amount replaces the customer rate and is entered in Primus as an ` +
+        `accessorial named Freight.` +
+        rateNote,
+      confirmLabel: "Confirm option F",
+      confirmColor: "#c2410c",
+      actionPath: "additionalChargeAction",
+      invoiceAmount: Number(invoice.invoiceAmount) || 0,
+      fields,
+    }));
+  }
+
+  // Options B and E: percent markup or flat per accessorial line.
+  const isE = option === "e";
+  const tenantForCatalog = String(tenantId || "default");
+  const accessorialsUrl =
+    `${pages.functionsBaseUrl()}/getDashboardAccessorials` +
+    `?tenantId=${encodeURIComponent(tenantForCatalog)}`;
   return res.status(200).send(pages.buildOptionBAccessorialConfirmPage({
-    title: "Confirm option B",
-    description:
-      `Load ${loadLabel}: ${OPTION_LABELS[option]}. Each additional ` +
-      `accessorial shows the carrier cost. Enter a percent markup or a ` +
-      `flat amount to charge the customer. You can rename lines or add ` +
-      `new accessorials. After submit, the dispatcher gets a customer ` +
-      `notification template; the customer invoice stays paused until ` +
-      `they confirm the customer was notified.`,
-    confirmLabel: "Confirm option B",
-    confirmColor: "#0d9488",
+    title: isE ? "Confirm option E" : "Confirm option B",
+    description: isE ?
+      `Load ${loadLabel}: ${OPTION_LABELS.e}. Each additional accessorial ` +
+      `shows the carrier cost. Pick the Primus name from the list ` +
+      `(type to filter), then enter a percent markup (default 30%) or a ` +
+      `flat amount. You can add new accessorials. The customer rate is ` +
+      `bumped by the total; no separate customer notification is sent - ` +
+      `the charge is included when the customer invoice goes out.` :
+      `Load ${loadLabel}: ${OPTION_LABELS.b}. Each additional ` +
+      `accessorial shows the carrier cost. Pick the Primus name from the ` +
+      `list (type to filter), then enter a percent markup (default 30%) ` +
+      `or a flat amount. You can add new accessorials. After submit, the ` +
+      `dispatcher gets a customer notification template; the customer ` +
+      `invoice stays paused until they confirm the customer was notified.`,
+    confirmLabel: isE ? "Confirm option E" : "Confirm option B",
+    confirmColor: isE ? "#7c3aed" : "#0d9488",
     actionPath: "additionalChargeAction",
     baseUrl: pages.functionsBaseUrl(),
     baseCustomerRate: currentRate,
+    bumpCustomerRate: isE,
     carrierCharges: Array.isArray(charge.charges) ? charge.charges : [],
+    accessorialOptions: accessorialCatalog.staticAccessorialChoices(),
+    accessorialsUrl,
     fields,
   }));
 }
@@ -401,9 +486,9 @@ async function handleAdditionalChargePost(req, res) {
   const exp = (req.body && req.body.exp) || req.query.exp;
   const sig = (req.body && req.body.sig) || req.query.sig;
 
-  if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+  if (!invoiceId || !["a", "b", "c", "d", "e", "f"].includes(option)) {
     return res.status(400).send(
-        "Missing invoiceId or a valid option (a|b|c|d|e).");
+        "Missing invoiceId or a valid option (a|b|c|d|e|f).");
   }
 
   const tokenOk = emailActionTokens.verify({
@@ -422,19 +507,42 @@ async function handleAdditionalChargePost(req, res) {
 
   let optionACustomerChargeAmount = null;
   let optionBCustomerBillLines = null;
-  if (option === "a" || option === "e") {
+  let optionFRateMode = null;
+  let optionFRateInput = null;
+  if (option === "f") {
+    const previewTenant = await tenantFromRequest(req);
+    const previewSnap = await tcol(previewTenant, "invoices")
+        .doc(String(invoiceId)).get();
+    if (!previewSnap.exists) {
+      return res.status(404).send("Invoice not found.");
+    }
+    const parsed = parseFreightCustomerRateFromRequest(
+        req.body || {}, (previewSnap.data() || {}).invoiceAmount);
+    if (!parsed.ok) {
+      return res.status(400).send(parsed.error);
+    }
+    optionFRateMode = parsed.mode;
+    optionFRateInput = parsed.input;
+  }
+  if (option === "a") {
     const parsed = parseCustomerChargeAmountFromRequest(req.body || {});
     if (!parsed.ok) {
       return res.status(400).send(parsed.error);
     }
     optionACustomerChargeAmount = parsed.amount;
   }
-  if (option === "b") {
+  if (option === "b" || option === "e") {
     const parsed = parseCustomerBillLinesFromRequest(req.body || {});
     if (!parsed.ok) {
       return res.status(400).send(parsed.error);
     }
     optionBCustomerBillLines = parsed.lines;
+    if (option === "e") {
+      optionACustomerChargeAmount = parsed.lines.reduce(
+          (sum, line) => sum + (Number(line.amount) || 0), 0);
+      optionACustomerChargeAmount =
+        Math.round(optionACustomerChargeAmount * 100) / 100;
+    }
   }
 
   const tenant = await tenantFromRequest(req);
@@ -466,6 +574,9 @@ async function handleAdditionalChargePost(req, res) {
       "can close this page.",
     e: "Option E recorded. Jerry is updating the customer rate and " +
       "resuming the workflow — you can close this page.",
+    f: "Option F recorded. Jerry is setting the customer rate and " +
+      "entering it in Primus as accessorial Freight. You can close " +
+      "this page.",
   };
   res.status(200).send(pages.buildEmailActionProcessingPage({
     title: `Option ${decision} submitted`,
@@ -479,6 +590,8 @@ async function handleAdditionalChargePost(req, res) {
     tenantId: tenant.tenantId,
     optionACustomerChargeAmount,
     optionBCustomerBillLines,
+    optionFRateMode,
+    optionFRateInput,
   });
   return;
 }

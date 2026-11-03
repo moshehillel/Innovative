@@ -100,7 +100,8 @@ check("accessorial email shows invoice over amount on file when equal",
     emailStorage.html.includes("Invoice over amount on file") &&
     emailStorage.html.includes("$166.45"), true);
 
-// Load 264844-style: pending accessorials ≠ invoice − Primus gap.
+// Load 264844-style: identified accessorials ≠ invoice − Primus gap.
+// Additional charge amount is ALWAYS the overage ($174.68).
 const emailGap = ac.buildAdditionalChargeApprovalEmail({
   baseUrl: "https://x.example.com",
   invoiceId: "inv264844",
@@ -114,7 +115,7 @@ const emailGap = ac.buildAdditionalChargeApprovalEmail({
     {type: "ADVANCING", amount: 45},
     {type: "REDELIVERY", amount: 100},
   ],
-  chargesTotal: 145,
+  chargesTotal: 174.68,
   category: ac.CHARGE_CATEGORY.ACCESSORIAL,
   customerRate: 200,
   ignoredSmall: [{type: "APPOINTMENT DLVY", amount: 5}],
@@ -124,17 +125,82 @@ const emailGap = ac.buildAdditionalChargeApprovalEmail({
 check("gap email shows invoice over amount on file $174.68",
     emailGap.html.includes("Invoice over amount on file") &&
     emailGap.html.includes("$174.68"), true);
-check("gap email labels pending accessorials separately",
-    emailGap.html.includes("Charges needing decision") &&
-    emailGap.html.includes("$145.00"), true);
+check("gap email Additional charge is invoice − Primus",
+    emailGap.html.includes("Additional charge") &&
+    emailGap.html.includes("$174.68"), true);
 check("gap email explains why totals differ",
     emailGap.html.includes("Why the totals differ") &&
+    emailGap.html.includes("Identified accessorial") &&
+    emailGap.html.includes("$145.00") &&
     emailGap.html.includes("Auto-ignored") &&
     emailGap.html.includes("APPOINTMENT") &&
     emailGap.html.includes("Awaiting proof") &&
     emailGap.html.includes("LUMPER"), true);
 check("gap email still shows customer rate",
     emailGap.html.includes("$200.00"), true);
+
+// Load 265647: line haul $19 is NOT the additional charge.
+check("line haul is freight breakdown",
+    ac.isFreightBreakdownLabel("Line Haul"), true);
+check("fuel surcharge is freight breakdown",
+    ac.isFreightBreakdownLabel("Fuel surcharge"), true);
+check("redelivery is not freight breakdown",
+    ac.isFreightBreakdownLabel("Redelivery Fee"), false);
+const stripped265647 = ac.stripFreightBreakdownCharges([
+  {label: "Line Haul", amount: 19},
+  {label: "Redelivery Fee", amount: 72.77},
+]);
+check("265647 strip drops line haul", stripped265647.dropped.length, 1);
+check("265647 strip keeps redelivery", stripped265647.kept.length, 1);
+check("265647 overage is invoice − Primus",
+    ac.invoiceOverage(286.47, 194.70), 91.77);
+check("265647 reported difference is overage not $19",
+    ac.reportedChargeDifference(286.47, 194.70), 91.77);
+check("line haul alone is rate increase (not accessorial)",
+    ac.classifyAdditionalChargeReason({
+      charges: [{label: "Line Haul", amount: 19}],
+      invoiceGap: 91.77,
+    }), ac.CHARGE_CATEGORY.RATE_INCREASE);
+const email265647 = ac.buildAdditionalChargeApprovalEmail({
+  baseUrl: "https://x.example.com",
+  invoiceId: "inv265647",
+  tenantId: "innovative",
+  loadNumber: "265647",
+  carrierName: "Example Carrier",
+  invoiceAmount: 286.47,
+  primusAmount: 194.70,
+  charges: [
+    {label: "Line Haul", amount: 19},
+    {label: "Redelivery Fee", amount: 72.77},
+  ],
+  chargesTotal: 91.77,
+  category: ac.CHARGE_CATEGORY.ACCESSORIAL,
+});
+check("265647 email Additional charge is $91.77",
+    email265647.html.includes("Additional charge") &&
+    email265647.html.includes("$91.77"), true);
+check("265647 email does not treat $19 as the additional",
+    !/\$19\.00/.test(email265647.html.match(
+        /Additional charge<\/td><td>[^<]*/) ?
+      email265647.html.match(/Additional charge<\/td><td>[^<]*/)[0] : ""),
+    true);
+check("265647 email lists redelivery, omits line haul",
+    email265647.html.includes("Redelivery Fee") &&
+    !email265647.html.includes("Line Haul"), true);
+const notice265647 = ac.buildCustomerChargeNotificationEmail({
+  customerName: "Example Customer",
+  loadNumber: "265647",
+  charges: [
+    {label: "Line haul", amount: 19},
+    {label: "Redelivery Fee", amount: 72.77},
+  ],
+  chargesTotal: 91.77,
+});
+check("265647 customer notice amount is overage",
+    notice265647.html.includes("$91.77"), true);
+check("265647 customer notice omits line haul",
+    notice265647.html.includes("Redelivery Fee") &&
+    !/line\s*haul/i.test(notice265647.html), true);
 
 check("no rows = rate increase",
     ac.classifyAdditionalChargeReason({charges: []}),
@@ -269,7 +335,7 @@ check("email shows quote number",
 check("email shows customer rate", email.html.includes("$545.00"), true);
 check("email shows customer rate label",
     email.html.includes("Customer rate (Primus)"), true);
-for (const opt of ["a", "b", "c", "d", "e"]) {
+for (const opt of ["a", "b", "c", "d", "e", "f"]) {
   check(`button ${opt} has action`,
       email.html.includes("additionalChargeAction") &&
       email.html.includes(`invoiceId=inv123`) &&
@@ -288,12 +354,44 @@ check("button B label mentions updated rate / dispatcher",
     email.html.includes("dispatcher notifies customer"), true);
 check("button E label mentions no separate notification",
     email.html.includes("no separate customer notification"), true);
-check("footer explains E vs A",
-    email.html.includes("like A") &&
+check("button F label mentions Freight accessorial",
+    email.html.includes("option=f") &&
+    email.html.includes("accessorial Freight"), true);
+check("footer explains E vs B",
+    email.html.includes("like B") &&
+    email.html.includes("percent markup or flat") &&
     email.html.includes("no separate customer notification") &&
     email.html.includes("included when the customer invoice is sent"), true);
+check("footer explains F Freight accessorial",
+    email.html.includes("accessorial named Freight") &&
+    email.html.includes("percent of the carrier invoice"), true);
 check("email HTML has no raw em dash",
     !email.html.includes("\u2014") && !email.html.includes("â€"), true);
+
+// 3a2. Option F flat / percent of invoice → customer rate
+const freightFlat = ac.computeFreightCustomerRate({
+  mode: "flat", input: 875.5, invoiceAmount: 1000,
+});
+check("option F flat amount",
+    freightFlat.ok && freightFlat.amount === 875.5 &&
+    freightFlat.mode === "flat", true);
+const freightPct = ac.computeFreightCustomerRate({
+  mode: "percent", input: 15, invoiceAmount: 1000,
+});
+check("option F 15% of $1000 → $150",
+    freightPct.ok && freightPct.amount === 150 &&
+    freightPct.mode === "percent", true);
+const freightBadMode = ac.computeFreightCustomerRate({
+  mode: "bump", input: 10, invoiceAmount: 1000,
+});
+check("option F bad mode fails", freightBadMode.ok, false);
+const freightPctNoInvoice = ac.computeFreightCustomerRate({
+  mode: "percent", input: 10, invoiceAmount: 0,
+});
+check("option F percent without invoice fails",
+    freightPctNoInvoice.ok, false);
+check("Freight accessorial name constant",
+    ac.FREIGHT_ACCESSORIAL_NAME === "Freight", true);
 
 // 3b. Option A amount parsing
 const badA = ac.parseCustomerChargeAmountFromRequest({});
@@ -365,6 +463,43 @@ check("Option B form has flat amount mode",
     optionBPage.includes("Flat customer amount"), true);
 check("Option B form seeds liftgate carrier amount",
     optionBPage.includes("\"carrierAmount\":100"), true);
+check("Option B form defaults markup percent to real 30",
+    optionBPage.includes("row.markupPct!=null?row.markupPct:30") &&
+    optionBPage.includes("?\"250.00\":\"30\""),
+    true);
+check("Option B form keeps base rate unchanged copy",
+    optionBPage.includes("Base customer rate (unchanged)"), true);
+
+// 3c2b. Option E reuses the same line-markup form with rate bump copy
+const optionEPage = ac.buildOptionBAccessorialConfirmPage({
+  title: "Confirm option E",
+  description: "option E test",
+  confirmLabel: "Confirm option E",
+  baseUrl: "https://x.example.com",
+  actionPath: "additionalChargeAction",
+  baseCustomerRate: 500,
+  bumpCustomerRate: true,
+  carrierCharges: [
+    {label: "Liftgate", amount: 100},
+  ],
+  fields: {invoiceId: "inv1", option: "e"},
+});
+check("Option E form reuses percent markup mode",
+    optionEPage.includes("Percent markup"), true);
+check("Option E form defaults markup percent to real 30",
+    optionEPage.includes("row.markupPct!=null?row.markupPct:30") &&
+    optionEPage.includes("?\"250.00\":\"30\""),
+    true);
+check("Option E form says rate will be bumped",
+    optionEPage.includes("Confirming bumps it by the accessorial total"),
+    true);
+check("Option E form does not say base rate unchanged",
+    !optionEPage.includes("Base customer rate (unchanged)"), true);
+const eMarkupTotal = ac.normalizeCustomerBillLines([
+  {name: "Liftgate", carrierAmount: 100, markupPct: 30},
+]);
+check("Option E 30% markup on $100 → $130 total",
+    eMarkupTotal.ok && eMarkupTotal.total === 130, true);
 
 // 3c3. Option B dispatcher ready template + finalize button
 const reminder = ac.buildDispatcherNotifyReminderEmail({

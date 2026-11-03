@@ -75,3 +75,21 @@ node_modules/
 docs
 .env.tai-invoice-automation
 alldocs
+
+# One-off agent scratch: probe dumps, deploy logs, live source snapshots.
+# Files already committed stay tracked.
+/_*
+/deploy-*
+/logs-*
+/debug-*.log
+/bulk-requeue-*
+/.gcloudignore.bak
+/.gcloudignore.deploy
+functions/_*
+functions/scripts/_*
+functions/deploy-*
+functions/firebase-debug.log
+deliverables/_*
+deliverables/jerry-logs-*-temp.csv
+deliverables/live-test-*
+deliverables/signed-bols-by-pickticket.zip

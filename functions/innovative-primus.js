@@ -1590,11 +1590,16 @@ exports.processPrimusWorkflow = onRequest(
           additionalCharge.source === "unrecognized_charges") ?
           (Number(additionalCharge.amount) || 0) : 0;
         const additionalChargesMod = require("./additional-charges");
+        const additionalDecision = String(
+            (additionalCharge && additionalCharge.decision) || "",
+        ).toUpperCase();
         const optionBCustomerBillLines = (additionalChargeApproved &&
           additionalCharge &&
-          String(additionalCharge.decision || "").toUpperCase() === "B" &&
+          additionalDecision === "B" &&
           Array.isArray(additionalCharge.customerBillLines)) ?
           additionalCharge.customerBillLines : [];
+        const optionFFreightAccessorial = additionalChargeApproved &&
+          additionalDecision === "F";
         const customerBillAccessorialTotal = optionBCustomerBillLines.length ?
           additionalChargesMod.sumCustomerBillLines(optionBCustomerBillLines) :
           0;
@@ -2771,6 +2776,13 @@ exports.processPrimusWorkflow = onRequest(
                 chargesTotal: proofTotal,
                 invoiceAmount: invoice.invoiceAmount,
                 status: additionalChargesMod.FOLLOW_UP_STATUS.PENDING_APPROVAL,
+                dispatcherEmail: (dispatcherForEmail.ok &&
+                  dispatcherForEmail.email) ?
+                  dispatcherForEmail.email : null,
+                dispatcherName: dispatcherForEmail.displayName ||
+                  dispatcherForEmail.userName || null,
+                cc: (dispatcherForEmail.ok && dispatcherForEmail.email) ?
+                  dispatcherForEmail.email : null,
               });
               if (!(followUp && followUp.reused)) {
                 await saveOutboundEmail(approvalPayload);
@@ -3774,11 +3786,21 @@ exports.processPrimusWorkflow = onRequest(
                     };
                   }
                 }
+                const optionFRate = optionFFreightAccessorial ?
+                  (Number(additionalCharge.customerChargeAmount) ||
+                    Number(customerRate) || 0) : 0;
                 const uiResult = await runUiBillingFlowWithRetry({
                   booking: bk,
                   loadNumber: invoice.loadNumber,
-                  customerRate,
-                  customerBillLines: optionBCustomerBillLines,
+                  customerRate: optionFFreightAccessorial ?
+                    optionFRate : customerRate,
+                  customerBillLines: optionFFreightAccessorial ?
+                    [] : optionBCustomerBillLines,
+                  freightAccessorialOnly: optionFFreightAccessorial,
+                  freightAccessorialName: optionFFreightAccessorial ?
+                    (additionalCharge.freightAccessorialName ||
+                      additionalChargesMod.FREIGHT_ACCESSORIAL_NAME) :
+                    null,
                   carrierInvoiceAmount: invoice.invoiceAmount,
                   carrierName: invoice.carrierName || null,
                   proNumber: workingProNumber || invoice.proNumber,

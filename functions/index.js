@@ -65,6 +65,7 @@ const invoiceLoadEntry = require("./invoice-load-entry");
 const dashboardTasks = require("./dashboard-tasks");
 const dashboardOps = require("./dashboard-ops");
 const dashboardOpsHttp = require("./dashboard-ops-http");
+const dashboardNotificationDigest = require("./dashboard-notification-digest");
 const mailProvider = require("./mail-provider");
 const emailBranding = require("./email-branding");
 const mailIntakeQueue = require("./mail-intake-queue");
@@ -2857,7 +2858,7 @@ function emailActionWorkerAuthOk(req) {
 /**
  * Atomically claims an additional-charge decision (blocks double-execute).
  * @param {object} invoiceRef Firestore invoice document reference.
- * @param {string} decision Decision letter A, B, C, D, or E.
+ * @param {string} decision Decision letter A, B, C, D, E, or F.
  * @return {Promise<object>} Claim result with ok flag.
  */
 async function claimAdditionalChargeDecision(invoiceRef, decision) {
@@ -3010,8 +3011,10 @@ async function handleExecuteAdditionalChargeDecision(req, res) {
     const tenantId = body.tenantId || null;
     const optionACustomerChargeAmount = body.optionACustomerChargeAmount;
     const optionBCustomerBillLines = body.optionBCustomerBillLines;
+    const optionFRateMode = body.optionFRateMode;
+    const optionFRateInput = body.optionFRateInput;
 
-    if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+    if (!invoiceId || !["a", "b", "c", "d", "e", "f"].includes(option)) {
       return res.status(400).json({ok: false, error: "Bad request"});
     }
 
@@ -3048,6 +3051,8 @@ async function handleExecuteAdditionalChargeDecision(req, res) {
         charge,
         optionACustomerChargeAmount,
         optionBCustomerBillLines,
+        optionFRateMode,
+        optionFRateInput,
       });
     } catch (bgError) {
       console.error("executeAdditionalChargeDecision background:", bgError);
@@ -3075,6 +3080,7 @@ async function runAdditionalChargeDecisionBackground(args) {
   const {
     invoiceId, option, decision, tenant, invoiceRef, invoice, charge,
     optionACustomerChargeAmount, optionBCustomerBillLines,
+    optionFRateMode, optionFRateInput,
   } = args;
   const chargesTotal = Number(charge.amount) || 0;
   const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
@@ -3135,7 +3141,32 @@ async function runAdditionalChargeDecisionBackground(args) {
     return;
   }
 
-  const billCustomer = option === "a" || option === "b" || option === "e";
+  let freightRate = null;
+  if (option === "f") {
+    freightRate = additionalCharges.computeFreightCustomerRate({
+      mode: optionFRateMode,
+      input: optionFRateInput,
+      invoiceAmount: invoice.invoiceAmount,
+    });
+    if (!freightRate.ok) {
+      await writeLog("error", "workflow",
+          "Option F customer rate could not be calculated", {
+            invoiceId,
+            loadNumber: invoice.loadNumber,
+            error: freightRate.error,
+          });
+      await additionalCharges.updateFollowUp(db, {
+        invoiceId: String(invoiceId),
+        status: additionalCharges.FOLLOW_UP_STATUS.PENDING_APPROVAL,
+        decision,
+        notes: freightRate.error,
+      });
+      return;
+    }
+  }
+
+  const billCustomer = option === "a" || option === "b" ||
+    option === "e" || option === "f";
   let rateBumpNote = "";
   // Option B pauses invoice send until the dispatcher confirms the
   // customer was notified (see finalizeAdditionalChargeInvoice).
@@ -3146,7 +3177,7 @@ async function runAdditionalChargeDecisionBackground(args) {
     "additionalCharge.billCustomer": billCustomer,
     "additionalCharge.notifyCustomer": option === "a" ? "auto" :
       (option === "b" ? "dispatcher" :
-        (option === "e" ? "none" : null)),
+        ((option === "e" || option === "f") ? "none" : null)),
     "additionalCharge.status": "approved",
     "additionalCharge.decidedAt":
       admin.firestore.FieldValue.serverTimestamp(),
@@ -3171,8 +3202,15 @@ async function runAdditionalChargeDecisionBackground(args) {
       optionACustomerChargeAmount > 0) {
     const baseRate = await resolveCurrentCustomerRate(invoice, booking);
     const billAmount = optionACustomerChargeAmount;
+    const billLines = Array.isArray(optionBCustomerBillLines) ?
+      optionBCustomerBillLines : [];
     approvalUpdate["additionalCharge.customerChargeAmount"] = billAmount;
     approvalUpdate["additionalCharge.rateBumpAmount"] = billAmount;
+    if (billLines.length) {
+      approvalUpdate["additionalCharge.customerBillLines"] = billLines;
+      approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
+        additionalCharges.sumCustomerBillLines(billLines);
+    }
     if (baseRate > 0) {
       const bumpedRate =
         Math.round((baseRate + billAmount) * 100) / 100;
@@ -3202,6 +3240,29 @@ async function runAdditionalChargeDecisionBackground(args) {
       " Base customer rate unchanged.";
     rateBumpNote += ` Billing ${billLines.length} accessorial line(s)` +
       ` ($${billExtra.toFixed(2)}).`;
+  } else if (option === "f" && freightRate && freightRate.ok) {
+    const baseRate = await resolveCurrentCustomerRate(invoice, booking);
+    approvalUpdate.customerRate = freightRate.amount;
+    approvalUpdate["additionalCharge.customerChargeAmount"] =
+      freightRate.amount;
+    approvalUpdate["additionalCharge.customerRateMode"] = freightRate.mode;
+    approvalUpdate["additionalCharge.customerRateInput"] = freightRate.input;
+    approvalUpdate["additionalCharge.freightAccessorialName"] =
+      additionalCharges.FREIGHT_ACCESSORIAL_NAME;
+    approvalUpdate["additionalCharge.originalCustomerRate"] =
+      baseRate > 0 ? baseRate : null;
+    invoice.customerRate = freightRate.amount;
+    const how = freightRate.mode === "percent" ?
+      `${freightRate.input}% of invoice $${Number(freightRate.invoiceAmount)
+          .toFixed(2)}` :
+      "flat amount";
+    approvalUpdate["additionalCharge.customerBillLines"] = [{
+      name: additionalCharges.FREIGHT_ACCESSORIAL_NAME,
+      amount: freightRate.amount,
+    }];
+    rateBumpNote = ` Customer rate set to $${freightRate.amount.toFixed(2)} ` +
+      `(${how}). Entered in Primus as accessorial ` +
+      `${additionalCharges.FREIGHT_ACCESSORIAL_NAME}.`;
   }
 
   await invoiceRef.update(approvalUpdate);
@@ -3249,9 +3310,11 @@ async function runAdditionalChargeDecisionBackground(args) {
       decision,
       notes: extraNote.trim(),
     });
-  } else if (option === "e") {
-    extraNote += " No separate customer notification sent; charge will " +
-      "be included on the customer invoice.";
+  } else if (option === "e" || option === "f") {
+    if (option === "e") {
+      extraNote += " No separate customer notification sent; charge will " +
+        "be included on the customer invoice.";
+    }
     await additionalCharges.updateFollowUp(db, {
       invoiceId: String(invoiceId),
       status: additionalCharges.FOLLOW_UP_STATUS.APPROVED_BILLED,
@@ -5084,6 +5147,11 @@ async function forwardToHumanReview(
     messageId,
     department,
     reason: safeReason,
+    from: from || null,
+    to: options.originalTo || options.to || null,
+    cc: safeCc || null,
+    dispatcherEmail: options.dispatcherEmail || null,
+    dispatcherName: options.dispatcherName || null,
   });
 }
 
@@ -5812,7 +5880,7 @@ async function inspectAndUploadWeightCertificate(opts) {
 }
 
 /**
- * Sends the 5-option (A/B/C/D/E) additional-charge approval email to the
+ * Sends the 6-option (A/B/C/D/E/F) additional-charge approval email to the
  * approver (Sarah) with the dispatcher CC'd, and creates the follow-up
  * entry so the charge is tracked until resolved.
  * @param {object} opts invoiceId, tenant, aiResult, pending (category,
@@ -5849,6 +5917,9 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     }
   }
 
+  const podFollowupForAssign = require("./pod-followup");
+  const approverForAssign = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+    podFollowupForAssign.SARAH_EMAIL;
   const followUp = await additionalCharges.createFollowUp(db, {
     loadNumber: aiResult.loadNumber,
     carrierName: aiResult.carrierName,
@@ -5860,6 +5931,11 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     chargesTotal: pending.chargesTotal,
     invoiceAmount: aiResult.invoiceAmount,
     status: additionalCharges.FOLLOW_UP_STATUS.PENDING_APPROVAL,
+    to: approverForAssign,
+    dispatcherEmail: (dispatcher.ok && dispatcher.email) ?
+      dispatcher.email : null,
+    dispatcherName: dispatcher.displayName || dispatcher.userName || null,
+    cc: (dispatcher.ok && dispatcher.email) ? dispatcher.email : null,
   });
   const followUpId = followUp && followUp.id ? followUp.id : followUp;
   if (followUp && followUp.reused) {
@@ -6042,7 +6118,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     title: `Additional charge — Load ${aiResult.loadNumber || "—"}`,
     body: `Category: ${pending.category || "—"}. ` +
       `Charges total: $${Number(pending.chargesTotal || 0).toFixed(2)}. ` +
-      `Choose A–E in the dashboard Tasks tab.`,
+      `Choose A–F in the dashboard Tasks tab.`,
     subject: email.subject,
     to: approver,
     cc: dispatcherEmail || additionalCharges.LISA_EMAIL,
@@ -6053,7 +6129,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     reason: pending.category || null,
     emailType: "additional_charge_approval",
     chargesTotal: pending.chargesTotal,
-    chargeOptions: ["a", "b", "c", "d", "e"],
+    chargeOptions: ["a", "b", "c", "d", "e", "f"],
     emailSent: !dashboardOps.isDashboardOpsPrimary(),
   });
 
@@ -6070,7 +6146,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
   }
 
   await writeLog("info", "email",
-      "Additional-charge approval email sent (A/B/C/D/E)", {
+      "Additional-charge approval email sent (A/B/C/D/E/F)", {
         invoiceId,
         followUpId,
         loadNumber: aiResult.loadNumber,
@@ -6322,12 +6398,20 @@ async function classifyInvoiceData(pdfAttachments, lastKnownLoadNumber) {
         "(YYYY-MM-DD). If the invoice shows terms like Net 30 but no " +
         "explicit due date, leave dueDate empty.",
         "Fuel surcharge is not an extra charge.",
+        "Line haul, linehaul, base freight, and freight breakdown lines " +
+        "are NOT extra charges — they break down the total freight, not " +
+        "an accessorial. Never put them in recognizedCharges, " +
+        "unrecognizedCharges, charges, or chargesNeedProof.",
+        "The additional charge amount is always carrier invoice total " +
+        "minus the Primus amount on file. Line items only help name the " +
+        "accessorial that explains that difference.",
         "Recognized extra charges are lumper and detention only.",
         "Detention = driver waiting time charge.",
         "If lumper exists, proof/receipt must be attached.",
         "Only classify lumper if clearly shown on the invoice.",
         "Populate recognizedCharges with recognized extra charges only.",
-        "Populate unrecognizedCharges with any extra charge not recognized.",
+        "Populate unrecognizedCharges with any extra charge not recognized " +
+        "(accessorials / fees — never line haul or base freight).",
         "Populate chargesNeedProof with recognized charges that need " +
         "proof but it is missing.",
         "Populate chargeProofRefs with {type, amount, attachmentFilename} " +
@@ -6862,6 +6946,7 @@ async function saveOutboundEmail(email) {
   delete emailToStore.tenant;
   delete emailToStore.skipAgentGreeting;
   delete emailToStore.forceRecipient;
+  delete emailToStore.forceSend;
   const emailRef = await tcol(tenant, "outboundEmails").add({
     ...emailToStore,
     to,
@@ -6874,8 +6959,11 @@ async function saveOutboundEmail(email) {
   const isCustomerBill = email.type === "generated_bill";
   const isSystemErr = isSystemErrorOutboundEmail(email);
   const isDashboardMeta = email.type === "dashboard_flag" ||
-    email.type === "dashboard_reply";
-  const parkOpsOnDashboard = dashboardOps.isDashboardOpsPrimary() &&
+    email.type === "dashboard_reply" ||
+    email.type === "dashboard_notification_digest";
+  const forceSend = email.forceSend === true || isDashboardMeta;
+  const parkOpsOnDashboard = !forceSend &&
+    dashboardOps.isDashboardOpsPrimary() &&
     !isCustomerBill && !isSystemErr && !isDashboardMeta;
 
   // additional_charge_approval already creates a richer notification upstream.
@@ -7836,7 +7924,12 @@ function normalizeAiChargeArrays(aiResult) {
     if (!c || typeof c !== "object") return false;
     const label = String(c.label || c.type || "").trim();
     const amt = Number(c.amount);
-    return label.length > 0 || (Number.isFinite(amt) && Math.abs(amt) > 0);
+    if (!(label.length > 0 || (Number.isFinite(amt) && Math.abs(amt) > 0))) {
+      return false;
+    }
+    // Line haul / fuel / base freight = freight breakdown, not an extra.
+    if (additionalCharges.isFreightBreakdownLabel(label)) return false;
+    return true;
   };
   let recognizedCharges = (Array.isArray(aiResult.recognizedCharges) ?
     aiResult.recognizedCharges : []).filter(keepCharge);
@@ -9864,6 +9957,25 @@ async function processGmailMessage(
         queueDocId,
         finalStatus: "dnb_promotional_ignored",
         reason: "D&B Credit Insights / promotional — no action needed",
+      });
+      return;
+    }
+
+    // The unfinished-notification digest is sent from this mailbox. If a
+    // copy lands here, do not open a dashboard row and do not reply
+    // (a reply becomes "Re:" and re-enters the inbox).
+    if (dashboardNotificationDigest.isInboundDigestEmail({
+      subject,
+      body: emailBody,
+    })) {
+      await completeAdministrativeIgnore({
+        messageId,
+        subject,
+        from,
+        tenant,
+        queueDocId,
+        finalStatus: "dashboard_digest_ignored",
+        reason: "Unfinished-notification digest is Jerry's own mail",
       });
       return;
     }
@@ -12260,17 +12372,29 @@ async function processGmailMessage(
         }
         const freightMismatch = additionalCharges.detectFreightMismatch(
             aiResult.freightDetails, bookingForCharges);
+        const primusVendorCost = bookingForCharges &&
+          bookingForCharges.vendor &&
+          Number(bookingForCharges.vendor.cost) || null;
+        // Drop line haul / fuel / base freight — never additional charges.
+        const strippedCharges =
+          additionalCharges.stripFreightBreakdownCharges(
+              normalizedChargeData.unrecognizedCharges);
+        normalizedChargeData.unrecognizedCharges = strippedCharges.kept;
+        // ALWAYS first: additional = invoice total − Primus on file.
+        const invoiceGap = additionalCharges.reportedChargeDifference(
+            aiResult.invoiceAmount, primusVendorCost);
         const chargeCategory =
           additionalCharges.classifyAdditionalChargeReason({
             charges: normalizedChargeData.unrecognizedCharges,
             hasCertificate: !!aiResult.hasWeightInspectionCertificate,
             freightMismatch,
+            invoiceGap,
+            invoiceAmount: aiResult.invoiceAmount,
+            primusAmount: primusVendorCost,
           });
-        const chargesTotal = additionalCharges.sumCharges(
-            normalizedChargeData.unrecognizedCharges);
-        const primusVendorCost = bookingForCharges &&
-          bookingForCharges.vendor &&
-          Number(bookingForCharges.vendor.cost) || null;
+        const chargesTotal = invoiceGap != null ? invoiceGap :
+          additionalCharges.sumCharges(
+              normalizedChargeData.unrecognizedCharges);
 
         if (chargeCategory ===
             additionalCharges.CHARGE_CATEGORY.RATE_INCREASE) {
@@ -12702,10 +12826,15 @@ async function processGmailMessage(
               finalStatus = "additional_charge_pending_approval";
               const storageTotal = additionalCharges.sumCharges(
                   storageCharges);
+              // Prefer invoice − Primus when known; storage lines identify it.
+              const storageInvoiceGap =
+                additionalCharges.reportedChargeDifference(
+                    aiResult.invoiceAmount, primusResult.amount);
               pendingAdditionalCharge = {
                 category: additionalCharges.CHARGE_CATEGORY.ACCESSORIAL,
                 charges: storageCharges,
-                chargesTotal: storageTotal,
+                chargesTotal: storageInvoiceGap != null ?
+                  storageInvoiceGap : storageTotal,
                 freightMismatch: rebillMismatch,
                 hasCertificate: !!aiResult.hasWeightInspectionCertificate,
                 primusVendorCost: Number(primusResult.amount) || null,
@@ -12909,7 +13038,7 @@ async function processGmailMessage(
         if (isPendingChargeApproval) {
           decisionStage = "additional_charge_pending_approval";
           reviewStatus = "needed";
-          decisionReason = "Additional charge awaiting A/B/C/D decision.";
+          decisionReason = "Additional charge awaiting A/B/C/D/E/F decision.";
         }
 
         if (primusResult && primusResult.ok && primusResult.validAmount) {
@@ -14251,7 +14380,7 @@ function invoiceDashboardStatus(data) {
       displayStatus: "additional_charge_pending_approval",
       displayLabel: "Awaiting extra-charge approval",
       displayReason: data.decisionReason ||
-        "Additional charge awaiting A/B/C/D decision.",
+        "Additional charge awaiting A/B/C/D/E/F decision.",
       remapWorkflow: false};
   }
   const awaitingCustomerNotify =
@@ -14479,6 +14608,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
           limit,
           offset: req.query.offset,
           chargePhase: req.query.chargePhase || null,
+          dispatcher: req.query.dispatcher || req.query.dispatcherKey || "",
         });
     return res.json({
       ok: true,
@@ -14547,76 +14677,135 @@ async function trashGmailMessage(tenant, messageId) {
 }
 
 /**
- * Applies an A–E additional-charge decision from the dashboard by signing a
- * short-lived action token and reusing handleAdditionalChargeAction.
+ * Applies an A–F additional-charge decision from the dashboard: claim the
+ * decision, then run the same fat-worker background path as email buttons.
  * @param {object} opts tenant, invoiceId, option, customerChargeAmount?,
- *   customerBillLines?.
+ *   customerBillLines?, rateMode?, rateInput?.
  * @return {Promise<object>}
  */
 async function applyAdditionalChargeFromDashboard(opts) {
-  const emailActionTokens = require("./email-action-tokens");
   const invoiceId = String(opts.invoiceId);
   const option = String(opts.option).toLowerCase();
-  const tenantId = opts.tenant.tenantId;
-  const exp = Date.now() + (60 * 60 * 1000);
-  const sig = emailActionTokens.sign(
-      "additionalCharge", invoiceId, option, tenantId, exp);
-
-  const body = {
-    invoiceId,
-    option,
-    tenantId,
-    exp: String(exp),
-    sig,
-  };
-  if (option === "a" || option === "e") {
-    body.customerChargeAmount = opts.customerChargeAmount;
-  }
-  if (option === "b") {
-    const lines = Array.isArray(opts.customerBillLines) ?
-      opts.customerBillLines : [];
-    // Form parser expects JSON string or structured fields.
-    body.customerBillLinesJson = JSON.stringify(lines.map((line) => ({
-      name: line.description || line.name || "ACCESSORIAL",
-      amount: Number(line.amount) || 0,
-    })));
-  }
-
-  let statusCode = 200;
-  let sentBody = "";
-  const fakeReq = {
-    method: "POST",
-    query: {},
-    body,
-    get: () => undefined,
-  };
-  const fakeRes = {
-    status(code) {
-      statusCode = code;
-      return this;
-    },
-    send(payload) {
-      sentBody = String(payload || "");
-      return this;
-    },
-    json(payload) {
-      sentBody = JSON.stringify(payload || {});
-      return this;
-    },
-  };
-
-  await handleAdditionalChargeAction(fakeReq, fakeRes);
-  if (statusCode >= 400) {
-    const plain = sentBody.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const tenant = opts.tenant;
+  if (!["a", "b", "c", "d", "e", "f"].includes(option)) {
     return {
       ok: false,
-      status: statusCode,
-      error: plain.slice(0, 300) || "Charge decision failed.",
+      status: 400,
+      error: "option (a|b|c|d|e|f) is required.",
     };
   }
-  const message = sentBody.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ")
-      .trim().slice(0, 240);
-  return {ok: true, message};
+
+  let optionACustomerChargeAmount = null;
+  let optionBCustomerBillLines = null;
+  let optionFRateMode = null;
+  let optionFRateInput = null;
+
+  const mapDashboardBillLines = (lines) => (Array.isArray(lines) ? lines : [])
+      .map((line) => ({
+        name: line.description || line.name || "ACCESSORIAL",
+        carrierAmount: line.carrierAmount,
+        markupPct: line.markupPct,
+        flatAmount: line.flatAmount,
+        amount: line.amount,
+        pricingMode: line.pricingMode,
+      }));
+
+  if (option === "a" || option === "e") {
+    const lines = Array.isArray(opts.customerBillLines) ?
+      opts.customerBillLines : [];
+    if (lines.length) {
+      const normalized = additionalCharges.normalizeCustomerBillLines(
+          mapDashboardBillLines(lines));
+      if (!normalized.ok) {
+        return {ok: false, status: 400, error: normalized.error};
+      }
+      optionBCustomerBillLines = normalized.lines;
+      optionACustomerChargeAmount = normalized.total;
+    } else {
+      const parsed = additionalCharges.parseCustomerChargeAmountFromRequest({
+        customerChargeAmount: opts.customerChargeAmount,
+      });
+      if (!parsed.ok) {
+        return {ok: false, status: 400, error: parsed.error};
+      }
+      optionACustomerChargeAmount = parsed.amount;
+    }
+  }
+  if (option === "b") {
+    const normalized = additionalCharges.normalizeCustomerBillLines(
+        mapDashboardBillLines(opts.customerBillLines));
+    if (!normalized.ok) {
+      return {ok: false, status: 400, error: normalized.error};
+    }
+    optionBCustomerBillLines = normalized.lines;
+  }
+  if (option === "f") {
+    const invoiceRefPeek = tcol(tenant, "invoices").doc(invoiceId);
+    const peek = await invoiceRefPeek.get();
+    if (!peek.exists) {
+      return {ok: false, status: 404, error: "Invoice not found."};
+    }
+    const freight = additionalCharges.computeFreightCustomerRate({
+      mode: opts.rateMode || opts.optionFRateMode,
+      input: opts.rateInput != null ?
+        opts.rateInput : opts.optionFRateInput,
+      invoiceAmount: (peek.data() || {}).invoiceAmount,
+    });
+    if (!freight.ok) {
+      return {ok: false, status: 400, error: freight.error};
+    }
+    optionFRateMode = freight.mode;
+    optionFRateInput = freight.input;
+  }
+
+  const invoiceRef = tcol(tenant, "invoices").doc(invoiceId);
+  const claim = await claimAdditionalChargeDecision(
+      invoiceRef, option.toUpperCase());
+  if (!claim.ok) {
+    if (claim.reason === "already") {
+      return {
+        ok: false,
+        status: 409,
+        error: `This charge was already handled (option ` +
+          `${String(claim.decision || "").toUpperCase()}).`,
+      };
+    }
+    return {
+      ok: false,
+      status: 400,
+      error: "Could not process this decision.",
+    };
+  }
+
+  const decision = option.toUpperCase();
+  try {
+    await runAdditionalChargeDecisionBackground({
+      invoiceId,
+      option,
+      decision,
+      tenant,
+      invoiceRef,
+      invoice: claim.invoice,
+      charge: (claim.invoice && claim.invoice.additionalCharge) || {},
+      optionACustomerChargeAmount,
+      optionBCustomerBillLines,
+      optionFRateMode,
+      optionFRateInput,
+    });
+  } catch (err) {
+    console.error("applyAdditionalChargeFromDashboard background:",
+        err.message);
+    return {
+      ok: false,
+      status: 500,
+      error: err.message || "Charge decision background failed.",
+    };
+  }
+
+  return {
+    ok: true,
+    message: `Option ${decision} recorded.`,
+  };
 }
 
 dashboardOpsHttp.init({
@@ -14633,6 +14822,8 @@ dashboardOpsHttp.init({
   trashGmailMessage,
 });
 
+exports.getDashboardAccessorials = onRequest(
+    {invoker: "public"}, dashboardOpsHttp.handleListAccessorials);
 exports.getDashboardNotifications = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
 exports.dismissDashboardNotification = onRequest(
@@ -17482,6 +17673,31 @@ exports.retryTransientWorkflowFailures = onSchedule({
   } catch (error) {
     console.error("retryTransientWorkflowFailures error:", error.message);
   }
+});
+
+dashboardNotificationDigest.init({
+  db,
+  getActiveTenants,
+  listNotifications: (database, opts) =>
+    dashboardOps.listNotifications(database, opts),
+  saveOutboundEmail,
+});
+
+/**
+ * Morning digest of unfinished dashboard notifications.
+ * 7:30 AM America/New_York. One send per tenant per Eastern calendar day.
+ * retryCount 0: Cloud Scheduler must not redeliver after a failure.
+ * The function also refuses any invocation outside the 7 AM Eastern hour.
+ */
+exports.sendDashboardNotificationDigest = onSchedule({
+  schedule: "30 7 * * *",
+  timeZone: "America/New_York",
+  timeoutSeconds: 300,
+  memory: "512MiB",
+  retryCount: 0,
+}, async () => {
+  const result = await dashboardNotificationDigest.runDailyNotificationDigest();
+  console.log("sendDashboardNotificationDigest:", JSON.stringify(result));
 });
 
 const innovativeInsurance = require("./innovative-insurance");
