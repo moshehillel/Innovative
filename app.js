@@ -412,10 +412,28 @@
       s = decodeHtmlEntities(s);
     }
     if (looksLikeHtml(s)) {
-      return s.replace(/<script[\s\S]*?<\/script>/gi, "");
+      return enableEmailActionPopups(
+          s.replace(/<script[\s\S]*?<\/script>/gi, ""));
     }
     return `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
       `${bodyEsc(s)}</pre>`;
+  }
+
+  /**
+   * Approval emails embed A–E/F as <a target=_blank> action URLs. Inside an
+   * iframe with sandbox="", left-click is blocked while right-click → Open in
+   * new tab still works. Keep the href and force target=_blank so allow-popups
+   * on the iframe can open the confirm page on a normal left click.
+   */
+  function enableEmailActionPopups(html) {
+    return String(html || "").replace(
+        /<a\b([^>]*?)href\s*=\s*(["'])([^"']*additionalChargeAction[^"']*)\2([^>]*)>/gi,
+        (full, pre, quote, href, post) => {
+          let attrs = `${pre} ${post}`;
+          attrs = attrs.replace(/\starget\s*=\s*(["']).*?\1/gi, "");
+          attrs = attrs.replace(/\srel\s*=\s*(["']).*?\1/gi, "");
+          return `<a href=${quote}${href}${quote} target="_blank" rel="noopener noreferrer"${attrs}>`;
+        });
   }
 
   function frameDoc(html) {
@@ -431,6 +449,20 @@
       "img{max-width:100%;height:auto}</style></head><body>" +
       html + "</body></html>";
   }
+
+  function findChargeForm(taskId) {
+    const id = String(taskId || "");
+    const roots = [els.drawerFooter, els.drawerBody].filter(Boolean);
+    for (const root of roots) {
+      const match = Array.from(root.querySelectorAll("[data-charge-form]"))
+          .find((el) => el.getAttribute("data-charge-form") === id);
+      if (match) return match;
+    }
+    return null;
+  }
+
+  const EMAIL_FRAME_SANDBOX =
+    "allow-popups allow-popups-to-escape-sandbox allow-downloads";
 
   /* —— Drawer —— */
   function closeDrawer() {
@@ -630,7 +662,7 @@
         `<div class="why-box dispute-notes-box"><strong>Notes on what to dispute:</strong> ${bodyEsc(task.disputeNotes)}</div>` : "") +
       (task.isUrgentOld || task.ageLabel ?
         `<p><span class="age-badge">URGENT/OLD</span></p>` : "") +
-      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>` +
+      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox="${EMAIL_FRAME_SANDBOX}"></iframe></div>` +
       attachmentListHtml(task, task.source === "additionalCharges" ?
         "additionalCharges" : "task");
     const footer =
@@ -708,7 +740,7 @@
       (n.reason ?
         `<div class="why-box"><strong>Why review:</strong> ${bodyEsc(n.reason)}</div>` :
         "") +
-      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox=""></iframe></div>` +
+      `<div class="email-frame-wrap"><iframe class="notif-body-frame" title="Email" sandbox="${EMAIL_FRAME_SANDBOX}"></iframe></div>` +
       attachmentListHtml(n, "notification") +
       `<div class="flag-form" hidden></div><div class="reply-form" hidden></div>`;
     const unhandled = n.type === "unhandled_email";
@@ -772,13 +804,20 @@
       });
     });
 
-    foot.querySelectorAll(".charge-opt").forEach((btn) => {
-      btn.addEventListener("click", () => {
+    if (!foot._chargeOptBound) {
+      foot._chargeOptBound = true;
+      foot.addEventListener("click", (event) => {
+        const btn = event.target && event.target.closest
+          ? event.target.closest(".charge-opt")
+          : null;
+        if (!btn || !foot.contains(btn)) return;
         if (btn.disabled || foot.dataset.chargeFrozen === "1") return;
+        event.preventDefault();
+        event.stopPropagation();
         freezeChargeButtons(drawerItem && drawerItem.id);
         openChargeForm(btn);
       });
-    });
+    }
 
     foot.querySelector(".notif-dismiss")?.addEventListener("click", () => {
       const id = drawerItem.id;
@@ -894,6 +933,19 @@
     return loose.length === 1 ? loose[0] : null;
   }
 
+  function filterAccessorialChoices(query, choices) {
+    const list = Array.isArray(choices) ? choices : [];
+    const want = normAccessorial(query);
+    if (!want) return list.slice(0, 50);
+    return list.filter((item) => {
+      const name = normAccessorial(item.name);
+      const code = normAccessorial(item.code);
+      const category = normAccessorial(item.category);
+      return name.includes(want) || code.includes(want) ||
+        category.includes(want) || want.includes(name);
+    }).slice(0, 50);
+  }
+
   function addChargeLine(list, seed, choices) {
     const row = document.createElement("div");
     row.className = "charge-line";
@@ -902,33 +954,82 @@
     row.style.gap = "6px";
     row.style.marginBottom = "8px";
     const carrier = seed && seed.carrierAmount ? Number(seed.carrierAmount) : "";
-    const select = document.createElement("select");
-    select.className = "input charge-line-name";
-    const blank = document.createElement("option");
-    blank.value = "";
-    blank.textContent = "Select accessorial";
-    select.appendChild(blank);
+    const picker = document.createElement("div");
+    picker.className = "charge-line-picker";
+    const search = document.createElement("input");
+    search.className = "input charge-line-search";
+    search.type = "search";
+    search.autocomplete = "off";
+    search.placeholder = "Type to find Primus accessorial";
+    const nameHidden = document.createElement("input");
+    nameHidden.type = "hidden";
+    nameHidden.className = "charge-line-name";
+    const codeHidden = document.createElement("input");
+    codeHidden.type = "hidden";
+    codeHidden.className = "charge-line-code";
+    const menu = document.createElement("div");
+    menu.className = "charge-line-menu";
+    menu.hidden = true;
     const matched = matchAccessorialChoice(seed && seed.name, choices || []);
-    let selected = false;
-    (choices || []).forEach((item) => {
-      const opt = document.createElement("option");
-      opt.value = item.code || "";
-      opt.dataset.name = item.name || "";
-      opt.textContent = `${item.category ? item.category + " — " : ""}${item.name}`;
-      if (matched && item.code === matched.code && item.name === matched.name) {
-        opt.selected = true;
-        selected = true;
-      }
-      select.appendChild(opt);
-    });
-    if (seed && seed.name && !selected) {
-      const extra = document.createElement("option");
-      extra.value = "";
-      extra.dataset.name = seed.name;
-      extra.selected = true;
-      extra.textContent = `${seed.name} (from the invoice)`;
-      select.appendChild(extra);
+    if (matched) {
+      nameHidden.value = matched.name || "";
+      codeHidden.value = matched.code || "";
+      search.value = matched.name || "";
+    } else if (seed && seed.name) {
+      // Narrow the list with Jerry's wording, but force a Primus pick.
+      search.value = String(seed.name);
+      search.placeholder =
+        `Pick Primus name (Jerry listed: ${seed.name})`;
     }
+    const setChoice = (item) => {
+      nameHidden.value = item.name || "";
+      codeHidden.value = item.code || "";
+      search.value = item.name || "";
+      menu.hidden = true;
+      menu.innerHTML = "";
+    };
+    const renderMenu = () => {
+      const items = filterAccessorialChoices(search.value, choices || []);
+      menu.innerHTML = "";
+      if (!items.length) {
+        const empty = document.createElement("div");
+        empty.className = "charge-line-menu-empty";
+        empty.textContent = "No Primus match — keep typing";
+        menu.appendChild(empty);
+        menu.hidden = false;
+        return;
+      }
+      items.forEach((item) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "charge-line-menu-item";
+        btn.textContent =
+          `${item.category ? item.category + " — " : ""}${item.name}`;
+        btn.addEventListener("mousedown", (event) => {
+          event.preventDefault();
+          setChoice(item);
+        });
+        menu.appendChild(btn);
+      });
+      menu.hidden = false;
+    };
+    search.addEventListener("focus", renderMenu);
+    search.addEventListener("input", () => {
+      if (search.value.trim() !== nameHidden.value.trim()) {
+        nameHidden.value = "";
+        codeHidden.value = "";
+      }
+      renderMenu();
+    });
+    search.addEventListener("blur", () => {
+      setTimeout(() => {
+        menu.hidden = true;
+      }, 150);
+    });
+    picker.appendChild(search);
+    picker.appendChild(nameHidden);
+    picker.appendChild(codeHidden);
+    picker.appendChild(menu);
     const carrierInput = document.createElement("input");
     carrierInput.className = "input charge-line-carrier";
     carrierInput.type = "number";
@@ -964,7 +1065,7 @@
       const typed = value.value.trim();
       if (typed !== "") value.dataset.keptPct = typed;
     });
-    row.appendChild(select);
+    row.appendChild(picker);
     row.appendChild(carrierInput);
     row.appendChild(mode);
     row.appendChild(value);
@@ -973,12 +1074,18 @@
 
   function readChargeLines(form) {
     const lines = [];
+    let missingPick = null;
     form.querySelectorAll(".charge-line").forEach((row) => {
-      const select = row.querySelector(".charge-line-name");
-      const opt = select && select.options[select.selectedIndex];
-      const name = opt && opt.dataset.name ? opt.dataset.name.trim() : "";
-      if (!name) return;
-      const code = select.value || null;
+      const nameEl = row.querySelector(".charge-line-name");
+      const codeEl = row.querySelector(".charge-line-code");
+      const searchEl = row.querySelector(".charge-line-search");
+      const name = nameEl && nameEl.value ? nameEl.value.trim() : "";
+      const typed = searchEl && searchEl.value ? searchEl.value.trim() : "";
+      if (!name) {
+        if (typed) missingPick = typed;
+        return;
+      }
+      const code = codeEl && codeEl.value ? codeEl.value : null;
       const carrierAmount = Number(row.querySelector(".charge-line-carrier").value);
       const mode = row.querySelector(".charge-line-mode").value;
       const val = Number(row.querySelector(".charge-line-value").value);
@@ -997,6 +1104,10 @@
         markupPct: val, amount,
       });
     });
+    if (!lines.length && missingPick) {
+      throw new Error(
+          `Pick "${missingPick}" from the Primus list (type to filter, then select).`);
+    }
     return lines;
   }
 
@@ -1056,7 +1167,7 @@
       `<textarea class="charge-dispute-notes" rows="3" ` +
       `placeholder="What should be disputed?"></textarea>` : "";
     return `<p><strong>${bodyEsc(CHARGE_LABELS[opt])}</strong></p>` +
-      `<p>Pick each accessorial from the Primus list. Add accessorial for a charge Jerry did not list. Then enter a percent markup or a flat customer amount.</p>` +
+      `<p>Type to find each accessorial in the Primus list, then select it. Add accessorial for a charge Jerry did not list. Then enter a percent markup or a flat customer amount.</p>` +
       `<div class="charge-line-list"></div>` +
       `<button type="button" class="btn btn-sm btn-outline charge-add-line">+ Add accessorial</button>` +
       notes +
@@ -1070,8 +1181,7 @@
     const invoiceId = btn.dataset.invoice;
     const taskId = btn.dataset.taskId;
     const taskSource = btn.dataset.taskSource;
-    const form = els.drawerFooter.querySelector(`[data-charge-form="${taskId}"]`) ||
-      els.drawerBody.querySelector(`[data-charge-form="${taskId}"]`);
+    const form = findChargeForm(taskId);
     if (!form) {
       unfreezeChargeButtons(taskId);
       return;
@@ -1150,7 +1260,14 @@
           }
         } else {
         const allowEmpty = confirmBtn.dataset.allowEmpty === "1";
-        const lines = readChargeLines(form);
+        let lines;
+        try {
+          lines = readChargeLines(form);
+        } catch (pickError) {
+          showError(pickError.message || "Pick an accessorial from the Primus list.");
+          releaseChargeAttempt(taskId, confirmBtn, form);
+          return;
+        }
         if (!lines.length && !allowEmpty) {
           showError("Enter a percent markup or a flat amount, or add an accessorial.");
           releaseChargeAttempt(taskId, confirmBtn, form);
@@ -1568,8 +1685,12 @@
       if (!loadSearch) {
         const key = personKey || dispatcherKey || "";
         const person = OPS_PEOPLE.find((p) => p.key === key);
-        if (person) params.set("dispatcher", person.email);
-        else if (dispatcherQuery) params.set("dispatcher", dispatcherQuery);
+        if (person) {
+          params.set("dispatcher", person.email);
+          params.set("dispatcherKey", person.key);
+        } else if (dispatcherQuery) {
+          params.set("dispatcher", dispatcherQuery);
+        }
       }
       if (q) params.set("q", q);
       const data = await fetchJson(`/getDashboardTasks?${params}`);
@@ -1604,6 +1725,31 @@
         page = page.filter(isMissingPodItem);
       } else {
         page = page.filter((task) => !isOptionDDispute(task));
+      }
+      // Belt-and-suspenders: if the API still returns mixed owners, narrow
+      // locally when a named dispatcher is selected and rows carry owners.
+      const selected = OPS_PEOPLE.find(
+          (p) => p.key === (personKey || dispatcherKey || ""));
+      if (selected && !loadSearch) {
+        const hasOwner = page.some((task) =>
+          task.dispatcherKey || task.dispatcherEmail || task.dispatcherName);
+        if (hasOwner) {
+          const needles = [
+            selected.key,
+            selected.email.toLowerCase(),
+            selected.name.toLowerCase(),
+          ];
+          page = page.filter((task) => {
+            const hay = [
+              task.dispatcherKey,
+              task.dispatcherEmail,
+              task.dispatcherName,
+              task.to,
+              task.cc,
+            ].map((v) => String(v || "").toLowerCase()).join(" ");
+            return needles.some((n) => hay.includes(n));
+          });
+        }
       }
       taskHasMore = Boolean(data.hasMore);
       taskOffset = data.nextOffset != null ? data.nextOffset : taskOffset + page.length;
