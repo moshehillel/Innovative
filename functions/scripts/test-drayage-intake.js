@@ -148,6 +148,13 @@ runAsyncChecks().then(() => {
       dray.extractPriorMessageIdFromText("",
           "Message ID\nAAMkAGU5MDg4MmNlLTdjNGYtNGI2ZC1iYjMxLTA1YzI2ZmIwZTczMgBGAAAAAAAqntx80xUMSq6IxxEc6_lyBwAKzphD0oUnQrPDK_2RRTFaAAAAAAEMAAAKzphD0oUnQrPDK_2RRTFaAAdlt5qvAAA=\n"),
       "AAMkAGU5MDg4MmNlLTdjNGYtNGI2ZC1iYjMxLTA1YzI2ZmIwZTczMgBGAAAAAAAqntx80xUMSq6IxxEc6_lyBwAKzphD0oUnQrPDK_2RRTFaAAAAAAEMAAAKzphD0oUnQrPDK_2RRTFaAAdlt5qvAAA=");
+  const picked = dray.pickContainerMatch([{
+    BOL: "270521",
+    carrierRef: "MIEU3641450",
+    thirdPartyReferenceNumber: "MIEU3641450",
+  }], "MIEU3641450");
+  check("container search picks Primus BOL", picked.ok, true);
+  check("container search load is BOL", picked.loadNumber, "270521");
   const merged = dray.mergeDrayageActualCost([
     {description: "Port fee", vendorInvoiceNumber: "PF-9", amount: 75},
     {description: "Open cost", vendorInvoiceNumber: "", amount: 10},
