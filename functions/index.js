@@ -11248,7 +11248,42 @@ async function processGmailMessage(
             });
       }
 
+      // Drayage first: multi-page carrier PDFs still look like LTL "packet
+      // incomplete" gaps, but those loads belong with Leo — do not alert Lisa
+      // with the statement under-extraction notice when Primus says drayage.
+      let inboundDrayageSignal = null;
+      if (!isTai) {
+        if (drayageIntake.isDrayageValidatorEmail(from)) {
+          const leoApply = await applyLeoDrayageReturnIfPresent({
+            from, emailBody, subject, invoiceItems,
+            pdfAttachments, messageId, tenant, queueDocId, gmail,
+          });
+          if (leoApply.handled && !leoApply.ok) return;
+        } else {
+          inboundDrayageSignal =
+            await drayageIntake.resolveInboundDrayageSignal({
+              from,
+              invoiceItems,
+              probedContainer: null,
+              subject,
+              body: emailBody,
+            });
+          if (inboundDrayageSignal.isDrayage) {
+            await handleDrayageInvoiceEmail({
+              gmail, messageId, subject, from, emailBody, emailHtml, tenant,
+              queueDocId,
+              containerNumber: inboundDrayageSignal.containerNumber,
+              carrierName: inboundDrayageSignal.carrierName,
+              reason: inboundDrayageSignal.reason ||
+                "Drayage invoice — carrier identified as drayage",
+            });
+            return;
+          }
+        }
+      }
+
       if (!isChildSplitJob &&
+          !(inboundDrayageSignal && inboundDrayageSignal.isDrayage) &&
           statementInvoiceBundle.shouldAlertStatementUnderExtraction(
               statementExtractionGap)) {
         try {
@@ -11267,36 +11302,6 @@ async function processGmailMessage(
                 messageId,
                 error: alertErr.message,
               });
-        }
-      }
-
-      if (!isTai) {
-        if (drayageIntake.isDrayageValidatorEmail(from)) {
-          const leoApply = await applyLeoDrayageReturnIfPresent({
-            from, emailBody, subject, invoiceItems,
-            pdfAttachments, messageId, tenant, queueDocId, gmail,
-          });
-          if (leoApply.handled && !leoApply.ok) return;
-        } else {
-          const drayageSignal =
-            await drayageIntake.resolveInboundDrayageSignal({
-              from,
-              invoiceItems,
-              probedContainer: null,
-              subject,
-              body: emailBody,
-            });
-          if (drayageSignal.isDrayage) {
-            await handleDrayageInvoiceEmail({
-              gmail, messageId, subject, from, emailBody, emailHtml, tenant,
-              queueDocId,
-              containerNumber: drayageSignal.containerNumber,
-              carrierName: drayageSignal.carrierName,
-              reason: drayageSignal.reason ||
-                "Drayage invoice — carrier identified as drayage",
-            });
-            return;
-          }
         }
       }
     } // end !isChildSplitJob — classification / attachment pipeline
