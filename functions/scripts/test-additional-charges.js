@@ -201,6 +201,10 @@ check("265647 customer notice amount is overage",
 check("265647 customer notice omits line haul",
     notice265647.html.includes("Redelivery Fee") &&
     !/line\s*haul/i.test(notice265647.html), true);
+check("265647 customer notice uses Lisa sample wording",
+    notice265647.html.includes("make you aware") &&
+    notice265647.html.includes("Innovative Accounting") &&
+    !/We were billed/i.test(notice265647.html), true);
 
 check("no rows = rate increase",
     ac.classifyAdditionalChargeReason({charges: []}),

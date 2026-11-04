@@ -14608,6 +14608,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
           limit,
           offset: req.query.offset,
           chargePhase: req.query.chargePhase || null,
+          issue: req.query.issue || "all",
           dispatcher: req.query.dispatcher || req.query.dispatcherKey || "",
         });
     return res.json({
@@ -14616,6 +14617,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
       tasks: result.tasks,
       openCount: result.openCount,
       disputeCount: result.disputeCount || 0,
+      missingPodCount: result.missingPodCount || 0,
       filteredCount: result.filteredCount,
       hasMore: result.hasMore,
       nextOffset: result.nextOffset,

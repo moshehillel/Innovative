@@ -338,6 +338,34 @@ async function main() {
       leoOnly.filteredCount === 1,
       leoOnly.tasks.map((t) => t.id).join());
 
+  const issueRows = [
+    {id: "rate-1", type: "missing_rate", reason: "missing_rate"},
+    {id: "charge-1", type: "additional_charge"},
+    {id: "pod-1", type: "missing_pod", issueType: "missing_pod",
+      status: "open"},
+    {id: "misc-1", type: "human_review"},
+  ];
+  const rateOnly = dashboardTasks.partitionByChargePhase(issueRows, {
+    chargePhase: "", issue: "missing_rate", limit: 20, offset: 0,
+  });
+  check("issue filter missing_rate",
+      rateOnly.tasks.length === 1 && rateOnly.tasks[0].id === "rate-1",
+      rateOnly.tasks.map((t) => t.id).join());
+  const chargeOnly = dashboardTasks.partitionByChargePhase(issueRows, {
+    chargePhase: "", issue: "charge_mismatch", limit: 20, offset: 0,
+  });
+  check("issue filter charge_mismatch",
+      chargeOnly.tasks.length === 1 && chargeOnly.tasks[0].id === "charge-1",
+      chargeOnly.tasks.map((t) => t.id).join());
+  const missingPodTab = dashboardTasks.partitionByChargePhase(issueRows, {
+    chargePhase: "missing_pod", limit: 20, offset: 0,
+  });
+  check("missing_pod phase returns only missing POD",
+      missingPodTab.tasks.length === 1 &&
+      missingPodTab.tasks[0].id === "pod-1" &&
+      missingPodTab.missingPodCount === 1,
+      missingPodTab.tasks.map((t) => t.id).join());
+
   if (failures) process.exit(1);
 }
 

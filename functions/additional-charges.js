@@ -1911,27 +1911,43 @@ function buildDisputeEmailDraft(opts) {
 }
 
 /**
+ * Short charge-type phrase for Option A customer notices (Lisa sample).
+ * @param {Array<object>} charges Charge rows.
+ * @param {string} category CHARGE_CATEGORY value.
+ * @return {string}
+ */
+function customerNoticeChargeTypePhrase(charges, category) {
+  const kept = stripFreightBreakdownCharges(charges).kept;
+  if (kept.length === 1) {
+    return displayChargeLabelForRow(kept[0]);
+  }
+  if (kept.length > 1) {
+    return kept.map((c) => displayChargeLabelForRow(c)).join(" / ");
+  }
+  return categoryLabel(category);
+}
+
+/**
  * Customer notification for decision A (bill the customer, auto email).
+ * Matches Lisa's Innovative Accounting sample wording.
  * @param {object} opts customerName, loadNumber, charges, chargesTotal,
  *   category.
  * @return {{subject: string, html: string}}
  */
 function buildCustomerChargeNotificationEmail(opts) {
-  const {customerName, loadNumber, charges, chargesTotal, category,
-    customerRate} = opts;
+  const {customerName, loadNumber, charges, chargesTotal, category} = opts;
+  const chargeType = customerNoticeChargeTypePhrase(charges, category);
+  const amount = money(chargesTotal);
+  const loadRef = esc(String(loadNumber || ""));
   const html =
-    `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
-    `<p>We were billed an additional charge by the carrier on your ` +
-    `shipment (our reference <strong>${esc(String(loadNumber || ""))}` +
-    `</strong>).</p>` +
-    (customerRate != null && Number(customerRate) > 0 ?
-      `<p><strong>Your rate for this shipment:</strong> ` +
-      `${formatCustomerRate(customerRate)}</p>` : "") +
-    `<p><strong>Reason:</strong> ${esc(categoryLabel(category))}</p>` +
-    chargesHtml(charges) +
-    `<p>The additional amount of <strong>${money(chargesTotal)}</strong> ` +
-    `will be reflected on your invoice for this shipment.</p>` +
-    `<p>Please reach out if you have any questions.</p>`;
+    `<p>Hi${customerName ? ` ${esc(customerName)}` : ""},</p>` +
+    `<p>I wanted to make you aware that we received an invoice from the ` +
+    `carrier for a ${esc(chargeType)} of <strong>${amount}</strong> for ` +
+    `the above referenced load` +
+    (loadRef ? ` (<strong>${loadRef}</strong>)` : "") +
+    `.</p>` +
+    `<p>Please let me know if you have any questions or concerns.</p>` +
+    `<p>Thank you,<br>Innovative Accounting</p>`;
   return {
     subject: toOutboundEmailSafeSubject(
         `Additional charge on shipment ${loadNumber}`),

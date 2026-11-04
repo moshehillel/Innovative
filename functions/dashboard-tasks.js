@@ -511,32 +511,111 @@ function chargeTaskFromFollowUp(id, data, tenantId) {
 }
 
 /**
+ * Missing-POD queue row (mirrors Jerry dashboard isMissingPodItem).
+ * @param {object} task Row.
+ * @return {boolean}
+ */
+function isMissingPodItem(task) {
+  if (!task || isOptionDDispute(task)) return false;
+  const status = String(task.status || "open").toLowerCase();
+  if (status && status !== "open") return false;
+  const type = String(task.type || task.emailType || "").toLowerCase();
+  if (type === "signed_pod" || type === "pod_discrepancy") return false;
+  if (type === "additional_charge") return false;
+  if (type === "missing_rate" || type === "rate_missing") return false;
+  if (type === "human_review" || type === "unhandled_email") return false;
+  const issue = String(task.issueType || "").toLowerCase();
+  const stage = String(task.decisionStage || task.reason || "").toLowerCase();
+  const missing = type === "missing_pod" || issue === "missing_pod" ||
+    /missing_pod|needs_pod|awaiting_pod/.test(stage);
+  if (!missing) return false;
+  if (type === "missing_pod" || type === "invoice_hold") return true;
+  if (/missing_pod|needs_pod|awaiting_pod/.test(
+      String(task.decisionStage || ""))) {
+    return true;
+  }
+  return !type && issue === "missing_pod";
+}
+
+/**
+ * Work subnav issue filters (Charges don't match / Missing POD / rate / misc).
+ * @param {object} task Row.
+ * @param {string} issue Filter key from the dashboard.
+ * @return {boolean}
+ */
+function matchesIssueFilter(task, issue) {
+  const key = String(issue || "all").toLowerCase().trim();
+  if (!key || key === "all") return true;
+  const type = String((task && task.type) || "").toLowerCase();
+  const reason = String((task && task.reason) || "").toLowerCase();
+  if (key === "missing_rate") {
+    return type === "missing_rate" || type === "rate_missing" ||
+      reason === "missing_rate";
+  }
+  if (key === "missing_pod") {
+    return isMissingPodItem(task) || type === "pod_discrepancy" ||
+      type === "signed_pod";
+  }
+  if (key === "charge_mismatch") {
+    return type === "additional_charge" ||
+      String((task && task.source) || "") === "additionalCharges";
+  }
+  if (key === "miscellaneous") {
+    if (type === "additional_charge" ||
+        String((task && task.source) || "") === "additionalCharges") {
+      return false;
+    }
+    if (isMissingPodItem(task) || type === "pod_discrepancy" ||
+        type === "signed_pod") {
+      return false;
+    }
+    if (type === "missing_rate" || type === "rate_missing" ||
+        reason === "missing_rate") {
+      return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+/**
  * Work excludes option D. In Dispute is only those rows.
+ * Missing POD tab is only missing-POD holds.
  * @param {object[]} tasks Merged rows, newest first.
- * @param {object} opts chargePhase, dispatcher, limit, offset.
+ * @param {object} opts chargePhase, issue, dispatcher, limit, offset.
  * @return {object}
  */
 function partitionByChargePhase(tasks, opts) {
   const phase = String((opts && opts.chargePhase) || "").toLowerCase();
+  const issue = String((opts && opts.issue) || "all").toLowerCase();
   const dispatcher = String(
       (opts && (opts.dispatcher || opts.dispatcherKey)) || "").trim();
   const limit = Math.min(Math.max(Number(opts && opts.limit) || 50, 1), 100);
   const offset = Math.max(0, Number(opts && opts.offset) || 0);
   const rows = Array.isArray(tasks) ? tasks : [];
   const disputes = rows.filter(isOptionDDispute);
-  let working = rows;
-  if (phase === "dispute") working = disputes;
+  const missingPods = rows.filter(isMissingPodItem);
+  let pool = rows;
+  if (phase === "dispute") pool = disputes;
+  else if (phase === "missing_pod") pool = missingPods;
   else if (phase !== "all") {
-    working = rows.filter((task) => !isOptionDDispute(task));
+    pool = rows.filter((task) => !isOptionDDispute(task));
   }
   if (dispatcher) {
-    working = working.filter((task) => dispatcherMatches(task, dispatcher));
+    pool = pool.filter((task) => dispatcherMatches(task, dispatcher));
+  }
+  // Issue subnav narrows the page only; Work badge stays on the full pool.
+  let working = pool;
+  if (phase !== "dispute" && phase !== "missing_pod" &&
+      issue && issue !== "all") {
+    working = pool.filter((task) => matchesIssueFilter(task, issue));
   }
   const page = working.slice(offset, offset + limit);
   return {
     tasks: page,
-    openCount: working.length,
+    openCount: pool.length,
     disputeCount: disputes.length,
+    missingPodCount: missingPods.length,
     filteredCount: working.length,
     hasMore: offset + page.length < working.length,
     nextOffset: offset + page.length,
@@ -648,6 +727,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
 
   return partitionByChargePhase(visible, {
     chargePhase: opts.chargePhase,
+    issue: opts.issue || "all",
     dispatcher: opts.dispatcher || opts.dispatcherKey || "",
     limit,
     offset,
@@ -996,6 +1076,8 @@ module.exports = {
   dismissDashboardTask,
   markTasksInDispute,
   isOptionDDispute,
+  isMissingPodItem,
+  matchesIssueFilter,
   isSameWorkItem,
   collapseDuplicateTasks,
   chargeLineSignature,
