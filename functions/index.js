@@ -6940,34 +6940,21 @@ function isSystemErrorOutboundEmail(email) {
  * @return {Promise<void>}
  */
 /**
- * Download the Primus BOL PDF for a load (from BOLDocumentURL) for Gmail.
+ * Download the Primus BOL PDF for a load for Gmail Option A notices.
+ * Uses BOLDocumentURL, then manage.php drive download (Bill of Lading).
  * @param {object} booking Primus booking.
  * @param {string|number} loadNumber Load / BOL number.
  * @return {Promise<object|null>} Attachment or null.
  */
 async function fetchPrimusBolEmailAttachment(booking, loadNumber) {
-  const url = String(
-      (booking && (booking.BOLDocumentURL || booking.documentURL)) || "")
-      .trim();
-  if (!url || !/^https?:\/\//i.test(url)) return null;
-  const axios = require("axios");
-  const resp = await axios.get(url, {
-    responseType: "arraybuffer",
-    timeout: 45000,
-    maxRedirects: 5,
-    validateStatus: (s) => s >= 200 && s < 400,
-  });
-  const buf = Buffer.from(resp.data || []);
-  if (buf.length < 100) return null;
-  const head = buf.slice(0, 5).toString("utf8");
-  if (head !== "%PDF-") return null;
-  const load = String(loadNumber ||
-    (booking && (booking.BOL || booking.bolNumber)) || "load")
-      .replace(/[^\w.-]+/g, "");
+  const bridge = require("./primus-ui-bridge");
+  if (typeof bridge.resolveBolPdfForEmail !== "function") return null;
+  const got = await bridge.resolveBolPdfForEmail(booking, loadNumber);
+  if (!got || !got.buffer) return null;
   return {
-    filename: `BOL-${load || "load"}.pdf`,
+    filename: got.filename || `BOL-${loadNumber || "load"}.pdf`,
     contentType: "application/pdf",
-    contentBase64: buf.toString("base64"),
+    contentBase64: got.buffer.toString("base64"),
   };
 }
 

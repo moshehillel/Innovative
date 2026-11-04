@@ -2354,6 +2354,109 @@ async function emailBOLDocs(args) {
 exports.emailBOLDocs = emailBOLDocs;
 
 /**
+ * Download a Primus drive PDF via manage.php downloadDriveFile.
+ * @param {string} fileId Drive file id.
+ * @return {Promise<Buffer|null>}
+ */
+async function downloadDriveFilePdf(fileId) {
+  const id = String(fileId || "").trim();
+  if (!id || !isManagePhpEnabled()) return null;
+  let cookie;
+  try {
+    cookie = await getUiSessionCookie();
+  } catch (_) {
+    return null;
+  }
+  const url = `${manageUrl()}?action=downloadDriveFile&fileId=` +
+    encodeURIComponent(id);
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Cookie": `PHPSESSID=${cookie}`,
+        "Accept": "*/*",
+        "Referer": "https://shipprimus.com/PRIMUS/trunk/",
+      },
+    });
+    if (!resp.ok) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length < 100) return null;
+    if (buf.slice(0, 5).toString("utf8") !== "%PDF-") return null;
+    return buf;
+  } catch (_) {
+    return null;
+  }
+}
+exports.downloadDriveFilePdf = downloadDriveFilePdf;
+
+/**
+ * Resolve the Bill of Lading PDF bytes for a load (Gmail attachment).
+ * Tries BOLDocumentURL first, then manage.php drive download.
+ * @param {object} booking Primus booking.
+ * @param {string|number} loadNumber Load / BOL number.
+ * @return {Promise<{buffer: Buffer, filename: string}|null>}
+ */
+async function resolveBolPdfForEmail(booking, loadNumber) {
+  const load = String(loadNumber ||
+    (booking && (booking.BOL || booking.BOLNbr || booking.bolNumber)) ||
+    "load").replace(/[^\w.-]+/g, "") || "load";
+  const filename = `BOL-${load}.pdf`;
+
+  const url = String(
+      (booking && (booking.BOLDocumentURL || booking.documentURL)) || "")
+      .trim();
+  if (url && /^https?:\/\//i.test(url)) {
+    try {
+      const resp = await fetch(url, {redirect: "follow"});
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        if (buf.length >= 100 &&
+            buf.slice(0, 5).toString("utf8") === "%PDF-") {
+          return {buffer: buf, filename};
+        }
+      }
+    } catch (_) {
+      // Fall through to drive download.
+    }
+  }
+
+  if (!isManagePhpEnabled()) return null;
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) return null;
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: String(loadNumber || load),
+  });
+  if (!docs.ok || !docs.data) return null;
+
+  const FILETYPE_BOL = "392";
+  let bolId = null;
+  let nameFallback = null;
+  for (const list of collectDocumentListArrays(docs.data)) {
+    for (const f of list) {
+      const id = readDriveFileId(f);
+      if (!id) continue;
+      const ft = readFileTypeId(f);
+      const name = String(f.name || f.fileName || f.filename || "");
+      if (ft === FILETYPE_BOL || /bill\s*of\s*lading/i.test(name)) {
+        bolId = id;
+        break;
+      }
+      if (!nameFallback && /\bbol\b/i.test(name) && /\.pdf$/i.test(name)) {
+        nameFallback = id;
+      }
+    }
+    if (bolId) break;
+  }
+  const fileId = bolId || nameFallback;
+  if (!fileId) return null;
+  const buf = await downloadDriveFilePdf(fileId);
+  if (!buf) return null;
+  return {buffer: buf, filename};
+}
+exports.resolveBolPdfForEmail = resolveBolPdfForEmail;
+
+/**
  * Sends POD document(s) from Primus to a recipient (no customer invoice).
  * Uses manage.php emailBOLDocs with only POD drive file checkboxes.
  * @param {object} args booking, loadNumber, recipientEmail, subject, body
