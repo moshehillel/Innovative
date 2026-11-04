@@ -618,6 +618,41 @@
     return !type && issue === "missing_pod";
   }
 
+  function matchesIssueFilter(task, issue) {
+    const key = String(issue || "all").toLowerCase().trim();
+    if (!key || key === "all") return true;
+    const type = String((task && task.type) || "").toLowerCase();
+    const reason = String((task && task.reason) || "").toLowerCase();
+    if (key === "missing_rate") {
+      return type === "missing_rate" || type === "rate_missing" ||
+        reason === "missing_rate";
+    }
+    if (key === "missing_pod") {
+      return isMissingPodItem(task) || type === "pod_discrepancy" ||
+        type === "signed_pod";
+    }
+    if (key === "charge_mismatch") {
+      return type === "additional_charge" ||
+        String((task && task.source) || "") === "additionalCharges";
+    }
+    if (key === "miscellaneous") {
+      if (type === "additional_charge" ||
+          String((task && task.source) || "") === "additionalCharges") {
+        return false;
+      }
+      if (isMissingPodItem(task) || type === "pod_discrepancy" ||
+          type === "signed_pod") {
+        return false;
+      }
+      if (type === "missing_rate" || type === "rate_missing" ||
+          reason === "missing_rate") {
+        return false;
+      }
+      return true;
+    }
+    return true;
+  }
+
   function taskCanResolve(task) {
     if (!task || !task.invoiceId) return false;
     if (task.source === "invoice") return false;
@@ -1725,6 +1760,9 @@
         page = page.filter(isMissingPodItem);
       } else {
         page = page.filter((task) => !isOptionDDispute(task));
+        if (issueFilter && issueFilter !== "all") {
+          page = page.filter((task) => matchesIssueFilter(task, issueFilter));
+        }
       }
       // Belt-and-suspenders: if the API still returns mixed owners, narrow
       // locally when a named dispatcher is selected and rows carry owners.
