@@ -11580,6 +11580,44 @@ async function processGmailMessage(
       if (loadGateFailed) {
         finalStatus = "no_load_number";
 
+        // Drayage carriers (incl. Evans Delivery) go to Leo — do not ask Lisa
+        // for a Primus load # on the LTL missing-load path.
+        if (!isTai && !drayageIntake.isDrayageValidatorEmail(from)) {
+          try {
+            const lateDrayage =
+              await drayageIntake.resolveInboundDrayageSignal({
+                from,
+                invoiceItems: [aiResult],
+                probedContainer: aiResult &&
+                  (aiResult.containerNumber || aiResult.carrierBolNumber) ||
+                  null,
+                subject,
+                body: emailBody,
+              });
+            if (lateDrayage.isDrayage) {
+              await handleDrayageInvoiceEmail({
+                gmail, messageId, subject, from, emailBody, emailHtml, tenant,
+                queueDocId,
+                containerNumber: lateDrayage.containerNumber ||
+                  drayageIntake.sanitizeContainerNumber(
+                      aiResult && aiResult.carrierBolNumber) ||
+                  null,
+                carrierName: lateDrayage.carrierName ||
+                  (aiResult && aiResult.carrierName) || null,
+                reason: lateDrayage.reason ||
+                  "Drayage invoice — carrier identified as drayage",
+              });
+              return;
+            }
+          } catch (lateDrayageErr) {
+            await writeLog("warn", "mail",
+                "Late drayage check before missing-load failed", {
+                  messageId,
+                  error: lateDrayageErr.message,
+                });
+          }
+        }
+
         const offerLisa = invoiceLoadEntry.shouldOfferLisaLoadEntry(
             aiResult, loadGateFailed);
         if (offerLisa) {

@@ -39,12 +39,19 @@ check("Mark Evans inbound container",
         [{containerNumber: "EGSU9876543", carrierName: "Mark Evans Delivery"}],
         null, "", ""),
     "EGSU9876543");
-check("Evans Delivery Company not configured drayage container",
+check("Evans Delivery Company inbound container",
     dray.resolveInboundDrayageContainer(
         "Billing@EvansDelivery.com",
         [{containerNumber: "EGSU9876543", carrierName: "Evans Delivery Company"}],
         null, "", ""),
-    null);
+    "EGSU9876543");
+check("Evans BOL with extra digits still yields container",
+    dray.sanitizeContainerNumber("OOLU2332637691"), "OOLU2332637");
+check("container from carrier BOL field",
+    dray.findContainerOnInvoiceItems([{
+      carrierName: "Evans Delivery Company, Inc.",
+      carrierBolNumber: "OOLU2332637691",
+    }]), "OOLU2332637");
 check("Leo return not forwarded again",
     dray.resolveInboundDrayageContainer(
         "leo@innovativecarriers.com",
@@ -66,8 +73,10 @@ check("MARK EVANS DELIVERY uppercase",
     dray.isConfiguredDrayageCarrierName("MARK EVANS DELIVERY"), true);
 check("Mark Evans Delivery LLC",
     dray.isConfiguredDrayageCarrierName("Mark Evans Delivery LLC"), true);
-check("Evans Delivery Company not Mark Evans",
-    dray.isConfiguredDrayageCarrierName("Evans Delivery Company"), false);
+check("Evans Delivery Company is configured drayage",
+    dray.isConfiguredDrayageCarrierName("Evans Delivery Company"), true);
+check("Evans Delivery Company Inc is configured drayage",
+    dray.isConfiguredDrayageCarrierName("Evans Delivery Company, Inc."), true);
 check("carrier name from invoice items",
     dray.carrierNameFromInvoiceItems(
         [{carrierName: "Evans Delivery Company"}]),
@@ -113,6 +122,22 @@ async function runAsyncChecks() {
       markEvansSignal.isDrayage, true);
   check("Mark Evans drayage reason mentions carrier",
       /configured carrier/i.test(markEvansSignal.reason || ""), true);
+
+  const evansDeliverySignal = await dray.resolveInboundDrayageSignal({
+    from: "EvansCollections@evansdelivery.com",
+    invoiceItems: [{
+      carrierName: "Evans Delivery Company, Inc.",
+      carrierBolNumber: "OOLU2332637691",
+      invoiceAmount: 882.5,
+    }],
+    probedContainer: null,
+    subject: "YLS145469",
+    body: "",
+  });
+  check("Evans Delivery Company is drayage even when Primus says LTL",
+      evansDeliverySignal.isDrayage, true);
+  check("Evans Delivery signal keeps container from BOL",
+      evansDeliverySignal.containerNumber, "OOLU2332637");
 }
 
 runAsyncChecks().then(() => {

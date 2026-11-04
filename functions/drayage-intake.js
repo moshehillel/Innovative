@@ -21,10 +21,13 @@ const DRAYAGE_OPS_EMAIL_DEFAULT = podFollowup.LISA_EMAIL;
 
 /**
  * Carriers explicitly treated as drayage when Primus vendor lookup is
- * ambiguous (e.g. duplicate vendor names).
+ * ambiguous (e.g. duplicate vendor names) or Primus types them as LTL
+ * while ops still routes their invoices through Leo.
  */
 const DRAYAGE_CARRIER_NAME_OVERRIDES = [
   /^mark evans( delivery)?$/,
+  // Primus vendor type is LTL; Innovative still treats these as drayage.
+  /^evans delivery( company)?$/,
 ];
 
 /**
@@ -59,7 +62,14 @@ function isPlausibleContainerNumber(value) {
  */
 function sanitizeContainerNumber(value) {
   const compact = normalizeContainerNumber(value);
-  return isPlausibleContainerNumber(compact) ? compact : null;
+  if (isPlausibleContainerNumber(compact)) return compact;
+  // Carrier BOLs sometimes append extra digits onto an ISO container id
+  // (e.g. OOLU2332637691 → OOLU2332637).
+  const isoPrefix = compact.match(/^([A-Z]{4}\d{7})/);
+  if (isoPrefix && isPlausibleContainerNumber(isoPrefix[1])) {
+    return isoPrefix[1];
+  }
+  return null;
 }
 
 /**
@@ -136,7 +146,9 @@ function isDrayageValidatorEmail(from) {
  */
 function containerFromInvoiceItem(item) {
   if (!item || typeof item !== "object") return null;
-  return sanitizeContainerNumber(item.containerNumber);
+  return sanitizeContainerNumber(item.containerNumber) ||
+    sanitizeContainerNumber(item.carrierBolNumber) ||
+    sanitizeContainerNumber(item.bolNumber);
 }
 
 /**
