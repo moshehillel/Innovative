@@ -84,6 +84,39 @@ function extractContainerFromText(subject, body) {
 }
 
 /**
+ * Carrier / Jerry invoice number from subject or body
+ * (e.g. "Invoice Number BL316636").
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {string|null}
+ */
+function extractInvoiceNumberFromText(subject, body) {
+  const text = `${subject || ""}\n${body || ""}`;
+  const labeled = text.match(
+      /invoice\s*(?:#|no\.?|number)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9_./-]{2,40})/i);
+  if (!labeled || !labeled[1]) return null;
+  const value = String(labeled[1]).trim().replace(/[>,;]+$/, "");
+  if (!value || /^(details|date|amount|total)$/i.test(value)) return null;
+  return value;
+}
+
+/**
+ * Outlook / Graph message id embedded in Jerry's ACTION REQUIRED
+ * "Message ID" block so a bare Leo GTG can re-open the carrier email.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {string|null}
+ */
+function extractPriorMessageIdFromText(subject, body) {
+  const text = `${subject || ""}\n${body || ""}`;
+  const labeled = text.match(
+      /message\s*id\s*[:#]?\s*\r?\n?\s*(AAMk[A-Za-z0-9+/=_-]{20,})/i);
+  if (labeled && labeled[1]) return labeled[1].trim();
+  const inline = text.match(/\b(AAMk[A-Za-z0-9+/=_-]{40,})\b/);
+  return inline && inline[1] ? inline[1].trim() : null;
+}
+
+/**
  * @param {string} from From header.
  * @return {boolean}
  */
@@ -822,6 +855,8 @@ module.exports = {
   isPlausibleContainerNumber,
   sanitizeContainerNumber,
   extractContainerFromText,
+  extractInvoiceNumberFromText,
+  extractPriorMessageIdFromText,
   isDrayageValidatorEmail,
   containerFromInvoiceItem,
   findContainerOnInvoiceItems,

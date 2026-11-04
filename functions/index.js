@@ -3331,9 +3331,9 @@ async function handleAdditionalChargeAction(req, res) {
             description:
               `Load ${invoice.loadNumber || invoiceId}: ` +
               `${optionLabels[option]}. Each line can be a percent markup ` +
-              `on the carrier cost or a flat customer amount. Pick each ` +
-              `accessorial from the Primus list. Use Add accessorial for ` +
-              `a charge Jerry did not list.` +
+              `on the carrier cost or a flat customer amount. Type to find ` +
+              `each accessorial in the Primus list, then select it. Use ` +
+              `Add accessorial for a charge Jerry did not list.` +
               notifyNote,
             confirmLabel: `Confirm option ${option.toUpperCase()}`,
             confirmColor: option === "d" ? "#dc2626" :
@@ -4755,10 +4755,106 @@ async function handleDrayageMissingDetailsFromLeo(args) {
  * @param {object} args Handler arguments.
  * @return {Promise<object>} {handled, ok}
  */
+/**
+ * Re-open the carrier invoice PDF when Leo only replies "GTG" on Jerry's
+ * ACTION REQUIRED forward (PDF lives on the prior Message ID / nested .eml).
+ * @param {object} opts gmail, subject, emailBody, messageId.
+ * @return {Promise<{pdfAttachments: Array, invoiceItems: Array}|null>}
+ */
+async function recoverDrayageGtgInvoiceFromPrior(opts) {
+  const {gmail, subject, emailBody, messageId} = opts;
+  if (!gmail) return null;
+
+  const priorMessageId = drayageIntake.extractPriorMessageIdFromText(
+      subject, emailBody);
+  const candidateIds = [];
+  if (priorMessageId) candidateIds.push(priorMessageId);
+  // Leo's own reply may still wrap original.eml in raw MIME.
+  if (messageId && messageId !== priorMessageId) {
+    candidateIds.push(messageId);
+  }
+  if (!candidateIds.length) return null;
+
+  let recoveredPdfs = [];
+  let sourceMessageId = null;
+  for (const candidateId of candidateIds) {
+    try {
+      const nested = await extractPdfsFromRawMessage(gmail, candidateId);
+      const usable = (nested || []).filter((file) =>
+        file && file.buffer && file.buffer.length &&
+        isPdfMagicBytes(file.buffer) &&
+        !drayageIntake.isDrayagePodAttachment(file));
+      if (usable.length) {
+        recoveredPdfs = usable;
+        sourceMessageId = candidateId;
+        break;
+      }
+    } catch (err) {
+      await writeLog("warn", "mail",
+          "Drayage GTG prior-message PDF recovery failed", {
+            messageId,
+            priorMessageId: candidateId,
+            error: err.message,
+          });
+    }
+  }
+  if (!recoveredPdfs.length) return null;
+
+  const pdfAttachments = [];
+  for (const attachment of recoveredPdfs) {
+    const safeFilename = String(attachment.filename || "invoice.pdf")
+        .replace(/[^a-zA-Z0-9._-]/g, "_");
+    const storagePath =
+      `emailAttachments/${messageId || sourceMessageId}/` +
+      `gtg-prior-${Date.now()}-${safeFilename}`;
+    try {
+      await getBucket().file(storagePath).save(attachment.buffer, {
+        metadata: {contentType: "application/pdf"},
+      });
+    } catch (storageErr) {
+      await writeLog("warn", "storage",
+          "Drayage GTG could not store recovered PDF", {
+            messageId,
+            error: storageErr.message,
+          });
+    }
+    pdfAttachments.push({
+      filename: attachment.filename || safeFilename,
+      mimeType: "application/pdf",
+      buffer: attachment.buffer,
+      storagePath,
+      docType: "INVOICE",
+      source: "drayage_gtg_prior_message",
+      priorMessageId: sourceMessageId,
+    });
+  }
+
+  let invoiceItems = [];
+  try {
+    invoiceItems = await classifyInvoiceData(pdfAttachments, null) || [];
+  } catch (classifyErr) {
+    await writeLog("warn", "ai",
+        "Drayage GTG recovered PDF classify failed", {
+          messageId,
+          priorMessageId: sourceMessageId,
+          error: classifyErr.message,
+        });
+  }
+
+  await writeLog("info", "mail",
+      "Drayage GTG recovered invoice PDF from prior message", {
+        messageId,
+        priorMessageId: sourceMessageId,
+        pdfCount: pdfAttachments.length,
+        invoiceItemCount: invoiceItems.length,
+      });
+  return {pdfAttachments, invoiceItems};
+}
+
 async function handleDrayageGtgReturn(args) {
   const {
-    emailBody, subject, invoiceItems, pdfAttachments,
-    messageId, tenant, queueDocId,
+    emailBody, subject, invoiceItems: initialInvoiceItems, pdfAttachments,
+    messageId, tenant, queueDocId, gmail: gmailArg,
   } = args;
   if (!drayageIntake.isGtgConfirmation(subject, emailBody)) {
     return {handled: false};
@@ -4767,13 +4863,86 @@ async function handleDrayageGtgReturn(args) {
   const docId = queueDocId || messageId;
   const leoParsed = drayageIntake.parseLeoReturnInstructions(
       emailBody, subject);
-  const item = (invoiceItems || []).find((row) =>
+  let workingItems = Array.isArray(initialInvoiceItems) ?
+    initialInvoiceItems.slice() : [];
+  let workingPdfs = Array.isArray(pdfAttachments) ?
+    pdfAttachments.slice() : [];
+  let item = workingItems.find((row) =>
     row && Number(row.invoiceAmount) > 0) || null;
   let loadNumber = (leoParsed && leoParsed.loadNumber) ||
     (item && item.loadNumber) || null;
-  const containerNumber = (leoParsed && leoParsed.containerNumber) ||
+  let containerNumber = (leoParsed && leoParsed.containerNumber) ||
     (item && item.containerNumber) ||
     drayageIntake.extractContainerFromText(subject, emailBody);
+  let invoiceAmount = item ? Number(item.invoiceAmount) : null;
+  let invoiceNumber = item && item.invoiceNumber ?
+    String(item.invoiceNumber).trim() :
+    (drayageIntake.extractInvoiceNumberFromText(subject, emailBody) || "");
+  let invoiceDate = (item && (item.invoiceDate || item.billDate)) ||
+    new Date();
+  let files = workingPdfs.filter((file) =>
+    file && file.buffer && file.buffer.length &&
+    !drayageIntake.isDrayagePodAttachment(file));
+
+  const needsRecovery = !(invoiceAmount > 0) || !invoiceNumber ||
+    !files.length;
+  if (needsRecovery) {
+    let mailClient = gmailArg;
+    if (!mailClient && tenant) {
+      try {
+        mailClient = await mailProvider.getTenantMailClient(tenant);
+      } catch (mailErr) {
+        await writeLog("warn", "mail",
+            "Drayage GTG could not open mailbox for prior PDF recovery", {
+              messageId,
+              error: mailErr.message,
+            });
+      }
+    }
+    const recovered = await recoverDrayageGtgInvoiceFromPrior({
+      gmail: mailClient,
+      subject,
+      emailBody,
+      messageId,
+    });
+    if (recovered) {
+      if (recovered.pdfAttachments && recovered.pdfAttachments.length) {
+        workingPdfs = workingPdfs.concat(recovered.pdfAttachments);
+        files = workingPdfs.filter((file) =>
+          file && file.buffer && file.buffer.length &&
+          !drayageIntake.isDrayagePodAttachment(file));
+      }
+      if (recovered.invoiceItems && recovered.invoiceItems.length) {
+        workingItems = workingItems.concat(recovered.invoiceItems);
+        item = workingItems.find((row) =>
+          row && Number(row.invoiceAmount) > 0) || item;
+        if (item) {
+          if (!(invoiceAmount > 0) && Number(item.invoiceAmount) > 0) {
+            invoiceAmount = Number(item.invoiceAmount);
+          }
+          if (!invoiceNumber && item.invoiceNumber) {
+            invoiceNumber = String(item.invoiceNumber).trim();
+          }
+          if (!containerNumber && item.containerNumber) {
+            containerNumber = item.containerNumber;
+          }
+          if (!loadNumber && item.loadNumber) {
+            loadNumber = item.loadNumber;
+          }
+          invoiceDate = item.invoiceDate || item.billDate || invoiceDate;
+        }
+      }
+    }
+    if (!invoiceNumber) {
+      invoiceNumber = drayageIntake.extractInvoiceNumberFromText(
+          subject, emailBody) || "";
+    }
+    if (!containerNumber) {
+      containerNumber = drayageIntake.extractContainerFromText(
+          subject, emailBody);
+    }
+  }
+
   if (!loadNumber && containerNumber &&
       primusUiBridge.searchBookingsForTrackingQuery) {
     try {
@@ -4794,14 +4963,7 @@ async function handleDrayageGtgReturn(args) {
           });
     }
   }
-  const invoiceAmount = item ? Number(item.invoiceAmount) : null;
-  const invoiceNumber = item && item.invoiceNumber ?
-    String(item.invoiceNumber).trim() : "";
-  const invoiceDate = (item && (item.invoiceDate || item.billDate)) ||
-    new Date();
-  const files = (pdfAttachments || []).filter((file) =>
-    file && file.buffer && file.buffer.length &&
-    !drayageIntake.isDrayagePodAttachment(file));
+
   const missing = [];
   if (!loadNumber) missing.push("Load number");
   if (!(invoiceAmount > 0)) missing.push("Invoice amount");
@@ -4813,6 +4975,10 @@ async function handleDrayageGtgReturn(args) {
       process.env.LOW_PROFIT_CC_EMAIL ||
       drayageIntake.DRAYAGE_OPS_EMAIL_DEFAULT,
   ).trim();
+  const accountingEmail = String(
+      process.env.DRAYAGE_RETURN_EMAIL ||
+      drayageIntake.DRAYAGE_RETURN_EMAIL_DEFAULT,
+  ).trim();
 
   /**
    * @param {string} reason Why Jerry stopped.
@@ -4820,24 +4986,37 @@ async function handleDrayageGtgReturn(args) {
    * @return {Promise<object>}
    */
   async function stopGtg(reason, finalStatus) {
+    const stopSubjectParts = [
+      `Drayage GTG stopped — load ${loadNumber || "unknown"}`,
+    ];
+    if (invoiceNumber) stopSubjectParts.push(invoiceNumber);
+    if (containerNumber) stopSubjectParts.push(containerNumber);
     await saveOutboundEmail({
       type: "drayage_gtg_stopped",
       forceRecipient: true,
       to: lisaEmail,
-      subject: `Drayage GTG stopped — load ${loadNumber || "unknown"}`,
+      cc: accountingEmail &&
+        accountingEmail.toLowerCase() !== lisaEmail.toLowerCase() ?
+        accountingEmail : undefined,
+      subject: stopSubjectParts.join(" — "),
       html: `<p>Jerry stopped a drayage invoice after Leo's GTG reply.</p>` +
         `<p><strong>Load:</strong> ${escapeHtml(loadNumber || "—")}</p>` +
+        `<p><strong>Container:</strong> ` +
+        `${escapeHtml(containerNumber || "—")}</p>` +
         `<p><strong>Invoice:</strong> ${escapeHtml(invoiceNumber || "—")} ` +
         `${invoiceAmount > 0 ? `${Number(invoiceAmount).toFixed(2)}` : ""}` +
         `</p>` +
         `<p><strong>Reason:</strong> ${escapeHtml(reason)}</p>` +
         `<p><strong>Subject:</strong> ${escapeHtml(subject || "")}</p>`,
       tenant,
+      messageId,
+      loadNumber: loadNumber || null,
     });
     await writeLog("warn", "mail", "Drayage GTG stopped", {
       messageId,
       loadNumber,
       invoiceNumber,
+      containerNumber,
       reason,
     });
     await mailIntakeQueue.completeIntakeRecord({
@@ -4972,8 +5151,7 @@ async function handleDrayageGtgReturn(args) {
 
 async function applyLeoDrayageReturnIfPresent(args) {
   const {
-    from, emailBody, subject, invoiceItems, pdfAttachments,
-    messageId, tenant, queueDocId,
+    from,
   } = args;
   if (!drayageIntake.isDrayageValidatorEmail(from)) {
     return {handled: false, ok: false};
@@ -10855,7 +11033,7 @@ async function processGmailMessage(
         if (drayageIntake.isDrayageValidatorEmail(from)) {
           const leoApply = await applyLeoDrayageReturnIfPresent({
             from, emailBody, subject, invoiceItems: [],
-            pdfAttachments, messageId, tenant, queueDocId,
+            pdfAttachments, messageId, tenant, queueDocId, gmail,
           });
           if (leoApply.handled) return;
         }
@@ -11096,7 +11274,7 @@ async function processGmailMessage(
         if (drayageIntake.isDrayageValidatorEmail(from)) {
           const leoApply = await applyLeoDrayageReturnIfPresent({
             from, emailBody, subject, invoiceItems,
-            pdfAttachments, messageId, tenant, queueDocId,
+            pdfAttachments, messageId, tenant, queueDocId, gmail,
           });
           if (leoApply.handled && !leoApply.ok) return;
         } else {
