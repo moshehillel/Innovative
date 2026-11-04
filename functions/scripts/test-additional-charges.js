@@ -203,6 +203,7 @@ check("265647 customer notice omits line haul",
     !/line\s*haul/i.test(notice265647.html), true);
 check("265647 customer notice uses Lisa sample wording",
     notice265647.html.includes("make you aware") &&
+    notice265647.html.includes("Total Additional Charges") &&
     notice265647.html.includes("Innovative Accounting") &&
     !/We were billed/i.test(notice265647.html), true);
 

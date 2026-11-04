@@ -388,35 +388,6 @@ async function handleAdditionalChargeGet(req, res) {
 
   const loadLabel = invoice.loadNumber || invoiceId;
   const currentRate = Number(invoice.customerRate) || 0;
-  if (option === "a") {
-    const defaultCharge = Number(charge.amount) || 0;
-    const rateNote = currentRate > 0 ?
-      ` Current customer rate: $${currentRate.toFixed(2)}.` : "";
-    return res.status(200).send(pages.buildEmailActionConfirmPage({
-      title: "Confirm option A",
-      description:
-        `Load ${loadLabel}: ${OPTION_LABELS.a}. Enter how much to ` +
-        `charge the customer for this additional charge. The customer rate ` +
-        `will be bumped by that amount and the customer will be emailed.` +
-        rateNote +
-        ` Nothing is sent until you click Confirm.`,
-      confirmLabel: "Confirm option A",
-      confirmColor: "#16a34a",
-      actionPath: "additionalChargeAction",
-      fields,
-      inputFields: [{
-        name: "customerChargeAmount",
-        label: "Amount to charge the customer ($)",
-        type: "number",
-        required: true,
-        min: "0.01",
-        step: "0.01",
-        placeholder: "0.00",
-        value: defaultCharge > 0 ? defaultCharge.toFixed(2) : "",
-      }],
-    }));
-  }
-
   if (option === "f") {
     const rateNote = currentRate > 0 ?
       ` Current customer rate on file: $${currentRate.toFixed(2)}.` : "";
@@ -436,15 +407,21 @@ async function handleAdditionalChargeGet(req, res) {
     }));
   }
 
-  // Options B and E: percent markup or flat per accessorial line.
+  // Options A, B, and E: pick which Primus accessorial(s) to bill.
+  const isA = option === "a";
   const isE = option === "e";
   const tenantForCatalog = String(tenantId || "default");
   const accessorialsUrl =
     `${pages.functionsBaseUrl()}/getDashboardAccessorials` +
     `?tenantId=${encodeURIComponent(tenantForCatalog)}`;
-  return res.status(200).send(pages.buildOptionBAccessorialConfirmPage({
-    title: isE ? "Confirm option E" : "Confirm option B",
-    description: isE ?
+  const description = isA ?
+    `Load ${loadLabel}: ${OPTION_LABELS.a}. Each additional accessorial ` +
+    `shows the carrier cost. Pick the Primus name from the list ` +
+    `(type to filter), then enter a percent markup (default 30%) or a ` +
+    `flat amount. You can add new accessorials. The customer rate is ` +
+    `bumped by the total and the customer is emailed automatically ` +
+    `(with the BOL attached when available).` :
+    (isE ?
       `Load ${loadLabel}: ${OPTION_LABELS.e}. Each additional accessorial ` +
       `shows the carrier cost. Pick the Primus name from the list ` +
       `(type to filter), then enter a percent markup (default 30%) or a ` +
@@ -456,13 +433,18 @@ async function handleAdditionalChargeGet(req, res) {
       `list (type to filter), then enter a percent markup (default 30%) ` +
       `or a flat amount. You can add new accessorials. After submit, the ` +
       `dispatcher gets a customer notification template; the customer ` +
-      `invoice stays paused until they confirm the customer was notified.`,
-    confirmLabel: isE ? "Confirm option E" : "Confirm option B",
-    confirmColor: isE ? "#7c3aed" : "#0d9488",
+      `invoice stays paused until they confirm the customer was notified.`);
+  return res.status(200).send(pages.buildOptionBAccessorialConfirmPage({
+    title: isA ? "Confirm option A" :
+      (isE ? "Confirm option E" : "Confirm option B"),
+    description,
+    confirmLabel: isA ? "Confirm option A" :
+      (isE ? "Confirm option E" : "Confirm option B"),
+    confirmColor: isA ? "#16a34a" : (isE ? "#7c3aed" : "#0d9488"),
     actionPath: "additionalChargeAction",
     baseUrl: pages.functionsBaseUrl(),
     baseCustomerRate: currentRate,
-    bumpCustomerRate: isE,
+    bumpCustomerRate: isA || isE,
     carrierCharges: Array.isArray(charge.charges) ? charge.charges : [],
     accessorialOptions: accessorialCatalog.staticAccessorialChoices(),
     accessorialsUrl,
@@ -524,24 +506,28 @@ async function handleAdditionalChargePost(req, res) {
     optionFRateMode = parsed.mode;
     optionFRateInput = parsed.input;
   }
-  if (option === "a") {
-    const parsed = parseCustomerChargeAmountFromRequest(req.body || {});
-    if (!parsed.ok) {
-      return res.status(400).send(parsed.error);
-    }
-    optionACustomerChargeAmount = parsed.amount;
-  }
-  if (option === "b" || option === "e") {
+  if (option === "a" || option === "b" || option === "e") {
     const parsed = parseCustomerBillLinesFromRequest(req.body || {});
     if (!parsed.ok) {
-      return res.status(400).send(parsed.error);
-    }
-    optionBCustomerBillLines = parsed.lines;
-    if (option === "e") {
-      optionACustomerChargeAmount = parsed.lines.reduce(
-          (sum, line) => sum + (Number(line.amount) || 0), 0);
-      optionACustomerChargeAmount =
-        Math.round(optionACustomerChargeAmount * 100) / 100;
+      // Option A still accepts a single dollar amount from older links.
+      if (option === "a") {
+        const amountParsed = parseCustomerChargeAmountFromRequest(
+            req.body || {});
+        if (!amountParsed.ok) {
+          return res.status(400).send(parsed.error || amountParsed.error);
+        }
+        optionACustomerChargeAmount = amountParsed.amount;
+      } else {
+        return res.status(400).send(parsed.error);
+      }
+    } else {
+      optionBCustomerBillLines = parsed.lines;
+      if (option === "a" || option === "e") {
+        optionACustomerChargeAmount = parsed.lines.reduce(
+            (sum, line) => sum + (Number(line.amount) || 0), 0);
+        optionACustomerChargeAmount =
+          Math.round(optionACustomerChargeAmount * 100) / 100;
+      }
     }
   }
 

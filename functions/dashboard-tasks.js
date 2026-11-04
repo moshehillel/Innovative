@@ -15,6 +15,8 @@ const TASK_TYPE = Object.freeze({
   ADDITIONAL_CHARGE: "additional_charge",
   SIGNED_POD: "signed_pod",
   POD_DISCREPANCY: "pod_discrepancy",
+  RATE_MISSING: "rate_missing",
+  MISSING_POD: "missing_pod",
 });
 
 const TASK_STATUS = Object.freeze({
@@ -520,7 +522,9 @@ function isMissingPodItem(task) {
   const status = String(task.status || "open").toLowerCase();
   if (status && status !== "open") return false;
   const type = String(task.type || task.emailType || "").toLowerCase();
-  if (type === "signed_pod" || type === "pod_discrepancy") return false;
+  // Damaged / discrepancy PODs belong on the Missing POD tab + filter.
+  if (type === "pod_discrepancy") return true;
+  if (type === "signed_pod") return false;
   if (type === "additional_charge") return false;
   if (type === "missing_rate" || type === "rate_missing") return false;
   if (type === "human_review" || type === "unhandled_email") return false;
@@ -550,11 +554,11 @@ function matchesIssueFilter(task, issue) {
   const reason = String((task && task.reason) || "").toLowerCase();
   if (key === "missing_rate") {
     return type === "missing_rate" || type === "rate_missing" ||
-      reason === "missing_rate";
+      reason === "missing_rate" ||
+      /missing\s*customer\s*rate/i.test(reason);
   }
   if (key === "missing_pod") {
-    return isMissingPodItem(task) || type === "pod_discrepancy" ||
-      type === "signed_pod";
+    return isMissingPodItem(task);
   }
   if (key === "charge_mismatch") {
     return type === "additional_charge" ||

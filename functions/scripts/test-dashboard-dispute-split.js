@@ -357,13 +357,18 @@ async function main() {
   check("issue filter charge_mismatch",
       chargeOnly.tasks.length === 1 && chargeOnly.tasks[0].id === "charge-1",
       chargeOnly.tasks.map((t) => t.id).join());
-  const missingPodTab = dashboardTasks.partitionByChargePhase(issueRows, {
+  const missingPodTab = dashboardTasks.partitionByChargePhase([
+    ...issueRows,
+    {id: "disc-1", type: "pod_discrepancy", reason: "Damage noted",
+      status: "open"},
+  ], {
     chargePhase: "missing_pod", limit: 20, offset: 0,
   });
-  check("missing_pod phase returns only missing POD",
-      missingPodTab.tasks.length === 1 &&
-      missingPodTab.tasks[0].id === "pod-1" &&
-      missingPodTab.missingPodCount === 1,
+  check("missing_pod phase includes missing POD and discrepancies",
+      missingPodTab.tasks.length === 2 &&
+      missingPodTab.missingPodCount === 2 &&
+      missingPodTab.tasks.some((t) => t.id === "pod-1") &&
+      missingPodTab.tasks.some((t) => t.id === "disc-1"),
       missingPodTab.tasks.map((t) => t.id).join());
 
   if (failures) process.exit(1);

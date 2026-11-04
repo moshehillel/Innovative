@@ -3279,6 +3279,8 @@ async function runAdditionalChargeDecisionBackground(args) {
       customerEmail = null;
     }
     if (customerEmail) {
+      const billLinesForEmail = Array.isArray(optionBCustomerBillLines) ?
+        optionBCustomerBillLines : [];
       const note = additionalCharges.buildCustomerChargeNotificationEmail({
         customerName,
         loadNumber: invoice.loadNumber,
@@ -3286,9 +3288,19 @@ async function runAdditionalChargeDecisionBackground(args) {
         chargesTotal: optionACustomerChargeAmount != null ?
           optionACustomerChargeAmount : chargesTotal,
         category: charge.category,
+        customerBillLines: billLinesForEmail,
         customerRate: invoice.customerRate ||
           customerRateFromBooking(booking),
       });
+      const noticeAttachments = [];
+      try {
+        const bolAtt = await fetchPrimusBolEmailAttachment(
+            booking, invoice.loadNumber);
+        if (bolAtt) noticeAttachments.push(bolAtt);
+      } catch (bolErr) {
+        console.warn("[option A] BOL attach skipped:",
+            bolErr && bolErr.message);
+      }
       await saveOutboundEmail(
           additionalCharges.applyAdditionalChargeEmailCc({
             type: "additional_charge_customer_notice",
@@ -3298,8 +3310,14 @@ async function runAdditionalChargeDecisionBackground(args) {
             subject: note.subject,
             html: note.html,
             skipAgentGreeting: true,
+            attachments: noticeAttachments,
           }));
       extraNote += ` The customer was notified at ${customerEmail}.`;
+      if (noticeAttachments.length) {
+        extraNote += " BOL attached.";
+      } else {
+        extraNote += " BOL was not available to attach.";
+      }
     } else {
       extraNote += " Could not resolve the customer email from Primus — " +
         "please notify the customer manually.";
@@ -5496,6 +5514,21 @@ async function notifyDispatcherRateIssue(opts) {
   });
   await saveOutboundEmail(emailPayload);
 
+  if (code === "MISSING_RATE" || code === "MISSING_CUSTOMER") {
+    await dashboardTasks.createDashboardTask(db, {
+      tenantId: tenantId || "default",
+      type: dashboardTasks.TASK_TYPE.RATE_MISSING,
+      title: code === "MISSING_CUSTOMER" ?
+        `Missing customer — Load ${loadNumber || "—"}` :
+        `Missing customer rate — Load ${loadNumber || "—"}`,
+      description: alert.subject || null,
+      loadNumber: loadNumber || null,
+      invoiceId: invoiceId || null,
+      reason: "missing_rate",
+      customerName: customerName || null,
+    });
+  }
+
   await writeLog("info", "email",
       "Customer/rate alert sent to dispatcher", {
         invoiceId: invoiceId || null,
@@ -6906,6 +6939,38 @@ function isSystemErrorOutboundEmail(email) {
  * @param {object} email - Email fields (type, subject, html, to, attachments).
  * @return {Promise<void>}
  */
+/**
+ * Download the Primus BOL PDF for a load (from BOLDocumentURL) for Gmail.
+ * @param {object} booking Primus booking.
+ * @param {string|number} loadNumber Load / BOL number.
+ * @return {Promise<object|null>} Attachment or null.
+ */
+async function fetchPrimusBolEmailAttachment(booking, loadNumber) {
+  const url = String(
+      (booking && (booking.BOLDocumentURL || booking.documentURL)) || "")
+      .trim();
+  if (!url || !/^https?:\/\//i.test(url)) return null;
+  const axios = require("axios");
+  const resp = await axios.get(url, {
+    responseType: "arraybuffer",
+    timeout: 45000,
+    maxRedirects: 5,
+    validateStatus: (s) => s >= 200 && s < 400,
+  });
+  const buf = Buffer.from(resp.data || []);
+  if (buf.length < 100) return null;
+  const head = buf.slice(0, 5).toString("utf8");
+  if (head !== "%PDF-") return null;
+  const load = String(loadNumber ||
+    (booking && (booking.BOL || booking.bolNumber)) || "load")
+      .replace(/[^\w.-]+/g, "");
+  return {
+    filename: `BOL-${load || "load"}.pdf`,
+    contentType: "application/pdf",
+    contentBase64: buf.toString("base64"),
+  };
+}
+
 async function saveOutboundEmail(email) {
   // Use the email's tenant, then the ambient tenant bound for this request
   // (set by runWithTenant/enterTenantContext). Only a genuinely tenant-less
