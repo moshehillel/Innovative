@@ -6935,11 +6935,6 @@ function isSystemErrorOutboundEmail(email) {
 }
 
 /**
- * Persists and sends an outbound email.
- * @param {object} email - Email fields (type, subject, html, to, attachments).
- * @return {Promise<void>}
- */
-/**
  * Download the Primus BOL PDF for a load for Gmail Option A notices.
  * Uses BOLDocumentURL, then manage.php drive download (Bill of Lading).
  * @param {object} booking Primus booking.
@@ -6958,6 +6953,11 @@ async function fetchPrimusBolEmailAttachment(booking, loadNumber) {
   };
 }
 
+/**
+ * Persists and sends an outbound email.
+ * @param {object} email - Email fields (type, subject, html, to, attachments).
+ * @return {Promise<void>}
+ */
 async function saveOutboundEmail(email) {
   // Use the email's tenant, then the ambient tenant bound for this request
   // (set by runWithTenant/enterTenantContext). Only a genuinely tenant-less
