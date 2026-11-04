@@ -4041,6 +4041,7 @@ function parseVendorsFromResponse(json) {
     id: String(v.id || v.carrierId || ""),
     name: String(v.name || v.carrierName || ""),
     type: String(v.type || v.vendorType || v.carrierType || "").trim(),
+    code: String(v.code || v.scac || v.vendorCode || "").trim(),
     vendorEmail: String(v.vendorEmail || v.email || "").trim(),
   })).filter((v) => v.id);
 }
@@ -4071,6 +4072,64 @@ function extractEmailFromFromHeader(from) {
 }
 
 /**
+ * True when Primus vendor.type looks like drayage.
+ * @param {string|null|undefined} type Vendor type.
+ * @return {boolean}
+ */
+function vendorTypeLooksDrayage(type) {
+  return drayageIntake.isDrayageVendorType(type);
+}
+
+/**
+ * All name matches for a carrier hint (exact / token / includes).
+ * Duplicate Primus rows often share the same name with different types.
+ * @param {Array<object>} vendors Parsed getVendors list.
+ * @param {string} hint Carrier name.
+ * @return {Array<object>}
+ */
+function collectVendorNameMatches(vendors, hint) {
+  const query = String(hint || "").trim();
+  if (!query || !Array.isArray(vendors) || !vendors.length) return [];
+  const queryLower = query.toLowerCase();
+  const firstToken = query.split(/[,\n/]/)[0].trim().toLowerCase();
+  const matches = [];
+  const seen = new Set();
+  const push = (vendor) => {
+    if (!vendor || !vendor.id || seen.has(vendor.id)) return;
+    seen.add(vendor.id);
+    matches.push(vendor);
+  };
+  for (const vendor of vendors) {
+    const name = String(vendor.name || "").toLowerCase();
+    if (name === queryLower || name === firstToken) push(vendor);
+  }
+  if (matches.length) return matches;
+  for (const vendor of vendors) {
+    const name = String(vendor.name || "").toLowerCase();
+    if (firstToken.length >= 6 &&
+        (name.includes(firstToken) || firstToken.includes(name))) {
+      push(vendor);
+    }
+  }
+  return matches;
+}
+
+/**
+ * When several vendors share a name (e.g. Evans Factoring vs Evans DRAYAGE),
+ * prefer an explicit drayage type, then a row with a carrier code/SCAC.
+ * @param {Array<object>} vendors Name matches.
+ * @return {object|null}
+ */
+function preferVendorForDrayageHint(vendors) {
+  if (!vendors || !vendors.length) return null;
+  const byType = vendors.find((v) => vendorTypeLooksDrayage(v.type));
+  if (byType) return byType;
+  const withCode = vendors.find((v) => String(v.code || "").trim());
+  if (withCode) return withCode;
+  return vendors[0] || null;
+}
+
+/**
  * Picks a vendor row by invoice carrier name and/or sender email domain.
  * @param {Array<object>} vendors Parsed getVendors list.
  * @param {object} hints carrierName, emailDomain.
@@ -4080,8 +4139,9 @@ function findVendorByCarrierHint(vendors, hints = {}) {
   const carrierName = String(hints.carrierName || "").trim();
   const emailDomain = String(hints.emailDomain || "").trim().toLowerCase();
   if (carrierName) {
-    const byName = findMasterVendorByName(vendors, carrierName);
-    if (byName) return byName;
+    const matches = collectVendorNameMatches(vendors, carrierName);
+    const preferred = preferVendorForDrayageHint(matches);
+    if (preferred) return preferred;
   }
   if (emailDomain) {
     const byEmail = vendors.find((v) => {
@@ -4137,13 +4197,41 @@ async function lookupVendorByCarrierHint(hints = {}) {
     return {done: false, match: match || null};
   };
 
+  // Collect name matches across pages so Factoring vs DRAYAGE duplicates
+  // (same name, different code/type) can be preferred correctly.
+  const nameMatches = [];
+  const seenMatchIds = new Set();
   if (nameQuery.length >= 3) {
     for (let page = 0; page < 8; page++) {
-      const out = await tryPage(page * 25, nameQuery);
-      if (!out) break;
-      if (out.done) break;
-      if (out.match) return out.match;
+      const params = {
+        action: "getVendors",
+        page: "1",
+        start: String(page * 25),
+        limit: "25",
+        query: nameQuery,
+      };
+      const result = await managePhpPost(params);
+      const vendors = parseVendorsFromResponse(result.json);
+      if (!vendors.length) break;
+      let anyNew = false;
+      for (const vendor of vendors) {
+        if (!seenIds.has(vendor.id)) {
+          seenIds.add(vendor.id);
+          anyNew = true;
+        }
+      }
+      for (const match of collectVendorNameMatches(vendors, carrierName)) {
+        if (seenMatchIds.has(match.id)) continue;
+        seenMatchIds.add(match.id);
+        nameMatches.push(match);
+      }
+      if (!anyNew) break;
+      // getVendors often returns a large unfiltered set; stop once we have
+      // same-name duplicates to choose from.
+      if (nameMatches.length >= 2) break;
     }
+    const preferred = preferVendorForDrayageHint(nameMatches);
+    if (preferred) return preferred;
   }
 
   for (let page = 0; page < maxPages; page++) {
