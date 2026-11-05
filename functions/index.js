@@ -11879,47 +11879,39 @@ async function processGmailMessage(
 
         if (chargeCategory ===
             additionalCharges.CHARGE_CATEGORY.RATE_INCREASE) {
-          // Rate increase with no reason → draft a dispute for manual
-          // submission (LTL portal / TL email) and track until resolved.
-          finalStatus = "unrecognized_charges";
-          const dispute = additionalCharges.buildDisputeEmailDraft({
-            loadNumber: aiResult.loadNumber,
-            carrierName: aiResult.carrierName,
-            proNumber: aiResult.proNumber,
-            invoiceNumber: aiResult.invoiceNumber,
-            invoiceAmount: aiResult.invoiceAmount,
-            expectedAmount: primusVendorCost,
-            charges: normalizedChargeData.unrecognizedCharges,
+          // Unknown reason is still an additional charge. Lisa reviews it
+          // with the option buttons; Jerry does not send a dispute on his own.
+          const named = (normalizedChargeData.unrecognizedCharges || [])
+              .filter((row) => Number(row && row.amount) > 0);
+          const lines = named.length ? named : [{
+            label: "Additional charge",
+            type: "Additional charge",
+            amount: chargesTotal,
+          }];
+          finalStatus = "additional_charge_pending_approval";
+          pendingAdditionalCharge = {
             category: chargeCategory,
+            charges: lines,
+            chargesTotal,
             freightMismatch,
             hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+            primusVendorCost,
+            booking: bookingForCharges,
+            rateValidation: null,
             customerRate: customerRateFromBooking(bookingForCharges),
-          });
-          await saveOutboundEmail(
-              additionalCharges.applyAdditionalChargeEmailCc({
-                type: "carrier_dispute_draft",
-                subject: dispute.subject,
-                html: dispute.html,
-              }));
-          await additionalCharges.createFollowUp(db, {
-            loadNumber: aiResult.loadNumber,
-            carrierName: aiResult.carrierName,
-            tenantId: tenant.tenantId,
-            category: chargeCategory,
-            charges: normalizedChargeData.unrecognizedCharges,
-            chargesTotal,
-            invoiceAmount: aiResult.invoiceAmount,
-            status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
-            notes: "Dispute draft emailed for manual submission",
-          });
+            excludedInPrimusCount: chargeReconciliation &&
+              chargeReconciliation.filtered ?
+              chargeReconciliation.filtered.alreadyInPrimus.length : 0,
+          };
           await writeLog("warn", "ai",
-              "Unexplained rate increase — dispute draft generated", {
+              "Unnamed additional charge — sending decision options", {
                 messageId,
                 loadNumber: aiResult.loadNumber,
                 carrierName: aiResult.carrierName,
                 invoiceAmount: aiResult.invoiceAmount,
                 primusVendorCost,
-                decision: "RATE_INCREASE_DISPUTE",
+                chargesTotal,
+                decision: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
               });
         } else {
           // Accessorial or W&I → 4-option approval email to Sarah +
@@ -12249,6 +12241,50 @@ async function processGmailMessage(
                   emailBody,
                 },
             );
+          } else if (primusResult.ok === true &&
+              additionalCharges.invoiceOverage(
+                  aiResult.invoiceAmount, primusResult.amount) > 0) {
+            // Carrier billed more than Primus and Jerry has no line name.
+            // That is still an additional charge: send the option buttons.
+            const overage = additionalCharges.invoiceOverage(
+                aiResult.invoiceAmount, primusResult.amount);
+            let overageBooking = null;
+            try {
+              overageBooking = await fetchPrimusBooking(aiResult.loadNumber);
+            } catch (_) {
+              overageBooking = null;
+            }
+            finalStatus = "additional_charge_pending_approval";
+            pendingAdditionalCharge = {
+              category: additionalCharges.CHARGE_CATEGORY.RATE_INCREASE,
+              charges: [{
+                label: "Additional charge",
+                type: "Additional charge",
+                amount: overage,
+              }],
+              chargesTotal: overage,
+              freightMismatch: {mismatch: false, details: {}},
+              hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+              primusVendorCost: Number(primusResult.amount),
+              booking: overageBooking,
+              rateValidation: null,
+              customerRate: customerRateFromBooking(overageBooking),
+              excludedInPrimusCount: 0,
+            };
+            await writeLog("warn", "primus",
+                "Invoice over Primus — sending additional-charge options", {
+                  event: "Primus validation failed",
+                  messageId: messageId,
+                  details: {
+                    submittedAmount: aiResult.invoiceAmount,
+                    savedAmount: primusResult.amount,
+                    difference: overage,
+                    result: "MISMATCH",
+                    reason: primusResult.reason ||
+                      "Amount does not match Primus",
+                    decision: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
+                  },
+                });
           } else {
             finalStatus = "unmatched_amount";
             await writeLog("warn", "primus", "Primus validation failed", {
@@ -12357,6 +12393,11 @@ async function processGmailMessage(
           decisionStage = "additional_charge_pending_approval";
           reviewStatus = "needed";
           decisionReason = "Additional charge awaiting A/B/C/D decision.";
+          if (primusAmount == null && primusResult && primusResult.amount) {
+            primusAmount = Number(primusResult.amount);
+            amountDifference = Math.abs(
+                Number(aiResult.invoiceAmount) - primusAmount);
+          }
         }
 
         if (primusResult && primusResult.ok && primusResult.validAmount) {
