@@ -3413,7 +3413,14 @@ async function runAdditionalChargeDecisionBackground(args) {
       approvalUpdate["additionalCharge.customerBillAccessorialTotal"] =
         additionalCharges.sumCustomerBillLines(billLines);
     }
-    if (baseRate > 0) {
+    if (baseRate > 0 && billLines.length) {
+      approvalUpdate["additionalCharge.originalCustomerRate"] = baseRate;
+      approvalUpdate["additionalCharge.bumpedCustomerRate"] =
+        Math.round((baseRate + billAmount) * 100) / 100;
+      rateBumpNote = ` Base customer rate stays $${baseRate.toFixed(2)}. ` +
+        `${billLines.length} accessorial line(s) ($${billAmount.toFixed(2)}) ` +
+        `are each a separate customer-invoice line.`;
+    } else if (baseRate > 0) {
       const bumpedRate =
         Math.round((baseRate + billAmount) * 100) / 100;
       approvalUpdate.customerRate = bumpedRate;

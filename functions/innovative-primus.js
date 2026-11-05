@@ -1706,7 +1706,7 @@ exports.processPrimusWorkflow = onRequest(
         ).toUpperCase();
         const optionBCustomerBillLines = (additionalChargeApproved &&
           additionalCharge &&
-          additionalDecision === "B" &&
+          ["A", "B", "E"].includes(additionalDecision) &&
           Array.isArray(additionalCharge.customerBillLines)) ?
           additionalCharge.customerBillLines : [];
         const optionFFreightAccessorial = additionalChargeApproved &&

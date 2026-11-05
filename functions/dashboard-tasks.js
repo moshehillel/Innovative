@@ -522,9 +522,7 @@ function isMissingPodItem(task) {
   const status = String(task.status || "open").toLowerCase();
   if (status && status !== "open") return false;
   const type = String(task.type || task.emailType || "").toLowerCase();
-  // Damaged / discrepancy PODs belong on the Missing POD tab + filter.
-  if (type === "pod_discrepancy") return true;
-  if (type === "signed_pod") return false;
+  if (type === "signed_pod" || type === "pod_discrepancy") return false;
   if (type === "additional_charge") return false;
   if (type === "missing_rate" || type === "rate_missing") return false;
   if (type === "human_review" || type === "unhandled_email") return false;

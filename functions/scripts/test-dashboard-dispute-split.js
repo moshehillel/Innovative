@@ -364,11 +364,10 @@ async function main() {
   ], {
     chargePhase: "missing_pod", limit: 20, offset: 0,
   });
-  check("missing_pod phase includes missing POD and discrepancies",
-      missingPodTab.tasks.length === 2 &&
-      missingPodTab.missingPodCount === 2 &&
-      missingPodTab.tasks.some((t) => t.id === "pod-1") &&
-      missingPodTab.tasks.some((t) => t.id === "disc-1"),
+  check("missing_pod phase keeps missing POD and drops damaged POD",
+      missingPodTab.tasks.length === 1 &&
+      missingPodTab.tasks[0].id === "pod-1" &&
+      missingPodTab.missingPodCount === 1,
       missingPodTab.tasks.map((t) => t.id).join());
 
   if (failures) process.exit(1);
