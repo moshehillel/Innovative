@@ -5086,6 +5086,98 @@ exports.isManagePhpEnabled = isManagePhpEnabled;
 exports.rePushCarrierBillToQuickBooks = rePushCarrierBillToQuickBooks;
 
 /**
+ * Invoice number from Primus when another session already issued the draft.
+ * @param {string} message manage.php error message.
+ * @return {string} Issued invoice number, or blank.
+ */
+function invoiceNumberFromAlreadyInvoicedMessage(message) {
+  const match = String(message || "").match(
+      /already been invoiced by another user with invoice#\s*(\d+)/i);
+  return match ? match[1] : "";
+}
+
+/**
+ * Issued customer invoice on a booking, preferring a known invoice number.
+ * @param {object} docData getBookingDocuments body.
+ * @param {string} invoiceNumber Issued number to prefer.
+ * @return {object|null}
+ */
+function findIssuedUiInvoice(docData, invoiceNumber) {
+  if (!docData || !Array.isArray(docData.invoices)) return null;
+  const issued = docData.invoices.filter(isIssuedUiInvoice);
+  if (!issued.length) return null;
+  const wanted = String(invoiceNumber || "");
+  if (wanted) {
+    const match = issued.find((inv) => String(inv.invoiceNumber) === wanted);
+    if (match) return match;
+  }
+  return issued.slice().sort(
+      (a, b) => Number(b.invoiceNumber || 0) - Number(a.invoiceNumber || 0),
+  )[0];
+}
+
+/**
+ * Stop a second billing pass when the customer invoice is already issued.
+ * Refreshes booking documents when the cached list has no issued invoice.
+ * @param {object} opts Lookup and POD-upload inputs.
+ * @return {Promise<object|null>} Already-issued result, or null to continue.
+ */
+async function alreadyIssuedBillingResult(opts) {
+  const loadNumber = opts.loadNumber ? String(opts.loadNumber) : "";
+  let data = opts.docData || null;
+  let issued = findIssuedUiInvoice(data, opts.invoiceNumber);
+  if (!issued && opts.refresh !== false && loadNumber && opts.bookingId) {
+    const docs = await getBookingDocuments({
+      bookingId: opts.bookingId,
+      bookingBOL: loadNumber,
+    });
+    if (docs.ok) {
+      data = docs.data;
+      issued = findIssuedUiInvoice(data, opts.invoiceNumber);
+    }
+  }
+  const fallbackId = opts.fallbackInvoiceId;
+  const customerInvoiceId = issued && issued.id != null ?
+    Number(issued.id) :
+    (fallbackId != null && String(fallbackId) !== "" ?
+      Number(fallbackId) : null);
+  const invoiceNumber = String(
+      (issued && issued.invoiceNumber) || opts.invoiceNumber || "");
+  if (!customerInvoiceId && !invoiceNumber) return null;
+  const types = opts.uploadFileTypes;
+  const podUpload = await maybeUploadBookingPdf({
+    docData: data,
+    bookingId: opts.bookingId,
+    bookingBOL: loadNumber,
+    fileType: types.pod.id,
+    fileTypeName: types.pod.name,
+    file: opts.args.podPdf,
+    skip: opts.args.skipPodUpload,
+    forbiddenBuffer: opts.args.carrierBillPdf &&
+      opts.args.carrierBillPdf.buffer,
+  });
+  if (writeLog) {
+    await writeLog("info", "primus",
+        "Customer invoice already issued — duplicate billing stopped", {
+          loadNumber,
+          bookingId: opts.bookingId,
+          customerInvoiceId,
+          invoiceNumber: invoiceNumber || null,
+        });
+  }
+  return {
+    ok: true,
+    skipped: true,
+    reason: "already issued",
+    generated: true,
+    customerInvoiceId,
+    invoiceNumber,
+    podUpload,
+    podUploaded: !!(podUpload.uploaded || podUpload.skipped),
+  };
+}
+
+/**
  * Full Primus UI billing flow captured from production DevTools:
  * saveInvoice (costs) → addVendorRefNumber → saveInvoice (ready) →
  * consolidateInvoices (issue).
@@ -5138,32 +5230,16 @@ async function runPrimusUiBillingFlow(args) {
     if (docs.ok) {
       bookingDocData = docs.data;
     }
-    if (bookingDocData && Array.isArray(bookingDocData.invoices)) {
-      const issued = bookingDocData.invoices.find(isIssuedUiInvoice);
-      if (issued) {
-        const podUpload = await maybeUploadBookingPdf({
-          docData: bookingDocData,
-          bookingId,
-          bookingBOL: loadNumber,
-          fileType: uploadFileTypes.pod.id,
-          fileTypeName: uploadFileTypes.pod.name,
-          file: args.podPdf,
-          skip: args.skipPodUpload,
-          forbiddenBuffer: args.carrierBillPdf &&
-            args.carrierBillPdf.buffer,
-        });
-        return {
-          ok: true,
-          skipped: true,
-          reason: "already issued",
-          generated: true,
-          customerInvoiceId: Number(issued.id),
-          invoiceNumber: String(issued.invoiceNumber),
-          podUpload,
-          podUploaded: !!(podUpload.uploaded || podUpload.skipped),
-        };
-      }
-    }
+    const issuedAtStart = await alreadyIssuedBillingResult({
+      docData: bookingDocData,
+      bookingId,
+      loadNumber,
+      uploadFileTypes,
+      args,
+      invoiceNumber: "",
+      refresh: false,
+    });
+    if (issuedAtStart) return issuedAtStart;
   }
 
   const carrierBillUpload = await maybeUploadBookingPdf({
@@ -5424,6 +5500,16 @@ async function runPrimusUiBillingFlow(args) {
     externalNotes: String(booking.externalNotes || ""),
   };
 
+  const issuedBeforeSave = await alreadyIssuedBillingResult({
+    docData: bookingDocData,
+    bookingId,
+    loadNumber,
+    uploadFileTypes,
+    args,
+    invoiceNumber: "",
+  });
+  if (issuedBeforeSave) return issuedBeforeSave;
+
   const phase1 = await managePhpPost({
     action: "saveInvoice",
     billsInfo,
@@ -5454,11 +5540,25 @@ async function runPrimusUiBillingFlow(args) {
   });
 
   if (!phase1.json || !isManageSuccess(phase1.json)) {
+    const phase1Message = (phase1.json && phase1.json.message) || "";
+    const alreadyNumber =
+      invoiceNumberFromAlreadyInvoicedMessage(phase1Message);
+    if (alreadyNumber) {
+      const finished = await alreadyIssuedBillingResult({
+        docData: null,
+        bookingId,
+        loadNumber,
+        uploadFileTypes,
+        args,
+        invoiceNumber: alreadyNumber,
+        fallbackInvoiceId: existingDraftId,
+      });
+      if (finished) return finished;
+    }
     return {
       ok: false,
       step: "saveInvoice_phase1",
-      error: (phase1.json && phase1.json.message) ||
-        "First saveInvoice failed",
+      error: phase1Message || "First saveInvoice failed",
       raw: phase1.text.slice(0, 500),
     };
   }
@@ -5571,11 +5671,25 @@ async function runPrimusUiBillingFlow(args) {
   });
 
   if (!phase2.json || !isManageSuccess(phase2.json)) {
+    const phase2Message = (phase2.json && phase2.json.message) || "";
+    const alreadyNumber =
+      invoiceNumberFromAlreadyInvoicedMessage(phase2Message);
+    if (alreadyNumber) {
+      const finished = await alreadyIssuedBillingResult({
+        docData: null,
+        bookingId,
+        loadNumber,
+        uploadFileTypes,
+        args,
+        invoiceNumber: alreadyNumber,
+        fallbackInvoiceId: uiInvoiceId,
+      });
+      if (finished) return finished;
+    }
     return {
       ok: false,
       step: "saveInvoice_phase2",
-      error: (phase2.json && phase2.json.message) ||
-        "Second saveInvoice failed",
+      error: phase2Message || "Second saveInvoice failed",
       customerInvoiceId: uiInvoiceId,
     };
   }
@@ -6558,6 +6672,8 @@ exports._internal = {
   customerNameFromBooking,
   fetchUiFileTypes,
   isIssuedUiInvoice,
+  invoiceNumberFromAlreadyInvoicedMessage,
+  findIssuedUiInvoice,
   isDraftUiInvoice,
   findDraftUiInvoice,
   extractBilltoIdFromStore,

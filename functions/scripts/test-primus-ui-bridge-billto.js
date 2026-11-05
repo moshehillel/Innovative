@@ -153,6 +153,25 @@ check("enrichBillToPartyFromConsignee uses spelled consignee",
         id: 9, description: "FREIGHT CHARGE", rate: 210.16,
       }]), null);
 
+  const dupMsg = "The invoice has already been invoiced by another user " +
+    "with invoice#32147. Please close the window form and reopen the invoice.";
+  check("already-invoiced message yields the issued number",
+      bridge._internal.invoiceNumberFromAlreadyInvoicedMessage(dupMsg),
+      "32147");
+  check("other save errors are not treated as a duplicate invoice",
+      bridge._internal.invoiceNumberFromAlreadyInvoicedMessage(
+          "Could not resolve billtoId"),
+      "");
+  check("issued invoice prefers the number from the duplicate error",
+      bridge._internal.findIssuedUiInvoice({
+        invoices: [
+          {id: 1, invoiceNumber: "0"},
+          {id: 2, invoiceNumber: "32147"},
+          {id: 3, invoiceNumber: "30000"},
+        ],
+      }, "32147").id,
+      2);
+
   console.log(failures ? `\n${failures} test(s) failed` : "\nAll tests passed");
   process.exit(failures ? 1 : 0);
 })().catch((err) => {
