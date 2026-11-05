@@ -1,0 +1,16 @@
+---
+description: Always commit, push, and cloud-deploy completed fixes unless told otherwise
+alwaysApply: true
+---
+
+# Ship: commit, push, then cloud-deploy
+
+When a fix or feature is complete:
+
+1. **Commit** the relevant files (not unrelated dirty tree junk).
+2. **Push** to the remote branch before any deploy.
+3. **Cloud-deploy** Firebase / Cloud Functions (Cloud Build or Cloud Agent). Prefer cloud deploy over local `firebase deploy` so IAM invoker permissions stay correct.
+
+Skip commit/push/deploy only when the user explicitly says not to.
+
+See also `deploy-cloud-first.mdc` for push-before-deploy and cloud-vs-local deploy details.
