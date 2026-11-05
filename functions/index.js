@@ -12117,10 +12117,16 @@ async function processGmailMessage(
         }
 
         // ── Profit / margin check (use lumper-adjusted amount) ───────────────
+        // A carrier bill above the customer rate is an additional charge.
+        // Lisa decides with the six option buttons. Do not send the
+        // low-profit alert for that gap.
         if (primusData.rate) {
           const profitCheck = checkProfitMargin(
               primusData.rate, primusValidationAmount);
-          if (profitCheck.noRate || profitCheck.lowProfit) {
+          const billedOverCustomer = additionalCharges.invoiceOverage(
+              aiResult.invoiceAmount, primusData.rate) > 0;
+          if (!billedOverCustomer &&
+              (profitCheck.noRate || profitCheck.lowProfit)) {
             const hasLumpers =
                 primusValidationAmount !== aiResult.invoiceAmount;
             try {
@@ -12203,11 +12209,49 @@ async function processGmailMessage(
           });
 
           if (primusResult.ok === true && primusResult.validAmount === true) {
-            finalStatus = "processing";
-            await writeLog("info", "mail", `Invoice queued for workflow`, {
-              messageId: messageId,
-              primusAmount: primusResult.amount,
-            });
+            const customerGap = additionalCharges.invoiceOverage(
+                aiResult.invoiceAmount, primusData.rate);
+            if (customerGap > 0) {
+              let gapBooking = null;
+              try {
+                gapBooking = await fetchPrimusBooking(aiResult.loadNumber);
+              } catch (_) {
+                gapBooking = null;
+              }
+              finalStatus = "additional_charge_pending_approval";
+              pendingAdditionalCharge = {
+                category: additionalCharges.CHARGE_CATEGORY.RATE_INCREASE,
+                charges: [{
+                  label: "Additional charge",
+                  type: "Additional charge",
+                  amount: customerGap,
+                }],
+                chargesTotal: customerGap,
+                freightMismatch: {mismatch: false, details: {}},
+                hasCertificate: !!aiResult.hasWeightInspectionCertificate,
+                primusVendorCost: Number(primusData.rate),
+                booking: gapBooking,
+                rateValidation: null,
+                customerRate: Number(primusData.rate),
+                excludedInPrimusCount: 0,
+              };
+              await writeLog("warn", "mail",
+                  "Carrier bill is over the customer rate — " +
+                  "sending additional-charge options", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    invoiceAmount: aiResult.invoiceAmount,
+                    customerRate: primusData.rate,
+                    difference: customerGap,
+                    decision: "ADDITIONAL_CHARGE_PENDING_APPROVAL",
+                  });
+            } else {
+              finalStatus = "processing";
+              await writeLog("info", "mail", `Invoice queued for workflow`, {
+                messageId: messageId,
+                primusAmount: primusResult.amount,
+              });
+            }
           } else if (primusResult.ok === false &&
                  primusResult.reason &&
                  primusResult.reason.toLowerCase().includes("not found")) {
