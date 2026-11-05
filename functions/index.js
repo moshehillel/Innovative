@@ -707,6 +707,146 @@ async function findExactDuplicateCarrierInvoice(tenant, aiResult) {
 }
 
 /**
+ * A short account number copied onto the bill is not a second invoice.
+ * @param {string} invoiceNumber Carrier invoice number from the classifier.
+ * @param {string} subject Original email subject.
+ * @return {boolean}
+ */
+function invoiceNumberEchoesAccount(invoiceNumber, subject) {
+  const inv = String(invoiceNumber || "").replace(/\D/g, "");
+  if (inv.length < 5 || inv.length > 8) return false;
+  return String(subject || "").includes(inv);
+}
+
+/**
+ * Later copy of the same load and amount inside one carrier email.
+ * A real second bill keeps a different invoice number and is not skipped.
+ * @param {object} tenant Tenant config.
+ * @param {object} opts parentMessageId, itemIndex, aiResult, subject.
+ * @return {Promise<object|null>}
+ */
+async function findSameEmailDuplicateItem(tenant, opts) {
+  const parentMessageId = String(opts && opts.parentMessageId || "");
+  const itemIndex = Number(opts && opts.itemIndex);
+  const aiResult = (opts && opts.aiResult) || {};
+  const subject = (opts && opts.subject) || "";
+  if (!parentMessageId || !Number.isFinite(itemIndex)) return null;
+  const load = normalizeLoadNumber(aiResult.loadNumber);
+  const amount = Number(aiResult.invoiceAmount);
+  if (!load || !(amount > 0)) return null;
+  let items = [];
+  try {
+    const parentSnap = await tcol(tenant, "emailIntake")
+        .doc(parentMessageId).get();
+    items = (parentSnap.data() || {}).invoiceItemsPending || [];
+  } catch (err) {
+    console.error("[findSameEmailDuplicateItem]", err.message);
+    return null;
+  }
+  if (!Array.isArray(items)) return null;
+  const newInv = normalizeCarrierReference(aiResult.invoiceNumber);
+  for (let i = 0; i < itemIndex && i < items.length; i++) {
+    const other = items[i] || {};
+    if (normalizeLoadNumber(other.loadNumber) !== load) continue;
+    const prev = Number(other.invoiceAmount);
+    if (!Number.isFinite(prev) || Math.abs(prev - amount) > 0.009) continue;
+    const oldInv = normalizeCarrierReference(other.invoiceNumber);
+    const sameInv = !newInv || !oldInv || newInv === oldInv;
+    const accountEcho = invoiceNumberEchoesAccount(newInv, subject) ||
+      invoiceNumberEchoesAccount(oldInv, subject);
+    if (!sameInv && !accountEcho) continue;
+    try {
+      const sibId = mailIntakeQueue.childQueueDocId(parentMessageId, i);
+      const sib = await tcol(tenant, "gmailQueue").doc(sibId).get();
+      const data = sib.data() || {};
+      if (data.status !== "completed" && data.status !== "processing") {
+        continue;
+      }
+      return {
+        itemIndex: i,
+        finalStatus: data.finalStatus || null,
+        invoiceNumber: other.invoiceNumber || null,
+      };
+    } catch (err) {
+      console.error("[findSameEmailDuplicateItem]", err.message);
+    }
+  }
+  return null;
+}
+
+/**
+ * Stable cents key so $652.52 and 652.5 do not look like two bills.
+ * @param {string|number} raw Amount.
+ * @return {string}
+ */
+function opsEmailMoneyKey(raw) {
+  const n = Number(String(raw == null ? "" : raw).replace(/[^0-9.-]/g, ""));
+  if (!Number.isFinite(n)) return "";
+  return String(Math.round(n * 100));
+}
+
+/**
+ * @param {string} messageId Inbound message id.
+ * @param {string} reason Review reason.
+ * @param {object|null} extractedData Review table fields.
+ * @return {string}
+ */
+function reviewEmailSendKey(messageId, reason, extractedData) {
+  const data = extractedData || {};
+  const load = String(
+      data.loadNumber || data["Load Number"] || data["Load #"] ||
+      data.load || "",
+  ).replace(/[^0-9A-Za-z]/g, "");
+  const amount = opsEmailMoneyKey(
+      data["Invoice Amount"] || data["Invoice Total"] ||
+      data.invoiceAmount || "");
+  return `review|${messageId}|${String(reason || "").slice(0, 140)}|` +
+    `${load}|${amount}`;
+}
+
+/**
+ * Records that this ops email is being sent. A second caller with the
+ * same key does not send again.
+ * @param {object} tenant Tenant config.
+ * @param {string} key Dedupe key.
+ * @return {Promise<boolean>} True when this caller should send.
+ */
+async function claimOpsEmailSend(tenant, key) {
+  const id = crypto.createHash("sha256").update(String(key)).digest("hex");
+  const ref = tcol(tenant, "opsEmailSends").doc(id);
+  try {
+    return await db.runTransaction(async (tx) => {
+      const snap = await tx.get(ref);
+      if (snap.exists) return false;
+      tx.set(ref, {
+        key: String(key).slice(0, 500),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        deleteAt: getDeleteAt(60),
+      });
+      return true;
+    });
+  } catch (err) {
+    console.error("[claimOpsEmailSend]", err.message);
+    return true;
+  }
+}
+
+/**
+ * Lets a failed send try again.
+ * @param {object} tenant Tenant config.
+ * @param {string} key Dedupe key.
+ * @return {Promise<void>}
+ */
+async function releaseOpsEmailSend(tenant, key) {
+  const id = crypto.createHash("sha256").update(String(key)).digest("hex");
+  try {
+    await tcol(tenant, "opsEmailSends").doc(id).delete();
+  } catch (err) {
+    console.error("[releaseOpsEmailSend]", err.message);
+  }
+}
+
+/**
  * Drops invoice items whose load was already processed from this email.
  * @param {object} tenant Tenant config.
  * @param {string} messageId Parent Gmail message id.
@@ -5229,6 +5369,8 @@ async function handleMissingLoadNumberForLisa(args) {
   await saveOutboundEmail({
     type: "missing_load_number",
     forceRecipient: true,
+    dedupeKey: `missing-load|${messageId}|${itemIndex || 0}|` +
+      `${opsEmailMoneyKey(aiResult.invoiceAmount)}`,
     to: lisaEmail,
     messageId,
     subject: `Enter load # — ${aiResult.carrierName || "carrier invoice"}`,
@@ -5733,8 +5875,8 @@ async function forwardToHumanReview(
   const raw = mimeBuffer.toString("base64url");
 
   const loadHint = extractedData && (
-    extractedData.loadNumber || extractedData["Load #"] ||
-    extractedData.load);
+    extractedData.loadNumber || extractedData["Load Number"] ||
+    extractedData["Load #"] || extractedData.load);
   const tenantId = (currentTenant() && currentTenant().tenantId) || "default";
   const opsPrimary = dashboardOps.isDashboardOpsPrimary();
   // Dashboard shows the same review email Lisa gets, plus the full original
@@ -5812,7 +5954,23 @@ async function forwardToHumanReview(
   });
 
   if (!opsPrimary) {
-    await gmail.users.messages.send({userId: "me", requestBody: {raw}});
+    const sendKey = reviewEmailSendKey(messageId, safeReason, extractedData);
+    const sendTenant = currentTenant() || DEFAULT_TENANT;
+    const claimed = await claimOpsEmailSend(sendTenant, sendKey);
+    if (!claimed) {
+      await writeLog("info", "mail", "Skipped duplicate review email", {
+        messageId,
+        reason: safeReason,
+        department,
+      });
+      return;
+    }
+    try {
+      await gmail.users.messages.send({userId: "me", requestBody: {raw}});
+    } catch (sendErr) {
+      await releaseOpsEmailSend(sendTenant, sendKey);
+      throw sendErr;
+    }
     await writeLog("info", "mail", "Forwarded to human review", {
       messageId,
       reason,
@@ -6016,6 +6174,8 @@ async function notifyDispatcherLowProfit(opts) {
   const emailPayload = additionalCharges.applyDispatcherEmailCc({
     type: "low_profit_dispatcher",
     forceRecipient: true,
+    dedupeKey: `low-profit|${messageId || ""}|${loadNumber || ""}|` +
+      `${opsEmailMoneyKey(invoiceAmount)}`,
     to,
     subject: `Action needed — low/negative profit on Load ${loadNumber}`,
     html,
@@ -6555,6 +6715,10 @@ async function sendAdditionalChargeApprovalEmail(opts) {
   });
 
   if (!dashboardOps.isDashboardOpsPrimary()) {
+    emailPayload.dedupeKey = `charge|${messageId || ""}|` +
+      `${aiResult.loadNumber || ""}|` +
+      `${opsEmailMoneyKey(aiResult.invoiceAmount)}|` +
+      `${opsEmailMoneyKey(pending.chargesTotal)}`;
     await saveOutboundEmail(emailPayload);
   } else {
     await writeLog("info", "email",
@@ -7323,6 +7487,7 @@ async function saveOutboundEmail(email) {
   delete emailToStore.skipAgentGreeting;
   delete emailToStore.forceRecipient;
   delete emailToStore.forceSend;
+  delete emailToStore.dedupeKey;
   delete emailToStore.dashboardAttachments;
   delete emailToStore.emailReceivedAt;
   if (Array.isArray(emailToStore.attachments)) {
@@ -7384,6 +7549,23 @@ async function saveOutboundEmail(email) {
   }
 
   if (to && !parkOpsOnDashboard) {
+    if (email.dedupeKey) {
+      const claimed = await claimOpsEmailSend(tenant, email.dedupeKey);
+      if (!claimed) {
+        sendResult = {ok: true, skipped: "duplicate"};
+        try {
+          await emailRef.update({sendResult});
+        } catch (updErr) {
+          console.error("saveOutboundEmail duplicate update:", updErr.message);
+        }
+        await writeLog("info", "email", "Skipped duplicate outbound email", {
+          type: email.type,
+          invoiceId: email.invoiceId || null,
+          to,
+        }, null, tenant);
+        return sendResult;
+      }
+    }
     try {
       await sendViaGmail(
           to,
@@ -7397,6 +7579,9 @@ async function saveOutboundEmail(email) {
     } catch (sendErr) {
       sendResult = {ok: false, error: sendErr.message};
       console.error("saveOutboundEmail send error:", sendErr.message);
+      if (email.dedupeKey) {
+        await releaseOpsEmailSend(tenant, email.dedupeKey);
+      }
     }
     try {
       await emailRef.update({sendResult});
@@ -11741,6 +11926,33 @@ async function processGmailMessage(
               invoiceId: exactDup.invoiceId,
             });
             continue;
+          }
+
+          if (isChildSplitJob) {
+            const sameEmailDup = await findSameEmailDuplicateItem(tenant, {
+              parentMessageId,
+              itemIndex: childItemIndex,
+              aiResult,
+              subject,
+            });
+            if (sameEmailDup) {
+              await writeLog("info", "mail",
+                  "Skipping duplicate invoice copy in the same email", {
+                    messageId,
+                    loadNumber: aiResult.loadNumber,
+                    invoiceAmount: aiResult.invoiceAmount || null,
+                    invoiceNumber: aiResult.invoiceNumber || null,
+                    priorItemIndex: sameEmailDup.itemIndex,
+                    priorFinalStatus: sameEmailDup.finalStatus,
+                  });
+              itemSummaries.push({
+                loadNumber: aiResult.loadNumber,
+                status: aiResult.status || null,
+                finalStatus: "exact_duplicate_skipped",
+                invoiceId: null,
+              });
+              continue;
+            }
           }
         }
       }
