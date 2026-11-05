@@ -898,6 +898,53 @@ function customerRateFromBooking(booking) {
 }
 
 /**
+ * Named lines for the additional-charge email. Detention is a recognized
+ * fee, so it was stored apart from the weight line and dropped off the
+ * email. Each named fee stays its own line. The lump difference is used
+ * only when the invoice names nothing.
+ * @param {object} normalizedChargeData Recognized and unrecognized rows.
+ * @param {number} fallbackAmount Invoice-minus-Primus when no lines exist.
+ * @return {Array<object>}
+ */
+function linesForAdditionalChargeEmail(normalizedChargeData, fallbackAmount) {
+  const lines = [];
+  const seen = new Set();
+  const push = (row) => {
+    const amount = Number(row && row.amount);
+    if (!(amount > 0)) return;
+    const type = String((row && (row.type || row.label)) || "").trim();
+    const label = String((row && (row.label || row.type)) || "").trim();
+    if (!type && !label) return;
+    const key = (label || type).toLowerCase().replace(/[^a-z0-9]/g, "") +
+      "|" + Math.round(amount * 100);
+    if (seen.has(key)) return;
+    seen.add(key);
+    lines.push({
+      label: label || type,
+      type: type || label,
+      amount,
+    });
+  };
+  const data = normalizedChargeData || {};
+  (data.unrecognizedCharges || []).forEach(push);
+  (data.recognizedCharges || []).forEach((row) => {
+    const name = String((row && (row.label || row.type)) || "");
+    if (!/detention/i.test(name)) return;
+    push(row);
+  });
+  if (lines.length) return lines;
+  const fallback = Number(fallbackAmount);
+  if (fallback > 0) {
+    return [{
+      label: "Additional charge",
+      type: "Additional charge",
+      amount: fallback,
+    }];
+  }
+  return [];
+}
+
+/**
  * Public base URL for HTTPS function links embedded in emails.
  * @return {string}
  */
@@ -12093,13 +12140,8 @@ async function processGmailMessage(
             additionalCharges.CHARGE_CATEGORY.RATE_INCREASE) {
           // Unknown reason is still an additional charge. Lisa reviews it
           // with the option buttons; Jerry does not send a dispute on his own.
-          const named = (normalizedChargeData.unrecognizedCharges || [])
-              .filter((row) => Number(row && row.amount) > 0);
-          const lines = named.length ? named : [{
-            label: "Additional charge",
-            type: "Additional charge",
-            amount: chargesTotal,
-          }];
+          const lines = linesForAdditionalChargeEmail(
+              normalizedChargeData, chargesTotal);
           finalStatus = "additional_charge_pending_approval";
           pendingAdditionalCharge = {
             category: chargeCategory,
@@ -12169,7 +12211,8 @@ async function processGmailMessage(
           finalStatus = "additional_charge_pending_approval";
           pendingAdditionalCharge = {
             category: chargeCategory,
-            charges: normalizedChargeData.unrecognizedCharges,
+            charges: linesForAdditionalChargeEmail(
+                normalizedChargeData, chargesTotal),
             chargesTotal,
             freightMismatch,
             hasCertificate: !!aiResult.hasWeightInspectionCertificate,
@@ -12433,11 +12476,8 @@ async function processGmailMessage(
               finalStatus = "additional_charge_pending_approval";
               pendingAdditionalCharge = {
                 category: additionalCharges.CHARGE_CATEGORY.RATE_INCREASE,
-                charges: [{
-                  label: "Additional charge",
-                  type: "Additional charge",
-                  amount: customerGap,
-                }],
+                charges: linesForAdditionalChargeEmail(
+                    normalizedChargeData, customerGap),
                 chargesTotal: customerGap,
                 freightMismatch: {mismatch: false, details: {}},
                 hasCertificate: !!aiResult.hasWeightInspectionCertificate,
@@ -12513,11 +12553,8 @@ async function processGmailMessage(
             finalStatus = "additional_charge_pending_approval";
             pendingAdditionalCharge = {
               category: additionalCharges.CHARGE_CATEGORY.RATE_INCREASE,
-              charges: [{
-                label: "Additional charge",
-                type: "Additional charge",
-                amount: overage,
-              }],
+              charges: linesForAdditionalChargeEmail(
+                  normalizedChargeData, overage),
               chargesTotal: overage,
               freightMismatch: {mismatch: false, details: {}},
               hasCertificate: !!aiResult.hasWeightInspectionCertificate,
