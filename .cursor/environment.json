@@ -1,0 +1,16 @@
+{
+  "name": "TAI Invoice Automation (Firebase Functions)",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "firebase-emulators",
+      "command": "bash .cursor/start-emulators.sh",
+      "description": "Firebase Emulator Suite (Functions on :5001, Firestore on :8080, UI on :4000) running offline under the demo-tai project."
+    }
+  ],
+  "ports": [
+    { "name": "Emulator UI", "port": 4000 },
+    { "name": "Functions", "port": 5001 },
+    { "name": "Firestore", "port": 8080 }
+  ]
+}
