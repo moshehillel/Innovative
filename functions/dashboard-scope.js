@@ -18,6 +18,8 @@ const ISSUE = Object.freeze({
   CHARGE_MISMATCH: "charge_mismatch",
   MISSING_POD: "missing_pod",
   MISSING_RATE: "missing_rate",
+  POD_DISCREPANCY: "pod_discrepancy",
+  SIGNED_POD: "signed_pod",
   MISCELLANEOUS: "miscellaneous",
 });
 
@@ -25,6 +27,8 @@ const ISSUE_LABELS = Object.freeze({
   charge_mismatch: "Carrier charges don't match",
   missing_pod: "Missing POD",
   missing_rate: "Missing customer rate",
+  pod_discrepancy: "Damaged POD",
+  signed_pod: "Signed POD",
   miscellaneous: "Miscellaneous",
 });
 
@@ -135,9 +139,12 @@ function classifyIssue(item) {
       /additional charge|charge mismatch/.test(blob)) {
     return ISSUE.CHARGE_MISMATCH;
   }
-  if (type === "signed_pod" || type === "pod_discrepancy" ||
-      type === "missing_pod" ||
-      /missing_pod|needs_pod|awaiting_pod|pod discrep|signed pod/.test(blob)) {
+  // Damaged / shortage POD and signed-POD requests are their own work.
+  // They must not land in the Missing POD list.
+  if (type === "pod_discrepancy") return ISSUE.POD_DISCREPANCY;
+  if (type === "signed_pod") return ISSUE.SIGNED_POD;
+  if (type === "missing_pod" ||
+      /missing_pod|needs_pod|awaiting_pod/.test(blob)) {
     return ISSUE.MISSING_POD;
   }
   const lowMargin = type === "low_margin" ||

@@ -35,6 +35,85 @@ const DISMISS_LOOKUP_FIELDS = [
  * @param {object} data Invoice fields.
  * @return {string|null}
  */
+/**
+ * Loads every open hold for one folder. The mixed newest-task scan misses
+ * older missing-POD and missing-rate rows, which made those folders look empty.
+ * @param {object} db Firestore.
+ * @param {object} deps tcol.
+ * @param {object} tenant Tenant.
+ * @param {string} tenantId Tenant id.
+ * @param {string} issue missing_pod or missing_rate.
+ * @return {Promise<object[]|null>} Null when the lookup cannot run.
+ */
+async function loadIssueRows(db, deps, tenant, tenantId, issue) {
+  if (typeof deps.tcol !== "function") return null;
+  const stages = issue === scope.ISSUE.MISSING_POD ?
+    ["missing_pod", "needs_pod", "awaiting_pod"] :
+    ["needs_customer_rate_review"];
+  const taskType = issue === scope.ISSUE.MISSING_POD ?
+    "missing_pod" : "missing_rate";
+  try {
+    const invSnap = await deps.tcol(tenant, "invoices")
+        .where("decisionStage", "in", stages)
+        .select(...INVOICE_HOLD_FIELDS)
+        .limit(800)
+        .get();
+    let taskDocs = [];
+    try {
+      const taskSnap = await deps.tcol(tenant, "dashboardTasks")
+          .where("status", "==", "open")
+          .where("type", "==", taskType)
+          .limit(500)
+          .get();
+      taskDocs = taskSnap.docs || [];
+    } catch (taskErr) {
+      console.warn("[loadIssueRows] tasks", taskErr && taskErr.message);
+    }
+    const invoices = [];
+    invSnap.forEach((doc) => {
+      const row = invoiceHoldRow(doc, tenantId);
+      if (row) invoices.push(row);
+    });
+    const tasks = taskDocs.map((doc) => {
+      const data = doc.data() || {};
+      const row = {
+        id: doc.id,
+        source: "dashboardTasks",
+        type: data.type || taskType,
+        status: data.status || "open",
+        tenantId: data.tenantId || tenantId,
+        loadNumber: data.loadNumber || null,
+        proNumber: data.proNumber || null,
+        carrierName: data.carrierName || null,
+        title: data.title || null,
+        reason: data.reason || null,
+        subject: data.subject || null,
+        description: data.description || null,
+        ownerEmail: data.ownerEmail || null,
+        dispatcherEmail: data.dispatcherEmail || null,
+        dispatcherName: data.dispatcherName || null,
+        createdAt: data.createdAt && data.createdAt.toDate ?
+          data.createdAt.toDate().toISOString() : (data.createdAt || null),
+        invoiceId: data.invoiceId || null,
+      };
+      row.issueType = scope.classifyIssue(row);
+      return row;
+    }).filter((row) => scope.rowBelongsToTenant(row, tenantId));
+    const visible = invoices.length || tasks.length ?
+      await omitRowsClosedByDismissedTask(
+          db, tasks.concat(invoices), tenantId) :
+      [];
+    return scope.mergeQueueItems(visible)
+        .map((row) => ownership.applyOwnerDefaults(row))
+        .filter((row) => issue === scope.ISSUE.MISSING_POD ?
+          podDash.isMissingPodDashboardItem(row) :
+          row.issueType === scope.ISSUE.MISSING_RATE);
+  } catch (err) {
+    console.warn("[loadIssueRows]", err && err.message);
+    return null;
+  }
+}
+
 function holdIssueForInvoice(data) {
   const wf = String((data && data.finalWorkflowStatus) || "");
   const stage = String((data && data.decisionStage) || "");
@@ -288,20 +367,36 @@ async function listOperationalQueue(db, deps, opts) {
     });
   }
   const phase = String(opts.chargePhase || "").toLowerCase();
+  const issue = String(opts.issue || "all").toLowerCase();
   const disputeRows = merged.filter((row) =>
     scope.isOptionDDispute(row));
   const disputeCount = disputeRows.length;
-  const missingPodRows = merged.filter((row) =>
+  let missingPodRows = merged.filter((row) =>
     podDash.isMissingPodDashboardItem(row));
+  // The mixed scan is only the newest open tasks. Missing POD and missing
+  // rate live further back, so those folders load their own holds.
+  const wantsMissingPod = phase === "missing_pod" ||
+    issue === scope.ISSUE.MISSING_POD;
+  if (wantsMissingPod) {
+    const targeted = await loadIssueRows(
+        db, deps, tenant, tenantId, scope.ISSUE.MISSING_POD);
+    if (targeted && targeted.length) missingPodRows = targeted;
+  }
   const missingPodCount = missingPodRows.length;
   if (phase === "dispute") {
     merged = disputeRows;
-  } else if (phase === "missing_pod") {
+  } else if (wantsMissingPod) {
     merged = missingPodRows.filter((row) =>
       scope.dispatcherMatches(row, opts.dispatcher || opts.dispatcherKey));
+  } else if (issue === scope.ISSUE.MISSING_RATE) {
+    const targeted = await loadIssueRows(
+        db, deps, tenant, tenantId, scope.ISSUE.MISSING_RATE);
+    const rateRows = targeted && targeted.length ? targeted :
+      merged.filter((row) => row.issueType === scope.ISSUE.MISSING_RATE);
+    merged = rateRows.filter((row) => scope.dispatcherMatches(
+        row, opts.dispatcher || opts.dispatcherKey));
   } else {
     merged = merged.filter((row) => !scope.isOptionDDispute(row));
-    const issue = String(opts.issue || "all").toLowerCase();
     if (issue && issue !== "all") {
       merged = merged.filter((row) => row.issueType === issue);
     }
@@ -320,7 +415,7 @@ async function listOperationalQueue(db, deps, opts) {
   page.items.forEach((item) => {
     if (item) item.body = null;
   });
-  return {
+  const payload = {
     tasks: page.items,
     openCount: page.openCount,
     filteredCount: page.filteredCount,
@@ -331,8 +426,11 @@ async function listOperationalQueue(db, deps, opts) {
     bucketCounts: page.bucketCounts,
     dispatchers: page.dispatchers,
     disputeCount,
-    missingPodCount,
   };
+  // Only the Missing POD folder has the full count. Other views scan the
+  // newest tasks and would replace that badge with a short number.
+  if (wantsMissingPod) payload.missingPodCount = missingPodCount;
+  return payload;
 }
 
 module.exports = {

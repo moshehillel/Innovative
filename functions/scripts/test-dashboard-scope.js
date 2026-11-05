@@ -32,6 +32,13 @@ assert.strictEqual(scope.classifyIssue({
   type: "low_margin",
   reason: "Customer rate too low",
 }), "miscellaneous");
+assert.strictEqual(scope.classifyIssue({
+  type: "pod_discrepancy",
+  reason: "POD discrepancy",
+}), "pod_discrepancy");
+assert.strictEqual(scope.classifyIssue({
+  type: "signed_pod",
+}), "signed_pod");
 
 const owner = ownership.classifyDashboardOwner({
   type: "missing_rate",
