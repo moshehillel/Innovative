@@ -39,12 +39,19 @@ check("Mark Evans inbound container",
         [{containerNumber: "EGSU9876543", carrierName: "Mark Evans Delivery"}],
         null, "", ""),
     "EGSU9876543");
-check("Evans Delivery Company not configured drayage container",
+check("Evans Delivery Company inbound container",
     dray.resolveInboundDrayageContainer(
         "Billing@EvansDelivery.com",
         [{containerNumber: "EGSU9876543", carrierName: "Evans Delivery Company"}],
         null, "", ""),
-    null);
+    "EGSU9876543");
+check("Evans BOL with extra digits still yields container",
+    dray.sanitizeContainerNumber("OOLU2332637691"), "OOLU2332637");
+check("container from carrier BOL field",
+    dray.findContainerOnInvoiceItems([{
+      carrierName: "Evans Delivery Company, Inc.",
+      carrierBolNumber: "OOLU2332637691",
+    }]), "OOLU2332637");
 check("Leo return not forwarded again",
     dray.resolveInboundDrayageContainer(
         "leo@innovativecarriers.com",
@@ -66,8 +73,10 @@ check("MARK EVANS DELIVERY uppercase",
     dray.isConfiguredDrayageCarrierName("MARK EVANS DELIVERY"), true);
 check("Mark Evans Delivery LLC",
     dray.isConfiguredDrayageCarrierName("Mark Evans Delivery LLC"), true);
-check("Evans Delivery Company not Mark Evans",
-    dray.isConfiguredDrayageCarrierName("Evans Delivery Company"), false);
+check("Evans Delivery Company is configured drayage",
+    dray.isConfiguredDrayageCarrierName("Evans Delivery Company"), true);
+check("Evans Delivery Company Inc is configured drayage",
+    dray.isConfiguredDrayageCarrierName("Evans Delivery Company, Inc."), true);
 check("carrier name from invoice items",
     dray.carrierNameFromInvoiceItems(
         [{carrierName: "Evans Delivery Company"}]),
@@ -113,6 +122,22 @@ async function runAsyncChecks() {
       markEvansSignal.isDrayage, true);
   check("Mark Evans drayage reason mentions carrier",
       /configured carrier/i.test(markEvansSignal.reason || ""), true);
+
+  const evansDeliverySignal = await dray.resolveInboundDrayageSignal({
+    from: "EvansCollections@evansdelivery.com",
+    invoiceItems: [{
+      carrierName: "Evans Delivery Company, Inc.",
+      carrierBolNumber: "OOLU2332637691",
+      invoiceAmount: 882.5,
+    }],
+    probedContainer: null,
+    subject: "YLS145469",
+    body: "",
+  });
+  check("Evans Delivery Company is drayage even when Primus says LTL",
+      evansDeliverySignal.isDrayage, true);
+  check("Evans Delivery signal keeps container from BOL",
+      evansDeliverySignal.containerNumber, "OOLU2332637");
 }
 
 runAsyncChecks().then(() => {
@@ -135,6 +160,43 @@ runAsyncChecks().then(() => {
       dray.buildLeoForwardNotes({containerNumber: "MSCU1234567"})
           .includes("accounting@innovativecarriers.com"),
       true);
+
+  check("GTG is recognized", dray.isGtgConfirmation("Load 1", "GTG"), true);
+  check("good to go is recognized",
+      dray.isGtgConfirmation("", "Good to go"), true);
+  check("a charge list is not GTG",
+      dray.isGtgConfirmation("", "Enter these charges"), false);
+  check("invoice number from subject",
+      dray.extractInvoiceNumberFromText(
+          "FW: Invoice Number BL316636", ""), "BL316636");
+  check("prior message id from Jerry ACTION REQUIRED",
+      dray.extractPriorMessageIdFromText("",
+          "Message ID\nAAMkAGU5MDg4MmNlLTdjNGYtNGI2ZC1iYjMxLTA1YzI2ZmIwZTczMgBGAAAAAAAqntx80xUMSq6IxxEc6_lyBwAKzphD0oUnQrPDK_2RRTFaAAAAAAEMAAAKzphD0oUnQrPDK_2RRTFaAAdlt5qvAAA=\n"),
+      "AAMkAGU5MDg4MmNlLTdjNGYtNGI2ZC1iYjMxLTA1YzI2ZmIwZTczMgBGAAAAAAAqntx80xUMSq6IxxEc6_lyBwAKzphD0oUnQrPDK_2RRTFaAAAAAAEMAAAKzphD0oUnQrPDK_2RRTFaAAdlt5qvAAA=");
+  const picked = dray.pickContainerMatch([{
+    BOL: "270521",
+    carrierRef: "MIEU3641450",
+    thirdPartyReferenceNumber: "MIEU3641450",
+  }], "MIEU3641450");
+  check("container search picks Primus BOL", picked.ok, true);
+  check("container search load is BOL", picked.loadNumber, "270521");
+  const merged = dray.mergeDrayageActualCost([
+    {description: "Port fee", vendorInvoiceNumber: "PF-9", amount: 75},
+    {description: "Open cost", vendorInvoiceNumber: "", amount: 10},
+    {description: "Zero bill", vendorInvoiceNumber: 0, amount: 5},
+    {description: "Text zero", vendorInvoiceNumber: "0", amount: 8},
+  ], {description: "Freight", vendorInvoiceNumber: "INV-44", amount: 400});
+  check("unbilled lines dropped", merged.removed, 2);
+  check("billed port fee kept",
+      merged.lines.some((line) => line.vendorInvoiceNumber === "PF-9"), true);
+  check("text zero bill kept",
+      merged.lines.some((line) => line.vendorInvoiceNumber === "0"), true);
+  check("carrier freight line added",
+      merged.lines.some((line) => line.vendorInvoiceNumber === "INV-44"), true);
+  check("five dollar gap stops",
+      dray.drayageAmountsAcceptable(1000, 1005).ok, false);
+  check("under five dollars can proceed",
+      dray.drayageAmountsAcceptable(1001, 1005).ok, true);
 
   if (failures) {
     console.error(`\n${failures} test(s) failed`);

@@ -5,6 +5,8 @@
 "use strict";
 
 const dashboardOps = require("./dashboard-ops");
+const dashboardEmailFiles = require("./dashboard-email-files");
+const ownership = require("./dashboard-ownership");
 
 let deps = {};
 
@@ -31,14 +33,61 @@ function cors(req, res) {
  * @param {object} res Response.
  * @return {Promise<object>}
  */
+async function handleListAccessorials(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "GET") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    await deps.resolveDashboardTenant(req);
+    const catalog = require("./quote-accessorial-catalog");
+    const accessorials = await catalog.listPrimusAccessorialChoices();
+    return res.json({ok: true, accessorials});
+  } catch (error) {
+    console.error("getDashboardAccessorials error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not load the Primus accessorial list.",
+    });
+  }
+}
+
 async function handleListNotifications(req, res) {
   if (cors(req, res)) return;
   try {
     const tenant = await deps.resolveDashboardTenant(req);
+    if (String(req.query.detail || "") === "1") {
+      const detail = await dashboardOps.loadNotificationDetail(deps.db, {
+        id: req.query.id,
+        tenantId: tenant.tenantId,
+        additionalChargesMod: deps.additionalCharges || null,
+      });
+      if (!detail.ok) {
+        return res.status(404).json({
+          ok: false,
+          error: detail.error || "Not found.",
+        });
+      }
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        body: detail.body || null,
+      });
+    }
     const result = await dashboardOps.listNotifications(deps.db, {
       tenantId: tenant.tenantId,
-      limit: req.query.limit,
+      collectionPrefix: tenant.collectionPrefix,
+      all: true,
+      q: req.query.q || null,
+      sort: req.query.sort || null,
       type: req.query.type || null,
+      ownerBucket: req.query.ownerBucket || null,
+      dispatcherKey: req.query.dispatcherKey || null,
+      urgentFirst: req.query.urgentFirst !== "0",
+      additionalChargesMod: deps.additionalCharges || null,
+      backfillMail: typeof deps.backfillDashboardMail === "function" ?
+        (items) => deps.backfillDashboardMail(
+            items, tenant, "notification") : null,
     });
     return res.json({
       ok: true,
@@ -148,7 +197,7 @@ async function handleFlagNotification(req, res) {
 }
 
 /**
- * POST additional-charge decision A–E from the dashboard.
+ * POST additional-charge decision A-F from the dashboard.
  * Signs an email-action token and reuses additionalChargeAction.
  * @param {object} req Request.
  * @param {object} res Response.
@@ -164,10 +213,11 @@ async function handleAdditionalChargeDecision(req, res) {
     const body = req.body || {};
     const invoiceId = String(body.invoiceId || "").trim();
     const option = String(body.option || "").toLowerCase();
-    if (!invoiceId || !["a", "b", "c", "d", "e"].includes(option)) {
+    if (!invoiceId ||
+        !["a", "b", "c", "d", "e", "f"].includes(option)) {
       return res.status(400).json({
         ok: false,
-        error: "invoiceId and option (a|b|c|d|e) are required.",
+        error: "invoiceId and option (a|b|c|d|e|f) are required.",
       });
     }
 
@@ -184,9 +234,26 @@ async function handleAdditionalChargeDecision(req, res) {
       option,
       customerChargeAmount: body.customerChargeAmount,
       customerBillLines: body.customerBillLines,
+      fMode: body.fMode,
+      fValue: body.fValue,
+      fFlatAmount: body.fFlatAmount,
+      fPercent: body.fPercent,
+      disputeNotes: body.disputeNotes,
     });
     if (!result.ok) {
       return res.status(result.status || 400).json(result);
+    }
+    if (result.alreadyApplied) {
+      return res.json({
+        ok: true,
+        accepted: false,
+        alreadyApplied: true,
+        option: String(result.decision || option).toUpperCase(),
+        handedOffToDispatch: false,
+        markedInDispute: false,
+        message: result.message ||
+          "This charge was already decided.",
+      });
     }
 
     if (body.notificationId) {
@@ -196,7 +263,33 @@ async function handleAdditionalChargeDecision(req, res) {
         extra: {actedOption: option.toUpperCase()},
       });
     }
-    if (body.taskId) {
+    // Option B → Dispatch folder. Option D → keep as open dispute task.
+    // Other options close the charge task.
+    if (option === "b") {
+      await deps.dashboardTasks.handoffTaskToDispatch(
+          deps.db, deps.additionalCharges, {
+            taskId: body.taskId || null,
+            source: body.taskSource || null,
+            followUpId: body.followUpId || null,
+            invoiceId,
+            tenantId: tenant.tenantId,
+            option,
+          }).catch((err) => {
+        console.error("handoffTaskToDispatch:", err.message);
+      });
+    } else if (option === "d") {
+      await deps.dashboardTasks.markTaskInDispute(
+          deps.db, deps.additionalCharges, {
+            taskId: body.taskId || null,
+            source: body.taskSource || null,
+            followUpId: body.followUpId || null,
+            invoiceId,
+            tenantId: tenant.tenantId,
+            disputeNotes: body.disputeNotes,
+          }).catch((err) => {
+        console.error("markTaskInDispute:", err.message);
+      });
+    } else if (body.taskId) {
       await deps.dashboardTasks.dismissDashboardTask(
           deps.db, deps.additionalCharges, {
             taskId: body.taskId,
@@ -209,6 +302,8 @@ async function handleAdditionalChargeDecision(req, res) {
       ok: true,
       accepted: true,
       option: option.toUpperCase(),
+      handedOffToDispatch: option === "b",
+      markedInDispute: option === "d",
       message: result.message || null,
     });
   } catch (error) {
@@ -251,7 +346,7 @@ async function handleReplyUnhandledEmail(req, res) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     const n = snap.data() || {};
-    if (n.tenantId && n.tenantId !== tenant.tenantId) {
+    if (!ownership.sameTenant(n.tenantId, tenant.tenantId)) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     const to = extractEmailAddress(n.from);
@@ -320,7 +415,7 @@ async function handleDeleteUnhandledEmail(req, res) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     const n = snap.data() || {};
-    if (n.tenantId && n.tenantId !== tenant.tenantId) {
+    if (!ownership.sameTenant(n.tenantId, tenant.tenantId)) {
       return res.status(404).json({ok: false, error: "Notification not found."});
     }
     if (n.messageId && typeof deps.trashGmailMessage === "function") {
@@ -343,6 +438,144 @@ async function handleDeleteUnhandledEmail(req, res) {
 }
 
 /**
+ * @param {string} source task|notification|additionalCharges.
+ * @param {string} id Document id.
+ * @return {Promise<object|null>}
+ */
+async function loadMailDoc(source, id) {
+  let collection = null;
+  if (source === "notification") {
+    collection = dashboardOps.NOTIF_COLLECTION;
+  } else if (source === "additionalCharges" && deps.additionalCharges) {
+    collection = deps.additionalCharges.FOLLOW_UP_COLLECTION;
+  } else if (deps.dashboardTasks) {
+    collection = deps.dashboardTasks.TASK_COLLECTION;
+  }
+  if (!collection) return null;
+  const snap = await deps.db.collection(collection).doc(id).get();
+  if (!snap.exists) return null;
+  return snap.data() || {};
+}
+
+/**
+ * Streams one stored or mailbox attachment.
+ * @param {object} res Response.
+ * @param {object} att Attachment metadata.
+ * @param {object} tenant Tenant.
+ * @return {Promise<object>}
+ */
+async function streamDashboardAttachment(res, att, tenant) {
+  const sendBytes = (buf) => {
+    res.set("Content-Type", att.mimeType || "application/octet-stream");
+    res.set("Content-Disposition",
+        dashboardEmailFiles.contentDisposition(att));
+    res.set("Cache-Control", "private, max-age=120");
+    res.set("X-Content-Type-Options", "nosniff");
+    res.send(buf);
+  };
+
+  if (att.storagePath && typeof deps.getBucket === "function") {
+    const file = deps.getBucket().file(att.storagePath);
+    const [exists] = await file.exists();
+    if (exists) {
+      res.set("Content-Type", att.mimeType || "application/octet-stream");
+      res.set("Content-Disposition",
+          dashboardEmailFiles.contentDisposition(att));
+      res.set("Cache-Control", "private, max-age=120");
+      res.set("X-Content-Type-Options", "nosniff");
+      await new Promise((resolve, reject) => {
+        file.createReadStream()
+            .on("error", reject)
+            .on("end", resolve)
+            .pipe(res);
+      });
+      return;
+    }
+  }
+
+  if (att.gmailMessageId && att.gmailAttachmentId &&
+      typeof deps.getMailClient === "function" &&
+      typeof deps.downloadGmailAttachmentBuffer === "function") {
+    const mail = await deps.getMailClient(tenant);
+    if (!mail) {
+      res.status(404).json({
+        ok: false,
+        error: "Mailbox is not connected.",
+      });
+      return;
+    }
+    const buf = await deps.downloadGmailAttachmentBuffer(
+        mail, att.gmailMessageId, att.gmailAttachmentId);
+    sendBytes(buf);
+    return;
+  }
+
+  res.status(404).json({
+    ok: false,
+    error: "Attachment file is no longer available.",
+  });
+}
+
+/**
+ * GET one email attachment for a task or notification drawer.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<object>}
+ */
+async function handleDownloadEmailAttachment(req, res) {
+  if (cors(req, res)) return;
+  try {
+    const tenant = await deps.resolveDashboardTenant(req);
+    const source = String(req.query.source || "task");
+    const id = String(req.query.id || "").trim();
+    const index = Number(req.query.index);
+    if (!id || !Number.isInteger(index) || index < 0 || index > 40) {
+      return res.status(400).json({
+        ok: false,
+        error: "id and index are required.",
+      });
+    }
+    const data = await loadMailDoc(source, id);
+    if (!data) {
+      return res.status(404).json({ok: false, error: "Not found."});
+    }
+    if (!ownership.sameTenant(data.tenantId, tenant && tenant.tenantId)) {
+      return res.status(404).json({ok: false, error: "Not found."});
+    }
+    let att = Array.isArray(data.attachments) ?
+      data.attachments[index] : null;
+    if (!att && data.invoiceId && typeof deps.tcol === "function") {
+      const invSnap = await deps.tcol(tenant, "invoices")
+          .doc(String(data.invoiceId)).get();
+      if (invSnap.exists) {
+        const fromInv = dashboardEmailFiles.attachmentsFromInvoice(
+            invSnap.data() || {}, {
+              includePod: data.type === "pod_discrepancy" ||
+                data.type === "signed_pod",
+            });
+        att = fromInv[index] || null;
+      }
+    }
+    if (!att) {
+      return res.status(404).json({
+        ok: false,
+        error: "Attachment not found.",
+      });
+    }
+    await streamDashboardAttachment(res, att, tenant);
+    return undefined;
+  } catch (error) {
+    console.error("getDashboardEmailAttachment error:", error);
+    if (res.headersSent) return undefined;
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to open attachment.",
+      details: error.message,
+    });
+  }
+}
+
+/**
  * @param {string} from Header value.
  * @return {string}
  */
@@ -356,10 +589,12 @@ function extractEmailAddress(from) {
 
 module.exports = {
   init,
+  handleListAccessorials,
   handleListNotifications,
   handleDismissNotification,
   handleFlagNotification,
   handleAdditionalChargeDecision,
   handleReplyUnhandledEmail,
   handleDeleteUnhandledEmail,
+  handleDownloadEmailAttachment,
 };

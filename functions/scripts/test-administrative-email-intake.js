@@ -991,6 +991,16 @@ check("Lisa Averitt Abe not on CC",
       {name: "From", value: averittFrom},
       {name: "To", value: "billing@innovativecarriers.com"},
     ]));
+check("Lisa on Cc is detected",
+    adm.isLisaCopiedOnEmailHeaders([
+      {name: "To", value: "jerry@innovativecarriers.com"},
+      {name: "Cc", value: "Lisa <Lisa@innovativecarriers.com>"},
+    ]));
+check("Lisa not copied stays a review item",
+    !adm.isLisaCopiedOnEmailHeaders([
+      {name: "To", value: "jerry@innovativecarriers.com"},
+      {name: "Cc", value: "Abe Goldberger <abe@innovativecarriers.com>"},
+    ]));
 check("ArcBest eInvoice is not carrier statement follow-up",
     !adm.isCarrierStatementFollowUpEmail(
         arcBestSubject,

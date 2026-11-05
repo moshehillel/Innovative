@@ -628,7 +628,8 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
 
           const msg = await graphFetch(
               `/me/messages/${encodeURIComponent(id)}` +
-              "?$select=id,subject,from,toRecipients,body,hasAttachments",
+              "?$select=id,subject,from,toRecipients,body,hasAttachments," +
+              "receivedDateTime",
               tokens,
               onTokenUpdate,
           );
@@ -648,9 +649,13 @@ function buildOutlookMailAdapter(tokens, onTokenUpdate) {
                     "#microsoft.graph.fileAttachment",
                 }));
           }
+          const receivedMs = msg.receivedDateTime ?
+            new Date(msg.receivedDateTime).getTime() : 0;
           return {
             data: {
               id: msg.id,
+              receivedDateTime: msg.receivedDateTime || null,
+              internalDate: receivedMs ? String(receivedMs) : undefined,
               payload: graphMessageToGmailPayload(msg, attachments),
             },
           };

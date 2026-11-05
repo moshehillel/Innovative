@@ -465,6 +465,7 @@ function shouldAlertStatementUnderExtraction(gap) {
  */
 function buildStatementGapSummarySuffix(gap) {
   if (!gap || !gap.underExtracted) return "";
+  if (gap.reason) return String(gap.reason);
   const missing = Array.isArray(gap.missingLoads) ? gap.missingLoads : [];
   if (missing.length > 0) {
     const list = missing.slice(0, 8).join(", ");

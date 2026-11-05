@@ -39,6 +39,9 @@ const {
   toOutboundEmailSafeText,
 } = require("./email-outbound-safe");
 const workflowErrors = require("./workflow-error-messages");
+const drayageIntake = require("./drayage-intake");
+const customerInvoiceSendGuard = require(
+    "./customer-invoice-send-guard");
 
 const admin = require("firebase-admin");
 
@@ -690,6 +693,182 @@ function listQuoteApprovalDriveFileIds(docData, quoteApprovalFileTypeId) {
   return [...new Set(ids)];
 }
 
+/** Customer-facing label for the Redkik certificate attachment. */
+const CERTIFICATE_OF_INSURANCE_ATTACHMENT_NAME = "Certificate of Insurance";
+
+/**
+ * Primus file types whose code is COI (system Redkik cert and the editable
+ * copy). Used when getFileTypes cannot be read.
+ */
+const KNOWN_COI_FILE_TYPE_IDS = ["1", "367"];
+
+/**
+ * File type ids whose code or name is Certificate of Insurance (COI).
+ * Primus has more than one COI type (system Redkik cert and an editable copy).
+ * @param {Array<object>} types getFileTypes rows.
+ * @return {string[]}
+ */
+function listCertificateOfInsuranceTypeIds(types) {
+  const ids = [];
+  for (const t of types || []) {
+    const code = String(t.code || "").trim().toUpperCase();
+    const name = String(
+        t.name || t.description || t.typeName || t.fileTypeName || "",
+    ).trim().toLowerCase();
+    if (code !== "COI" && name !== "certificate of insurance") continue;
+    const id = t.id != null ? t.id :
+      (t.fileTypeId != null ? t.fileTypeId : t.type);
+    if (id == null || String(id) === "") continue;
+    ids.push(String(id));
+  }
+  return [...new Set(ids)];
+}
+
+/**
+ * @param {object} file Drive row from getBookingDocuments.
+ * @return {string}
+ */
+function driveFileDisplayName(file) {
+  const raw = String(
+      (file && (file.fileName || file.name)) || "",
+  );
+  if (!raw) return "";
+  try {
+    return decodeURIComponent(raw);
+  } catch (_) {
+    return raw;
+  }
+}
+
+/**
+ * True for the per-load Redkik / Primus Certificate of Insurance.
+ * Matches the COI file type, the type name, or the "Redkik COI File"
+ * description Primus writes when it files the certificate. Other
+ * certificates (detention, reweigh, MC, carrier cargo) do not match.
+ * @param {object} file Drive row.
+ * @param {string[]} [coiTypeIds] Certificate of Insurance type ids.
+ * @return {boolean}
+ */
+function isCertificateOfInsuranceFile(file, coiTypeIds) {
+  if (!file || typeof file !== "object") return false;
+  const want = new Set((coiTypeIds || []).map(String));
+  const ft = readFileTypeId(file);
+  if (ft && want.has(ft)) return true;
+  const typeName = String(file.fileTypeName || "").trim().toLowerCase();
+  if (typeName === "certificate of insurance") return true;
+  const name = driveFileDisplayName(file).toUpperCase();
+  if (/CERTIFICATE OF INSURANCE/.test(name)) return true;
+  // Redkik stores the per-load PDF as COI_BOL#<load>.pdf.
+  if (/(?:^|[^A-Z0-9])COI(?:[^A-Z0-9]|$)/.test(name)) return true;
+  const desc = String(file.fileDescription || "");
+  return /redkik\s+coi\b/i.test(desc);
+}
+
+/**
+ * Names the certificate in the customer email when one is attached.
+ * Leaves the invoice body unchanged when the load has no COI.
+ * @param {string} body Existing email HTML.
+ * @param {object} coi Selection from selectCustomerInvoiceCoi.
+ * @return {string}
+ */
+function emailBodyWithCoiNote(body, coi) {
+  const ids = coi && coi.coiDriveIds;
+  if (!ids || !ids.length) return body;
+  const html = String(body || "");
+  if (/certificate of insurance/i.test(html)) return html;
+  const note = "<p>A Certificate of Insurance is attached for this shipment." +
+    "</p>";
+  const thankYou = html.indexOf("<p>Thank you!</p>");
+  if (thankYou >= 0) {
+    return html.slice(0, thankYou) + note + html.slice(thankYou);
+  }
+  return html + note;
+}
+
+/**
+ * Per-load Certificate of Insurance drive files.
+ * @param {object} docData getBookingDocuments JSON body.
+ * @param {string[]} [coiTypeIds] COI file type ids.
+ * @return {Array<{driveId: string, fileName: string}>}
+ */
+function listCoiDriveFiles(docData, coiTypeIds) {
+  const found = [];
+  const seen = new Set();
+  for (const list of collectDocumentListArrays(docData)) {
+    for (const f of list) {
+      if (!isCertificateOfInsuranceFile(f, coiTypeIds)) continue;
+      const driveId = readDriveFileId(f);
+      if (!driveId || seen.has(driveId)) continue;
+      seen.add(driveId);
+      found.push({
+        driveId,
+        fileName: driveFileDisplayName(f),
+      });
+    }
+  }
+  return found;
+}
+
+/**
+ * True when the Redkik premium has been posted on the load.
+ * Same rule as addInsurancePremiumToLoad: an actual-cost line whose
+ * carrier is the insurance vendor.
+ * @param {Array<object>|null} actualCosts Invoice actual-cost lines.
+ * @param {string|number|null} vendorId Insurance vendor id.
+ * @return {boolean}
+ */
+function loadHasPostedInsurance(actualCosts, vendorId) {
+  if (vendorId == null || String(vendorId) === "") return false;
+  const want = String(vendorId);
+  return (Array.isArray(actualCosts) ? actualCosts : []).some((line) =>
+    line && String(line.carrierId) === want);
+}
+
+/**
+ * Decides whether the customer invoice email should include a COI.
+ * A load has insurance when its booking already has the Redkik certificate,
+ * or when the insurance vendor's premium is on the invoice. The certificate
+ * is attached only when that file is on the load. A posted premium with no
+ * file is reported as missing so the invoice can still be sent.
+ * @param {object} args docData, coiTypeIds, carrierBillDriveIds,
+ *   actualCosts (null when costs were not loaded), insuranceVendorId.
+ * @return {object}
+ */
+function selectCustomerInvoiceCoi(args) {
+  const opts = args || {};
+  const blocked = new Set(
+      (opts.carrierBillDriveIds || []).map((id) => String(id)));
+  const files = listCoiDriveFiles(opts.docData, opts.coiTypeIds)
+      .filter((f) => !blocked.has(String(f.driveId)));
+  if (files.length) {
+    return {
+      hasInsurance: true,
+      coiDriveIds: files.map((f) => f.driveId),
+      coiFileNames: files.map((f) => f.fileName),
+      coiAttachmentName: CERTIFICATE_OF_INSURANCE_ATTACHMENT_NAME,
+      missing: false,
+    };
+  }
+  if (opts.actualCosts == null) {
+    return {
+      hasInsurance: false,
+      coiDriveIds: [],
+      coiFileNames: [],
+      coiAttachmentName: null,
+      missing: false,
+    };
+  }
+  const hasInsurance = loadHasPostedInsurance(
+      opts.actualCosts, opts.insuranceVendorId);
+  return {
+    hasInsurance,
+    coiDriveIds: [],
+    coiFileNames: [],
+    coiAttachmentName: null,
+    missing: hasInsurance,
+  };
+}
+
 /**
  * @param {object} docData getBookingDocuments JSON body.
  * @param {string|number} fileType Primus fileType id.
@@ -845,6 +1024,76 @@ async function getBookingDocuments({bookingId, bookingBOL}) {
   return {ok: true, data: result.json};
 }
 exports.getBookingDocuments = getBookingDocuments;
+
+/**
+ * Picks the shipment BOL from getBookingDocuments. Skips POD, carrier
+ * bills, certificates, and invoices.
+ * @param {object} docData getBookingDocuments body.
+ * @return {object}
+ */
+function selectShipmentBol(docData) {
+  const lists = collectDocumentListArrays(docData);
+  for (const list of lists) {
+    for (const file of list) {
+      const typeName = String(file && file.fileTypeName || "").toLowerCase();
+      const name = driveFileDisplayName(file).toLowerCase();
+      const blob = `${typeName} ${name}`;
+      if (/pod|proof of delivery|carrier bill|weight cert/.test(blob) ||
+          /certificate|invoice/.test(blob)) {
+        continue;
+      }
+      if (/bill of lading|\bbol\b/.test(blob)) {
+        return {
+          found: true,
+          driveId: readDriveFileId(file),
+          fileName: driveFileDisplayName(file) || "BOL.pdf",
+        };
+      }
+    }
+  }
+  return {found: false};
+}
+
+/**
+ * Downloads the shipment BOL when Primus returns a PDF. Records a reason
+ * when the file cannot be fetched.
+ * @param {object} booking Primus booking.
+ * @param {string|number} loadNumber Load number.
+ * @return {Promise<object>}
+ */
+async function fetchShipmentBolPdf(booking, loadNumber) {
+  const url = booking && (booking.BOLDocumentURL || booking.documentURL);
+  if (url && /^https?:/i.test(String(url))) {
+    try {
+      const cookie = await getUiSessionCookie();
+      const resp = await fetch(String(url), {
+        headers: {cookie: `PHPSESSID=${cookie}`},
+      });
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (resp.ok && buf.slice(0, 4).toString() === "%PDF") {
+        const name = `BOL-${loadNumber || "shipment"}.pdf`;
+        return {
+          ok: true,
+          filename: name,
+          contentBase64: buf.toString("base64"),
+        };
+      }
+    } catch (err) {
+      return {ok: false, reason: "bol_fetch_failed"};
+    }
+  }
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) return {ok: false, reason: "bol_not_listed"};
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: booking.BOL || booking.billOfLading || bookingId,
+  });
+  if (!docs.ok) return {ok: false, reason: "bol_not_listed"};
+  const bol = selectShipmentBol(docs.data);
+  if (!bol.found) return {ok: false, reason: "bol_not_listed"};
+  return {ok: false, reason: "bol_bytes_unavailable"};
+}
+exports.fetchShipmentBolPdf = fetchShipmentBolPdf;
 
 const DEFAULT_EMAIL_DOCS_BODY = defaultPrimusEmailDocsBody();
 
@@ -1691,7 +1940,124 @@ async function resolvePodDriveIdsForEmail(args) {
     blockedDriveFileIds: blocked,
     miworld,
     customerName,
+    docData,
   };
+}
+
+/**
+ * Loads the per-load Redkik certificate for the customer invoice email.
+ * Does not throw: a lookup failure is logged and the invoice email continues.
+ * @param {object|null} docData getBookingDocuments body.
+ * @param {string} loadNumber BOL number.
+ * @return {Promise<object>}
+ */
+async function resolveCustomerInvoiceCoi(docData, loadNumber) {
+  const empty = {
+    hasInsurance: false,
+    coiDriveIds: [],
+    coiFileNames: [],
+    coiAttachmentName: null,
+    missing: false,
+    lookupFailed: false,
+  };
+  try {
+    const uploadTypes = await resolveUploadFileTypes();
+    let typeIds = KNOWN_COI_FILE_TYPE_IDS.slice();
+    try {
+      const discovered = listCertificateOfInsuranceTypeIds(
+          await fetchUiFileTypes());
+      if (discovered.length) typeIds = discovered;
+    } catch (typeErr) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "COI file types unavailable — using known Certificate of " +
+            "Insurance type ids", {
+              loadNumber,
+              error: typeErr && typeErr.message,
+            });
+      }
+    }
+    const carrierBillIds = listFileTypeDriveIds(
+        docData, uploadTypes.carrierBill && uploadTypes.carrierBill.id);
+    let selection = selectCustomerInvoiceCoi({
+      docData,
+      coiTypeIds: typeIds,
+      carrierBillDriveIds: carrierBillIds,
+      actualCosts: null,
+      insuranceVendorId: null,
+    });
+    if (!selection.coiDriveIds.length) {
+      const invoice = findUiInvoice(docData);
+      if (invoice && invoice.id != null) {
+        const vendor = await resolveInsuranceVendor();
+        const stores = await getInvoiceStores(invoice.id);
+        if (!stores.ok) {
+          if (writeLog) {
+            await writeLog("warn", "primus",
+                "Could not read invoice costs to check insurance for COI", {
+                  loadNumber,
+                  error: stores.error || null,
+                });
+          }
+        } else {
+          selection = selectCustomerInvoiceCoi({
+            docData,
+            coiTypeIds: typeIds,
+            carrierBillDriveIds: carrierBillIds,
+            actualCosts: extractActualCostsFromStore(stores.data) || [],
+            insuranceVendorId: vendor && vendor.id,
+          });
+        }
+      }
+    }
+    if (selection.coiDriveIds.length && writeLog) {
+      await writeLog("info", "primus",
+          "Customer invoice email — including Certificate of Insurance", {
+            loadNumber,
+            coiDriveIds: selection.coiDriveIds,
+            coiFileNames: selection.coiFileNames,
+            coiAttachmentName: selection.coiAttachmentName,
+          });
+    } else if (selection.missing && writeLog) {
+      await writeLog("warn", "primus",
+          "Insured load has no Certificate of Insurance — " +
+          "customer invoice email will still send", {
+            loadNumber,
+          });
+    }
+    return Object.assign({lookupFailed: false}, selection);
+  } catch (err) {
+    if (writeLog) {
+      await writeLog("warn", "primus",
+          "Certificate of Insurance lookup failed — " +
+          "customer invoice email will still send", {
+            loadNumber,
+            error: err && err.message,
+          });
+    }
+    return Object.assign({}, empty, {lookupFailed: true});
+  }
+}
+
+/**
+ * Names the certificate in the invoice email when one is attached.
+ * Primus keeps the stored drive filename; this sentence tells the customer
+ * that file is the Certificate of Insurance.
+ * @param {string} bodyHtml Email HTML.
+ * @param {object} coi resolveCustomerInvoiceCoi result.
+ * @return {string}
+ */
+function emailBodyWithCoiNote(bodyHtml, coi) {
+  if (!coi || !coi.coiDriveIds || !coi.coiDriveIds.length) {
+    return bodyHtml;
+  }
+  const html = String(bodyHtml || "");
+  if (/certificate of insurance/i.test(html)) return html;
+  const paragraph =
+    "<p>A Certificate of Insurance for this shipment is attached.</p>";
+  const marker = "<p>Please see your invoices attached.</p>";
+  if (html.includes(marker)) return html.replace(marker, marker + paragraph);
+  return paragraph + html;
 }
 
 /**
@@ -1736,6 +2102,7 @@ async function emailBOLDocs(args) {
     blockedDriveFileIds,
     miworld,
     customerName: resolvedCustomerName,
+    docData,
   } = await resolvePodDriveIdsForEmail({
     booking,
     loadNumber,
@@ -1746,9 +2113,7 @@ async function emailBOLDocs(args) {
       ...(Array.isArray(args.driveFileIds) ? args.driveFileIds : []),
     ],
   });
-
-  const driveFileIds = [...new Set(resolvedDriveIds || podDriveIds || [])];
-  if (!podDriveIds || !podDriveIds.length) {
+  if (!args.invoiceOnly && (!podDriveIds || !podDriveIds.length)) {
     return {
       ok: false,
       error: "No POD document on Primus — customer email blocked",
@@ -1764,9 +2129,21 @@ async function emailBOLDocs(args) {
         blockedCarrierBillDriveIds: blockedDriveFileIds || [],
         customerInvoiceId: String(customerInvoiceId),
         invoiceNumber,
+        hasInsurance: false,
+        coiDriveIdsSelected: [],
+        coiFileNames: [],
+        coiAttachmentName: null,
+        coiMissing: false,
       },
     };
   }
+
+  const coi = await resolveCustomerInvoiceCoi(docData, loadNumber);
+  const coiDriveIds = coi.coiDriveIds || [];
+  const driveFileIds = args.invoiceOnly ? [] : [...new Set([
+    ...(resolvedDriveIds || podDriveIds || []),
+    ...coiDriveIds,
+  ])];
 
   const subject = toOutboundEmailSafeSubject(
       args.subject || `Invoice for BOL#${loadNumber}`);
@@ -1776,7 +2153,7 @@ async function emailBOLDocs(args) {
       customBody :
       appendCustomerInvoiceEmailSignature(customBody)) :
     DEFAULT_EMAIL_DOCS_BODY;
-  const body = toOutboundEmailSafeText(bodyRaw);
+  const body = toOutboundEmailSafeText(emailBodyWithCoiNote(bodyRaw, coi));
   const fromAddr = process.env.PRIMUS_UI_EMAIL_FROM ||
     "accounting@innovativecarriers.com";
 
@@ -1806,26 +2183,135 @@ async function emailBOLDocs(args) {
   params["email-docs-to"] = customerEmail;
   params["email-docs-subject"] = subject;
   params["email-docs-body"] = body;
-  params["email-docs-bol"] = "on";
+  if (!args.invoiceOnly) {
+    params["email-docs-bol"] = "on";
+  }
   // UI checkbox: attach issued customer invoice
   params[`email-docs-invoice-${customerInvoiceId}`] = "on";
-  // UI checkbox(es): attach POD / quote approval / customer drive file(s)
-  for (const driveId of driveFileIds) {
-    params[`email-docs-drive-${driveId}`] = "on";
+  if (!args.invoiceOnly) {
+    // POD, quote approval, and Certificate of Insurance
+    for (const driveId of driveFileIds) {
+      params[`email-docs-drive-${driveId}`] = "on";
+    }
+  }
+
+  let primusInvoiceSent = false;
+  try {
+    const restInvoices = await fetchRestInvoicesByLoad(loadNumber);
+    primusInvoiceSent = customerInvoiceSendGuard.readPrimusSentFlag(
+        restInvoices, customerInvoiceId, invoiceNumber);
+  } catch (_) {
+    primusInvoiceSent = false;
+  }
+
+  let sendClaim = null;
+  // forceResend skips Jerry's own records. Primus sent=true still blocks.
+  if (!args.forceResend || primusInvoiceSent) {
+    try {
+      const decision =
+        await customerInvoiceSendGuard.evaluateCustomerInvoiceResend(
+            firestore(), {
+              loadNumber,
+              customerInvoiceId,
+              invoiceNumber,
+              invoiceTotal: args.customerInvoiceTotal,
+              customerRate: args.customerRate != null ?
+                args.customerRate : args.chargesTotal,
+              customerBillLines: args.customerBillLines,
+              invoiceUnchanged: args.invoiceUnchanged === true,
+              alreadyIssued: args.alreadyIssued === true,
+              issuedNow: args.issuedNow === true,
+              customerTotalChanged: args.customerTotalChanged === true,
+              primusInvoiceSent,
+              firestoreInvoiceId: args.firestoreInvoiceId || null,
+              to: customerEmail,
+            });
+      if (decision.skip || primusInvoiceSent) {
+        const sentReason =
+          customerInvoiceSendGuard.PRIMUS_ALREADY_SENT_REASON;
+        const reason = decision.skip ? decision.reason : sentReason;
+        const skipLog = reason === sentReason ?
+          "Customer invoice email skipped — Primus marked sent" :
+          "Customer invoice email skipped — already sent unchanged";
+        if (writeLog) {
+          await writeLog("info", "primus", skipLog, {
+            loadNumber,
+            customerInvoiceId: String(customerInvoiceId),
+            invoiceNumber,
+            reason,
+            priorInvoiceId: decision.priorInvoiceId || null,
+          });
+        }
+        return {
+          ok: true,
+          skipped: true,
+          reason,
+          to: customerEmail,
+          driveFileIds: [],
+          attachments: null,
+        };
+      }
+      sendClaim = decision.claim || null;
+    } catch (guardErr) {
+      if (primusInvoiceSent) {
+        if (writeLog) {
+          await writeLog("warn", "primus",
+              "Primus marked sent — email blocked after guard error", {
+                loadNumber,
+                error: guardErr && guardErr.message,
+              });
+        }
+        return {
+          ok: true,
+          skipped: true,
+          reason: customerInvoiceSendGuard.PRIMUS_ALREADY_SENT_REASON,
+          to: customerEmail,
+          driveFileIds: [],
+          attachments: null,
+        };
+      }
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "Customer invoice resend check failed — email will send", {
+              loadNumber,
+              error: guardErr && guardErr.message,
+            });
+      }
+    }
   }
 
   const result = await managePhpPost(params);
   const success = isEmailBOLDocsSuccess(result.json);
+  if (sendClaim) {
+    try {
+      await customerInvoiceSendGuard.finishCustomerInvoiceSend(
+          sendClaim, success ? "sent" : "failed");
+    } catch (markErr) {
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "Could not record customer invoice send", {
+              loadNumber,
+              error: markErr && markErr.message,
+            });
+      }
+    }
+  }
   const attachments = {
     invoiceSelected: true,
-    bolSelected: true,
-    podDriveIdsSelected: podDriveIds || [],
+    bolSelected: !args.invoiceOnly,
+    podDriveIdsSelected: args.invoiceOnly ? [] : (podDriveIds || []),
     quoteApprovalDriveIdsSelected: quoteApprovalDriveIds || [],
     miworld: !!miworld,
     customerName: resolvedCustomerName || null,
     blockedCarrierBillDriveIds: blockedDriveFileIds || [],
     customerInvoiceId: String(customerInvoiceId),
     invoiceNumber,
+    hasInsurance: !!coi.hasInsurance,
+    coiDriveIdsSelected: coiDriveIds,
+    coiFileNames: coi.coiFileNames || [],
+    coiAttachmentName: coi.coiAttachmentName || null,
+    coiMissing: !!coi.missing,
+    coiLookupFailed: !!coi.lookupFailed,
   };
   return {
     ok: success,
@@ -3199,37 +3685,79 @@ function buildActualCosts(vendor, bill, withIds = null) {
  */
 function buildCustomerCharges(
     customerRate, billToReference, customerBillLines) {
-  let description = "FREIGHT CHARGE";
+  const additionalCharges = require("./additional-charges");
+  const planned = additionalCharges.customerInvoiceChargeLines(
+      customerRate, customerBillLines);
   const ref = sanitizeBillToReferenceText(billToReference);
-  if (ref) {
-    description += ` - ${ref}`;
-  }
-  const lines = [{
-    id: 1,
-    code: "",
-    qty: 1,
-    description,
-    rate: roundMoney(customerRate),
-    total: roundMoney(customerRate).toFixed(2),
-    chargeType: "",
-  }];
-  (Array.isArray(customerBillLines) ? customerBillLines : []).forEach(
-      (line, idx) => {
-        const amount = roundMoney(line && line.amount);
-        if (!amount || amount <= 0) return;
-        const name = String(line && (line.name || line.label) || "ACCESSORIAL")
-            .trim().toUpperCase();
-        lines.push({
-          id: idx + 2,
-          code: "",
-          qty: 1,
-          description: name,
-          rate: amount,
-          total: amount.toFixed(2),
-          chargeType: "",
-        });
-      });
-  return lines;
+  return planned.map((line, idx) => {
+    let description = line.description;
+    if (idx === 0 && ref) description += ` - ${ref}`;
+    const rate = roundMoney(line.rate);
+    return {
+      id: idx + 1,
+      code: line.kind === "accessorial" ? (line.code || "") : "",
+      qty: 1,
+      description,
+      rate,
+      total: rate.toFixed(2),
+      chargeType: "",
+      isAccessorial: line.kind === "accessorial",
+    };
+  });
+}
+
+/**
+ * Match key for a customer charge. Freight stays one row. Each
+ * accessorial matches on its Primus code, then its description.
+ * @param {object} row Charge row.
+ * @return {string}
+ */
+function customerChargeMatchKey(row) {
+  const desc = String((row && row.description) || "").trim().toUpperCase();
+  if (desc.startsWith("FREIGHT")) return "freight";
+  const code = String((row && row.code) || "").trim().toUpperCase();
+  if (code) return `code:${code}`;
+  return `desc:${desc}`;
+}
+
+/**
+ * Customer charges to send on saveInvoice. Each accessorial is its own
+ * line at its own amount. Primus often echoes a single freight row after
+ * the first save; that echo must not replace the itemized lines.
+ * @param {number} customerRate Base freight rate.
+ * @param {string} billToReference Bill-to reference.
+ * @param {Array<object>} customerBillLines Accessorial lines.
+ * @param {Array<object>|null} storedCharges Charges Primus already stored.
+ * @return {Array<object>|null} Null when there is nothing to itemize.
+ */
+function customerChargesForSave(
+    customerRate, billToReference, customerBillLines, storedCharges) {
+  const planned = buildCustomerCharges(
+      customerRate, billToReference, customerBillLines);
+  const accessorials = planned.filter((line) => line.isAccessorial);
+  if (!accessorials.length) return null;
+  const stored = Array.isArray(storedCharges) ? storedCharges : [];
+  const used = new Set();
+  return planned.map((line) => {
+    const key = customerChargeMatchKey(line);
+    let storedId = "";
+    stored.forEach((row, idx) => {
+      if (storedId || used.has(idx)) return;
+      if (customerChargeMatchKey(row) !== key) return;
+      used.add(idx);
+      if (row && row.id != null && row.id !== "") storedId = String(row.id);
+    });
+    const rate = roundMoney(line.rate);
+    return {
+      id: storedId,
+      code: line.code || "",
+      description: line.description || "FREIGHT CHARGE",
+      qty: Number(line.qty || 1),
+      rate,
+      total: rate.toFixed(2),
+      isAccessorial: !!line.isAccessorial,
+    };
+  });
 }
 
 /**
@@ -3568,6 +4096,7 @@ function parseVendorsFromResponse(json) {
     id: String(v.id || v.carrierId || ""),
     name: String(v.name || v.carrierName || ""),
     type: String(v.type || v.vendorType || v.carrierType || "").trim(),
+    code: String(v.code || v.scac || v.vendorCode || "").trim(),
     vendorEmail: String(v.vendorEmail || v.email || "").trim(),
   })).filter((v) => v.id);
 }
@@ -3598,6 +4127,64 @@ function extractEmailFromFromHeader(from) {
 }
 
 /**
+ * True when Primus vendor.type looks like drayage.
+ * @param {string|null|undefined} type Vendor type.
+ * @return {boolean}
+ */
+function vendorTypeLooksDrayage(type) {
+  return drayageIntake.isDrayageVendorType(type);
+}
+
+/**
+ * All name matches for a carrier hint (exact / token / includes).
+ * Duplicate Primus rows often share the same name with different types.
+ * @param {Array<object>} vendors Parsed getVendors list.
+ * @param {string} hint Carrier name.
+ * @return {Array<object>}
+ */
+function collectVendorNameMatches(vendors, hint) {
+  const query = String(hint || "").trim();
+  if (!query || !Array.isArray(vendors) || !vendors.length) return [];
+  const queryLower = query.toLowerCase();
+  const firstToken = query.split(/[,\n/]/)[0].trim().toLowerCase();
+  const matches = [];
+  const seen = new Set();
+  const push = (vendor) => {
+    if (!vendor || !vendor.id || seen.has(vendor.id)) return;
+    seen.add(vendor.id);
+    matches.push(vendor);
+  };
+  for (const vendor of vendors) {
+    const name = String(vendor.name || "").toLowerCase();
+    if (name === queryLower || name === firstToken) push(vendor);
+  }
+  if (matches.length) return matches;
+  for (const vendor of vendors) {
+    const name = String(vendor.name || "").toLowerCase();
+    if (firstToken.length >= 6 &&
+        (name.includes(firstToken) || firstToken.includes(name))) {
+      push(vendor);
+    }
+  }
+  return matches;
+}
+
+/**
+ * When several vendors share a name (e.g. Evans Factoring vs Evans DRAYAGE),
+ * prefer an explicit drayage type, then a row with a carrier code/SCAC.
+ * @param {Array<object>} vendors Name matches.
+ * @return {object|null}
+ */
+function preferVendorForDrayageHint(vendors) {
+  if (!vendors || !vendors.length) return null;
+  const byType = vendors.find((v) => vendorTypeLooksDrayage(v.type));
+  if (byType) return byType;
+  const withCode = vendors.find((v) => String(v.code || "").trim());
+  if (withCode) return withCode;
+  return vendors[0] || null;
+}
+
+/**
  * Picks a vendor row by invoice carrier name and/or sender email domain.
  * @param {Array<object>} vendors Parsed getVendors list.
  * @param {object} hints carrierName, emailDomain.
@@ -3607,8 +4194,9 @@ function findVendorByCarrierHint(vendors, hints = {}) {
   const carrierName = String(hints.carrierName || "").trim();
   const emailDomain = String(hints.emailDomain || "").trim().toLowerCase();
   if (carrierName) {
-    const byName = findMasterVendorByName(vendors, carrierName);
-    if (byName) return byName;
+    const matches = collectVendorNameMatches(vendors, carrierName);
+    const preferred = preferVendorForDrayageHint(matches);
+    if (preferred) return preferred;
   }
   if (emailDomain) {
     const byEmail = vendors.find((v) => {
@@ -3664,13 +4252,41 @@ async function lookupVendorByCarrierHint(hints = {}) {
     return {done: false, match: match || null};
   };
 
+  // Collect name matches across pages so Factoring vs DRAYAGE duplicates
+  // (same name, different code/type) can be preferred correctly.
+  const nameMatches = [];
+  const seenMatchIds = new Set();
   if (nameQuery.length >= 3) {
     for (let page = 0; page < 8; page++) {
-      const out = await tryPage(page * 25, nameQuery);
-      if (!out) break;
-      if (out.done) break;
-      if (out.match) return out.match;
+      const params = {
+        action: "getVendors",
+        page: "1",
+        start: String(page * 25),
+        limit: "25",
+        query: nameQuery,
+      };
+      const result = await managePhpPost(params);
+      const vendors = parseVendorsFromResponse(result.json);
+      if (!vendors.length) break;
+      let anyNew = false;
+      for (const vendor of vendors) {
+        if (!seenIds.has(vendor.id)) {
+          seenIds.add(vendor.id);
+          anyNew = true;
+        }
+      }
+      for (const match of collectVendorNameMatches(vendors, carrierName)) {
+        if (seenMatchIds.has(match.id)) continue;
+        seenMatchIds.add(match.id);
+        nameMatches.push(match);
+      }
+      if (!anyNew) break;
+      // getVendors often returns a large unfiltered set; stop once we have
+      // same-name duplicates to choose from.
+      if (nameMatches.length >= 2) break;
     }
+    const preferred = preferVendorForDrayageHint(nameMatches);
+    if (preferred) return preferred;
   }
 
   for (let page = 0; page < maxPages; page++) {
@@ -4470,6 +5086,98 @@ exports.isManagePhpEnabled = isManagePhpEnabled;
 exports.rePushCarrierBillToQuickBooks = rePushCarrierBillToQuickBooks;
 
 /**
+ * Invoice number from Primus when another session already issued the draft.
+ * @param {string} message manage.php error message.
+ * @return {string} Issued invoice number, or blank.
+ */
+function invoiceNumberFromAlreadyInvoicedMessage(message) {
+  const match = String(message || "").match(
+      /already been invoiced by another user with invoice#\s*(\d+)/i);
+  return match ? match[1] : "";
+}
+
+/**
+ * Issued customer invoice on a booking, preferring a known invoice number.
+ * @param {object} docData getBookingDocuments body.
+ * @param {string} invoiceNumber Issued number to prefer.
+ * @return {object|null}
+ */
+function findIssuedUiInvoice(docData, invoiceNumber) {
+  if (!docData || !Array.isArray(docData.invoices)) return null;
+  const issued = docData.invoices.filter(isIssuedUiInvoice);
+  if (!issued.length) return null;
+  const wanted = String(invoiceNumber || "");
+  if (wanted) {
+    const match = issued.find((inv) => String(inv.invoiceNumber) === wanted);
+    if (match) return match;
+  }
+  return issued.slice().sort(
+      (a, b) => Number(b.invoiceNumber || 0) - Number(a.invoiceNumber || 0),
+  )[0];
+}
+
+/**
+ * Stop a second billing pass when the customer invoice is already issued.
+ * Refreshes booking documents when the cached list has no issued invoice.
+ * @param {object} opts Lookup and POD-upload inputs.
+ * @return {Promise<object|null>} Already-issued result, or null to continue.
+ */
+async function alreadyIssuedBillingResult(opts) {
+  const loadNumber = opts.loadNumber ? String(opts.loadNumber) : "";
+  let data = opts.docData || null;
+  let issued = findIssuedUiInvoice(data, opts.invoiceNumber);
+  if (!issued && opts.refresh !== false && loadNumber && opts.bookingId) {
+    const docs = await getBookingDocuments({
+      bookingId: opts.bookingId,
+      bookingBOL: loadNumber,
+    });
+    if (docs.ok) {
+      data = docs.data;
+      issued = findIssuedUiInvoice(data, opts.invoiceNumber);
+    }
+  }
+  const fallbackId = opts.fallbackInvoiceId;
+  const customerInvoiceId = issued && issued.id != null ?
+    Number(issued.id) :
+    (fallbackId != null && String(fallbackId) !== "" ?
+      Number(fallbackId) : null);
+  const invoiceNumber = String(
+      (issued && issued.invoiceNumber) || opts.invoiceNumber || "");
+  if (!customerInvoiceId && !invoiceNumber) return null;
+  const types = opts.uploadFileTypes;
+  const podUpload = await maybeUploadBookingPdf({
+    docData: data,
+    bookingId: opts.bookingId,
+    bookingBOL: loadNumber,
+    fileType: types.pod.id,
+    fileTypeName: types.pod.name,
+    file: opts.args.podPdf,
+    skip: opts.args.skipPodUpload,
+    forbiddenBuffer: opts.args.carrierBillPdf &&
+      opts.args.carrierBillPdf.buffer,
+  });
+  if (writeLog) {
+    await writeLog("info", "primus",
+        "Customer invoice already issued — duplicate billing stopped", {
+          loadNumber,
+          bookingId: opts.bookingId,
+          customerInvoiceId,
+          invoiceNumber: invoiceNumber || null,
+        });
+  }
+  return {
+    ok: true,
+    skipped: true,
+    reason: "already issued",
+    generated: true,
+    customerInvoiceId,
+    invoiceNumber,
+    podUpload,
+    podUploaded: !!(podUpload.uploaded || podUpload.skipped),
+  };
+}
+
+/**
  * Full Primus UI billing flow captured from production DevTools:
  * saveInvoice (costs) → addVendorRefNumber → saveInvoice (ready) →
  * consolidateInvoices (issue).
@@ -4522,32 +5230,16 @@ async function runPrimusUiBillingFlow(args) {
     if (docs.ok) {
       bookingDocData = docs.data;
     }
-    if (bookingDocData && Array.isArray(bookingDocData.invoices)) {
-      const issued = bookingDocData.invoices.find(isIssuedUiInvoice);
-      if (issued) {
-        const podUpload = await maybeUploadBookingPdf({
-          docData: bookingDocData,
-          bookingId,
-          bookingBOL: loadNumber,
-          fileType: uploadFileTypes.pod.id,
-          fileTypeName: uploadFileTypes.pod.name,
-          file: args.podPdf,
-          skip: args.skipPodUpload,
-          forbiddenBuffer: args.carrierBillPdf &&
-            args.carrierBillPdf.buffer,
-        });
-        return {
-          ok: true,
-          skipped: true,
-          reason: "already issued",
-          generated: true,
-          customerInvoiceId: Number(issued.id),
-          invoiceNumber: String(issued.invoiceNumber),
-          podUpload,
-          podUploaded: !!(podUpload.uploaded || podUpload.skipped),
-        };
-      }
-    }
+    const issuedAtStart = await alreadyIssuedBillingResult({
+      docData: bookingDocData,
+      bookingId,
+      loadNumber,
+      uploadFileTypes,
+      args,
+      invoiceNumber: "",
+      refresh: false,
+    });
+    if (issuedAtStart) return issuedAtStart;
   }
 
   const carrierBillUpload = await maybeUploadBookingPdf({
@@ -4672,7 +5364,14 @@ async function runPrimusUiBillingFlow(args) {
           });
     }
   } else if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: "Could not resolve billtoId from booking",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName,
+      draftInvoiceId: existingDraftId || null,
+    };
   } else if (writeLog) {
     await writeLog("info", "primus",
         "No draft invoice found — saveInvoice will create one", {
@@ -4685,7 +5384,14 @@ async function runPrimusUiBillingFlow(args) {
   }
 
   if (!billtoId) {
-    return {ok: false, error: "Could not resolve billtoId from booking"};
+    return {
+      ok: false,
+      step: "resolveBillto",
+      error: "Could not resolve billtoId from booking",
+      billtoSource,
+      billtoPartyName: billtoResolution.partyName,
+      draftInvoiceId: existingDraftId || null,
+    };
   }
 
   const billDate = args.billDate || new Date();
@@ -4794,6 +5500,16 @@ async function runPrimusUiBillingFlow(args) {
     externalNotes: String(booking.externalNotes || ""),
   };
 
+  const issuedBeforeSave = await alreadyIssuedBillingResult({
+    docData: bookingDocData,
+    bookingId,
+    loadNumber,
+    uploadFileTypes,
+    args,
+    invoiceNumber: "",
+  });
+  if (issuedBeforeSave) return issuedBeforeSave;
+
   const phase1 = await managePhpPost({
     action: "saveInvoice",
     billsInfo,
@@ -4824,11 +5540,25 @@ async function runPrimusUiBillingFlow(args) {
   });
 
   if (!phase1.json || !isManageSuccess(phase1.json)) {
+    const phase1Message = (phase1.json && phase1.json.message) || "";
+    const alreadyNumber =
+      invoiceNumberFromAlreadyInvoicedMessage(phase1Message);
+    if (alreadyNumber) {
+      const finished = await alreadyIssuedBillingResult({
+        docData: null,
+        bookingId,
+        loadNumber,
+        uploadFileTypes,
+        args,
+        invoiceNumber: alreadyNumber,
+        fallbackInvoiceId: existingDraftId,
+      });
+      if (finished) return finished;
+    }
     return {
       ok: false,
       step: "saveInvoice_phase1",
-      error: (phase1.json && phase1.json.message) ||
-        "First saveInvoice failed",
+      error: phase1Message || "First saveInvoice failed",
       raw: phase1.text.slice(0, 500),
     };
   }
@@ -4845,7 +5575,10 @@ async function runPrimusUiBillingFlow(args) {
   const actualCostsWithIds = buildActualCosts(
       vendor, bill, storedCosts || actualCostsFirst);
   const storedCharges = extractChargesFromStore(storeData);
-  const phase2Charges = (storedCharges ||
+  const itemizedCharges = customerChargesForSave(
+      customerRate, args.billToReferenceNumber, customerBillLines,
+      storedCharges);
+  const phase2Charges = itemizedCharges || (storedCharges ||
     buildCustomerCharges(
         customerRate, args.billToReferenceNumber, customerBillLines))
       .map((c) => ({
@@ -4856,7 +5589,7 @@ async function runPrimusUiBillingFlow(args) {
         rate: roundMoney(c.rate),
         total: roundMoney(c.total).toFixed(2),
       }));
-  if (args.billToReferenceNumber &&
+  if (!itemizedCharges && args.billToReferenceNumber &&
       !invoiceChargesIncludeReference(
           phase2Charges, args.billToReferenceNumber)) {
     const withRef = buildCustomerCharges(
@@ -4938,11 +5671,25 @@ async function runPrimusUiBillingFlow(args) {
   });
 
   if (!phase2.json || !isManageSuccess(phase2.json)) {
+    const phase2Message = (phase2.json && phase2.json.message) || "";
+    const alreadyNumber =
+      invoiceNumberFromAlreadyInvoicedMessage(phase2Message);
+    if (alreadyNumber) {
+      const finished = await alreadyIssuedBillingResult({
+        docData: null,
+        bookingId,
+        loadNumber,
+        uploadFileTypes,
+        args,
+        invoiceNumber: alreadyNumber,
+        fallbackInvoiceId: uiInvoiceId,
+      });
+      if (finished) return finished;
+    }
     return {
       ok: false,
       step: "saveInvoice_phase2",
-      error: (phase2.json && phase2.json.message) ||
-        "Second saveInvoice failed",
+      error: phase2Message || "Second saveInvoice failed",
       customerInvoiceId: uiInvoiceId,
     };
   }
@@ -5405,6 +6152,458 @@ exports.ensureCarrierBillUploadedToPrimus = ensureCarrierBillUploadedToPrimus;
  * @param {string|null|undefined} text Raw reference text.
  * @return {string}
  */
+/**
+ * Primus term for a port-fee vendor bill. The entered transaction uses
+ * Due on receipt (due date = bill date), not the due date printed on the PDF.
+ * @param {Array<object>} termsList From fetchUiTerms.
+ * @return {object} ok, termsId, source, error
+ */
+function resolveDueOnReceiptTerms(termsList) {
+  const list = Array.isArray(termsList) ? termsList : [];
+  const byName = list.find((t) =>
+    /due\s+(?:on|upon)\s+receipt|upon\s+receipt/i.test(
+        `${t.description || ""} ${t.code || ""}`));
+  if (byName) {
+    return {
+      ok: true,
+      termsId: Number(byName.id),
+      source: "description",
+      days: byName.days,
+      code: byName.code,
+      description: byName.description,
+    };
+  }
+  const zero = list.find((t) => t.days === 0);
+  if (zero) {
+    return {
+      ok: true,
+      termsId: Number(zero.id),
+      source: "zero_days",
+      days: 0,
+      code: zero.code,
+      description: zero.description,
+    };
+  }
+  return {
+    ok: false,
+    error: "Primus has no Due on receipt term",
+  };
+}
+
+/**
+ * @return {Promise<object>} resolveDueOnReceiptTerms result.
+ */
+async function resolveDueOnReceiptTermId() {
+  const termsList = await fetchUiTerms();
+  return resolveDueOnReceiptTerms(termsList);
+}
+
+/**
+ * Uploads the drayage invoice and every backup file as Carrier Bill.
+ * Does not upload a POD.
+ * @param {object} args booking, loadNumber, files [{buffer, filename}].
+ * @return {Promise<object>}
+ */
+async function uploadDrayageCarrierDocuments(args) {
+  const booking = args && args.booking;
+  const loadNumber = args && args.loadNumber ? String(args.loadNumber) : "";
+  const files = (args && args.files) || [];
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  if (!booking || !loadNumber) {
+    return {ok: false, error: "Missing booking or loadNumber"};
+  }
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  let uploadFileTypes;
+  try {
+    uploadFileTypes = await resolveUploadFileTypes();
+  } catch (err) {
+    return {ok: false, error: err.message || String(err)};
+  }
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: loadNumber,
+  });
+  const uploaded = [];
+  const skipped = [];
+  for (const file of files) {
+    if (!file || !file.buffer || !file.buffer.length) continue;
+    const result = await maybeUploadBookingPdf({
+      docData: docs.ok ? docs.data : null,
+      bookingId,
+      bookingBOL: loadNumber,
+      fileType: uploadFileTypes.carrierBill.id,
+      fileTypeName: uploadFileTypes.carrierBill.name,
+      allowAdditional: true,
+      file: {
+        buffer: file.buffer,
+        filename: file.filename || `carrier-bill-${loadNumber}.pdf`,
+      },
+    });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.error || "Carrier document upload failed",
+        filename: file.filename || null,
+        uploaded,
+      };
+    }
+    if (result.uploaded) uploaded.push(file.filename || null);
+    else skipped.push(file.filename || result.reason || "skipped");
+  }
+  if (writeLog) {
+    await writeLog("info", "primus", "Drayage documents uploaded as Carrier Bill", {
+      loadNumber,
+      uploaded,
+      skipped,
+    });
+  }
+  return {ok: true, uploaded, skipped};
+}
+
+exports.uploadDrayageCarrierDocuments = uploadDrayageCarrierDocuments;
+
+/**
+ * Records the drayage invoice on Actual Cost. Charges that do not yet
+ * have a vendor bill number (the Actual Cost Bill# column) are removed.
+ * Charges that already have a bill number are left as they are. The
+ * carrier FRT line is added when that invoice number is not already on
+ * the load. This runs when the carrier bill is first posted and again
+ * when the customer invoice is already issued, so a later GTG still
+ * drops unbilled lines. Closes actual cost and marks Ready to Invoice.
+ * Generates the customer invoice only when it has not been issued.
+ * @param {object} args booking, loadNumber, invoiceAmount, invoiceNumber,
+ *   billDate, dueDate, proNumber.
+ * @return {Promise<object>}
+ */
+async function enterDrayageInvoice(args) {
+  if (!isManagePhpEnabled()) {
+    return {ok: false, error: "PRIMUS_USE_MANAGE_PHP off"};
+  }
+  const booking = args.booking;
+  const loadNumber = args.loadNumber ? String(args.loadNumber) : "";
+  const amount = roundMoney(args.invoiceAmount || 0);
+  const vendorInvoiceNumber = String(args.invoiceNumber || "").trim();
+  const billDate = args.billDate || new Date();
+  const dueDate = args.dueDate || billDate;
+  const proNumber = String(args.proNumber || loadNumber).trim();
+  if (!booking || !loadNumber) {
+    return {ok: false, error: "Missing booking or loadNumber"};
+  }
+  if (!(amount > 0)) return {ok: false, error: "invoice amount required"};
+  if (!vendorInvoiceNumber) {
+    return {ok: false, error: "invoice number required"};
+  }
+  const vendor = booking.vendor || {};
+  if (!vendor.id) return {ok: false, error: "Load has no vendor"};
+
+  const bookingId = resolveManageBookingId(booking);
+  if (!bookingId) {
+    return {ok: false, error: "Could not resolve manage.php bookingId"};
+  }
+  const docs = await getBookingDocuments({
+    bookingId,
+    bookingBOL: loadNumber,
+  });
+  if (!docs.ok || !docs.data) {
+    return {ok: false, error: docs.error || "getBookingDocuments failed"};
+  }
+  const uiInvoice = findUiInvoice(docs.data);
+  if (!uiInvoice || uiInvoice.id == null) {
+    return {
+      ok: false,
+      noInvoice: true,
+      error: "No Primus invoice on this load",
+      loadNumber,
+    };
+  }
+  const alreadyIssued = isIssuedUiInvoice(uiInvoice);
+  const invoiceId = String(uiInvoice.id);
+  const stores = await getInvoiceStores(invoiceId);
+  if (!stores.ok) {
+    return {ok: false, error: stores.error || "getInvoiceStores failed"};
+  }
+  const storeData = stores.data;
+  const actualCosts = extractActualCostsFromStore(storeData) || [];
+  const charges = extractChargesFromStore(storeData) || [];
+  const estimatedCosts = extractEstimatedCostsFromStore(storeData) || [];
+  const mappedCosts = actualCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId),
+    carrierName: String(line.carrierName || ""),
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: String(line.PRO || ""),
+    isAccessorial: !!line.isAccessorial,
+  }));
+  const feeLine = {
+    id: "",
+    code: "FRT",
+    description: "FREIGHT CHARGE",
+    carrierId: String(vendor.id),
+    carrierName: String(vendor.name || ""),
+    qty: 1,
+    rate: amount,
+    total: amount.toFixed(2),
+    vendorInvoiceNumber,
+    terms: "",
+    PRO: proNumber,
+    isAccessorial: false,
+  };
+  const merged = drayageIntake.mergeDrayageActualCost(mappedCosts, feeLine);
+  const mergedActualCosts = merged.lines;
+  const billNoAlready = !merged.added;
+  const preservedLines = mappedCosts.length - merged.removed;
+  const billedExisting = merged.added ?
+    mergedActualCosts.slice(0, -1) : mergedActualCosts.slice();
+
+  if (alreadyIssued && merged.removed === 0 && billNoAlready) {
+    return {
+      ok: true,
+      alreadyIssued: true,
+      loadNumber,
+      customerInvoiceId: invoiceId,
+      invoiceNumber: String(uiInvoice.invoiceNumber),
+      addedBill: false,
+      preservedLines,
+      removedUnbilledActualCosts: 0,
+    };
+  }
+
+  let termsId = null;
+  const terms = await resolveDueOnReceiptTermId();
+  if (!terms.ok) return {ok: false, error: terms.error || "no terms"};
+  termsId = terms.termsId;
+
+  let issuedInvoiceData = null;
+  if (alreadyIssued) {
+    const issuedInvoice = await managePhpPost({
+      action: "getInvoice",
+      id: invoiceId,
+    });
+    issuedInvoiceData = (issuedInvoice.json &&
+      issuedInvoice.json.invoiceData) || null;
+  }
+
+  let billsInfo = extractBillsInfoFromStore(storeData);
+  if ((!billsInfo || !billsInfo.length) && issuedInvoiceData) {
+    const raw = issuedInvoiceData.billsInfo;
+    if (typeof raw === "string" && raw.trim()) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) billsInfo = parsed;
+      } catch (_) {
+        billsInfo = null;
+      }
+    } else if (Array.isArray(raw)) {
+      billsInfo = raw;
+    }
+  }
+  if (!billsInfo || !billsInfo.length) {
+    billsInfo = reconstructBillsInfoFromActualCosts(billedExisting);
+  } else {
+    billsInfo = billsInfo.filter((bill) =>
+      drayageIntake.actualCostHasVendorBillNumber(bill));
+  }
+  if (!billNoAlready) {
+    billsInfo.push({
+      code: "FRT",
+      vendorInvoiceNumber,
+      carrierId: String(vendor.id),
+      carrierName: String(vendor.name || ""),
+      total: amount,
+      breakdown: [{
+        code: "FRT",
+        description: "FREIGHT CHARGE",
+        qty: 1,
+        rate: amount,
+        total: amount,
+        first: true,
+      }],
+      terms: Number(termsId),
+      PRO: proNumber,
+      billDate: toPrimusDateTime(toDateOnly(billDate)),
+      billDueDate: toPrimusDateTime(toDateOnly(dueDate)),
+    });
+  }
+
+  const totalActual = roundMoney(
+      mergedActualCosts.reduce((s, l) => s + Number(l.total || 0), 0));
+  const chargesTotal = roundMoney(
+      charges.reduce((s, c) => s + Number(c.total || 0), 0));
+  const totalEstimated = roundMoney(
+      estimatedCosts.reduce((s, e) => s + Number(e.total || 0), 0));
+  const profit = roundMoney(chargesTotal - totalActual);
+  const profitPer = totalActual > 0 ? (profit / totalActual) * 100 : 0;
+  const gp = chargesTotal > 0 ? (profit / chargesTotal) * 100 : 0;
+  const storedEstimatedProfit = alreadyIssued && issuedInvoiceData ?
+    Number(issuedInvoiceData.estimatedProfitUSD) : NaN;
+  const estimatedProfitUSD = Number.isFinite(storedEstimatedProfit) ?
+    roundMoney(storedEstimatedProfit) : profit;
+  const storedEstimatedProfitPer = alreadyIssued && issuedInvoiceData ?
+    Number(issuedInvoiceData.estimatedProfitPer) : NaN;
+  const estimatedProfitPer = Number.isFinite(storedEstimatedProfitPer) ?
+    storedEstimatedProfitPer : profitPer;
+  const storedEstimatedGp = alreadyIssued && issuedInvoiceData ?
+    Number(issuedInvoiceData.estimatedGP) : NaN;
+  const estimatedGP = Number.isFinite(storedEstimatedGp) ?
+    storedEstimatedGp : gp;
+  const billtoResolution = await resolveManageBilltoId(booking);
+  const storedBillto = extractBilltoIdFromStore(storeData);
+  const billtoId = billtoResolution.id || storedBillto;
+  if (!billtoId) return {ok: false, error: "Could not resolve billtoId"};
+
+  const phase2Charges = charges.map((c) => ({
+    id: String(c.id),
+    code: c.code || "",
+    description: c.description || "",
+    qty: Number(c.qty || 1),
+    rate: roundMoney(c.rate),
+    total: roundMoney(c.total).toFixed(2),
+  }));
+  const phase2Estimated = estimatedCosts.map((line) => ({
+    id: String(line.id),
+    code: line.code || "",
+    description: line.description || "",
+    carrierId: String(line.carrierId || ""),
+    carrierName: String(line.carrierName || ""),
+    editable: line.editable != null ? String(line.editable) : "0",
+    qty: Number(line.qty || 1),
+    rate: roundMoney(line.rate),
+    total: roundMoney(line.total).toFixed(2),
+    isAccessorial: !!line.isAccessorial,
+    vendorInvoiceNumber: String(line.vendorInvoiceNumber || ""),
+    terms: "",
+    PRO: "",
+  }));
+  const notes = {
+    internalNotes: String(booking.internalNotes || ""),
+    externalNotes: String(booking.externalNotes || ""),
+  };
+  const refExtra = buildVendorRefExtraFieldsForBills(billsInfo);
+  const vendorRef = await managePhpPost({
+    action: "addVendorRefNumber",
+    invoiceId,
+    bookingId,
+    billsInfo,
+    actualCosts: mergedActualCosts,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    totalActualCost: totalActual,
+    ...refExtra,
+  });
+  if (!vendorRef.json || !isManageSuccess(vendorRef.json)) {
+    return {
+      ok: false,
+      step: "addVendorRefNumber",
+      error: (vendorRef.json && vendorRef.json.message) ||
+        "addVendorRefNumber failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+  const saveResult = await managePhpPost({
+    action: "saveInvoice",
+    billsInfo,
+    charges: phase2Charges,
+    actualCosts: mergedActualCosts,
+    estimatedCosts: phase2Estimated,
+    chargesTotal,
+    totalEstimatedCosts: totalEstimated,
+    totalActualCosts: totalActual,
+    billtoId: String(billtoId),
+    bookingId,
+    ...notes,
+    costClosed: "0",
+    costActualClosed: "1",
+    readyToInvoice: "1",
+    estimatedProfitUSD: estimatedProfitUSD,
+    estimatedProfitPer: estimatedProfitPer,
+    estimatedGP: estimatedGP,
+    actualProfitUSD: profit,
+    actualProfitPer: profitPer,
+    actualGP: gp,
+    vendorInvoiceNumber: "",
+    vendorTerm: "",
+    PRONumber: "",
+    invoiceNumber: alreadyIssued ? String(uiInvoice.invoiceNumber) : "0",
+    id: invoiceId,
+  });
+  if (!saveResult.json || !isManageSuccess(saveResult.json)) {
+    return {
+      ok: false,
+      step: "saveInvoice",
+      error: (saveResult.json && saveResult.json.message) ||
+        "saveInvoice failed",
+      loadNumber,
+      invoiceId,
+    };
+  }
+
+  let issuedNumber = alreadyIssued ? String(uiInvoice.invoiceNumber) : null;
+  if (!alreadyIssued) {
+    const genAction = process.env.PRIMUS_UI_GENERATE_ACTION ||
+      "consolidateInvoices";
+    const phase3 = await managePhpPost({
+      action: genAction,
+      billToId: String(billtoId),
+      invoices: [invoiceId],
+      generationDate: toDateOnly(new Date()),
+    });
+    if (!phase3.json || !isManageSuccess(phase3.json)) {
+      return {
+        ok: false,
+        step: "consolidateInvoices",
+        error: (phase3.json && phase3.json.message) ||
+          "consolidateInvoices failed",
+        loadNumber,
+        customerInvoiceId: invoiceId,
+      };
+    }
+    issuedNumber = phase3.json.maxInvoiceNumber ||
+      (phase3.json.message &&
+        (String(phase3.json.message).match(/Invoice#(\d+)/) || [])[1]) ||
+      null;
+  }
+  if (writeLog) {
+    await writeLog("info", "primus", alreadyIssued ?
+      "Drayage unbilled actual costs removed on issued invoice" :
+      "Drayage invoice generated", {
+      loadNumber,
+      invoiceId,
+      vendorInvoiceNumber,
+      amount,
+      addedBill: !billNoAlready,
+      preservedLines,
+      removedUnbilledActualCosts: merged.removed,
+      alreadyIssued,
+      issuedNumber,
+    });
+  }
+  return {
+    ok: true,
+    alreadyIssued,
+    loadNumber,
+    customerInvoiceId: invoiceId,
+    invoiceNumber: issuedNumber ? String(issuedNumber) : null,
+    chargesTotal,
+    addedBill: !billNoAlready,
+    preservedLines,
+    removedUnbilledActualCosts: merged.removed,
+  };
+}
+
+exports.enterDrayageInvoice = enterDrayageInvoice;
 function sanitizeBillToReferenceText(text) {
   const cleaned = String(text || "")
       .replace(/\u00a0/g, " ")
@@ -5464,10 +6663,17 @@ exports._internal = {
   listPodDriveFileIds,
   listCustomerDriveFileIds,
   listQuoteApprovalDriveFileIds,
+  listCertificateOfInsuranceTypeIds,
+  listCoiDriveFiles,
+  loadHasPostedInsurance,
+  selectCustomerInvoiceCoi,
+  emailBodyWithCoiNote,
   isMiworldCustomer,
   customerNameFromBooking,
   fetchUiFileTypes,
   isIssuedUiInvoice,
+  invoiceNumberFromAlreadyInvoicedMessage,
+  findIssuedUiInvoice,
   isDraftUiInvoice,
   findDraftUiInvoice,
   extractBilltoIdFromStore,
@@ -5487,4 +6693,5 @@ exports._internal = {
   buildVendorRefExtraFieldsForBills,
   sanitizeBillToReferenceText,
   invoiceChargesIncludeReference,
+  customerChargesForSave,
 };

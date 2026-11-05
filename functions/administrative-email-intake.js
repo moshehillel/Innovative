@@ -169,6 +169,34 @@ function isAbeCopiedOnEmailHeaders(headers) {
 }
 
 /**
+ * Ops address already used for Lisa. Do not invent a second mailbox.
+ * @return {string}
+ */
+function resolveLisaOpsEmail() {
+  return String(
+      process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com",
+  ).trim().toLowerCase();
+}
+
+/**
+ * True when Lisa is already on the original email (To or Cc).
+ * @param {Array<object>} headers Gmail payload headers.
+ * @return {boolean}
+ */
+function isLisaCopiedOnEmailHeaders(headers) {
+  const lisa = resolveLisaOpsEmail();
+  if (!lisa) return false;
+  const list = Array.isArray(headers) ? headers : [];
+  for (const header of list) {
+    const name = String(header && header.name || "").toLowerCase();
+    if (name !== "to" && name !== "cc") continue;
+    const addrs = parseEmailAddressesFromHeaderValue(header.value);
+    if (addrs.includes(lisa)) return true;
+  }
+  return false;
+}
+
+/**
  * True when the sender domain is coface.com (Lisa: ignore all Coface mail).
  * @param {string} from From header.
  * @return {boolean}
@@ -1333,6 +1361,8 @@ module.exports = {
   parseEmailAddressesFromHeaderValue,
   resolveStatementAbeEmail,
   isAbeCopiedOnEmailHeaders,
+  resolveLisaOpsEmail,
+  isLisaCopiedOnEmailHeaders,
   isEmodalBroadcast,
   isCardknoxBatchReport,
   looksLikeDnbCreditAlert,
