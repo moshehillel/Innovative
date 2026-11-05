@@ -48,7 +48,14 @@ function isPlausibleContainerNumber(value) {
  */
 function sanitizeContainerNumber(value) {
   const compact = normalizeContainerNumber(value);
-  return isPlausibleContainerNumber(compact) ? compact : null;
+  if (isPlausibleContainerNumber(compact)) return compact;
+  // Carrier BOLs sometimes append extra digits onto an ISO container id
+  // (e.g. OOLU2332637691 → OOLU2332637).
+  const isoPrefix = compact.match(/^([A-Z]{4}\d{7})/);
+  if (isoPrefix && isPlausibleContainerNumber(isoPrefix[1])) {
+    return isoPrefix[1];
+  }
+  return null;
 }
 
 /**
@@ -124,6 +131,39 @@ function extractContainerFromText(subject, body) {
 }
 
 /**
+ * Carrier / Jerry invoice number from subject or body
+ * (e.g. "Invoice Number BL316636").
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {string|null}
+ */
+function extractInvoiceNumberFromText(subject, body) {
+  const text = `${subject || ""}\n${body || ""}`;
+  const labeled = text.match(
+      /invoice\s*(?:#|no\.?|number)?\s*[:#-]?\s*([A-Z0-9][A-Z0-9_./-]{2,40})/i);
+  if (!labeled || !labeled[1]) return null;
+  const value = String(labeled[1]).trim().replace(/[>,;]+$/, "");
+  if (!value || /^(details|date|amount|total)$/i.test(value)) return null;
+  return value;
+}
+
+/**
+ * Outlook / Graph message id embedded in Jerry's ACTION REQUIRED
+ * "Message ID" block so a bare Leo GTG can re-open the carrier email.
+ * @param {string} subject Email subject.
+ * @param {string} body Email body.
+ * @return {string|null}
+ */
+function extractPriorMessageIdFromText(subject, body) {
+  const text = `${subject || ""}\n${body || ""}`;
+  const labeled = text.match(
+      /message\s*id\s*[:#]?\s*\r?\n?\s*(AAMk[A-Za-z0-9+/=_-]{20,})/i);
+  if (labeled && labeled[1]) return labeled[1].trim();
+  const inline = text.match(/\b(AAMk[A-Za-z0-9+/=_-]{40,})\b/);
+  return inline && inline[1] ? inline[1].trim() : null;
+}
+
+/**
  * @param {string} from From header.
  * @return {boolean}
  */
@@ -142,7 +182,9 @@ function isDrayageValidatorEmail(from) {
  */
 function containerFromInvoiceItem(item) {
   if (!item || typeof item !== "object") return null;
-  return sanitizeContainerNumber(item.containerNumber);
+  return sanitizeContainerNumber(item.containerNumber) ||
+    sanitizeContainerNumber(item.carrierBolNumber) ||
+    sanitizeContainerNumber(item.bolNumber);
 }
 
 /**
@@ -232,6 +274,9 @@ function isDrayageVendorType(type) {
  */
 const KNOWN_DRAYAGE_CARRIER_NAME_KEYS = [
   "blitz",
+  // Primus types Evans as LTL. Ops still routes these invoices to Leo.
+  "mark evans",
+  "evans delivery",
 ];
 
 /**
@@ -884,6 +929,8 @@ module.exports = {
   isPlausibleContainerNumber,
   sanitizeContainerNumber,
   extractContainerFromText,
+  extractInvoiceNumberFromText,
+  extractPriorMessageIdFromText,
   isDrayageValidatorEmail,
   containerFromInvoiceItem,
   findContainerOnInvoiceItems,

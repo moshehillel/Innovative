@@ -474,6 +474,13 @@ check("own company name is not an inbound drayage carrier",
       dray.isOwnCompanyCarrierName("Innovative Carriers"), true);
   check("Good to go is recognized",
       dray.isGtgConfirmation("", "This load is good to go"), true);
+  check("invoice number from subject",
+      dray.extractInvoiceNumberFromText(
+          "FW: Invoice Number BL316636", ""), "BL316636");
+  check("prior message id from Jerry ACTION REQUIRED",
+      dray.extractPriorMessageIdFromText("",
+          "Message ID\nAAMkAGU5MDg4MmNlLTdjNGYtNGI2ZC1iYjMxLTA1YzI2ZmIwZTczMgBGAAAAAAAqntx80xUMSq6IxxEc6_lyBwAKzphD0oUnQrPDK_2RRTFaAAAAAAEMAAAKzphD0oUnQrPDK_2RRTFaAAdlt5qvAAA=\n"),
+      "AAMkAGU5MDg4MmNlLTdjNGYtNGI2ZC1iYjMxLTA1YzI2ZmIwZTczMgBGAAAAAAAqntx80xUMSq6IxxEc6_lyBwAKzphD0oUnQrPDK_2RRTFaAAAAAAEMAAAKzphD0oUnQrPDK_2RRTFaAAdlt5qvAAA=");
   check("A reply without GTG is not ready",
       dray.isGtgConfirmation("Invoice", "Please enter these charges"), false);
   const closeMatch = dray.drayageAmountsAcceptable(1001, 1005);

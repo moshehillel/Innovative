@@ -18,6 +18,7 @@ const loadResolution = require("./invoice-load-resolution");
 const intakeAmountMismatchGate = require("./intake-amount-mismatch-gate");
 const childrensApparel = require("./childrens-apparel-invoice");
 const workflowErrors = require("./workflow-error-messages");
+const qbPostGuard = require("./customer-invoice-qb-guard");
 const mailIntakeQueue = require("./mail-intake-queue");
 const {findInvoiceAttachment} = require("./pod-utils");
 
@@ -1228,6 +1229,27 @@ exports.retryPendingTransientWorkflows = retryPendingTransientWorkflows;
  * @param {string|number} [args.invoiceNumber] Issued customer invoice number.
  * @return {Promise<object>} {synced, skipped, uploaded, failed, error}.
  */
+/**
+ * Remembers whether this workflow issued the customer invoice.
+ * A later pass must not treat that new invoice as a pre-existing one.
+ * @param {object} invoice Invoice data.
+ * @param {boolean} reused Primus already had the issued invoice.
+ * @return {void}
+ */
+function noteCustomerInvoiceOrigin(invoice, reused) {
+  if (!invoice || invoice.customerInvoiceOrigin) return;
+  invoice.customerInvoiceOrigin = reused ?
+    "already_issued" : "issued_now";
+}
+
+/**
+ * @param {object} invoice Invoice data.
+ * @return {boolean} True when QuickBooks must not be posted again.
+ */
+function quickBooksAlreadyIssued(invoice) {
+  return !invoice || invoice.customerInvoiceOrigin !== "issued_now";
+}
+
 async function pushCarrierBillToQuickBooks(args) {
   const {
     req,
@@ -1253,12 +1275,34 @@ async function pushCarrierBillToQuickBooks(args) {
       "0",
   );
   const loadNumber = invoice.loadNumber ? String(invoice.loadNumber) : "";
+  let qbClaim = null;
+  const qbIdentity = {
+    customerInvoiceId: uiInvoiceId,
+    invoiceNumber,
+    loadNumber,
+    sourceInvoiceId: invoiceId,
+  };
+
+  /**
+   * @param {object} claim Claim from the QuickBooks guard.
+   * @param {string} status posted or failed.
+   * @return {Promise<void>}
+   */
+  async function finishQbClaim(claim, status) {
+    if (!claim) return;
+    try {
+      await qbPostGuard.finishQuickBooksPost(claim, status);
+    } catch (_) {
+      // The Primus result stands. The claim only blocks a second post.
+    }
+  }
 
   /**
    * @param {object} syncInfo Success metadata for logs.
    * @return {Promise<object>}
    */
   async function markSynced(syncInfo) {
+    await finishQbClaim(qbClaim, "posted");
     if (primusSteps) {
       primusSteps.qbBillingSynced = true;
       primusSteps.qbBillingSyncedAt = new Date().toISOString();
@@ -1311,6 +1355,7 @@ async function pushCarrierBillToQuickBooks(args) {
    * @return {Promise<object>}
    */
   async function reportFailure(failMsg, detail) {
+    await finishQbClaim(qbClaim, "failed");
     const rawSnippet = detail.raw ?
       String(detail.raw).slice(0, 400) : "";
     await writeLog("error", "workflow",
@@ -1352,6 +1397,72 @@ async function pushCarrierBillToQuickBooks(args) {
       });
     }
     return {synced: false, error: failMsg, method: detail.method};
+  }
+
+  /**
+   * @param {string} reason Why this invoice is not posted again.
+   * @return {Promise<object>}
+   */
+  async function markQbSkipped(reason) {
+    if (primusSteps) {
+      primusSteps.qbBillingSynced = true;
+      primusSteps.qbBillingMethod = reason;
+    }
+    await invoiceDoc.ref.update({
+      "primusSteps.qbBillingSynced": true,
+      "primusSteps.qbBillingMethod": reason,
+      "updatedAt": admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await writeLog("info", "workflow",
+        "QuickBooks transfer skipped — invoice already issued", {
+          invoiceId,
+          loadNumber,
+          customerInvoiceId: uiInvoiceId,
+          invoiceNumber,
+          reason,
+        });
+    await logWorkflowStep({
+      invoiceId,
+      stepName: "qb_billing_sync",
+      stepStatus: "skipped",
+      reason,
+      output: {
+        customerInvoiceId: uiInvoiceId,
+        invoiceNumber,
+      },
+    });
+    return {synced: true, skipped: true, reason};
+  }
+
+  if (quickBooksAlreadyIssued(invoice)) {
+    try {
+      if (db) {
+        await qbPostGuard.recordSkippedAlreadyIssued(db, qbIdentity);
+      }
+    } catch (skipErr) {
+      await writeLog("warn", "workflow",
+          "Could not record QuickBooks skip", {
+            invoiceId,
+            loadNumber,
+            error: skipErr.message,
+          });
+    }
+    return markQbSkipped("customer_invoice_already_issued");
+  }
+
+  if (db) {
+    try {
+      const gate = await qbPostGuard.claimQuickBooksPost(db, qbIdentity);
+      if (gate.skip) return markQbSkipped(gate.reason);
+      qbClaim = gate.claim || null;
+    } catch (guardErr) {
+      await writeLog("warn", "workflow",
+          "QuickBooks duplicate check failed — transfer continues", {
+            invoiceId,
+            loadNumber,
+            error: guardErr.message,
+          });
+    }
   }
 
   // Primary path: QuickBooks Desktop via manage.php rePushToQB (UI invoice id).
@@ -3710,6 +3821,7 @@ exports.processPrimusWorkflow = onRequest(
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_exists");
                 if (!carrierBillOnlyMode) {
+                  noteCustomerInvoiceOrigin(invoice, true);
                   // Backfill QB if issued before sync moved earlier.
                   await pushCarrierBillToQuickBooks({
                     req,
@@ -3943,6 +4055,11 @@ exports.processPrimusWorkflow = onRequest(
                 await setWorkflowHeartbeat(
                     invoiceDoc.ref, "customer_invoice_generated");
 
+                noteCustomerInvoiceOrigin(
+                    invoice,
+                    !!(invoiceGenerationResult &&
+                      invoiceGenerationResult.reused) ||
+                    !!customerInvoicePredatedThisRun);
                 if (!carrierBillOnlyMode && !customerInvoicePredatedThisRun) {
                   // Push carrier bill to QB immediately — do not wait for
                   // customer-email approval (loads parked at that gate never
@@ -4022,6 +4139,7 @@ exports.processPrimusWorkflow = onRequest(
               });
 
               primusSteps.customerInvoiceGenerated = true;
+              noteCustomerInvoiceOrigin(invoice, true);
               await invoiceDoc.ref.update({
                 primusSteps: primusSteps,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -4130,6 +4248,9 @@ exports.processPrimusWorkflow = onRequest(
               await setWorkflowHeartbeat(
                   invoiceDoc.ref, "customer_invoice_generated");
 
+              noteCustomerInvoiceOrigin(
+                  invoice, !!(invoiceGenerationResult &&
+                    invoiceGenerationResult.reused));
               if (!carrierBillOnlyMode) {
                 await pushCarrierBillToQuickBooks({
                   req,
@@ -4488,6 +4609,8 @@ exports.processPrimusWorkflow = onRequest(
                 };
               }
             }
+            const reusedIssued = !!(invoiceGenerationResult &&
+              invoiceGenerationResult.reused);
             const primusEmailResult = await emailBOLDocs({
               booking: bookingForEmail,
               loadNumber: invoice.loadNumber,
@@ -4496,10 +4619,39 @@ exports.processPrimusWorkflow = onRequest(
               customerInvoiceId: finalCustomerInvoiceId,
               invoiceNumber: issuedInvoiceNumber || "0",
               chargesTotal: customerRate,
+              customerRate,
+              customerInvoiceTotal: invoiceGenerationResult &&
+                invoiceGenerationResult.invoiceTotal != null ?
+                invoiceGenerationResult.invoiceTotal : customerRate,
+              customerBillLines: optionBCustomerBillLines,
+              invoiceUnchanged: reusedIssued &&
+                optionBCustomerBillLines.length === 0,
+              alreadyIssued: invoice.customerInvoiceOrigin === "already_issued",
+              issuedNow: invoice.customerInvoiceOrigin === "issued_now",
+              customerTotalChanged: optionBCustomerBillLines.length > 0,
+              firestoreInvoiceId: invoiceId,
               podPdf: podPdfForEmail,
               extraDriveFileIds: extraDriveIds,
             });
-            if (primusEmailResult.ok) {
+            if (primusEmailResult.ok && primusEmailResult.skipped) {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "final_email_sent",
+                stepStatus: "skipped",
+                reason: primusEmailResult.reason ||
+                  "customer_invoice_unchanged",
+                output: {
+                  to: customerEmail,
+                  customerInvoiceId: finalCustomerInvoiceId,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "Customer invoice email skipped — already sent", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    reason: primusEmailResult.reason,
+                  });
+            } else if (primusEmailResult.ok) {
               await logWorkflowStep({
                 invoiceId,
                 stepName: "final_email_sent",
@@ -4640,6 +4792,9 @@ exports.processPrimusWorkflow = onRequest(
 
           // Backstop: push to QB if early sync was skipped (older invoices)
           // or failed transiently. Idempotent via primusSteps.qbBillingSynced.
+          if (!invoice.customerInvoiceOrigin) {
+            noteCustomerInvoiceOrigin(invoice, false);
+          }
           if (finalCustomerInvoiceId && !primusSteps.qbBillingSynced &&
               !carrierBillOnlyMode) {
             await pushCarrierBillToQuickBooks({

@@ -3,9 +3,11 @@
  * reviewers, plus unhandled-email actions (reply / delete / flag).
  *
  * Env:
- *   DASHBOARD_OPS_PRIMARY=true — park unhandled / ops alerts in the
- *     dashboard instead of (or in addition to) emailing humans. When set,
- *     forwardToHumanReview skips SMTP send after writing a notification.
+ *   DASHBOARD_OPS_PRIMARY — default OFF (emails must go out). Set true only
+ *     with explicit Moshe approval. When true, park unhandled / ops alerts
+ *     on the dashboard instead of emailing; forwardToHumanReview skips SMTP
+ *     after writing a notification. Never flip this on in a deploy without
+ *     that approval.
  */
 
 "use strict";
@@ -334,6 +336,94 @@ async function findOpenByRef(db, opts) {
   });
 }
 
+/**
+ * Open "POD needed" / "No POD" notices. Rate, margin, GTG, charge, and
+ * escalation mail is left alone.
+ * @param {object} row Notification fields.
+ * @return {boolean}
+ */
+function isClearablePodNotification(row) {
+  if (!row) return false;
+  if (String(row.status || "").toLowerCase() !== "open") return false;
+  const text = `${row.subject || ""} ${row.reason || ""} ${row.title || ""}`;
+  if (/escalat|customer rate|low margin|gtg|enter load|additional charge/i
+      .test(text)) {
+    return false;
+  }
+  return /no pod|pod needed/i.test(text);
+}
+
+/**
+ * @param {object} row Notification fields.
+ * @param {string} query Load number.
+ * @return {boolean}
+ */
+function notificationMatchesLoadQuery(row, query) {
+  const needle = String(query || "").trim();
+  if (!needle) return false;
+  if (row && String(row.loadNumber || "") === needle) return true;
+  const text = `${row && row.subject || ""} ${row && row.body || ""} ` +
+    `${row && row.reason || ""} ${row && row.title || ""}`;
+  return new RegExp(`\\b${needle}\\b`).test(text);
+}
+
+/**
+ * @param {object[]} rows Notification rows.
+ * @return {object[]}
+ */
+function uniqueNotificationsById(rows) {
+  const seen = new Set();
+  const out = [];
+  (rows || []).forEach((row) => {
+    const id = row && row.id;
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(row);
+  });
+  return out;
+}
+
+/**
+ * Clears open POD notices for a load once the POD is found.
+ * @param {object} db Firestore.
+ * @param {object} opts loadNumber, invoiceId, tenantId.
+ * @return {Promise<{dismissed: number, ids: string[]}>}
+ */
+async function dismissOpenPodNotifications(db, opts) {
+  const loadNumber = String((opts && opts.loadNumber) || "").trim();
+  const invoiceId = String((opts && opts.invoiceId) || "").trim();
+  if (!loadNumber && !invoiceId) return {dismissed: 0, ids: []};
+  const tenantId = (opts && opts.tenantId) || "default";
+  const snap = await db.collection(NOTIF_COLLECTION)
+      .where("status", "==", NOTIF_STATUS.OPEN)
+      .limit(500)
+      .get();
+  const ids = [];
+  for (const doc of snap.docs || []) {
+    const data = doc.data() || {};
+    if (data.tenantId && data.tenantId !== tenantId) continue;
+    const row = {
+      id: doc.id,
+      ...data,
+      loadNumber: data.loadNumber,
+      invoiceId: data.invoiceId,
+      status: data.status || NOTIF_STATUS.OPEN,
+    };
+    const sameLoad = loadNumber &&
+      String(row.loadNumber == null ? "" : row.loadNumber) === loadNumber;
+    const sameInvoice = invoiceId &&
+      String(row.invoiceId || "") === invoiceId;
+    if (!sameLoad && !sameInvoice) continue;
+    if (!isClearablePodNotification(row)) continue;
+    await db.collection(NOTIF_COLLECTION).doc(doc.id).update({
+      status: NOTIF_STATUS.DISMISSED,
+      dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    ids.push(doc.id);
+  }
+  return {dismissed: ids.length, ids};
+}
+
 module.exports = {
   NOTIF_COLLECTION,
   NOTIF_TYPE,
@@ -342,6 +432,10 @@ module.exports = {
   createNotification,
   listNotifications,
   dismissNotification,
+  dismissOpenPodNotifications,
+  isClearablePodNotification,
+  notificationMatchesLoadQuery,
+  uniqueNotificationsById,
   flagNotification,
   markActed,
   findOpenByRef,

@@ -46,6 +46,7 @@ const workflowErrors = require("./workflow-error-messages");
 const drayageIntake = require("./drayage-intake");
 
 const admin = require("firebase-admin");
+const customerInvoiceSendGuard = require("./customer-invoice-send-guard");
 
 const SESSION_DOC = "system/primusUiSession";
 const DEFAULT_SESSION_TTL_HOURS = 24;
@@ -2320,8 +2321,90 @@ async function emailBOLDocs(args) {
     }
   }
 
+  let primusInvoiceSent = false;
+  try {
+    const restInvoices = await fetchRestInvoicesByLoad(loadNumber);
+    primusInvoiceSent = customerInvoiceSendGuard.readPrimusSentFlag(
+        restInvoices, customerInvoiceId, invoiceNumber);
+  } catch (_) {
+    primusInvoiceSent = false;
+  }
+
+  let sendClaim = null;
+  if (!args.forceResend || primusInvoiceSent) {
+    try {
+      const decision =
+        await customerInvoiceSendGuard.evaluateCustomerInvoiceResend(
+            firestore(), {
+              loadNumber,
+              customerInvoiceId,
+              invoiceNumber,
+              invoiceTotal: args.customerInvoiceTotal,
+              customerRate: args.customerRate != null ?
+                args.customerRate : args.chargesTotal,
+              customerBillLines: args.customerBillLines,
+              invoiceUnchanged: args.invoiceUnchanged === true,
+              alreadyIssued: args.alreadyIssued === true,
+              issuedNow: args.issuedNow === true,
+              customerTotalChanged: args.customerTotalChanged === true,
+              primusInvoiceSent,
+              firestoreInvoiceId: args.firestoreInvoiceId || null,
+              to: customerEmail,
+            });
+      if (decision.skip || primusInvoiceSent) {
+        const sentReason =
+          customerInvoiceSendGuard.PRIMUS_ALREADY_SENT_REASON;
+        const reason = decision.skip ? decision.reason : sentReason;
+        if (writeLog) {
+          await writeLog("info", "primus",
+              reason === sentReason ?
+                "Customer invoice email skipped — Primus marked sent" :
+                "Customer invoice email skipped — already sent unchanged", {
+                loadNumber,
+                customerInvoiceId: String(customerInvoiceId),
+                invoiceNumber,
+                reason,
+              });
+        }
+        return {
+          ok: true,
+          skipped: true,
+          reason,
+          to: customerEmail,
+          driveFileIds: [],
+          attachments: null,
+        };
+      }
+      sendClaim = decision.claim || null;
+    } catch (guardErr) {
+      if (primusInvoiceSent) {
+        return {
+          ok: true,
+          skipped: true,
+          reason: customerInvoiceSendGuard.PRIMUS_ALREADY_SENT_REASON,
+          to: customerEmail,
+        };
+      }
+      if (writeLog) {
+        await writeLog("warn", "primus",
+            "Customer invoice resend check failed — email continues", {
+              loadNumber,
+              error: guardErr && guardErr.message,
+            });
+      }
+    }
+  }
+
   const result = await managePhpPost(params);
   const success = isEmailBOLDocsSuccess(result.json);
+  if (sendClaim) {
+    try {
+      await customerInvoiceSendGuard.finishCustomerInvoiceSend(
+          sendClaim, success ? "sent" : "failed");
+    } catch (_) {
+      // The send result stands. The claim only blocks a second email.
+    }
+  }
   const attachments = {
     invoiceSelected: true,
     bolSelected: !args.invoiceOnly,
@@ -3960,6 +4043,7 @@ function buildCustomerCharges(
       rate: amount,
       total: amount.toFixed(2),
       chargeType: "",
+      isAccessorial: true,
     }];
   }
   let description = "FREIGHT CHARGE";
@@ -3975,6 +4059,7 @@ function buildCustomerCharges(
     rate: roundMoney(customerRate),
     total: roundMoney(customerRate).toFixed(2),
     chargeType: "",
+    isAccessorial: false,
   }];
   (Array.isArray(customerBillLines) ? customerBillLines : []).forEach(
       (line, idx) => {
@@ -3984,15 +4069,72 @@ function buildCustomerCharges(
             .trim().toUpperCase();
         lines.push({
           id: idx + 2,
-          code: "",
+          code: String(line && line.code || ""),
           qty: 1,
           description: name,
           rate: amount,
           total: amount.toFixed(2),
           chargeType: "",
+          isAccessorial: true,
         });
       });
   return lines;
+}
+
+/**
+ * Match key for a customer charge. Freight stays one row. Each
+ * accessorial matches on its Primus code, then its description.
+ * @param {object} row Charge row.
+ * @return {string}
+ */
+function customerChargeMatchKey(row) {
+  const desc = String((row && row.description) || "").trim().toUpperCase();
+  if (desc.startsWith("FREIGHT")) return "freight";
+  const code = String((row && row.code) || "").trim().toUpperCase();
+  if (code) return `code:${code}`;
+  return `desc:${desc}`;
+}
+
+/**
+ * Customer charges to send on the second invoice save. Each accessorial
+ * is its own line at its own amount. Primus often echoes a single freight
+ * row after the first save; that echo must not replace the itemized lines.
+ * @param {number} customerRate Base freight rate.
+ * @param {string} billToReference Bill-to reference.
+ * @param {Array<object>} customerBillLines Accessorial lines.
+ * @param {Array<object>|null} storedCharges Charges Primus already stored.
+ * @param {object} [opts] Billing shape. Option F stays a single Freight line.
+ * @return {Array<object>|null} Null when there is nothing to itemize.
+ */
+function customerChargesForSave(
+    customerRate, billToReference, customerBillLines, storedCharges, opts) {
+  if (opts && opts.freightAccessorialOnly) return null;
+  const planned = buildCustomerCharges(
+      customerRate, billToReference, customerBillLines, opts);
+  const accessorials = planned.filter((line) => line.isAccessorial);
+  if (!accessorials.length) return null;
+  const stored = Array.isArray(storedCharges) ? storedCharges : [];
+  const used = new Set();
+  return planned.map((line) => {
+    const key = customerChargeMatchKey(line);
+    let storedId = "";
+    stored.forEach((row, idx) => {
+      if (storedId || used.has(idx)) return;
+      if (customerChargeMatchKey(row) !== key) return;
+      used.add(idx);
+      if (row && row.id != null && row.id !== "") storedId = String(row.id);
+    });
+    const rate = roundMoney(line.rate);
+    return {
+      id: storedId,
+      code: line.code || "",
+      description: line.description || "FREIGHT CHARGE",
+      qty: Number(line.qty || 1),
+      rate,
+      total: rate.toFixed(2),
+      isAccessorial: !!line.isAccessorial,
+    };
+  });
 }
 
 /**
@@ -4475,6 +4617,7 @@ function parseVendorsFromResponse(json) {
     id: String(v.id || v.carrierId || ""),
     name: String(v.name || v.carrierName || ""),
     type: String(v.type || v.vendorType || v.carrierType || "").trim(),
+    code: String(v.code || v.scac || v.vendorCode || "").trim(),
     vendorEmail: String(v.vendorEmail || v.email || "").trim(),
   })).filter((v) => v.id);
 }
@@ -4525,11 +4668,73 @@ function normalizeVendorNameKey(value) {
  * @param {object} hints carrierName, emailDomain, nameOnly.
  * @return {object|null}
  */
+/**
+ * True when Primus vendor.type looks like drayage.
+ * @param {string|null|undefined} type Vendor type.
+ * @return {boolean}
+ */
+function vendorTypeLooksDrayage(type) {
+  const drayageIntake = require("./drayage-intake");
+  return drayageIntake.isDrayageVendorType(type);
+}
+
+/**
+ * All name matches for a carrier hint (exact, then includes).
+ * Duplicate Primus rows often share the same name with different types.
+ * @param {Array<object>} vendors Parsed getVendors list.
+ * @param {string} hint Carrier name.
+ * @return {Array<object>}
+ */
+function collectVendorNameMatches(vendors, hint) {
+  const query = String(hint || "").trim();
+  if (!query || !Array.isArray(vendors) || !vendors.length) return [];
+  const queryLower = query.toLowerCase();
+  const firstToken = query.split(/[,\n/]/)[0].trim().toLowerCase();
+  const matches = [];
+  const seen = new Set();
+  const push = (vendor) => {
+    if (!vendor || !vendor.id || seen.has(vendor.id)) return;
+    seen.add(vendor.id);
+    matches.push(vendor);
+  };
+  for (const vendor of vendors) {
+    const name = String(vendor.name || "").toLowerCase();
+    if (name === queryLower || name === firstToken) push(vendor);
+  }
+  if (matches.length) return matches;
+  for (const vendor of vendors) {
+    const name = String(vendor.name || "").toLowerCase();
+    if (firstToken.length >= 6 &&
+        (name.includes(firstToken) || firstToken.includes(name))) {
+      push(vendor);
+    }
+  }
+  return matches;
+}
+
+/**
+ * When several vendors share a name (Evans Factoring vs Evans DRAYAGE),
+ * prefer an explicit drayage type, then a row with a carrier code.
+ * @param {Array<object>} vendors Name matches.
+ * @return {object|null}
+ */
+function preferVendorForDrayageHint(vendors) {
+  if (!vendors || !vendors.length) return null;
+  const byType = vendors.find((v) => vendorTypeLooksDrayage(v.type));
+  if (byType) return byType;
+  const withCode = vendors.find((v) => String(v.code || "").trim());
+  if (withCode) return withCode;
+  return vendors[0] || null;
+}
+
 function findVendorByCarrierHint(vendors, hints = {}) {
   const carrierName = String(hints.carrierName || "").trim();
   const emailDomain = String(hints.emailDomain || "").trim().toLowerCase();
   const nameOnly = !!hints.nameOnly;
   if (carrierName) {
+    const matches = collectVendorNameMatches(vendors, carrierName);
+    const preferred = preferVendorForDrayageHint(matches);
+    if (preferred) return preferred;
     const byName = findMasterVendorByName(vendors, carrierName);
     if (byName) return byName;
   }
@@ -4604,12 +4809,36 @@ async function lookupVendorByCarrierHint(hints = {}) {
   };
 
   if (nameQuery.length >= 3) {
+    const nameMatches = [];
+    const seenMatchIds = new Set();
     for (let page = 0; page < 8; page++) {
-      const out = await tryPage(page * 25, nameQuery);
-      if (!out) break;
-      if (out.done) break;
-      if (out.match) return await enrichVendorProfileTypes(out.match);
+      const params = {
+        action: "getVendors",
+        page: "1",
+        start: String(page * 25),
+        limit: "25",
+        query: nameQuery,
+      };
+      const result = await managePhpPost(params);
+      const vendors = parseVendorsFromResponse(result.json);
+      if (!vendors.length) break;
+      let anyNew = false;
+      for (const vendor of vendors) {
+        if (!seenIds.has(vendor.id)) {
+          seenIds.add(vendor.id);
+          anyNew = true;
+        }
+      }
+      for (const match of collectVendorNameMatches(vendors, carrierName)) {
+        if (seenMatchIds.has(match.id)) continue;
+        seenMatchIds.add(match.id);
+        nameMatches.push(match);
+      }
+      if (!anyNew) break;
+      if (nameMatches.length >= 2) break;
     }
+    const preferred = preferVendorForDrayageHint(nameMatches);
+    if (preferred) return await enrichVendorProfileTypes(preferred);
   }
 
   // nameOnly (drayage): never page the whole vendor list or match by email.
@@ -6606,10 +6835,13 @@ async function runPrimusUiBillingFlow(args) {
   const actualCostsWithIds = buildActualCosts(
       vendor, bill, storedCosts || actualCostsFirst);
   const storedCharges = extractChargesFromStore(storeData);
-  const phase2Charges = (storedCharges ||
+  const itemizedCharges = customerChargesForSave(
+      customerRate, args.billToReferenceNumber, customerBillLines,
+      storedCharges, chargeOpts);
+  const phase2Charges = (itemizedCharges || (storedCharges ||
     buildCustomerCharges(
         customerRate, args.billToReferenceNumber, customerBillLines,
-        chargeOpts))
+        chargeOpts)))
       .map((c) => ({
         id: String(c.id != null ? c.id : 1),
         code: c.code || "",
@@ -6619,7 +6851,7 @@ async function runPrimusUiBillingFlow(args) {
         rate: roundMoney(c.rate),
         total: roundMoney(c.total).toFixed(2),
       }));
-  if (args.billToReferenceNumber && !chargeOpts &&
+  if (!itemizedCharges && args.billToReferenceNumber && !chargeOpts &&
       !invoiceChargesIncludeReference(
           phase2Charges, args.billToReferenceNumber)) {
     const withRef = buildCustomerCharges(
@@ -7996,6 +8228,7 @@ exports._internal = {
   buildVendorRefExtraFieldsForBills,
   sanitizeBillToReferenceText,
   invoiceChargesIncludeReference,
+  customerChargesForSave,
   defaultCustomerInvoiceEmailSubject,
   isClosedPriorInsuranceBill,
   insuranceSaveInvoiceCloseFlags,
