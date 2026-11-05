@@ -124,6 +124,35 @@ check("enrichBillToPartyFromConsignee uses spelled consignee",
 
   process.env.PRIMUS_USE_MANAGE_PHP = origEnabled;
 
+  const itemized = bridge._internal.customerChargesForSave(210.16, "", [
+    {name: "Residential Delivery", code: "RSD", amount: 55.9},
+    {name: "Liftgate at Destination", code: "LFD", amount: 54.6},
+  ], [{
+    id: 9,
+    code: "",
+    description: "FREIGHT CHARGE",
+    rate: 320.66,
+    total: "320.66",
+  }]);
+  check("accessorials stay separate when Primus stored one freight line",
+      itemized.map((row) => ({
+        description: row.description,
+        rate: row.rate,
+        isAccessorial: row.isAccessorial,
+        id: row.id,
+      })), [
+        {description: "FREIGHT CHARGE", rate: 210.16,
+          isAccessorial: false, id: "9"},
+        {description: "RESIDENTIAL DELIVERY", rate: 55.9,
+          isAccessorial: true, id: ""},
+        {description: "LIFTGATE AT DESTINATION", rate: 54.6,
+          isAccessorial: true, id: ""},
+      ]);
+  check("no accessorials leaves the stored freight line alone",
+      bridge._internal.customerChargesForSave(210.16, "", [], [{
+        id: 9, description: "FREIGHT CHARGE", rate: 210.16,
+      }]), null);
+
   console.log(failures ? `\n${failures} test(s) failed` : "\nAll tests passed");
   process.exit(failures ? 1 : 0);
 })().catch((err) => {

@@ -3701,6 +3701,61 @@ function buildCustomerCharges(
       rate,
       total: rate.toFixed(2),
       chargeType: "",
+      isAccessorial: line.kind === "accessorial",
+    };
+  });
+}
+
+/**
+ * Match key for a customer charge. Freight stays one row. Each
+ * accessorial matches on its Primus code, then its description.
+ * @param {object} row Charge row.
+ * @return {string}
+ */
+function customerChargeMatchKey(row) {
+  const desc = String((row && row.description) || "").trim().toUpperCase();
+  if (desc.startsWith("FREIGHT")) return "freight";
+  const code = String((row && row.code) || "").trim().toUpperCase();
+  if (code) return `code:${code}`;
+  return `desc:${desc}`;
+}
+
+/**
+ * Customer charges to send on saveInvoice. Each accessorial is its own
+ * line at its own amount. Primus often echoes a single freight row after
+ * the first save; that echo must not replace the itemized lines.
+ * @param {number} customerRate Base freight rate.
+ * @param {string} billToReference Bill-to reference.
+ * @param {Array<object>} customerBillLines Accessorial lines.
+ * @param {Array<object>|null} storedCharges Charges Primus already stored.
+ * @return {Array<object>|null} Null when there is nothing to itemize.
+ */
+function customerChargesForSave(
+    customerRate, billToReference, customerBillLines, storedCharges) {
+  const planned = buildCustomerCharges(
+      customerRate, billToReference, customerBillLines);
+  const accessorials = planned.filter((line) => line.isAccessorial);
+  if (!accessorials.length) return null;
+  const stored = Array.isArray(storedCharges) ? storedCharges : [];
+  const used = new Set();
+  return planned.map((line) => {
+    const key = customerChargeMatchKey(line);
+    let storedId = "";
+    stored.forEach((row, idx) => {
+      if (storedId || used.has(idx)) return;
+      if (customerChargeMatchKey(row) !== key) return;
+      used.add(idx);
+      if (row && row.id != null && row.id !== "") storedId = String(row.id);
+    });
+    const rate = roundMoney(line.rate);
+    return {
+      id: storedId,
+      code: line.code || "",
+      description: line.description || "FREIGHT CHARGE",
+      qty: Number(line.qty || 1),
+      rate,
+      total: rate.toFixed(2),
+      isAccessorial: !!line.isAccessorial,
     };
   });
 }
@@ -5420,7 +5475,10 @@ async function runPrimusUiBillingFlow(args) {
   const actualCostsWithIds = buildActualCosts(
       vendor, bill, storedCosts || actualCostsFirst);
   const storedCharges = extractChargesFromStore(storeData);
-  const phase2Charges = (storedCharges ||
+  const itemizedCharges = customerChargesForSave(
+      customerRate, args.billToReferenceNumber, customerBillLines,
+      storedCharges);
+  const phase2Charges = itemizedCharges || (storedCharges ||
     buildCustomerCharges(
         customerRate, args.billToReferenceNumber, customerBillLines))
       .map((c) => ({
@@ -5431,7 +5489,7 @@ async function runPrimusUiBillingFlow(args) {
         rate: roundMoney(c.rate),
         total: roundMoney(c.total).toFixed(2),
       }));
-  if (args.billToReferenceNumber &&
+  if (!itemizedCharges && args.billToReferenceNumber &&
       !invoiceChargesIncludeReference(
           phase2Charges, args.billToReferenceNumber)) {
     const withRef = buildCustomerCharges(
@@ -6519,4 +6577,5 @@ exports._internal = {
   buildVendorRefExtraFieldsForBills,
   sanitizeBillToReferenceText,
   invoiceChargesIncludeReference,
+  customerChargesForSave,
 };
