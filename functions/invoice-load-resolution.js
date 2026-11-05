@@ -331,6 +331,95 @@ function carrierReferenceReviewFields(refs) {
   };
 }
 
+/**
+ * A classified row that is a carrier bill, not a supporting PDF.
+ * Status "error" is the classifier's mark for a non-invoice (BOL, rate
+ * confirmation). Those stay companions.
+ * @param {object} item Classifier row.
+ * @return {boolean}
+ */
+function isCarrierInvoiceDocument(item) {
+  if (!item || typeof item !== "object") return false;
+  const status = String(item.status || "").toLowerCase();
+  if (status === "error") return false;
+  const invoiceNumber = String(item.invoiceNumber || "").trim();
+  if (invoiceNumber) return true;
+  const amount = Number(item.invoiceAmount);
+  if (Number.isFinite(amount) && amount > 0) return true;
+  return status === "ready_for_primus_validation" ||
+    status === "unmatched_amount" ||
+    status === "unrecognized_charges" ||
+    status === "charges_no_proof";
+}
+
+/**
+ * BOL or load digits from a non-invoice PDF. 5-digit account numbers
+ * are not a BOL.
+ * @param {object} item Classifier row.
+ * @return {string}
+ */
+function companionBolNumber(item) {
+  const pick = (value) => {
+    const digits = String(value || "").replace(/\D/g, "");
+    if (digits.length < 6 || digits.length > 12) return "";
+    return digits;
+  };
+  return pick(item && item.carrierBolNumber) ||
+    pick(item && item.loadNumber);
+}
+
+/**
+ * When an email has exactly one carrier invoice, a BOL or rate
+ * confirmation in the same email can supply the BOL number. Other
+ * invoices are left untouched. Matching companion PDFs are not processed
+ * as their own invoices.
+ * @param {Array<object>} invoiceItems Classifier rows.
+ * @return {{items: Array<object>, borrowedBol: string|null, dropped: number}}
+ */
+function borrowBolFromCompanionDocuments(invoiceItems) {
+  const items = (Array.isArray(invoiceItems) ? invoiceItems : [])
+      .filter((item) => item && typeof item === "object");
+  const unchanged = {items, borrowedBol: null, dropped: 0};
+  const invoices = items.filter(isCarrierInvoiceDocument);
+  if (invoices.length !== 1) return unchanged;
+  const companions = items.filter((item) => item !== invoices[0]);
+  const bols = [];
+  companions.forEach((item) => {
+    if (isCarrierInvoiceDocument(item)) return;
+    const bol = companionBolNumber(item);
+    if (bol && !bols.includes(bol)) bols.push(bol);
+  });
+  if (bols.length !== 1) return unchanged;
+  const bol = bols[0];
+  const invoice = {...invoices[0]};
+  const existingBol = companionBolNumber({
+    carrierBolNumber: invoice.carrierBolNumber,
+  });
+  const existingLoad = isValidLoadNumber(invoice.loadNumber) ?
+    normalizeLoadNumber(invoice.loadNumber) : "";
+  if ((existingBol && existingBol !== bol) ||
+      (existingLoad && existingLoad !== bol)) {
+    return unchanged;
+  }
+  let borrowedBol = null;
+  if (!existingBol && !existingLoad) {
+    invoice.carrierBolNumber = bol;
+    invoice.bolNumberSource = "companion_pdf";
+    borrowedBol = bol;
+  }
+  const kept = [invoice];
+  let dropped = 0;
+  companions.forEach((item) => {
+    const companionBol = companionBolNumber(item);
+    if (!isCarrierInvoiceDocument(item) && companionBol === bol) {
+      dropped += 1;
+      return;
+    }
+    kept.push(item);
+  });
+  return {items: kept, borrowedBol, dropped};
+}
+
 module.exports = {
   normalizeLoadNumber,
   isValidLoadNumber,
@@ -345,4 +434,5 @@ module.exports = {
   extractLoadHintsFromEmailText,
   applyEmailLoadHintsToInvoice,
   carrierReferenceReviewFields,
+  borrowBolFromCompanionDocuments,
 };

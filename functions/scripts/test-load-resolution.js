@@ -208,5 +208,68 @@ const factorview798 = lr.applyEmailLoadHintsToInvoice({
 check("FactorView subject does not fill load",
     factorview798.loadNumber, "");
 
+const mikes = lr.borrowBolFromCompanionDocuments([
+  {
+    status: "error",
+    carrierBolNumber: "270576",
+    invoiceAmount: 0,
+    attachmentFilename: "BOL_270576.pdf",
+  },
+  {
+    status: "error",
+    loadNumber: "270576",
+    invoiceAmount: 0,
+    attachmentFilename: "RateConf_BOL_270576.pdf",
+  },
+  {
+    status: "ready_for_primus_validation",
+    invoiceNumber: "2380",
+    invoiceAmount: 185,
+    loadNumber: "",
+    carrierBolNumber: "",
+  },
+]);
+check("one invoice borrows the companion BOL", mikes.borrowedBol, "270576");
+check("companion BOL is stored on the invoice",
+    mikes.items[0].carrierBolNumber, "270576");
+check("BOL and rate confirmation are not separate invoices",
+    mikes.items.length, 1);
+check("borrowed BOL promotes to the load number",
+    lr.normalizeCarrierReferenceFields(mikes.items[0]).loadNumber, "270576");
+
+const twoInvoices = lr.borrowBolFromCompanionDocuments([
+  {
+    status: "error",
+    carrierBolNumber: "270576",
+    invoiceAmount: 0,
+  },
+  {
+    status: "ready_for_primus_validation",
+    invoiceNumber: "2380",
+    invoiceAmount: 185,
+  },
+  {
+    status: "ready_for_primus_validation",
+    invoiceNumber: "2383",
+    invoiceAmount: 75,
+  },
+]);
+check("two invoices do not borrow a companion BOL",
+    twoInvoices.borrowedBol, null);
+check("two invoices keep every row", twoInvoices.items.length, 3);
+
+const disagree = lr.borrowBolFromCompanionDocuments([
+  {status: "error", carrierBolNumber: "270576", invoiceAmount: 0},
+  {status: "error", loadNumber: "269100", invoiceAmount: 0},
+  {
+    status: "ready_for_primus_validation",
+    invoiceNumber: "2380",
+    invoiceAmount: 185,
+  },
+]);
+check("disagreeing companion BOLs are not used",
+    disagree.borrowedBol, null);
+check("disagreeing companions stay in the email", disagree.items.length, 3);
+
 console.log(failures ? `\n${failures} FAILURES` : "\nAll checks passed");
 process.exit(failures ? 1 : 0);

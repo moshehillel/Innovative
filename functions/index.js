@@ -11235,6 +11235,18 @@ async function processGmailMessage(
             });
       }
 
+      const companionBol = loadResolution.borrowBolFromCompanionDocuments(
+          invoiceItems);
+      if (companionBol.borrowedBol || companionBol.dropped) {
+        invoiceItems = companionBol.items;
+        await writeLog("info", "ai",
+            "Used a companion PDF for the invoice BOL number", {
+              messageId,
+              borrowedBol: companionBol.borrowedBol,
+              droppedCompanionPdfs: companionBol.dropped,
+            });
+      }
+
       try {
         const filtered = await filterAlreadyProcessedInvoiceItems(
             tenant, messageId, invoiceItems);
