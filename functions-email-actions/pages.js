@@ -384,7 +384,12 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `String(nameHidden.value||"").trim()){` +
     `nameHidden.value="";codeHidden.value="";}` +
     `renderMenu();};` +
-    `search.onblur=()=>{setTimeout(()=>{menu.className="bill-menu";},150);};` +
+    `search.onblur=()=>{` +
+    `const typed=(search.value||"").trim();` +
+    `if(typed&&!(nameHidden.value||"").trim()){` +
+    `const auto=matchCatalog(typed,codeHidden.value);` +
+    `if(auto)setChoice(auto);}` +
+    `setTimeout(()=>{menu.className="bill-menu";},150);};` +
     `picker.appendChild(search);picker.appendChild(nameHidden);` +
     `picker.appendChild(codeHidden);picker.appendChild(menu);` +
     `nameCell.appendChild(label);nameCell.appendChild(picker);` +
@@ -454,9 +459,15 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `document.getElementById("option-b-form").onsubmit=(e)=>{` +
     `const lines=[];` +
     `for(const row of container.querySelectorAll(".bill-row")){` +
-    `const name=(row.querySelector(".bill-name").value||"").trim();` +
-    `const code=row.querySelector(".bill-code").value||"";` +
+    `let name=(row.querySelector(".bill-name").value||"").trim();` +
+    `let code=row.querySelector(".bill-code").value||"";` +
     `const typed=(row.querySelector(".bill-name-search").value||"").trim();` +
+    `if(!name&&typed){` +
+    `const auto=matchCatalog(typed,code);` +
+    `if(auto){name=auto.name||typed;code=auto.code||code;` +
+    `row.querySelector(".bill-name").value=name;` +
+    `row.querySelector(".bill-code").value=code;` +
+    `row.querySelector(".bill-name-search").value=name;}}` +
     `if(!name){` +
     `if(typed){alert("Pick \\""+typed+"\\" from the Primus list "+` +
     `"(type to filter, then select).");e.preventDefault();return false;}` +

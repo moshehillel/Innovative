@@ -49,6 +49,18 @@ check("newly issued customer invoice is emailed",
       customerInvoicePredatedThisRun: false,
       currentStep: null,
     }), false);
+check("reused invoice result suppresses resend",
+    workflowErrors.shouldSuppressCustomerInvoiceResend({
+      customerInvoicePredatedThisRun: false,
+      invoiceGenerationResult: {reused: true},
+      currentStep: null,
+    }), true);
+check("already_issued origin suppresses resend",
+    workflowErrors.shouldSuppressCustomerInvoiceResend({
+      customerInvoicePredatedThisRun: false,
+      customerInvoiceOrigin: "already_issued",
+      currentStep: null,
+    }), true);
 
 const missingPodAlert = buildWorkflowAlertEmail({
   code: "MISSING_POD",

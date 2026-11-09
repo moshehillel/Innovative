@@ -43,10 +43,26 @@ async function handleListAccessorials(req, res) {
     return res.json({ok: true, accessorials});
   } catch (error) {
     console.error("getDashboardAccessorials error:", error);
-    return res.status(500).json({
-      ok: false,
-      error: "Could not load the Primus accessorial list.",
-    });
+    // Never leave Option A/E without a picker — fall back to the static
+    // Primus catalog so confirm pages keep working when live fetch fails.
+    try {
+      const catalog = require("./quote-accessorial-catalog");
+      const accessorials = typeof catalog.staticAccessorialChoices === "function" ?
+        catalog.staticAccessorialChoices() :
+        (await catalog.listPrimusAccessorialChoices());
+      return res.json({
+        ok: true,
+        accessorials: accessorials || [],
+        stale: true,
+        fetchError: error.message || String(error),
+      });
+    } catch (fallbackErr) {
+      console.error("getDashboardAccessorials fallback error:", fallbackErr);
+      return res.status(500).json({
+        ok: false,
+        error: "Could not load the Primus accessorial list.",
+      });
+    }
   }
 }
 

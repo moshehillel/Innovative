@@ -2822,23 +2822,14 @@ exports.processPrimusWorkflow = onRequest(
               excludedInPrimusCount: filteredProof.alreadyInPrimus.length,
             });
 
-              const podFollowupMod = require("./pod-followup");
-              const approver =
-            process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-            podFollowupMod.SARAH_EMAIL;
-              const approvalPayload =
-            additionalChargesMod.applyAdditionalChargeEmailCc({
-              type: "additional_charge_approval",
-              invoiceId,
-              subject: approvalEmail.subject,
-              html: approvalEmail.html,
-              forceRecipient: true,
-              to: approver,
-              cc: (dispatcherForEmail.ok && dispatcherForEmail.email &&
-                dispatcherForEmail.email.toLowerCase() !==
-                approver.toLowerCase()) ?
-                dispatcherForEmail.email : undefined,
-            });
+              const approvalPayload = {
+                type: "additional_charge_approval",
+                invoiceId,
+                subject: approvalEmail.subject,
+                html: approvalEmail.html,
+                forceRecipient: true,
+                to: additionalChargesMod.additionalChargeOpsTo(),
+              };
               // Full carrier packet (invoice + W&I), same as processGmailQueue.
               try {
                 const attachmentHints = {
@@ -3813,6 +3804,9 @@ exports.processPrimusWorkflow = onRequest(
                   reused: true,
                   invoiceTotal: customerRate + customerBillAccessorialTotal,
                 };
+                // Already-issued shortcut must suppress customer resend the
+                // same way runPrimusUiBillingFlow "already issued" does.
+                customerInvoicePredatedThisRun = true;
                 primusSteps.customerInvoiceGenerated = true;
                 await invoiceDoc.ref.update({
                   primusSteps,
@@ -4377,6 +4371,8 @@ exports.processPrimusWorkflow = onRequest(
           if (workflowErrors.shouldSuppressCustomerInvoiceResend({
             customerInvoicePredatedThisRun,
             currentStep,
+            invoiceGenerationResult,
+            customerInvoiceOrigin: invoice.customerInvoiceOrigin || null,
           })) {
             const issuedInvoiceNumberReuse =
               (invoiceGenerationResult &&
@@ -4611,6 +4607,9 @@ exports.processPrimusWorkflow = onRequest(
             }
             const reusedIssued = !!(invoiceGenerationResult &&
               invoiceGenerationResult.reused);
+            const alreadyIssuedForGuard = reusedIssued ||
+              customerInvoicePredatedThisRun ||
+              invoice.customerInvoiceOrigin === "already_issued";
             const primusEmailResult = await emailBOLDocs({
               booking: bookingForEmail,
               loadNumber: invoice.loadNumber,
@@ -4624,10 +4623,11 @@ exports.processPrimusWorkflow = onRequest(
                 invoiceGenerationResult.invoiceTotal != null ?
                 invoiceGenerationResult.invoiceTotal : customerRate,
               customerBillLines: optionBCustomerBillLines,
-              invoiceUnchanged: reusedIssued &&
+              invoiceUnchanged: alreadyIssuedForGuard &&
                 optionBCustomerBillLines.length === 0,
-              alreadyIssued: invoice.customerInvoiceOrigin === "already_issued",
-              issuedNow: invoice.customerInvoiceOrigin === "issued_now",
+              alreadyIssued: alreadyIssuedForGuard,
+              issuedNow: invoice.customerInvoiceOrigin === "issued_now" &&
+                !alreadyIssuedForGuard,
               customerTotalChanged: optionBCustomerBillLines.length > 0,
               firestoreInvoiceId: invoiceId,
               podPdf: podPdfForEmail,

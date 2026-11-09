@@ -45,9 +45,16 @@ function shouldRunBillingPipelineOnResume(resumeStep) {
  * @return {boolean}
  */
 function shouldSuppressCustomerInvoiceResend(opts) {
-  if (!opts || !opts.customerInvoicePredatedThisRun) return false;
+  if (!opts) return false;
   if (String(opts.currentStep || "") === "send_customer_email") return false;
-  return true;
+  if (opts.customerInvoicePredatedThisRun) return true;
+  // Statement/replay paths sometimes reuse an issued invoice without
+  // flipping customerInvoicePredatedThisRun — still do not resend.
+  if (opts.invoiceGenerationResult && opts.invoiceGenerationResult.reused) {
+    return true;
+  }
+  if (opts.customerInvoiceOrigin === "already_issued") return true;
+  return false;
 }
 
 /**

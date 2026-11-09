@@ -6320,7 +6320,7 @@ async function inspectAndUploadWeightCertificate(opts) {
 
 /**
  * Sends the 6-option (A/B/C/D/E/F) additional-charge approval email to the
- * approver (Sarah) with the dispatcher CC'd, and creates the follow-up
+ * approver list (Sarah + Lisa only), and creates the follow-up
  * entry so the charge is tracked until resolved.
  * @param {object} opts invoiceId, tenant, aiResult, pending (category,
  *   charges, chargesTotal, freightMismatch, hasCertificate,
@@ -6356,9 +6356,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     }
   }
 
-  const podFollowupForAssign = require("./pod-followup");
-  const approverForAssign = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-    podFollowupForAssign.SARAH_EMAIL;
+  const opsTo = additionalCharges.additionalChargeOpsTo();
   const followUp = await additionalCharges.createFollowUp(db, {
     loadNumber: aiResult.loadNumber,
     carrierName: aiResult.carrierName,
@@ -6370,11 +6368,11 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     chargesTotal: pending.chargesTotal,
     invoiceAmount: aiResult.invoiceAmount,
     status: additionalCharges.FOLLOW_UP_STATUS.PENDING_APPROVAL,
-    to: approverForAssign,
+    to: opsTo,
     dispatcherEmail: (dispatcher.ok && dispatcher.email) ?
       dispatcher.email : null,
     dispatcherName: dispatcher.displayName || dispatcher.userName || null,
-    cc: (dispatcher.ok && dispatcher.email) ? dispatcher.email : null,
+    cc: null,
   });
   const followUpId = followUp && followUp.id ? followUp.id : followUp;
   if (followUp && followUp.reused) {
@@ -6457,20 +6455,18 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     certificateStatus,
   });
 
-  const podFollowup = require("./pod-followup");
-  const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-    podFollowup.SARAH_EMAIL;
+  const opsTo = additionalCharges.additionalChargeOpsTo();
   const dispatcherEmail = (dispatcher.ok && dispatcher.email) ?
     dispatcher.email : null;
-  const emailPayload = additionalCharges.applyAdditionalChargeEmailCc({
+  // Approval emails go to Sarah + Lisa only (no dispatcher CC).
+  const emailPayload = {
     type: "additional_charge_approval",
     invoiceId,
     subject: email.subject,
     html: email.html,
     forceRecipient: true,
-    to: approver,
-    cc: dispatcherEmail || undefined,
-  });
+    to: opsTo,
+  };
 
   // Attach the full original carrier packet (invoice + W&I backups), not
   // an invoice-only page extract, so Sarah/Lisa can review supporting docs.
@@ -6559,8 +6555,8 @@ async function sendAdditionalChargeApprovalEmail(opts) {
       `Charges total: $${Number(pending.chargesTotal || 0).toFixed(2)}. ` +
       `Choose A–F in the dashboard Tasks tab.`,
     subject: email.subject,
-    to: approver,
-    cc: dispatcherEmail || additionalCharges.LISA_EMAIL,
+    to: opsTo,
+    cc: null,
     invoiceId,
     followUpId,
     loadNumber: aiResult.loadNumber || null,
@@ -6594,8 +6590,9 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         followUpId,
         loadNumber: aiResult.loadNumber,
         category: pending.category,
-        to: approver,
-        ccDispatcher: dispatcherEmail || null,
+        to: opsTo,
+        ccDispatcher: null,
+        loadDispatcher: dispatcherEmail || null,
         ccLisa: additionalCharges.LISA_EMAIL,
         customerRate,
         attachedInvoicePdf,

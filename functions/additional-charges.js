@@ -30,8 +30,9 @@
  *      resolved.
  *
  * Env:
- *   ADDITIONAL_CHARGE_APPROVER_EMAIL — Sarah (approval email recipient);
- *     default Sarah@innovativecarriers.com (same domain as Lisa).
+ *   ADDITIONAL_CHARGE_APPROVER_EMAIL — Sarah (one of the approval To
+ *     recipients with Lisa); default Sarah@innovativecarriers.com.
+ *   Approval emails go To Sarah + Lisa only (no dispatcher CC).
  */
 
 "use strict";
@@ -232,6 +233,27 @@ function esc(text) {
 function money(amount) {
   const n = Number(amount);
   return Number.isFinite(n) ? `$${n.toFixed(2)}` : "—";
+}
+
+/**
+ * Internal additional-charge approval recipients: Sarah + Lisa only.
+ * Dispatchers are no longer CC'd on these approval emails.
+ * @return {string} Comma-separated To list.
+ */
+function additionalChargeOpsTo() {
+  let sarah = "Sarah@innovativecarriers.com";
+  try {
+    const podFollowup = require("./pod-followup");
+    sarah = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+      podFollowup.SARAH_EMAIL || sarah;
+  } catch (err) {
+    sarah = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL || sarah;
+  }
+  const lisa = LISA_EMAIL;
+  if (String(sarah).toLowerCase() === String(lisa).toLowerCase()) {
+    return sarah;
+  }
+  return `${sarah}, ${lisa}`;
 }
 
 /**
@@ -2720,6 +2742,7 @@ module.exports = {
   evaluatePrimusAmountMatch,
   invoiceTotalMatchesPrimusCost,
   mergeLisaOnCc,
+  additionalChargeOpsTo,
   applyAdditionalChargeEmailCc,
   applyDispatcherEmailCc,
   formatCustomerRate,
