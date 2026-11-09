@@ -437,6 +437,9 @@
   }
 
   function frameDoc(html) {
+    // Email body scripts are stripped before this. Our click helper opens
+    // A–F confirm links via the top window so left-click works even when
+    // the sandboxed iframe popup path is blocked.
     return "<!doctype html><html><head><meta charset=\"utf-8\">" +
       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" +
       "<base target=\"_blank\" rel=\"noopener\">" +
@@ -447,7 +450,15 @@
       "p{margin:0 0 1em} table{border-collapse:collapse;max-width:100%}" +
       "td,th{padding:.35em .65em;vertical-align:top}" +
       "img{max-width:100%;height:auto}</style></head><body>" +
-      html + "</body></html>";
+      html +
+      "<script>(function(){document.addEventListener(\"click\",function(e){" +
+      "var t=e.target;while(t&&t.tagName!==\"A\")t=t.parentElement;" +
+      "if(!t)return;var href=t.getAttribute(\"href\")||\"\";" +
+      "if(!/additionalChargeAction/i.test(href))return;" +
+      "e.preventDefault();e.stopPropagation();" +
+      "try{window.top.open(href,\"_blank\",\"noopener\");}" +
+      "catch(err){window.top.location.href=href;}" +
+      "},true);})();</script></body></html>";
   }
 
   function findChargeForm(taskId) {
@@ -462,7 +473,8 @@
   }
 
   const EMAIL_FRAME_SANDBOX =
-    "allow-popups allow-popups-to-escape-sandbox allow-downloads";
+    "allow-popups allow-popups-to-escape-sandbox allow-downloads " +
+    "allow-scripts allow-same-origin";
 
   /* —— Drawer —— */
   function closeDrawer() {
@@ -1057,6 +1069,11 @@
       renderMenu();
     });
     search.addEventListener("blur", () => {
+      const typed = (search.value || "").trim();
+      if (typed && !(nameHidden.value || "").trim()) {
+        const auto = matchAccessorialChoice(typed, choices || []);
+        if (auto) setChoice(auto);
+      }
       setTimeout(() => {
         menu.hidden = true;
       }, 150);
@@ -1114,8 +1131,17 @@
       const nameEl = row.querySelector(".charge-line-name");
       const codeEl = row.querySelector(".charge-line-code");
       const searchEl = row.querySelector(".charge-line-search");
-      const name = nameEl && nameEl.value ? nameEl.value.trim() : "";
+      let name = nameEl && nameEl.value ? nameEl.value.trim() : "";
       const typed = searchEl && searchEl.value ? searchEl.value.trim() : "";
+      if (!name && typed) {
+        const auto = matchAccessorialChoice(typed, accessorialChoices || []);
+        if (auto) {
+          name = auto.name || typed;
+          if (nameEl) nameEl.value = name;
+          if (codeEl) codeEl.value = auto.code || "";
+          if (searchEl) searchEl.value = name;
+        }
+      }
       if (!name) {
         if (typed) missingPick = typed;
         return;
