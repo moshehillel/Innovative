@@ -6455,7 +6455,6 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     certificateStatus,
   });
 
-  const opsTo = additionalCharges.additionalChargeOpsTo();
   const dispatcherEmail = (dispatcher.ok && dispatcher.email) ?
     dispatcher.email : null;
   // Approval emails go to Sarah + Lisa only (no dispatcher CC).
