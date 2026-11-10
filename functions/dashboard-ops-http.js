@@ -5,6 +5,7 @@
 "use strict";
 
 const dashboardOps = require("./dashboard-ops");
+const customerRate = require("./dashboard-customer-rate");
 
 let deps = {};
 
@@ -79,7 +80,11 @@ async function handleListNotifications(req, res) {
     const result = await dashboardOps.listNotifications(deps.db, {
       tenantId: tenant.tenantId,
       limit: req.query.limit,
+      offset: req.query.offset,
       type: req.query.type || null,
+      q: req.query.q || req.query.load || "",
+      range: req.query.range || "",
+      sort: req.query.sort || "",
     });
     return res.json({
       ok: true,
@@ -387,6 +392,54 @@ async function handleDeleteUnhandledEmail(req, res) {
 }
 
 /**
+ * POST a customer rate for a load that is blocked without one.
+ * Writes the invoice the same way as the emailed setCustomerRate form,
+ * then resumes the Primus workflow from get_rate.
+ * @param {object} req Request.
+ * @param {object} res Response.
+ * @return {Promise<object>}
+ */
+async function handleSetCustomerRate(req, res) {
+  if (cors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    const tenant = await deps.resolveDashboardTenant(req);
+    const body = req.body || {};
+    const result = await customerRate.saveDashboardCustomerRate({
+      db: deps.db,
+      tcol: deps.tcol,
+      kickWorkflow: deps.kickCustomerRateWorkflow,
+    }, {
+      tenant,
+      invoiceId: body.invoiceId,
+      loadNumber: body.loadNumber,
+      customerRate: body.customerRate,
+      customerName: body.customerName,
+    });
+    if (!result.ok) return res.status(400).json(result);
+    const notificationId = String(body.notificationId || "").trim();
+    if (notificationId) {
+      await dashboardOps.markActed(deps.db, {
+        id: notificationId,
+        tenantId: tenant.tenantId,
+      }).catch((err) => {
+        console.error("setDashboardCustomerRate notice:", err.message);
+      });
+    }
+    return res.json({ok: true, tenantId: tenant.tenantId, ...result});
+  } catch (error) {
+    console.error("setDashboardCustomerRate error:", error);
+    return res.status(500).json({
+      ok: false,
+      error: "Could not save the customer rate.",
+      details: error.message,
+    });
+  }
+}
+
+/**
  * @param {string} from Header value.
  * @return {string}
  */
@@ -407,4 +460,5 @@ module.exports = {
   handleAdditionalChargeDecision,
   handleReplyUnhandledEmail,
   handleDeleteUnhandledEmail,
+  handleSetCustomerRate,
 };

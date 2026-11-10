@@ -15,6 +15,14 @@ const HOLD_STAGES = [
   "awaiting_pod",
 ];
 
+/** Same windows as the dashboard Day / Week / Month / Year control. */
+const SEARCH_RANGE_DAYS = Object.freeze({
+  day: 1,
+  week: 7,
+  month: 30,
+  year: 365,
+});
+
 /** Invoice fields the work list needs. Skips extracted bodies and mail HTML. */
 const INVOICE_HOLD_FIELDS = [
   "tenantId", "finalWorkflowStatus", "decisionStage", "decisionReason",
@@ -30,11 +38,6 @@ const DISMISS_LOOKUP_FIELDS = [
   "finalWorkflowStatus", "title",
 ];
 
-/**
- * Issue a live invoice hold would show, before dashboard dismissal.
- * @param {object} data Invoice fields.
- * @return {string|null}
- */
 /**
  * Loads every open hold for one folder. The mixed newest-task scan misses
  * older missing-POD and missing-rate rows, which made those folders look empty.
@@ -114,6 +117,11 @@ async function loadIssueRows(db, deps, tenant, tenantId, issue) {
   }
 }
 
+/**
+ * Issue a live invoice hold would show, before dashboard dismissal.
+ * @param {object} data Invoice fields.
+ * @return {string|null}
+ */
 function holdIssueForInvoice(data) {
   const wf = String((data && data.finalWorkflowStatus) || "");
   const stage = String((data && data.decisionStage) || "");
@@ -305,6 +313,126 @@ async function loadInvoiceHoldRows(
 }
 
 /**
+ * @param {object} row Queue row.
+ * @return {number|null} Millis, or null when the row has no timestamp.
+ */
+function queueRowTime(row) {
+  const raw = row && (row.receivedAt || row.createdAt || row.emailReceivedAt);
+  const parsed = Date.parse(raw || "");
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+/**
+ * Search text across the fields a dispatcher would type.
+ * @param {object} row Queue row.
+ * @param {string} query Search box text.
+ * @return {boolean}
+ */
+function queueRowMatchesQuery(row, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return true;
+  const load = String(row && row.loadNumber == null ? "" : row.loadNumber)
+      .trim().toLowerCase();
+  if (load && (load === needle || load.includes(needle))) return true;
+  const hay = [
+    row && row.carrierName,
+    row && row.customerName,
+    row && row.title,
+    row && row.reason,
+    row && row.proNumber,
+    row && row.subject,
+    row && row.description,
+    row && row.invoiceId,
+  ].filter((part) => part != null && String(part).trim() !== "")
+      .join(" ")
+      .toLowerCase();
+  return hay.includes(needle);
+}
+
+/**
+ * Selected Day/Week/Month/Year window. No range means no time cut.
+ * Rows with no timestamp stay visible so a match is not dropped.
+ * @param {object} row Queue row.
+ * @param {string} range day|week|month|year.
+ * @param {number} now Clock millis.
+ * @return {boolean}
+ */
+function queueRowInRange(row, range, now) {
+  const days = SEARCH_RANGE_DAYS[String(range || "").toLowerCase()];
+  if (!days) return true;
+  const at = queueRowTime(row);
+  if (at == null) return true;
+  const clock = Number(now) || Date.now();
+  return at >= clock - days * 24 * 60 * 60 * 1000;
+}
+
+/**
+ * Work vs In Dispute vs Missing POD stays. A search query ignores the
+ * issue sub-filter and the dispatcher filter, and urgent sort never
+ * removes non-urgent matches.
+ * @param {object[]} merged Rows already merged.
+ * @param {object} opts q, range, chargePhase, issue, dispatcher, sort.
+ * @return {object}
+ */
+function selectOperationalRows(merged, opts) {
+  const sort = String((opts && opts.sort) || "").toLowerCase();
+  const q = String((opts && opts.q) || "").trim();
+  const searching = Boolean(q);
+  const now = Number(opts && opts.now) || Date.now();
+  let rows = Array.isArray(merged) ? merged.slice() : [];
+  if (searching) {
+    rows = rows.filter((row) =>
+      queueRowMatchesQuery(row, q) &&
+      queueRowInRange(row, opts.range, now));
+  }
+  const phase = String((opts && opts.chargePhase) || "").toLowerCase();
+  const issue = String((opts && opts.issue) || "all").toLowerCase();
+  const disputeRows = rows.filter((row) => scope.isOptionDDispute(row));
+  const disputeCount = disputeRows.length;
+  const missingPodRows = rows.filter((row) =>
+    podDash.isMissingPodDashboardItem(row));
+  const missingPodCount = missingPodRows.length;
+  if (phase === "dispute") {
+    rows = disputeRows;
+  } else if (phase === "missing_pod") {
+    rows = missingPodRows;
+    if (!searching) {
+      rows = rows.filter((row) => scope.dispatcherMatches(
+          row, opts.dispatcher || opts.dispatcherKey));
+    }
+  } else if (!searching && issue === scope.ISSUE.MISSING_RATE) {
+    rows = rows.filter((row) => row.issueType === scope.ISSUE.MISSING_RATE);
+    rows = rows.filter((row) => scope.dispatcherMatches(
+        row, opts.dispatcher || opts.dispatcherKey));
+  } else if (!searching && issue === scope.ISSUE.MISSING_POD) {
+    rows = missingPodRows.filter((row) => scope.dispatcherMatches(
+        row, opts.dispatcher || opts.dispatcherKey));
+  } else {
+    rows = rows.filter((row) => !scope.isOptionDDispute(row));
+    if (!searching && issue && issue !== "all") {
+      rows = rows.filter((row) => row.issueType === issue);
+    }
+    if (!searching) {
+      rows = rows.filter((row) => scope.dispatcherMatches(
+          row, opts.dispatcher || opts.dispatcherKey));
+    }
+  }
+  const page = ownership.filterSortPaginate(rows, {
+    offset: opts && opts.offset,
+    limit: (opts && opts.limit) || 50,
+    maxLimit: 100,
+    sort,
+    urgentFirst: opts && opts.urgentFirst !== false,
+  });
+  return {
+    page,
+    disputeCount,
+    missingPodCount,
+    searching,
+  };
+}
+
+/**
  * @param {object} db Firestore.
  * @param {object} deps tenant, tcol, dashboardTasks, additionalCharges.
  * @param {object} opts issue, dispatcher, limit, offset.
@@ -315,11 +443,15 @@ async function listOperationalQueue(db, deps, opts) {
   const tenantId = tenant.tenantId;
   const sort = String(opts.sort || "").toLowerCase();
   const q = String(opts.q || "").trim();
+  const searching = Boolean(q);
   const loadSearch = /^\d{5,}$/.test(q);
   const requestedScan = Number(opts.scanLimit) || 0;
+  // A search has to see the whole open set for the tab, not the first
+  // page of whatever sort is active. Load numbers are a direct lookup.
   const fetchLimit = loadSearch ? 40 :
-    (requestedScan > 0 ? Math.min(requestedScan, 800) :
-      (Number(opts.offset) > 0 ? 800 : 220));
+    (searching ? 2000 :
+      (requestedScan > 0 ? Math.min(requestedScan, 800) :
+        (Number(opts.offset) > 0 ? 800 : 220)));
 
   const invoicePromise = loadInvoiceHoldRows(
       deps, tenant, tenantId, q, loadSearch, fetchLimit);
@@ -356,61 +488,50 @@ async function listOperationalQueue(db, deps, opts) {
       db, tasks.concat(invoiceRows), tenantId);
   let merged = scope.mergeQueueItems(visible)
       .map((row) => ownership.applyOwnerDefaults(row));
-  if (q && !loadSearch) {
-    const needle = q.toLowerCase();
-    merged = merged.filter((row) => {
-      const hay = [
-        row.loadNumber, row.carrierName, row.title, row.reason,
-        row.proNumber, row.subject, row.description,
-      ].filter(Boolean).join(" ").toLowerCase();
-      return hay.includes(needle);
-    });
-  }
   const phase = String(opts.chargePhase || "").toLowerCase();
   const issue = String(opts.issue || "all").toLowerCase();
-  const disputeRows = merged.filter((row) =>
-    scope.isOptionDDispute(row));
-  const disputeCount = disputeRows.length;
-  let missingPodRows = merged.filter((row) =>
-    podDash.isMissingPodDashboardItem(row));
+  const scannedDisputeCount = merged.filter((row) =>
+    scope.isOptionDDispute(row)).length;
   // The mixed scan is only the newest open tasks. Missing POD and missing
   // rate live further back, so those folders load their own holds.
+  // Search stays on the current tab, but does not switch to a status
+  // folder just because that sub-filter is selected.
   const wantsMissingPod = phase === "missing_pod" ||
-    issue === scope.ISSUE.MISSING_POD;
+    (!searching && issue === scope.ISSUE.MISSING_POD);
+  let replacedWithFolder = false;
   if (wantsMissingPod) {
     const targeted = await loadIssueRows(
         db, deps, tenant, tenantId, scope.ISSUE.MISSING_POD);
-    if (targeted && targeted.length) missingPodRows = targeted;
-  }
-  const missingPodCount = missingPodRows.length;
-  if (phase === "dispute") {
-    merged = disputeRows;
-  } else if (wantsMissingPod) {
-    merged = missingPodRows.filter((row) =>
-      scope.dispatcherMatches(row, opts.dispatcher || opts.dispatcherKey));
-  } else if (issue === scope.ISSUE.MISSING_RATE) {
+    if (targeted && targeted.length) {
+      merged = targeted;
+      replacedWithFolder = true;
+    }
+  } else if (!searching && phase !== "dispute" &&
+      issue === scope.ISSUE.MISSING_RATE) {
     const targeted = await loadIssueRows(
         db, deps, tenant, tenantId, scope.ISSUE.MISSING_RATE);
-    const rateRows = targeted && targeted.length ? targeted :
-      merged.filter((row) => row.issueType === scope.ISSUE.MISSING_RATE);
-    merged = rateRows.filter((row) => scope.dispatcherMatches(
-        row, opts.dispatcher || opts.dispatcherKey));
-  } else {
-    merged = merged.filter((row) => !scope.isOptionDDispute(row));
-    if (issue && issue !== "all") {
-      merged = merged.filter((row) => row.issueType === issue);
+    if (targeted && targeted.length) {
+      merged = targeted;
+      replacedWithFolder = true;
     }
-    const dispatcher = opts.dispatcher || opts.dispatcherKey || "";
-    merged = merged.filter((row) => scope.dispatcherMatches(row, dispatcher));
   }
 
-  const page = ownership.filterSortPaginate(merged, {
+  const selected = selectOperationalRows(merged, {
+    q,
+    range: opts.range,
+    now: opts.now,
+    chargePhase: phase,
+    issue,
+    dispatcher: opts.dispatcher || opts.dispatcherKey || "",
+    sort,
     offset: opts.offset,
     limit: opts.limit || 50,
-    maxLimit: 100,
-    sort,
-    urgentFirst: opts.urgentFirst !== false,
+    urgentFirst: opts.urgentFirst,
   });
+  const page = selected.page;
+  const disputeCount = (!searching || replacedWithFolder) ?
+    scannedDisputeCount : selected.disputeCount;
+  const missingPodCount = selected.missingPodCount;
   // Email HTML is loaded when a row is opened, not with every page.
   page.items.forEach((item) => {
     if (item) item.body = null;
@@ -437,4 +558,8 @@ module.exports = {
   listOperationalQueue,
   invoiceHoldRow,
   holdIssueForInvoice,
+  queueRowMatchesQuery,
+  queueRowInRange,
+  selectOperationalRows,
+  SEARCH_RANGE_DAYS,
 };

@@ -211,16 +211,103 @@ async function createNotification(db, data) {
   }
 }
 
+const NOTIF_RANGE_DAYS = Object.freeze({
+  day: 1,
+  week: 7,
+  month: 30,
+  year: 365,
+});
+
+/**
+ * @param {object} row Notification.
+ * @param {string} query Search text.
+ * @return {boolean}
+ */
+function notificationMatchesQuery(row, query) {
+  const needle = String(query || "").trim().toLowerCase();
+  if (!needle) return true;
+  const load = String(row && row.loadNumber == null ? "" : row.loadNumber)
+      .trim().toLowerCase();
+  if (load && (load === needle || load.includes(needle))) return true;
+  const hay = [
+    row && row.subject,
+    row && row.title,
+    row && row.reason,
+    row && row.carrierName,
+    row && row.from,
+    row && row.to,
+    row && row.proNumber,
+    row && row.body,
+    row && row.invoiceId,
+  ].filter((part) => part != null && String(part).trim() !== "")
+      .join(" ")
+      .toLowerCase();
+  return hay.includes(needle);
+}
+
+/**
+ * @param {object} row Notification.
+ * @param {string} range day|week|month|year. Blank keeps every row.
+ * @param {number} now Clock millis.
+ * @return {boolean}
+ */
+function notificationInRange(row, range, now) {
+  const days = NOTIF_RANGE_DAYS[String(range || "").toLowerCase()];
+  if (!days) return true;
+  const raw = row && (row.receivedAt || row.createdAt);
+  const at = Date.parse(raw || "");
+  if (!Number.isFinite(at)) return true;
+  const clock = Number(now) || Date.now();
+  return at >= clock - days * 24 * 60 * 60 * 1000;
+}
+
+/**
+ * Urgent-first orders old rows ahead. It does not drop the rest.
+ * @param {object[]} rows Notifications.
+ * @param {string} sort newest|oldest|urgent|amount.
+ * @param {number} now Clock millis.
+ * @return {object[]}
+ */
+function sortNotifications(rows, sort, now) {
+  const key = String(sort || "").toLowerCase();
+  const clock = Number(now) || Date.now();
+  const urgentMs = 14 * 24 * 60 * 60 * 1000;
+  const timeOf = (row) => {
+    const at = Date.parse((row && (row.receivedAt || row.createdAt)) || "");
+    return Number.isFinite(at) ? at : 0;
+  };
+  const amountOf = (row) => {
+    const n = Number(row && row.chargesTotal);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const urgent = (row) => {
+    const at = timeOf(row);
+    return Boolean(at) && (clock - at) >= urgentMs;
+  };
+  return rows.slice().sort((a, b) => {
+    if (key === "amount") return amountOf(b) - amountOf(a);
+    if (key === "urgent") {
+      if (urgent(a) !== urgent(b)) return urgent(a) ? -1 : 1;
+    }
+    const ta = timeOf(a);
+    const tb = timeOf(b);
+    return key === "oldest" ? ta - tb : tb - ta;
+  });
+}
+
 /**
  * Lists open notifications for a tenant.
  * opts.all returns every open row (daily unfinished digest).
+ * A search query scans the open set inside the selected time range
+ * and does not drop rows just because sort is urgent-first.
  * @param {object} db Firestore.
- * @param {object} opts tenantId, limit, type, all.
+ * @param {object} opts tenantId, limit, type, all, q, range, sort, offset.
  * @return {Promise<object>}
  */
 async function listNotifications(db, opts) {
   const tenantId = String(opts.tenantId || "default");
   const returnAll = opts && opts.all === true;
+  const q = String((opts && opts.q) || "").trim();
   let base = db.collection(NOTIF_COLLECTION)
       .where("tenantId", "==", tenantId)
       .where("status", "==", NOTIF_STATUS.OPEN)
@@ -232,10 +319,34 @@ async function listNotifications(db, opts) {
         .where("type", "==", String(opts.type))
         .orderBy("createdAt", "desc");
   }
-  const docs = returnAll ?
-    await collectNotifPage(base) :
-    await collectNotifPage(base, Math.min(Number(opts.limit) || 50, 100));
-  const notifications = docs.map(serializeNotif);
+  if (returnAll) {
+    const docs = await collectNotifPage(base);
+    const notifications = docs.map(serializeNotif);
+    return {notifications, openCount: notifications.length};
+  }
+  const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), 100);
+  const offset = Math.max(0, Number(opts.offset) || 0);
+  if (q) {
+    const docs = await collectNotifPage(base, 2000);
+    const now = Number(opts.now) || Date.now();
+    let rows = docs.map(serializeNotif).filter((row) =>
+      notificationMatchesQuery(row, q) &&
+      notificationInRange(row, opts.range, now));
+    rows = sortNotifications(rows, opts.sort, now);
+    const page = rows.slice(offset, offset + limit);
+    return {
+      notifications: page,
+      openCount: rows.length,
+      filteredCount: rows.length,
+      hasMore: offset + page.length < rows.length,
+      nextOffset: offset + page.length,
+      offset,
+      limit,
+    };
+  }
+  const docs = await collectNotifPage(base, limit);
+  const notifications = sortNotifications(
+      docs.map(serializeNotif), opts.sort, opts.now);
   return {notifications, openCount: notifications.length};
 }
 
@@ -323,7 +434,7 @@ async function markActed(db, opts) {
  */
 async function findOpenByRef(db, opts) {
   const tenantId = String(opts.tenantId || "default");
-  let query = db.collection(NOTIF_COLLECTION)
+  const query = db.collection(NOTIF_COLLECTION)
       .where("tenantId", "==", tenantId)
       .where("status", "==", NOTIF_STATUS.OPEN)
       .limit(20);
@@ -435,6 +546,9 @@ module.exports = {
   dismissOpenPodNotifications,
   isClearablePodNotification,
   notificationMatchesLoadQuery,
+  notificationMatchesQuery,
+  notificationInRange,
+  sortNotifications,
   uniqueNotificationsById,
   flagNotification,
   markActed,

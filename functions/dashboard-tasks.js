@@ -639,7 +639,9 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   const offset = Math.max(0, Number(opts.offset) || 0);
   // Page size used to cap both queries, so older disputes never left the
   // shared first page. Scan a wider window, then split by charge phase.
-  const scan = 200;
+  // Search asks for the open set (up to 2000), not the first page.
+  const scan = Math.min(
+      Math.max(Number(opts.fetchLimit) || 200, 50), 2000);
 
   const taskSnap = await db.collection(TASK_COLLECTION)
       .where("tenantId", "==", tenantId)
@@ -726,6 +728,24 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
     return tb - ta;
   });
+
+  if (opts.unpaged) {
+    const phase = String(opts.chargePhase || "").toLowerCase();
+    let working = visible;
+    if (phase === "dispute") {
+      working = visible.filter(isOptionDDispute);
+    } else if (phase === "missing_pod") {
+      working = visible.filter(isMissingPodItem);
+    } else if (phase !== "all") {
+      working = visible.filter((task) => !isOptionDDispute(task));
+    }
+    return {
+      tasks: working,
+      openCount: working.length,
+      disputeCount: visible.filter(isOptionDDispute).length,
+      missingPodCount: visible.filter(isMissingPodItem).length,
+    };
+  }
 
   return partitionByChargePhase(visible, {
     chargePhase: opts.chargePhase,
@@ -1069,6 +1089,60 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
   return {ok: true};
 }
 
+/**
+ * Open tasks and unresolved charges for one load number.
+ * Used when the search box is a load id so the result does not depend
+ * on which page the current sort would have returned.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object} opts tenantId, q.
+ * @return {Promise<{tasks: object[]}>}
+ */
+async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
+  const raw = String((opts && opts.q) || "").trim();
+  const tenantId = String((opts && opts.tenantId) || "default");
+  if (!raw) return {tasks: []};
+  const values = [raw];
+  if (/^\d+$/.test(raw)) values.push(Number(raw));
+  const tasks = [];
+  const seen = new Set();
+  for (const value of values) {
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", value)
+        .limit(40)
+        .get();
+    snap.forEach((doc) => {
+      if (seen.has(doc.id)) return;
+      const data = doc.data() || {};
+      if ((data.status || "") !== TASK_STATUS.OPEN) return;
+      if (!ownership.sameTenant(data.tenantId, tenantId)) return;
+      seen.add(doc.id);
+      tasks.push(serializeTaskDoc(doc));
+    });
+  }
+  const followCollection = additionalChargesMod &&
+    additionalChargesMod.FOLLOW_UP_COLLECTION;
+  if (followCollection) {
+    for (const value of values) {
+      // eslint-disable-next-line no-await-in-loop
+      const snap = await db.collection(followCollection)
+          .where("loadNumber", "==", value)
+          .limit(20)
+          .get();
+      snap.forEach((doc) => {
+        if (seen.has(`fu:${doc.id}`)) return;
+        const data = doc.data() || {};
+        if (data.resolved === true) return;
+        if (!ownership.sameTenant(data.tenantId, tenantId)) return;
+        seen.add(`fu:${doc.id}`);
+        tasks.push(chargeTaskFromFollowUp(doc.id, data, tenantId));
+      });
+    }
+  }
+  return {tasks};
+}
+
 module.exports = {
   TASK_COLLECTION,
   TASK_TYPE,
@@ -1087,4 +1161,5 @@ module.exports = {
   applyFollowUpDispute,
   chargeTaskFromFollowUp,
   dispatcherMatches,
+  searchOpenByLoadNumber,
 };

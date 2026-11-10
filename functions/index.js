@@ -840,6 +840,43 @@ async function kickPrimusWorkflow(invoiceId, extraBody) {
   };
 }
 
+/**
+ * Starts the Primus workflow resume used by setCustomerRate.
+ * The workflow keeps running after this caller stops waiting, so the
+ * dashboard can return once the request is accepted.
+ * @param {string} invoiceId Invoice document id.
+ * @param {object} extraBody resumeFrom and tenantId.
+ * @return {Promise<object>}
+ */
+async function startCustomerRateResume(invoiceId, extraBody) {
+  const url = workflowUrlForTms("primus");
+  if (!url) {
+    return {ok: false, error: "No Primus workflow URL configured"};
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        invoiceId,
+        tenantId: (extraBody && extraBody.tenantId) || "default",
+        ...(extraBody || {}),
+      }),
+      signal: controller.signal,
+    });
+    return {ok: resp.ok, status: resp.status};
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      return {ok: true, started: true};
+    }
+    return {ok: false, error: err && err.message};
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Tenant context for logging. Routing a tenant through every one of the dozens
 // of writeLog/logWorkflowStep calls in the ingestion + workflow paths would be
 // error-prone, so we stash the active tenant in async-local storage for the
@@ -15241,6 +15278,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
       dispatcher: req.query.dispatcher || req.query.dispatcherKey || "",
       q: req.query.q || req.query.load || "",
       sort: req.query.sort || "",
+      range: req.query.range || "",
     });
     return res.json({
       ok: true,
@@ -15496,12 +15534,16 @@ dashboardOpsHttp.init({
   dashboardTasks,
   additionalCharges,
   trashGmailMessage,
+  kickCustomerRateWorkflow: startCustomerRateResume,
 });
 
 exports.getDashboardAccessorials = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListAccessorials);
 exports.getDashboardNotifications = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
+exports.setDashboardCustomerRate = onRequest(
+    {invoker: "public", timeoutSeconds: 60},
+    dashboardOpsHttp.handleSetCustomerRate);
 exports.dismissDashboardNotification = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleDismissNotification);
 exports.flagDashboardNotification = onRequest(
