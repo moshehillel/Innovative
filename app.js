@@ -513,6 +513,7 @@
       }
     }
     bindDrawerActions();
+    bindRateForm(els.drawerFooter, item);
   }
 
   function loadRowDetail(item, kind) {
@@ -686,6 +687,91 @@
       `</div><div class="charge-form" data-charge-form="${bodyEsc(task.id)}" hidden></div>`;
   }
 
+  function invoiceIdOf(item) {
+    if (!item) return "";
+    const explicit = String(item.invoiceId || "").trim();
+    if (explicit) return explicit.replace(/^invoice:/, "");
+    const id = String(item.id || "");
+    return id.startsWith("invoice:") ? id.slice("invoice:".length) : "";
+  }
+
+  function itemNeedsCustomerRate(item) {
+    if (!item) return false;
+    const type = String(item.type || "").toLowerCase();
+    const issue = String(item.issueType || item.emailType || "").toLowerCase();
+    const blob = [
+      item.reason, item.decisionReason, item.decisionStage,
+      item.title, item.subject, item.description,
+    ].filter(Boolean).join(" ").toLowerCase();
+    if (type === "missing_rate" || type === "rate_missing" ||
+        issue === "missing_rate" || issue === "rate_missing") {
+      return true;
+    }
+    if (/missing customer rate|needs_customer_rate|missing_rate|no customer rate|rate_missing/.test(blob)) {
+      return true;
+    }
+    return item.source === "invoice" ||
+      String(item.id || "").startsWith("invoice:");
+  }
+
+  function customerRateFormHtml(item) {
+    if (!itemNeedsCustomerRate(item)) return "";
+    const invoiceId = invoiceIdOf(item);
+    if (!invoiceId && !item.loadNumber) return "";
+    return `<form class="rate-entry">` +
+      `<label>Customer rate</label>` +
+      `<input class="input rate-amount" type="number" min="0.01" step="0.01" ` +
+      `inputmode="decimal" placeholder="0.00" aria-label="Customer rate" required>` +
+      `<button type="submit" class="btn btn-sm btn-primary rate-save">Save rate</button>` +
+      `</form>`;
+  }
+
+  async function saveCustomerRate(item, rawAmount, button) {
+    const amount = Number(rawAmount);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      showError("Enter a customer rate greater than zero.");
+      return;
+    }
+    if (button) button.disabled = true;
+    const kind = drawerKind;
+    try {
+      const data = await postJson("/setDashboardCustomerRate", {
+        invoiceId: invoiceIdOf(item) || null,
+        loadNumber: item.loadNumber || null,
+        customerRate: amount,
+        taskId: item.source ? item.id : null,
+        notificationId: item.type && !item.source ? item.id : null,
+      });
+      const saved = `Customer rate of $${amount.toFixed(2)} saved.`;
+      showRunResult(data.resumed === false ?
+        `${saved} ${data.warning || "Workflow did not resume."}` :
+        `${saved} Workflow is resuming.`, false);
+      if (drawerItem === item) closeDrawer();
+      if (kind === "notif" || item.type && !item.source) {
+        await loadNotifications({reset: true});
+      } else {
+        await loadTasks({reset: true});
+      }
+    } catch (error) {
+      if (button) button.disabled = false;
+      showError(error.message || "Could not save the customer rate.");
+    }
+  }
+
+  function bindRateForm(root, item) {
+    const form = root && root.querySelector
+      ? root.querySelector(".rate-entry") : null;
+    if (!form || form.dataset.bound === "1") return;
+    form.dataset.bound = "1";
+    form.addEventListener("click", (event) => event.stopPropagation());
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const input = form.querySelector(".rate-amount");
+      saveCustomerRate(item, input && input.value, form.querySelector(".rate-save"));
+    });
+  }
+
   function openTaskDrawer(task) {
     const meta = taskTypeMeta(task);
     const why = task.reason || task.description || task.subject ||
@@ -713,6 +799,7 @@
       attachmentListHtml(task, task.source === "additionalCharges" ?
         "additionalCharges" : "task");
     const footer =
+      customerRateFormHtml(task) +
       renderChargeButtons(task) +
       `<div class="assign-row">` +
       `<select class="input input-select assign-person" aria-label="Assign to">` +
@@ -792,6 +879,7 @@
       `<div class="flag-form" hidden></div><div class="reply-form" hidden></div>`;
     const unhandled = n.type === "unhandled_email";
     const footer =
+      customerRateFormHtml(n) +
       `<button type="button" class="btn btn-outline btn-sm notif-dismiss">Done</button>` +
       `<button type="button" class="btn btn-ghost btn-sm notif-flag">Flag</button>` +
       (unhandled ?
@@ -1534,7 +1622,7 @@
       list = list.filter((t) => {
         const hay = [
           t.loadNumber, t.carrierName, t.customerName, t.title, t.subject,
-          t.reason, t.description, t.to, t.proNumber, t.id,
+          t.reason, t.description, t.to, t.proNumber, t.id, t.invoiceId,
           t.displayLabel, t.displayStatus, t.invoiceNumber,
         ].filter((v) => v != null && String(v).trim() !== "")
             .join(" ").toLowerCase();
@@ -1570,8 +1658,11 @@
       els.taskCountBadge.textContent = String(openTaskCount);
     }
     if (!list.length) {
-      const empty = chargePhase === "missing_pod" ?
-        "No open missing POD items." : "No open work for this filter.";
+      const searching = String(els.workspaceSearch?.value || "").trim();
+      const empty = searching ?
+        "No matches in this time range." :
+        (chargePhase === "missing_pod" ?
+          "No open missing POD items." : "No open work for this filter.");
       els.tasksContainer.innerHTML =
         `<p class="panel-empty">${empty}</p>`;
       return;
@@ -1617,6 +1708,7 @@
               <span class="work-status">${bodyEsc(statusLabel)}${urgent ? ' <span class="age-badge">OLD</span>' : ""}</span>
             </button>
             <span class="row-side-actions">
+              ${customerRateFormHtml(task)}
               ${isMissingPodItem(task) ?
                 `<button type="button" class="btn btn-sm btn-primary task-pod-done">POD done</button>` : ""}
               <button type="button" class="btn btn-sm btn-outline task-open">Review</button>
@@ -1683,6 +1775,7 @@
         e.stopPropagation();
         dismissTaskOptimistic(task);
       });
+      bindRateForm(row, task);
       row.querySelector(".row-assign")?.addEventListener("change", async (e) => {
         e.stopPropagation();
         const person = OPS_PEOPLE.find((p) => p.key === e.target.value);
@@ -1729,21 +1822,23 @@
     }
     try {
       const sort = els.workspaceSort?.value || "newest";
+      const q = String(els.workspaceSearch?.value || "").trim();
+      const searching = Boolean(q);
       const params = new URLSearchParams({
         limit: String(TASK_PAGE),
         offset: String(taskOffset),
         view: "queue",
-        issue: (chargePhase === "dispute" || chargePhase === "missing_pod") ?
+        issue: (searching || chargePhase === "dispute" ||
+            chargePhase === "missing_pod") ?
           "all" : (issueFilter || "all"),
         sort,
+        range: activeRange || "year",
       });
       if (chargePhase === "dispute") params.set("chargePhase", "dispute");
       else if (chargePhase === "missing_pod") {
         params.set("chargePhase", "missing_pod");
       }
-      const q = String(els.workspaceSearch?.value || "").trim();
-      const loadSearch = /^\d{5,}$/.test(q);
-      if (!loadSearch) {
+      if (!searching) {
         const key = personKey || dispatcherKey || "";
         const person = OPS_PEOPLE.find((p) => p.key === key);
         if (person) {
@@ -1786,15 +1881,16 @@
         page = page.filter(isMissingPodItem);
       } else {
         page = page.filter((task) => !isOptionDDispute(task));
-        if (issueFilter && issueFilter !== "all") {
+        if (!searching && issueFilter && issueFilter !== "all") {
           page = page.filter((task) => matchesIssueFilter(task, issueFilter));
         }
       }
       // Belt-and-suspenders: if the API still returns mixed owners, narrow
       // locally when a named dispatcher is selected and rows carry owners.
+      // Search covers every status in this tab, so the person filter stays off.
       const selected = OPS_PEOPLE.find(
           (p) => p.key === (personKey || dispatcherKey || ""));
-      if (selected && !loadSearch) {
+      if (selected && !searching) {
         const hasOwner = page.some((task) =>
           task.dispatcherKey || task.dispatcherEmail || task.dispatcherName);
         if (hasOwner) {
@@ -2101,6 +2197,7 @@
         sort,
       });
       if (sort !== "urgent") params.set("urgentFirst", "0");
+      params.set("range", activeRange || "year");
       const q = String(els.workspaceSearch?.value || "").trim();
       if (q) params.set("q", q);
       const data = await fetchJson(`/getDashboardNotifications?${params}`);
@@ -2235,6 +2332,13 @@
       btn.classList.toggle("is-active", btn.dataset.range === range);
     });
     loadStats(range);
+    const q = String(els.workspaceSearch?.value || "").trim();
+    if (!q) return;
+    if (activeTab === "notifications") loadNotifications({reset: true});
+    else if (activeTab === "tasks" || activeTab === "dispute" ||
+        activeTab === "missing_pod") {
+      loadTasks({reset: true});
+    }
   }
 
   els.rangeBtns.forEach((btn) => {

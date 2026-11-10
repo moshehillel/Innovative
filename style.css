@@ -331,6 +331,9 @@ body::before {
   border-radius: 999px; cursor: pointer;
 }
 .subnav-btn.is-active { background: var(--ic-brand); border-color: var(--ic-brand); color: #fff; }
+.rate-entry { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+.rate-entry .rate-amount { width: 7.5rem; }
+.row-side-actions .rate-entry { margin-bottom: 0; }
 .assign-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
 .assign-row .assign-who { min-width: 180px; flex: 1; }
 
