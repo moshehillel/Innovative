@@ -8,6 +8,29 @@
     X-Content-Type-Options = "nosniff"
     Cache-Control = "no-store"
 
+# index.html stays no-store (above). Static files are referenced with a
+# version query (app.js?v=..., style.css?v=..., config.js?v=...) that is
+# bumped on every change, so the browser may reuse them between visits.
+[[headers]]
+  for = "/app.js"
+  [headers.values]
+    Cache-Control = "public, max-age=86400"
+
+[[headers]]
+  for = "/style.css"
+  [headers.values]
+    Cache-Control = "public, max-age=86400"
+
+[[headers]]
+  for = "/config.js"
+  [headers.values]
+    Cache-Control = "public, max-age=86400"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=604800"
+
 [[edge_functions]]
   path = "/*"
   function = "basic-auth"
