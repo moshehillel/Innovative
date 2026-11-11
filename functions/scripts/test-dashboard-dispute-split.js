@@ -54,6 +54,9 @@ function mockDb(tasks, charges) {
         orderBy() {
           return query;
         },
+        select() {
+          return query;
+        },
         limit() {
           return query;
         },

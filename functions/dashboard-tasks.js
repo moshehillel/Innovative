@@ -26,6 +26,30 @@ const TASK_STATUS = Object.freeze({
 
 const AMOUNT_TOLERANCE_CENTS = 1;
 
+/** Task fields the list reads. Mirrors serializeTaskDoc. */
+const TASK_LIST_FIELDS = [
+  "tenantId", "type", "title", "description", "from", "to", "cc",
+  "loadNumber", "proNumber", "carrierName", "messageId", "invoiceId",
+  "followUpId", "department", "reason", "chargesTotal", "chargeSignature",
+  "status", "ownerBucket", "awaitingReplyFrom", "dispatcherEmail",
+  "dispatcherName", "dispatcherKey", "chargePhase", "followUpStatus",
+  "decision", "disputeNotes", "createdAt", "dismissedAt",
+];
+
+/** Follow-up fields the list reads. Leaves out email HTML. */
+const FOLLOW_UP_LIST_FIELDS = [
+  "tenantId", "status", "resolved", "chargePhase", "decision",
+  "disputeNotes", "notes", "chargesTotal", "invoiceAmount", "category",
+  "charges", "to", "cc", "dispatcherEmail", "dispatcherName",
+  "dispatcherKey", "ownerBucket", "loadNumber", "carrierName", "invoiceId",
+  "createdAt",
+];
+
+/** Notification fields used to find To/Cc for tasks with no dispatcher. */
+const NOTIFICATION_ROUTING_FIELDS = [
+  "to", "cc", "followUpId", "messageId", "loadNumber",
+];
+
 /**
  * @param {*} value Dollar amount.
  * @return {number|null} Integer cents, or null when unknown.
@@ -92,8 +116,16 @@ function workIdentity(item) {
  * @return {boolean}
  */
 function isSameWorkItem(a, b) {
-  const left = workIdentity(a);
-  const right = workIdentity(b);
+  return isSameIdentity(workIdentity(a), workIdentity(b));
+}
+
+/**
+ * Same rule as isSameWorkItem, on identities that were already computed.
+ * @param {object} left workIdentity of the first row.
+ * @param {object} right workIdentity of the second row.
+ * @return {boolean}
+ */
+function isSameIdentity(left, right) {
   if (!left.type || left.type !== right.type) return false;
   if (left.followUpId && right.followUpId &&
       left.followUpId === right.followUpId) {
@@ -174,9 +206,36 @@ function collapseDuplicateTasks(items) {
     const pb = find(b);
     if (pa !== pb) parent[pb] = pa;
   };
-  for (let i = 0; i < list.length; i++) {
-    for (let j = i + 1; j < list.length; j++) {
-      if (isSameWorkItem(list[i], list[j])) union(i, j);
+  // Identities are computed once, and only rows that share a follow-up id,
+  // an email id, or a type + load can be the same work item, so only those
+  // pairs are compared. Every true branch of isSameIdentity needs one of
+  // those three keys, so the groups are the same as comparing every pair.
+  const identities = list.map(workIdentity);
+  const buckets = new Map();
+  const bucketFor = (key) => {
+    let bucket = buckets.get(key);
+    if (!bucket) {
+      bucket = [];
+      buckets.set(key, bucket);
+    }
+    return bucket;
+  };
+  identities.forEach((identity, i) => {
+    if (!identity.type) return;
+    if (identity.followUpId) bucketFor(`f|${identity.followUpId}`).push(i);
+    if (identity.messageId) bucketFor(`m|${identity.messageId}`).push(i);
+    if (identity.loadNumber) {
+      bucketFor(`l|${identity.type}|${identity.loadNumber}`).push(i);
+    }
+  });
+  for (const bucket of buckets.values()) {
+    for (let x = 0; x < bucket.length; x++) {
+      for (let y = x + 1; y < bucket.length; y++) {
+        const i = bucket[x];
+        const j = bucket[y];
+        if (find(i) === find(j)) continue;
+        if (isSameIdentity(identities[i], identities[j])) union(i, j);
+      }
     }
   }
   const groups = new Map();
@@ -643,22 +702,29 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   const scan = Math.min(
       Math.max(Number(opts.fetchLimit) || 200, 50), 2000);
 
-  const taskSnap = await db.collection(TASK_COLLECTION)
-      .where("tenantId", "==", tenantId)
-      .where("status", "==", TASK_STATUS.OPEN)
-      .orderBy("createdAt", "desc")
-      .limit(scan)
-      .get();
+  // The open tasks, the open follow-ups, and the notification routing rows
+  // do not depend on each other, so they are read together. Field masks keep
+  // email HTML and other large fields out of memory; only the fields below
+  // are ever read from these rows.
+  const routingPromise = loadNotificationRouting(db, tenantId);
+  const [taskSnap, chargeSnap] = await Promise.all([
+    db.collection(TASK_COLLECTION)
+        .where("tenantId", "==", tenantId)
+        .where("status", "==", TASK_STATUS.OPEN)
+        .orderBy("createdAt", "desc")
+        .select(...TASK_LIST_FIELDS)
+        .limit(scan)
+        .get(),
+    db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
+        .where("resolved", "==", false)
+        .orderBy("createdAt", "desc")
+        .select(...FOLLOW_UP_LIST_FIELDS)
+        .limit(scan)
+        .get(),
+  ]);
 
   const tasks = taskSnap.docs.map(serializeTaskDoc);
   const followById = new Map();
-
-  const chargeSnap = await db
-      .collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
-      .where("resolved", "==", false)
-      .orderBy("createdAt", "desc")
-      .limit(scan)
-      .get();
 
   chargeSnap.forEach((doc) => {
     const data = doc.data() || {};
@@ -674,7 +740,9 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
   if (missingIds.length && typeof db.getAll === "function") {
     const refs = missingIds.slice(0, 100).map((id) =>
       db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION).doc(id));
-    const snaps = await db.getAll(...refs);
+    const snaps = await db.getAll(...refs, {
+      fieldMask: FOLLOW_UP_LIST_FIELDS,
+    });
     snaps.forEach((snap) => {
       if (!snap.exists) return;
       const data = snap.data() || {};
@@ -720,7 +788,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     tasks.push(chargeTaskFromFollowUp(id, data, tenantId));
   });
 
-  await enrichTasksFromNotifications(db, tasks, tenantId);
+  await enrichTasksFromNotifications(db, tasks, tenantId, routingPromise);
 
   const visible = collapseDuplicateTasks(tasks);
   visible.sort((a, b) => {
@@ -757,29 +825,43 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
 }
 
 /**
+ * Newest open notifications, only the fields that route a task to a person.
+ * Never rejects: a failed read just skips the routing step.
+ * @param {object} db Firestore.
+ * @param {string} tenantId Tenant.
+ * @return {Promise<object|null>} Query snapshot, or null on failure.
+ */
+async function loadNotificationRouting(db, tenantId) {
+  try {
+    return await db.collection("dashboardNotifications")
+        .where("tenantId", "==", tenantId)
+        .where("status", "==", "open")
+        .orderBy("createdAt", "desc")
+        .select(...NOTIFICATION_ROUTING_FIELDS)
+        .limit(200)
+        .get();
+  } catch (err) {
+    console.error("[enrichTasksFromNotifications]", err.message);
+    return null;
+  }
+}
+
+/**
  * Older tasks lack dispatcher fields. Open notifications still store To/Cc
  * from the approval email, so reuse those to assign roster owners at list time.
  * @param {object} db Firestore.
  * @param {object[]} tasks Task rows.
  * @param {string} tenantId Tenant.
+ * @param {Promise<object>=} preloaded Routing read started earlier.
  * @return {Promise<void>}
  */
-async function enrichTasksFromNotifications(db, tasks, tenantId) {
+async function enrichTasksFromNotifications(
+    db, tasks, tenantId, preloaded) {
   const need = (tasks || []).filter((task) =>
     task && !task.dispatcherKey && !task.dispatcherEmail);
   if (!need.length) return;
-  let snap;
-  try {
-    snap = await db.collection("dashboardNotifications")
-        .where("tenantId", "==", tenantId)
-        .where("status", "==", "open")
-        .orderBy("createdAt", "desc")
-        .limit(200)
-        .get();
-  } catch (err) {
-    console.error("[enrichTasksFromNotifications]", err.message);
-    return;
-  }
+  const snap = preloaded ?
+    await preloaded : await loadNotificationRouting(db, tenantId);
   if (!snap || snap.empty) return;
   const byFollowUp = new Map();
   const byMessage = new Map();
@@ -1106,12 +1188,24 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
   if (/^\d+$/.test(raw)) values.push(Number(raw));
   const tasks = [];
   const seen = new Set();
-  for (const value of values) {
-    // eslint-disable-next-line no-await-in-loop
-    const snap = await db.collection(TASK_COLLECTION)
+  const followCollection = additionalChargesMod &&
+    additionalChargesMod.FOLLOW_UP_COLLECTION;
+  // All four lookups start together; rows are still added in the old order
+  // (tasks for each value, then follow-ups for each value).
+  const taskSnaps = values.map((value) =>
+    db.collection(TASK_COLLECTION)
         .where("loadNumber", "==", value)
         .limit(40)
-        .get();
+        .get());
+  const followSnaps = followCollection ? values.map((value) =>
+    db.collection(followCollection)
+        .where("loadNumber", "==", value)
+        .limit(20)
+        .get()) : [];
+  await Promise.all([...taskSnaps, ...followSnaps]);
+  for (const pending of taskSnaps) {
+    // eslint-disable-next-line no-await-in-loop
+    const snap = await pending;
     snap.forEach((doc) => {
       if (seen.has(doc.id)) return;
       const data = doc.data() || {};
@@ -1121,15 +1215,10 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
       tasks.push(serializeTaskDoc(doc));
     });
   }
-  const followCollection = additionalChargesMod &&
-    additionalChargesMod.FOLLOW_UP_COLLECTION;
   if (followCollection) {
-    for (const value of values) {
+    for (const pending of followSnaps) {
       // eslint-disable-next-line no-await-in-loop
-      const snap = await db.collection(followCollection)
-          .where("loadNumber", "==", value)
-          .limit(20)
-          .get();
+      const snap = await pending;
       snap.forEach((doc) => {
         if (seen.has(`fu:${doc.id}`)) return;
         const data = doc.data() || {};
@@ -1143,7 +1232,146 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
   return {tasks};
 }
 
+const DETAIL_BODY_CAP = 120000;
+
+/**
+ * @param {*} value Email HTML or text.
+ * @return {string|null}
+ */
+function capDetailBody(value) {
+  if (value == null || value === "") return null;
+  const text = String(value);
+  return text.length <= DETAIL_BODY_CAP ? text :
+    text.slice(0, DETAIL_BODY_CAP);
+}
+
+/**
+ * Rebuilds the additional-charge approval HTML when the email was not saved.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object} d Follow-up doc data.
+ * @return {string}
+ */
+function buildChargeFallbackHtml(additionalChargesMod, d) {
+  try {
+    const baseUrl = process.env.FUNCTION_BASE_URL ||
+      "https://us-central1-tai-invoice-automation.cloudfunctions.net";
+    const email = additionalChargesMod.buildAdditionalChargeApprovalEmail({
+      baseUrl,
+      invoiceId: d.invoiceId || "unknown",
+      tenantId: d.tenantId || "default",
+      loadNumber: d.loadNumber,
+      carrierName: d.carrierName,
+      customerName: d.customerName,
+      invoiceAmount: d.invoiceAmount,
+      primusAmount: d.primusAmount != null ? d.primusAmount : null,
+      charges: Array.isArray(d.charges) ? d.charges : [],
+      chargesTotal: d.chargesTotal,
+      category: d.category,
+      freightMismatch: d.freightMismatch || null,
+      hasCertificate: Boolean(d.hasCertificate),
+      dispatcherName: d.dispatcherName || null,
+      rateValidation: d.rateValidation || null,
+      customerRate: d.customerRate != null ? d.customerRate : null,
+      excludedInPrimusCount: d.excludedInPrimusCount || 0,
+    });
+    if (email && email.html) return String(email.html);
+  } catch (err) {
+    console.error("[buildChargeFallbackHtml]", err.message);
+  }
+  const esc = (v) => String(v == null ? "" : v)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  const money = (n) => {
+    const num = Number(n);
+    return Number.isFinite(num) ? `$${num.toFixed(2)}` : "—";
+  };
+  const rows = (Array.isArray(d.charges) ? d.charges : []).map((c) => {
+    const name = esc(c.name || c.description || c.type || "Charge");
+    const amt = money(c.amount != null ? c.amount : c.total);
+    return `<tr><td style="padding:6px 12px 6px 0">${name}</td>` +
+      `<td style="padding:6px 0;text-align:right">${amt}</td></tr>`;
+  }).join("");
+  return `<div style="font-family:Arial,sans-serif;color:#111827;` +
+    `font-size:15px;line-height:1.55">` +
+    `<p style="margin:0 0 12px"><strong>Additional charge approval` +
+    `</strong></p>` +
+    `<p style="margin:0 0 6px">Load ${esc(d.loadNumber || "—")} · ` +
+    `${esc(d.carrierName || "—")}</p>` +
+    `<p style="margin:0 0 12px">Charges total ` +
+    `<strong>${money(d.chargesTotal)}</strong></p>` +
+    (rows ? `<table style="border-collapse:collapse;width:100%;` +
+      `max-width:420px">${rows}</table>` : "") +
+    `<p style="margin:16px 0 0;color:#374151">Choose A–E below to ` +
+    `decide.</p></div>`;
+}
+
+/**
+ * Email HTML and charge lines for one open row. Tenant-checked.
+ * The work list does not carry this payload; the dashboard asks for it when
+ * a row is opened.
+ * @param {object} db Firestore.
+ * @param {object} additionalChargesMod additional-charges module.
+ * @param {object} opts id, source, tenantId.
+ * @return {Promise<object>}
+ */
+async function loadItemDetail(db, additionalChargesMod, opts) {
+  const id = String((opts && opts.id) || "").trim();
+  const source = String((opts && opts.source) || "dashboardTasks");
+  const tenantId = String((opts && opts.tenantId) || "default");
+  if (!id) return {ok: false, error: "Not found."};
+  if (source === "invoice" || id.startsWith("invoice:")) {
+    return {ok: true, body: null, charges: []};
+  }
+  const followCollection = additionalChargesMod &&
+    additionalChargesMod.FOLLOW_UP_COLLECTION;
+  let taskData = null;
+  let followId = null;
+  let type = null;
+  if (source === "additionalCharges") {
+    followId = id;
+    type = TASK_TYPE.ADDITIONAL_CHARGE;
+  } else {
+    const snap = await db.collection(TASK_COLLECTION).doc(id).get();
+    if (!snap.exists) return {ok: false, error: "Not found."};
+    taskData = snap.data() || {};
+    if (!ownership.sameTenant(taskData.tenantId, tenantId)) {
+      return {ok: false, error: "Not found."};
+    }
+    followId = taskData.followUpId || null;
+    type = taskData.type || null;
+  }
+  let follow = null;
+  if (followId && followCollection) {
+    const snap = await db.collection(followCollection).doc(followId).get();
+    if (snap.exists) follow = snap.data() || {};
+  }
+  if (source === "additionalCharges" && !follow) {
+    return {ok: false, error: "Not found."};
+  }
+  if (follow && !ownership.sameTenant(follow.tenantId, tenantId)) {
+    if (source === "additionalCharges") {
+      return {ok: false, error: "Not found."};
+    }
+    follow = null;
+  }
+  const stored = taskData ? capDetailBody(taskData.body) : null;
+  const emailHtml = follow ? capDetailBody(follow.emailHtml) : null;
+  let body = null;
+  if (source === "additionalCharges") {
+    body = emailHtml || buildChargeFallbackHtml(additionalChargesMod, follow);
+  } else if (stored || emailHtml) {
+    body = stored || emailHtml;
+  } else if (follow && type === TASK_TYPE.ADDITIONAL_CHARGE) {
+    body = buildChargeFallbackHtml(additionalChargesMod, follow);
+  }
+  // Charge lines are left out on purpose. The A-F form seeds its lines from
+  // them, and this production line has never sent them, so the form keeps
+  // starting with one empty line exactly as it does today.
+  return {ok: true, body, charges: []};
+}
+
 module.exports = {
+  loadItemDetail,
   TASK_COLLECTION,
   TASK_TYPE,
   TASK_STATUS,

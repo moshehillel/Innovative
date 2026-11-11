@@ -56,22 +56,27 @@ async function loadIssueRows(db, deps, tenant, tenantId, issue) {
   const taskType = issue === scope.ISSUE.MISSING_POD ?
     "missing_pod" : "missing_rate";
   try {
-    const invSnap = await deps.tcol(tenant, "invoices")
+    // Invoice holds and open tasks are independent reads; run them together.
+    const invPromise = deps.tcol(tenant, "invoices")
         .where("decisionStage", "in", stages)
         .select(...INVOICE_HOLD_FIELDS)
         .limit(800)
         .get();
-    let taskDocs = [];
-    try {
-      const taskSnap = await deps.tcol(tenant, "dashboardTasks")
-          .where("status", "==", "open")
-          .where("type", "==", taskType)
-          .limit(500)
-          .get();
-      taskDocs = taskSnap.docs || [];
-    } catch (taskErr) {
-      console.warn("[loadIssueRows] tasks", taskErr && taskErr.message);
-    }
+    const taskPromise = (async () => {
+      try {
+        const taskSnap = await deps.tcol(tenant, "dashboardTasks")
+            .where("status", "==", "open")
+            .where("type", "==", taskType)
+            .select(...ISSUE_TASK_FIELDS)
+            .limit(500)
+            .get();
+        return taskSnap.docs || [];
+      } catch (taskErr) {
+        console.warn("[loadIssueRows] tasks", taskErr && taskErr.message);
+        return [];
+      }
+    })();
+    const [invSnap, taskDocs] = await Promise.all([invPromise, taskPromise]);
     const invoices = [];
     invSnap.forEach((doc) => {
       const row = invoiceHoldRow(doc, tenantId);
@@ -139,6 +144,30 @@ function holdIssueForInvoice(data) {
   return issueType;
 }
 
+const DISMISS_LOOKUP_CONCURRENCY = 40;
+
+/** Task fields loadIssueRows copies into a row. No email HTML. */
+const ISSUE_TASK_FIELDS = [
+  "type", "status", "tenantId", "loadNumber", "proNumber", "carrierName",
+  "title", "reason", "subject", "description", "ownerEmail",
+  "dispatcherEmail", "dispatcherName", "createdAt", "invoiceId",
+];
+
+/**
+ * Rows the done-task check is allowed to hide. Matches the keep/drop rule in
+ * omitRowsClosedByDismissedTask.
+ * @param {object} row Queue row.
+ * @return {boolean}
+ */
+function canBeClosedByDismissedTask(row) {
+  if (!row) return false;
+  if (row.source === "invoice") return true;
+  const type = String(row.type || "");
+  return type === "missing_rate" || type === "rate_missing" ||
+    type === "missing_pod" || type === "signed_pod" ||
+    type === "pod_discrepancy" || type === "invoice_hold";
+}
+
 /**
  * Drops rows the dispatcher already marked done.
  * A dismissed task used to leave the invoice hold or a new copy on the list.
@@ -149,9 +178,14 @@ function holdIssueForInvoice(data) {
  */
 async function omitRowsClosedByDismissedTask(db, rows, tenantId) {
   const list = Array.isArray(rows) ? rows : [];
-  const invoiceIds = [...new Set(list.map((row) =>
+  // Only invoice holds and these task types can be dropped below. Every
+  // other row is kept whatever the lookup finds, so it is not looked up.
+  // A dismissed task can only close a row through that row's own invoice
+  // id or load, so looking up just these rows hides exactly the same rows.
+  const lookup = list.filter(canBeClosedByDismissedTask);
+  const invoiceIds = [...new Set(lookup.map((row) =>
     String((row && row.invoiceId) || "").trim()).filter(Boolean))];
-  const loads = [...new Set(list.map((row) =>
+  const loads = [...new Set(lookup.map((row) =>
     String((row && row.loadNumber) || "").trim()).filter(Boolean))];
   const closed = new Set();
   const remember = (data) => {
@@ -163,33 +197,34 @@ async function omitRowsClosedByDismissedTask(db, rows, tenantId) {
     if (invoiceId) closed.add(`${invoiceId}|${issue}`);
     if (load) closed.add(`load:${load}|${issue}`);
   };
-  const pull = async (field, values) => {
-    const chunks = [];
+  const jobs = [];
+  const queueLookup = (field, values) => {
     for (let i = 0; i < values.length; i += 10) {
       const chunk = values.slice(i, i + 10);
-      if (chunk.length) chunks.push(chunk);
-    }
-    const concurrency = 8;
-    for (let i = 0; i < chunks.length; i += concurrency) {
-      const batch = chunks.slice(i, i + concurrency);
-      // eslint-disable-next-line no-await-in-loop
-      const snaps = await Promise.all(batch.map((chunk) =>
-        db.collection("dashboardTasks")
-            .where(field, "in", chunk)
-            .select(...DISMISS_LOOKUP_FIELDS)
-            .get()));
-      snaps.forEach((snap) => {
-        snap.forEach((doc) => remember(doc.data() || {}));
-      });
+      if (chunk.length) jobs.push({field, chunk});
     }
   };
   try {
     const numeric = loads.filter((load) => /^\d+$/.test(load)).map(Number);
-    await Promise.all([
-      pull("invoiceId", invoiceIds),
-      pull("loadNumber", loads),
-      pull("loadNumber", numeric),
-    ]);
+    queueLookup("invoiceId", invoiceIds);
+    queueLookup("loadNumber", loads);
+    queueLookup("loadNumber", numeric);
+    // Every lookup is independent, so they run together (bounded).
+    let next = 0;
+    const worker = async () => {
+      while (next < jobs.length) {
+        const job = jobs[next];
+        next += 1;
+        // eslint-disable-next-line no-await-in-loop
+        const snap = await db.collection("dashboardTasks")
+            .where(job.field, "in", job.chunk)
+            .select(...DISMISS_LOOKUP_FIELDS)
+            .get();
+        snap.forEach((doc) => remember(doc.data() || {}));
+      }
+    };
+    await Promise.all(Array.from(
+        {length: Math.min(DISMISS_LOOKUP_CONCURRENCY, jobs.length)}, worker));
   } catch (err) {
     console.error("[dashboard-queue] dismissed rows:", err.message);
     return list;
@@ -456,6 +491,21 @@ async function listOperationalQueue(db, deps, opts) {
   const invoicePromise = loadInvoiceHoldRows(
       deps, tenant, tenantId, q, loadSearch, fetchLimit);
 
+  // The Missing POD and Missing rate folders load their own holds. That read
+  // does not depend on the mixed scan, so it starts now instead of after it.
+  const earlyPhase = String(opts.chargePhase || "").toLowerCase();
+  const earlyIssue = String(opts.issue || "all").toLowerCase();
+  let folderIssue = null;
+  if (earlyPhase === "missing_pod" ||
+      (!searching && earlyIssue === scope.ISSUE.MISSING_POD)) {
+    folderIssue = scope.ISSUE.MISSING_POD;
+  } else if (!searching && earlyPhase !== "dispute" &&
+      earlyIssue === scope.ISSUE.MISSING_RATE) {
+    folderIssue = scope.ISSUE.MISSING_RATE;
+  }
+  const folderPromise = folderIssue ?
+    loadIssueRows(db, deps, tenant, tenantId, folderIssue) : null;
+
   let listedPromise;
   if (loadSearch &&
       typeof deps.dashboardTasks.searchOpenByLoadNumber === "function") {
@@ -499,17 +549,8 @@ async function listOperationalQueue(db, deps, opts) {
   const wantsMissingPod = phase === "missing_pod" ||
     (!searching && issue === scope.ISSUE.MISSING_POD);
   let replacedWithFolder = false;
-  if (wantsMissingPod) {
-    const targeted = await loadIssueRows(
-        db, deps, tenant, tenantId, scope.ISSUE.MISSING_POD);
-    if (targeted && targeted.length) {
-      merged = targeted;
-      replacedWithFolder = true;
-    }
-  } else if (!searching && phase !== "dispute" &&
-      issue === scope.ISSUE.MISSING_RATE) {
-    const targeted = await loadIssueRows(
-        db, deps, tenant, tenantId, scope.ISSUE.MISSING_RATE);
+  if (folderPromise) {
+    const targeted = await folderPromise;
     if (targeted && targeted.length) {
       merged = targeted;
       replacedWithFolder = true;
