@@ -15260,10 +15260,37 @@ exports.getDashboardStats = onRequest(async (req, res) => {
   }
 });
 
-exports.getDashboardTasks = onRequest(async (req, res) => {
+// minInstances keeps one copy warm so the first page load after an idle
+// period does not wait several seconds for a cold start.
+exports.getDashboardTasks = onRequest({
+  invoker: "public",
+  minInstances: 1,
+}, async (req, res) => {
   if (applyDashboardCors(req, res)) return;
+  const startedAt = Date.now();
   try {
     const tenant = await resolveDashboardTenant(req);
+    if (String(req.query.detail || "") === "1") {
+      // Email HTML for one opened row. The list never carries it.
+      const detail = await dashboardTasks.loadItemDetail(
+          db, additionalCharges, {
+            tenantId: tenant.tenantId,
+            id: req.query.id,
+            source: req.query.source || "dashboardTasks",
+          });
+      if (!detail.ok) {
+        return res.status(404).json({
+          ok: false,
+          error: detail.error || "Not found.",
+        });
+      }
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        body: detail.body || null,
+        charges: detail.charges || [],
+      });
+    }
     const limit = Math.min(Number(req.query.limit || 50), 100);
     const result = await dashboardQueue.listOperationalQueue(db, {
       tenant,
@@ -15280,6 +15307,7 @@ exports.getDashboardTasks = onRequest(async (req, res) => {
       sort: req.query.sort || "",
       range: req.query.range || "",
     });
+    res.set("Server-Timing", `list;dur=${Date.now() - startedAt}`);
     return res.json({
       ok: true,
       tenantId: tenant.tenantId,
@@ -15540,7 +15568,8 @@ dashboardOpsHttp.init({
 exports.getDashboardAccessorials = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListAccessorials);
 exports.getDashboardNotifications = onRequest(
-    {invoker: "public"}, dashboardOpsHttp.handleListNotifications);
+    {invoker: "public", minInstances: 1},
+    dashboardOpsHttp.handleListNotifications);
 exports.setDashboardCustomerRate = onRequest(
     {invoker: "public", timeoutSeconds: 60},
     dashboardOpsHttp.handleSetCustomerRate);

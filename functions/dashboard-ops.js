@@ -16,6 +16,16 @@ const admin = require("firebase-admin");
 
 const NOTIF_COLLECTION = "dashboardNotifications";
 
+/** Every field serializeNotif reads except the email body. */
+const NOTIF_LIST_FIELDS = [
+  "tenantId", "type", "status", "title", "subject", "from", "to", "cc",
+  "messageId", "invoiceId", "followUpId", "loadNumber", "proNumber",
+  "carrierName", "department", "reason", "emailType", "chargesTotal",
+  "chargeOptions", "emailSent", "ownerBucket", "awaitingReplyFrom",
+  "dispatcherEmail", "dispatcherName", "dispatcherKey", "receivedAt",
+  "emailReceivedAt", "createdAt", "dismissedAt", "flaggedAt", "flagNote",
+];
+
 const NOTIF_TYPE = Object.freeze({
   OPS_EMAIL: "ops_email",
   UNHANDLED_EMAIL: "unhandled_email",
@@ -344,10 +354,32 @@ async function listNotifications(db, opts) {
       limit,
     };
   }
-  const docs = await collectNotifPage(base, limit);
+  // The first page does not carry email HTML. The dashboard loads it with
+  // loadNotificationDetail when a row is opened.
+  const docs = await collectNotifPage(
+      base.select(...NOTIF_LIST_FIELDS), limit);
   const notifications = sortNotifications(
       docs.map(serializeNotif), opts.sort, opts.now);
   return {notifications, openCount: notifications.length};
+}
+
+/**
+ * Email body for one notification. Other tenants get not-found.
+ * @param {object} db Firestore.
+ * @param {object} opts id, tenantId.
+ * @return {Promise<object>}
+ */
+async function loadNotificationDetail(db, opts) {
+  const id = String((opts && opts.id) || "").trim();
+  const tenantId = String((opts && opts.tenantId) || "default");
+  if (!id) return {ok: false, error: "Not found."};
+  const snap = await db.collection(NOTIF_COLLECTION).doc(id).get();
+  if (!snap.exists) return {ok: false, error: "Not found."};
+  const data = snap.data() || {};
+  if (String(data.tenantId || "default") !== tenantId) {
+    return {ok: false, error: "Not found."};
+  }
+  return {ok: true, body: data.body || null};
 }
 
 /**
@@ -542,6 +574,7 @@ module.exports = {
   isDashboardOpsPrimary,
   createNotification,
   listNotifications,
+  loadNotificationDetail,
   dismissNotification,
   dismissOpenPodNotifications,
   isClearablePodNotification,

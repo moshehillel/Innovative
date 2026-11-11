@@ -77,6 +77,23 @@ async function handleListNotifications(req, res) {
   if (cors(req, res)) return;
   try {
     const tenant = await deps.resolveDashboardTenant(req);
+    if (String(req.query.detail || "") === "1") {
+      const detail = await dashboardOps.loadNotificationDetail(deps.db, {
+        id: req.query.id,
+        tenantId: tenant.tenantId,
+      });
+      if (!detail.ok) {
+        return res.status(404).json({
+          ok: false,
+          error: detail.error || "Not found.",
+        });
+      }
+      return res.json({
+        ok: true,
+        tenantId: tenant.tenantId,
+        body: detail.body || null,
+      });
+    }
     const result = await dashboardOps.listNotifications(deps.db, {
       tenantId: tenant.tenantId,
       limit: req.query.limit,
