@@ -298,17 +298,54 @@
     return res.json();
   }
 
-  async function postJson(path, body) {
-    const res = await fetch(`${BASE_URL}${path}?${tenantQuery}`, {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(body || {}),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok || data.ok === false) {
-      throw new Error(data.error || data.details || `Request failed (${res.status})`);
+  /*
+   * Short-lived copy of list responses, used only when someone switches
+   * tabs. Every list load writes it, any change (a POST of any kind) wipes
+   * it, and Refresh, Load more, search and filters never read it. A copy is
+   * at most NAV_CACHE_TTL_MS old, so a tab switch inside that window shows
+   * the same rows the previous load of that tab showed.
+   */
+  const NAV_CACHE_TTL_MS = 15000;
+  const navCache = new Map();
+  let navCacheGen = 0;
+
+  function clearNavCache() {
+    navCacheGen += 1;
+    navCache.clear();
+  }
+
+  async function fetchListJson(path, {useCache = false} = {}) {
+    if (useCache) {
+      const hit = navCache.get(path);
+      if (hit && Date.now() - hit.at < NAV_CACHE_TTL_MS) {
+        return structuredClone(hit.data);
+      }
+    }
+    const gen = navCacheGen;
+    const data = await fetchJson(path);
+    // A change that happened while this list was in flight makes it stale.
+    if (gen === navCacheGen) {
+      navCache.set(path, {at: Date.now(), data: structuredClone(data)});
     }
     return data;
+  }
+
+  async function postJson(path, body) {
+    clearNavCache();
+    try {
+      const res = await fetch(`${BASE_URL}${path}?${tenantQuery}`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body || {}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) {
+        throw new Error(data.error || data.details || `Request failed (${res.status})`);
+      }
+      return data;
+    } finally {
+      clearNavCache();
+    }
   }
 
   function switchTab(tab) {
@@ -358,9 +395,9 @@
       switchTab(tab);
       if ((tab === "tasks" || tab === "dispute" || tab === "missing_pod") &&
           tab !== prev) {
-        loadTasks({reset: true});
+        loadTasks({reset: true, useCache: true});
       } else if (tab === "notifications" && tab !== prev) {
-        loadNotifications({reset: true});
+        loadNotifications({reset: true, useCache: true});
       }
     });
   });
@@ -1824,7 +1861,7 @@
     els.loadMoreTasksBtn.textContent = loading ? "Loading…" : "Load more tasks";
   }
 
-  async function loadTasks({reset = true} = {}) {
+  async function loadTasks({reset = true, useCache = false} = {}) {
     const seq = ++taskLoadSeq;
     if (reset) {
       taskOffset = 0;
@@ -1863,7 +1900,7 @@
         }
       }
       if (q) params.set("q", q);
-      const data = await fetchJson(`/getDashboardTasks?${params}`);
+      const data = await fetchListJson(`/getDashboardTasks?${params}`, {useCache});
       if (seq !== taskLoadSeq) return;
       if (data.disputeCount != null && chargePhase !== "dispute") {
         disputeCount = data.disputeCount;
@@ -2194,7 +2231,7 @@
     els.loadMoreNotifsBtn.textContent = loading ? "Loading…" : "Load more";
   }
 
-  async function loadNotifications({reset = true} = {}) {
+  async function loadNotifications({reset = true, useCache = false} = {}) {
     if (reset) {
       notifOffset = 0;
       notifHasMore = false;
@@ -2214,7 +2251,7 @@
       params.set("range", activeRange || "year");
       const q = String(els.workspaceSearch?.value || "").trim();
       if (q) params.set("q", q);
-      const data = await fetchJson(`/getDashboardNotifications?${params}`);
+      const data = await fetchListJson(`/getDashboardNotifications?${params}`, {useCache});
       const page = data.notifications || [];
       if (data.bucketCounts) bucketCounts = data.bucketCounts;
       notifHasMore = Boolean(data.hasMore);
@@ -2242,8 +2279,22 @@
     return String(value);
   }
 
+  // chart.js loads deferred so it no longer blocks the first paint. If the
+  // stats arrive first, the chart is drawn as soon as the library is ready.
+  let pendingChart = null;
+  window.addEventListener("load", () => {
+    if (!pendingChart) return;
+    const next = pendingChart;
+    pendingChart = null;
+    renderChart(next.series, next.range);
+  });
+
   function renderChart(series, range) {
-    if (!els.chartCanvas || !window.Chart) return;
+    if (!els.chartCanvas) return;
+    if (!window.Chart) {
+      pendingChart = {series, range};
+      return;
+    }
     const labels = (series || []).map((p) => formatPeriodLabel(p.period, range));
     const datasets = [
       {
@@ -2569,9 +2620,11 @@
     });
   }
 
+  // The work list is what people came for, so its request goes out first.
+  // Mail status, stats and notifications start in the same tick right after.
   switchTab("tasks");
-  loadMailStatus();
-  setActiveRange(activeRange);
   loadTasks({reset: true});
   loadNotifications({reset: true});
+  loadMailStatus();
+  setActiveRange(activeRange);
 })();
