@@ -29,6 +29,8 @@ const workflowErrors = require("./workflow-error-messages");
 const brokerCommission = require("./broker-commission");
 const undeliveredReport = require("./undelivered-shipment-report");
 const deliveredUninvoicedReport = require("./delivered-uninvoiced-report");
+const djDirectLtlWeeklyReport =
+  require("./dj-direct-ltl-weekly-invoice-report");
 const additionalCharges = require("./additional-charges");
 const emailActionTokens = require("./email-action-tokens");
 const fedexFreightPod = require("./fedex-freight-pod");
@@ -2355,6 +2357,104 @@ exports.reportDeliveredUninvoicedShipmentsWeekly = onSchedule({
     throw error;
   }
 });
+
+/**
+ * DJ Direct LTL weekly customer-invoice CSV. Query: ?dryRun=1, ?sample=1.
+ */
+exports.reportDjDirectLtlInvoices = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "512MiB"},
+    handleReportDjDirectLtlInvoices);
+
+/** Monday 8:00 AM America/New_York — prior-week DJ Direct LTL invoices CSV. */
+exports.reportDjDirectLtlInvoicesWeekly = onSchedule({
+  schedule: "0 8 * * 1",
+  timeZone: "America/New_York",
+  timeoutSeconds: 540,
+  memory: "512MiB",
+}, async () => {
+  try {
+    const result = await djDirectLtlWeeklyReport.runDjDirectLtlWeeklyReport({});
+    if (!result.ok) {
+      await writeLog("error", "report",
+          "DJ Direct LTL weekly invoice report failed", {
+            error: result.error || "unknown",
+          });
+      await saveOutboundEmail({
+        type: "dj_direct_ltl_weekly_report_failed",
+        subject: "System issue — DJ Direct LTL weekly report failed",
+        html: `<p>The DJ Direct LTL weekly invoice report failed.</p>` +
+          `<p>${escapeHtml(result.error || "Unknown error")}</p>`,
+        systemError: true,
+      });
+    }
+  } catch (error) {
+    await writeLog("error", "report",
+        "DJ Direct LTL weekly invoice report threw", {
+          error: error.message,
+        });
+    await saveOutboundEmail({
+      type: "dj_direct_ltl_weekly_report_failed",
+      subject: "System issue — DJ Direct LTL weekly report failed",
+      html: `<p>The DJ Direct LTL weekly invoice report failed.</p>` +
+        `<p>${escapeHtml(error.message)}</p>`,
+      systemError: true,
+    });
+    throw error;
+  }
+});
+
+/**
+ * @param {object} req HTTPS request.
+ * @param {object} res HTTPS response.
+ * @return {Promise<object>}
+ */
+async function handleReportDjDirectLtlInvoices(req, res) {
+  try {
+    if (req.method !== "POST" && req.method !== "GET") {
+      return res.status(405).json({ok: false, error: "Use GET or POST"});
+    }
+    const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true" ||
+      (req.body && (req.body.dryRun === true || req.body.dryRun === "1"));
+    const sample = req.query.sample === "1" || req.query.sample === "true" ||
+      (req.body && (req.body.sample === true || req.body.sample === "1"));
+    const result = await djDirectLtlWeeklyReport.runDjDirectLtlWeeklyReport({
+      dryRun,
+      sample,
+    });
+    if (dryRun && result.csv) {
+      return res.status(200).json({
+        ok: true,
+        dryRun: true,
+        count: result.count,
+        window: {
+          start: result.window.start.toISOString(),
+          end: result.window.end.toISOString(),
+          label: result.window.label,
+        },
+        filename: result.filename,
+        to: result.to,
+        subject: result.subject,
+        loads: (result.rows || []).map((r) => r.loadNumber),
+      });
+    }
+    return res.status(200).json({
+      ok: !!result.ok,
+      dryRun: !!result.dryRun,
+      count: result.count,
+      filename: result.filename,
+      to: result.to,
+      subject: result.subject,
+      loads: (result.rows || []).map((r) => r.loadNumber),
+      error: result.error || null,
+    });
+  } catch (error) {
+    await writeLog("error", "report",
+        "DJ Direct LTL weekly invoice report HTTP failed", {
+          error: error.message,
+        });
+    return res.status(500).json({ok: false, error: error.message});
+  }
+}
 
 /**
  * @param {object} req HTTPS request.
@@ -17701,6 +17801,15 @@ deliveredUninvoicedReport.init({
   writeLog,
   saveOutboundEmail,
   primusUiBridge,
+});
+
+djDirectLtlWeeklyReport.init({
+  db: admin.firestore(),
+  writeLog,
+  saveOutboundEmail,
+  tcol,
+  runWithTenant,
+  DEFAULT_TENANT,
 });
 
 dailyActivityReport.init({
