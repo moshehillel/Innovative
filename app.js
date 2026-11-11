@@ -1071,14 +1071,14 @@
   function filterAccessorialChoices(query, choices) {
     const list = Array.isArray(choices) ? choices : [];
     const want = normAccessorial(query);
-    if (!want) return list.slice(0, 50);
+    if (!want) return list.slice();
     return list.filter((item) => {
       const name = normAccessorial(item.name);
       const code = normAccessorial(item.code);
       const category = normAccessorial(item.category);
       return name.includes(want) || code.includes(want) ||
         category.includes(want) || want.includes(name);
-    }).slice(0, 50);
+    });
   }
 
   function addChargeLine(list, seed, choices) {
@@ -1091,85 +1091,90 @@
     const carrier = seed && seed.carrierAmount ? Number(seed.carrierAmount) : "";
     const picker = document.createElement("div");
     picker.className = "charge-line-picker";
+    picker.style.display = "flex";
+    picker.style.flexDirection = "column";
+    picker.style.gap = "4px";
     const search = document.createElement("input");
     search.className = "input charge-line-search";
     search.type = "search";
     search.autocomplete = "off";
-    search.placeholder = "Type to find Primus accessorial";
+    search.placeholder = "Filter the dropdown list";
     const nameHidden = document.createElement("input");
     nameHidden.type = "hidden";
     nameHidden.className = "charge-line-name";
     const codeHidden = document.createElement("input");
     codeHidden.type = "hidden";
     codeHidden.className = "charge-line-code";
-    const menu = document.createElement("div");
-    menu.className = "charge-line-menu";
-    menu.hidden = true;
+    const select = document.createElement("select");
+    select.className = "input charge-line-select";
+    select.setAttribute("aria-label", "Primus accessorial");
     const matched = matchAccessorialChoice(seed && seed.name, choices || []);
     if (matched) {
       nameHidden.value = matched.name || "";
       codeHidden.value = matched.code || "";
-      search.value = matched.name || "";
     } else if (seed && seed.name) {
-      // Narrow the list with Jerry's wording, but force a Primus pick.
-      search.value = String(seed.name);
-      search.placeholder =
-        `Pick Primus name (Jerry listed: ${seed.name})`;
+      search.placeholder = `Filter — Jerry listed: ${seed.name}`;
     }
     const setChoice = (item) => {
-      nameHidden.value = item.name || "";
-      codeHidden.value = item.code || "";
-      search.value = item.name || "";
-      menu.hidden = true;
-      menu.innerHTML = "";
-    };
-    const renderMenu = () => {
-      const items = filterAccessorialChoices(search.value, choices || []);
-      menu.innerHTML = "";
-      if (!items.length) {
-        const empty = document.createElement("div");
-        empty.className = "charge-line-menu-empty";
-        empty.textContent = "No Primus match — keep typing";
-        menu.appendChild(empty);
-        menu.hidden = false;
-        return;
-      }
-      items.forEach((item) => {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "charge-line-menu-item";
-        btn.textContent =
-          `${item.category ? item.category + " — " : ""}${item.name}`;
-        btn.addEventListener("mousedown", (event) => {
-          event.preventDefault();
-          setChoice(item);
-        });
-        menu.appendChild(btn);
-      });
-      menu.hidden = false;
-    };
-    search.addEventListener("focus", renderMenu);
-    search.addEventListener("input", () => {
-      if (search.value.trim() !== nameHidden.value.trim()) {
+      if (!item) {
         nameHidden.value = "";
         codeHidden.value = "";
+        return;
       }
-      renderMenu();
+      nameHidden.value = item.name || "";
+      codeHidden.value = item.code || "";
+    };
+    const fillSelect = (selectedName, selectedCode) => {
+      select.innerHTML = "";
+      const placeholder = document.createElement("option");
+      placeholder.value = "";
+      placeholder.textContent = "— Select Primus accessorial —";
+      select.appendChild(placeholder);
+      const items = filterAccessorialChoices(search.value, choices || []);
+      let sawSelected = false;
+      items.forEach((item) => {
+        const opt = document.createElement("option");
+        opt.value = String(item.name || "");
+        opt.textContent =
+          `${item.category ? item.category + " — " : ""}${item.name}`;
+        opt.dataset.code = item.code || "";
+        if ((selectedCode && item.code === selectedCode) ||
+            (selectedName &&
+              normAccessorial(item.name) === normAccessorial(selectedName))) {
+          opt.selected = true;
+          sawSelected = true;
+        }
+        select.appendChild(opt);
+      });
+      if (!sawSelected) {
+        select.value = "";
+        setChoice(null);
+      } else {
+        const opt = select.options[select.selectedIndex];
+        setChoice({
+          name: select.value,
+          code: (opt && opt.dataset.code) || "",
+        });
+      }
+    };
+    fillSelect(
+        (matched && matched.name) || (seed && seed.name) || "",
+        (matched && matched.code) || "");
+    search.addEventListener("input", () => {
+      fillSelect(nameHidden.value, codeHidden.value);
     });
-    search.addEventListener("blur", () => {
-      const typed = (search.value || "").trim();
-      if (typed && !(nameHidden.value || "").trim()) {
-        const auto = matchAccessorialChoice(typed, choices || []);
-        if (auto) setChoice(auto);
+    select.addEventListener("change", () => {
+      const opt = select.options[select.selectedIndex];
+      if (!opt || !opt.value) {
+        setChoice(null);
+        return;
       }
-      setTimeout(() => {
-        menu.hidden = true;
-      }, 150);
+      setChoice({name: opt.value, code: opt.dataset.code || ""});
     });
     picker.appendChild(search);
+    picker.appendChild(select);
     picker.appendChild(nameHidden);
     picker.appendChild(codeHidden);
-    picker.appendChild(menu);
     const carrierInput = document.createElement("input");
     carrierInput.className = "input charge-line-carrier";
     carrierInput.type = "number";
@@ -1219,19 +1224,28 @@
       const nameEl = row.querySelector(".charge-line-name");
       const codeEl = row.querySelector(".charge-line-code");
       const searchEl = row.querySelector(".charge-line-search");
+      const selectEl = row.querySelector(".charge-line-select");
       let name = nameEl && nameEl.value ? nameEl.value.trim() : "";
       const typed = searchEl && searchEl.value ? searchEl.value.trim() : "";
+      const selected = selectEl && selectEl.value ? selectEl.value.trim() : "";
+      if (!name && selected) {
+        name = selected;
+        if (nameEl) nameEl.value = name;
+        if (codeEl && selectEl.selectedOptions[0]) {
+          codeEl.value = selectEl.selectedOptions[0].dataset.code || "";
+        }
+      }
       if (!name && typed) {
         const auto = matchAccessorialChoice(typed, accessorialChoices || []);
         if (auto) {
           name = auto.name || typed;
           if (nameEl) nameEl.value = name;
           if (codeEl) codeEl.value = auto.code || "";
-          if (searchEl) searchEl.value = name;
+          if (selectEl) selectEl.value = name;
         }
       }
       if (!name) {
-        if (typed) missingPick = typed;
+        if (typed || selected) missingPick = typed || selected;
         return;
       }
       const code = codeEl && codeEl.value ? codeEl.value : null;
