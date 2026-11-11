@@ -1795,7 +1795,8 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `${formatCustomerRate(baseRate)}</p>` :
     `<p style="font-size:14px;color:#374151;margin:12px 0">` +
     `The base customer freight rate will stay as-is in Primus. For each ` +
-    `accessorial, pick it from the Primus list, then enter a percent ` +
+    `accessorial, pick the Primus name from the dropdown (you can type in ` +
+    `the filter box above it to narrow the list), then enter a percent ` +
     `markup or a flat customer charge. Use Add accessorial for a charge ` +
     `Jerry did not list.` +
     `</p>`;
@@ -1805,8 +1806,12 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `<style>` +
     `.bill-row{display:grid;grid-template-columns:1fr 160px 32px;gap:8px;` +
     `align-items:start;margin-bottom:10px}` +
-    `.bill-row input{width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
-    `border-radius:8px;font-size:16px;box-sizing:border-box}` +
+    `.bill-row input,.bill-row select{width:100%;padding:10px 12px;` +
+    `border:1px solid #d1d5db;border-radius:8px;font-size:16px;` +
+    `box-sizing:border-box;background:#fff}` +
+    `.bill-picker{display:flex;flex-direction:column;gap:6px}` +
+    `.bill-name-search{font-size:14px}` +
+    `.bill-name-select{min-height:44px;font-size:15px}` +
     `.bill-hint{font-size:12px;color:#6b7280;margin-top:4px}` +
     `.add-btn{background:#fff;color:#0d9488;border:1px solid #0d9488;` +
     `padding:8px 12px;border-radius:8px;font-size:14px;cursor:pointer}` +
@@ -1852,35 +1857,82 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `.replace(/"/g,"&quot;").replace(/</g,"&lt;");}` +
     `function normName(v){return String(v||"").toLowerCase()` +
     `.replace(/[^a-z0-9]/g,"");}` +
+    `function filterCatalog(q){` +
+    `const want=normName(q);` +
+    `if(!want)return catalog.slice();` +
+    `return catalog.filter((item)=>{` +
+    `const name=normName(item.name);` +
+    `const code=normName(item.code);` +
+    `const cat=normName(item.category);` +
+    `return name.includes(want)||code.includes(want)||cat.includes(want)||` +
+    `want.includes(name);});}` +
     `function addRow(row={}){` +
     `const wrap=document.createElement("div");wrap.className="bill-row";` +
     `const carrier=Number(row.carrierAmount)||0;` +
-    `const sel=document.createElement("select");sel.className="bill-name";` +
-    `const blank=document.createElement("option");blank.value="";` +
-    `blank.textContent="Select accessorial";sel.appendChild(blank);` +
+    `const picker=document.createElement("div");picker.className="bill-picker";` +
+    `const search=document.createElement("input");` +
+    `search.type="search";search.className="bill-name-search";` +
+    `search.autocomplete="off";` +
+    `search.placeholder="Filter the dropdown list";` +
+    `const nameHidden=document.createElement("input");` +
+    `nameHidden.type="hidden";nameHidden.className="bill-name";` +
+    `const codeHidden=document.createElement("input");` +
+    `codeHidden.type="hidden";codeHidden.className="bill-code";` +
+    `const select=document.createElement("select");` +
+    `select.className="bill-name-select";` +
+    `select.setAttribute("aria-label","Primus accessorial");` +
     `const want=normName(row.name);const wantCode=String(row.code||"");` +
-    `let matched=false;` +
+    `let matched=null;` +
     `for(const item of catalog){` +
-    `const opt=document.createElement("option");` +
-    `opt.value=item.code||"";opt.dataset.name=item.name||"";` +
-    `opt.textContent=(item.category?item.category+" — ":"")+item.name;` +
     `if((wantCode&&item.code===wantCode)||` +
-    `(!wantCode&&want&&normName(item.name)===want)){` +
-    `opt.selected=true;matched=true;}` +
-    `sel.appendChild(opt);}` +
-    `if(want&&!matched){` +
-    `const opt=document.createElement("option");opt.value="";` +
-    `opt.dataset.name=row.name;opt.selected=true;` +
-    `opt.textContent=row.name+" (from the invoice)";` +
-    `sel.appendChild(opt);}` +
-    `const nameCell=document.createElement("div");nameCell.appendChild(sel);` +
+    `(!wantCode&&want&&normName(item.name)===want)){matched=item;break;}}` +
+    `if(matched){` +
+    `nameHidden.value=matched.name||"";` +
+    `codeHidden.value=matched.code||"";` +
+    `}else if(row.name){` +
+    `search.placeholder="Filter — Jerry listed: "+row.name;}` +
+    `function setChoice(item){` +
+    `if(!item){nameHidden.value="";codeHidden.value="";return;}` +
+    `nameHidden.value=item.name||"";codeHidden.value=item.code||"";}` +
+    `function fillSelect(selectedName, selectedCode){` +
+    `while(select.options.length)select.remove(0);` +
+    `const placeholder=document.createElement("option");` +
+    `placeholder.value="";placeholder.textContent=` +
+    `"— Select Primus accessorial —";` +
+    `select.appendChild(placeholder);` +
+    `const items=filterCatalog(search.value);` +
+    `let sawSelected=false;` +
+    `for(const item of items){` +
+    `const opt=document.createElement("option");` +
+    `opt.value=String(item.name||"");` +
+    `opt.textContent=(item.category?item.category+" — ":"")+item.name;` +
+    `opt.dataset.code=item.code||"";` +
+    `if((selectedCode&&item.code===selectedCode)||` +
+    `(selectedName&&normName(item.name)===normName(selectedName))){` +
+    `opt.selected=true;sawSelected=true;}` +
+    `select.appendChild(opt);}` +
+    `if(!sawSelected){select.value="";}` +
+    `else{setChoice({name:select.value,` +
+    `code:(select.options[select.selectedIndex]||{}).dataset.code||""});}}` +
+    `fillSelect(matched&&matched.name||row.name||"",` +
+    `matched&&matched.code||row.code||"");` +
+    `search.oninput=()=>{` +
+    `fillSelect(nameHidden.value, codeHidden.value);};` +
+    `select.onchange=()=>{` +
+    `const opt=select.options[select.selectedIndex];` +
+    `if(!opt||!opt.value){setChoice(null);return;}` +
+    `setChoice({name:opt.value,code:opt.dataset.code||""});};` +
+    `picker.appendChild(search);picker.appendChild(select);` +
+    `picker.appendChild(nameHidden);picker.appendChild(codeHidden);` +
+    `const nameCell=document.createElement("div");nameCell.appendChild(picker);` +
     `const carrierInput=document.createElement("input");` +
     `carrierInput.className="bill-carrier";carrierInput.type="number";` +
     `carrierInput.min="0";carrierInput.step="0.01";` +
     `carrierInput.placeholder="Carrier $";` +
     `if(carrier>0)carrierInput.value=carrier.toFixed(2);` +
     `const hint=document.createElement("div");hint.className="bill-hint";` +
-    `hint.textContent="Carrier cost, then percent or flat customer charge";` +
+    `hint.textContent="Use the dropdown to pick the Primus accessorial. "+` +
+    `"Optional: type above it to filter the list.";` +
     `nameCell.appendChild(carrierInput);nameCell.appendChild(hint);` +
     `const price=document.createElement("div");` +
     `const mode=document.createElement("select");` +
@@ -1925,11 +1977,15 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `if(form.dataset.submitted==="1"){e.preventDefault();return false;}` +
     `const lines=[];` +
     `for(const row of container.querySelectorAll(".bill-row")){` +
-    `const sel=row.querySelector(".bill-name");` +
-    `const opt=sel.options[sel.selectedIndex];` +
-    `const name=(opt&&opt.dataset.name||"").trim();` +
-    `const code=sel.value||"";` +
-    `if(!name)continue;` +
+    `const name=(row.querySelector(".bill-name").value||"").trim();` +
+    `const code=row.querySelector(".bill-code").value||"";` +
+    `const selectEl=row.querySelector(".bill-name-select");` +
+    `const selectVal=selectEl?(selectEl.value||"").trim():"";` +
+    `if(!name){` +
+    `if(selectVal||(row.querySelector(".bill-name-search")||{}).value){` +
+    `alert("Select the Primus accessorial from the dropdown list.");` +
+    `e.preventDefault();return false;}` +
+    `continue;}` +
     `const carrierAmount=Number(row.querySelector(".bill-carrier").value)||0;` +
     `const mode=row.querySelector(".bill-mode").value;` +
     `const val=Number(row.querySelector(".bill-value").value);` +

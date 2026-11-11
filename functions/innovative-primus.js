@@ -2003,7 +2003,41 @@ exports.processPrimusWorkflow = onRequest(
 
           baseAmount = Number(invoice.invoiceAmount) - approvedChargesTotal;
 
-          if (primusSteps.amountValidated) {
+          // After A–F, accounting already accepted the carrier bill. Do not
+          // re-check invoice-minus-extra against Primus (270194 / 268543
+          // failed here when additionalCharge.amount was only the named
+          // lines, not the full Primus gap).
+          if (additionalChargeApproved) {
+            amountValidation = {
+              ok: true,
+              validAmount: true,
+              submittedAmount: Number(invoice.invoiceAmount),
+              primusQuotedAmount: null,
+              amount: null,
+              difference: 0,
+              reason: "additional_charge_approved",
+            };
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "amount_validation_completed",
+              stepStatus: "skipped",
+              reason: "Additional charge already approved — amount accepted",
+              output: {
+                validAmount: true,
+                submittedAmount: amountValidation.submittedAmount,
+                decision: additionalCharge && additionalCharge.decision || null,
+                approvedChargesTotal,
+              },
+            });
+            await writeLog("info", "workflow",
+                "Amount validation skipped — additional charge approved", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  decision: additionalCharge && additionalCharge.decision,
+                  invoiceAmount: invoice.invoiceAmount,
+                  approvedChargesTotal,
+                });
+          } else if (primusSteps.amountValidated) {
             amountValidation = reusedAmountValidationFromInvoice(invoice);
             await logWorkflowStep({
               invoiceId,

@@ -3481,10 +3481,20 @@ async function handleAdditionalChargeAction(req, res) {
         storedRate : 0;
       let accessorialOptions = [];
       try {
-        accessorialOptions = require("./quote-accessorial-catalog")
-            .staticAccessorialChoices();
+        const catalog = require("./quote-accessorial-catalog");
+        if (typeof catalog.listPrimusAccessorialChoices === "function") {
+          accessorialOptions = await catalog.listPrimusAccessorialChoices();
+        }
+        if (!Array.isArray(accessorialOptions) || !accessorialOptions.length) {
+          accessorialOptions = catalog.staticAccessorialChoices();
+        }
       } catch (_) {
-        accessorialOptions = [];
+        try {
+          accessorialOptions = require("./quote-accessorial-catalog")
+              .staticAccessorialChoices();
+        } catch (__) {
+          accessorialOptions = [];
+        }
       }
       if (option === "f") {
         return res.status(200).send(
@@ -3518,9 +3528,9 @@ async function handleAdditionalChargeAction(req, res) {
             description:
               `Load ${invoice.loadNumber || invoiceId}: ` +
               `${optionLabels[option]}. Each line can be a percent markup ` +
-              `on the carrier cost or a flat customer amount. Type to find ` +
-              `each accessorial in the Primus list, then select it. Use ` +
-              `Add accessorial for a charge Jerry did not list.` +
+              `on the carrier cost or a flat customer amount. Pick each ` +
+              `accessorial from the Primus dropdown (filter box optional). ` +
+              `Use Add accessorial for a charge Jerry did not list.` +
               notifyNote,
             confirmLabel: `Confirm option ${option.toUpperCase()}`,
             confirmColor: option === "d" ? "#dc2626" :
