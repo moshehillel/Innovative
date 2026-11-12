@@ -1191,14 +1191,14 @@ function listInvoicePdfAttachments(attachments) {
 
 /**
  * True when each invoice PDF should be classified on its own.
- * One combined call on a Central Transport-style batch (many multi-page
- * bills) gets truncated and only the first invoices are returned.
- * A single multi-invoice PDF (FedEx) stays one call.
+ * One combined call on a Central Transport batch (two or more multi-page
+ * bills) is truncated or returns only a thinking block, so later invoices
+ * are never read. A single multi-invoice PDF (FedEx) stays one call.
  * @param {Array<object>|null|undefined} attachments Attachment list.
  * @return {boolean}
  */
 function shouldClassifyEachInvoicePdf(attachments) {
-  return listInvoicePdfAttachments(attachments).length >= 3;
+  return listInvoicePdfAttachments(attachments).length >= 2;
 }
 
 /**

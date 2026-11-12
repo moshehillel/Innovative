@@ -79,8 +79,10 @@ check("10 separate invoice PDFs classify one at a time",
 check("one multi-invoice PDF stays a single call",
     pod.shouldClassifyEachInvoicePdf(
         [{filename: "fedex-bundle.pdf", docType: "INVOICE"}]) === false);
-check("two invoice PDFs stay a single call",
-    pod.shouldClassifyEachInvoicePdf(ctBatch.slice(0, 2)) === false);
+// Two multi-page bills in one combined call were cut off or came back as a
+// thinking-only reply (Central Transport), so two already read one by one.
+check("two invoice PDFs classify one at a time",
+    pod.shouldClassifyEachInvoicePdf(ctBatch.slice(0, 2)) === true);
 check("POD companions do not force per-file classification",
     pod.shouldClassifyEachInvoicePdf([
       {filename: "bill.pdf", docType: "INVOICE"},

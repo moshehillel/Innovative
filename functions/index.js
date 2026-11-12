@@ -7208,9 +7208,23 @@ async function classifyCarrierInvoiceAttachments(
   let merged = [];
 
   if (!separate) {
-    const combined = await classifyInvoiceData(
-        pdfAttachments, lastKnownLoadNumber);
-    merged = normalizeClassificationToInvoices(combined);
+    try {
+      const combined = await classifyInvoiceData(
+          pdfAttachments, lastKnownLoadNumber);
+      merged = normalizeClassificationToInvoices(combined);
+    } catch (combinedErr) {
+      // A failed combined call (cut off, or a reply with no text block)
+      // must not lose the email: the uncovered-PDF pass below reads each
+      // invoice PDF on its own.
+      if (!invoicePdfs.length) throw combinedErr;
+      await writeLog("warn", "ai",
+          "Combined invoice classification failed; reading each PDF", {
+            messageId: messageId || null,
+            invoicePdfCount: invoicePdfs.length,
+            error: combinedErr.message,
+          });
+      merged = [];
+    }
   } else {
     await writeLog("info", "ai",
         "Classifying each invoice PDF separately", {
