@@ -4348,7 +4348,7 @@ function isAbeCopiedOnEmail(headers) {
  */
 async function handleStatementOnlyEmail(args) {
   const {
-    gmail, messageId, subject, from, emailBody, tenant, headers,
+    gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
     emailClassification, reason, queueDocId,
   } = args;
   const docId = queueDocId || messageId;
@@ -4391,7 +4391,7 @@ async function handleStatementOnlyEmail(args) {
       `there is no freight invoice for me to enter. Please verify in ` +
       `Primus whether these charges are already entered.${classifierNote}\n\n` +
       `Thank you,\n${AI_AGENT_NAME}`,
-      {department: "statement", emailBody},
+      {department: "statement", emailBody, emailHtml},
   );
   await mailIntakeQueue.completeIntakeRecord({
     tenant,
@@ -4411,7 +4411,7 @@ async function handleStatementOnlyEmail(args) {
  */
 async function handleDrayageInvoiceEmail(args) {
   const {
-    gmail, messageId, subject, from, emailBody, tenant,
+    gmail, messageId, subject, from, emailBody, emailHtml, tenant,
     queueDocId, containerNumber, carrierName, reason,
   } = args;
   const docId = queueDocId || messageId;
@@ -4434,6 +4434,7 @@ async function handleDrayageInvoiceEmail(args) {
       {
         department: "drayage",
         emailBody,
+        emailHtml: emailHtml || null,
         extractedData: {
           "Container #": containerNumber || "—",
           "Carrier": carrierName || "—",
@@ -5161,7 +5162,7 @@ async function handlePaymentInquiryEmail(args) {
  */
 async function handleCustomerPaymentRemittanceEmail(args) {
   const {
-    gmail, messageId, subject, from, emailBody, tenant, headers,
+    gmail, messageId, subject, from, emailBody, emailHtml, tenant, headers,
     emailClassification, reason, queueDocId,
   } = args;
   const docId = queueDocId || messageId;
@@ -5201,7 +5202,7 @@ async function handleCustomerPaymentRemittanceEmail(args) {
       `This email appears to be a customer payment remittance (not a ` +
       `carrier freight invoice). I'm forwarding it to accounting for ` +
       `payment posting.\n\nThank you,\n${AI_AGENT_NAME}`,
-      {department: "statement", emailBody},
+      {department: "statement", emailBody, emailHtml},
   );
   await mailIntakeQueue.completeIntakeRecord({
     tenant,
@@ -5376,6 +5377,7 @@ async function forwardToHumanReview(
     department = "general",
     extractedData = null,
     emailBody = null,
+    emailHtml = null,
     cc = null,
   } = options;
 
@@ -5543,14 +5545,35 @@ async function forwardToHumanReview(
     extractedData["Load #"] || extractedData.load);
   const tenantId = (currentTenant() && currentTenant().tenantId) || "default";
   const opsPrimary = dashboardOps.isDashboardOpsPrimary();
-  const bodyPreview = emailBody ?
-    String(emailBody).slice(0, 4000) : (notes || null);
+  // The dashboard shows what the reviewer got: the Action Required note and
+  // the original email as the mail client shows it (HTML when there is one).
+  const MAX_NOTIF_BODY = 120000;
+  let originalSection = emailHtml ? String(emailHtml) : "";
+  if (!originalSection && emailBody) {
+    originalSection =
+      `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
+      `${escapeHtml(String(emailBody))}</pre>`;
+  }
+  let notifBody = String(html || "");
+  if (originalSection) {
+    // Drop the short plain-text excerpt; the full original follows instead.
+    if (emailBodySection) notifBody = notifBody.replace(emailBodySection, "");
+    notifBody = notifBody.replace(/<\/div><\/div>$/, "") +
+      `<h3 style="margin:20px 0 8px;font-size:13px;text-transform:uppercase;` +
+      `letter-spacing:.05em;color:#374151;">Original Message</h3>` +
+      `<div style="background:#f9fafb;border:1px solid #e5e7eb;` +
+      `border-radius:6px;padding:14px;font-size:13px;line-height:1.6;` +
+      `color:#374151;">${originalSection}</div></div></div>`;
+  }
+  if (notifBody.length > MAX_NOTIF_BODY) {
+    notifBody = notifBody.slice(0, MAX_NOTIF_BODY);
+  }
 
   await dashboardOps.createNotification(db, {
     tenantId,
     type: dashboardOps.NOTIF_TYPE.UNHANDLED_EMAIL,
     title: `[Review] ${safeReason}`,
-    body: bodyPreview,
+    body: notifBody || null,
     subject: safeSubject,
     from,
     to: departmentEmail,
@@ -5602,6 +5625,8 @@ async function forwardToHumanReview(
     type: dashboardTasks.TASK_TYPE.HUMAN_REVIEW,
     title: `[Review] ${safeReason}`,
     description: notes || null,
+    body: notifBody || null,
+    subject: forwardSubject,
     loadNumber: loadHint ? String(loadHint) : null,
     messageId,
     department,
@@ -6583,13 +6608,31 @@ async function sendAdditionalChargeApprovalEmail(opts) {
         });
   }
 
+  // Save the approval email as sent, so the dashboard row shows the same
+  // email (with its A-F buttons) that Sarah and Lisa receive.
+  const approvalHtml = String(email.html || "").slice(0, 120000);
+  if (followUpId && approvalHtml) {
+    try {
+      await db.collection(additionalCharges.FOLLOW_UP_COLLECTION)
+          .doc(String(followUpId)).update({
+            emailHtml: approvalHtml,
+            emailSubject: email.subject || null,
+            emailTo: opsTo || null,
+            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+          });
+    } catch (updErr) {
+      console.error("follow-up emailHtml update failed:", updErr.message);
+    }
+  }
+
   await dashboardOps.createNotification(db, {
     tenantId: tenant.tenantId,
     type: dashboardOps.NOTIF_TYPE.ADDITIONAL_CHARGE,
     title: `Additional charge — Load ${aiResult.loadNumber || "—"}`,
-    body: `Category: ${pending.category || "—"}. ` +
+    body: approvalHtml ||
+      (`Category: ${pending.category || "—"}. ` +
       `Charges total: $${Number(pending.chargesTotal || 0).toFixed(2)}. ` +
-      `Choose A–F in the dashboard Tasks tab.`,
+      `Choose A–F in the dashboard Tasks tab.`),
     subject: email.subject,
     to: opsTo,
     cc: null,
@@ -7250,7 +7293,7 @@ async function recoverStatementInvoiceItems(opts) {
  */
 async function handleStatementUnderExtractionAlert(args) {
   const {
-    gmail, messageId, subject, from, gap, emailBody,
+    gmail, messageId, subject, from, gap, emailBody, emailHtml,
   } = args;
   if (!statementInvoiceBundle.shouldAlertStatementUnderExtraction(gap)) {
     return;
@@ -7279,6 +7322,7 @@ async function handleStatementUnderExtractionAlert(args) {
       {
         department: "operations",
         emailBody,
+        emailHtml: emailHtml || null,
         extractedData: {
           "Subject": subject || "—",
           "Expected invoices": String(gap.expectedCount || "—"),
@@ -7465,11 +7509,8 @@ async function saveOutboundEmail(email) {
   // additional_charge_approval already creates a richer notification upstream.
   if (!isCustomerBill && !isDashboardMeta &&
       email.type !== "additional_charge_approval") {
-    const plainBody = String(htmlToSend || "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 4000);
+    // Store the same HTML that is emailed so the dashboard matches the mail.
+    const plainBody = String(htmlToSend || "").slice(0, 120000);
     await dashboardOps.createNotification(db, {
       tenantId: tenant.tenantId || "default",
       type: dashboardOps.NOTIF_TYPE.OPS_EMAIL,
@@ -9892,6 +9933,63 @@ async function reserveGmailQueueItemForProcessing(
 }
 
 /**
+ * Decodes a Gmail body.data base64url payload to utf-8 text.
+ * @param {string} data Gmail body.data.
+ * @return {string}
+ */
+function decodeGmailBodyData(data) {
+  if (!data) return "";
+  return Buffer.from(
+      String(data).replace(/-/g, "+").replace(/_/g, "/"),
+      "base64",
+  ).toString("utf-8");
+}
+
+/**
+ * Extracts the HTML body from a Gmail message payload (as in the mail client).
+ * Falls back to wrapping plain text when no HTML part exists, so the
+ * dashboard can show the same email the mailbox shows.
+ * @param {object} payload Gmail message payload.
+ * @return {string} HTML body.
+ */
+function extractEmailHtml(payload) {
+  if (!payload) return "";
+  const wrapText = (text) => text ?
+    `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
+    `${escapeHtml(text)}</pre>` : "";
+
+  if (payload.body && payload.body.data) {
+    const mimeType = payload.mimeType || "";
+    if (mimeType === "text/html") {
+      return decodeGmailBodyData(payload.body.data);
+    }
+    if (mimeType === "text/plain") {
+      return wrapText(decodeGmailBodyData(payload.body.data));
+    }
+  }
+
+  if (payload.parts && Array.isArray(payload.parts)) {
+    for (const part of payload.parts) {
+      if (part.mimeType === "text/html" && part.body && part.body.data) {
+        return decodeGmailBodyData(part.body.data);
+      }
+    }
+    for (const part of payload.parts) {
+      if (part.mimeType === "text/plain" && part.body && part.body.data) {
+        const wrapped = wrapText(decodeGmailBodyData(part.body.data));
+        if (wrapped) return wrapped;
+      }
+    }
+    for (const part of payload.parts) {
+      const nested = extractEmailHtml(part);
+      if (nested) return nested;
+    }
+  }
+
+  return "";
+}
+
+/**
  * Extracts plain-text body from a Gmail message payload.
  * @param {object} payload Gmail message payload.
  * @return {string} Plain text body.
@@ -10420,6 +10518,8 @@ async function processGmailMessage(
     }
 
     const emailBody = extractEmailBody(payload);
+    // Original HTML, so dashboard notifications show the email as mailed.
+    const emailHtml = extractEmailHtml(payload);
 
     // Used when the system doesn't know how to handle an email.
     // Asks Claude what the email is about, then forwards it to the reviewer
@@ -10448,7 +10548,7 @@ async function processGmailMessage(
 
       return forwardToHumanReview(
           gmail, messageId, subject, from, reason, aiNote,
-          {...fwdOpts, emailBody},
+          {...fwdOpts, emailBody, emailHtml},
       );
     };
 
@@ -10817,7 +10917,8 @@ async function processGmailMessage(
         if (statementInvoiceBundle.shouldShortCircuitAsStatementOnly(
             emailClassification, subject, from, emailBody, attachments)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
           });
@@ -10827,7 +10928,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
             subject, from, emailBody)) {
           await handleCustomerPaymentRemittanceEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason: "Customer payment remittance — not a carrier invoice",
@@ -10842,7 +10944,8 @@ async function processGmailMessage(
             administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
                 subject, from, emailBody, attachments, 0)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -10858,7 +10961,8 @@ async function processGmailMessage(
             administrativeEmailIntake.shouldHandlePaymentInquiry(
                 subject, from, emailBody, 0)) {
           await handlePaymentInquiryEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -11292,7 +11396,8 @@ async function processGmailMessage(
             emailClassification,
           })) {
           await handlePaymentInquiryEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason: "Payment inquiry email with no attachments",
@@ -11302,7 +11407,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
             subject, from, emailBody)) {
           await handleCustomerPaymentRemittanceEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason: "Customer payment remittance with no attachments",
@@ -11312,7 +11418,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
             subject, from, emailBody, attachments, 0)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -11354,7 +11461,8 @@ async function processGmailMessage(
           if (payIgnore.ai &&
               payIgnore.ai.intent === "customer_remittance") {
             await handleCustomerPaymentRemittanceEmail({
-              gmail, messageId, subject, from, emailBody, tenant, headers,
+              gmail, messageId, subject, from, emailBody,
+              emailHtml, tenant, headers,
               emailClassification,
               queueDocId,
               reason: "Customer remittance (AI) with no attachments",
@@ -11852,7 +11960,7 @@ async function processGmailMessage(
         trailerImageCount > 0;
         if (hasPodMaterial) {
           const podResult = await handlePodOnlyDeliveryEmail({
-            gmail, messageId, subject, from, emailBody, tenant,
+            gmail, messageId, subject, from, emailBody, emailHtml, tenant,
             pdfAttachments, storedAttachments,
           });
           if (podResult && podResult.handled) {
@@ -11883,7 +11991,8 @@ async function processGmailMessage(
             !statementInvoiceBundle.looksLikeStatementCoverInvoicePacketEmail(
                 subject, from, emailBody, attachments)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -11894,7 +12003,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCarrierStatementFollowUp(
             subject, from, emailBody, attachments, invoicePdfCount)) {
           await handleStatementOnlyEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason:
@@ -11982,7 +12092,8 @@ async function processGmailMessage(
             invoicePdfCount,
           })) {
           await handlePaymentInquiryEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason: noInvoiceReason,
@@ -11992,7 +12103,8 @@ async function processGmailMessage(
         if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
             subject, from, emailBody)) {
           await handleCustomerPaymentRemittanceEmail({
-            gmail, messageId, subject, from, emailBody, tenant, headers,
+            gmail, messageId, subject, from, emailBody,
+            emailHtml, tenant, headers,
             emailClassification,
             queueDocId,
             reason: noInvoiceReason,
@@ -12023,7 +12135,7 @@ async function processGmailMessage(
             });
           if (drayageSignal.isDrayage) {
             await handleDrayageInvoiceEmail({
-              gmail, messageId, subject, from, emailBody, tenant,
+              gmail, messageId, subject, from, emailBody, emailHtml, tenant,
               queueDocId,
               containerNumber: drayageSignal.containerNumber,
               carrierName: drayageSignal.carrierName,
@@ -12079,7 +12191,8 @@ async function processGmailMessage(
       if (administrativeEmailIntake.shouldHandleCustomerPaymentRemittance(
           subject, from, emailBody)) {
         await handleCustomerPaymentRemittanceEmail({
-          gmail, messageId, subject, from, emailBody, tenant, headers,
+          gmail, messageId, subject, from, emailBody,
+          emailHtml, tenant, headers,
           emailClassification,
           queueDocId,
           reason:
@@ -12275,7 +12388,7 @@ async function processGmailMessage(
             });
           if (inboundDrayageSignal.isDrayage) {
             await handleDrayageInvoiceEmail({
-              gmail, messageId, subject, from, emailBody, tenant,
+              gmail, messageId, subject, from, emailBody, emailHtml, tenant,
               queueDocId,
               containerNumber: inboundDrayageSignal.containerNumber,
               carrierName: inboundDrayageSignal.carrierName,
@@ -12299,6 +12412,7 @@ async function processGmailMessage(
             from,
             gap: statementExtractionGap,
             emailBody,
+            emailHtml,
           });
         } catch (alertErr) {
           await writeLog("warn", "mail",
@@ -15389,6 +15503,8 @@ exports.dismissDashboardTask = onRequest(async (req, res) => {
           taskId,
           source,
           tenantId: tenant.tenantId,
+          collectionPrefix: tenant.collectionPrefix,
+          invoiceId: body.invoiceId || req.query.invoiceId || null,
         });
     if (!result.ok) {
       return res.status(400).json(result);

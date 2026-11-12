@@ -7,6 +7,8 @@
 
 const admin = require("firebase-admin");
 const ownership = require("./dashboard-ownership");
+const scope = require("./dashboard-scope");
+const queue = require("./dashboard-queue");
 
 const TASK_COLLECTION = "dashboardTasks";
 
@@ -104,6 +106,17 @@ function workIdentity(item) {
     followUpId: String(row.followUpId || "").trim(),
     messageId: String(row.messageId || "").trim(),
   };
+}
+
+/**
+ * Reads only the list, matching and patch fields of a task query, so a
+ * saved email body (up to 120 KB) is never pulled just to compare rows.
+ * @param {object} query Firestore query.
+ * @return {object} Query.
+ */
+function leanTaskQuery(query) {
+  return query && typeof query.select === "function" ?
+    query.select(...TASK_LIST_FIELDS, "hasBody", "subject") : query;
 }
 
 /**
@@ -267,18 +280,18 @@ async function findOpenDuplicateTask(db, data) {
   const followUpId = String((data && data.followUpId) || "").trim();
   let snap = null;
   if (loadNumber) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("loadNumber", "==", loadNumber)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", loadNumber))
         .limit(200)
         .get();
   } else if (messageId) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("messageId", "==", messageId)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("messageId", "==", messageId))
         .limit(20)
         .get();
   } else if (followUpId) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("followUpId", "==", followUpId)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("followUpId", "==", followUpId))
         .limit(20)
         .get();
   }
@@ -332,6 +345,14 @@ async function createDashboardTask(db, data) {
         if (data.description && !existing.data.description) {
           patch.description = data.description;
         }
+        const reuseBody = capDetailBody(data.body);
+        if (reuseBody && !existing.data.hasBody) {
+          patch.body = reuseBody;
+          patch.hasBody = true;
+          if (data.subject && !existing.data.subject) {
+            patch.subject = String(data.subject);
+          }
+        }
         if (!existing.data.dispatcherKey && !existing.data.dispatcherEmail) {
           const owner = ownership.ownershipFieldsForCreate(data);
           if (owner.dispatcherKey || owner.dispatcherEmail) {
@@ -362,6 +383,10 @@ async function createDashboardTask(db, data) {
       type: data.type || TASK_TYPE.HUMAN_REVIEW,
       title: data.title || "Action required",
       description: data.description || null,
+      // Full email HTML for the row-open view; the list query leaves it out.
+      body: capDetailBody(data.body),
+      hasBody: Boolean(capDetailBody(data.body)),
+      subject: data.subject ? String(data.subject) : null,
       from: data.from || null,
       to: data.to || null,
       cc: data.cc || null,
@@ -906,13 +931,13 @@ async function markTasksInDispute(db, opts) {
   const invoiceId = String((opts && opts.invoiceId) || "").trim();
   let snap = null;
   if (followUpId) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("followUpId", "==", followUpId)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("followUpId", "==", followUpId))
         .limit(10)
         .get();
   } else if (invoiceId) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("invoiceId", "==", invoiceId)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("invoiceId", "==", invoiceId))
         .limit(10)
         .get();
   }
@@ -1014,18 +1039,18 @@ async function dismissDuplicateOpenTasks(db, additionalChargesMod, seed) {
   const followUpId = String((seed && seed.followUpId) || "").trim();
   let snap = null;
   if (loadNumber) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("loadNumber", "==", loadNumber)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", loadNumber))
         .limit(200)
         .get();
   } else if (messageId) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("messageId", "==", messageId)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("messageId", "==", messageId))
         .limit(20)
         .get();
   } else if (followUpId) {
-    snap = await db.collection(TASK_COLLECTION)
-        .where("followUpId", "==", followUpId)
+    snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("followUpId", "==", followUpId))
         .limit(20)
         .get();
   }
@@ -1054,6 +1079,130 @@ async function dismissDuplicateOpenTasks(db, additionalChargesMod, seed) {
   });
   await Promise.all(writes);
   return writes.length;
+}
+
+/**
+ * Invoice id for a synthesized hold row (`invoice:{id}`).
+ * Real dashboard tasks and additional-charge rows return "".
+ * @param {string} taskId Row id.
+ * @param {string} source Row source.
+ * @param {string} invoiceId Explicit invoice id.
+ * @return {string}
+ */
+function syntheticInvoiceId(taskId, source, invoiceId) {
+  const id = String(taskId || "").trim();
+  const src = String(source || "");
+  const explicit = String(invoiceId || "").trim();
+  if (src === "invoice" || id.startsWith("invoice:")) {
+    const parsed = id.startsWith("invoice:") ?
+      id.slice("invoice:".length).trim() : "";
+    return parsed || explicit;
+  }
+  return "";
+}
+
+/**
+ * @param {object} data Invoice fields.
+ * @param {string} tenantId Caller tenant.
+ * @return {boolean}
+ */
+function invoiceVisibleToTenant(data, tenantId) {
+  return scope.rowBelongsToTenant(data, tenantId) ||
+    ownership.sameTenant(data && data.tenantId, tenantId);
+}
+
+/**
+ * Remembers that this hold was cleared on the work list.
+ * Does not change decisionStage or complete the invoice.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, collectionPrefix, issue.
+ * @return {Promise<object>}
+ */
+async function stampInvoiceHoldDismissed(db, opts) {
+  const invoiceId = String(opts.invoiceId || "").trim();
+  const issue = String(opts.issue || "").trim().toLowerCase();
+  if (!invoiceId || !issue) return {ok: false};
+  const ref = db.collection(scope.collectionName({
+    collectionPrefix: opts.collectionPrefix,
+  }, "invoices")).doc(invoiceId);
+  const snap = await ref.get();
+  if (!snap.exists) return {ok: false};
+  const data = snap.data() || {};
+  if (!invoiceVisibleToTenant(data, opts.tenantId)) return {ok: false};
+  const dismissed = scope.dismissedIssueList(data);
+  if (!dismissed.includes(issue)) dismissed.push(issue);
+  await ref.update({
+    dashboardDismissedIssues: dismissed,
+    dashboardDismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return {ok: true, invoiceId, issue, loadNumber: data.loadNumber || null};
+}
+
+/**
+ * Dismisses open tasks that would re-list this invoice hold.
+ * Other issues on the same invoice stay open.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, issue.
+ * @return {Promise<number>}
+ */
+async function dismissOpenTasksForHold(db, opts) {
+  const invoiceId = String(opts.invoiceId || "").trim();
+  const issue = String(opts.issue || "").trim().toLowerCase();
+  if (!invoiceId || !issue) return 0;
+  const snap = await leanTaskQuery(db.collection(TASK_COLLECTION)
+      .where("invoiceId", "==", invoiceId))
+      .limit(40)
+      .get();
+  let count = 0;
+  for (const doc of snap.docs) {
+    const row = doc.data() || {};
+    if ((row.status || "") !== TASK_STATUS.OPEN) continue;
+    if (!ownership.sameTenant(row.tenantId, opts.tenantId)) continue;
+    if (String(row.invoiceId || "") !== invoiceId) continue;
+    if (scope.classifyIssue(row) !== issue) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await doc.ref.update({
+      status: TASK_STATUS.DISMISSED,
+      dismissedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Clears a synthesized invoice-hold row and the task that would replace it.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, collectionPrefix.
+ * @return {Promise<object>}
+ */
+async function dismissInvoiceHold(db, opts) {
+  const invoiceId = String(opts.invoiceId || "").trim();
+  if (!invoiceId) return {ok: false, error: "Task not found."};
+  const ref = db.collection(scope.collectionName({
+    collectionPrefix: opts.collectionPrefix,
+  }, "invoices")).doc(invoiceId);
+  const snap = await ref.get();
+  if (!snap.exists) return {ok: false, error: "Task not found."};
+  const data = snap.data() || {};
+  if (!invoiceVisibleToTenant(data, opts.tenantId)) {
+    return {ok: false, error: "Task not found."};
+  }
+  const issue = queue.holdIssueForInvoice(data);
+  if (!issue) return {ok: false, error: "Task not found."};
+  const stamped = await stampInvoiceHoldDismissed(db, {
+    invoiceId,
+    tenantId: opts.tenantId,
+    collectionPrefix: opts.collectionPrefix,
+    issue,
+  });
+  if (!stamped.ok) return {ok: false, error: "Task not found."};
+  await dismissOpenTasksForHold(db, {
+    invoiceId,
+    tenantId: opts.tenantId,
+    issue,
+  });
+  return {ok: true};
 }
 
 /**
@@ -1111,6 +1260,17 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     return {ok: false, error: "taskId is required."};
   }
 
+  // Hold rows built from an invoice (Missing POD, missing customer rate)
+  // have no task document. Mark done records the dismissal on the invoice.
+  const syntheticId = syntheticInvoiceId(taskId, source, opts.invoiceId);
+  if (syntheticId) {
+    return dismissInvoiceHold(db, {
+      invoiceId: syntheticId,
+      tenantId: opts.tenantId,
+      collectionPrefix: opts.collectionPrefix,
+    });
+  }
+
   if (source === "additionalCharges") {
     const ref = db.collection(additionalChargesMod.FOLLOW_UP_COLLECTION)
         .doc(taskId);
@@ -1138,6 +1298,16 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     };
     await resolveDuplicateFollowUps(db, additionalChargesMod, seed);
     await dismissDuplicateOpenTasks(db, additionalChargesMod, seed);
+    await closeInvoiceHoldForDismissedWork(db, {
+      invoiceId: row.invoiceId,
+      tenantId: opts.tenantId,
+      collectionPrefix: opts.collectionPrefix,
+      issue: scope.classifyIssue({
+        type: TASK_TYPE.ADDITIONAL_CHARGE,
+        reason: row.category || row.status,
+      }),
+      requireHoldMatch: false,
+    });
     return {ok: true};
   }
 
@@ -1168,7 +1338,55 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     await resolveDuplicateFollowUps(db, additionalChargesMod, seed);
   }
   await dismissDuplicateOpenTasks(db, additionalChargesMod, seed);
+  // A done hold task also marks its invoice, so the hold row built from the
+  // invoice (Missing POD, missing customer rate) does not come back.
+  await closeInvoiceHoldForDismissedWork(db, {
+    invoiceId: data.invoiceId,
+    tenantId: opts.tenantId,
+    collectionPrefix: opts.collectionPrefix,
+    issue: scope.classifyIssue(data),
+    requireHoldMatch: true,
+  });
   return {ok: true};
+}
+
+/**
+ * After a task or charge is marked done, stamps the invoice hold of the same
+ * issue as dismissed and closes the other open tasks for it. Never throws:
+ * the dismissal itself already succeeded.
+ * @param {object} db Firestore.
+ * @param {object} opts invoiceId, tenantId, collectionPrefix, issue,
+ *   requireHoldMatch (only stamp when the invoice's live hold is this issue).
+ * @return {Promise<void>}
+ */
+async function closeInvoiceHoldForDismissedWork(db, opts) {
+  const invoiceId = String((opts && opts.invoiceId) || "").trim();
+  const issue = String((opts && opts.issue) || "").trim().toLowerCase();
+  if (!invoiceId || !issue) return;
+  try {
+    if (opts.requireHoldMatch) {
+      const snap = await db.collection(scope.collectionName({
+        collectionPrefix: opts.collectionPrefix,
+      }, "invoices")).doc(invoiceId).get();
+      if (!snap.exists) return;
+      const invoice = snap.data() || {};
+      if (!invoiceVisibleToTenant(invoice, opts.tenantId)) return;
+      if (queue.holdIssueForInvoice(invoice) !== issue) return;
+    }
+    await stampInvoiceHoldDismissed(db, {
+      invoiceId,
+      tenantId: opts.tenantId,
+      collectionPrefix: opts.collectionPrefix,
+      issue,
+    });
+    await dismissOpenTasksForHold(db, {
+      invoiceId,
+      tenantId: opts.tenantId,
+      issue,
+    });
+  } catch (err) {
+    console.error("[closeInvoiceHoldForDismissedWork]", err.message);
+  }
 }
 
 /**
@@ -1193,8 +1411,8 @@ async function searchOpenByLoadNumber(db, additionalChargesMod, opts) {
   // All four lookups start together; rows are still added in the old order
   // (tasks for each value, then follow-ups for each value).
   const taskSnaps = values.map((value) =>
-    db.collection(TASK_COLLECTION)
-        .where("loadNumber", "==", value)
+    leanTaskQuery(db.collection(TASK_COLLECTION)
+        .where("loadNumber", "==", value))
         .limit(40)
         .get());
   const followSnaps = followCollection ? values.map((value) =>

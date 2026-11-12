@@ -247,7 +247,7 @@ function notificationMatchesQuery(row, query) {
     row && row.from,
     row && row.to,
     row && row.proNumber,
-    row && row.body,
+    bodySearchText(row),
     row && row.invoiceId,
   ].filter((part) => part != null && String(part).trim() !== "")
       .join(" ")
@@ -379,7 +379,30 @@ async function loadNotificationDetail(db, opts) {
   if (String(data.tenantId || "default") !== tenantId) {
     return {ok: false, error: "Not found."};
   }
-  return {ok: true, body: data.body || null};
+  const stored = data.body || null;
+  // Older charge notices saved only a one-line summary. Show the approval
+  // email instead: the saved copy on the follow-up, or a rebuilt one.
+  const isCharge = data.type === NOTIF_TYPE.ADDITIONAL_CHARGE ||
+    data.emailType === "additional_charge_approval";
+  const looksLikeEmail = /<\/?[a-z][\s\S]*>/i.test(String(stored || ""));
+  if (isCharge && data.followUpId && !looksLikeEmail) {
+    try {
+      const dashboardTasks = require("./dashboard-tasks");
+      const additionalCharges = require("./additional-charges");
+      const detail = await dashboardTasks.loadItemDetail(
+          db, additionalCharges, {
+            id: String(data.followUpId),
+            source: "additionalCharges",
+            tenantId,
+          });
+      if (detail && detail.ok && detail.body) {
+        return {ok: true, body: detail.body};
+      }
+    } catch (err) {
+      console.error("[loadNotificationDetail] charge email:", err.message);
+    }
+  }
+  return {ok: true, body: stored};
 }
 
 /**
@@ -497,6 +520,20 @@ function isClearablePodNotification(row) {
 }
 
 /**
+ * Notification body as plain words for search (bodies are saved as HTML).
+ * @param {object} row Notification fields.
+ * @return {string}
+ */
+function bodySearchText(row) {
+  const body = row && row.body;
+  if (!body) return "";
+  return String(body).replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/\s+/g, " ");
+}
+
+/**
  * @param {object} row Notification fields.
  * @param {string} query Load number.
  * @return {boolean}
@@ -505,7 +542,7 @@ function notificationMatchesLoadQuery(row, query) {
   const needle = String(query || "").trim();
   if (!needle) return false;
   if (row && String(row.loadNumber || "") === needle) return true;
-  const text = `${row && row.subject || ""} ${row && row.body || ""} ` +
+  const text = `${row && row.subject || ""} ${bodySearchText(row)} ` +
     `${row && row.reason || ""} ${row && row.title || ""}`;
   return new RegExp(`\\b${needle}\\b`).test(text);
 }
