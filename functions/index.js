@@ -33,6 +33,8 @@ const workflowErrors = require("./workflow-error-messages");
 const brokerCommission = require("./broker-commission");
 const undeliveredReport = require("./undelivered-shipment-report");
 const deliveredUninvoicedReport = require("./delivered-uninvoiced-report");
+const djDirectLtlWeeklyReport =
+  require("./dj-direct-ltl-weekly-invoice-report");
 const additionalCharges = require("./additional-charges");
 const intakeProfitGate = require("./intake-profit-gate");
 const intakeAmountMismatchGate = require("./intake-amount-mismatch-gate");
@@ -2191,6 +2193,104 @@ exports.reportDeliveredUninvoicedShipmentsWeekly = onSchedule({
     throw error;
   }
 });
+
+/**
+ * DJ Direct LTL weekly customer-invoice CSV. Query: ?dryRun=1, ?sample=1.
+ */
+exports.reportDjDirectLtlInvoices = onRequest(
+    {invoker: "public", timeoutSeconds: 540, memory: "512MiB"},
+    handleReportDjDirectLtlInvoices);
+
+/** Monday 8:00 AM America/New_York — prior-week DJ Direct LTL invoices CSV. */
+exports.reportDjDirectLtlInvoicesWeekly = onSchedule({
+  schedule: "0 8 * * 1",
+  timeZone: "America/New_York",
+  timeoutSeconds: 540,
+  memory: "512MiB",
+}, async () => {
+  try {
+    const result = await djDirectLtlWeeklyReport.runDjDirectLtlWeeklyReport({});
+    if (!result.ok) {
+      await writeLog("error", "report",
+          "DJ Direct LTL weekly invoice report failed", {
+            error: result.error || "unknown",
+          });
+      await saveOutboundEmail({
+        type: "dj_direct_ltl_weekly_report_failed",
+        subject: "System issue — DJ Direct LTL weekly report failed",
+        html: `<p>The DJ Direct LTL weekly invoice report failed.</p>` +
+          `<p>${escapeHtml(result.error || "Unknown error")}</p>`,
+        systemError: true,
+      });
+    }
+  } catch (error) {
+    await writeLog("error", "report",
+        "DJ Direct LTL weekly invoice report threw", {
+          error: error.message,
+        });
+    await saveOutboundEmail({
+      type: "dj_direct_ltl_weekly_report_failed",
+      subject: "System issue — DJ Direct LTL weekly report failed",
+      html: `<p>The DJ Direct LTL weekly invoice report failed.</p>` +
+        `<p>${escapeHtml(error.message)}</p>`,
+      systemError: true,
+    });
+    throw error;
+  }
+});
+
+/**
+ * @param {object} req HTTPS request.
+ * @param {object} res HTTPS response.
+ * @return {Promise<object>}
+ */
+async function handleReportDjDirectLtlInvoices(req, res) {
+  try {
+    if (req.method !== "POST" && req.method !== "GET") {
+      return res.status(405).json({ok: false, error: "Use GET or POST"});
+    }
+    const dryRun = req.query.dryRun === "1" || req.query.dryRun === "true" ||
+      (req.body && (req.body.dryRun === true || req.body.dryRun === "1"));
+    const sample = req.query.sample === "1" || req.query.sample === "true" ||
+      (req.body && (req.body.sample === true || req.body.sample === "1"));
+    const result = await djDirectLtlWeeklyReport.runDjDirectLtlWeeklyReport({
+      dryRun,
+      sample,
+    });
+    if (dryRun && result.csv) {
+      return res.status(200).json({
+        ok: true,
+        dryRun: true,
+        count: result.count,
+        window: {
+          start: result.window.start.toISOString(),
+          end: result.window.end.toISOString(),
+          label: result.window.label,
+        },
+        filename: result.filename,
+        to: result.to,
+        subject: result.subject,
+        loads: (result.rows || []).map((r) => r.loadNumber),
+      });
+    }
+    return res.status(result.ok ? 200 : 502).json({
+      ok: !!result.ok,
+      dryRun: !!result.dryRun,
+      count: result.count,
+      filename: result.filename,
+      to: result.to,
+      subject: result.subject,
+      loads: (result.rows || []).map((r) => r.loadNumber),
+      error: result.error || null,
+    });
+  } catch (error) {
+    await writeLog("error", "report",
+        "DJ Direct LTL weekly invoice report HTTP failed", {
+          error: error.message,
+        });
+    return res.status(500).json({ok: false, error: error.message});
+  }
+}
 
 /**
  * @param {object} req HTTPS request.
@@ -6519,14 +6619,18 @@ async function sendAdditionalChargeApprovalEmail(opts) {
 
   const dispatcherEmail = (dispatcher.ok && dispatcher.email) ?
     dispatcher.email : null;
-  // Approval emails go to Sarah + Lisa only (no dispatcher CC).
+  // Approval emails go To Sarah, CC Lisa only. The load dispatcher is NOT
+  // copied (Rose / Innovative: dispatchers must not receive these).
+  const approvalRecipients =
+    additionalCharges.additionalChargeApprovalRecipients();
   const emailPayload = {
     type: "additional_charge_approval",
     invoiceId,
     subject: email.subject,
     html: email.html,
     forceRecipient: true,
-    to: opsTo,
+    to: approvalRecipients.to,
+    cc: approvalRecipients.cc,
   };
 
   // Attach the full original carrier packet (invoice + W&I backups), not
@@ -7487,6 +7591,20 @@ async function saveOutboundEmail(email) {
   delete emailToStore.forceRecipient;
   delete emailToStore.forceSend;
   delete emailToStore.dedupeKey;
+  delete emailToStore.dashboardAttachments;
+  delete emailToStore.emailReceivedAt;
+  // Keep file names and types on the record, not the file bytes: a carrier
+  // packet in base64 can pass Firestore's 1 MB document limit and stop the
+  // email before it is sent.
+  if (Array.isArray(emailToStore.attachments)) {
+    emailToStore.attachments = emailToStore.attachments.map((att) => {
+      if (!att || typeof att !== "object") return att;
+      const copy = {...att};
+      delete copy.contentBase64;
+      delete copy.content;
+      return copy;
+    });
+  }
   const emailRef = await tcol(tenant, "outboundEmails").add({
     ...emailToStore,
     to,
@@ -7501,7 +7619,10 @@ async function saveOutboundEmail(email) {
   const isDashboardMeta = email.type === "dashboard_flag" ||
     email.type === "dashboard_reply" ||
     email.type === "dashboard_notification_digest";
-  const forceSend = email.forceSend === true || isDashboardMeta;
+  // Customer-facing charge notices and the dispatcher copy always go out,
+  // even when ops mail is parked on the dashboard.
+  const forceSend = email.forceSend === true || isDashboardMeta ||
+    additionalCharges.mustDeliverDespiteDashboardPark(email);
   const parkOpsOnDashboard = !forceSend &&
     dashboardOps.isDashboardOpsPrimary() &&
     !isCustomerBill && !isSystemErr && !isDashboardMeta;
@@ -7588,8 +7709,10 @@ async function saveOutboundEmail(email) {
     to: to,
     cc: cc || null,
     intendedTo: email.to || null,
-    sent: Boolean(sendResult && sendResult.ok),
+    sent: Boolean(sendResult && sendResult.ok && !sendResult.parked),
   }, null, tenant);
+  // Callers (DJ Direct report) check this to fail loudly on a lost send.
+  return sendResult;
 }
 
 /**
@@ -18486,6 +18609,15 @@ deliveredUninvoicedReport.init({
   writeLog,
   saveOutboundEmail,
   primusUiBridge,
+});
+
+djDirectLtlWeeklyReport.init({
+  db: admin.firestore(),
+  writeLog,
+  saveOutboundEmail,
+  tcol,
+  runWithTenant,
+  DEFAULT_TENANT,
 });
 
 dailyActivityReport.init({

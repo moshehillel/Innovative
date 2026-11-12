@@ -279,6 +279,37 @@ function mergeLisaOnCc(cc) {
 }
 
 /**
+ * Dashboard-ops mode parks internal mail. The customer additional-charge
+ * notice, the dispatcher copy of that notice, customer bills, and a few
+ * ops digests still go out.
+ * @param {object} email Outbound email payload.
+ * @return {boolean}
+ */
+function mustDeliverDespiteDashboardPark(email) {
+  if (!email || typeof email !== "object") return false;
+  if (email.forceSend === true) return true;
+  const type = String(email.type || "");
+  return type === "dashboard_notification_digest" ||
+    type === "dashboard_assignment" ||
+    type === "additional_charge_customer_notice" ||
+    type === "additional_charge_dispatcher_task";
+}
+
+/**
+ * To / CC for the additional-charge approval email: Sarah on To, Lisa on CC.
+ * The load dispatcher is never copied (Rose / Innovative, Nov 11); option B
+ * sends the dispatcher their own task email later.
+ * @return {{to: string, cc: (string|undefined)}}
+ */
+function additionalChargeApprovalRecipients() {
+  const both = additionalChargeOpsTo().split(",")
+      .map((part) => part.trim()).filter(Boolean);
+  const to = both[0];
+  const cc = both.slice(1).join(", ");
+  return {to, cc: cc || undefined};
+}
+
+/**
  * Ensures Lisa is on CC for any additional-charge outbound email payload.
  * @param {object} payload saveOutboundEmail fields.
  * @return {object} Payload with Lisa merged into cc.
@@ -2743,6 +2774,8 @@ module.exports = {
   invoiceTotalMatchesPrimusCost,
   mergeLisaOnCc,
   additionalChargeOpsTo,
+  additionalChargeApprovalRecipients,
+  mustDeliverDespiteDashboardPark,
   applyAdditionalChargeEmailCc,
   applyDispatcherEmailCc,
   formatCustomerRate,

@@ -2529,7 +2529,41 @@ exports.processPrimusWorkflow = onRequest(
 
           baseAmount = Number(invoice.invoiceAmount) - approvedChargesTotal;
 
-          if (primusSteps.amountValidated) {
+          // After A-F, accounting already accepted the carrier bill. Do not
+          // re-check invoice-minus-extra against Primus (270194 / 268543
+          // failed here when additionalCharge.amount was only the named
+          // lines, not the full Primus gap).
+          if (additionalChargeApproved) {
+            amountValidation = {
+              ok: true,
+              validAmount: true,
+              submittedAmount: Number(invoice.invoiceAmount),
+              primusQuotedAmount: null,
+              amount: null,
+              difference: 0,
+              reason: "additional_charge_approved",
+            };
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "amount_validation_completed",
+              stepStatus: "skipped",
+              reason: "Additional charge already approved — amount accepted",
+              output: {
+                validAmount: true,
+                submittedAmount: amountValidation.submittedAmount,
+                decision: additionalCharge && additionalCharge.decision || null,
+                approvedChargesTotal,
+              },
+            });
+            await writeLog("info", "workflow",
+                "Amount validation skipped — additional charge approved", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  decision: additionalCharge && additionalCharge.decision,
+                  invoiceAmount: invoice.invoiceAmount,
+                  approvedChargesTotal,
+                });
+          } else if (primusSteps.amountValidated) {
             amountValidation = reusedAmountValidationFromInvoice(invoice);
             await logWorkflowStep({
               invoiceId,
@@ -2822,13 +2856,17 @@ exports.processPrimusWorkflow = onRequest(
               excludedInPrimusCount: filteredProof.alreadyInPrimus.length,
             });
 
+              // To Sarah, CC Lisa only. The load dispatcher is NOT copied.
+              const approvalRecipients =
+                additionalChargesMod.additionalChargeApprovalRecipients();
               const approvalPayload = {
                 type: "additional_charge_approval",
                 invoiceId,
                 subject: approvalEmail.subject,
                 html: approvalEmail.html,
                 forceRecipient: true,
-                to: additionalChargesMod.additionalChargeOpsTo(),
+                to: approvalRecipients.to,
+                cc: approvalRecipients.cc,
               };
               // Full carrier packet (invoice + W&I), same as processGmailQueue.
               try {
@@ -3564,7 +3602,42 @@ exports.processPrimusWorkflow = onRequest(
 
             await setWorkflowHeartbeat(invoiceDoc.ref, "customer_rate_checked");
 
-            if (!customerRate || Number(customerRate) <= 0 || profit < 10) {
+            // After a human picks A-F the charge and the customer billing are
+            // decided. Do not stop the invoice again just because margin is
+            // thin (Lisa: "must not recheck rates"). A missing customer rate
+            // still pauses: there is nothing to bill without one.
+            const hasCustomerRate = !!customerRate &&
+              Number(customerRate) > 0;
+            const lowMarginOverriddenByApproval = additionalChargeApproved &&
+              hasCustomerRate && profit < 10;
+            if (lowMarginOverriddenByApproval) {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "customer_rate_check_completed",
+                stepStatus: "skipped",
+                reason: "Additional charge already approved — low margin " +
+                  "not rechecked",
+                output: {
+                  customerRate,
+                  profit,
+                  marginPct: marginPctCalc,
+                  decision: additionalCharge && additionalCharge.decision ||
+                    null,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "Low-margin pause skipped — additional charge approved", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerRate,
+                    profit,
+                    decision: additionalCharge && additionalCharge.decision ||
+                      null,
+                  });
+            }
+
+            if (!lowMarginOverriddenByApproval &&
+                (!customerRate || Number(customerRate) <= 0 || profit < 10)) {
               const pauseReason = !customerRate || Number(customerRate) <= 0 ?
         "Missing customer rate" : "Customer rate too low";
               await logWorkflowStep({

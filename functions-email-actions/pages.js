@@ -199,7 +199,8 @@ function buildOptionBAccessorialConfirmPage(opts) {
   const accessorialsUrlJson = JSON.stringify(
       opts.accessorialsUrl ? String(opts.accessorialsUrl) : "");
   const pickHint =
-    `Type to find each accessorial in the Primus list, then select it. ` +
+    `Pick each accessorial from the Primus dropdown (type in the filter box ` +
+    `above it to narrow the list). ` +
     `Add accessorial for a charge Jerry did not list. Then enter a ` +
     `percent markup (default 30%) or a flat customer amount.`;
   const baseRateHtml = bumpRate ?
@@ -230,7 +231,10 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `.bill-row input,.bill-row select{width:100%;padding:10px 12px;` +
     `border:1px solid #d1d5db;border-radius:8px;font-size:16px;` +
     `box-sizing:border-box;background:#fff}` +
-    `.bill-picker{position:relative}` +
+    `.bill-picker{position:relative;display:flex;flex-direction:column;` +
+    `gap:6px}` +
+    `.bill-name-search{font-size:14px}` +
+    `.bill-name-select{min-height:44px;font-size:15px}` +
     `.bill-menu{display:none;position:absolute;z-index:20;left:0;right:0;` +
     `top:calc(100% + 2px);max-height:220px;overflow:auto;background:#fff;` +
     `border:1px solid #d1d5db;border-radius:8px;` +
@@ -300,6 +304,16 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `const cat=normName(item.category);` +
     `return name.includes(want)||code.includes(want)||cat.includes(want)||` +
     `want.includes(name);}).slice(0,50);}` +
+    `function filterAll(q){` +
+    `const list=Array.isArray(catalog)?catalog:[];` +
+    `const want=normName(q);` +
+    `if(!want)return list.slice();` +
+    `return list.filter((item)=>{` +
+    `const name=normName(item.name);` +
+    `const code=normName(item.code);` +
+    `const cat=normName(item.category);` +
+    `return name.includes(want)||code.includes(want)||cat.includes(want)||` +
+    `want.includes(name);});}` +
     `function matchCatalog(name,code){` +
     `const want=normName(name);const wantCode=String(code||"");` +
     `const list=Array.isArray(catalog)?catalog:[];` +
@@ -344,54 +358,46 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `const search=document.createElement("input");` +
     `search.type="search";search.className="bill-name-search";` +
     `search.autocomplete="off";` +
-    `search.placeholder="Type to find Primus accessorial";` +
+    `search.placeholder="Filter the dropdown list (optional)";` +
     `const nameHidden=document.createElement("input");` +
     `nameHidden.type="hidden";nameHidden.className="bill-name";` +
     `const codeHidden=document.createElement("input");` +
     `codeHidden.type="hidden";codeHidden.className="bill-code";` +
-    `const menu=document.createElement("div");menu.className="bill-menu";` +
-    `const matched=matchCatalog(row.name,row.code);` +
-    `if(matched){` +
-    `nameHidden.value=matched.name||"";` +
-    `codeHidden.value=matched.code||"";` +
-    `search.value=matched.name||"";` +
-    `}else if(row.name){` +
-    `search.value=String(row.name);` +
-    `search.placeholder="Pick Primus name (Jerry listed: "+row.name+")";}` +
+    `const select=document.createElement("select");` +
+    `select.className="bill-name-select";` +
+    `select.setAttribute("aria-label","Primus accessorial");` +
     `function setChoice(item){` +
-    `nameHidden.value=item.name||"";codeHidden.value=item.code||"";` +
-    `search.value=item.name||"";menu.className="bill-menu";` +
-    `while(menu.firstChild)menu.removeChild(menu.firstChild);}` +
-    `function renderMenu(){` +
-    `while(menu.firstChild)menu.removeChild(menu.firstChild);` +
-    `const items=filterCatalog(search.value);` +
-    `if(!items.length){` +
-    `const empty=document.createElement("div");` +
-    `empty.className="bill-menu-empty";` +
-    `empty.textContent="No Primus match — keep typing";` +
-    `menu.appendChild(empty);menu.className="bill-menu open";return;}` +
+    `nameHidden.value=item&&item.name||"";` +
+    `codeHidden.value=item&&item.code||"";}` +
+    `function fillSelect(){` +
+    `while(select.options.length)select.remove(0);` +
+    `const ph=document.createElement("option");ph.value="";` +
+    `ph.textContent="— Select Primus accessorial —";select.appendChild(ph);` +
+    `const items=filterAll(search.value);let saw=false;` +
     `items.forEach((item)=>{` +
-    `const btn=document.createElement("button");btn.type="button";` +
-    `btn.className="bill-menu-item";` +
-    `btn.textContent=(item.category?item.category+" — ":"")+item.name;` +
-    `btn.onmousedown=(ev)=>{if(ev&&ev.preventDefault)ev.preventDefault();` +
-    `setChoice(item);};` +
-    `menu.appendChild(btn);});` +
-    `menu.className="bill-menu open";}` +
-    `search.onfocus=()=>renderMenu();` +
-    `search.oninput=()=>{` +
-    `if(String(search.value||"").trim()!==` +
-    `String(nameHidden.value||"").trim()){` +
-    `nameHidden.value="";codeHidden.value="";}` +
-    `renderMenu();};` +
-    `search.onblur=()=>{` +
-    `const typed=(search.value||"").trim();` +
-    `if(typed&&!(nameHidden.value||"").trim()){` +
-    `const auto=matchCatalog(typed,codeHidden.value);` +
-    `if(auto)setChoice(auto);}` +
-    `setTimeout(()=>{menu.className="bill-menu";},150);};` +
-    `picker.appendChild(search);picker.appendChild(nameHidden);` +
-    `picker.appendChild(codeHidden);picker.appendChild(menu);` +
+    `const opt=document.createElement("option");` +
+    `opt.value=String(item.name||"");opt.dataset.code=item.code||"";` +
+    `opt.textContent=(item.category?item.category+" — ":"")+item.name;` +
+    `if((codeHidden.value&&item.code===codeHidden.value)||` +
+    `(nameHidden.value&&normName(item.name)===normName(nameHidden.value))){` +
+    `opt.selected=true;saw=true;}` +
+    `select.appendChild(opt);});` +
+    `if(!saw){select.value="";` +
+    `if(items.length===1&&search.value){` +
+    `select.selectedIndex=1;setChoice(items[0]);}}}` +
+    `const matched=matchCatalog(row.name,row.code);` +
+    `if(matched){setChoice(matched);` +
+    `}else if(row.name){` +
+    `if(filterAll(row.name).length)search.value=String(row.name);` +
+    `search.placeholder="Filter — Jerry listed: "+row.name;}` +
+    `fillSelect();` +
+    `search.oninput=()=>fillSelect();` +
+    `select.onchange=()=>{` +
+    `const opt=select.options[select.selectedIndex];` +
+    `if(!opt||!opt.value){setChoice(null);return;}` +
+    `setChoice({name:opt.value,code:opt.dataset.code||""});};` +
+    `picker.appendChild(search);picker.appendChild(select);` +
+    `picker.appendChild(nameHidden);picker.appendChild(codeHidden);` +
     `nameCell.appendChild(label);nameCell.appendChild(picker);` +
     `const remove=document.createElement("button");` +
     `remove.type="button";remove.className="remove-btn";` +
@@ -469,8 +475,8 @@ function buildOptionBAccessorialConfirmPage(opts) {
     `row.querySelector(".bill-code").value=code;` +
     `row.querySelector(".bill-name-search").value=name;}}` +
     `if(!name){` +
-    `if(typed){alert("Pick \\""+typed+"\\" from the Primus list "+` +
-    `"(type to filter, then select).");e.preventDefault();return false;}` +
+    `if(typed){alert("Select \\""+typed+"\\" from the Primus dropdown "+` +
+    `"(the filter box narrows the list).");e.preventDefault();return false;}` +
     `continue;}` +
     `const carrierAmount=Number(row.dataset.carrierAmount)||0;` +
     `const mode=row.querySelector(".bill-mode").value;` +
