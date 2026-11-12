@@ -2437,7 +2437,7 @@ async function handleReportDjDirectLtlInvoices(req, res) {
         loads: (result.rows || []).map((r) => r.loadNumber),
       });
     }
-    return res.status(200).json({
+    return res.status(result.ok ? 200 : 502).json({
       ok: !!result.ok,
       dryRun: !!result.dryRun,
       count: result.count,
@@ -6739,6 +6739,9 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     podFollowup.SARAH_EMAIL;
   const dispatcherEmail = (dispatcher.ok && dispatcher.email) ?
     dispatcher.email : null;
+  // Approval emails go to Sarah with Lisa on CC only. The load dispatcher
+  // is NOT copied (Rose/Innovative: dispatchers must not receive these).
+  // Option B hands the dispatcher their own separate task email later.
   const emailPayload = additionalCharges.applyAdditionalChargeEmailCc({
     type: "additional_charge_approval",
     invoiceId,
@@ -6746,7 +6749,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
     html: email.html,
     forceRecipient: true,
     to: approver,
-    cc: dispatcherEmail || undefined,
+    cc: undefined,
   });
 
   // Attach the carrier invoice PDF (GCS) so Sarah/Lisa can review the bill.
@@ -6786,8 +6789,7 @@ async function sendAdditionalChargeApprovalEmail(opts) {
   // Persist the same HTML the email has so Tasks/Notifications match.
   const MAX_NOTIF_BODY = 120000;
   const emailHtmlBody = String(email.html || "").slice(0, MAX_NOTIF_BODY);
-  const emailCcParts = [dispatcherEmail, additionalCharges.LISA_EMAIL]
-      .filter(Boolean);
+  const emailCcParts = [additionalCharges.LISA_EMAIL].filter(Boolean);
   const emailCc = emailCcParts.join(", ");
   const resolvedDispatcherName =
     dispatcher.displayName || dispatcher.userName || null;

@@ -445,7 +445,9 @@ const page = ac.buildOptionBAccessorialConfirmPage({
   fields: {invoiceId: "1", option: "b"},
 });
 check("resolution page uses the Primus list",
-    page.includes("Redelivery Fee") && page.includes("Select accessorial"),
+    page.includes("Redelivery Fee") &&
+      page.includes("Select Primus accessorial") ||
+      page.includes("bill-name-select"),
     true);
 check("resolution page can add another charge",
     page.includes("add-bill-line"), true);
@@ -493,7 +495,9 @@ function mountConfirmPage(html) {
       title: "",
       disabled: false,
       readOnly: false,
+      autocomplete: "",
       dataset: {},
+      style: {},
       parent: null,
       _value: "",
       _options: [],
@@ -511,17 +515,40 @@ function mountConfirmPage(html) {
         }
         return child;
       },
+      removeChild(child) {
+        this.children = this.children.filter((c) => c !== child);
+        if (child) child.parent = null;
+        return child;
+      },
       querySelector(sel) {
         return queryAll(this, sel)[0] || null;
       },
       querySelectorAll(sel) {
         return queryAll(this, sel);
       },
-      remove() {
+      setAttribute(name, value) {
+        this.attrs = this.attrs || {};
+        this.attrs[name] = String(value);
+      },
+      remove(index) {
+        if (this.tag === "select" && typeof index === "number") {
+          const opt = this._options[index];
+          if (!opt) return;
+          this._options.splice(index, 1);
+          this.children = this.children.filter((c) => c !== opt);
+          opt.parent = null;
+          if (this._selected >= this._options.length) this._selected = 0;
+          return;
+        }
         if (!this.parent) return;
         this.parent.children = this.parent.children.filter((c) => c !== this);
       },
     };
+    Object.defineProperty(node, "firstChild", {
+      get() {
+        return this.children[0] || null;
+      },
+    });
     Object.defineProperty(node, "options", {
       get() {
         return this._options;
@@ -638,7 +665,8 @@ const added = edited.container.querySelectorAll(".bill-row");
 const addedRow = added[added.length - 1];
 const addedPct = addedRow.querySelector(".bill-value");
 check("new accessorial row starts at 30 percent", addedPct.value, "30");
-addedRow.querySelector(".bill-name").value = "RDV";
+addedRow.querySelector(".bill-name").value = "Redelivery";
+addedRow.querySelector(".bill-code").value = "RDV";
 addedRow.querySelector(".bill-carrier").value = "10";
 edited.form.onsubmit({preventDefault() {}});
 const editedLines = JSON.parse(edited.jsonField.value);
@@ -876,6 +904,34 @@ check("internal approval mail can still stay on the dashboard",
     ac.mustDeliverDespiteDashboardPark({
       type: "additional_charge_approval",
     }), false);
+check("approval email CC is Lisa only (no dispatcher)",
+    ac.applyAdditionalChargeEmailCc({
+      type: "additional_charge_approval",
+      to: "Sarah@innovativecarriers.com",
+      cc: undefined,
+    }).cc, ac.LISA_EMAIL);
+{
+  // Regression guard: Rose reported dispatchers still being CC'd on the
+  // Sarah approval email after it was claimed fixed. Both code paths that
+  // send additional_charge_approval must never put a dispatcher on cc.
+  const fs = require("fs");
+  const path = require("path");
+  const sources = ["../index.js", "../innovative-primus.js"].map((rel) =>
+    fs.readFileSync(path.join(__dirname, rel), "utf8"));
+  const approvalBlocks = [];
+  for (const src of sources) {
+    let at = src.indexOf("type: \"additional_charge_approval\"");
+    while (at !== -1) {
+      approvalBlocks.push(src.slice(at, at + 500));
+      at = src.indexOf("type: \"additional_charge_approval\"", at + 1);
+    }
+  }
+  const sendBlocks = approvalBlocks.filter((b) => b.includes("to: approver"));
+  check("found both approval-email send sites", sendBlocks.length >= 2, true);
+  check("no approval email puts the dispatcher on cc",
+      sendBlocks.every((b) => /cc:\s*undefined/.test(b) &&
+        !/cc:\s*(dispatcherEmail|\(dispatcherForEmail)/.test(b)), true);
+}
 check("option A completion closes the dashboard task",
     ac.shouldCloseAdditionalChargeTask({
       decision: "A",

@@ -333,7 +333,7 @@ async function runDjDirectLtlWeeklyReport(opts = {}) {
   }
 
   const contentBase64 = Buffer.from(csv, "utf8").toString("base64");
-  await saveOutboundEmail({
+  const sendResult = await saveOutboundEmail({
     type: "dj_direct_ltl_weekly_invoices",
     forceRecipient: true,
     to,
@@ -345,6 +345,33 @@ async function runDjDirectLtlWeeklyReport(opts = {}) {
       contentBase64,
     }],
   });
+
+  // saveOutboundEmail never throws on a transport failure; it records
+  // {ok:false,error} on the outbound doc. Surface it so a failed send is a
+  // loud failure instead of a silent "ok".
+  if (!sendResult || sendResult.ok !== true || sendResult.parked) {
+    const error = (sendResult && sendResult.error) ||
+      (sendResult && sendResult.parked ?
+        "Email was parked instead of sent" :
+        "Email send did not report success");
+    await writeLog("error", "report",
+        "DJ Direct LTL weekly invoice email was NOT sent", {
+          error,
+          to,
+          subject,
+        });
+    return {
+      ok: false,
+      error,
+      dryRun: false,
+      count: rows.length,
+      window,
+      filename,
+      to,
+      subject,
+      rows,
+    };
+  }
 
   return {
     ok: true,

@@ -2324,10 +2324,9 @@ exports.processPrimusWorkflow = onRequest(
               html: approvalEmail.html,
               forceRecipient: true,
               to: approver,
-              cc: (dispatcherForEmail.ok && dispatcherForEmail.email &&
-                dispatcherForEmail.email.toLowerCase() !==
-                approver.toLowerCase()) ?
-                dispatcherForEmail.email : undefined,
+              // Sarah To + Lisa CC only (applyAdditionalChargeEmailCc adds
+              // Lisa). The load dispatcher is intentionally NOT copied.
+              cc: undefined,
             });
               await saveOutboundEmail(approvalPayload);
 
@@ -2933,7 +2932,42 @@ exports.processPrimusWorkflow = onRequest(
 
             await setWorkflowHeartbeat(invoiceDoc.ref, "customer_rate_checked");
 
-            if (!customerRate || Number(customerRate) <= 0 || profit < 10) {
+            // After a human picks A–F the charge and the customer billing are
+            // decided. Do not stop the invoice again just because margin is
+            // thin (Lisa: "must not recheck rates"). A missing customer rate
+            // still pauses — there is nothing to bill without one.
+            const hasCustomerRate = !!customerRate &&
+              Number(customerRate) > 0;
+            const lowMarginOverriddenByApproval = additionalChargeApproved &&
+              hasCustomerRate && profit < 10;
+            if (lowMarginOverriddenByApproval) {
+              await logWorkflowStep({
+                invoiceId,
+                stepName: "customer_rate_check_completed",
+                stepStatus: "skipped",
+                reason: "Additional charge already approved — low margin " +
+                  "not rechecked",
+                output: {
+                  customerRate,
+                  profit,
+                  marginPct: marginPctCalc,
+                  decision: additionalCharge && additionalCharge.decision ||
+                    null,
+                },
+              });
+              await writeLog("info", "workflow",
+                  "Low-margin pause skipped — additional charge approved", {
+                    invoiceId,
+                    loadNumber: invoice.loadNumber,
+                    customerRate,
+                    profit,
+                    decision: additionalCharge && additionalCharge.decision ||
+                      null,
+                  });
+            }
+
+            if (!lowMarginOverriddenByApproval &&
+                (!customerRate || Number(customerRate) <= 0 || profit < 10)) {
               const pauseReason = !customerRate || Number(customerRate) <= 0 ?
         "Missing customer rate" : "Customer rate too low";
               await logWorkflowStep({

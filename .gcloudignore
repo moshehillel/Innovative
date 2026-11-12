@@ -1,0 +1,19 @@
+.git
+**/.git
+node_modules/
+functions/node_modules/
+functions/scripts/_tmp*
+functions/.env*
+**/.env
+**/.env.*
+deliverables/
+tools/
+*.md
+firebase-debug.log
+firebase-debug.*.log
+_cloudbuild-*.yaml
+**/*.pdf
+# Ship the project env file so deployed functions actually get OUTLOOK_*,
+# PRIMUS_*, DASHBOARD_OPS_PRIMARY=false etc. Without this, brand-new functions
+# deploy with NO env (DJ Direct email failed) and existing ones keep stale values.
+!functions/.env.tai-invoice-automation
