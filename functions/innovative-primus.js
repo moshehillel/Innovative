@@ -2410,6 +2410,38 @@ exports.processPrimusWorkflow = onRequest(
         // restart the workflow.
         if (invoice.additionalCharge &&
             !invoice.additionalCharge.decision) {
+          // The decision may have been clicked while paperwork uploaded. Its
+          // restart was turned away by this run's lock. The approval values
+          // above were read before the decision, so do not bill on them:
+          // release the lock and queue a fresh run (retry job, every 5 min).
+          const freshSnap = await invoiceDoc.ref.get();
+          const fresh = freshSnap.exists ? (freshSnap.data() || {}) : {};
+          const freshCharge = fresh.additionalCharge || null;
+          if (freshCharge && freshCharge.decision) {
+            await logWorkflowStep({
+              invoiceId,
+              stepName: "additional_charge_gate",
+              stepStatus: "skipped",
+              reason: "Decision arrived during paperwork — fresh run queued",
+            });
+            await invoiceDoc.ref.update({
+              processingLock: false,
+              pendingDelayedRetry: true,
+              delayedRetryAt: new Date(),
+              updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            });
+            await writeLog("info", "workflow",
+                "Additional-charge decision arrived during paperwork — " +
+                "queued a fresh run", {
+                  invoiceId,
+                  loadNumber: invoice.loadNumber,
+                  decision: freshCharge.decision,
+                });
+            return res.json({
+              ok: false,
+              error: "ADDITIONAL_CHARGE_DECISION_RERUN_QUEUED",
+            });
+          }
           await logWorkflowStep({
             invoiceId,
             stepName: "additional_charge_gate",
