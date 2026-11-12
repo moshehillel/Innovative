@@ -626,6 +626,62 @@ async function releaseOpsEmailSend(tenant, key) {
 }
 
 /**
+ * Finds a prior Firestore invoice for the same load with the same dollar
+ * total (carrier resent an identical copy in a new email). Different totals
+ * are NOT duplicates: those are updated invoices and must be processed.
+ * A prior copy whose run failed does not count, so a resend can recover it.
+ * @param {object} tenant Tenant config.
+ * @param {object} aiResult Extracted invoice fields.
+ * @return {Promise<object|null>}
+ */
+async function findExactDuplicateCarrierInvoice(tenant, aiResult) {
+  const loadNumber = normalizeLoadNumber(
+      aiResult && aiResult.loadNumber);
+  const amount = Number(aiResult && aiResult.invoiceAmount);
+  if (!loadNumber || !Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+  try {
+    // Equality only: no composite index is needed (the dashboard-ops copy
+    // ordered by createdAt, had no index, and never found a duplicate).
+    const snap = await tcol(tenant, "invoices")
+        .where("loadNumber", "==", loadNumber)
+        .limit(50)
+        .get();
+    const millis = (v) => (v && typeof v.toMillis === "function" ?
+      v.toMillis() : (v ? new Date(v).getTime() || 0 : 0));
+    const docs = snap.docs.slice().sort((a, b) =>
+      millis((b.data() || {}).createdAt) - millis((a.data() || {}).createdAt));
+    for (const doc of docs) {
+      const d = doc.data() || {};
+      const prev = Number(d.invoiceAmount);
+      if (!Number.isFinite(prev)) continue;
+      // Different $ total → updated invoice; never skip.
+      if (Math.abs(prev - amount) > 0.009) continue;
+      const priorStatus = String(d.finalWorkflowStatus || "").toLowerCase();
+      if (priorStatus === "failed" || priorStatus === "error") continue;
+
+      const newInv = normalizeCarrierReference(aiResult.invoiceNumber);
+      const oldInv = normalizeCarrierReference(d.invoiceNumber);
+      // When both sides have an invoice # and they differ, keep processing
+      // (could be a second bill that happens to match on dollars).
+      if (newInv && oldInv && newInv !== oldInv) continue;
+
+      return {
+        invoiceId: doc.id,
+        invoiceAmount: prev,
+        invoiceNumber: d.invoiceNumber || null,
+        gmailMessageId: d.gmailMessageId || null,
+        finalWorkflowStatus: d.finalWorkflowStatus || null,
+      };
+    }
+  } catch (err) {
+    console.error("[findExactDuplicateCarrierInvoice]", err.message);
+  }
+  return null;
+}
+
+/**
  * Drops invoice items whose load was already processed from this email.
  * @param {object} tenant Tenant config.
  * @param {string} messageId Parent Gmail message id.
@@ -13044,6 +13100,31 @@ async function processGmailMessage(
               status: aiResult.status || null,
               finalStatus: "already_billed_skipped",
               invoiceId: null,
+            });
+            continue;
+          }
+
+          // Carrier resent the same invoice copy in a new email (same load +
+          // same $). Different totals are updates and still process, and a
+          // copy whose first run failed is processed again.
+          const exactDup = await findExactDuplicateCarrierInvoice(
+              tenant, aiResult);
+          if (exactDup) {
+            await writeLog("info", "mail",
+                "Skipping exact duplicate carrier invoice copy", {
+                  messageId,
+                  loadNumber: aiResult.loadNumber,
+                  invoiceNumber: aiResult.invoiceNumber || null,
+                  invoiceAmount: aiResult.invoiceAmount || null,
+                  priorInvoiceId: exactDup.invoiceId,
+                  priorGmailMessageId: exactDup.gmailMessageId || null,
+                  priorStatus: exactDup.finalWorkflowStatus || null,
+                });
+            itemSummaries.push({
+              loadNumber: aiResult.loadNumber,
+              status: aiResult.status || null,
+              finalStatus: "exact_duplicate_skipped",
+              invoiceId: exactDup.invoiceId,
             });
             continue;
           }
