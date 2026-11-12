@@ -442,6 +442,72 @@
     return s;
   }
 
+  /* Tags that can run code, load other pages, or submit data. */
+  const EMAIL_BLOCKED_TAGS = new Set([
+    "script", "iframe", "frame", "frameset", "object", "embed", "applet",
+    "base", "meta", "link", "form", "input", "button", "textarea", "select",
+    "option", "portal", "noscript", "template", "svg", "math",
+  ]);
+  const EMAIL_URL_ATTRS = new Set([
+    "href", "src", "action", "formaction", "background", "poster",
+    "xlink:href", "srcset", "data", "cite", "longdesc", "lowsrc", "dynsrc",
+  ]);
+
+  /**
+   * Customer and carrier emails are untrusted. The email frame must allow
+   * scripts and same-origin for the A–F click helper, so an email must
+   * never bring its own script: parse it in an inert document and keep
+   * only markup, with no event handlers and no script URLs.
+   */
+  function sanitizeEmailHtml(html) {
+    let doc;
+    try {
+      doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+    } catch (_) {
+      return `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
+        `${bodyEsc(String(html || ""))}</pre>`;
+    }
+    const all = Array.from(doc.querySelectorAll("*"));
+    for (const el of all) {
+      const tag = el.tagName.toLowerCase();
+      if (EMAIL_BLOCKED_TAGS.has(tag)) {
+        el.remove();
+        continue;
+      }
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        const value = String(attr.value || "")
+            .replace(/[\u0000- \u007f-\u009f]+/g, "").toLowerCase();
+        if (name.startsWith("on") || name === "srcdoc" ||
+            name === "formaction" || name === "http-equiv") {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (EMAIL_URL_ATTRS.has(name)) {
+          const dataImage = /^data:image\/(png|gif|jpe?g|webp|bmp);/.test(value);
+          if (/^(javascript|vbscript|livescript|mocha):/.test(value) ||
+              (value.startsWith("data:") && !dataImage)) {
+            el.removeAttribute(attr.name);
+          }
+          continue;
+        }
+        if (name === "style" &&
+            /expression\s*\(|javascript:|behavior\s*:|-moz-binding/.test(value)) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    }
+    const styles = Array.from(doc.querySelectorAll("style")).map((st) =>
+      String(st.textContent || "")
+          .replace(/expression\s*\(|javascript:|behavior\s*:|-moz-binding/gi, "")
+          .replace(/@import[^;]*;?/gi, ""));
+    doc.querySelectorAll("style").forEach((st) => st.remove());
+    const bodyHtml = doc.body ? doc.body.innerHTML : "";
+    const keptStyles = styles.length ?
+      `<style>${styles.join("\n").replace(/<\/style/gi, "")}</style>` : "";
+    return keptStyles + bodyHtml;
+  }
+
   function emailBodyAsHtml(rawBody) {
     let s = String(rawBody || "").trim();
     if (!s) return "";
@@ -449,8 +515,7 @@
       s = decodeHtmlEntities(s);
     }
     if (looksLikeHtml(s)) {
-      return enableEmailActionPopups(
-          s.replace(/<script[\s\S]*?<\/script>/gi, ""));
+      return enableEmailActionPopups(sanitizeEmailHtml(s));
     }
     return `<pre style="white-space:pre-wrap;font:inherit;margin:0;">` +
       `${bodyEsc(s)}</pre>`;
