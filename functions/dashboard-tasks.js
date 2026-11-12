@@ -753,7 +753,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
 
   chargeSnap.forEach((doc) => {
     const data = doc.data() || {};
-    if (data.tenantId && data.tenantId !== tenantId) return;
+    if (!ownership.sameTenant(data.tenantId, tenantId)) return;
     followById.set(doc.id, data);
   });
 
@@ -771,7 +771,7 @@ async function listDashboardTasks(db, additionalChargesMod, opts) {
     snaps.forEach((snap) => {
       if (!snap.exists) return;
       const data = snap.data() || {};
-      if (data.tenantId && data.tenantId !== tenantId) return;
+      if (!ownership.sameTenant(data.tenantId, tenantId)) return;
       if (data.resolved === true) return;
       followById.set(snap.id, data);
     });
@@ -948,7 +948,7 @@ async function markTasksInDispute(db, opts) {
   snap.forEach((doc) => {
     const data = doc.data() || {};
     if (data.type && data.type !== TASK_TYPE.ADDITIONAL_CHARGE) return;
-    if (tenantId && data.tenantId && data.tenantId !== tenantId) return;
+    if (tenantId && !ownership.sameTenant(data.tenantId, tenantId)) return;
     if (data.status === TASK_STATUS.DISMISSED) return;
     writes.push(doc.ref.update({
       chargePhase: "dispute",
@@ -1059,7 +1059,7 @@ async function dismissDuplicateOpenTasks(db, additionalChargesMod, seed) {
   snap.forEach((doc) => {
     const row = doc.data() || {};
     if (row.status === TASK_STATUS.DISMISSED) return;
-    if (seed.tenantId && row.tenantId && row.tenantId !== seed.tenantId) {
+    if (seed.tenantId && !ownership.sameTenant(row.tenantId, seed.tenantId)) {
       return;
     }
     openDocs.push(doc);
@@ -1223,7 +1223,7 @@ async function resolveDuplicateFollowUps(db, additionalChargesMod, seed) {
   snap.forEach((doc) => {
     const row = doc.data() || {};
     if (row.resolved === true) return;
-    if (seed.tenantId && row.tenantId && row.tenantId !== seed.tenantId) {
+    if (seed.tenantId && !ownership.sameTenant(row.tenantId, seed.tenantId)) {
       return;
     }
     const candidate = {
@@ -1279,7 +1279,7 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
       return {ok: false, error: "Task not found."};
     }
     const row = snap.data() || {};
-    if (opts.tenantId && row.tenantId && row.tenantId !== opts.tenantId) {
+    if (opts.tenantId && !ownership.sameTenant(row.tenantId, opts.tenantId)) {
       return {ok: false, error: "Task not found."};
     }
     await ref.update({
@@ -1317,8 +1317,7 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     return {ok: false, error: "Task not found."};
   }
   const data = snap.data() || {};
-  if (opts.tenantId && data.tenantId &&
-      data.tenantId !== opts.tenantId) {
+  if (opts.tenantId && !ownership.sameTenant(data.tenantId, opts.tenantId)) {
     return {ok: false, error: "Task not found."};
   }
   await ref.update({

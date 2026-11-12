@@ -13,6 +13,7 @@
 "use strict";
 
 const admin = require("firebase-admin");
+const ownership = require("./dashboard-ownership");
 
 const NOTIF_COLLECTION = "dashboardNotifications";
 
@@ -417,7 +418,7 @@ async function dismissNotification(db, opts) {
   const snap = await ref.get();
   if (!snap.exists) return {ok: false, error: "Notification not found."};
   const data = snap.data() || {};
-  if (opts.tenantId && data.tenantId && data.tenantId !== opts.tenantId) {
+  if (opts.tenantId && !ownership.sameTenant(data.tenantId, opts.tenantId)) {
     return {ok: false, error: "Notification not found."};
   }
   await ref.update({
@@ -444,7 +445,7 @@ async function flagNotification(db, opts) {
   const snap = await ref.get();
   if (!snap.exists) return {ok: false, error: "Notification not found."};
   const data = snap.data() || {};
-  if (opts.tenantId && data.tenantId && data.tenantId !== opts.tenantId) {
+  if (opts.tenantId && !ownership.sameTenant(data.tenantId, opts.tenantId)) {
     return {ok: false, error: "Notification not found."};
   }
   await ref.update({
@@ -581,7 +582,7 @@ async function dismissOpenPodNotifications(db, opts) {
   const ids = [];
   for (const doc of snap.docs || []) {
     const data = doc.data() || {};
-    if (data.tenantId && data.tenantId !== tenantId) continue;
+    if (!ownership.sameTenant(data.tenantId, tenantId)) continue;
     const row = {
       id: doc.id,
       ...data,
