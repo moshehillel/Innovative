@@ -9,6 +9,7 @@ const admin = require("firebase-admin");
 const ownership = require("./dashboard-ownership");
 const scope = require("./dashboard-scope");
 const queue = require("./dashboard-queue");
+const dashboardOps = require("./dashboard-ops");
 
 const TASK_COLLECTION = "dashboardTasks";
 
@@ -1082,6 +1083,56 @@ async function dismissDuplicateOpenTasks(db, additionalChargesMod, seed) {
 }
 
 /**
+ * Drops the open notice for the problem that was just finished.
+ * Other problems on the same load stay open. Never throws.
+ * @param {object} db Firestore.
+ * @param {object} opts issue, tenantId, loadNumber, invoiceId,
+ *   messageId, followUpId.
+ * @return {Promise<void>}
+ */
+async function dismissNoticesForCompletedWork(db, opts) {
+  const issue = opts && opts.issue;
+  if (!issue) return;
+  try {
+    await dashboardOps.dismissOpenIssueNotifications(db, {
+      tenantId: opts.tenantId,
+      loadNumber: opts.loadNumber || null,
+      invoiceId: opts.invoiceId || null,
+      messageId: opts.messageId || null,
+      followUpId: opts.followUpId || null,
+      issue,
+    });
+  } catch (err) {
+    console.error("[dashboard-tasks] notice dismiss:",
+        err && err.message);
+  }
+}
+
+/**
+ * Notice key for an invoice hold that was just cleared.
+ * @param {string} issue Hold issue id.
+ * @param {object} data Invoice fields.
+ * @return {string|null}
+ */
+function noticeKeyForHold(issue, data) {
+  if (issue === scope.ISSUE.MISSING_POD) {
+    return dashboardOps.NOTICE_ISSUE.POD;
+  }
+  if (issue === scope.ISSUE.MISSING_RATE) {
+    return dashboardOps.NOTICE_ISSUE.RATE;
+  }
+  const key = dashboardOps.noticeIssueKey(data);
+  if (key === dashboardOps.NOTICE_ISSUE.PROFIT ||
+      key === dashboardOps.NOTICE_ISSUE.GTG ||
+      key === dashboardOps.NOTICE_ISSUE.LOAD_NUMBER) {
+    return key;
+  }
+  const saved = dashboardOps.noticeIssueForRateSave(data);
+  if (saved === dashboardOps.NOTICE_ISSUE.PROFIT) return saved;
+  return null;
+}
+
+/**
  * Invoice id for a synthesized hold row (`invoice:{id}`).
  * Real dashboard tasks and additional-charge rows return "".
  * @param {string} taskId Row id.
@@ -1202,6 +1253,12 @@ async function dismissInvoiceHold(db, opts) {
     tenantId: opts.tenantId,
     issue,
   });
+  await dismissNoticesForCompletedWork(db, {
+    tenantId: opts.tenantId,
+    invoiceId,
+    loadNumber: data.loadNumber,
+    issue: noticeKeyForHold(issue, data),
+  });
   return {ok: true};
 }
 
@@ -1308,6 +1365,20 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
       }),
       requireHoldMatch: false,
     });
+    await dismissNoticesForCompletedWork(db, {
+      tenantId: opts.tenantId,
+      invoiceId: row.invoiceId,
+      loadNumber: row.loadNumber,
+      followUpId: taskId,
+      issue: dashboardOps.noticeIssueKey({
+        type: TASK_TYPE.ADDITIONAL_CHARGE,
+        chargePhase: row.chargePhase,
+        followUpStatus: row.status,
+        decision: row.decision,
+        subject: row.emailSubject,
+        reason: row.category,
+      }),
+    });
     return {ok: true};
   }
 
@@ -1345,6 +1416,14 @@ async function dismissDashboardTask(db, additionalChargesMod, opts) {
     collectionPrefix: opts.collectionPrefix,
     issue: scope.classifyIssue(data),
     requireHoldMatch: true,
+  });
+  await dismissNoticesForCompletedWork(db, {
+    tenantId: opts.tenantId,
+    invoiceId: data.invoiceId,
+    loadNumber: data.loadNumber,
+    messageId: data.messageId,
+    followUpId: data.followUpId,
+    issue: dashboardOps.noticeIssueKey(data),
   });
   return {ok: true};
 }

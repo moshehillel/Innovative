@@ -192,6 +192,8 @@ async function createNotification(db, data) {
       status: NOTIF_STATUS.OPEN,
       title: data.title || "Notification",
       body: data.body || null,
+      // Plain words for dashboard search, so search never reads the HTML.
+      searchText: notificationSearchTextFromBody(data.body),
       subject: data.subject || null,
       from: data.from || null,
       to: data.to || null,
@@ -331,18 +333,59 @@ async function listNotifications(db, opts) {
         .orderBy("createdAt", "desc");
   }
   if (returnAll) {
-    const docs = await collectNotifPage(base);
-    const notifications = docs.map(serializeNotif);
-    return {notifications, openCount: notifications.length};
+    // Every open row (daily digest). List fields only: no email HTML.
+    const docs = await collectNotifPage(base.select(...NOTIF_LIST_FIELDS));
+    const notifications = uniqueNotificationsById(
+        sortNotifications(docs.map(serializeNotif), opts.sort, opts.now));
+    return {
+      notifications,
+      openCount: notifications.length,
+      hasMore: false,
+    };
   }
   const limit = Math.min(Math.max(Number(opts.limit) || 50, 1), 100);
   const offset = Math.max(0, Number(opts.offset) || 0);
   if (q) {
-    const docs = await collectNotifPage(base, 2000);
+    // Every open row is searched, through the small searchText field.
+    // Older rows saved before searchText have short plain bodies; only
+    // those bodies are read.
+    const docs = await collectNotifPage(
+        base.select(...NOTIF_LIST_FIELDS, "searchText"));
+    const searchRows = docs.map((doc) => {
+      const data = doc.data() || {};
+      const row = serializeNotif(doc);
+      row.searchText = data.searchText || null;
+      return {row, ref: doc.ref};
+    });
+    const legacy = searchRows.filter((entry) =>
+      !entry.row.searchText && entry.ref);
+    if (legacy.length && typeof db.getAll === "function") {
+      for (let i = 0; i < legacy.length; i += 100) {
+        const chunk = legacy.slice(i, i + 100);
+        // eslint-disable-next-line no-await-in-loop
+        const snaps = await db.getAll(...chunk.map((entry) => entry.ref), {
+          fieldMask: ["body"],
+        }).catch(() => []);
+        snaps.forEach((snap, idx) => {
+          const body = snap && snap.exists ? (snap.data() || {}).body : null;
+          if (body) {
+            chunk[idx].row.searchText =
+              notificationSearchTextFromBody(body);
+          }
+        });
+      }
+    }
     const now = Number(opts.now) || Date.now();
-    let rows = docs.map(serializeNotif).filter((row) =>
+    let rows = uniqueNotificationsById(searchRows.map((entry) => {
+      const row = entry.row;
+      row.body = null;
+      return row;
+    })).filter((row) =>
       notificationMatchesQuery(row, q) &&
       notificationInRange(row, opts.range, now));
+    rows.forEach((row) => {
+      delete row.searchText;
+    });
     rows = sortNotifications(rows, opts.sort, now);
     const page = rows.slice(offset, offset + limit);
     return {
@@ -355,13 +398,33 @@ async function listNotifications(db, opts) {
       limit,
     };
   }
-  // The first page does not carry email HTML. The dashboard loads it with
-  // loadNotificationDetail when a row is opened.
-  const docs = await collectNotifPage(
-      base.select(...NOTIF_LIST_FIELDS), limit);
-  const notifications = sortNotifications(
+  // Pages do not carry email HTML. The dashboard loads it with
+  // loadNotificationDetail when a row is opened. Load more asks for the
+  // next offset, so read through offset + limit (list fields only) and
+  // report hasMore and the real open count; the old first-page-only read
+  // repeated the same rows and showed the page size as the open count.
+  const countPromise = typeof base.count === "function" ?
+    base.count().get().then((snap) => {
+      const data = snap && typeof snap.data === "function" ? snap.data() : null;
+      return data && Number.isFinite(Number(data.count)) ?
+        Number(data.count) : null;
+    }).catch(() => null) : Promise.resolve(null);
+  const [docs, counted] = await Promise.all([
+    collectNotifPage(base.select(...NOTIF_LIST_FIELDS), offset + limit + 1),
+    countPromise,
+  ]);
+  const rows = sortNotifications(
       docs.map(serializeNotif), opts.sort, opts.now);
-  return {notifications, openCount: notifications.length};
+  const notifications = rows.slice(offset, offset + limit);
+  const hasMore = rows.length > offset + limit;
+  return {
+    notifications,
+    openCount: counted != null ? counted : rows.length,
+    hasMore,
+    nextOffset: offset + notifications.length,
+    offset,
+    limit,
+  };
 }
 
 /**
@@ -521,11 +584,28 @@ function isClearablePodNotification(row) {
 }
 
 /**
+ * Plain-text copy of a notification body for search, capped at 3000 chars.
+ * @param {*} body Body HTML or text.
+ * @return {string|null}
+ */
+function notificationSearchTextFromBody(body) {
+  if (!body) return null;
+  const text = String(body).replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/\s+/g, " ")
+      .trim();
+  return text ? text.slice(0, 3000) : null;
+}
+
+/**
  * Notification body as plain words for search (bodies are saved as HTML).
  * @param {object} row Notification fields.
  * @return {string}
  */
 function bodySearchText(row) {
+  if (row && row.searchText) return String(row.searchText);
   const body = row && row.body;
   if (!body) return "";
   return String(body).replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -605,7 +685,260 @@ async function dismissOpenPodNotifications(db, opts) {
   return {dismissed: ids.length, ids};
 }
 
+const NOTICE_ISSUE = Object.freeze({
+  POD: "pod",
+  RATE: "rate",
+  PROFIT: "profit",
+  GTG: "gtg",
+  LOAD_NUMBER: "load_number",
+  CHARGE_APPROVAL: "charge_approval",
+  DISPUTE: "dispute",
+});
+
+/**
+ * Subject, title, and reason with dashes folded to a hyphen.
+ * Email HTML is left out so a mention in the body cannot match.
+ * @param {object} row Notification or task.
+ * @return {string}
+ */
+function noticePlainText(row) {
+  return [
+    row && row.subject,
+    row && row.reason,
+    row && row.title,
+    row && row.decisionReason,
+    row && row.emailType,
+    row && row.type,
+  ].filter((part) => part != null && String(part) !== "")
+      .join("\n")
+      .replace(/[\u2014\u2013\u2012\u2212]/g, "-")
+      .toLowerCase();
+}
+/**
+ * @param {object} row Notification.
+ * @return {boolean}
+ */
+function isOpenNotice(row) {
+  const status = String((row && row.status) || "open").toLowerCase();
+  return status === NOTIF_STATUS.OPEN;
+}
+/**
+ * One problem per notice. A different problem on the same load
+ * gets a different key and is left open.
+ * @param {object} row Notification or task.
+ * @return {string|null}
+ */
+function noticeIssueKey(row) {
+  if (!row) return null;
+  const type = String(row.type || "").toLowerCase();
+  const emailType = String(row.emailType || "").toLowerCase();
+  const text = noticePlainText(row);
+  const phase = String(row.chargePhase || "").toLowerCase();
+  const follow = String(row.followUpStatus || "").toLowerCase();
+  const decision = String(row.decision || "").toLowerCase();
+  const dispute = emailType === "carrier_dispute_draft" ||
+    /dispute draft/.test(text) ||
+    phase === "dispute" ||
+    follow === "disputing" ||
+    follow === "disputed" ||
+    decision === "d";
+  if (emailType.indexOf("drayage_gtg") === 0 || /gtg stopped/.test(text)) {
+    return NOTICE_ISSUE.GTG;
+  }
+  if (emailType === "missing_load_number" ||
+      /enter load\s*(#|number)\b/.test(text)) {
+    return NOTICE_ISSUE.LOAD_NUMBER;
+  }
+  if (dispute && (type === "additional_charge" ||
+      emailType === "carrier_dispute_draft" ||
+      /dispute draft/.test(text))) {
+    return NOTICE_ISSUE.DISPUTE;
+  }
+  if (emailType === "additional_charge_approval" ||
+      type === "additional_charge" ||
+      /approval needed\s*-\s*additional charge/.test(text)) {
+    return NOTICE_ISSUE.CHARGE_APPROVAL;
+  }
+  if (type === "missing_pod" ||
+      /action needed\s*-\s*no pod\b/.test(text) ||
+      /\bpod needed\b/.test(text)) {
+    return NOTICE_ISSUE.POD;
+  }
+  if (type === "low_margin" ||
+      type === "low_profit" ||
+      emailType === "low_profit_dispatcher" ||
+      emailType === "low_margin" ||
+      /low\/negative profit|low margin|customer rate too low/.test(text) ||
+      /rate too low/.test(text)) {
+    return NOTICE_ISSUE.PROFIT;
+  }
+  const reason = String(row.reason || row.decisionReason || "");
+  if (type === "missing_rate" ||
+      type === "rate_missing" ||
+      emailType === "rate_missing" ||
+      reason.toUpperCase() === "MISSING_RATE" ||
+      /no customer rate|missing customer rate|missing carrier rate/
+          .test(text)) {
+    return NOTICE_ISSUE.RATE;
+  }
+  return null;
+}
+/**
+ * Which notice the set-rate form finished. Missing rate and low
+ * margin are different problems.
+ * @param {object} inv Invoice fields before the rate is saved.
+ * @return {string|null}
+ */
+function noticeIssueForRateSave(inv) {
+  if (!inv) return null;
+  const rate = Number(inv.customerRate);
+  const missing = !Number.isFinite(rate) || rate <= 0;
+  const blob = [inv.decisionReason, inv.decisionStage, inv.reason]
+      .filter((part) => part != null && String(part) !== "")
+      .join(" ")
+      .toLowerCase();
+  const low = /too low|low margin|low_margin|negative profit|low profit/
+      .test(blob);
+  const rateText = /missing customer rate|missing_rate|no customer rate/
+      .test(blob);
+  if (missing || (rateText && !low)) return NOTICE_ISSUE.RATE;
+  if (low) return NOTICE_ISSUE.PROFIT;
+  return null;
+}
+/**
+ * @param {object} data Notice fields.
+ * @param {string} loadNumber Requested load.
+ * @return {boolean}
+ */
+function sameNoticeLoad(data, loadNumber) {
+  const want = String(loadNumber || "").trim();
+  const got = String(data && data.loadNumber == null ?
+    "" : data.loadNumber).trim();
+  return Boolean(want) && want === got;
+}
+/**
+ * @param {object} data Notice fields.
+ * @param {object} request issue, loadNumber, invoiceId, messageId,
+ *   followUpId.
+ * @return {boolean}
+ */
+function notificationMatchesCompletedIssue(data, request) {
+  if (!isOpenNotice(data)) return false;
+  if (noticeIssueKey(data) !== request.issue) return false;
+  const issue = request.issue;
+  if (issue === NOTICE_ISSUE.LOAD_NUMBER) {
+    const mid = String(request.messageId || "").trim();
+    if (!mid) return false;
+    if (String(data.messageId || "") === mid) return true;
+    if (mid.length < 8) return false;
+    const blob = [data.subject, data.title, data.body]
+        .filter((part) => part != null && String(part) !== "")
+        .join("\n");
+    return blob.includes(mid);
+  }
+  if (issue === NOTICE_ISSUE.CHARGE_APPROVAL ||
+      issue === NOTICE_ISSUE.DISPUTE) {
+    const wantFollow = String(request.followUpId || "").trim();
+    const gotFollow = String(data.followUpId || "").trim();
+    if (wantFollow && gotFollow && wantFollow !== gotFollow) return false;
+    const wantInvoice = String(request.invoiceId || "").trim();
+    const gotInvoice = String(data.invoiceId || "").trim();
+    if (wantInvoice && gotInvoice && wantInvoice !== gotInvoice) {
+      return false;
+    }
+    if (wantFollow && gotFollow === wantFollow) return true;
+    if (wantInvoice && gotInvoice === wantInvoice) return true;
+  }
+  const wantInvoice = String(request.invoiceId || "").trim();
+  const gotInvoice = String(data.invoiceId || "").trim();
+  if (wantInvoice && gotInvoice === wantInvoice) return true;
+  return sameNoticeLoad(data, request.loadNumber);
+}
+/**
+ * @param {object} db Firestore.
+ * @param {string} field Field name.
+ * @param {string|number} value Field value.
+ * @return {Promise<object[]>}
+ */
+async function loadNotifDocs(db, field, value) {
+  const snap = await db.collection(NOTIF_COLLECTION)
+      .where(field, "==", value)
+      .limit(40)
+      .get();
+  return snap.docs || [];
+}
+/**
+ * Dismisses open notices for one completed problem on a load.
+ * A different problem on that load stays open.
+ * @param {object} db Firestore.
+ * @param {object} opts issue, tenantId, loadNumber, invoiceId,
+ *   messageId, followUpId.
+ * @return {Promise<object>}
+ */
+async function dismissOpenIssueNotifications(db, opts) {
+  const request = opts || {};
+  const issue = String(request.issue || "").trim();
+  if (!db || !issue) return {ok: true, dismissed: 0, ids: []};
+  const tenantId = request.tenantId || "default";
+  const loadNumber = String(request.loadNumber || "").trim();
+  const invoiceId = String(request.invoiceId || "").trim();
+  const messageId = String(request.messageId || "").trim();
+  const followUpId = String(request.followUpId || "").trim();
+  const lookups = [];
+  if (invoiceId) lookups.push(["invoiceId", invoiceId]);
+  if (loadNumber) {
+    lookups.push(["loadNumber", loadNumber]);
+    if (/^\d+$/.test(loadNumber)) {
+      lookups.push(["loadNumber", Number(loadNumber)]);
+    }
+  }
+  if (messageId) lookups.push(["messageId", messageId]);
+  if (followUpId) lookups.push(["followUpId", followUpId]);
+  if (issue === NOTICE_ISSUE.LOAD_NUMBER) {
+    lookups.push(["emailType", "missing_load_number"]);
+  }
+  if (!lookups.length) return {ok: true, dismissed: 0, ids: []};
+  const seen = new Set();
+  const ids = [];
+  const match = {
+    issue,
+    loadNumber,
+    invoiceId,
+    messageId,
+    followUpId,
+  };
+  for (const pair of lookups) {
+    let docs = [];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      docs = await loadNotifDocs(db, pair[0], pair[1]);
+    } catch (err) {
+      console.error("[dismissOpenIssueNotifications]",
+          err && err.message);
+      continue;
+    }
+    for (const doc of docs) {
+      if (!doc || seen.has(doc.id)) continue;
+      seen.add(doc.id);
+      const data = doc.data() || {};
+      if (!ownership.sameTenant(data.tenantId, tenantId)) continue;
+      if (!notificationMatchesCompletedIssue(data, match)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const result = await dismissNotification(db, {
+        id: doc.id,
+        tenantId: data.tenantId || tenantId,
+      });
+      if (result && result.ok) ids.push(doc.id);
+    }
+  }
+  return {ok: true, dismissed: ids.length, ids};
+}
+
 module.exports = {
+  NOTICE_ISSUE,
+  noticeIssueKey,
+  noticeIssueForRateSave,
+  dismissOpenIssueNotifications,
   NOTIF_COLLECTION,
   NOTIF_TYPE,
   NOTIF_STATUS,
