@@ -3231,58 +3231,6 @@ exports.executeAdditionalChargeDecision = onRequest(
 
 /**
  * Fat worker for option B's last step. The email-action page returns
- * immediately; this call runs the Primus invoice workflow after accepting.
- */
-exports.executeFinalizeAdditionalChargeInvoice = onRequest(
-    {invoker: "public", timeoutSeconds: 540, memory: "1GiB"},
-    async (req, res) => {
-      if (!emailActionWorkerAuthOk(req)) {
-        return res.status(403).json({ok: false, error: "Forbidden"});
-      }
-      const invoiceId = req.body && req.body.invoiceId;
-      const tenantId = (req.body && req.body.tenantId) || null;
-      if (!invoiceId) {
-        return res.status(400).json({ok: false, error: "Missing invoiceId"});
-      }
-      const tenant = await getTenant(tenantId);
-      const workflowUrl = workflowUrlForTenant(tenant);
-      if (!workflowUrl) {
-        return res.status(400).json({ok: false, error: "No workflow URL"});
-      }
-
-      res.status(200).json({ok: true, accepted: true});
-
-      try {
-        const workflowRes = await fetch(workflowUrl, {
-          method: "POST",
-          headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({
-            invoiceId: String(invoiceId),
-            tenantId: tenant.tenantId,
-          }),
-        });
-        const parsed = await readWorkflowResponse(workflowRes);
-        const alreadyRunning = workflowRes.status === 409;
-        if (!parsed.ok && !alreadyRunning) {
-          await writeLog("error", "workflow",
-              "Option B finalize workflow returned an error", {
-                invoiceId: String(invoiceId),
-                httpStatus: workflowRes.status,
-                error: parsed.text ? String(parsed.text).slice(0, 300) : null,
-              }).catch(() => {});
-        }
-      } catch (err) {
-        console.error("executeFinalizeAdditionalChargeInvoice:", err);
-        await writeLog("error", "workflow",
-            "Option B finalize workflow call failed", {
-              invoiceId: String(invoiceId),
-              error: err.message,
-            }).catch(() => {});
-      }
-    });
-
-/**
- * Fat worker for option B's last step. The email-action page returns
  * immediately; this call runs the Primus invoice workflow (up to a few
  * minutes) after accepting the request.
  */
@@ -15724,6 +15672,97 @@ exports.finishMissingPodWorkflow = onRequest({
   }
 });
 
+/**
+ * Dashboard "Assign" (row dropdown and drawer): moves a work item to a
+ * dispatcher, Sarah, or accounting and emails that person once. Hold rows
+ * built from an invoice get a task so the assignment sticks.
+ */
+exports.reassignDashboardWork = onRequest({invoker: "public"}, async (req, res) => {
+  if (applyDashboardCors(req, res)) return;
+  if (req.method !== "POST") {
+    return res.status(405).json({ok: false, error: "Method not allowed."});
+  }
+  try {
+    const tenant = await resolveDashboardTenant(req);
+    const body = req.body || {};
+    let result;
+    if (String(body.source || "") === "invoice") {
+      const bucket = String(body.bucket || "").toLowerCase();
+      if (!["accounting", "sarah", "dispatch"].includes(bucket)) {
+        return res.status(400).json({
+          ok: false,
+          error: "Pick accounting, Sarah, or a dispatcher.",
+        });
+      }
+      const createdId = await dashboardTasks.createDashboardTask(db, {
+        tenantId: tenant.tenantId,
+        type: body.issue === "missing_rate" ? "missing_rate" : "invoice_hold",
+        title: body.subject || `Load ${body.loadNumber || "—"}`,
+        subject: body.subject || null,
+        loadNumber: body.loadNumber || null,
+        carrierName: body.carrierName || null,
+        invoiceId: body.invoiceId || null,
+        reason: body.issue || null,
+        ownerBucket: bucket,
+        dispatcherEmail: body.dispatcherEmail || null,
+        dispatcherName: body.dispatcherName || null,
+        ownershipReason: "dashboard_reassign",
+      });
+      if (!createdId) {
+        return res.status(400).json({ok: false, error: "Could not assign."});
+      }
+      const emailTo = bucket === "sarah" ?
+        (process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
+          "Sarah@innovativecarriers.com") :
+        (bucket === "dispatch" ? body.dispatcherEmail :
+          (process.env.HUMAN_REVIEW_EMAIL || "Lisa@innovativecarriers.com"));
+      result = {
+        ok: true,
+        loadNumber: body.loadNumber || null,
+        subject: body.subject || null,
+        issueLabel: body.issue || "dashboard item",
+        emailTo,
+      };
+    } else {
+      result = await dashboardTasks.reassignDashboardWork(db, {
+        taskId: body.taskId,
+        source: body.source || "dashboardTasks",
+        tenantId: tenant.tenantId,
+        bucket: body.bucket,
+        dispatcherEmail: body.dispatcherEmail,
+        dispatcherName: body.dispatcherName,
+        followUpCollection: additionalCharges.FOLLOW_UP_COLLECTION,
+      });
+    }
+    if (!result.ok) return res.status(400).json(result);
+    if (result.emailTo) {
+      const load = result.loadNumber || "—";
+      await saveOutboundEmail({
+        type: "dashboard_assignment",
+        forceSend: true,
+        forceRecipient: true,
+        tenant,
+        to: result.emailTo,
+        subject: `Assigned to you — Load ${load}`,
+        html: `<p>Load <strong>${escapeHtml(load)}</strong> ` +
+          `(${escapeHtml(result.issueLabel || "dashboard item")}) ` +
+          `was assigned to you.</p>` +
+          `<p>${escapeHtml(result.subject || "")}</p>` +
+          `<p>It is on the Jerry dashboard.</p>`,
+      });
+    }
+    return res.json({ok: true, tenantId: tenant.tenantId});
+  } catch (error) {
+    console.error("reassignDashboardWork error:", error);
+    const status = error.statusCode === 403 ? 403 : 500;
+    return res.status(status).json({
+      ok: false,
+      error: "Could not reassign.",
+      details: error.message,
+    });
+  }
+});
+
 exports.dismissDashboardTask = onRequest(async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   if (req.method !== "POST") {
@@ -15918,7 +15957,14 @@ dashboardOpsHttp.init({
   additionalCharges,
   trashGmailMessage,
   kickCustomerRateWorkflow: startCustomerRateResume,
+  getBucket,
+  downloadGmailAttachmentBuffer,
+  getMailClient: (tenant) => mailProvider.getTenantMailClient(tenant),
 });
+
+exports.getDashboardEmailAttachment = onRequest(
+    {invoker: "public", timeoutSeconds: 120, memory: "512MiB"},
+    dashboardOpsHttp.handleDownloadEmailAttachment);
 
 exports.getDashboardAccessorials = onRequest(
     {invoker: "public"}, dashboardOpsHttp.handleListAccessorials);

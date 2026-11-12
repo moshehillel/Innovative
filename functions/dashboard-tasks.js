@@ -1588,7 +1588,80 @@ async function loadItemDetail(db, additionalChargesMod, opts) {
   return {ok: true, body, charges: []};
 }
 
+/**
+ * Moves a task to accounting, Sarah, or a dispatcher and records history.
+ * Does not send email; the HTTP handler does that once.
+ * Tasks and follow-ups live in shared collections keyed by tenantId.
+ * @param {object} db Firestore.
+ * @param {object} opts taskId, source, tenantId, bucket, dispatcherEmail,
+ *   dispatcherName, followUpCollection.
+ * @return {Promise<object>}
+ */
+async function reassignDashboardWork(db, opts) {
+  const bucket = String(opts.bucket || "").toLowerCase();
+  if (!["accounting", "sarah", "dispatch"].includes(bucket)) {
+    return {ok: false, error: "Pick accounting, Sarah, or a dispatcher."};
+  }
+  const dispatcherEmail = ownership.normEmail(opts.dispatcherEmail) || null;
+  const dispatcherName = opts.dispatcherName ?
+    String(opts.dispatcherName).trim() : null;
+  if (bucket === "dispatch" && !dispatcherEmail && !dispatcherName) {
+    return {ok: false, error: "Enter the dispatcher name or email."};
+  }
+  const taskId = String(opts.taskId || "").trim();
+  if (!taskId) return {ok: false, error: "taskId is required."};
+
+  const source = String(opts.source || "dashboardTasks");
+  const colName = source === "additionalCharges" ?
+    (opts.followUpCollection || "additionalCharges") : TASK_COLLECTION;
+  const ref = db.collection(colName).doc(taskId);
+  const snap = await ref.get();
+  if (!snap.exists) return {ok: false, error: "Task not found."};
+  const data = snap.data() || {};
+  if (!ownership.sameTenant(data.tenantId, opts.tenantId || "default")) {
+    return {ok: false, error: "Task not found."};
+  }
+  const history = Array.isArray(data.ownershipHistory) ?
+    data.ownershipHistory.slice() : [];
+  history.push({
+    bucket,
+    at: new Date().toISOString(),
+    reason: "dashboard_reassign",
+    dispatcherEmail,
+  });
+  const patch = {
+    ownerBucket: bucket,
+    awaitingReplyFrom: bucket,
+    ownershipHistory: history,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  };
+  if (bucket === "dispatch") {
+    const roster = ownership.OPS_DISPATCHERS.find((p) =>
+      p.email === dispatcherEmail ||
+      (dispatcherName && p.name.toLowerCase() === dispatcherName.toLowerCase()));
+    patch.dispatcherEmail = roster ? roster.email : dispatcherEmail;
+    patch.dispatcherName = roster ? roster.name : dispatcherName;
+    patch.dispatcherKey = roster ? roster.key :
+      (dispatcherEmail ||
+        (dispatcherName ? dispatcherName.toLowerCase() : null));
+  }
+  await ref.update(patch);
+  const issue = scope.classifyIssue({...data, type: data.type});
+  return {
+    ok: true,
+    loadNumber: data.loadNumber || null,
+    subject: data.subject || data.title || null,
+    issue,
+    issueLabel: scope.issueLabel(issue),
+    emailTo: bucket === "dispatch" ? (patch.dispatcherEmail || null) :
+      (bucket === "sarah" ? ownership.sarahEmail() :
+        (process.env.HUMAN_REVIEW_EMAIL ||
+          "Lisa@innovativecarriers.com")),
+  };
+}
+
 module.exports = {
+  reassignDashboardWork,
   loadItemDetail,
   TASK_COLLECTION,
   TASK_TYPE,
