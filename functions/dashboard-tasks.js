@@ -1637,7 +1637,8 @@ async function reassignDashboardWork(db, opts) {
   if (bucket === "dispatch") {
     const roster = ownership.OPS_DISPATCHERS.find((p) =>
       p.email === dispatcherEmail ||
-      (dispatcherName && p.name.toLowerCase() === dispatcherName.toLowerCase()));
+      (dispatcherName &&
+        p.name.toLowerCase() === dispatcherName.toLowerCase()));
     patch.dispatcherEmail = roster ? roster.email : dispatcherEmail;
     patch.dispatcherName = roster ? roster.name : dispatcherName;
     patch.dispatcherKey = roster ? roster.key :

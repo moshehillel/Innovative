@@ -10520,14 +10520,8 @@ async function classifyIncomingEmail(subject, from, body, attachments) {
   }
 }
 
-/**
- * Jerry (accounting) inbox never processes quotes — dispatcher Outlook only.
- * Kept as a hard off-switch so processGmailMessage cannot route quote_request.
- * @return {boolean}
- */
-function isQuoteInboxProcessingEnabled() {
-  return false;
-}
+// The Jerry (accounting) inbox never processes quotes. Quote requests come
+// in only through the dispatcher Outlook inboxes (quote-mail-queue).
 
 /**
  * Quiet-ignore payment alerts: clear bank-sender regex stays cheap; ambiguous
@@ -11343,63 +11337,6 @@ async function processGmailMessage(
         return;
       }
 
-      if (!isTai && isQuoteInboxProcessingEnabled()) {
-        const quoteIntakeMod = require("./quote-intake");
-        if (quoteIntakeMod.looksLikeQuoteRequest(subject, emailBody) &&
-          emailClassification.intent === "unknown") {
-          try {
-            emailClassification = await classifyIncomingEmail(
-                subject, from, emailBody, attachments);
-          } catch (_) {
-          // heuristic fallback below
-          }
-        }
-      }
-
-      if (!isTai && isQuoteInboxProcessingEnabled()) {
-        const quoteAutomation = require("./quote-automation");
-        const quoteIntakeMod = require("./quote-intake");
-        const quoteLooks =
-        emailClassification.intent === "quote_request" ||
-        (emailClassification.intent === "unknown" &&
-          quoteIntakeMod.looksLikeQuoteRequest(subject, emailBody));
-        if (quoteLooks) {
-          try {
-            const quoteResult = await quoteAutomation.processQuoteEmail({
-              messageId,
-              subject,
-              from,
-              to,
-              cc,
-              emailBody,
-              tenant,
-            });
-            if (quoteResult.handled) {
-              await mailIntakeQueue.completeIntakeRecord({
-                tenant,
-                docId: queueDocId,
-                parentMessageId: messageId,
-                outcome: mailIntakeQueue.OUTCOME.PROCESSED,
-                finalStatus: "quote_processed",
-                extra: {
-                  gmailMessageId: messageId,
-                  subject,
-                  from,
-                  deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
-                },
-              });
-              return;
-            }
-          } catch (quoteErr) {
-            await writeLog("error", "quote", "Quote request handler failed", {
-              messageId,
-              subject,
-              error: quoteErr.message,
-            });
-          }
-        }
-      }
-
       if (!isTai) {
         const skipPodForCarrierInvoice =
           administrativeEmailIntake.hasInvoiceVeto({
@@ -11502,43 +11439,6 @@ async function processGmailMessage(
       }
 
       if (attachments.length === 0) {
-        const quoteIntakeMod = require("./quote-intake");
-        if (!isTai && isQuoteInboxProcessingEnabled() &&
-          quoteIntakeMod.looksLikeQuoteRequest(subject, emailBody)) {
-          try {
-            const quoteAutomation = require("./quote-automation");
-            const quoteResult = await quoteAutomation.processQuoteEmail({
-              messageId,
-              subject,
-              from,
-              to,
-              cc,
-              emailBody,
-              tenant,
-            });
-            if (quoteResult.handled) {
-              await mailIntakeQueue.completeIntakeRecord({
-                tenant,
-                docId: queueDocId,
-                parentMessageId: messageId,
-                outcome: mailIntakeQueue.OUTCOME.PROCESSED,
-                finalStatus: "quote_processed",
-                extra: {
-                  gmailMessageId: messageId,
-                  subject,
-                  from,
-                  deleteAt: getDeleteAt(mailIntakeQueue.INTAKE_TTL_DAYS),
-                },
-              });
-              return;
-            }
-          } catch (quoteErr) {
-            await writeLog("error", "quote",
-                "Quote handler failed (no attachment path)", {
-                  messageId, error: quoteErr.message,
-                });
-          }
-        }
         if (administrativeEmailIntake.shouldHandlePaymentInquiry(
             subject, from, emailBody, 0) &&
           !administrativeEmailIntake.hasInvoiceVeto({
@@ -15758,7 +15658,8 @@ exports.finishMissingPodWorkflow = onRequest({
  * dispatcher, Sarah, or accounting and emails that person once. Hold rows
  * built from an invoice get a task so the assignment sticks.
  */
-exports.reassignDashboardWork = onRequest({invoker: "public"}, async (req, res) => {
+const REASSIGN_OPTS = {invoker: "public"};
+exports.reassignDashboardWork = onRequest(REASSIGN_OPTS, async (req, res) => {
   if (applyDashboardCors(req, res)) return;
   if (req.method !== "POST") {
     return res.status(405).json({ok: false, error: "Method not allowed."});
