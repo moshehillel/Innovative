@@ -1096,9 +1096,10 @@ function classifyAdditionalChargeReason(opts) {
   const gap = opts.invoiceGap != null ? Number(opts.invoiceGap) :
     invoiceOverage(opts.invoiceAmount, opts.primusAmount);
 
-  // Itemized accessorials (school delivery, notify/detention, etc.) win
-  // over a stray W&I certificate flag or matching weight/class on the invoice.
-  if (accessorialByLabel && !wniByLabel && !mismatch) {
+  // A named accessorial (redelivery, liftgate, school delivery, notify /
+  // detention...) is the reason even when weight or dims also differ or a
+  // W&I certificate is attached. Reweigh only when the invoice says so.
+  if (accessorialByLabel && !wniByLabel) {
     return CHARGE_CATEGORY.ACCESSORIAL;
   }
 
@@ -1855,11 +1856,24 @@ function buildAdditionalChargeApprovalEmail(opts) {
 }
 
 /**
+ * Trims option D notes. Empty is allowed.
+ * @param {*} value Raw notes from the confirm form or dashboard.
+ * @return {string}
+ */
+function normalizeDisputeNotes(value) {
+  return String(value == null ? "" : value)
+      .replace(/\r\n/g, "\n")
+      .trim()
+      .slice(0, 4000);
+}
+
+/**
  * Builds a carrier dispute draft for manual submission. Most LTL carriers
  * take disputes on their website portal, so this is copy/paste wording; TL
  * disputes go to the carrier email on file.
  * @param {object} opts loadNumber, carrierName, proNumber, invoiceNumber,
- *   invoiceAmount, expectedAmount, charges, category, freightMismatch.
+ *   invoiceAmount, expectedAmount, charges, category, freightMismatch,
+ *   disputeNotes.
  * @return {{subject: string, html: string}}
  */
 function buildDisputeEmailDraft(opts) {
@@ -1868,6 +1882,7 @@ function buildDisputeEmailDraft(opts) {
     invoiceAmount, expectedAmount, charges, category, freightMismatch,
     customerRate, hasCertificate,
   } = opts;
+  const disputeNotes = normalizeDisputeNotes(opts.disputeNotes);
 
   const effectiveCategory = resolveEffectiveChargeCategory({
     charges,
@@ -1937,6 +1952,9 @@ function buildDisputeEmailDraft(opts) {
     `${money(expectedAmount)} (difference ${money(Math.abs(diff))}).<br><br>` +
     `${basis}<br><br>` +
     (chargeLines ? `Disputed charge(s):<br>${chargeLines}<br><br>` : "") +
+    (disputeNotes ?
+      `Notes on what to dispute:<br>` +
+      `${esc(disputeNotes).replace(/\n/g, "<br>")}<br><br>` : "") +
     `Please review and issue a corrected invoice. Payment for the ` +
     `undisputed portion is being processed per our standard terms.<br><br>` +
     `Thank you,<br>Innovative Carriers — Accounting`;
@@ -2350,7 +2368,9 @@ async function updateFollowUp(db, opts) {
     update.decisionAt = admin.firestore.FieldValue.serverTimestamp();
   }
   if (opts.notes) update.notes = opts.notes;
-  if (opts.disputeNotes) update.disputeNotes = opts.disputeNotes;
+  if (opts.disputeNotes) {
+    update.disputeNotes = normalizeDisputeNotes(opts.disputeNotes);
+  }
   await ref.update(update);
   const decision = String(opts.decision || "").toLowerCase();
   const disputing = opts.status === FOLLOW_UP_STATUS.DISPUTING ||
@@ -2500,8 +2520,12 @@ function normalizeCustomerBillLines(lines) {
         error: `${priced.error} (${name})`,
       };
     }
+    // Keep the Primus accessorial code picked on the page, so the customer
+    // invoice line carries the real accessorial, not only its name.
+    const code = String((line && line.code) || "").trim().toUpperCase();
     out.push({
       name,
+      code: code || null,
       amount: priced.amount,
       carrierAmount: Number.isFinite(carrierAmount) && carrierAmount > 0 ?
         carrierAmount : 0,
@@ -2776,6 +2800,7 @@ module.exports = {
   additionalChargeOpsTo,
   additionalChargeApprovalRecipients,
   mustDeliverDespiteDashboardPark,
+  normalizeDisputeNotes,
   applyAdditionalChargeEmailCc,
   applyDispatcherEmailCc,
   formatCustomerRate,

@@ -363,6 +363,11 @@ async function handleAdditionalChargeGet(req, res) {
       confirmColor: option === "d" ? "#dc2626" : "#2563eb",
       actionPath: "additionalChargeAction",
       fields,
+      notesField: option === "d" ? {
+        name: "disputeNotes",
+        label: "Notes on what to dispute (optional)",
+        placeholder: "What should be disputed?",
+      } : null,
     }));
   }
 
@@ -578,6 +583,8 @@ async function handleAdditionalChargePost(req, res) {
     optionBCustomerBillLines,
     optionFRateMode,
     optionFRateInput,
+    disputeNotes: option === "d" ?
+      String((req.body && req.body.disputeNotes) || "").slice(0, 4000) : "",
   });
   return;
 }

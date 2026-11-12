@@ -3352,6 +3352,8 @@ async function handleExecuteAdditionalChargeDecision(req, res) {
     const optionBCustomerBillLines = body.optionBCustomerBillLines;
     const optionFRateMode = body.optionFRateMode;
     const optionFRateInput = body.optionFRateInput;
+    const disputeNotes = option === "d" ?
+      additionalCharges.normalizeDisputeNotes(body.disputeNotes) : "";
 
     if (!invoiceId || !["a", "b", "c", "d", "e", "f"].includes(option)) {
       return res.status(400).json({ok: false, error: "Bad request"});
@@ -3392,6 +3394,7 @@ async function handleExecuteAdditionalChargeDecision(req, res) {
         optionBCustomerBillLines,
         optionFRateMode,
         optionFRateInput,
+        disputeNotes,
       });
     } catch (bgError) {
       console.error("executeAdditionalChargeDecision background:", bgError);
@@ -3421,6 +3424,9 @@ async function runAdditionalChargeDecisionBackground(args) {
     optionACustomerChargeAmount, optionBCustomerBillLines,
     optionFRateMode, optionFRateInput,
   } = args;
+  // Option D: what Sarah typed on the page or dashboard about the dispute.
+  const disputeNotes = additionalCharges.normalizeDisputeNotes(
+      args.disputeNotes);
   const chargesTotal = Number(charge.amount) || 0;
   const chargeRows = Array.isArray(charge.charges) ? charge.charges : [];
 
@@ -3449,6 +3455,7 @@ async function runAdditionalChargeDecisionBackground(args) {
       hasCertificate: charge.hasCertificate,
       customerRate: invoice.customerRate ||
         customerRateFromBooking(booking),
+      disputeNotes,
     });
     await saveOutboundEmail(additionalCharges.applyAdditionalChargeEmailCc({
       type: "carrier_dispute_draft",
@@ -3460,6 +3467,7 @@ async function runAdditionalChargeDecisionBackground(args) {
       "additionalCharge.decision": decision,
       "additionalCharge.approved": false,
       "additionalCharge.status": "disputed",
+      "additionalCharge.disputeNotes": disputeNotes,
       "additionalCharge.decidedAt":
         admin.firestore.FieldValue.serverTimestamp(),
       "decisionStage": "additional_charge_disputed",
@@ -3471,7 +3479,11 @@ async function runAdditionalChargeDecisionBackground(args) {
       invoiceId: String(invoiceId),
       status: additionalCharges.FOLLOW_UP_STATUS.DISPUTING,
       decision,
-      notes: "Dispute draft emailed for manual submission",
+      notes: disputeNotes ?
+        ("Dispute draft emailed for manual submission. " +
+          "Notes on what to dispute: " + disputeNotes) :
+        "Dispute draft emailed for manual submission",
+      disputeNotes,
     });
     await writeLog("info", "workflow",
         "Additional charge NOT approved — dispute draft generated", {
@@ -15684,6 +15696,7 @@ async function applyAdditionalChargeFromDashboard(opts) {
   const mapDashboardBillLines = (lines) => (Array.isArray(lines) ? lines : [])
       .map((line) => ({
         name: line.description || line.name || "ACCESSORIAL",
+        code: line.code || null,
         carrierAmount: line.carrierAmount,
         markupPct: line.markupPct,
         flatAmount: line.flatAmount,
@@ -15772,6 +15785,8 @@ async function applyAdditionalChargeFromDashboard(opts) {
       optionBCustomerBillLines,
       optionFRateMode,
       optionFRateInput,
+      disputeNotes: option === "d" ?
+        additionalCharges.normalizeDisputeNotes(opts.disputeNotes) : "",
     });
   } catch (err) {
     console.error("applyAdditionalChargeFromDashboard background:",

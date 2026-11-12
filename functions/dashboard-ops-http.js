@@ -250,6 +250,7 @@ async function handleAdditionalChargeDecision(req, res) {
       rateMode: body.rateMode || body.optionFRateMode,
       rateInput: body.rateInput != null ?
         body.rateInput : body.optionFRateInput,
+      disputeNotes: body.disputeNotes,
     });
     if (!result.ok) {
       return res.status(result.status || 400).json(result);

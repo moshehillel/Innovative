@@ -38,6 +38,18 @@ function buildEmailActionConfirmPage(opts) {
         `value="${escapeHtml(String(value ?? ""))}">`)
       .join("");
   const inputFields = Array.isArray(opts.inputFields) ? opts.inputFields : [];
+  // Optional free-text box (option D: notes on what to dispute).
+  const notes = opts.notesField || null;
+  const notesHtml = notes ?
+    `<label for="${escapeHtml(notes.name)}" style="display:block;` +
+    `font-size:14px;font-weight:600;color:#374151;margin:16px 0 8px">` +
+    `${escapeHtml(notes.label || notes.name)}</label>` +
+    `<textarea name="${escapeHtml(notes.name)}" ` +
+    `id="${escapeHtml(notes.name)}" rows="4" maxlength="4000" ` +
+    `placeholder="${escapeHtml(notes.placeholder || "")}" ` +
+    `style="width:100%;padding:10px 12px;border:1px solid #d1d5db;` +
+    `border-radius:8px;font-size:16px;box-sizing:border-box;` +
+    `font-family:Arial,sans-serif;margin-bottom:16px"></textarea>` : "";
   const inputs = inputFields.map((field) => {
     const attrs = [
       `type="${escapeHtml(field.type || "text")}"`,
@@ -73,6 +85,7 @@ function buildEmailActionConfirmPage(opts) {
     `style="margin-top:24px">` +
     hidden +
     inputs +
+    notesHtml +
     `<button type="submit" style="background:${btnColor};` +
     `color:#fff;border:none;padding:12px 20px;border-radius:8px;` +
     `font-size:16px;font-weight:600;cursor:pointer">` +
