@@ -13217,6 +13217,47 @@ async function processGmailMessage(
         }
       }
 
+      // Credits / discounts (negative amounts) are not additional charges.
+      // Holding those left loads stuck with no approval email and no
+      // visible dashboard row (load 269295: -$40 per diem). Detention in
+      // recognizedCharges must still open the options email when the
+      // invoice is over Primus.
+      if (!loadGateFailed && hasUnrecognizedCharges) {
+        const beforeCredits = normalizedChargeData.unrecognizedCharges || [];
+        const positiveOnly = beforeCredits.filter((row) =>
+          Number(row && row.amount) > 0);
+        if (positiveOnly.length !== beforeCredits.length) {
+          await writeLog("info", "ai",
+              "Dropped credit/zero extra-charge lines — not holding", {
+                messageId,
+                loadNumber: aiResult.loadNumber,
+                dropped: beforeCredits.filter((row) =>
+                  !(Number(row && row.amount) > 0)),
+                kept: positiveOnly,
+              });
+          normalizedChargeData.unrecognizedCharges = positiveOnly;
+          hasUnrecognizedCharges = positiveOnly.length > 0;
+          if (!hasUnrecognizedCharges &&
+              aiResult.status === "unrecognized_charges") {
+            aiResult.status = "ready_for_primus_validation";
+          }
+        }
+      }
+      const hasRecognizedDetention = (normalizedChargeData.recognizedCharges ||
+        []).some((row) => {
+        const name = String((row && (row.label || row.type)) || "");
+        return /detention/i.test(name) && Number(row && row.amount) > 0;
+      });
+      if (!loadGateFailed && !hasUnrecognizedCharges &&
+          hasRecognizedDetention &&
+          aiResult.status === "ready_for_primus_validation") {
+        // Treat named detention like an accessorial hold so Lisa gets
+        // the options email (269295 had detention $200 + a -$40 credit).
+        // The hold below only opens when the invoice is over Primus.
+        hasUnrecognizedCharges = true;
+        aiResult.status = "unrecognized_charges";
+      }
+
       if (loadGateFailed) {
         // Stop execution: do not attempt Primus lookup or workflow.
       } else if (aiResult.status === "unrecognized_charges" ||
@@ -13257,7 +13298,25 @@ async function processGmailMessage(
           additionalCharges.sumCharges(
               normalizedChargeData.unrecognizedCharges);
 
-        if (chargeCategory ===
+        // Only a positive invoice-minus-Primus gap opens the hold. Named
+        // lines (including detention) explain the gap on the email.
+        const hasPositiveHold = Number(chargesTotal) > 0;
+        if (!hasPositiveHold) {
+          await writeLog("info", "ai",
+              "No positive additional charge — continuing without hold", {
+                messageId,
+                loadNumber: aiResult.loadNumber,
+                invoiceAmount: aiResult.invoiceAmount,
+                primusVendorCost,
+                chargesTotal,
+                unrecognizedCharges:
+                  normalizedChargeData.unrecognizedCharges,
+              });
+          normalizedChargeData.unrecognizedCharges = [];
+          hasUnrecognizedCharges = false;
+          aiResult.status = "ready_for_primus_validation";
+          finalStatus = "processing";
+        } else if (chargeCategory ===
             additionalCharges.CHARGE_CATEGORY.RATE_INCREASE) {
           // Unknown reason is still an additional charge. Lisa reviews it
           // with the option buttons; Jerry does not send a dispute on his own.
