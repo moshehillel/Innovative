@@ -148,6 +148,50 @@ function extractInvoiceNumberFromText(subject, body) {
 }
 
 /**
+ * True when a "bill number" is really the carrier's bank routing number:
+ * the same digits appear right after a Routing / ABA / RTN / Transit
+ * label in the email or invoice text (load 270520, Nov 4: Jerry entered
+ * the routing number as the Primus Bill#).
+ * @param {string} value Candidate invoice number.
+ * @param {string} text Subject, body and invoice PDF text.
+ * @return {boolean}
+ */
+function isBankRoutingNumber(value, text) {
+  const digits = String(value || "").replace(/[\s-]/g, "");
+  if (!/^\d{6,17}$/.test(digits)) return false;
+  const hay = String(text || "");
+  if (!hay) return false;
+  const label =
+      /\b(?:routing|aba|rtn|transit)\b(?:\s*(?:#|no\.?|number|num))?/gi;
+  let match;
+  while ((match = label.exec(hay)) !== null) {
+    const after = hay.slice(match.index + match[0].length,
+        match.index + match[0].length + 60);
+    const near = after.replace(/[^0-9A-Za-z]+/g, " ").trim();
+    const first = (near.match(/\d[\d ]{5,20}\d/) || [""])[0]
+        .replace(/\s/g, "");
+    if (first && first === digits) return true;
+  }
+  return false;
+}
+
+/**
+ * Invoice number labeled "Invoice" in PDF text, for when the AI value was
+ * rejected.
+ * @param {string} text Invoice PDF text.
+ * @return {string|null}
+ */
+function extractInvoiceNumberFromPdfText(text) {
+  const hay = String(text || "");
+  const labeled = hay.match(
+      /invoice\s*(?:#|no\.?|number)\s*[:#-]?\s*([A-Z0-9][A-Z0-9_./-]{2,40})/i);
+  if (!labeled || !labeled[1]) return null;
+  const found = String(labeled[1]).trim().replace(/[>,;.]+$/, "");
+  if (!found || /^(details|date|amount|total)$/i.test(found)) return null;
+  return found;
+}
+
+/**
  * Outlook / Graph message id embedded in Jerry's ACTION REQUIRED
  * "Message ID" block so a bare Leo GTG can re-open the carrier email.
  * @param {string} subject Email subject.
@@ -930,6 +974,8 @@ module.exports = {
   sanitizeContainerNumber,
   extractContainerFromText,
   extractInvoiceNumberFromText,
+  isBankRoutingNumber,
+  extractInvoiceNumberFromPdfText,
   extractPriorMessageIdFromText,
   isDrayageValidatorEmail,
   containerFromInvoiceItem,

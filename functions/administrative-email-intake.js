@@ -276,6 +276,36 @@ function isAbeCopiedOnEmailHeaders(headers) {
 }
 
 /**
+ * Lisa's address on Innovative ops mail (the same one Jerry CCs her on).
+ * @return {string}
+ */
+function resolveLisaOpsEmail() {
+  return String(
+      process.env.LOW_PROFIT_CC_EMAIL || "Lisa@innovativecarriers.com",
+  ).trim().toLowerCase();
+}
+
+/**
+ * True when Lisa is already on the original email (To or Cc).
+ * Lisa (Oct 22): a non-invoice email Jerry is unsure how to handle is
+ * disregarded when she is already copied on it.
+ * @param {Array<object>} headers Mail headers ({name, value}).
+ * @return {boolean}
+ */
+function isLisaCopiedOnEmailHeaders(headers) {
+  const lisa = resolveLisaOpsEmail();
+  if (!lisa) return false;
+  const list = Array.isArray(headers) ? headers : [];
+  for (const header of list) {
+    const name = String(header && header.name || "").toLowerCase();
+    if (name !== "to" && name !== "cc") continue;
+    const addrs = parseEmailAddressesFromHeaderValue(header.value);
+    if (addrs.includes(lisa)) return true;
+  }
+  return false;
+}
+
+/**
  * True when the sender domain is coface.com (Lisa: ignore all Coface mail).
  * @param {string} from From header.
  * @return {boolean}
@@ -2125,6 +2155,8 @@ module.exports = {
   parseEmailAddressesFromHeaderValue,
   resolveStatementAbeEmail,
   isAbeCopiedOnEmailHeaders,
+  resolveLisaOpsEmail,
+  isLisaCopiedOnEmailHeaders,
   isEmodalBroadcast,
   isCardknoxDomain,
   isCardknoxEmail,

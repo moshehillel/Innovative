@@ -178,11 +178,11 @@ async function testDigestSendsOnce() {
   assert.strictEqual(first.results[0].open, 2);
   assert.strictEqual(second.results[0].skipped, true);
   assert.strictEqual(afternoon.skipped, true);
+  // Both open items are accounting work (no dispatch owner), so only
+  // Lisa gets them. Nobody else gets a copy of someone else's list.
   assert.ok(!/accounting@innovativecarriers.com/i.test(sent[0].to));
-  assert.ok(/lisa@innovativecarriers.com/i.test(sent[0].to));
-  assert.ok(/sarah@innovativecarriers.com/i.test(sent[0].to));
-  assert.ok(/pat@innovativecarriers.com/i.test(sent[0].to));
-  assert.ok(/leo@innovativecarriers.com/i.test(sent[0].to));
+  assert.strictEqual(sent[0].to.toLowerCase(), "lisa@innovativecarriers.com");
+  assert.ok(!/sarah@|pat@|leo@/i.test(sent[0].to));
   assert.strictEqual(sent[0].type, "dashboard_notification_digest");
   assert.strictEqual(sent[0].forceSend, true);
   assert.strictEqual(sent[0].forceRecipient, true);
@@ -202,7 +202,63 @@ async function testDigestSendsOnce() {
   assert.strictEqual(sent.length, 1);
 }
 
-testDigestSendsOnce().then(() => {
+/**
+ * Rose (Nov 12): each person gets only the items they are responsible for.
+ * @return {Promise<void>}
+ */
+async function testDigestGoesToResponsiblePartyOnly() {
+  const sent = [];
+  digestMod.init({
+    db: claimDb(),
+    listNotifications: async () => ({
+      notifications: [
+        {status: "open", tenantId: "default", subject: "Leo load 1",
+          ownerBucket: "dispatch", dispatcherKey: "leo"},
+        {status: "open", tenantId: "default", subject: "Leo load 2",
+          ownerBucket: "dispatch",
+          dispatcherEmail: "leo@innovativecarriers.com"},
+        {status: "open", tenantId: "default", subject: "Tina load",
+          ownerBucket: "dispatch", dispatcherKey: "tina"},
+        {status: "open", tenantId: "default", subject: "Sarah approval",
+          ownerBucket: "sarah",
+          dispatcherEmail: "jak@innovativecarriers.com"},
+        {status: "open", tenantId: "default", subject: "Missing POD row",
+          ownerBucket: "accounting"},
+      ],
+    }),
+    saveOutboundEmail: async (email) => {
+      sent.push(email);
+    },
+  });
+  const result = await digestMod.runDailyNotificationDigest({
+    now: new Date("2026-11-13T12:30:00.000Z"),
+    tenants: [{tenantId: "default"}],
+  });
+  const byTo = {};
+  sent.forEach((email) => {
+    byTo[email.to.toLowerCase()] = email;
+  });
+  assert.deepStrictEqual(Object.keys(byTo).sort(), [
+    "leo@innovativecarriers.com",
+    "lisa@innovativecarriers.com",
+    "sarah@innovativecarriers.com",
+    "tina@innovativecarriers.com",
+  ]);
+  const leo = byTo["leo@innovativecarriers.com"].html;
+  assert.ok(/Leo load 1/.test(leo) && /Leo load 2/.test(leo));
+  assert.ok(!/Tina load|Sarah approval|Missing POD row/.test(leo));
+  const tina = byTo["tina@innovativecarriers.com"].html;
+  assert.ok(/Tina load/.test(tina) && !/Leo load/.test(tina));
+  // The load's dispatcher (Jak) is not sent an item waiting on Sarah.
+  assert.ok(!byTo["jak@innovativecarriers.com"]);
+  assert.ok(/Sarah approval/.test(byTo["sarah@innovativecarriers.com"].html));
+  const lisa = byTo["lisa@innovativecarriers.com"].html;
+  assert.ok(/Missing POD row/.test(lisa) && !/Leo load|Tina load/.test(lisa));
+  sent.forEach((email) => assert.strictEqual(email.cc, null));
+  assert.strictEqual(result.results[0].sentCount, 4);
+}
+
+testDigestSendsOnce().then(testDigestGoesToResponsiblePartyOnly).then(() => {
   console.log("test-dashboard-notification-digest: ok");
 }).catch((err) => {
   console.error(err);

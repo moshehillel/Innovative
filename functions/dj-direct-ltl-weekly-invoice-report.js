@@ -148,71 +148,90 @@ function csvEscapeCell(value) {
 }
 
 /**
- * @param {FirebaseFirestore.Timestamp|Date|string|null} value
- * @return {string}
+ * @param {*} value Amount.
+ * @return {number|null} Rounded to cents, or null when not a number.
  */
-function tsIso(value) {
-  if (!value) return "";
-  if (typeof value.toDate === "function") {
-    return value.toDate().toISOString();
-  }
-  if (value instanceof Date) return value.toISOString();
-  return String(value);
+function cents(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 }
 
 /**
+ * Accessorial lines Jerry billed the customer on their own invoice lines
+ * (approved option A, B or E). Option F sets the customer rate itself.
+ * @param {object} inv Invoice doc.
+ * @return {Array<{name: string, amount: number}>}
+ */
+function customerAccessorialLines(inv) {
+  const ac = (inv && inv.additionalCharge) || {};
+  const decision = String(ac.decision || "").toUpperCase();
+  if (!["A", "B", "E"].includes(decision)) return [];
+  const lines = Array.isArray(ac.customerBillLines) ?
+    ac.customerBillLines : [];
+  return lines.map((line) => ({
+    name: String((line && (line.name || line.label ||
+      line.description)) || "Accessorial").trim(),
+    amount: cents(line && line.amount),
+  })).filter((line) => line.amount != null && line.amount > 0);
+}
+
+/**
+ * One CSV row with only what is on the invoice the customer receives
+ * (Lisa, Nov 12: no carrier cost or other internal fields).
  * @param {object} inv
- * @param {string} firestoreId
  * @return {object}
  */
-function rowFromInvoice(inv, firestoreId) {
+function rowFromInvoice(inv) {
   const freight = inv.freightDetails || {};
   const emailMeta = inv.customerInvoiceEmail || {};
+  const freightCharge = cents(inv.customerRate);
+  const accessorials = customerAccessorialLines(inv);
+  const accessorialTotal = accessorials
+      .reduce((sum, line) => sum + line.amount, 0);
+  const total = freightCharge != null || accessorials.length ?
+    cents((freightCharge || 0) + accessorialTotal) : null;
+  const issued = inv.updatedAt && typeof inv.updatedAt.toDate === "function" ?
+    inv.updatedAt.toDate() :
+    (inv.updatedAt instanceof Date ? inv.updatedAt : null);
   return {
-    issuedAt: tsIso(inv.updatedAt),
+    invoiceDate: issued ? isoDayNy(issued) : "",
     customerInvoiceNumber: inv.issuedInvoiceNumber ||
       emailMeta.invoiceNumber || "",
-    customerInvoiceId: inv.customerInvoiceId ||
-      emailMeta.customerInvoiceId || "",
     loadNumber: inv.loadNumber || "",
     customerName: inv.customerName || "",
-    carrierName: inv.carrierName || "",
-    carrierInvoiceNumber: inv.invoiceNumber || "",
-    carrierInvoiceDate: inv.invoiceDate || "",
-    proNumber: inv.proNumber || "",
-    shipmentReference: inv.shipmentReference || "",
     poNumber: inv.poNumber || "",
+    shipmentReference: inv.shipmentReference || "",
+    proNumber: inv.proNumber || "",
     pieces: freight.pieces != null ? freight.pieces : "",
     weightLbs: freight.totalWeightLbs != null ? freight.totalWeightLbs : "",
     freightClass: freight.freightClass || "",
-    customerAmount: inv.customerRate != null ? inv.customerRate : "",
-    carrierAmount: inv.invoiceAmount != null ? inv.invoiceAmount : "",
-    profit: inv.profit != null ? inv.profit : "",
-    workflowStatus: inv.finalWorkflowStatus || "",
-    firestoreInvoiceId: firestoreId || "",
+    freightCharge: freightCharge != null ? freightCharge.toFixed(2) : "",
+    accessorials: accessorials
+        .map((line) => `${line.name} $${line.amount.toFixed(2)}`)
+        .join("; "),
+    accessorialTotal: accessorials.length ?
+      cents(accessorialTotal).toFixed(2) : "",
+    invoiceTotal: total != null ? total.toFixed(2) : "",
   };
 }
 
+exports.rowFromInvoice = rowFromInvoice;
+
 const CSV_HEADERS = [
-  "Issued At (UTC)",
-  "Customer Invoice #",
-  "Primus Customer Invoice Id",
-  "Load / BOL",
-  "Customer Name",
-  "Carrier Name",
-  "Carrier Invoice #",
-  "Carrier Invoice Date",
-  "PRO #",
-  "Shipment Reference",
+  "Invoice Date",
+  "Invoice #",
+  "Load / BOL #",
+  "Customer",
   "PO #",
+  "Shipment Reference",
+  "PRO #",
   "Pieces",
   "Weight (lbs)",
   "Freight Class",
-  "Customer Amount",
-  "Carrier Amount",
-  "Profit",
-  "Workflow Status",
-  "Firestore Invoice Id",
+  "Freight Charge",
+  "Accessorial Charges",
+  "Accessorial Total",
+  "Invoice Total",
 ];
 
 /**
@@ -223,25 +242,20 @@ function buildCsv(rows) {
   const lines = [CSV_HEADERS.map(csvEscapeCell).join(",")];
   for (const row of rows) {
     lines.push([
-      row.issuedAt,
+      row.invoiceDate,
       row.customerInvoiceNumber,
-      row.customerInvoiceId,
       row.loadNumber,
       row.customerName,
-      row.carrierName,
-      row.carrierInvoiceNumber,
-      row.carrierInvoiceDate,
-      row.proNumber,
-      row.shipmentReference,
       row.poNumber,
+      row.shipmentReference,
+      row.proNumber,
       row.pieces,
       row.weightLbs,
       row.freightClass,
-      row.customerAmount,
-      row.carrierAmount,
-      row.profit,
-      row.workflowStatus,
-      row.firestoreInvoiceId,
+      row.freightCharge,
+      row.accessorials,
+      row.accessorialTotal,
+      row.invoiceTotal,
     ].map(csvEscapeCell).join(","));
   }
   return `\uFEFF${lines.join("\n")}\n`;
@@ -279,7 +293,7 @@ async function runDjDirectLtlWeeklyReport(opts = {}) {
       const inv = doc.data() || {};
       if (!isDjDirectLtlCustomer(inv.customerName)) return;
       if (!isIssuedCustomerInvoice(inv)) return;
-      rows.push(rowFromInvoice(inv, doc.id));
+      rows.push(rowFromInvoice(inv));
     });
     return rows;
   };
@@ -303,8 +317,9 @@ async function runDjDirectLtlWeeklyReport(opts = {}) {
     `<p>Attached is the CSV of DJ Direct LTL customer invoices issued ` +
     `${window.label} (${rows.length} invoice` +
     `${rows.length === 1 ? "" : "s"}).</p>` +
-    `<p>Columns mirror the Jerry / Primus invoice fields Jerry has on file ` +
-    `(load, invoice numbers, carrier, amounts, freight details).</p>` +
+    `<p>Each row has only what is on the customer invoice: invoice and ` +
+    `load numbers, references, freight details, the freight charge, ` +
+    `each accessorial, and the invoice total.</p>` +
     (sample ?
       `<p>This is a one-time sample. Going forward Jerry emails this every ` +
       `Monday for the prior week.</p>` : "");

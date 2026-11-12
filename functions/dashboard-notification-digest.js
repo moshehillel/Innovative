@@ -167,6 +167,53 @@ function digestRecipients(tenant, items) {
 }
 
 /**
+ * Who must act on one open item (Rose, Nov 12: "sent to the responsible
+ * party only"). A named dispatcher gets their own items. Sarah gets
+ * items waiting on her. Everything else is accounting work for Lisa
+ * (other tenants: their alert address).
+ * @param {object} tenant Tenant.
+ * @param {object} item Open notification.
+ * @return {string|null} Email, or null when nobody can be resolved.
+ */
+function responsibleEmailFor(tenant, item) {
+  const tenantId = tenant && tenant.tenantId;
+  const innovative = !tenantId || tenantId === "default";
+  const owned = ownership.applyOwnerDefaults(item || {});
+  const dispatcher = owned.dispatcherEmail &&
+    !isIntakeAddress(owned.dispatcherEmail) ?
+    String(owned.dispatcherEmail).trim() : null;
+  if (owned.ownerBucket === ownership.OWNER_BUCKET.DISPATCH && dispatcher) {
+    return dispatcher;
+  }
+  if (!innovative) {
+    return (tenant && tenant.alertEmail) || dispatcher || null;
+  }
+  if (owned.ownerBucket === ownership.OWNER_BUCKET.SARAH) {
+    return ownership.sarahEmail();
+  }
+  return LISA_EMAIL;
+}
+
+/**
+ * Splits open items by the person responsible for each one.
+ * @param {object} tenant Tenant.
+ * @param {object[]} items Open notifications.
+ * @return {Array<{email: string, items: object[]}>}
+ */
+function digestGroups(tenant, items) {
+  const byEmail = new Map();
+  (items || []).forEach((item) => {
+    if (!item) return;
+    const email = responsibleEmailFor(tenant, item);
+    if (!email || isIntakeAddress(email)) return;
+    const key = email.toLowerCase();
+    if (!byEmail.has(key)) byEmail.set(key, {email, items: []});
+    byEmail.get(key).items.push(item);
+  });
+  return [...byEmail.values()];
+}
+
+/**
  * @param {object} row Notification or mail fields.
  * @return {string}
  */
@@ -370,17 +417,19 @@ async function runDailyNotificationDigest(opts) {
           .filter((row) => rowBelongsToTenant(row, tenant.tenantId) ||
             ownership.sameTenant(row.tenantId, tenant.tenantId))
           .filter((row) => !isJerrySystemNotification(row));
-      const recipients = digestRecipients(tenant, open);
-      if (!open.length || !recipients.length) {
+      // Each person gets only the items they are responsible for, not the
+      // whole office list (Rose, Nov 12).
+      const groups = digestGroups(tenant, open);
+      if (!open.length || !groups.length) {
         await finishDay(tenant, dateKey, "sent", {
           open: open.length,
-          recipients: recipients.length,
+          recipients: groups.length,
         });
         results.push({
           tenantId: tenant.tenantId,
           sent: false,
           open: open.length,
-          recipients: recipients.length,
+          recipients: groups.length,
         });
         continue;
       }
@@ -390,25 +439,40 @@ async function runDailyNotificationDigest(opts) {
         day: "numeric",
         year: "numeric",
       });
-      await deps.saveOutboundEmail({
-        type: "dashboard_notification_digest",
-        forceSend: true,
-        forceRecipient: true,
-        tenant,
-        to: recipients.join(", "),
-        cc: null,
-        subject: `Jerry — ${open.length} unfinished notification(s) — ${label}`,
-        html: digestHtml(open, label),
-      });
-      await finishDay(tenant, dateKey, "sent", {
+      let sentCount = 0;
+      const failed = [];
+      for (const group of groups) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await deps.saveOutboundEmail({
+            type: "dashboard_notification_digest",
+            forceSend: true,
+            forceRecipient: true,
+            tenant,
+            to: group.email,
+            cc: null,
+            subject: `Jerry — ${group.items.length} unfinished ` +
+              `notification(s) — ${label}`,
+            html: digestHtml(group.items, label),
+          });
+          sentCount += 1;
+        } catch (sendErr) {
+          failed.push({email: group.email, error: sendErr.message});
+        }
+      }
+      await finishDay(tenant, dateKey, failed.length ? "error" : "sent", {
         open: open.length,
-        recipients: recipients.length,
+        recipients: groups.length,
+        sentCount,
+        failed: failed.length ? failed : null,
       });
       results.push({
         tenantId: tenant.tenantId,
-        sent: true,
+        sent: sentCount > 0,
         open: open.length,
-        recipients: recipients.length,
+        recipients: groups.length,
+        sentCount,
+        failed: failed.length,
       });
     } catch (err) {
       await finishDay(tenant, dateKey, "error", {
@@ -426,6 +490,8 @@ async function runDailyNotificationDigest(opts) {
 module.exports = {
   init,
   digestRecipients,
+  responsibleEmailFor,
+  digestGroups,
   digestHtml,
   isIntakeAddress,
   isJerrySystemNotification,

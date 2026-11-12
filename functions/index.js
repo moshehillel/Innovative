@@ -3651,6 +3651,8 @@ async function runAdditionalChargeDecisionBackground(args) {
           optionACustomerChargeAmount : chargesTotal,
         category: charge.category,
         customerBillLines: billLinesForEmail,
+        weightRebill: charge.weightRebill || null,
+        freightMismatch: charge.freightMismatch || null,
         customerRate: invoice.customerRate ||
           customerRateFromBooking(booking),
       });
@@ -3750,13 +3752,16 @@ async function runAdditionalChargeDecisionBackground(args) {
         customerRate: await resolveCurrentCustomerRate(invoice, booking),
         customerBillLines:
           approvalUpdate["additionalCharge.customerBillLines"] || [],
+        category: charge.category,
+        weightRebill: charge.weightRebill || null,
+        freightMismatch: charge.freightMismatch || null,
         baseUrl: emailActionTokens.publicFunctionsBaseUrl(),
         invoiceId: String(invoiceId),
         tenantId: tenant.tenantId,
       });
-      const podFollowup = require("./pod-followup");
-      const approver = process.env.ADDITIONAL_CHARGE_APPROVER_EMAIL ||
-        podFollowup.SARAH_EMAIL;
+      // Dispatcher task only. Sarah stays off To and CC (Lisa, Oct 15:
+      // "Sarah should not be CCd in this email"); she already decided on
+      // the approval email. Lisa is added on CC below.
       const reminderPayload = {
         type: "additional_charge_dispatcher_task",
         invoiceId: String(invoiceId),
@@ -3766,7 +3771,6 @@ async function runAdditionalChargeDecisionBackground(args) {
       if (dispatcher.ok && dispatcher.email) {
         reminderPayload.forceRecipient = true;
         reminderPayload.to = dispatcher.email;
-        if (approver) reminderPayload.cc = approver;
         extraNote += ` The dispatcher (${dispatcher.email}) was reminded ` +
           `to notify the customer before the invoice is sent.`;
       } else {
@@ -4854,6 +4858,37 @@ async function handleDrayageGtgReturn(args) {
             messageId,
             containerNumber,
             error: lookupErr.message,
+          });
+    }
+  }
+  // Never enter the carrier's bank routing number as the Primus Bill#
+  // (load 270520). Fall back to a number labeled "Invoice"; if there is
+  // none, Jerry stops and asks Lisa below.
+  if (invoiceNumber) {
+    let pdfText = "";
+    for (const file of files) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const texts = await extractPdfPageTexts(file.buffer);
+        if (Array.isArray(texts)) pdfText += "\n" + texts.join("\n");
+      } catch (_) {
+        // Unreadable PDF: the subject and body are still checked.
+      }
+    }
+    const routingText = (subject || "") + "\n" + (emailBody || "") + pdfText;
+    if (drayageIntake.isBankRoutingNumber(invoiceNumber, routingText)) {
+      const rejected = invoiceNumber;
+      invoiceNumber =
+        drayageIntake.extractInvoiceNumberFromPdfText(pdfText) || "";
+      if (invoiceNumber &&
+          drayageIntake.isBankRoutingNumber(invoiceNumber, routingText)) {
+        invoiceNumber = "";
+      }
+      await writeLog("warn", "mail",
+          "Drayage bill number was the bank routing number", {
+            messageId,
+            rejected,
+            replacement: invoiceNumber || null,
           });
     }
   }
@@ -11566,6 +11601,23 @@ async function processGmailMessage(
           headers,
           emailClassification,
         });
+        // Lisa (Oct 22): a non-invoice email Jerry cannot handle is
+        // disregarded when Lisa is already copied. It still shows on the
+        // daily ignored-emails report.
+        if (!noAttachVeto &&
+            administrativeEmailIntake.isLisaCopiedOnEmailHeaders(headers)) {
+          await completeAdministrativeIgnore({
+            messageId,
+            subject,
+            from,
+            tenant,
+            queueDocId,
+            finalStatus: "unsure_lisa_copied",
+            reason: "Non-invoice email Jerry could not handle - " +
+              "Lisa already copied, disregarded",
+          });
+          return;
+        }
         await forwardWithAnalysis(
             "Email received with no attachments",
             noAttachVeto ?
@@ -12205,6 +12257,20 @@ async function processGmailMessage(
           emailClassification,
           invoicePdfCount,
         });
+        if (!vetoBlockedAmbiguous &&
+            administrativeEmailIntake.isLisaCopiedOnEmailHeaders(headers)) {
+          await completeAdministrativeIgnore({
+            messageId,
+            subject,
+            from,
+            tenant,
+            queueDocId,
+            finalStatus: "unsure_lisa_copied",
+            reason: "Non-invoice email Jerry could not handle - " +
+              "Lisa already copied, disregarded",
+          });
+          return;
+        }
         await forwardWithAnalysis(
             noInvoiceReason,
             vetoBlockedAmbiguous ?

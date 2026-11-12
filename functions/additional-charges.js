@@ -1999,18 +1999,74 @@ function customerNoticeChargeTypePhrase(charges, category) {
 }
 
 /**
- * Customer notification for decision A (bill the customer, auto email).
- * Matches Lisa's sample (itemized accessorials + total).
+ * Original and updated weight, class and dims for a reweigh, reclass or
+ * redim notice (Lisa, Option A: "add the original and updated
+ * dims/weight"). Only values known on both sides that differ are listed.
+ * @param {object} opts category, charges, customerBillLines, weightRebill,
+ *   freightMismatch.
+ * @return {string} HTML, or "" when this is not a weight/dims charge.
+ */
+function customerNoticeMeasurementHtml(opts) {
+  const labels = []
+      .concat(Array.isArray(opts.charges) ? opts.charges : [])
+      .concat(Array.isArray(opts.customerBillLines) ?
+        opts.customerBillLines : [])
+      .map((row) => String((row && (row.name || row.label ||
+        row.description || row.type)) || ""))
+      .join(" ");
+  const measure = opts.category === CHARGE_CATEGORY.WEIGHT_INSPECTION ||
+    /re-?weigh|re-?class|re-?dim|dimension|inspection/i.test(labels);
+  if (!measure) return "";
+  const summary = opts.weightRebill || {};
+  const original = summary.original || {};
+  const updated = summary.updated || {};
+  const mm = (opts.freightMismatch && opts.freightMismatch.details) || {};
+  const rows = [];
+  const oWeight = Number(original.totalWeightLbs || mm.primusWeightLbs) || 0;
+  const uWeight = Number(updated.totalWeightLbs || mm.invoiceWeightLbs) || 0;
+  if (oWeight > 0 && uWeight > 0 && oWeight !== uWeight) {
+    rows.push(`Original weight: ${esc(String(oWeight))} lbs`);
+    rows.push(`Updated weight: ${esc(String(uWeight))} lbs`);
+  }
+  const oClass = String(original.freightClass || mm.primusClass || "").trim();
+  const uClass = String(updated.freightClass || mm.invoiceClass || "").trim();
+  if (oClass && uClass && oClass !== uClass) {
+    rows.push(`Original class: ${esc(oClass)}`);
+    rows.push(`Updated class: ${esc(uClass)}`);
+  }
+  const oDims = formatDims(original.length, original.width,
+      original.height) || mm.primusDims || "";
+  const uDims = formatDims(updated.length, updated.width,
+      updated.height) || mm.invoiceDims || "";
+  if (oDims && uDims && oDims !== uDims) {
+    rows.push(`Original dimensions: ${esc(String(oDims))}`);
+    rows.push(`Updated dimensions: ${esc(String(uDims))}`);
+  }
+  return rows.map((row) => `<p>${row}</p>`).join("");
+}
+
+/**
+ * Customer notification for decision A (bill the customer, auto email),
+ * and the ready-to-send copy in the option B dispatcher task. Matches
+ * Lisa's sample: each billed accessorial, the total the customer is
+ * charged, and original vs updated weight/dims for a reweigh or redim.
  * @param {object} opts customerName, loadNumber, charges, chargesTotal,
- *   category, customerBillLines.
+ *   category, customerBillLines, weightRebill, freightMismatch.
  * @return {{subject: string, html: string}}
  */
 function buildCustomerChargeNotificationEmail(opts) {
   const {
-    customerName, loadNumber, charges, chargesTotal, category,
-    customerBillLines,
+    customerName, loadNumber, charges, category, customerBillLines,
   } = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
+  const billLines = (Array.isArray(customerBillLines) ?
+    customerBillLines : []).filter((line) =>
+    Number(line && line.amount) > 0);
+  // Customer lines are what the customer is billed (carrier cost plus
+  // markup, or the flat amount). The carrier difference is used only when
+  // nobody entered customer lines.
+  const chargesTotal = billLines.length ?
+    Math.round(sumCustomerBillLines(billLines) * 100) / 100 :
+    opts.chargesTotal;
   let detailHtml = "";
   if (billLines.length) {
     detailHtml = billLines.map((line) =>
@@ -2033,6 +2089,7 @@ function buildCustomerChargeNotificationEmail(opts) {
     `<p>We wanted to make you aware that the carrier has applied an ` +
     `additional charge to this shipment for the following:</p>` +
     detailHtml +
+    customerNoticeMeasurementHtml(opts) +
     `<p><strong>Total Additional Charges: ${money(chargesTotal)}</strong></p>` +
     `<p>If you have any questions, please feel free to reach out.</p>` +
     `<p>Thank you,<br>Innovative Accounting</p>`;
@@ -2044,47 +2101,16 @@ function buildCustomerChargeNotificationEmail(opts) {
 }
 
 /**
- * Ready-to-forward customer email body for option B (dispatcher sends it).
- * @param {object} opts loadNumber, customerName, carrierName, chargesTotal,
- *   customerRate, customerBillLines, newCustomerRate.
+ * Ready-to-forward customer email for option B (the dispatcher sends it).
+ * Same template and amounts as the option A customer notice (Lisa: "the
+ * templates should be the same as option A"): each accessorial at the
+ * customer amount, never the carrier cost.
+ * @param {object} opts loadNumber, customerName, charges, chargesTotal,
+ *   category, customerBillLines, weightRebill, freightMismatch.
  * @return {{subject: string, html: string}}
  */
 function buildDispatcherCustomerNotifyTemplate(opts) {
-  const {
-    loadNumber, customerName, carrierName, chargesTotal,
-    customerRate, customerBillLines, newCustomerRate,
-  } = opts;
-  const billLines = Array.isArray(customerBillLines) ? customerBillLines : [];
-  const baseRate = Number(customerRate) || 0;
-  const accessorialTotal = sumCustomerBillLines(billLines);
-  const updatedRate = Number(newCustomerRate) > 0 ?
-    Number(newCustomerRate) :
-    (baseRate > 0 ? baseRate + accessorialTotal : accessorialTotal);
-  const chargeDetail = billLines.length ?
-    customerBillLinesHtml(billLines) :
-    `<p>Additional charge total: <strong>${money(chargesTotal)}</strong></p>`;
-  const html =
-    `<p>Hello${customerName ? ` ${esc(customerName)}` : ""},</p>` +
-    `<p>This note is about your shipment ` +
-    `<strong>${esc(String(loadNumber || ""))}</strong>` +
-    (carrierName ? ` with ${esc(carrierName)}` : "") + `.</p>` +
-    `<p>The carrier billed an additional charge on this load` +
-    (Number(chargesTotal) > 0 ?
-      ` of <strong>${money(chargesTotal)}</strong>` : "") +
-    `. Your updated customer rate for this shipment is ` +
-    `<strong>${money(updatedRate)}</strong>` +
-    (baseRate > 0 && billLines.length ?
-      ` (base freight ${formatCustomerRate(baseRate)} plus the ` +
-      `accessorial(s) below)` : "") +
-    `.</p>` +
-    chargeDetail +
-    `<p>Please let us know if you have any questions.</p>` +
-    `<p>Thank you,<br>Innovative Carriers</p>`;
-  return {
-    subject: toOutboundEmailSafeSubject(
-        `Updated rate on shipment ${loadNumber}`),
-    html: toOutboundEmailSafeText(html),
-  };
+  return buildCustomerChargeNotificationEmail(opts || {});
 }
 
 /**
@@ -2124,11 +2150,12 @@ function buildDispatcherNotifyReminderEmail(opts) {
   const forward = buildDispatcherCustomerNotifyTemplate({
     loadNumber,
     customerName,
-    carrierName,
+    charges,
     chargesTotal,
-    customerRate: baseRate,
+    category: opts.category,
     customerBillLines: billLines,
-    newCustomerRate,
+    weightRebill: opts.weightRebill,
+    freightMismatch: opts.freightMismatch,
   });
   const emailTokens = require("./email-action-tokens");
   const finalizeBase = baseUrl || emailTokens.publicFunctionsBaseUrl();

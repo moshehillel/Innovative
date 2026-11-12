@@ -548,10 +548,71 @@ const forward = ac.buildDispatcherCustomerNotifyTemplate({
   customerBillLines: [{name: "Reweigh Fee", amount: 120}],
   newCustomerRate: 665,
 });
-check("forward template mentions load",
-    forward.html.includes("264172"), true);
-check("forward template mentions new rate",
-    forward.html.includes("$665.00"), true);
+// Option B forward copy is Lisa's option A template (tickets "Option B",
+// "267289"): load in the subject, each charge at the customer amount.
+check("forward template subject has load",
+    forward.subject.includes("264172"), true);
+check("forward template uses Lisa wording",
+    forward.html.includes("We wanted to make you aware"), true);
+check("forward template lists the charge at customer amount",
+    forward.html.includes("Reweigh Fee") &&
+    forward.html.includes("$120.00"), true);
+check("forward template total is the customer amount",
+    forward.html.includes("Total Additional Charges: $120.00"), true);
+const optionANotice = ac.buildCustomerChargeNotificationEmail({
+  loadNumber: "264172",
+  customerName: "Miworld",
+  chargesTotal: 120,
+  customerBillLines: [{name: "Reweigh Fee", amount: 120}],
+});
+check("option A and option B customer copy are the same",
+    optionANotice.html === forward.html &&
+    optionANotice.subject === forward.subject, true);
+// Customer is billed carrier cost plus markup, never the carrier cost.
+const marked = ac.buildDispatcherCustomerNotifyTemplate({
+  loadNumber: "267289",
+  customerName: "Acme",
+  chargesTotal: 100,
+  charges: [{type: "Redelivery", amount: 100}],
+  customerBillLines: [{name: "REDELIVERY", amount: 130}],
+});
+check("267289 forward shows customer $130, not carrier $100",
+    marked.html.includes("$130.00") && !marked.html.includes("$100.00"),
+    true);
+// Reweigh notice: original and updated weight/dims (Option A- Update).
+const reweighNotice = ac.buildCustomerChargeNotificationEmail({
+  loadNumber: "270001",
+  customerName: "Acme",
+  chargesTotal: 85,
+  category: ac.CHARGE_CATEGORY.WEIGHT_INSPECTION,
+  customerBillLines: [{name: "REWEIGH", amount: 85}],
+  weightRebill: {
+    original: {totalWeightLbs: 500, freightClass: "70",
+      length: 48, width: 40, height: 40},
+    updated: {totalWeightLbs: 720, freightClass: "70",
+      length: 48, width: 40, height: 60},
+  },
+});
+check("reweigh notice has original weight",
+    reweighNotice.html.includes("Original weight: 500 lbs"), true);
+check("reweigh notice has updated weight",
+    reweighNotice.html.includes("Updated weight: 720 lbs"), true);
+check("reweigh notice has original and updated dims",
+    reweighNotice.html.includes("Original dimensions:") &&
+    reweighNotice.html.includes("Updated dimensions:"), true);
+check("reweigh notice leaves out an unchanged class",
+    reweighNotice.html.includes("class:"), false);
+const plainNotice = ac.buildCustomerChargeNotificationEmail({
+  loadNumber: "270002",
+  customerName: "Acme",
+  chargesTotal: 75,
+  customerBillLines: [{name: "LIFTGATE", amount: 75}],
+  weightRebill: {
+    original: {totalWeightLbs: 500}, updated: {totalWeightLbs: 720},
+  },
+});
+check("liftgate notice has no weight lines",
+    plainNotice.html.includes("weight"), false);
 const dispute = ac.buildDisputeEmailDraft({
   loadNumber: "264172",
   carrierName: "Central Transport",
