@@ -939,8 +939,7 @@ function extractCompactPalletBlocks(body) {
   const text = normalizeDirtyFreightText(body);
   const pattern = new RegExp(
       "Pallet\\s+(\\d+)\\s*[:.\\-]?\\s+" +
-      "([\\d.]+)\\s*" + DIRTY_DIM_SEP + "\\s*([\\d.]+)\\s*" +
-      DIRTY_DIM_SEP + "\\s*([\\d.]+)\\s*,?\\s*" +
+      "(" + freightDims.DIM_TRIPLE_CAPTURE + ")\\s*,?\\s*" +
       "([\\d.,]+)\\s*lbs",
       "gi");
   let m;
@@ -948,16 +947,20 @@ function extractCompactPalletBlocks(body) {
     const n = Number(m[1]);
     if (seen.has(n)) continue;
     seen.add(n);
-    const weight = parseLooseNumber(m[5]);
+    // "Pallet 1: L 40 x H 57 x W 48" — labels win over position.
+    const dims = freightDims.parseDimTripleString(m[2]);
+    if (!dims) continue;
+    const weight = parseLooseNumber(m[3]);
     freight.push(freightDims.normalizePalletDims({
       qty: 1,
       weight: weight != null ? weight : null,
       weightType: "total",
       class: null,
-      length: Number(m[2]),
-      width: Number(m[3]),
-      height: Number(m[4]),
+      length: dims.length,
+      width: dims.width,
+      height: dims.height,
       dimType: "PLT",
+      dimAxesLabeled: !!dims.labeled,
     }));
   }
   // Coreforce dim lines: "48*40*50 – 32ctns – 327lbs", optional second
@@ -1096,24 +1099,31 @@ function parseInformalPalletCount(text) {
  * @return {Array<object>}
  */
 function extractPalletFreight(body) {
+  const text = String(body || "");
   const freight = [];
-  const pattern = new RegExp(
-      "Pallet\\s+(\\d+)\\s*[\\s\\S]*?Weight:\\s*([\\d.]+)\\s*lbs" +
-      "[\\s\\S]*?Length:\\s*([\\d.]+)\\s*in" +
-      "[\\s\\S]*?Width:\\s*([\\d.]+)\\s*in" +
-      "[\\s\\S]*?Height:\\s*([\\d.]+)\\s*in",
-      "gi");
-  let m;
-  while ((m = pattern.exec(String(body || ""))) !== null) {
+  const headerRe = /Pallet\s+(\d+)/gi;
+  const headers = [];
+  let hm;
+  while ((hm = headerRe.exec(text)) !== null) {
+    headers.push({n: Number(hm[1]), index: hm.index});
+  }
+  for (let i = 0; i < headers.length; i++) {
+    const start = headers[i].index;
+    const end = i + 1 < headers.length ? headers[i + 1].index : text.length;
+    const block = text.slice(start, end);
+    const wt = block.match(/Weight:\s*([\d.]+)\s*lbs/i);
+    const labeled = freightDims.parseAxisLabeledDims(block);
+    if (!wt || !labeled) continue;
     freight.push(freightDims.normalizePalletDims({
       qty: 1,
-      weight: Number(m[2]),
+      weight: Number(wt[1]),
       weightType: "total",
       class: null,
-      length: Number(m[3]),
-      width: Number(m[4]),
-      height: Number(m[5]),
+      length: labeled.length,
+      width: labeled.width,
+      height: labeled.height,
       dimType: "PLT",
+      dimAxesLabeled: true,
     }));
   }
   if (freight.length) return freight;
@@ -1603,10 +1613,11 @@ function parseLabeledFreightTotals(body) {
     }
   }
   const dim = text.match(new RegExp(
-      "Pallet\\s+Dimensions?\\s*" + DIRTY_LABEL_SEP + "?\\s*" +
-      "([\\d.]+)\\s*" + DIRTY_DIM_SEP + "\\s*" +
-      "([\\d.]+)\\s*" + DIRTY_DIM_SEP + "\\s*([\\d.]+)",
+      "Pallet\\s+Dimensions?\\s*[-–—:=]?\\s*" +
+      "(" + freightDims.DIM_TRIPLE_CAPTURE + ")",
       "i"));
+  // "40L x 57H x 48W" / "L 40 x H 57 x W 48": labels decide the axes.
+  const dimParsed = dim ? freightDims.parseDimTripleString(dim[1]) : null;
   // Prefer single LxWxH only when not a mixed dim list / "N plts @ …".
   const dimLine = text.match(new RegExp(
       "Pallet\\s+[Dd]imensions?\\s*(?:\\([^)]*\\))?\\s*" +
@@ -1620,9 +1631,9 @@ function parseLabeledFreightTotals(body) {
     cartonCount,
     palletCount,
     weight,
-    length: (!mixedDims && dim) ? Number(dim[1]) : null,
-    width: (!mixedDims && dim) ? Number(dim[2]) : null,
-    height: (!mixedDims && dim) ? Number(dim[3]) : null,
+    length: (!mixedDims && dimParsed) ? dimParsed.length : null,
+    width: (!mixedDims && dimParsed) ? dimParsed.width : null,
+    height: (!mixedDims && dimParsed) ? dimParsed.height : null,
   };
 }
 

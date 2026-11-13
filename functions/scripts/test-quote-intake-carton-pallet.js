@@ -1727,6 +1727,40 @@ check("D2129 weight stays each",
     d2129.lanes[3].freightInfo[0].weightType, "each");
 
 // maybeRepairFreightExtract: max one attempt (early return, no model call).
+// --- L/W/H labels in any order (from Aug branch 1e91356) ---
+const labeledSuffix = intake.parseLabeledFreightTotals(
+    "Pallet dimensions – 40L x 57H x 48W");
+check("labeled suffix L 40", labeledSuffix.length, 40);
+check("labeled suffix W 48", labeledSuffix.width, 48);
+check("labeled suffix H 57", labeledSuffix.height, 57);
+
+const labeledPrefix = intake.parseLabeledFreightTotals(
+    "Pallet dimensions – L 40 x H 57 x W 48");
+check("labeled L W H prefix L 40", labeledPrefix.length, 40);
+check("labeled L W H prefix W 48", labeledPrefix.width, 48);
+check("labeled L W H prefix H 57", labeledPrefix.height, 57);
+
+const compactLwh = intake.extractCompactPalletBlocks(
+    "Pallet 1: L 40 x H 57 x W 48, 1268 lbs");
+check("compact L 40 x H 57 x W 48", [
+  compactLwh[0] && compactLwh[0].length,
+  compactLwh[0] && compactLwh[0].width,
+  compactLwh[0] && compactLwh[0].height,
+], [40, 48, 57]);
+
+const ltlHFirst = intake.extractPalletFreight([
+  "Pallet 1",
+  "Weight: 1268 lbs",
+  "H: 57 in",
+  "L: 40 in",
+  "W: 48 in",
+].join("\n"));
+check("LTLFlow L/W/H any order", [
+  ltlHFirst[0] && ltlHFirst[0].length,
+  ltlHFirst[0] && ltlHFirst[0].width,
+  ltlHFirst[0] && ltlHFirst[0].height,
+], [40, 48, 57]);
+
 const repairOnceEx = {
   _freightRepairAttempted: true,
   extractModel: "grok-4.5",
