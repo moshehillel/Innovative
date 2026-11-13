@@ -4150,7 +4150,6 @@ exports.processInvoice = onRequest(async (req, res) => {
       decisionReason: "Waiting for Primus lookup.",
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      deleteAt: getDeleteAt(7),
     });
 
     return res.json({
@@ -14159,9 +14158,10 @@ async function processGmailMessage(
             podUploaded: false,
             qbBillingSynced: false,
           },
+          // Kept for good: QuickBooks statement checks look loads up by
+          // invoice number, so these records must never expire.
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          deleteAt: getDeleteAt(7),
         });
 
         await logWorkflowStep({
